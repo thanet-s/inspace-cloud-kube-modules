@@ -107,6 +107,7 @@ func (s *Server) vm(w http.ResponseWriter, r *http.Request) {
 			OSName:             r.Form.Get("os_name"),
 			OSVersion:          r.Form.Get("os_version"),
 			PrivateIPv4:        "10.0.0.10",
+			NetworkUUID:        r.Form.Get("network_uuid"),
 			DesignatedPoolUUID: r.Form.Get("designated_pool_uuid"),
 			Storage:            []inspace.VMStorage{{UUID: "cccccccc-1111-4222-8333-dddddddddddd", Name: "vda", SizeGiB: disk, Primary: true}},
 		}

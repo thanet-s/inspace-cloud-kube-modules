@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	sdk "github.com/thanet-s/inspace-cloud-kube-modules/modules/cloud-provider/pkg/inspace"
 	cloudapi "github.com/thanet-s/inspace-cloud-kube-modules/modules/karpenter-provider/pkg/cloud"
@@ -41,6 +42,9 @@ func TestCreateIsReadBeforeCreateIdempotent(t *testing.T) {
 	}
 	if api.lastVMRequest.ReservePublicIP == nil || *api.lastVMRequest.ReservePublicIP {
 		t.Fatalf("VM create must reserve no implicit public IP: %#v", api.lastVMRequest.ReservePublicIP)
+	}
+	if api.lastVMRequest.NetworkUUID != request.NetworkUUID {
+		t.Fatalf("VM create network UUID = %q, want %q", api.lastVMRequest.NetworkUUID, request.NetworkUUID)
 	}
 	if !strings.Contains(decodedSDKCloudInit(t, api.lastVMRequest.CloudInit), "203.0.113.10") || strings.Contains(decodedSDKCloudInit(t, api.lastVMRequest.CloudInit), "__INSPACE_FLOATING_IPV4__") {
 		t.Fatalf("VM cloud-init external IP was not resolved: %s", api.lastVMRequest.CloudInit)
@@ -179,6 +183,222 @@ func TestCreateRecoversAmbiguousCommittedPOSTWithoutRetry(t *testing.T) {
 	}
 	if vm.UUID == "" || api.createCalls != 1 {
 		t.Fatalf("recovery VM = %#v, POSTs = %d", vm, api.createCalls)
+	}
+}
+
+func TestCreateWaitsForNetworkAttachmentWithoutDuplicatePOST(t *testing.T) {
+	api := &fakeAPI{networkMembershipAfter: 8}
+	adapter, _ := New(api)
+	configureFastNetworkReadback(adapter, 500*time.Millisecond)
+	created, err := adapter.CreateVM(context.Background(), testRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created.UUID == "" || api.createCalls != 1 {
+		t.Fatalf("created VM = %#v, POSTs = %d", created, api.createCalls)
+	}
+	if api.networkGetCalls < 9 {
+		t.Fatalf("network read-backs = %d, want propagation beyond the old five-read boundary", api.networkGetCalls)
+	}
+}
+
+func TestCreateRetriesTransientNetworkReadbackErrors(t *testing.T) {
+	for name, transientErr := range map[string]error{
+		"service unavailable": &sdk.APIError{StatusCode: 503, Retryable: true},
+		"request deadline":    context.DeadlineExceeded,
+		"transport":           errors.New("connection reset while reading response"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			api := &fakeAPI{networkErrors: map[int]error{2: transientErr}}
+			adapter, _ := New(api)
+			configureFastNetworkReadback(adapter, 250*time.Millisecond)
+			created, err := adapter.CreateVM(context.Background(), testRequest())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if created.UUID == "" || api.createCalls != 1 || api.networkGetCalls < 3 {
+				t.Fatalf("created VM = %#v, POSTs = %d, network reads = %d", created, api.createCalls, api.networkGetCalls)
+			}
+			if slicesContain(api.operations, "delete-vm") {
+				t.Fatalf("transient read caused rollback: %v", api.operations)
+			}
+		})
+	}
+}
+
+func TestCreateDoesNotRetryNonRetryableNetworkReadbackError(t *testing.T) {
+	api := &fakeAPI{networkErrors: map[int]error{2: &sdk.APIError{StatusCode: 403}}}
+	adapter, _ := New(api)
+	started := time.Now()
+	_, err := adapter.CreateVM(context.Background(), testRequest())
+	if err == nil || !strings.Contains(err.Error(), "getting worker network") {
+		t.Fatalf("CreateVM() error = %v, want terminal network read error", err)
+	}
+	if elapsed := time.Since(started); elapsed >= time.Second {
+		t.Fatalf("terminal read error took %s, want no retry delay", elapsed)
+	}
+	if api.networkGetCalls != 2 || len(api.vms) != 0 || len(api.floatingIPs) != 0 {
+		t.Fatalf("terminal read was retried or leaked resources: reads=%d VMs=%#v FIPs=%#v", api.networkGetCalls, api.vms, api.floatingIPs)
+	}
+	if api.firewallAssignCalls != 0 || api.floatingIPAssignCalls != 0 {
+		t.Fatalf("terminal VPC read reached protection mutation: firewall=%d floatingIP=%d", api.firewallAssignCalls, api.floatingIPAssignCalls)
+	}
+}
+
+func TestCreateRejectsMalformedNetworkMembershipReadback(t *testing.T) {
+	const vmUUID = "11111111-1111-4111-8111-111111111111"
+	for name, api := range map[string]*fakeAPI{
+		"nil network": {networkNilOnCalls: map[int]bool{2: true}},
+		"duplicate membership": {network: &sdk.Network{
+			UUID: "network-1", Subnet: "10.0.0.0/24", VMUUIDs: []string{vmUUID, vmUUID},
+		}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			adapter, _ := New(api)
+			_, err := adapter.CreateVM(context.Background(), testRequest())
+			if err == nil {
+				t.Fatal("expected malformed network read-back rejection")
+			}
+			if api.createCalls != 1 || len(api.vms) != 0 || len(api.floatingIPs) != 0 {
+				t.Fatalf("malformed read-back leaked launch: POSTs=%d VMs=%#v FIPs=%#v", api.createCalls, api.vms, api.floatingIPs)
+			}
+			if api.firewallAssignCalls != 0 || api.floatingIPAssignCalls != 0 {
+				t.Fatalf("malformed VPC proof reached protection mutation: firewall=%d floatingIP=%d", api.firewallAssignCalls, api.floatingIPAssignCalls)
+			}
+		})
+	}
+}
+
+func TestCreateCleansVMWhenNetworkAttachmentNeverAppears(t *testing.T) {
+	api := &fakeAPI{network: &sdk.Network{UUID: "network-1", Subnet: "10.0.0.0/24"}}
+	adapter, _ := New(api)
+	configureFastNetworkReadback(adapter, 60*time.Millisecond)
+	if _, err := adapter.CreateVM(context.Background(), testRequest()); err == nil || !strings.Contains(err.Error(), "attachment to network") {
+		t.Fatalf("CreateVM() error = %v, want missing network attachment", err)
+	}
+	if api.createCalls != 1 || len(api.vms) != 0 || len(api.floatingIPs) != 0 {
+		t.Fatalf("failed network attachment leaked resources: POSTs=%d VMs=%#v FIPs=%#v", api.createCalls, api.vms, api.floatingIPs)
+	}
+	if api.firewallAssignCalls != 0 || api.floatingIPAssignCalls != 0 {
+		t.Fatalf("protection mutated before VPC proof: firewall=%d floatingIP=%d", api.firewallAssignCalls, api.floatingIPAssignCalls)
+	}
+}
+
+func TestCreateCancellationStopsVPCWaitAndUsesDetachedCleanup(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	api := &fakeAPI{network: &sdk.Network{UUID: "network-1", Subnet: "10.0.0.0/24"}}
+	api.networkGetHook = func(call int) {
+		if call == 2 {
+			cancel()
+		}
+	}
+	adapter, _ := New(api)
+	started := time.Now()
+	_, err := adapter.CreateVM(ctx, testRequest())
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("CreateVM() error = %v, want context cancellation", err)
+	}
+	if elapsed := time.Since(started); elapsed >= time.Second {
+		t.Fatalf("cancellation took %s, want prompt return after detached cleanup", elapsed)
+	}
+	if len(api.vms) != 0 || len(api.floatingIPs) != 0 || api.deleteVMCalls != 1 {
+		t.Fatalf("canceled launch was not cleaned: VMs=%#v FIPs=%#v deleteVMCalls=%d", api.vms, api.floatingIPs, api.deleteVMCalls)
+	}
+	if api.deleteVMContextCanceled || api.deleteFloatingIPContextCanceled {
+		t.Fatal("cleanup inherited the canceled reconciliation context")
+	}
+}
+
+func TestCreateCallerDeadlineFailsClosed(t *testing.T) {
+	api := &fakeAPI{network: &sdk.Network{UUID: "network-1", Subnet: "10.0.0.0/24"}}
+	adapter, _ := New(api)
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+	defer cancel()
+	_, err := adapter.CreateVM(ctx, testRequest())
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("CreateVM() error = %v, want caller deadline", err)
+	}
+	if len(api.vms) != 0 || len(api.floatingIPs) != 0 || api.deleteVMCalls != 1 {
+		t.Fatalf("deadline launch was not cleaned: VMs=%#v FIPs=%#v deleteVMCalls=%d", api.vms, api.floatingIPs, api.deleteVMCalls)
+	}
+}
+
+func TestCreateRejectsNetworkUUIDReadbackMismatchBeforeMutation(t *testing.T) {
+	api := &fakeAPI{network: &sdk.Network{UUID: "other-network", Subnet: "10.0.0.0/24"}}
+	adapter, _ := New(api)
+	if _, err := adapter.CreateVM(context.Background(), testRequest()); err == nil || !strings.Contains(err.Error(), "read-back UUID") {
+		t.Fatalf("CreateVM() error = %v, want mismatched network read-back", err)
+	}
+	if api.floatingIPCreateCalls != 0 || api.createCalls != 0 || len(api.operations) != 0 {
+		t.Fatalf("network mismatch mutated cloud state: floatingIPCreates=%d VMPOSTs=%d operations=%v", api.floatingIPCreateCalls, api.createCalls, api.operations)
+	}
+}
+
+func TestCreateRejectsNonEmptyMismatchedVMNetwork(t *testing.T) {
+	api := &fakeAPI{createdNetworkUUID: "other-network"}
+	adapter, _ := New(api)
+	if _, err := adapter.CreateVM(context.Background(), testRequest()); err == nil || !strings.Contains(err.Error(), "instead of") {
+		t.Fatalf("CreateVM() error = %v, want wrong-network rejection", err)
+	}
+	if len(api.vms) != 0 || len(api.floatingIPs) != 0 {
+		t.Fatalf("wrong-network VM leaked resources: VMs=%#v FIPs=%#v", api.vms, api.floatingIPs)
+	}
+	if api.firewallAssignCalls != 0 || api.floatingIPAssignCalls != 0 {
+		t.Fatalf("wrong-network response reached protection mutation: firewall=%d floatingIP=%d", api.firewallAssignCalls, api.floatingIPAssignCalls)
+	}
+}
+
+func TestCreateRefusesToAdoptOwnedVMFromAnotherNetwork(t *testing.T) {
+	api := &fakeAPI{}
+	adapter, _ := New(api)
+	if _, err := adapter.CreateVM(context.Background(), testRequest()); err != nil {
+		t.Fatal(err)
+	}
+	api.floatingIPs = nil
+	api.operations = nil
+	api.vms[0].NetworkUUID = "other-network"
+	if _, err := adapter.CreateVM(context.Background(), testRequest()); err == nil || !strings.Contains(err.Error(), "launch parameters differ") {
+		t.Fatalf("CreateVM() error = %v, want wrong-network adoption refusal", err)
+	}
+	if api.createCalls != 1 || len(api.vms) != 1 || api.floatingIPCreateCalls != 1 || len(api.operations) != 0 {
+		t.Fatalf("wrong-network adoption mutated resources: VMPOSTs=%d floatingIPPOSTs=%d VMs=%#v operations=%v", api.createCalls, api.floatingIPCreateCalls, api.vms, api.operations)
+	}
+}
+
+func TestCreateDoesNotReplaceMissingFloatingIPForOwnedVM(t *testing.T) {
+	api := &fakeAPI{}
+	adapter, _ := New(api)
+	request := testRequest()
+	if _, err := adapter.CreateVM(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	api.floatingIPs = nil
+	api.operations = nil
+	if _, err := adapter.CreateVM(context.Background(), request); !errors.Is(err, cloudapi.ErrNotFound) {
+		t.Fatalf("CreateVM() error = %v, want missing recorded floating IP", err)
+	}
+	if api.floatingIPCreateCalls != 1 || api.createCalls != 1 || len(api.vms) != 1 || len(api.operations) != 0 {
+		t.Fatalf("missing adoption anchor caused mutation: floatingIPPOSTs=%d VMPOSTs=%d VMs=%#v operations=%v", api.floatingIPCreateCalls, api.createCalls, api.vms, api.operations)
+	}
+}
+
+func TestCreateDoesNotDestroyAdoptedVMWhenVPCAttachmentIsTemporarilyAbsent(t *testing.T) {
+	api := &fakeAPI{}
+	adapter, _ := New(api)
+	request := testRequest()
+	if _, err := adapter.CreateVM(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	api.vms[0].NetworkUUID = ""
+	api.network = &sdk.Network{UUID: request.NetworkUUID, Subnet: "10.0.0.0/24"}
+	api.operations = nil
+	configureFastNetworkReadback(adapter, 60*time.Millisecond)
+	if _, err := adapter.CreateVM(context.Background(), request); err == nil || !strings.Contains(err.Error(), "attachment to network") {
+		t.Fatalf("CreateVM() error = %v, want temporary missing membership", err)
+	}
+	if len(api.vms) != 1 || len(api.floatingIPs) != 1 || api.deleteVMCalls != 0 || slicesContain(api.operations, "delete-vm") {
+		t.Fatalf("adoption verification destroyed owned resources: VMs=%#v FIPs=%#v operations=%v", api.vms, api.floatingIPs, api.operations)
 	}
 }
 
@@ -345,17 +565,46 @@ func decodedSDKCloudInit(t *testing.T, data string) string {
 	return decoded.String()
 }
 
+func configureFastNetworkReadback(adapter *Adapter, timeout time.Duration) {
+	adapter.networkAttachmentReadbackTimeout = timeout
+	adapter.networkAttachmentRequestTimeout = timeout
+	adapter.networkAttachmentReadbackMinDelay = 5 * time.Millisecond
+	adapter.networkAttachmentReadbackMaxDelay = 10 * time.Millisecond
+}
+
+func slicesContain(values []string, expected string) bool {
+	for _, value := range values {
+		if value == expected {
+			return true
+		}
+	}
+	return false
+}
+
 type fakeAPI struct {
-	vms                 []sdk.VM
-	pools               []sdk.HostPool
-	firewalls           []sdk.Firewall
-	createErr           error
-	commitOnCreateError bool
-	createCalls         int
-	floatingIPs         []sdk.FloatingIP
-	lastVMRequest       sdk.CreateVMRequest
-	operations          []string
-	deleteVMErr         error
+	vms                             []sdk.VM
+	pools                           []sdk.HostPool
+	firewalls                       []sdk.Firewall
+	createErr                       error
+	commitOnCreateError             bool
+	createCalls                     int
+	floatingIPs                     []sdk.FloatingIP
+	lastVMRequest                   sdk.CreateVMRequest
+	operations                      []string
+	deleteVMErr                     error
+	network                         *sdk.Network
+	networkGetCalls                 int
+	networkMembershipAfter          int
+	createdNetworkUUID              string
+	networkErrors                   map[int]error
+	networkNilOnCalls               map[int]bool
+	networkGetHook                  func(int)
+	floatingIPCreateCalls           int
+	floatingIPAssignCalls           int
+	firewallAssignCalls             int
+	deleteVMCalls                   int
+	deleteVMContextCanceled         bool
+	deleteFloatingIPContextCanceled bool
 }
 
 func (f *fakeAPI) ListHostPools(context.Context, string) ([]sdk.HostPool, error) {
@@ -365,7 +614,28 @@ func (f *fakeAPI) ListHostPools(context.Context, string) ([]sdk.HostPool, error)
 	return append([]sdk.HostPool(nil), f.pools...), nil
 }
 func (f *fakeAPI) GetNetwork(context.Context, string, string) (*sdk.Network, error) {
-	return &sdk.Network{UUID: "network-1", Subnet: "10.0.0.0/24"}, nil
+	f.networkGetCalls++
+	if f.networkGetHook != nil {
+		f.networkGetHook(f.networkGetCalls)
+	}
+	if err := f.networkErrors[f.networkGetCalls]; err != nil {
+		return nil, err
+	}
+	if f.networkNilOnCalls[f.networkGetCalls] {
+		return nil, nil
+	}
+	if f.network != nil {
+		copy := *f.network
+		copy.VMUUIDs = append([]string(nil), f.network.VMUUIDs...)
+		return &copy, nil
+	}
+	network := &sdk.Network{UUID: "network-1", Subnet: "10.0.0.0/24"}
+	if f.networkGetCalls > f.networkMembershipAfter {
+		for _, vm := range f.vms {
+			network.VMUUIDs = append(network.VMUUIDs, vm.UUID)
+		}
+	}
+	return network, nil
 }
 func (f *fakeAPI) ListFirewalls(context.Context, string) ([]sdk.Firewall, error) {
 	if f.firewalls == nil {
@@ -374,6 +644,7 @@ func (f *fakeAPI) ListFirewalls(context.Context, string) ([]sdk.Firewall, error)
 	return append([]sdk.Firewall(nil), f.firewalls...), nil
 }
 func (f *fakeAPI) AssignFirewallToVM(_ context.Context, _ string, firewallUUID, vmUUID string) error {
+	f.firewallAssignCalls++
 	if f.firewalls == nil {
 		f.firewalls = []sdk.Firewall{secureFirewall()}
 	}
@@ -414,11 +685,13 @@ func (f *fakeAPI) ListFloatingIPs(_ context.Context, _ string, filters *sdk.Floa
 	return result, nil
 }
 func (f *fakeAPI) CreateFloatingIP(_ context.Context, _ string, request sdk.CreateFloatingIPRequest) (*sdk.FloatingIP, error) {
+	f.floatingIPCreateCalls++
 	address := sdk.FloatingIP{Name: request.Name, Address: "203.0.113.10", BillingAccountID: request.BillingAccountID, Enabled: true}
 	f.floatingIPs = append(f.floatingIPs, address)
 	return &address, nil
 }
 func (f *fakeAPI) AssignFloatingIP(_ context.Context, _ string, address, uuid, resourceType string) (*sdk.FloatingIP, error) {
+	f.floatingIPAssignCalls++
 	for i := range f.floatingIPs {
 		if f.floatingIPs[i].Address == address {
 			f.floatingIPs[i].AssignedTo = uuid
@@ -441,7 +714,10 @@ func (f *fakeAPI) UnassignFloatingIP(_ context.Context, _ string, address string
 	}
 	return nil, &sdk.APIError{StatusCode: 404}
 }
-func (f *fakeAPI) DeleteFloatingIP(_ context.Context, _ string, address string) error {
+func (f *fakeAPI) DeleteFloatingIP(ctx context.Context, _ string, address string) error {
+	if ctx.Err() != nil {
+		f.deleteFloatingIPContextCanceled = true
+	}
 	f.operations = append(f.operations, "delete-floating-ip")
 	for i := range f.floatingIPs {
 		if f.floatingIPs[i].Address == address {
@@ -481,8 +757,11 @@ func (f *fakeAPI) CreateVM(_ context.Context, _ string, request sdk.CreateVMRequ
 	vm := sdk.VM{
 		UUID: "11111111-1111-4111-8111-111111111111", Name: request.Name, Description: request.Description,
 		Status: "provisioning", VCPU: request.VCPU, MemoryMiB: request.MemoryMiB, OSName: request.OSName,
-		OSVersion: request.OSVersion, DesignatedPoolUUID: request.DesignatedPoolUUID,
+		OSVersion: request.OSVersion, DesignatedPoolUUID: request.DesignatedPoolUUID, NetworkUUID: request.NetworkUUID,
 		Storage: []sdk.VMStorage{{SizeGiB: request.DiskGiB, Primary: true}},
+	}
+	if f.createdNetworkUUID != "" {
+		vm.NetworkUUID = f.createdNetworkUUID
 	}
 	if f.createErr == nil || f.commitOnCreateError {
 		f.vms = append(f.vms, vm)
@@ -492,7 +771,11 @@ func (f *fakeAPI) CreateVM(_ context.Context, _ string, request sdk.CreateVMRequ
 	}
 	return &vm, nil
 }
-func (f *fakeAPI) DeleteVM(_ context.Context, _, uuid string) error {
+func (f *fakeAPI) DeleteVM(ctx context.Context, _, uuid string) error {
+	f.deleteVMCalls++
+	if ctx.Err() != nil {
+		f.deleteVMContextCanceled = true
+	}
 	f.operations = append(f.operations, "delete-vm")
 	if f.deleteVMErr != nil {
 		return f.deleteVMErr

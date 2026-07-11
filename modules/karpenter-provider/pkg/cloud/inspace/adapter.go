@@ -26,9 +26,13 @@ import (
 )
 
 const (
-	ownershipSchema  = "karpenter.inspace.cloud/v1"
-	defaultUsername  = "user"
-	passwordByteSize = 21
+	ownershipSchema                             = "karpenter.inspace.cloud/v1"
+	defaultUsername                             = "user"
+	passwordByteSize                            = 21
+	defaultNetworkAttachmentReadbackTimeout     = 60 * time.Second
+	defaultNetworkAttachmentRequestTimeout      = 10 * time.Second
+	defaultNetworkAttachmentReadbackMinInterval = 500 * time.Millisecond
+	defaultNetworkAttachmentReadbackMaxInterval = 5 * time.Second
 )
 
 type API interface {
@@ -51,8 +55,12 @@ type API interface {
 }
 
 type Adapter struct {
-	api              API
-	generatePassword func() (string, error)
+	api                               API
+	generatePassword                  func() (string, error)
+	networkAttachmentReadbackTimeout  time.Duration
+	networkAttachmentRequestTimeout   time.Duration
+	networkAttachmentReadbackMinDelay time.Duration
+	networkAttachmentReadbackMaxDelay time.Duration
 }
 
 func New(api API) (*Adapter, error) {
@@ -66,7 +74,14 @@ func newAdapter(api API, passwordGenerator func() (string, error)) (*Adapter, er
 	if passwordGenerator == nil {
 		return nil, fmt.Errorf("secure VM password generator is required")
 	}
-	return &Adapter{api: api, generatePassword: passwordGenerator}, nil
+	return &Adapter{
+		api:                               api,
+		generatePassword:                  passwordGenerator,
+		networkAttachmentReadbackTimeout:  defaultNetworkAttachmentReadbackTimeout,
+		networkAttachmentRequestTimeout:   defaultNetworkAttachmentRequestTimeout,
+		networkAttachmentReadbackMinDelay: defaultNetworkAttachmentReadbackMinInterval,
+		networkAttachmentReadbackMaxDelay: defaultNetworkAttachmentReadbackMaxInterval,
+	}, nil
 }
 
 type ownership struct {
@@ -87,12 +102,45 @@ type ownership struct {
 	PublicIPv4       string `json:"publicIPv4"`
 }
 
+func newOwnership(request cloudapi.CreateVMRequest, floatingIP sdk.FloatingIP) ownership {
+	return ownership{
+		Schema: ownershipSchema, Cluster: request.ClusterName, NodeClaim: request.NodeClaimName,
+		KeyHash: hashKey(request.IdempotencyKey), HostClass: request.HostClass, InstanceType: request.InstanceType,
+		RootDiskGiB: request.RootDiskGiB, SpecHash: request.SpecHash, BootstrapHash: request.BootstrapHash,
+		FirewallUUID: request.FirewallUUID, OSName: request.OSName, OSVersion: request.OSVersion,
+		BillingAccountID: request.BillingAccountID, FloatingIPName: floatingIP.Name, PublicIPv4: floatingIP.Address,
+	}
+}
+
 func (a *Adapter) CreateVM(ctx context.Context, request cloudapi.CreateVMRequest) (*cloudapi.VM, error) {
 	if err := validateCreateRequest(request); err != nil {
 		return nil, err
 	}
 	if err := a.ValidateNodeClass(ctx, request.Location, request.NetworkUUID, request.HostPoolUUID, request.FirewallUUID); err != nil {
 		return nil, fmt.Errorf("preflight NodeClass infrastructure: %w", err)
+	}
+	if existing, actual, err := a.findOwnedVM(ctx, request); err != nil {
+		return nil, err
+	} else if existing != nil {
+		expectedFloatingIP := sdk.FloatingIP{
+			Name: floatingIPName(request.ClusterName, request.NodeClaimName), Address: actual.PublicIPv4,
+			BillingAccountID: request.BillingAccountID,
+		}
+		expected := newOwnership(request, expectedFloatingIP)
+		if err := validateExisting(*existing, request, actual, expected); err != nil {
+			return nil, err
+		}
+		floatingIP, err := a.findFloatingIPByName(ctx, request.Location, expectedFloatingIP.Name, request.BillingAccountID)
+		if err != nil {
+			return nil, fmt.Errorf("finding floating IP recorded by owned VM %s: %w", existing.UUID, err)
+		}
+		if err := validateExistingFloatingIP(*floatingIP, actual, existing.UUID); err != nil {
+			return nil, err
+		}
+		if err := a.ensureProtection(ctx, request, existing.UUID, *floatingIP); err != nil {
+			return nil, fmt.Errorf("verifying protection for owned VM %s: %w", existing.UUID, err)
+		}
+		return fromSDK(existing, request.Location, actual), nil
 	}
 	floatingIP, floatingIPCreated, err := a.ensureFloatingIP(ctx, request)
 	if err != nil {
@@ -107,13 +155,7 @@ func (a *Adapter) CreateVM(ctx context.Context, request cloudapi.CreateVMRequest
 		return nil, errors.Join(fmt.Errorf("resolving K3s external node IP: %w", err), cleanupErr)
 	}
 	request.CloudInitJSON = resolvedCloudInit
-	record := ownership{
-		Schema: ownershipSchema, Cluster: request.ClusterName, NodeClaim: request.NodeClaimName,
-		KeyHash: hashKey(request.IdempotencyKey), HostClass: request.HostClass, InstanceType: request.InstanceType,
-		RootDiskGiB: request.RootDiskGiB, SpecHash: request.SpecHash, BootstrapHash: request.BootstrapHash,
-		FirewallUUID: request.FirewallUUID, OSName: request.OSName, OSVersion: request.OSVersion,
-		BillingAccountID: request.BillingAccountID, FloatingIPName: floatingIP.Name, PublicIPv4: floatingIP.Address,
-	}
+	record := newOwnership(request, *floatingIP)
 	description, err := json.Marshal(record)
 	if err != nil {
 		var cleanupErr error
@@ -124,7 +166,11 @@ func (a *Adapter) CreateVM(ctx context.Context, request cloudapi.CreateVMRequest
 	}
 
 	if existing, err := a.findCreate(ctx, request, record, floatingIP); err != nil {
-		return nil, err
+		var cleanupErr error
+		if floatingIPCreated {
+			cleanupErr = a.cleanupUnassignedFloatingIP(ctx, request.Location, *floatingIP)
+		}
+		return nil, errors.Join(err, cleanupErr)
 	} else if existing != nil {
 		return existing, nil
 	}
@@ -188,45 +234,61 @@ func (a *Adapter) CreateVM(ctx context.Context, request cloudapi.CreateVMRequest
 	created.OSName = request.OSName
 	created.OSVersion = request.OSVersion
 	created.DesignatedPoolUUID = request.HostPoolUUID
+	if created.NetworkUUID != "" && created.NetworkUUID != request.NetworkUUID {
+		return nil, a.cleanupLaunch(ctx, request.Location, request.FirewallUUID, created.UUID, *floatingIP,
+			fmt.Errorf("created VM is attached to network %q instead of %q", created.NetworkUUID, request.NetworkUUID))
+	}
 	if err := a.ensureProtection(ctx, request, created.UUID, *floatingIP); err != nil {
-		return nil, err
+		return nil, a.cleanupLaunch(ctx, request.Location, request.FirewallUUID, created.UUID, *floatingIP, err)
 	}
 	return fromSDK(created, request.Location, record), nil
 }
 
 func (a *Adapter) findCreate(ctx context.Context, request cloudapi.CreateVMRequest, expected ownership, floatingIP *sdk.FloatingIP) (*cloudapi.VM, error) {
+	vm, actual, err := a.findOwnedVM(ctx, request)
+	if err != nil || vm == nil {
+		return nil, err
+	}
+	if err := validateExisting(*vm, request, actual, expected); err != nil {
+		return nil, err
+	}
+	if err := validateExistingFloatingIP(*floatingIP, actual, vm.UUID); err != nil {
+		return nil, err
+	}
+	if err := a.ensureProtection(ctx, request, vm.UUID, *floatingIP); err != nil {
+		return nil, fmt.Errorf("verifying protection for owned VM %s: %w", vm.UUID, err)
+	}
+	return fromSDK(vm, request.Location, actual), nil
+}
+
+func (a *Adapter) findOwnedVM(ctx context.Context, request cloudapi.CreateVMRequest) (*sdk.VM, ownership, error) {
 	vms, err := a.api.ListVMs(ctx, request.Location)
 	if err != nil {
-		return nil, fmt.Errorf("listing VMs before create: %w", err)
+		return nil, ownership{}, fmt.Errorf("listing VMs before create: %w", err)
 	}
 	type match struct {
 		vm     sdk.VM
 		record ownership
 	}
 	var matches []match
+	keyHash := hashKey(request.IdempotencyKey)
 	for i := range vms {
 		record, managed := parseOwnership(vms[i].Description)
-		if managed && record.Cluster == expected.Cluster && record.NodeClaim == expected.NodeClaim && record.KeyHash == expected.KeyHash {
+		if managed && record.Cluster == request.ClusterName && record.NodeClaim == request.NodeClaimName && record.KeyHash == keyHash {
 			matches = append(matches, match{vm: vms[i], record: record})
 			continue
 		}
 		if vms[i].Name == request.Name {
-			return nil, fmt.Errorf("refusing create: VM name %q already exists without matching ownership", request.Name)
+			return nil, ownership{}, fmt.Errorf("refusing create: VM name %q already exists without matching ownership", request.Name)
 		}
 	}
 	if len(matches) > 1 {
-		return nil, fmt.Errorf("refusing create: %d VMs have the same Karpenter ownership identity", len(matches))
+		return nil, ownership{}, fmt.Errorf("refusing create: %d VMs have the same Karpenter ownership identity", len(matches))
 	}
 	if len(matches) == 1 {
-		if err := validateExisting(matches[0].vm, request, matches[0].record, expected); err != nil {
-			return nil, err
-		}
-		if err := a.ensureProtection(ctx, request, matches[0].vm.UUID, *floatingIP); err != nil {
-			return nil, err
-		}
-		return fromSDK(&matches[0].vm, request.Location, matches[0].record), nil
+		return &matches[0].vm, matches[0].record, nil
 	}
-	return nil, nil
+	return nil, ownership{}, nil
 }
 
 func (a *Adapter) GetVM(ctx context.Context, location, uuid, clusterName string) (*cloudapi.VM, error) {
@@ -350,6 +412,12 @@ func (a *Adapter) ValidateNodeClass(ctx context.Context, location, networkUUID, 
 	if err != nil {
 		return fmt.Errorf("getting InSpace network %s: %w", networkUUID, err)
 	}
+	if network == nil {
+		return fmt.Errorf("getting InSpace network %s: API returned no network", networkUUID)
+	}
+	if network.UUID != networkUUID {
+		return fmt.Errorf("network read-back UUID %q does not match %q", network.UUID, networkUUID)
+	}
 	networkPrefix, err := netip.ParsePrefix(network.Subnet)
 	if err != nil || !isRFC1918Prefix(networkPrefix) {
 		return fmt.Errorf("network %s subnet %q must be an RFC1918 IPv4 prefix", networkUUID, network.Subnet)
@@ -424,10 +492,23 @@ func validateGeneratedPassword(password string) error {
 }
 
 func validateExisting(vm sdk.VM, request cloudapi.CreateVMRequest, actual, expected ownership) error {
-	if actual != expected || vm.VCPU != request.VCPU || vm.MemoryMiB != request.MemoryGiB*1024 ||
+	if actual != expected || vm.Name != request.Name || vm.VCPU != request.VCPU || vm.MemoryMiB != request.MemoryGiB*1024 ||
 		(vm.OSName != "" && vm.OSName != request.OSName) || (vm.OSVersion != "" && vm.OSVersion != request.OSVersion) ||
-		(vm.DesignatedPoolUUID != "" && vm.DesignatedPoolUUID != request.HostPoolUUID) {
+		(vm.DesignatedPoolUUID != "" && vm.DesignatedPoolUUID != request.HostPoolUUID) ||
+		(vm.NetworkUUID != "" && vm.NetworkUUID != request.NetworkUUID) {
 		return fmt.Errorf("owned VM %s exists but launch parameters differ; refusing duplicate create", vm.UUID)
+	}
+	return nil
+}
+
+func validateExistingFloatingIP(floatingIP sdk.FloatingIP, record ownership, vmUUID string) error {
+	if floatingIP.Name != record.FloatingIPName || floatingIP.Address != record.PublicIPv4 ||
+		(floatingIP.BillingAccountID != 0 && floatingIP.BillingAccountID != record.BillingAccountID) {
+		return fmt.Errorf("%w: floating IP recorded by owned VM %s changed", cloudapi.ErrOwnershipMismatch, vmUUID)
+	}
+	if floatingIP.AssignedTo != "" &&
+		(floatingIP.AssignedTo != vmUUID || floatingIP.AssignedToResourceType != "virtual_machine") {
+		return fmt.Errorf("%w: floating IP %s is assigned to %s", cloudapi.ErrOwnershipMismatch, floatingIP.Address, floatingIP.AssignedTo)
 	}
 	return nil
 }
@@ -488,21 +569,70 @@ func (a *Adapter) ensureFloatingIP(ctx context.Context, request cloudapi.CreateV
 }
 
 func (a *Adapter) ensureProtection(ctx context.Context, request cloudapi.CreateVMRequest, vmUUID string, floatingIP sdk.FloatingIP) error {
-	network, err := a.api.GetNetwork(ctx, request.Location, request.NetworkUUID)
+	networkPrefix, err := a.ensureNetworkAttachment(ctx, request.Location, request.NetworkUUID, vmUUID)
 	if err != nil {
-		return a.cleanupLaunch(ctx, request.Location, request.FirewallUUID, vmUUID, floatingIP, fmt.Errorf("getting worker network: %w", err))
-	}
-	networkPrefix, err := netip.ParsePrefix(network.Subnet)
-	if err != nil || !isRFC1918Prefix(networkPrefix) {
-		return a.cleanupLaunch(ctx, request.Location, request.FirewallUUID, vmUUID, floatingIP, fmt.Errorf("worker network subnet %q is not RFC1918", network.Subnet))
+		return err
 	}
 	if err := a.ensureFirewall(ctx, request.Location, request.FirewallUUID, vmUUID, networkPrefix); err != nil {
-		return a.cleanupLaunch(ctx, request.Location, request.FirewallUUID, vmUUID, floatingIP, err)
+		return err
 	}
 	if err := a.ensureFloatingAssignment(ctx, request.Location, floatingIP, vmUUID); err != nil {
-		return a.cleanupLaunch(ctx, request.Location, request.FirewallUUID, vmUUID, floatingIP, err)
+		return err
 	}
 	return nil
+}
+
+func (a *Adapter) ensureNetworkAttachment(ctx context.Context, location, networkUUID, vmUUID string) (netip.Prefix, error) {
+	readbackCtx, cancel := context.WithTimeout(ctx, a.networkAttachmentReadbackTimeout)
+	defer cancel()
+	var lastObservation error
+	readbackDelay := a.networkAttachmentReadbackMinDelay
+	for {
+		requestCtx, requestCancel := context.WithTimeout(readbackCtx, a.networkAttachmentRequestTimeout)
+		network, err := a.api.GetNetwork(requestCtx, location, networkUUID)
+		requestCancel()
+		if readbackErr := readbackCtx.Err(); readbackErr != nil {
+			return netip.Prefix{}, fmt.Errorf(
+				"VM %s attachment to network %s read-back stopped: %w", vmUUID, networkUUID, readbackErr,
+			)
+		}
+		if err != nil {
+			lastObservation = fmt.Errorf("getting worker network: %w", err)
+			if !isRetryableReadback(readbackCtx, err) {
+				return netip.Prefix{}, lastObservation
+			}
+		} else if network == nil {
+			return netip.Prefix{}, fmt.Errorf("getting worker network: API returned no network")
+		} else {
+			if network.UUID != networkUUID {
+				return netip.Prefix{}, fmt.Errorf("worker network read-back UUID %q does not match %q", network.UUID, networkUUID)
+			}
+			networkPrefix, err := netip.ParsePrefix(network.Subnet)
+			if err != nil || !isRFC1918Prefix(networkPrefix) {
+				return netip.Prefix{}, fmt.Errorf("worker network subnet %q is not RFC1918", network.Subnet)
+			}
+			membershipCount := 0
+			for _, attachedVMUUID := range network.VMUUIDs {
+				if attachedVMUUID == vmUUID {
+					membershipCount++
+				}
+			}
+			if membershipCount == 1 {
+				return networkPrefix, nil
+			}
+			if membershipCount > 1 {
+				return netip.Prefix{}, fmt.Errorf("worker network %s contains VM %s %d times", networkUUID, vmUUID, membershipCount)
+			}
+			lastObservation = fmt.Errorf("VM %s attachment to network %s is not visible yet", vmUUID, networkUUID)
+		}
+		if err := waitForReadback(readbackCtx, readbackDelay); err != nil {
+			return netip.Prefix{}, fmt.Errorf(
+				"VM %s attachment to network %s was not visible before the read-back deadline: %w",
+				vmUUID, networkUUID, errors.Join(lastObservation, err),
+			)
+		}
+		readbackDelay = nextReadbackDelay(readbackDelay, a.networkAttachmentReadbackMaxDelay)
+	}
 }
 
 func (a *Adapter) ensureFirewall(ctx context.Context, location, firewallUUID, vmUUID string, networkPrefix netip.Prefix) error {
@@ -821,6 +951,40 @@ func isAmbiguousCreate(err error) bool {
 		return true
 	}
 	return apiErr.Retryable || apiErr.StatusCode == http.StatusRequestTimeout
+}
+
+func isRetryableReadback(ctx context.Context, err error) bool {
+	if ctx.Err() != nil {
+		return false
+	}
+	if errors.Is(err, sdk.ErrCrossOriginRedirect) || errors.Is(err, sdk.ErrMutationBlocked) {
+		return false
+	}
+	var apiErr *sdk.APIError
+	if errors.As(err, &apiErr) {
+		return apiErr.Retryable || apiErr.StatusCode == http.StatusRequestTimeout
+	}
+	// A non-HTTP error from a GET is a transport or response-read failure. It is
+	// safe to retry within the bounded window because reads do not mutate state.
+	return true
+}
+
+func nextReadbackDelay(current, maximum time.Duration) time.Duration {
+	if current >= maximum || current > maximum/2 {
+		return maximum
+	}
+	return current * 2
+}
+
+func waitForReadback(ctx context.Context, interval time.Duration) error {
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func waitReadback(ctx context.Context, attempt int) error {

@@ -50,6 +50,9 @@ func TestSmoke(t *testing.T) {
 	if created.UUID != fakeapi.VMUUID || created.VCPU != 4 || created.MemoryMiB != 8192 {
 		t.Fatalf("CreateVM() = %#v", created)
 	}
+	if created.NetworkUUID != "11111111-2222-3333-4444-555555555555" {
+		t.Fatalf("CreateVM() network UUID = %q", created.NetworkUUID)
+	}
 	got, err := client.GetVM(ctx, "bkk01", created.UUID)
 	if err != nil || got.UUID != created.UUID {
 		t.Fatalf("GetVM() = %#v, %v", got, err)

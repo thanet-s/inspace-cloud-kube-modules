@@ -25,6 +25,55 @@ func TestClusterE2ERendersWorkerSSHAccess(t *testing.T) {
 	}
 }
 
+func TestClusterE2EProvesWorkerVPCAttachment(t *testing.T) {
+	script := readClusterE2E(t)
+	vpcCheck := shellFunction(t, script, "owned_worker_vpc_ready", "karpenter_pods_absent")
+	for _, gate := range []string{
+		`validate_worker_records "$workers"`,
+		`[[ $(jq -r 'length' <<<"$workers") == 1 ]]`,
+		`worker_uuid=$(jq -er '.[0].uuid'`,
+		`worker_name=$(jq -er '.[0].name'`,
+		`[[ $worker_name == "$node_name" ]]`,
+		`api_get "network/network/$INSPACE_NETWORK_UUID"`,
+		`.uuid == $network`,
+		`(.vm_uuids | type) == "array"`,
+		`([.vm_uuids[] | select(. == $worker)] | length) == 1`,
+		`--arg provider "inspace://$INSPACE_LOCATION/$worker_uuid"`,
+		`.spec.providerID == $provider`,
+		`select(.type == "InternalIP")`,
+		`if length == 1 then .[0]`,
+		`ipaddress.ip_network(sys.argv[1], strict=False)`,
+		`address not in network`,
+	} {
+		if !strings.Contains(vpcCheck, gate) {
+			t.Fatalf("worker VPC proof is missing gate %q", gate)
+		}
+	}
+	workerPhaseStart := strings.Index(script, `cat >"$state_dir/karpenter.yaml"`)
+	if workerPhaseStart < 0 {
+		t.Fatal("cluster E2E is missing the rendered Karpenter resources")
+	}
+	assertOrdered(t, script[workerPhaseStart:],
+		`networkUUID: $INSPACE_NETWORK_UUID`,
+		`kubectl apply -f "$state_dir/trigger.yaml"`,
+		`kubectl -n default rollout status deployment/inspace-e2e-trigger`,
+		`kubectl wait --for=condition=Ready node -l "karpenter.sh/nodepool=$nodepool_name"`,
+		`jq -e '.items | length == 1 and all(.[]; any(.status.conditions[]; .type=="Ready" and .status=="True"))'`,
+		`kubectl get nodeclaims -l "karpenter.sh/nodepool=$nodepool_name"`,
+		`worker_node=$(kubectl get node -l "karpenter.sh/nodepool=$nodepool_name"`,
+		`persist_worker_ownership_from_cloud`,
+		`jq -e 'length == 1'`,
+		`wait_until 300 "Karpenter worker attachment to the configured private VPC"`,
+		`owned_worker_vpc_ready "$worker_node"`,
+		`worker_public_ip=$(owned_worker_public_ip)`,
+		`wait_until 600 "SSH on Karpenter worker"`,
+		`wait_until 600 "worker cloud-init, Ubuntu 24.04, and K3s agent"`,
+		`rollout status daemonset/inspace-csi-node`,
+		`echo "==> verify RWO CSI mount, persistence, and TCP public LoadBalancer"`,
+		`kubectl apply -f "$state_dir/workload.yaml"`,
+	)
+}
+
 func TestClusterE2EDeletesNodeClaimsBeforeNodePool(t *testing.T) {
 	script := readClusterE2E(t)
 	quiesce := shellFunction(t, script, "kubernetes_e2e_quiesce", "quiesce_kubernetes_e2e_owners_bounded")

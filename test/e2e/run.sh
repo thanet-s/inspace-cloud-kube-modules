@@ -466,6 +466,37 @@ owned_worker_public_ip() {
     <<<"$all_ips"
 }
 
+owned_worker_vpc_ready() {
+  local node_name=$1
+  local internal_ip network node subnet worker_name worker_uuid workers
+  workers=$(jq -c '.workerVMs // []' "$state_file") || return 1
+  validate_worker_records "$workers" || return 2
+  [[ $(jq -r 'length' <<<"$workers") == 1 ]] || return 2
+  worker_uuid=$(jq -er '.[0].uuid' <<<"$workers") || return 2
+  worker_name=$(jq -er '.[0].name' <<<"$workers") || return 2
+  [[ $worker_name == "$node_name" ]] || return 2
+  network=$(api_get "network/network/$INSPACE_NETWORK_UUID") || return 1
+  if ! jq -e --arg network "$INSPACE_NETWORK_UUID" --arg worker "$worker_uuid" '
+      .uuid == $network and (.vm_uuids | type) == "array" and
+      ([.vm_uuids[] | select(. == $worker)] | length) == 1' >/dev/null <<<"$network"; then
+    return 1
+  fi
+  subnet=$(jq -er '.subnet' <<<"$network") || return 1
+  node=$(kubectl --request-timeout=10s get node "$node_name" -o json) || return 1
+  jq -e --arg name "$worker_name" --arg provider "inspace://$INSPACE_LOCATION/$worker_uuid" '
+    .metadata.name == $name and .spec.providerID == $provider' >/dev/null <<<"$node" || return 2
+  internal_ip=$(jq -er '
+    [.status.addresses[]? | select(.type == "InternalIP") | .address] |
+    if length == 1 then .[0] else error("expected exactly one worker InternalIP") end' <<<"$node") || return 1
+  python3 - "$subnet" "$internal_ip" <<'PY'
+import ipaddress, sys
+network = ipaddress.ip_network(sys.argv[1], strict=False)
+address = ipaddress.ip_address(sys.argv[2])
+if network.version != 4 or not network.is_private or address.version != 4 or address not in network:
+    raise SystemExit("worker InternalIP is not in the configured private VPC subnet")
+PY
+}
+
 karpenter_pods_absent() {
   local deadline=${1:-$((SECONDS + 10))}
   local pods timeout_seconds
@@ -1637,6 +1668,8 @@ worker_node=$(kubectl get node -l "karpenter.sh/nodepool=$nodepool_name" -o json
 persist_worker_ownership_from_cloud
 workers=$(jq -c '.workerVMs // []' "$state_file")
 jq -e 'length == 1' >/dev/null <<<"$workers"
+wait_until 300 "Karpenter worker attachment to the configured private VPC" \
+  owned_worker_vpc_ready "$worker_node"
 worker_public_ip=$(owned_worker_public_ip)
 require_public_ipv4 "$worker_public_ip"
 state_update '.workerPublicIPv4=$ip' --arg ip "$worker_public_ip"
