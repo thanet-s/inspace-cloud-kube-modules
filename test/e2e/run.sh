@@ -67,6 +67,8 @@ known_hosts=$state_dir/known_hosts
 k3s_token_file=$state_dir/k3s-token
 controller_bin=$state_dir/inspace-cluster-controller
 controller_child_pid=""
+validated_worker_claim_json=""
+validated_worker_node_json=""
 bootstrap_timeout_seconds=2700
 raw_cleanup_attempts=90
 raw_cleanup_interval_seconds=10
@@ -79,17 +81,43 @@ chmod 600 "$known_hosts"
 
 api_base=${INSPACE_API_URL%/}/v1/$INSPACE_LOCATION
 api_get() {
-  curl --fail --silent --show-error --max-time 60 -H "apikey: $INSPACE_API_TOKEN" "$api_base/$1"
+  local path=$1
+  local deadline=${2:-}
+  local timeout_seconds=60
+  if [[ -n $deadline ]]; then
+    timeout_seconds=$(remaining_timeout_seconds "$deadline" 60) || return 124
+  fi
+  curl --fail --silent --show-error --max-time "$timeout_seconds" -H "apikey: $INSPACE_API_TOKEN" "$api_base/$path"
 }
 api_delete_json() {
-  curl --fail --silent --show-error --max-time 300 -X DELETE -H "apikey: $INSPACE_API_TOKEN" -H 'Content-Type: application/json' "$api_base/$1" >/dev/null
+  local path=$1
+  local deadline=${2:-}
+  local timeout_seconds=300
+  if [[ -n $deadline ]]; then
+    timeout_seconds=$(remaining_timeout_seconds "$deadline" 300) || return 124
+  fi
+  curl --fail --silent --show-error --max-time "$timeout_seconds" -X DELETE -H "apikey: $INSPACE_API_TOKEN" \
+    -H 'Content-Type: application/json' "$api_base/$path" >/dev/null
 }
 api_post_json() {
-  curl --fail --silent --show-error --max-time 300 -X POST -H "apikey: $INSPACE_API_TOKEN" -H 'Content-Type: application/json' "$api_base/$1" >/dev/null
+  local path=$1
+  local deadline=${2:-}
+  local timeout_seconds=300
+  if [[ -n $deadline ]]; then
+    timeout_seconds=$(remaining_timeout_seconds "$deadline" 300) || return 124
+  fi
+  curl --fail --silent --show-error --max-time "$timeout_seconds" -X POST -H "apikey: $INSPACE_API_TOKEN" \
+    -H 'Content-Type: application/json' "$api_base/$path" >/dev/null
 }
 api_delete_vm() {
-  curl --fail --silent --show-error --max-time 300 -X DELETE -H "apikey: $INSPACE_API_TOKEN" \
-    -H 'Content-Type: application/x-www-form-urlencoded' --data-urlencode "uuid=$1" "$api_base/user-resource/vm" >/dev/null
+  local uuid=$1
+  local deadline=${2:-}
+  local timeout_seconds=300
+  if [[ -n $deadline ]]; then
+    timeout_seconds=$(remaining_timeout_seconds "$deadline" 300) || return 124
+  fi
+  curl --fail --silent --show-error --max-time "$timeout_seconds" -X DELETE -H "apikey: $INSPACE_API_TOKEN" \
+    -H 'Content-Type: application/x-www-form-urlencoded' --data-urlencode "uuid=$uuid" "$api_base/user-resource/vm" >/dev/null
 }
 api_detach_disk() {
   curl --fail --silent --show-error --max-time 300 -X POST -H "apikey: $INSPACE_API_TOKEN" \
@@ -217,9 +245,17 @@ remaining_timeout_seconds() {
 wait_until_deadline() {
   local deadline=$1
   local description=$2
-  local sleep_seconds
+  local sleep_seconds status
   shift 2
-  until "$@"; do
+  while true; do
+    if "$@"; then
+      return 0
+    else
+      status=$?
+    fi
+    if (( status == 2 || status == 124 )); then
+      return "$status"
+    fi
     if (( SECONDS >= deadline )); then
       echo "timed out waiting for $description" >&2
       return 1
@@ -315,11 +351,16 @@ pv_and_attachments_absent() {
 
 owned_nodeclaims_absent() {
   local deadline=${1:-$((SECONDS + 10))}
-  local claims timeout_seconds
+  local claims timeout_seconds workers
+  workers=$(jq -c '.workerVMs // []' "$state_file") || return 1
+  validate_worker_records "$workers" || return 2
   timeout_seconds=$(remaining_timeout_seconds "$deadline" 10) || return 1
-  claims=$(kubectl --request-timeout="${timeout_seconds}s" get nodeclaims \
-    -l "karpenter.sh/nodepool=$nodepool_name" -o json 2>/dev/null) || return 1
-  jq -e '.items | length == 0' >/dev/null <<<"$claims"
+  claims=$(kubectl --request-timeout="${timeout_seconds}s" get nodeclaims -o json 2>/dev/null) || return 1
+  jq -e --arg pool "$nodepool_name" --arg prefix "$nodepool_name-" --argjson workers "$workers" '
+    [.items[] | . as $claim | select(
+      ((.metadata.name // "") | startswith($prefix)) or
+      .metadata.labels["karpenter.sh/nodepool"] == $pool or
+      any($workers[]; .name == $claim.metadata.name))] | length == 0' >/dev/null <<<"$claims"
 }
 
 persist_service_ownership_from_cluster() {
@@ -383,8 +424,9 @@ validate_worker_records() {
 }
 
 persist_worker_ownership_from_cloud() {
+  local deadline=${1:-}
   local all_vms matching invalid_workers discovered current combined merged fips
-  all_vms=$(api_get user-resource/vm/list) || return 1
+  all_vms=$(api_get user-resource/vm/list "$deadline") || return $?
   matching=$(jq -c --arg cluster "$cluster_name" --arg prefix "$nodepool_name-" '[.[] | . as $vm |
     ((((.description // "{}") | fromjson?) // {})) as $record |
     select($record.cluster==$cluster or (($vm.name // "") | startswith($prefix))) |
@@ -424,25 +466,361 @@ owned_worker_public_ip() {
     <<<"$all_ips"
 }
 
+karpenter_pods_absent() {
+  local deadline=${1:-$((SECONDS + 10))}
+  local pods timeout_seconds
+  timeout_seconds=$(remaining_timeout_seconds "$deadline" 10) || return 1
+  pods=$(kubectl --request-timeout="${timeout_seconds}s" -n kube-system get pods \
+    -l app.kubernetes.io/component=karpenter -o json 2>/dev/null) || return 1
+  jq -e '.items | length == 0' >/dev/null <<<"$pods"
+}
+
+owned_worker_node_absent() {
+  local deadline=${1:-$((SECONDS + 10))}
+  local workers nodes timeout_seconds
+  workers=$(jq -c '.workerVMs // []' "$state_file") || return 1
+  validate_worker_records "$workers" || return 2
+  timeout_seconds=$(remaining_timeout_seconds "$deadline" 10) || return 1
+  nodes=$(kubectl --request-timeout="${timeout_seconds}s" get nodes -o json) || return 1
+  jq -e --arg pool "$nodepool_name" --arg prefix "$nodepool_name-" --argjson workers "$workers" '
+    [.items[] | . as $node | select(
+      ((.metadata.name // "") | startswith($prefix)) or
+      .metadata.labels["karpenter.sh/nodepool"] == $pool or
+      any($workers[]; .name == $node.metadata.name))] | length == 0' >/dev/null <<<"$nodes"
+}
+
+owned_worker_nodeclaim_absent() {
+  local deadline=${1:-$((SECONDS + 10))}
+  local claim node_name timeout_seconds workers
+  workers=$(jq -c '.workerVMs // []' "$state_file") || return 1
+  validate_worker_records "$workers" || return 2
+  [[ $(jq -r 'length' <<<"$workers") == 1 ]] || return 2
+  node_name=$(jq -er '.[0].name' <<<"$workers") || return 2
+  timeout_seconds=$(remaining_timeout_seconds "$deadline" 10) || return 1
+  claim=$(kubectl --request-timeout="${timeout_seconds}s" get nodeclaim "$node_name" \
+    --ignore-not-found -o name) || return 1
+  [[ -z $claim ]]
+}
+
+worker_volume_attachments_absent() {
+  local deadline=$1
+  local node_name=$2
+  local attachments timeout_seconds
+  timeout_seconds=$(remaining_timeout_seconds "$deadline" 10) || return 1
+  attachments=$(kubectl --request-timeout="${timeout_seconds}s" get volumeattachments -o json) || return 1
+  jq -e --arg node "$node_name" 'all(.items[]; .spec.nodeName != $node)' >/dev/null <<<"$attachments"
+}
+
+forced_worker_cloud_snapshot() {
+  local deadline=$1
+  local all_ips all_vms snapshot workers
+  workers=$(jq -c '.workerVMs // []' "$state_file") || return 1
+  validate_worker_records "$workers" || return 2
+  [[ $(jq -r 'length' <<<"$workers") == 1 ]] || {
+    echo "refusing forced worker cleanup without exactly one persisted worker" >&2
+    return 2
+  }
+  all_vms=$(api_get user-resource/vm/list "$deadline") || return 1
+  all_ips=$(api_get network/ip_addresses "$deadline") || return 1
+  if ! snapshot=$(jq -ce -n \
+      --arg cluster "$cluster_name" --arg prefix "$nodepool_name-" \
+      --argjson workers "$workers" --argjson vms "$all_vms" --argjson ips "$all_ips" '
+      $workers[0] as $worker |
+      [$vms[] | . as $vm |
+        ((((.description // "{}") | fromjson?) // {})) as $record |
+        select($vm.uuid == $worker.uuid or $vm.name == $worker.name or
+          $record.cluster == $cluster or (($vm.name // "") | startswith($prefix))) |
+        {vm:$vm,record:$record}] as $ownedVMs |
+      [$ips[] | select(
+        ((.is_deleted // false) | not) and
+        (.name == $worker.fip or ((.name // "") | startswith($prefix)) or
+          (.assigned_to // "") == $worker.uuid))] as $ownedIPs |
+      if (($ownedVMs | length) <= 1) and
+          all($ownedVMs[];
+            .vm.uuid == $worker.uuid and .vm.name == $worker.name and
+            .record.schema == "karpenter.inspace.cloud/v1" and
+            .record.cluster == $cluster and .record.nodeClaim == $worker.name and
+            .record.floatingIPName == $worker.fip) and
+          (($ownedIPs | length) <= 1) and
+          all($ownedIPs[];
+            .name == $worker.fip and
+            ((.assigned_to // "") == "" or
+              ((.assigned_to == $worker.uuid) and
+               (.assigned_to_resource_type == "virtual_machine"))))
+      then {
+        worker:$worker,
+        vm:(if ($ownedVMs | length) == 1 then $ownedVMs[0].vm else null end),
+        floatingIP:(if ($ownedIPs | length) == 1 then $ownedIPs[0] else null end)
+      }
+      else error("cloud worker candidates do not equal the exact persisted worker")
+      end'); then
+    echo "refusing forced worker cleanup because cloud ownership is not exact" >&2
+    return 2
+  fi
+  printf '%s\n' "$snapshot"
+}
+
+forced_worker_resources_absent() {
+  local deadline=$1
+  local snapshot
+  snapshot=$(forced_worker_cloud_snapshot "$deadline") || return $?
+  jq -e '.vm == null and .floatingIP == null' >/dev/null <<<"$snapshot"
+}
+
+cleanup_forced_worker_resources_once() {
+  local deadline=$1
+  local address assigned snapshot uuid
+  snapshot=$(forced_worker_cloud_snapshot "$deadline") || return $?
+  if [[ $(jq -r '.floatingIP != null' <<<"$snapshot") == true ]]; then
+    address=$(jq -er '.floatingIP.address' <<<"$snapshot") || return 2
+    require_public_ipv4 "$address" || {
+      echo "refusing invalid forced-cleanup worker floating IPv4" >&2
+      return 2
+    }
+    assigned=$(jq -r '.floatingIP.assigned_to // ""' <<<"$snapshot") || return 1
+    if [[ -n $assigned ]]; then
+      api_post_json "network/ip_addresses/$address/unassign" "$deadline" || return 1
+    else
+      api_delete_json "network/ip_addresses/$address" "$deadline" || return 1
+    fi
+    return 0
+  fi
+  if [[ $(jq -r '.vm != null' <<<"$snapshot") == true ]]; then
+    uuid=$(jq -er '.vm.uuid' <<<"$snapshot") || return 2
+    api_delete_vm "$uuid" "$deadline" || return 1
+  fi
+  return 0
+}
+
+cleanup_forced_worker_resources() {
+  local deadline=$1
+  local absent_status attempt sleep_seconds status
+  local maximum_deadline=$((SECONDS + raw_cleanup_timeout_seconds))
+  if (( deadline > maximum_deadline )); then deadline=$maximum_deadline; fi
+  for attempt in $(seq 1 "$raw_cleanup_attempts"); do
+    if cleanup_forced_worker_resources_once "$deadline"; then
+      status=0
+    else
+      status=$?
+    fi
+    if (( status == 2 )); then
+      echo "refusing to retry exact worker cleanup after an ownership or safety mismatch" >&2
+      return 2
+    fi
+    if forced_worker_resources_absent "$deadline"; then
+      return 0
+    else
+      absent_status=$?
+    fi
+    if (( absent_status == 2 )); then
+      echo "refusing to retry exact worker cleanup after an ownership or safety mismatch" >&2
+      return 2
+    fi
+    if (( SECONDS >= deadline )); then break; fi
+    if (( attempt < raw_cleanup_attempts )); then
+      sleep_seconds=$(remaining_timeout_seconds "$deadline" "$raw_cleanup_interval_seconds") || break
+      sleep "$sleep_seconds"
+    fi
+  done
+  echo "exact Karpenter worker cleanup did not converge within the bounded retry window" >&2
+  return 1
+}
+
+validate_forced_worker_cleanup_state() {
+  local deadline=$1
+  local workers worker_name nodepool nodeclass claims nodes timeout_seconds
+  validated_worker_claim_json=""
+  validated_worker_node_json=""
+  e2e_pods_absent "$deadline" || return 1
+  pv_and_attachments_absent "$deadline" || return 1
+  persist_worker_ownership_from_cloud "$deadline" || return $?
+  workers=$(jq -c '.workerVMs // []' "$state_file") || return 1
+  validate_worker_records "$workers" || return 2
+  [[ $(jq -r 'length' <<<"$workers") == 1 ]] || {
+    echo "refusing forced worker cleanup without exactly one persisted worker" >&2
+    return 2
+  }
+  worker_name=$(jq -er '.[0].name' <<<"$workers") || return 2
+  worker_volume_attachments_absent "$deadline" "$worker_name" || return 1
+
+  timeout_seconds=$(remaining_timeout_seconds "$deadline" 10) || return 1
+  nodepool=$(kubectl --request-timeout="${timeout_seconds}s" get nodepool "$nodepool_name" -o json) || return 1
+  timeout_seconds=$(remaining_timeout_seconds "$deadline" 10) || return 1
+  nodeclass=$(kubectl --request-timeout="${timeout_seconds}s" get inspacenodeclass "$nodeclass_name" -o json) || return 1
+  timeout_seconds=$(remaining_timeout_seconds "$deadline" 10) || return 1
+  claims=$(kubectl --request-timeout="${timeout_seconds}s" get nodeclaims -o json) || return 1
+  timeout_seconds=$(remaining_timeout_seconds "$deadline" 10) || return 1
+  nodes=$(kubectl --request-timeout="${timeout_seconds}s" get nodes -o json) || return 1
+
+  if ! jq -e -n \
+      --arg location "$INSPACE_LOCATION" --arg prefix "$nodepool_name-" \
+      --arg pool "$nodepool_name" --arg class "$nodeclass_name" \
+      --arg cluster "$cluster_name" --arg billing "$INSPACE_BILLING_ACCOUNT_ID" \
+      --arg network "$INSPACE_NETWORK_UUID" \
+      --argjson workers "$workers" --argjson nodepool "$nodepool" \
+      --argjson nodeclass "$nodeclass" --argjson claims "$claims" --argjson nodes "$nodes" '
+      $workers[0] as $worker |
+      [$claims.items[] | select(
+        ((.metadata.name // "") | startswith($prefix)) or
+        .metadata.labels["karpenter.sh/nodepool"] == $pool)] as $ownedClaims |
+      $ownedClaims[0] as $claim |
+      [$nodes.items[] | select(
+        .metadata.name == $worker.name or
+        ((.metadata.name // "") | startswith($prefix)) or
+        .metadata.labels["karpenter.sh/nodepool"] == $pool)] as $ownedNodes |
+      ($nodepool.metadata.name == $pool) and
+      (($nodepool.metadata.deletionTimestamp // "") == "") and
+      ($nodeclass.metadata.name == $class) and
+      (($nodeclass.metadata.deletionTimestamp // "") == "") and
+      ($nodeclass.spec.clusterName == $cluster) and
+      (($nodeclass.spec.billingAccountID | tostring) == $billing) and
+      ($nodeclass.spec.location == $location) and
+      ($nodeclass.spec.networkUUID == $network) and
+      ($nodepool.spec.template.spec.nodeClassRef.group == "karpenter.inspace.cloud") and
+      ($nodepool.spec.template.spec.nodeClassRef.kind == "InSpaceNodeClass") and
+      ($nodepool.spec.template.spec.nodeClassRef.name == $class) and
+      (($ownedClaims | length) == 1) and
+      ($claim.metadata.name == $worker.name) and
+      ($claim.metadata.deletionTimestamp != null) and
+      (($claim.metadata.finalizers // []) == ["karpenter.sh/termination"]) and
+      ($claim.status.providerID == ("inspace://" + $location + "/" + $worker.uuid)) and
+      ($claim.status.nodeName == $worker.name) and
+      ($claim.spec.nodeClassRef.group == "karpenter.inspace.cloud") and
+      ($claim.spec.nodeClassRef.kind == "InSpaceNodeClass") and
+      ($claim.spec.nodeClassRef.name == $class) and
+      ($claim.metadata.labels["karpenter.sh/nodepool"] == $pool) and
+      any($claim.metadata.ownerReferences[]?;
+        .apiVersion == "karpenter.sh/v1" and .kind == "NodePool" and
+        .name == $pool and .uid == $nodepool.metadata.uid) and
+      any($claim.status.conditions[]?; .type == "Drained" and .status == "True") and
+      any($claim.status.conditions[]?; .type == "VolumesDetached" and .status == "True") and
+      (($ownedNodes | length) <= 1) and
+      (($ownedNodes | length) == 0 or (
+        ($ownedNodes[0].metadata.name == $worker.name) and
+        ($ownedNodes[0].metadata.deletionTimestamp != null) and
+        (($ownedNodes[0].metadata.finalizers // []) == ["karpenter.sh/termination"]) and
+        any($ownedNodes[0].metadata.ownerReferences[]?;
+          .apiVersion == "karpenter.sh/v1" and .kind == "NodeClaim" and
+          .name == $claim.metadata.name and .uid == $claim.metadata.uid)))' >/dev/null; then
+    echo "refusing forced worker cleanup because Kubernetes ownership or drain state is not exact" >&2
+    return 2
+  fi
+  validated_worker_claim_json=$(jq -ce --arg name "$worker_name" '
+    [.items[] | select(.metadata.name == $name)] |
+    if length == 1 then .[0] else error("validated NodeClaim snapshot is no longer exact") end' \
+    <<<"$claims") || return 2
+  validated_worker_node_json=$(jq -c --arg name "$worker_name" '
+    [.items[] | select(.metadata.name == $name)] |
+    if length == 0 then empty
+    elif length == 1 then .[0]
+    else error("validated Node snapshot is no longer exact")
+    end' <<<"$nodes") || return 2
+}
+
+force_finalize_drained_owned_worker() {
+  local deadline=$1
+  local claim_json claim_patch deployment deployment_rv node_json node_patch replicas workers worker_name timeout_seconds
+  validate_forced_worker_cleanup_state "$deadline" || return $?
+
+  timeout_seconds=$(remaining_timeout_seconds "$deadline" 10) || return 124
+  deployment=$(kubectl --request-timeout="${timeout_seconds}s" -n kube-system get deployment inspace-karpenter -o json) || return 1
+  if ! jq -e '
+      .metadata.name == "inspace-karpenter" and
+      .metadata.namespace == "kube-system" and
+      .metadata.deletionTimestamp == null and
+      .metadata.labels["app.kubernetes.io/managed-by"] == "Helm" and
+      .metadata.labels["app.kubernetes.io/instance"] == "inspace" and
+      .metadata.labels["app.kubernetes.io/component"] == "karpenter" and
+      .spec.selector.matchLabels["app.kubernetes.io/name"] == "inspace-karpenter" and
+      .spec.selector.matchLabels["app.kubernetes.io/component"] == "karpenter" and
+      .spec.template.metadata.labels["app.kubernetes.io/name"] == "inspace-karpenter" and
+      .spec.template.metadata.labels["app.kubernetes.io/component"] == "karpenter" and
+      (.spec.replicas == 0 or .spec.replicas == 1)' >/dev/null <<<"$deployment"; then
+    echo "refusing to scale a Karpenter Deployment whose identity is not exact" >&2
+    return 2
+  fi
+  replicas=$(jq -er '.spec.replicas' <<<"$deployment") || return 1
+  deployment_rv=$(jq -er '.metadata.resourceVersion' <<<"$deployment") || return 1
+  if [[ $replicas != 0 ]]; then
+    [[ $replicas == 1 ]] || {
+      echo "refusing to scale unexpected Karpenter replica count $replicas" >&2
+      return 2
+    }
+    timeout_seconds=$(remaining_timeout_seconds "$deadline" 30) || return 124
+    kubectl --request-timeout="${timeout_seconds}s" -n kube-system scale deployment inspace-karpenter \
+      --current-replicas="$replicas" --resource-version="$deployment_rv" --replicas=0 >/dev/null || return 1
+  fi
+  wait_until_deadline "$deadline" "Karpenter controller pods to stop" \
+    karpenter_pods_absent "$deadline" || return 1
+
+  # Close the race with the controller before using the local, ownership-bound
+  # fallback. All safety predicates are re-read after its Pods are gone.
+  validate_forced_worker_cleanup_state "$deadline" || return $?
+  cleanup_forced_worker_resources "$deadline" || return $?
+  (( SECONDS < deadline )) || return 124
+  forced_worker_resources_absent "$deadline" || return $?
+
+  # Bind every finalizer mutation to a post-cloud-cleanup Kubernetes snapshot.
+  # UID and resourceVersion JSON Patch tests make replacement or concurrent
+  # mutation fail atomically instead of finalizing a different object.
+  validate_forced_worker_cleanup_state "$deadline" || return $?
+
+  workers=$(jq -c '.workerVMs // []' "$state_file") || return 1
+  [[ $(jq -r 'length' <<<"$workers") == 1 ]] || return 2
+  worker_name=$(jq -er '.[0].name' <<<"$workers") || return 2
+  timeout_seconds=$(remaining_timeout_seconds "$deadline" 10) || return 124
+  node_json=$validated_worker_node_json
+  if [[ -n $node_json ]]; then
+    node_patch=$(jq -ce '[
+      {op:"test",path:"/metadata/uid",value:.metadata.uid},
+      {op:"test",path:"/metadata/resourceVersion",value:.metadata.resourceVersion},
+      {op:"test",path:"/metadata/deletionTimestamp",value:.metadata.deletionTimestamp},
+      {op:"test",path:"/metadata/finalizers",value:["karpenter.sh/termination"]},
+      {op:"remove",path:"/metadata/finalizers/0"}
+    ]' <<<"$node_json") || return 2
+    timeout_seconds=$(remaining_timeout_seconds "$deadline" 10) || return 124
+    kubectl --request-timeout="${timeout_seconds}s" patch node "$worker_name" \
+      --type=json -p="$node_patch" >/dev/null || return 2
+    wait_until_deadline "$deadline" "owned Karpenter Node to terminate" \
+      owned_worker_node_absent "$deadline" || return $?
+  fi
+
+  validate_forced_worker_cleanup_state "$deadline" || return $?
+  claim_json=$validated_worker_claim_json
+  claim_patch=$(jq -ce '[
+    {op:"test",path:"/metadata/uid",value:.metadata.uid},
+    {op:"test",path:"/metadata/resourceVersion",value:.metadata.resourceVersion},
+    {op:"test",path:"/metadata/deletionTimestamp",value:.metadata.deletionTimestamp},
+    {op:"test",path:"/metadata/finalizers",value:["karpenter.sh/termination"]},
+    {op:"remove",path:"/metadata/finalizers/0"}
+  ]' <<<"$claim_json") || return 2
+  timeout_seconds=$(remaining_timeout_seconds "$deadline" 10) || return 124
+  kubectl --request-timeout="${timeout_seconds}s" patch nodeclaim "$worker_name" \
+    --type=json -p="$claim_patch" >/dev/null || return 2
+  wait_until_deadline "$deadline" "owned Karpenter NodeClaim to terminate" \
+    owned_worker_nodeclaim_absent "$deadline" || return $?
+  owned_nodeclaims_absent "$deadline" || return $?
+}
+
 # Quiesce every Kubernetes owner before removing controllers or falling back
 # to raw cloud cleanup. This prevents CSI detach/delete and Karpenter deletion
 # from racing mounted pods or recreating resources after the audit.
 kubernetes_e2e_quiesce() {
   local deadline=$1
-  local crd_name discovered_pv pvc_json timeout_seconds
+  local claim_grace_deadline claim_wait_status crd_name discovered_pv pvc_json timeout_seconds
   (( SECONDS < deadline )) || return 124
   persist_service_ownership_from_cluster "$deadline" || return 1
   (( SECONDS < deadline )) || return 124
   persist_pvc_ownership_from_cluster "$deadline" || return 1
   (( SECONDS < deadline )) || return 124
-  persist_worker_ownership_from_cloud || return 1
+  persist_worker_ownership_from_cloud "$deadline" || return $?
   timeout_seconds=$(remaining_timeout_seconds "$deadline" 600) || return 124
   kubectl --request-timeout="${timeout_seconds}s" -n default delete service inspace-e2e-web \
     --ignore-not-found --wait=true --timeout="${timeout_seconds}s" >/dev/null || return 1
   timeout_seconds=$(remaining_timeout_seconds "$deadline" 600) || return 124
   kubectl --request-timeout="${timeout_seconds}s" -n default delete deployment inspace-e2e-web inspace-e2e-trigger \
     --ignore-not-found --wait=true --timeout="${timeout_seconds}s" >/dev/null || return 1
-  wait_until_deadline "$deadline" "E2E workload pods to terminate" e2e_pods_absent "$deadline" || return 1
+  wait_until_deadline "$deadline" "E2E workload pods to terminate" e2e_pods_absent "$deadline" || return $?
   timeout_seconds=$(remaining_timeout_seconds "$deadline" 10) || return 124
   pvc_json=$(kubectl --request-timeout="${timeout_seconds}s" -n default get pvc inspace-e2e-rwo \
     --ignore-not-found -o json) || return 1
@@ -456,19 +834,44 @@ kubernetes_e2e_quiesce() {
   kubectl --request-timeout="${timeout_seconds}s" -n default delete pvc inspace-e2e-rwo \
     --ignore-not-found --wait=true --timeout="${timeout_seconds}s" >/dev/null || return 1
   wait_until_deadline "$deadline" "E2E PV and VolumeAttachment deletion" \
-    pv_and_attachments_absent "$deadline" || return 1
+    pv_and_attachments_absent "$deadline" || return $?
 
   (( SECONDS < deadline )) || return 124
-  persist_worker_ownership_from_cloud || return 1
+  persist_worker_ownership_from_cloud "$deadline" || return $?
+  timeout_seconds=$(remaining_timeout_seconds "$deadline" 10) || return 124
+  crd_name=$(kubectl --request-timeout="${timeout_seconds}s" get crd nodeclaims.karpenter.sh \
+    --ignore-not-found -o name) || return 1
+  if [[ -n $crd_name ]]; then
+    timeout_seconds=$(remaining_timeout_seconds "$deadline" 30) || return 124
+    # Keep the NodePool available while Karpenter drains each NodeClaim. Its
+    # state controllers resolve NodeClaim labels back to the NodePool during
+    # termination; deleting the parent first can stall finalization.
+    kubectl --request-timeout="${timeout_seconds}s" delete nodeclaims \
+      -l "karpenter.sh/nodepool=$nodepool_name" \
+      --ignore-not-found --wait=false --timeout="${timeout_seconds}s" >/dev/null || return 1
+    claim_grace_deadline=$((SECONDS + 300))
+    if (( claim_grace_deadline > deadline )); then claim_grace_deadline=$deadline; fi
+    if wait_until_deadline "$claim_grace_deadline" "normal Karpenter NodeClaim termination" \
+        owned_nodeclaims_absent "$claim_grace_deadline"; then
+      :
+    else
+      claim_wait_status=$?
+      if (( claim_wait_status == 2 || claim_wait_status == 124 )); then
+        return "$claim_wait_status"
+      fi
+      echo "normal Karpenter deletion stalled; entering guarded E2E-only worker fallback" >&2
+      force_finalize_drained_owned_worker "$deadline" || return $?
+    fi
+    wait_until_deadline "$deadline" "owned Karpenter Node to terminate" \
+      owned_worker_node_absent "$deadline" || return $?
+  fi
   timeout_seconds=$(remaining_timeout_seconds "$deadline" 10) || return 124
   crd_name=$(kubectl --request-timeout="${timeout_seconds}s" get crd nodepools.karpenter.sh \
     --ignore-not-found -o name) || return 1
   if [[ -n $crd_name ]]; then
-    timeout_seconds=$(remaining_timeout_seconds "$deadline" 900) || return 124
+    timeout_seconds=$(remaining_timeout_seconds "$deadline" 300) || return 124
     kubectl --request-timeout="${timeout_seconds}s" delete nodepool "$nodepool_name" \
       --ignore-not-found --wait=true --timeout="${timeout_seconds}s" >/dev/null || return 1
-    wait_until_deadline "$deadline" "owned Karpenter NodeClaims to terminate" \
-      owned_nodeclaims_absent "$deadline" || return 1
   fi
   timeout_seconds=$(remaining_timeout_seconds "$deadline" 10) || return 124
   crd_name=$(kubectl --request-timeout="${timeout_seconds}s" get crd \
@@ -490,7 +893,7 @@ quiesce_kubernetes_e2e_owners_bounded() {
     else
       status=$?
     fi
-    if (( status == 124 || SECONDS >= deadline )); then
+    if (( status == 2 || status == 124 || SECONDS >= deadline )); then
       break
     fi
     sleep_seconds=$(remaining_timeout_seconds "$deadline" 10) || break
