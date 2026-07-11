@@ -11,6 +11,13 @@ updates:
     directory: /modules/cloud-provider
     schedule:
       interval: weekly
+    ignore:
+      # Keep the CCM on the Kubernetes minor used by the K3s control plane.
+      # Patch updates within the current minor remain enabled.
+      - dependency-name: "k8s.io/*"
+        update-types:
+          - version-update:semver-minor
+          - version-update:semver-major
     groups:
       go-dependencies:
         patterns: ["*"]
@@ -25,6 +32,17 @@ updates:
     directory: /modules/karpenter-provider
     schedule:
       interval: weekly
+    ignore:
+      # Upgrade the Kubernetes and controller-runtime minor lines together as
+      # an explicit platform change, not as an independent dependency bump.
+      - dependency-name: "k8s.io/*"
+        update-types:
+          - version-update:semver-minor
+          - version-update:semver-major
+      - dependency-name: sigs.k8s.io/controller-runtime
+        update-types:
+          - version-update:semver-minor
+          - version-update:semver-major
     groups:
       go-dependencies:
         patterns: ["*"]
