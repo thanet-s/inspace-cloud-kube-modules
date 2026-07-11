@@ -95,7 +95,7 @@ fi
 export INSPACE_FIREWALL_UUID="$firewall_uuid"
 export INSPACE_TEST_FIREWALL_UUID="$firewall_uuid"
 
-for module in modules/cloud-provider-inspace modules/inspace-csi-driver modules/karpenter-provider-inspace; do
+for module in modules/cloud-provider modules/csi-driver modules/karpenter-provider; do
   echo "==> live-test $module"
   "$make_command" -C "$workspace/$module" live-test
 done

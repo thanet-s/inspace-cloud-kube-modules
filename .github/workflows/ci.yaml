@@ -21,12 +21,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - module: cloud-provider-inspace
-            directory: modules/cloud-provider-inspace
-          - module: inspace-csi-driver
-            directory: modules/inspace-csi-driver
-          - module: karpenter-provider-inspace
-            directory: modules/karpenter-provider-inspace
+          - module: cloud-provider
+            directory: modules/cloud-provider
+          - module: csi-driver
+            directory: modules/csi-driver
+          - module: karpenter-provider
+            directory: modules/karpenter-provider
     steps:
       - name: Check out source
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -81,14 +81,14 @@ jobs:
       matrix:
         include:
           - image: inspace-cloud-controller-manager
-            context: modules/cloud-provider-inspace
-            dockerfile: modules/cloud-provider-inspace/Dockerfile
+            context: modules/cloud-provider
+            dockerfile: modules/cloud-provider/Dockerfile
           - image: inspace-csi-driver
             context: .
-            dockerfile: modules/inspace-csi-driver/Dockerfile
+            dockerfile: modules/csi-driver/Dockerfile
           - image: karpenter-provider-inspace
             context: .
-            dockerfile: modules/karpenter-provider-inspace/Dockerfile
+            dockerfile: modules/karpenter-provider/Dockerfile
     steps:
       - name: Check out source
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -124,9 +124,9 @@ jobs:
         run: |
           set -euo pipefail
           for directory in \
-            modules/cloud-provider-inspace \
-            modules/inspace-csi-driver \
-            modules/karpenter-provider-inspace \
+            modules/cloud-provider \
+            modules/csi-driver \
+            modules/karpenter-provider \
             charts/inspace-cloud-kube-modules \
             charts/inspace-cloud-kube-modules-crds; do
             cmp LICENSE "$directory/LICENSE"
@@ -138,9 +138,9 @@ jobs:
           f65f0f3edd3afe96dc2b6b4fa648982dab557af077d7ab22e6ec26207b6465ed  charts/inspace-cloud-kube-modules-crds/templates/karpenter.sh_nodeoverlays.yaml
           62990043212a239704c0195bbd37abd0fddad90a586f5b37dfb403a0a0aefe1e  charts/inspace-cloud-kube-modules-crds/templates/karpenter.sh_nodepools.yaml
           EOF
-          cmp modules/cloud-provider-inspace/config/crd/bases/infrastructure.inspace.cloud_inspaceclusters.yaml \
+          cmp modules/cloud-provider/config/crd/bases/infrastructure.inspace.cloud_inspaceclusters.yaml \
             charts/inspace-cloud-kube-modules-crds/templates/infrastructure.inspace.cloud_inspaceclusters.yaml
-          cmp modules/karpenter-provider-inspace/config/crd/bases/karpenter.inspace.cloud_inspacenodeclasses.yaml \
+          cmp modules/karpenter-provider/config/crd/bases/karpenter.inspace.cloud_inspacenodeclasses.yaml \
             charts/inspace-cloud-kube-modules-crds/templates/karpenter.inspace.cloud_inspacenodeclasses.yaml
           crd_count="$(grep -h -c '^kind: CustomResourceDefinition$' charts/inspace-cloud-kube-modules-crds/templates/*.yaml \
             | awk '{ total += $1 } END { print total }')"

@@ -494,7 +494,7 @@ for image in inspace-cloud-controller-manager inspace-csi-driver karpenter-provi
 done
 
 echo "==> build local bootstrap controller"
-(cd modules/cloud-provider-inspace && GOWORK=off go build -trimpath -o "$controller_bin" ./cmd/inspace-cluster-controller)
+(cd modules/cloud-provider && GOWORK=off go build -trimpath -o "$controller_bin" ./cmd/inspace-cluster-controller)
 
 baseline=$(owned_audit_json)
 if [[ $(jq -r '.count' <<<"$baseline") != 0 ]]; then

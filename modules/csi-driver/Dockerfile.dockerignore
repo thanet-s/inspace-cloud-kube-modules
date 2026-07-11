@@ -1,0 +1,12 @@
+**
+!modules
+!modules/cloud-provider
+!modules/cloud-provider/**
+!modules/csi-driver
+!modules/csi-driver/**
+**/.git
+**/.DS_Store
+**/.env
+**/.env.*
+**/bin
+**/dist

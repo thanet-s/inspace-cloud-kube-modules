@@ -2,7 +2,7 @@
 
 /.github/ @thanet-s
 /charts/ @thanet-s
-/modules/cloud-provider-inspace/ @thanet-s
-/modules/inspace-csi-driver/ @thanet-s
-/modules/karpenter-provider-inspace/ @thanet-s
+/modules/cloud-provider/ @thanet-s
+/modules/csi-driver/ @thanet-s
+/modules/karpenter-provider/ @thanet-s
 /test/e2e/ @thanet-s

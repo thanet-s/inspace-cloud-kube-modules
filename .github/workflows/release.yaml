@@ -75,18 +75,18 @@ jobs:
           - image: inspace-cloud-controller-manager
             title: InSpace Cloud Controller Manager
             description: External Kubernetes cloud controller manager for InSpace Cloud
-            context: modules/cloud-provider-inspace
-            dockerfile: modules/cloud-provider-inspace/Dockerfile
+            context: modules/cloud-provider
+            dockerfile: modules/cloud-provider/Dockerfile
           - image: inspace-csi-driver
             title: InSpace CSI Driver
             description: Kubernetes RWO block storage CSI driver for InSpace Cloud
             context: .
-            dockerfile: modules/inspace-csi-driver/Dockerfile
+            dockerfile: modules/csi-driver/Dockerfile
           - image: karpenter-provider-inspace
             title: Karpenter Provider for InSpace Cloud
             description: Karpenter provider for elastic K3s workers on InSpace Cloud
             context: .
-            dockerfile: modules/karpenter-provider-inspace/Dockerfile
+            dockerfile: modules/karpenter-provider/Dockerfile
     steps:
       - name: Check out source
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -213,8 +213,33 @@ jobs:
             --version "$VERSION" \
             --app-version "$VERSION" \
             --destination dist
-          for package in dist/*.tgz; do
-            helm push "$package" "oci://ghcr.io/$owner/charts"
+          charts=(
+            "inspace-cloud-kube-modules-crds|dist/inspace-cloud-kube-modules-crds-$VERSION.tgz"
+            "inspace-cloud-kube-modules|dist/inspace-cloud-kube-modules-$VERSION.tgz"
+          )
+          for chart in "${charts[@]}"; do
+            chart_name="${chart%%|*}"
+            package="${chart#*|}"
+            published=false
+            for attempt in $(seq 1 6); do
+              if helm push "$package" "oci://ghcr.io/$owner/charts"; then
+                for read_attempt in $(seq 1 6); do
+                  if helm show chart "oci://ghcr.io/$owner/charts/$chart_name" \
+                    --version "$VERSION" >/dev/null; then
+                    published=true
+                    break
+                  fi
+                  sleep $((read_attempt * 5))
+                done
+              fi
+              [[ "$published" == true ]] && break
+              echo "OCI registry has not converged for $chart_name (attempt $attempt/6)" >&2
+              sleep $((attempt * 5))
+            done
+            if [[ "$published" != true ]]; then
+              echo "failed to publish and read back $chart_name:$VERSION" >&2
+              exit 1
+            fi
           done
           (
             cd dist

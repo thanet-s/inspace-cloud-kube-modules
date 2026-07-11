@@ -4,9 +4,9 @@ This monorepo contains three independently buildable Go modules:
 
 | Module | Responsibility |
 | --- | --- |
-| `modules/cloud-provider-inspace` | Shared InSpace API client, external CCM, and fixed K3s control-plane/bootstrap controller |
-| `modules/inspace-csi-driver` | RWO-only CSI controller and node plugin |
-| `modules/karpenter-provider-inspace` | Karpenter `InSpaceNodeClass`, instance catalog, and elastic K3s worker lifecycle |
+| `modules/cloud-provider` | Shared InSpace API client, external CCM, and fixed K3s control-plane/bootstrap controller |
+| `modules/csi-driver` | RWO-only CSI controller and node plugin |
+| `modules/karpenter-provider` | Karpenter `InSpaceNodeClass`, instance catalog, and elastic K3s worker lifecycle |
 
 The repository root owns all source, tests, manifests, and E2E tooling.
 `go.work` links the three modules for local development while their separate
