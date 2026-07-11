@@ -9,13 +9,14 @@ permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.ref }}
+  # All releases can update shared major, minor, and latest tags.
+  group: release
   cancel-in-progress: false
 
 jobs:
   validate:
     name: Validate tag
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-slim
     outputs:
       version: ${{ steps.semver.outputs.version }}
       prerelease: ${{ steps.semver.outputs.prerelease }}
@@ -39,6 +40,26 @@ jobs:
             echo "prerelease=false" >>"$GITHUB_OUTPUT"
           fi
 
+      - name: Refuse to republish a completed release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          error_file="$(mktemp)"
+          if draft="$(gh api "repos/$GH_REPO/releases/tags/$TAG" --jq .draft 2>"$error_file")"; then
+            if [[ "$draft" != "true" ]]; then
+              echo "Release $TAG already exists and is not a recoverable draft" >&2
+              exit 1
+            fi
+          elif ! grep -q 'HTTP 404' "$error_file"; then
+            cat "$error_file" >&2
+            echo "Could not determine whether release $TAG already exists" >&2
+            exit 1
+          fi
+
       - name: Check out source history
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -58,31 +79,63 @@ jobs:
     name: Release quality gate
     uses: ./.github/workflows/ci.yaml
 
-  images:
-    name: Image / ${{ matrix.image }}
+  image-platforms:
+    name: Native image / ${{ matrix.image }} / ${{ matrix.arch }}
     needs: [validate, quality]
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
       packages: write
-      id-token: write
-      attestations: write
       artifact-metadata: write
     strategy:
       fail-fast: false
+      # GitHub-hosted Ubuntu 26.04 runners are currently public preview.
       matrix:
         include:
           - image: inspace-cloud-controller-manager
+            arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-26.04
+            title: InSpace Cloud Controller Manager
+            description: External Kubernetes cloud controller manager for InSpace Cloud
+            context: modules/cloud-provider
+            dockerfile: modules/cloud-provider/Dockerfile
+          - image: inspace-cloud-controller-manager
+            arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-26.04-arm
             title: InSpace Cloud Controller Manager
             description: External Kubernetes cloud controller manager for InSpace Cloud
             context: modules/cloud-provider
             dockerfile: modules/cloud-provider/Dockerfile
           - image: inspace-csi-driver
+            arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-26.04
+            title: InSpace CSI Driver
+            description: Kubernetes RWO block storage CSI driver for InSpace Cloud
+            context: .
+            dockerfile: modules/csi-driver/Dockerfile
+          - image: inspace-csi-driver
+            arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-26.04-arm
             title: InSpace CSI Driver
             description: Kubernetes RWO block storage CSI driver for InSpace Cloud
             context: .
             dockerfile: modules/csi-driver/Dockerfile
           - image: karpenter-provider-inspace
+            arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-26.04
+            title: Karpenter Provider for InSpace Cloud
+            description: Karpenter provider for elastic K3s workers on InSpace Cloud
+            context: .
+            dockerfile: modules/karpenter-provider/Dockerfile
+          - image: karpenter-provider-inspace
+            arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-26.04-arm
             title: Karpenter Provider for InSpace Cloud
             description: Karpenter provider for elastic K3s workers on InSpace Cloud
             context: .
@@ -90,9 +143,6 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
@@ -124,32 +174,228 @@ jobs:
             org.opencontainers.image.version=${{ needs.validate.outputs.version }}
             org.opencontainers.image.revision=${{ github.sha }}
 
-      - name: Build and push multi-platform image
-        id: push
+      - name: Build and push ${{ matrix.platform }} image by digest
+        id: build
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: ${{ matrix.context }}
           file: ${{ matrix.dockerfile }}
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
+          platforms: ${{ matrix.platform }}
           labels: ${{ steps.meta.outputs.labels }}
           sbom: true
           provenance: false
-          cache-from: type=gha,scope=${{ matrix.image }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.image }}
+          outputs: type=image,name=ghcr.io/${{ github.repository_owner }}/${{ matrix.image }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ matrix.image }}-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}-${{ matrix.arch }}
 
-      - name: Attest image provenance
+      - name: Record platform digest marker
+        shell: bash
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          digest="${DIGEST#sha256:}"
+          if [[ ! "$digest" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "build returned an invalid image digest" >&2
+            exit 1
+          fi
+          mkdir -p platform-digest
+          : >"platform-digest/$digest"
+
+      - name: Upload platform digest marker
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: platform-digest-${{ matrix.image }}-${{ matrix.arch }}
+          path: platform-digest/
+          if-no-files-found: error
+          retention-days: 7
+
+  images:
+    name: Image / ${{ matrix.image }}
+    needs: [validate, image-platforms]
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: inspace-cloud-controller-manager
+            title: InSpace Cloud Controller Manager
+            description: External Kubernetes cloud controller manager for InSpace Cloud
+          - image: inspace-csi-driver
+            title: InSpace CSI Driver
+            description: Kubernetes RWO block storage CSI driver for InSpace Cloud
+          - image: karpenter-provider-inspace
+            title: Karpenter Provider for InSpace Cloud
+            description: Karpenter provider for elastic K3s workers on InSpace Cloud
+    steps:
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate image metadata
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}},enable=${{ !startsWith(github.ref, 'refs/tags/v0.') }}
+            type=raw,value=latest,enable=${{ needs.validate.outputs.prerelease == 'false' }}
+          labels: |
+            org.opencontainers.image.title=${{ matrix.title }}
+            org.opencontainers.image.description=${{ matrix.description }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.url=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.documentation=${{ github.server_url }}/${{ github.repository }}/tree/${{ github.ref_name }}
+            org.opencontainers.image.licenses=Apache-2.0
+            org.opencontainers.image.version=${{ needs.validate.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+
+      - name: Download platform digest markers
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: platform-digest-${{ matrix.image }}-*
+          path: /tmp/platform-digests
+          merge-multiple: true
+
+      - name: Merge and tag multi-platform image
+        id: merge
+        shell: bash
+        env:
+          IMAGE: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
+          METADATA_JSON: ${{ steps.meta.outputs.json }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          digest_files=(/tmp/platform-digests/*)
+          if (( ${#digest_files[@]} != 2 )); then
+            echo "expected two platform digests, found ${#digest_files[@]}" >&2
+            exit 1
+          fi
+
+          tags=()
+          tag_args=()
+          while IFS= read -r tag; do
+            if [[ -n "$tag" ]]; then
+              tags+=("$tag")
+              tag_args+=(--tag "$tag")
+            fi
+          done < <(jq -r '.tags[]' <<<"$METADATA_JSON")
+          if (( ${#tags[@]} == 0 )); then
+            echo "image metadata produced no tags" >&2
+            exit 1
+          fi
+
+          source_args=()
+          for digest_file in "${digest_files[@]}"; do
+            digest="$(basename "$digest_file")"
+            if [[ ! "$digest" =~ ^[0-9a-f]{64}$ ]]; then
+              echo "invalid platform digest marker: $digest" >&2
+              exit 1
+            fi
+            source_args+=("$IMAGE@sha256:$digest")
+          done
+
+          metadata_file="$(mktemp)"
+          converged=false
+          final_digest=""
+          for attempt in $(seq 1 6); do
+            : >"$metadata_file"
+            if ! docker buildx imagetools create \
+              --metadata-file "$metadata_file" \
+              "${tag_args[@]}" \
+              "${source_args[@]}"; then
+              echo "GHCR has not accepted the platform manifests (attempt $attempt/6)" >&2
+              sleep $((attempt * 5))
+              continue
+            fi
+
+            final_digest="$(jq -r \
+              '."containerimage.digest" // ."containerimage.descriptor".digest // .digest // empty' \
+              "$metadata_file")"
+            if [[ ! "$final_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "imagetools returned an invalid final digest" >&2
+              exit 1
+            fi
+
+            if ! docker buildx imagetools inspect "$IMAGE@$final_digest" --raw \
+              >/tmp/final-index.json; then
+              echo "GHCR cannot read the merged digest yet (attempt $attempt/6)" >&2
+              sleep $((attempt * 5))
+              continue
+            fi
+
+            valid_index=true
+            for arch in amd64 arm64; do
+              if ! jq -e --arg arch "$arch" \
+                'any(.manifests[]?; .platform.os == "linux" and .platform.architecture == $arch)' \
+                /tmp/final-index.json >/dev/null; then
+                echo "merged image index is missing linux/$arch" >&2
+                valid_index=false
+              fi
+            done
+            sbom_count="$(jq \
+              '[.manifests[]? | select(.annotations["vnd.docker.reference.type"] == "attestation-manifest")] | length' \
+              /tmp/final-index.json)"
+            if (( sbom_count < 2 )); then
+              echo "merged image index did not retain both platform SBOM attestations" >&2
+              valid_index=false
+            fi
+
+            expected_hash="${final_digest#sha256:}"
+            for tag in "${tags[@]}"; do
+              tag_index="$(mktemp)"
+              if ! docker buildx imagetools inspect "$tag" --raw >"$tag_index"; then
+                echo "GHCR cannot read tag $tag yet" >&2
+                valid_index=false
+                rm -f "$tag_index"
+                continue
+              fi
+              actual_hash="$(sha256sum "$tag_index" | awk '{ print $1 }')"
+              rm -f "$tag_index"
+              if [[ "$actual_hash" != "$expected_hash" ]]; then
+                echo "GHCR tag $tag has not converged to $final_digest" >&2
+                valid_index=false
+              fi
+            done
+
+            if [[ "$valid_index" == "true" ]]; then
+              converged=true
+              break
+            fi
+            echo "GHCR has not converged for the merged image (attempt $attempt/6)" >&2
+            sleep $((attempt * 5))
+          done
+          if [[ "$converged" != "true" ]]; then
+            echo "failed to publish and read back every tag for $IMAGE" >&2
+            exit 1
+          fi
+          echo "digest=$final_digest" >>"$GITHUB_OUTPUT"
+
+      - name: Attest final image-index provenance
         uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4
         with:
           subject-name: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
-          subject-digest: ${{ steps.push.outputs.digest }}
+          subject-digest: ${{ steps.merge.outputs.digest }}
           push-to-registry: true
 
       - name: Record immutable image digest
         shell: bash
         env:
-          DIGEST: ${{ steps.push.outputs.digest }}
+          DIGEST: ${{ steps.merge.outputs.digest }}
           IMAGE: ${{ matrix.image }}
         run: |
           set -euo pipefail
@@ -168,7 +414,7 @@ jobs:
   charts:
     name: OCI Helm charts
     needs: [validate, quality]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
       packages: write
@@ -262,7 +508,7 @@ jobs:
   github-release:
     name: GitHub release
     needs: [validate, images, charts]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-slim
     permissions:
       contents: write
     steps:
