@@ -8,35 +8,35 @@ updates:
       github-actions:
         patterns: ["*"]
   - package-ecosystem: gomod
-    directory: /cloud-provider-inspace
+    directory: /modules/cloud-provider-inspace
     schedule:
       interval: weekly
     groups:
       go-dependencies:
         patterns: ["*"]
   - package-ecosystem: gomod
-    directory: /inspace-csi-driver
+    directory: /modules/inspace-csi-driver
     schedule:
       interval: weekly
     groups:
       go-dependencies:
         patterns: ["*"]
   - package-ecosystem: gomod
-    directory: /karpenter-provider-inspace
+    directory: /modules/karpenter-provider-inspace
     schedule:
       interval: weekly
     groups:
       go-dependencies:
         patterns: ["*"]
   - package-ecosystem: docker
-    directory: /cloud-provider-inspace
+    directory: /modules/cloud-provider-inspace
     schedule:
       interval: weekly
   - package-ecosystem: docker
-    directory: /inspace-csi-driver
+    directory: /modules/inspace-csi-driver
     schedule:
       interval: weekly
   - package-ecosystem: docker
-    directory: /karpenter-provider-inspace
+    directory: /modules/karpenter-provider-inspace
     schedule:
       interval: weekly

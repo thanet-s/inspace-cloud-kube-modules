@@ -1,7 +1,7 @@
 go 1.26.5
 
 use (
-	./cloud-provider-inspace
-	./inspace-csi-driver
-	./karpenter-provider-inspace
+	./modules/cloud-provider-inspace
+	./modules/inspace-csi-driver
+	./modules/karpenter-provider-inspace
 )

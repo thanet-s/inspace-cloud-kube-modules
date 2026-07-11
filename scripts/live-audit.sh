@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-workspace=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+workspace=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 
 if [ -f "$workspace/.env" ]; then
   set -a

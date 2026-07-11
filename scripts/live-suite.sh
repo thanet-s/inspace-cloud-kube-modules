@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-workspace=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+workspace=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 
 if [ -f "$workspace/.env" ]; then
   set -a
@@ -95,7 +95,7 @@ fi
 export INSPACE_FIREWALL_UUID="$firewall_uuid"
 export INSPACE_TEST_FIREWALL_UUID="$firewall_uuid"
 
-for module in cloud-provider-inspace inspace-csi-driver karpenter-provider-inspace; do
+for module in modules/cloud-provider-inspace modules/inspace-csi-driver modules/karpenter-provider-inspace; do
   echo "==> live-test $module"
   "$make_command" -C "$workspace/$module" live-test
 done

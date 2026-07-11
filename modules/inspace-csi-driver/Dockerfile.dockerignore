@@ -1,0 +1,12 @@
+**
+!modules
+!modules/cloud-provider-inspace
+!modules/cloud-provider-inspace/**
+!modules/inspace-csi-driver
+!modules/inspace-csi-driver/**
+**/.git
+**/.DS_Store
+**/.env
+**/.env.*
+**/bin
+**/dist

@@ -1,0 +1,146 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: inspace-cloud-controller-manager
+  namespace: kube-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: system:inspace-cloud-controller-manager
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch", "patch", "update"]
+  - apiGroups: [""]
+    resources: ["nodes/status"]
+    verbs: ["get", "patch", "update"]
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["get", "list", "watch", "patch", "update"]
+  - apiGroups: [""]
+    resources: ["services/status"]
+    verbs: ["get", "patch", "update"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch", "update"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: system:inspace-cloud-controller-manager
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:inspace-cloud-controller-manager
+subjects:
+  - kind: ServiceAccount
+    name: inspace-cloud-controller-manager
+    namespace: kube-system
+---
+# Replace placeholder values before applying. API credentials belong in the
+# separately created inspace-cloud-credentials Secret, never this ConfigMap.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: inspace-cloud-config
+  namespace: kube-system
+data:
+  location: bkk01
+  region: thailand
+  networkUUID: REPLACE_WITH_PRIVATE_NETWORK_UUID
+  billingAccountID: "REPLACE_WITH_BILLING_ACCOUNT_ID"
+  clusterID: REPLACE_WITH_STABLE_CLUSTER_ID
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: inspace-cloud-controller-manager
+  namespace: kube-system
+  labels:
+    app.kubernetes.io/name: inspace-cloud-controller-manager
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: inspace-cloud-controller-manager
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: inspace-cloud-controller-manager
+    spec:
+      serviceAccountName: inspace-cloud-controller-manager
+      priorityClassName: system-cluster-critical
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: "true"
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+        - key: node.cloudprovider.kubernetes.io/uninitialized
+          operator: Exists
+          effect: NoSchedule
+        - key: node.kubernetes.io/not-ready
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: cloud-controller-manager
+          image: ghcr.io/thanet-s/inspace-cloud-controller-manager:dev
+          imagePullPolicy: IfNotPresent
+          args:
+            - --cloud-provider=inspace
+            - --leader-elect=true
+            - --configure-cloud-routes=false
+            - --controllers=cloud-node-controller,cloud-node-lifecycle-controller,service-lb-controller
+          env:
+            - name: INSPACE_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: inspace-cloud-credentials
+                  key: apikey
+            - name: INSPACE_API_URL
+              value: https://api.inspace.cloud
+            - name: INSPACE_ALLOW_REMOTE_MUTATIONS
+              value: "true"
+            - name: INSPACE_LOCATION
+              valueFrom:
+                configMapKeyRef:
+                  name: inspace-cloud-config
+                  key: location
+            - name: INSPACE_REGION
+              valueFrom:
+                configMapKeyRef:
+                  name: inspace-cloud-config
+                  key: region
+            - name: INSPACE_NETWORK_UUID
+              valueFrom:
+                configMapKeyRef:
+                  name: inspace-cloud-config
+                  key: networkUUID
+            - name: INSPACE_BILLING_ACCOUNT_ID
+              valueFrom:
+                configMapKeyRef:
+                  name: inspace-cloud-config
+                  key: billingAccountID
+            - name: INSPACE_CLUSTER_ID
+              valueFrom:
+                configMapKeyRef:
+                  name: inspace-cloud-config
+                  key: clusterID
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities:
+              drop: ["ALL"]

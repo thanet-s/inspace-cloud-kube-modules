@@ -1,22 +1,34 @@
 # Release process
 
-Releases are automated from signed or annotated SemVer tags. The repository
-uses a single version for the three controller images and both Helm charts.
+Releases are automated from annotated SemVer tags. The repository uses a
+single version for the three controller images and both Helm charts.
 
-1. Merge through `main` only after CI passes Go formatting, tests, vet, CRD
-   integrity, Helm lint, and both namespace render paths.
+1. Merge through `main` only after CI passes Go formatting, tests, vet,
+   command builds, `govulncheck`, container builds, CRD integrity, Helm lint,
+   and both namespace render paths.
 2. Review dependency updates and release notes. Update chart defaults or CRDs
    in source before tagging; never patch a generated release artifact.
-3. Create and push a tag such as `v0.1.0` (or `v0.2.0-rc.1`).
-4. The release workflow validates SemVer, builds `linux/amd64` and
-   `linux/arm64` images, pushes versioned GHCR tags, attaches SBOM and GitHub
-   build-provenance attestations, and publishes both OCI charts.
-5. A GitHub release is created only after every image and chart succeeds. Its
-   assets include the chart archives and `SHA256SUMS`.
+3. Create and push an annotated tag such as `v0.1.0` (or `v0.2.0-rc.1`).
+4. The release workflow requires the tag target to be reachable from `main`
+   and reruns the complete CI workflow against the tagged source.
+5. It builds `linux/amd64` and `linux/arm64` images, pushes versioned GHCR
+   tags, attaches SBOM and keyless GitHub build-provenance attestations, and
+   publishes and attests both OCI charts.
+6. Only after every image and chart succeeds does the workflow create a draft,
+   attach chart archives, `SHA256SUMS`, and immutable image-digest records,
+   then publish the GitHub release. Repository release immutability prevents a
+   published release or tag from being changed afterward.
 
-Stable tags additionally update floating major, minor, and `latest` image
-tags. Prereleases never update `latest`. Consumers should pin an image digest
-or an exact chart version in production.
+Stable tags additionally update floating minor and `latest` image tags. A
+major alias is published from v1 onward, but never as the ambiguous `:0` tag.
+Prereleases publish only their exact prerelease version. Consumers should pin
+an image digest or an exact chart version in production.
+
+Versions are append-only even if a workflow fails after partially publishing
+to GHCR. Never move or repush a failed version; fix the source and issue the
+next prerelease such as `rc.2`. After a package is first created, verify all
+three images and both `charts/*` packages are public before an anonymous K3s
+cluster attempts to pull them.
 
 Published artifacts:
 
