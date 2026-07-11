@@ -43,6 +43,7 @@ func TestClusterE2EProvesWorkerVPCAttachment(t *testing.T) {
 		`select(.type == "InternalIP")`,
 		`if length == 1 then .[0]`,
 		`ipaddress.ip_network(sys.argv[1], strict=False)`,
+		`network.subnet_of(prefix)`,
 		`address not in network`,
 	} {
 		if !strings.Contains(vpcCheck, gate) {

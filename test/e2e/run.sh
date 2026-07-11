@@ -492,7 +492,12 @@ owned_worker_vpc_ready() {
 import ipaddress, sys
 network = ipaddress.ip_network(sys.argv[1], strict=False)
 address = ipaddress.ip_address(sys.argv[2])
-if network.version != 4 or not network.is_private or address.version != 4 or address not in network:
+private_ranges = tuple(ipaddress.ip_network(prefix) for prefix in (
+    "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"
+))
+if (network.version != 4 or
+        not any(network.subnet_of(prefix) for prefix in private_ranges) or
+        address.version != 4 or address not in network):
     raise SystemExit("worker InternalIP is not in the configured private VPC subnet")
 PY
 }
