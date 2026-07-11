@@ -20,6 +20,7 @@ import (
 const (
 	defaultUserAgent   = "cloud-provider-inspace/dev"
 	defaultHTTPTimeout = 5 * time.Minute
+	defaultReadTimeout = 30 * time.Second
 )
 
 var (
@@ -80,7 +81,8 @@ func NewClient(opts Options) (*Client, error) {
 	if httpClient == nil {
 		// VM creation is a synchronous API call and can legitimately take well
 		// over 30 seconds. Callers may still supply a shorter client or context
-		// deadline for read-only and latency-sensitive operations.
+		// deadline for mutations that need a tighter bound. GET requests receive
+		// their own shorter per-request deadline in doBody.
 		httpClient = &http.Client{Timeout: defaultHTTPTimeout}
 	}
 	// Copy the caller's client so the safety policy cannot be bypassed by an
@@ -188,6 +190,11 @@ func (c *Client) doJSON(ctx context.Context, method, path string, query url.Valu
 func (c *Client) doBody(ctx context.Context, method, path string, query url.Values, body io.Reader, contentType string, out any) error {
 	if isMutation(method) && !isLiteralLoopback(c.baseURL.Hostname()) && !c.dangerouslyAllowMutations {
 		return fmt.Errorf("%w: %s %s", ErrMutationBlocked, method, path)
+	}
+	if method == http.MethodGet && ctx != nil {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, defaultReadTimeout)
+		defer cancel()
 	}
 	u := *c.baseURL
 	u.Path = strings.TrimRight(c.baseURL.Path, "/") + path

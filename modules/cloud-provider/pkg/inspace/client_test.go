@@ -3,10 +3,13 @@ package inspace_test
 import (
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/thanet-s/inspace-cloud-kube-modules/modules/cloud-provider/internal/testutil/fakeapi"
 	"github.com/thanet-s/inspace-cloud-kube-modules/modules/cloud-provider/pkg/inspace"
@@ -133,6 +136,149 @@ func TestMutationGuardBlocksBeforeTransport(t *testing.T) {
 	}
 }
 
+func TestReadRequestsHaveBoundedContext(t *testing.T) {
+	var observedRemaining time.Duration
+	transport := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		deadline, ok := req.Context().Deadline()
+		if !ok {
+			t.Error("GET request reached transport without a context deadline")
+		} else {
+			observedRemaining = time.Until(deadline)
+		}
+		return response(req, `[]`), nil
+	})
+	client, err := inspace.NewClient(inspace.Options{
+		BaseURL:    "https://api.example.invalid",
+		APIKey:     "test-key",
+		HTTPClient: &http.Client{Transport: transport},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.ListLocations(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if observedRemaining < 25*time.Second || observedRemaining > 31*time.Second {
+		t.Fatalf("GET request deadline remaining = %s, want about 30s", observedRemaining)
+	}
+}
+
+func TestReadRequestsPreserveShorterCallerDeadline(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	t.Cleanup(cancel)
+	callerDeadline, ok := ctx.Deadline()
+	if !ok {
+		t.Fatal("caller context has no deadline")
+	}
+	transport := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		observedDeadline, ok := req.Context().Deadline()
+		if !ok {
+			t.Error("GET request reached transport without a context deadline")
+		} else if !observedDeadline.Equal(callerDeadline) {
+			t.Errorf("GET request deadline = %s, want caller deadline %s", observedDeadline, callerDeadline)
+		}
+		return response(req, `[]`), nil
+	})
+	client, err := inspace.NewClient(inspace.Options{
+		BaseURL:    "https://api.example.invalid",
+		APIKey:     "test-key",
+		HTTPClient: &http.Client{Transport: transport},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.ListLocations(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestMutationRequestsRetainLongerClientDeadline(t *testing.T) {
+	transport := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		deadline, ok := req.Context().Deadline()
+		if !ok {
+			t.Error("mutation request did not retain the HTTP client deadline")
+		} else if remaining := time.Until(deadline); remaining < 55*time.Second || remaining > 61*time.Second {
+			t.Errorf("mutation request deadline remaining = %s, want about 1m", remaining)
+		}
+		return response(req, `{}`), nil
+	})
+	client, err := inspace.NewClient(inspace.Options{
+		BaseURL:                   "https://api.example.invalid",
+		APIKey:                    "test-key",
+		HTTPClient:                &http.Client{Transport: transport, Timeout: time.Minute},
+		DangerouslyAllowMutations: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.CreateVM(context.Background(), "bkk01", inspace.CreateVMRequest{
+		Name: "worker", OSName: "ubuntu", OSVersion: "24.04", DiskGiB: 40, VCPU: 2, MemoryMiB: 4096,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestReadRequestCancellationInterruptsResponseBody(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		<-r.Context().Done()
+	}))
+	t.Cleanup(server.Close)
+	client, err := inspace.NewClient(inspace.Options{BaseURL: server.URL, APIKey: "test-key"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	t.Cleanup(cancel)
+	_, err = client.ListLocations(ctx)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("ListLocations() error = %v, want context deadline exceeded", err)
+	}
+}
+
+func TestReadDeadlineSurvivesSameOriginRedirect(t *testing.T) {
+	var observedDeadline time.Time
+	transport := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.URL.Path != "/redirected" {
+			redirect := response(req, "")
+			redirect.StatusCode = http.StatusTemporaryRedirect
+			redirect.Header.Set("Location", "/redirected")
+			return redirect, nil
+		}
+		var ok bool
+		observedDeadline, ok = req.Context().Deadline()
+		if !ok {
+			t.Error("redirected GET request reached transport without a deadline")
+		}
+		return response(req, `[]`), nil
+	})
+	client, err := inspace.NewClient(inspace.Options{
+		BaseURL:    "https://api.example.invalid",
+		APIKey:     "test-key",
+		HTTPClient: &http.Client{Transport: transport},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	t.Cleanup(cancel)
+	callerDeadline, ok := ctx.Deadline()
+	if !ok {
+		t.Fatal("caller context has no deadline")
+	}
+	if _, err := client.ListLocations(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !observedDeadline.Equal(callerDeadline) {
+		t.Fatalf("redirected GET deadline = %s, want caller deadline %s", observedDeadline, callerDeadline)
+	}
+}
+
 func TestIsNotFoundNormalizesInSpaceMissingResourceResponse(t *testing.T) {
 	if !inspace.IsNotFound(&inspace.APIError{StatusCode: http.StatusBadRequest, Message: "Error: No such virtual machine exists: deadbeef"}) {
 		t.Fatal("expected InSpace's missing-VM HTTP 400 response to normalize as not found")
@@ -146,4 +292,19 @@ type panicTransport struct{}
 
 func (*panicTransport) RoundTrip(*http.Request) (*http.Response, error) {
 	panic("mutation guard allowed a request to reach transport")
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+func response(req *http.Request, body string) *http.Response {
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     make(http.Header),
+		Body:       io.NopCloser(strings.NewReader(body)),
+		Request:    req,
+	}
 }
