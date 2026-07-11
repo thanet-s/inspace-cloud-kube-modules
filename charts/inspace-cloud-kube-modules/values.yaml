@@ -30,6 +30,7 @@ ccm:
     annotations: {}
   priorityClassName: system-cluster-critical
   hostNetwork: true
+  dnsPolicy: Default
   podAnnotations: {}
   podLabels: {}
   nodeSelector:
@@ -74,6 +75,9 @@ csi:
       node-role.kubernetes.io/control-plane: "true"
     tolerations:
       - key: node-role.kubernetes.io/control-plane
+        operator: Exists
+        effect: NoSchedule
+      - key: node.cloudprovider.kubernetes.io/uninitialized
         operator: Exists
         effect: NoSchedule
     affinity: {}
@@ -159,6 +163,9 @@ karpenter:
       operator: Exists
       effect: NoSchedule
     - key: node-role.kubernetes.io/master
+      operator: Exists
+      effect: NoSchedule
+    - key: node.cloudprovider.kubernetes.io/uninitialized
       operator: Exists
       effect: NoSchedule
   affinity: {}

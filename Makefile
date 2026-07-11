@@ -45,6 +45,7 @@ helm-verify:
 	helm lint charts/inspace-cloud-kube-modules --values charts/inspace-cloud-kube-modules/ci/test-values.yaml
 	helm template verify-crds charts/inspace-cloud-kube-modules-crds >/dev/null
 	helm template verify charts/inspace-cloud-kube-modules --namespace kube-system --values charts/inspace-cloud-kube-modules/ci/test-values.yaml >/dev/null
+	./scripts/verify-bootstrap-manifests.sh
 
 helm-package: helm-verify
 	rm -rf dist

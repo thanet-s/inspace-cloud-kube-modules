@@ -66,7 +66,7 @@
     "ccm": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["enabled", "replicaCount", "image", "serviceAccount", "priorityClassName", "hostNetwork", "podAnnotations", "podLabels", "nodeSelector", "tolerations", "affinity", "resources", "extraArgs", "extraEnv"],
+      "required": ["enabled", "replicaCount", "image", "serviceAccount", "priorityClassName", "hostNetwork", "dnsPolicy", "podAnnotations", "podLabels", "nodeSelector", "tolerations", "affinity", "resources", "extraArgs", "extraEnv"],
       "properties": {
         "enabled": {"type": "boolean"},
         "replicaCount": {"type": "integer", "minimum": 1, "maximum": 10},
@@ -74,6 +74,7 @@
         "serviceAccount": {"$ref": "#/definitions/serviceAccount"},
         "priorityClassName": {"type": "string"},
         "hostNetwork": {"type": "boolean"},
+        "dnsPolicy": {"type": "string", "enum": ["Default", "ClusterFirst", "ClusterFirstWithHostNet"]},
         "podAnnotations": {"$ref": "#/definitions/stringMap"},
         "podLabels": {"$ref": "#/definitions/stringMap"},
         "nodeSelector": {"$ref": "#/definitions/stringMap"},

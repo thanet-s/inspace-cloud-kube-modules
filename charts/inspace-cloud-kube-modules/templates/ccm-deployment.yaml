@@ -30,7 +30,7 @@ spec:
       serviceAccountName: {{ include "inspace.serviceAccountName" (dict "root" . "component" $component "serviceAccount" .Values.ccm.serviceAccount) }}
       priorityClassName: {{ .Values.ccm.priorityClassName | quote }}
       hostNetwork: {{ .Values.ccm.hostNetwork }}
-      dnsPolicy: {{ ternary "ClusterFirstWithHostNet" "ClusterFirst" .Values.ccm.hostNetwork }}
+      dnsPolicy: {{ .Values.ccm.dnsPolicy }}
       {{- with .Values.global.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}

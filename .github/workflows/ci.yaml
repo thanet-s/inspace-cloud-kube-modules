@@ -194,6 +194,7 @@ jobs:
             --set karpenter.namespace=karpenter \
             --set karpenter.createNamespace=true \
             >/tmp/inspace-split-namespace.yaml
+          ./scripts/verify-bootstrap-manifests.sh
 
       - name: Validate full-cluster E2E shell syntax
         run: bash -n test/e2e/run.sh
