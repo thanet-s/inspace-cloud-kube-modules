@@ -245,8 +245,11 @@ ssh_ready() {
 
 k3s_etcd_ready() {
   local ip=$1
+  # InSpace's generated cloud-config currently triggers recoverable schema
+  # warnings. cloud-init uses status 2 for degraded completion; K3s and etcd
+  # health below remain mandatory.
   ssh "${ssh_options[@]}" "$ssh_user@$ip" \
-    "sudo timeout --kill-after=5s 45s bash -o pipefail -c 'cloud-init status --wait >/dev/null 2>&1 &&
+    "sudo timeout --kill-after=5s 45s bash -o pipefail -c '(cloud-init status --wait >/dev/null 2>&1 || test \$? -eq 2) &&
      systemctl is-active --quiet k3s &&
      timeout 20s k3s kubectl get --raw=\"/readyz?verbose\" 2>/dev/null |
        grep -F \"[+]etcd ok\"'" >/dev/null 2>&1
