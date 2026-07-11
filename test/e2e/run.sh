@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2016 # jq programs intentionally use single-quoted $variables.
 set -Eeuo pipefail
 
 # Full, destructive, isolated-account E2E. This script intentionally requires
 # a released OCI chart/images and a billing-account confirmation. It reads the
 # SSH public key only; the private key remains in ~/.ssh and is used by ssh(1).
 
-workspace=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
+workspace=$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd)
 cd "$workspace"
 
 if [[ -f .env ]]; then
@@ -167,7 +168,7 @@ export INSPACE_ALLOW_REMOTE_MUTATIONS=true
 export INSPACE_K3S_TOKEN=$k3s_token
 export KUBECONFIG=$kubeconfig
 
-ssh_options=(-i "$ssh_private_key" -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=10 \
+ssh_options=(-n -i "$ssh_private_key" -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=10 \
   -o UserKnownHostsFile="$known_hosts" -o StrictHostKeyChecking=yes)
 ssh_user=${INSPACE_E2E_SSH_USERNAME:-inspacee2e}
 
@@ -392,7 +393,7 @@ state_update '.controlPlanePublicIPv4s=$ips' --argjson ips "$control_plane_ips"
 echo "==> verify SSH, cloud-init, K3s readiness, and embedded etcd"
 while IFS= read -r ip; do
   wait_until 900 "SSH on $ip" ssh_ready "$ip"
-  ssh "${ssh_options[@]}" "$ssh_user@$ip" \
+  ssh -n "${ssh_options[@]}" "$ssh_user@$ip" \
     "sudo cloud-init status --wait >/dev/null && sudo systemctl is-active --quiet k3s && sudo k3s kubectl get --raw='/readyz?verbose' | grep -F '[+]etcd ok'" >/dev/null
 done < <(jq -r '.[]' <<<"$control_plane_ips")
 
