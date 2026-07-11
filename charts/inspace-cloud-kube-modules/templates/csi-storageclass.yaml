@@ -1,0 +1,18 @@
+{{- if and .Values.csi.enabled .Values.csi.storageClass.create }}
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: {{ .Values.csi.storageClass.name }}
+  labels:
+    {{- include "inspace.componentLabels" (dict "root" . "component" "csi") | nindent 4 }}
+  {{- with .Values.csi.storageClass.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+provisioner: csi.inspace.cloud
+reclaimPolicy: {{ .Values.csi.storageClass.reclaimPolicy }}
+allowVolumeExpansion: false
+volumeBindingMode: {{ .Values.csi.storageClass.volumeBindingMode }}
+parameters:
+  csi.storage.k8s.io/fstype: {{ .Values.csi.storageClass.fsType | quote }}
+{{- end }}

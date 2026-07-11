@@ -1,0 +1,15 @@
+{{- if and .Values.karpenter.enabled (gt (int .Values.karpenter.replicaCount) 1) }}
+{{- $component := "karpenter" }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "inspace.componentName" (dict "root" . "component" $component) }}
+  namespace: {{ include "inspace.karpenterNamespace" . }}
+  labels:
+    {{- include "inspace.componentLabels" (dict "root" . "component" $component) | nindent 4 }}
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      {{- include "inspace.selectorLabels" (dict "root" . "component" $component) | nindent 6 }}
+{{- end }}

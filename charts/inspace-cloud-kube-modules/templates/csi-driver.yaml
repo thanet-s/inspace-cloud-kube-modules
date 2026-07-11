@@ -1,0 +1,16 @@
+{{- if .Values.csi.enabled }}
+apiVersion: storage.k8s.io/v1
+kind: CSIDriver
+metadata:
+  name: csi.inspace.cloud
+  labels:
+    {{- include "inspace.componentLabels" (dict "root" . "component" "csi") | nindent 4 }}
+spec:
+  attachRequired: true
+  podInfoOnMount: false
+  volumeLifecycleModes:
+    - Persistent
+  fsGroupPolicy: None
+  requiresRepublish: false
+  seLinuxMount: false
+{{- end }}

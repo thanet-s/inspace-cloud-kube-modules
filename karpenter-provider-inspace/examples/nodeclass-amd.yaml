@@ -1,0 +1,27 @@
+apiVersion: karpenter.inspace.cloud/v1alpha1
+kind: InSpaceNodeClass
+metadata:
+  name: ubuntu-workers-amd
+spec:
+  clusterName: example-k3s
+  billingAccountID: 12345
+  location: bkk01
+  networkUUID: 11111111-1111-4111-8111-111111111111
+  # InSpace has no managed NAT. This public address is egress-only; generated
+  # bootstrap firewalls public ingress and forces K3s to the RFC1918 node IP.
+  reservePublicIPv4: true
+  # Pre-create this default-deny firewall. Only RFC1918 inbound rules are
+  # accepted by NodeClass readiness validation.
+  firewallUUID: 22222222-2222-4222-8222-222222222222
+  imageSelector:
+    osName: ubuntu
+    osVersion: "24.04"
+  hostPoolSelector:
+    class: amd-epyc
+  rootDiskGiB: 40
+  k3s:
+    version: v1.35.6+k3s1
+    server: https://api.example-k3s.example:6443
+    tokenSecretRef:
+      name: inspace-k3s-agent-token
+      key: token

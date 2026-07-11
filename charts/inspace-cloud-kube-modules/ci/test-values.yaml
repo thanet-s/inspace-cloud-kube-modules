@@ -1,0 +1,7 @@
+global:
+  inspace:
+    networkUUID: 00000000-0000-0000-0000-000000000001
+    clusterID: ci-k3s
+karpenter:
+  clusterName: ci-k3s
+  defaultNodeClass: ci-workers

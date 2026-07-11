@@ -1,0 +1,5 @@
+Karpenter v1.14 and InSpace Cloud CRDs are installed.
+
+Upgrade this chart before upgrading the inspace-cloud-kube-modules workload
+chart. Keep this release installed: uninstalling it deletes the CRDs and their
+custom resources.

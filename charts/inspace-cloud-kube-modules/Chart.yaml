@@ -1,0 +1,18 @@
+apiVersion: v2
+name: inspace-cloud-kube-modules
+description: InSpace Cloud CCM, CSI driver, and Karpenter provider for K3s
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+kubeVersion: ">=1.30.0-0"
+home: https://github.com/thanet-s/inspace-cloud-kube-modules
+sources:
+  - https://github.com/thanet-s/inspace-cloud-kube-modules
+maintainers:
+  - name: thanet-s
+    url: https://github.com/thanet-s
+annotations:
+  artifacthub.io/license: Apache-2.0
+  artifacthub.io/containsSecurityUpdates: "false"
+  org.opencontainers.image.licenses: Apache-2.0
+  org.opencontainers.image.source: https://github.com/thanet-s/inspace-cloud-kube-modules

@@ -1,0 +1,111 @@
+{{- if .Values.ccm.enabled }}
+{{- $component := "ccm" }}
+{{- $name := include "inspace.componentName" (dict "root" . "component" $component) }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "inspace.componentLabels" (dict "root" . "component" $component) | nindent 4 }}
+spec:
+  replicas: {{ .Values.ccm.replicaCount }}
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      {{- include "inspace.selectorLabels" (dict "root" . "component" $component) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "inspace.selectorLabels" (dict "root" . "component" $component) | nindent 8 }}
+        {{- with .Values.ccm.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/ccm-configmap.yaml") . | sha256sum }}
+        {{- with .Values.ccm.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "inspace.serviceAccountName" (dict "root" . "component" $component "serviceAccount" .Values.ccm.serviceAccount) }}
+      priorityClassName: {{ .Values.ccm.priorityClassName | quote }}
+      hostNetwork: {{ .Values.ccm.hostNetwork }}
+      dnsPolicy: {{ ternary "ClusterFirstWithHostNet" "ClusterFirst" .Values.ccm.hostNetwork }}
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.ccm.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.ccm.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.ccm.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: cloud-controller-manager
+          image: {{ include "inspace.image" (dict "root" . "image" .Values.ccm.image) }}
+          imagePullPolicy: {{ .Values.ccm.image.pullPolicy }}
+          args:
+            - --cloud-provider=inspace
+            - --leader-elect=true
+            - --configure-cloud-routes=false
+            - --controllers=cloud-node-controller,cloud-node-lifecycle-controller,service-lb-controller
+            {{- range .Values.ccm.extraArgs }}
+            - {{ . | quote }}
+            {{- end }}
+          env:
+            - name: INSPACE_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.global.inspace.apiSecret.name }}
+                  key: {{ .Values.global.inspace.apiSecret.tokenKey }}
+            - name: INSPACE_BILLING_ACCOUNT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.global.inspace.apiSecret.name }}
+                  key: {{ .Values.global.inspace.apiSecret.billingAccountIDKey }}
+            - name: INSPACE_API_URL
+              value: {{ .Values.global.inspace.apiBaseURL | quote }}
+            - name: INSPACE_ALLOW_REMOTE_MUTATIONS
+              value: "true"
+            - name: INSPACE_LOCATION
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ $name }}
+                  key: location
+            - name: INSPACE_REGION
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ $name }}
+                  key: region
+            - name: INSPACE_NETWORK_UUID
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ $name }}
+                  key: networkUUID
+            - name: INSPACE_CLUSTER_ID
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ $name }}
+                  key: clusterID
+            {{- with .Values.ccm.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          resources:
+            {{- toYaml .Values.ccm.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities:
+              drop: ["ALL"]
+{{- end }}

@@ -1,0 +1,130 @@
+{{- if .Values.csi.enabled }}
+{{- $component := "csi-node" }}
+{{- $name := include "inspace.componentName" (dict "root" . "component" $component) }}
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "inspace.componentLabels" (dict "root" . "component" $component) | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "inspace.selectorLabels" (dict "root" . "component" $component) | nindent 6 }}
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        {{- include "inspace.selectorLabels" (dict "root" . "component" $component) | nindent 8 }}
+        {{- with .Values.csi.node.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.csi.node.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "inspace.serviceAccountName" (dict "root" . "component" $component "serviceAccount" .Values.csi.node.serviceAccount) }}
+      automountServiceAccountToken: false
+      priorityClassName: {{ .Values.csi.node.priorityClassName | quote }}
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.csi.node.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.csi.node.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: driver
+          image: {{ include "inspace.image" (dict "root" . "image" .Values.csi.image) }}
+          imagePullPolicy: {{ .Values.csi.image.pullPolicy }}
+          args:
+            - --endpoint=unix:///csi/csi.sock
+            - --mode=node
+            - --location=$(INSPACE_LOCATION)
+            - --node-id=$(NODE_ID)
+          env:
+            - name: INSPACE_LOCATION
+              value: {{ .Values.global.inspace.location | quote }}
+            - name: NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          resources:
+            {{- toYaml .Values.csi.node.resources | nindent 12 }}
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: plugin-dir
+              mountPath: /csi
+            - name: kubelet-dir
+              mountPath: {{ .Values.csi.node.kubeletDir }}
+              mountPropagation: Bidirectional
+            - name: devices
+              mountPath: /dev
+        - name: node-driver-registrar
+          image: {{ .Values.csi.sidecars.registrar.image }}
+          args:
+            - --csi-address=/csi/csi.sock
+            - --kubelet-registration-path={{ .Values.csi.node.kubeletDir }}/plugins/csi.inspace.cloud/csi.sock
+          volumeMounts:
+            - name: plugin-dir
+              mountPath: /csi
+            - name: registration-dir
+              mountPath: /registration
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+        - name: liveness-probe
+          image: {{ .Values.csi.sidecars.livenessProbe.image }}
+          args:
+            - --csi-address=/csi/csi.sock
+            - --health-port=9808
+          ports:
+            - name: healthz
+              containerPort: 9808
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: healthz
+            initialDelaySeconds: 10
+            timeoutSeconds: 3
+            periodSeconds: 10
+            failureThreshold: 5
+          volumeMounts:
+            - name: plugin-dir
+              mountPath: /csi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: plugin-dir
+          hostPath:
+            path: {{ .Values.csi.node.kubeletDir }}/plugins/csi.inspace.cloud
+            type: DirectoryOrCreate
+        - name: registration-dir
+          hostPath:
+            path: {{ .Values.csi.node.kubeletDir }}/plugins_registry
+            type: Directory
+        - name: kubelet-dir
+          hostPath:
+            path: {{ .Values.csi.node.kubeletDir }}
+            type: Directory
+        - name: devices
+          hostPath:
+            path: /dev
+            type: Directory
+{{- end }}

@@ -1,0 +1,20 @@
+# Replace the zero UUID and example names with the cluster's real values.
+global:
+  inspace:
+    networkUUID: 00000000-0000-0000-0000-000000000001
+    clusterID: example-k3s
+    apiSecret:
+      name: inspace-cloud-credentials
+      tokenKey: api-token
+      billingAccountIDKey: billing-account-id
+
+karpenter:
+  clusterName: example-k3s
+  defaultNodeClass: ubuntu-workers-intel
+  # Prefer an externally managed Secret/inspace-k3s-agent-token.
+  agentTokenSecret:
+    create: false
+
+csi:
+  storageClass:
+    name: inspace-rwo

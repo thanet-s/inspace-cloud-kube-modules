@@ -1,0 +1,16 @@
+.env
+.env.*
+!.env.example
+.DS_Store
+dist/
+
+# Defensive credential exclusions. E2E reads only ~/.ssh/id_rsa.pub in memory.
+**/id_rsa
+**/id_dsa
+**/id_ecdsa
+**/id_ed25519
+**/*.pem
+**/*.key
+
+# Local full-cluster E2E journals, kubeconfigs, generated tokens, and host keys.
+.e2e/

@@ -1,0 +1,172 @@
+nameOverride: ""
+fullnameOverride: ""
+
+global:
+  imagePullSecrets: []
+  inspace:
+    apiBaseURL: https://api.inspace.cloud
+    location: bkk01
+    region: thailand
+    networkUUID: ""
+    clusterID: ""
+    # This chart never creates or copies the cloud API credential. Create one
+    # Secret with both keys before installing; all three controllers use it.
+    apiSecret:
+      name: inspace-cloud-credentials
+      tokenKey: api-token
+      billingAccountIDKey: billing-account-id
+
+ccm:
+  enabled: true
+  replicaCount: 2
+  image:
+    repository: ghcr.io/thanet-s/inspace-cloud-controller-manager
+    tag: ""
+    digest: ""
+    pullPolicy: IfNotPresent
+  serviceAccount:
+    create: true
+    name: ""
+    annotations: {}
+  priorityClassName: system-cluster-critical
+  hostNetwork: true
+  podAnnotations: {}
+  podLabels: {}
+  nodeSelector:
+    node-role.kubernetes.io/control-plane: "true"
+  tolerations:
+    - key: node-role.kubernetes.io/control-plane
+      operator: Exists
+      effect: NoSchedule
+    - key: node.cloudprovider.kubernetes.io/uninitialized
+      operator: Exists
+      effect: NoSchedule
+    - key: node.kubernetes.io/not-ready
+      operator: Exists
+      effect: NoSchedule
+  affinity: {}
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      memory: 512Mi
+  extraArgs: []
+  extraEnv: []
+
+csi:
+  enabled: true
+  image:
+    repository: ghcr.io/thanet-s/inspace-csi-driver
+    tag: ""
+    digest: ""
+    pullPolicy: IfNotPresent
+  controller:
+    replicaCount: 1
+    serviceAccount:
+      create: true
+      name: ""
+      annotations: {}
+    priorityClassName: system-cluster-critical
+    podAnnotations: {}
+    podLabels: {}
+    nodeSelector:
+      node-role.kubernetes.io/control-plane: "true"
+    tolerations:
+      - key: node-role.kubernetes.io/control-plane
+        operator: Exists
+        effect: NoSchedule
+    affinity: {}
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        memory: 256Mi
+  node:
+    serviceAccount:
+      create: true
+      name: ""
+      annotations: {}
+    priorityClassName: system-node-critical
+    podAnnotations: {}
+    podLabels: {}
+    kubeletDir: /var/lib/kubelet
+    nodeSelector: {}
+    tolerations:
+      - operator: Exists
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        memory: 256Mi
+  sidecars:
+    provisioner:
+      image: registry.k8s.io/sig-storage/csi-provisioner:v5.2.0
+    attacher:
+      image: registry.k8s.io/sig-storage/csi-attacher:v4.8.1
+    registrar:
+      image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.13.0
+    livenessProbe:
+      image: registry.k8s.io/sig-storage/livenessprobe:v2.15.0
+  storageClass:
+    create: true
+    name: inspace-rwo
+    annotations: {}
+    reclaimPolicy: Delete
+    volumeBindingMode: WaitForFirstConsumer
+    fsType: ext4
+
+karpenter:
+  enabled: true
+  # Empty uses the Helm release namespace (recommended: install in kube-system
+  # so exactly one cloud API Secret object is needed).
+  namespace: ""
+  createNamespace: false
+  replicaCount: 1
+  image:
+    repository: ghcr.io/thanet-s/karpenter-provider-inspace
+    tag: ""
+    digest: ""
+    pullPolicy: IfNotPresent
+  serviceAccount:
+    create: true
+    name: ""
+    annotations: {}
+  clusterName: ""
+  defaultNodeClass: ""
+  # The provider only accepts this fixed Secret name and key. Creating it
+  # outside Helm is preferred so the token is not stored in Helm release data.
+  agentTokenSecret:
+    create: false
+    token: ""
+  featureGates:
+    reservedCapacity: true
+    nodeOverlay: false
+    staticCapacity: false
+    spotToSpotConsolidation: false
+    nodeRepair: false
+    capacityBuffer: true
+  logLevel: info
+  priorityClassName: system-cluster-critical
+  podAnnotations: {}
+  podLabels: {}
+  nodeSelector:
+    node-role.kubernetes.io/control-plane: "true"
+  tolerations:
+    - key: node-role.kubernetes.io/control-plane
+      operator: Exists
+      effect: NoSchedule
+    - key: node-role.kubernetes.io/master
+      operator: Exists
+      effect: NoSchedule
+  affinity: {}
+  resources:
+    requests:
+      cpu: 200m
+      memory: 256Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
+  extraEnv: []

@@ -1,0 +1,105 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: inspace-csi-controller
+  namespace: kube-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: inspace-csi-controller
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: inspace-csi-controller
+    spec:
+      serviceAccountName: inspace-csi-controller
+      priorityClassName: system-cluster-critical
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+        - key: node-role.kubernetes.io/master
+          operator: Exists
+          effect: NoSchedule
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: node-role.kubernetes.io/control-plane
+                    operator: Exists
+              - matchExpressions:
+                  - key: node-role.kubernetes.io/master
+                    operator: Exists
+      containers:
+        - name: driver
+          image: ghcr.io/thanet-s/inspace-csi-driver:v0.1.0
+          imagePullPolicy: IfNotPresent
+          args:
+            - --endpoint=unix:///csi/csi.sock
+            - --mode=controller
+            - --location=$(INSPACE_LOCATION)
+          env:
+            - name: INSPACE_LOCATION
+              value: bkk01
+            - name: INSPACE_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: inspace-cloud
+                  key: api-token
+            - name: INSPACE_BILLING_ACCOUNT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: inspace-cloud
+                  key: billing-account-id
+            - name: INSPACE_ALLOW_REMOTE_MUTATIONS
+              value: "true"
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+        - name: provisioner
+          image: registry.k8s.io/sig-storage/csi-provisioner:v5.2.0
+          args:
+            - --csi-address=/csi/csi.sock
+            - --feature-gates=Topology=true
+            - --strict-topology
+            - --leader-election
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+        - name: attacher
+          image: registry.k8s.io/sig-storage/csi-attacher:v4.8.1
+          args:
+            - --csi-address=/csi/csi.sock
+            - --leader-election
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+        - name: liveness-probe
+          image: registry.k8s.io/sig-storage/livenessprobe:v2.15.0
+          args:
+            - --csi-address=/csi/csi.sock
+            - --health-port=9808
+          ports:
+            - name: healthz
+              containerPort: 9808
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: healthz
+            initialDelaySeconds: 10
+            timeoutSeconds: 3
+            periodSeconds: 10
+            failureThreshold: 5
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+      volumes:
+        - name: socket-dir
+          emptyDir: {}

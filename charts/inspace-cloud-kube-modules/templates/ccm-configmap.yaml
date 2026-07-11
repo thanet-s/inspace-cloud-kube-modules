@@ -1,0 +1,15 @@
+{{- if .Values.ccm.enabled }}
+{{- $component := "ccm" }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "inspace.componentName" (dict "root" . "component" $component) }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "inspace.componentLabels" (dict "root" . "component" $component) | nindent 4 }}
+data:
+  location: {{ .Values.global.inspace.location | quote }}
+  region: {{ .Values.global.inspace.region | quote }}
+  networkUUID: {{ .Values.global.inspace.networkUUID | quote }}
+  clusterID: {{ .Values.global.inspace.clusterID | quote }}
+{{- end }}

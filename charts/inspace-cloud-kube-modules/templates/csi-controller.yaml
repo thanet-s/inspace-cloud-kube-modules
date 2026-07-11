@@ -1,0 +1,143 @@
+{{- if .Values.csi.enabled }}
+{{- $component := "csi-controller" }}
+{{- $name := include "inspace.componentName" (dict "root" . "component" $component) }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "inspace.componentLabels" (dict "root" . "component" $component) | nindent 4 }}
+spec:
+  replicas: {{ .Values.csi.controller.replicaCount }}
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      {{- include "inspace.selectorLabels" (dict "root" . "component" $component) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "inspace.selectorLabels" (dict "root" . "component" $component) | nindent 8 }}
+        {{- with .Values.csi.controller.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.csi.controller.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "inspace.serviceAccountName" (dict "root" . "component" $component "serviceAccount" .Values.csi.controller.serviceAccount) }}
+      priorityClassName: {{ .Values.csi.controller.priorityClassName | quote }}
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.csi.controller.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.csi.controller.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.csi.controller.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        fsGroup: 65532
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: driver
+          image: {{ include "inspace.image" (dict "root" . "image" .Values.csi.image) }}
+          imagePullPolicy: {{ .Values.csi.image.pullPolicy }}
+          args:
+            - --endpoint=unix:///csi/csi.sock
+            - --mode=controller
+            - --location=$(INSPACE_LOCATION)
+            - --api-base-url=$(INSPACE_API_BASE_URL)
+          env:
+            - name: INSPACE_LOCATION
+              value: {{ .Values.global.inspace.location | quote }}
+            - name: INSPACE_API_BASE_URL
+              value: {{ .Values.global.inspace.apiBaseURL | quote }}
+            - name: INSPACE_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.global.inspace.apiSecret.name }}
+                  key: {{ .Values.global.inspace.apiSecret.tokenKey }}
+            - name: INSPACE_BILLING_ACCOUNT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.global.inspace.apiSecret.name }}
+                  key: {{ .Values.global.inspace.apiSecret.billingAccountIDKey }}
+            - name: INSPACE_ALLOW_REMOTE_MUTATIONS
+              value: "true"
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+          resources:
+            {{- toYaml .Values.csi.controller.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+            capabilities:
+              drop: ["ALL"]
+        - name: csi-provisioner
+          image: {{ .Values.csi.sidecars.provisioner.image }}
+          args:
+            - --csi-address=/csi/csi.sock
+            - --feature-gates=Topology=true
+            - --strict-topology
+            - --leader-election
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+        - name: csi-attacher
+          image: {{ .Values.csi.sidecars.attacher.image }}
+          args:
+            - --csi-address=/csi/csi.sock
+            - --leader-election
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+        - name: liveness-probe
+          image: {{ .Values.csi.sidecars.livenessProbe.image }}
+          args:
+            - --csi-address=/csi/csi.sock
+            - --health-port=9808
+          ports:
+            - name: healthz
+              containerPort: 9808
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: healthz
+            initialDelaySeconds: 10
+            timeoutSeconds: 3
+            periodSeconds: 10
+            failureThreshold: 5
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: socket-dir
+          emptyDir: {}
+{{- end }}

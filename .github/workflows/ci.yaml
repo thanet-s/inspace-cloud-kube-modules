@@ -1,0 +1,159 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  go:
+    name: Go / ${{ matrix.module }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        module:
+          - cloud-provider-inspace
+          - inspace-csi-driver
+          - karpenter-provider-inspace
+    steps:
+      - name: Check out source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: ${{ matrix.module }}/go.mod
+          cache: true
+          cache-dependency-path: ${{ matrix.module }}/go.sum
+
+      - name: Check formatting
+        working-directory: ${{ matrix.module }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          unformatted="$(gofmt -l .)"
+          if [[ -n "$unformatted" ]]; then
+            printf 'The following Go files are not formatted:\n%s\n' "$unformatted"
+            exit 1
+          fi
+
+      - name: Test
+        working-directory: ${{ matrix.module }}
+        env:
+          GOWORK: "off"
+        run: go test ./...
+
+      - name: Vet
+        working-directory: ${{ matrix.module }}
+        env:
+          GOWORK: "off"
+        run: go vet ./...
+
+      - name: Build commands
+        working-directory: ${{ matrix.module }}
+        env:
+          GOWORK: "off"
+        run: go build ./cmd/...
+
+  containers:
+    name: Container / ${{ matrix.image }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: inspace-cloud-controller-manager
+            context: cloud-provider-inspace
+            dockerfile: cloud-provider-inspace/Dockerfile
+          - image: inspace-csi-driver
+            context: .
+            dockerfile: inspace-csi-driver/Dockerfile
+          - image: karpenter-provider-inspace
+            context: .
+            dockerfile: karpenter-provider-inspace/Dockerfile
+    steps:
+      - name: Check out source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Build linux/amd64 image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/amd64
+          push: false
+          tags: local/${{ matrix.image }}:ci
+          cache-from: type=gha,scope=ci-${{ matrix.image }}
+          cache-to: type=gha,mode=max,scope=ci-${{ matrix.image }}
+
+  helm:
+    name: Helm
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Set up Helm
+        uses: azure/setup-helm@bf6a7d304bc2fdb57e0331155b7ebf2c504acf0a # v4
+        with:
+          version: v4.2.3
+
+      - name: Verify vendored CRDs
+        shell: bash
+        run: |
+          set -euo pipefail
+          for directory in \
+            cloud-provider-inspace \
+            inspace-csi-driver \
+            karpenter-provider-inspace \
+            charts/inspace-cloud-kube-modules \
+            charts/inspace-cloud-kube-modules-crds; do
+            cmp LICENSE "$directory/LICENSE"
+            cmp NOTICE "$directory/NOTICE"
+          done
+          sha256sum --check <<'EOF'
+          66fd5680b902b38fb9657ad2b432196a06c42b37d078e53be2e39909200a6342  charts/inspace-cloud-kube-modules-crds/templates/autoscaling.x-k8s.io_capacitybuffers.yaml
+          712e207ad9da26b95717b82bff8bc89a2b5fc048309f97207e407788b426faf9  charts/inspace-cloud-kube-modules-crds/templates/karpenter.sh_nodeclaims.yaml
+          f65f0f3edd3afe96dc2b6b4fa648982dab557af077d7ab22e6ec26207b6465ed  charts/inspace-cloud-kube-modules-crds/templates/karpenter.sh_nodeoverlays.yaml
+          62990043212a239704c0195bbd37abd0fddad90a586f5b37dfb403a0a0aefe1e  charts/inspace-cloud-kube-modules-crds/templates/karpenter.sh_nodepools.yaml
+          EOF
+          cmp cloud-provider-inspace/config/crd/bases/infrastructure.inspace.cloud_inspaceclusters.yaml \
+            charts/inspace-cloud-kube-modules-crds/templates/infrastructure.inspace.cloud_inspaceclusters.yaml
+          cmp karpenter-provider-inspace/config/crd/bases/karpenter.inspace.cloud_inspacenodeclasses.yaml \
+            charts/inspace-cloud-kube-modules-crds/templates/karpenter.inspace.cloud_inspacenodeclasses.yaml
+          test "$(grep -h '^kind: CustomResourceDefinition$' charts/inspace-cloud-kube-modules-crds/templates/*.yaml | wc -l | tr -d ' ')" = "6"
+
+      - name: Lint charts
+        run: |
+          helm lint charts/inspace-cloud-kube-modules-crds
+          helm lint charts/inspace-cloud-kube-modules \
+            --values charts/inspace-cloud-kube-modules/ci/test-values.yaml
+
+      - name: Render charts
+        run: |
+          helm template ci-crds charts/inspace-cloud-kube-modules-crds \
+            --include-crds >/tmp/inspace-crds.yaml
+          helm template ci charts/inspace-cloud-kube-modules \
+            --namespace kube-system \
+            --values charts/inspace-cloud-kube-modules/ci/test-values.yaml \
+            >/tmp/inspace.yaml
+          helm template ci-split charts/inspace-cloud-kube-modules \
+            --namespace kube-system \
+            --values charts/inspace-cloud-kube-modules/ci/test-values.yaml \
+            --set karpenter.namespace=karpenter \
+            --set karpenter.createNamespace=true \
+            >/tmp/inspace-split-namespace.yaml
+
+      - name: Validate full-cluster E2E shell syntax
+        run: bash -n test/e2e/run.sh

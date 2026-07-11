@@ -1,0 +1,29 @@
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: memory-amd
+spec:
+  limits:
+    cpu: "32"
+    memory: 128Gi
+  template:
+    spec:
+      nodeClassRef:
+        group: karpenter.inspace.cloud
+        kind: InSpaceNodeClass
+        name: ubuntu-workers-amd
+      requirements:
+        - key: inspace.cloud/instance-family
+          operator: In
+          values: [memory]
+        - key: inspace.cloud/host-class
+          operator: In
+          values: [amd-epyc]
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: [on-demand]
+  disruption:
+    consolidationPolicy: WhenEmpty
+    consolidateAfter: 5m
+    budgets:
+      - nodes: "1"

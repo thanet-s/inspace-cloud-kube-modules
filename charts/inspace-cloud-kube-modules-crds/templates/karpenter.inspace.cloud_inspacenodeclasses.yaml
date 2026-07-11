@@ -1,0 +1,170 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: inspacenodeclasses.karpenter.inspace.cloud
+spec:
+  group: karpenter.inspace.cloud
+  scope: Cluster
+  names:
+    plural: inspacenodeclasses
+    singular: inspacenodeclass
+    kind: InSpaceNodeClass
+    listKind: InSpaceNodeClassList
+    categories:
+      - karpenter
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Location
+          type: string
+          jsonPath: .spec.location
+        - name: Host Class
+          type: string
+          jsonPath: .spec.hostPoolSelector.class
+        - name: Ready
+          type: string
+          jsonPath: '.status.conditions[?(@.type=="Ready")].status'
+      schema:
+        openAPIV3Schema:
+          type: object
+          required:
+            - spec
+          properties:
+            apiVersion:
+              type: string
+            kind:
+              type: string
+            metadata:
+              type: object
+            spec:
+              type: object
+              additionalProperties: false
+              required:
+                - clusterName
+                - billingAccountID
+                - location
+                - networkUUID
+                - reservePublicIPv4
+                - firewallUUID
+                - imageSelector
+                - hostPoolSelector
+                - rootDiskGiB
+                - k3s
+              properties:
+                clusterName:
+                  type: string
+                  minLength: 1
+                  maxLength: 253
+                  pattern: '^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$'
+                billingAccountID:
+                  type: integer
+                  format: int64
+                  minimum: 1
+                location:
+                  type: string
+                  enum: [bkk01]
+                networkUUID:
+                  type: string
+                  format: uuid
+                reservePublicIPv4:
+                  type: boolean
+                  enum: [true]
+                firewallUUID:
+                  type: string
+                  format: uuid
+                imageSelector:
+                  type: object
+                  required: [osName, osVersion]
+                  additionalProperties: false
+                  properties:
+                    osName:
+                      type: string
+                      enum: [ubuntu]
+                    osVersion:
+                      type: string
+                      enum: ["24.04"]
+                hostPoolSelector:
+                  type: object
+                  required: [class]
+                  additionalProperties: false
+                  properties:
+                    class:
+                      type: string
+                      enum: [intel-scalable, amd-epyc]
+                rootDiskGiB:
+                  type: integer
+                  format: int32
+                  minimum: 30
+                  maximum: 2000
+                k3s:
+                  type: object
+                  required: [version, server, tokenSecretRef]
+                  additionalProperties: false
+                  properties:
+                    version:
+                      type: string
+                      pattern: '^v[0-9]+\.[0-9]+\.[0-9]+\+k3s[0-9]+$'
+                    server:
+                      type: string
+                      pattern: '^https://[A-Za-z0-9.-]+:6443$'
+                    tokenSecretRef:
+                      type: object
+                      required: [name, key]
+                      additionalProperties: false
+                      properties:
+                        name:
+                          type: string
+                          minLength: 1
+                          maxLength: 253
+                          enum: [inspace-k3s-agent-token]
+                        key:
+                          type: string
+                          minLength: 1
+                          enum: [token]
+                additionalUserData:
+                  type: string
+                  maxLength: 65536
+            status:
+              type: object
+              properties:
+                hostPoolUUID:
+                  type: string
+                firewallUUID:
+                  type: string
+                observedImageID:
+                  type: string
+                observedSpecHash:
+                  type: string
+                observedGeneration:
+                  type: integer
+                  format: int64
+                observedBillingAccountID:
+                  type: integer
+                  format: int64
+                conditions:
+                  type: array
+                  x-kubernetes-list-type: map
+                  x-kubernetes-list-map-keys: [type]
+                  items:
+                    type: object
+                    required: [lastTransitionTime, message, reason, status, type]
+                    properties:
+                      lastTransitionTime:
+                        type: string
+                        format: date-time
+                      message:
+                        type: string
+                      observedGeneration:
+                        type: integer
+                        format: int64
+                      reason:
+                        type: string
+                      status:
+                        type: string
+                        enum: ["True", "False", Unknown]
+                      type:
+                        type: string

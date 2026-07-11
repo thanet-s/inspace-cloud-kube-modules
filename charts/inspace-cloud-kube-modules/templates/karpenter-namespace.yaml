@@ -1,0 +1,11 @@
+{{- if and .Values.karpenter.enabled .Values.karpenter.createNamespace .Values.karpenter.namespace (ne .Values.karpenter.namespace .Release.Namespace) }}
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ include "inspace.karpenterNamespace" . }}
+  annotations:
+    helm.sh/resource-policy: keep
+  labels:
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    app.kubernetes.io/part-of: inspace-cloud-kube-modules
+{{- end }}

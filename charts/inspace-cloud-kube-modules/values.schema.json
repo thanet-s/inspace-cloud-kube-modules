@@ -1,0 +1,198 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "title": "inspace-cloud-kube-modules values",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["nameOverride", "fullnameOverride", "global", "ccm", "csi", "karpenter"],
+  "definitions": {
+    "image": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository", "tag", "digest", "pullPolicy"],
+      "properties": {
+        "repository": {"type": "string", "minLength": 1},
+        "tag": {"type": "string"},
+        "digest": {"type": "string", "pattern": "^(|sha256:[a-f0-9]{64})$"},
+        "pullPolicy": {"type": "string", "enum": ["Always", "IfNotPresent", "Never"]}
+      }
+    },
+    "serviceAccount": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["create", "name", "annotations"],
+      "properties": {
+        "create": {"type": "boolean"},
+        "name": {"type": "string"},
+        "annotations": {"type": "object", "additionalProperties": {"type": "string"}}
+      }
+    },
+    "resources": {"type": "object", "additionalProperties": true},
+    "stringMap": {"type": "object", "additionalProperties": {"type": "string"}},
+    "objectArray": {"type": "array", "items": {"type": "object"}}
+  },
+  "properties": {
+    "nameOverride": {"type": "string", "maxLength": 63},
+    "fullnameOverride": {"type": "string", "maxLength": 63},
+    "global": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["imagePullSecrets", "inspace"],
+      "properties": {
+        "imagePullSecrets": {"$ref": "#/definitions/objectArray"},
+        "inspace": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["apiBaseURL", "location", "region", "networkUUID", "clusterID", "apiSecret"],
+          "properties": {
+            "apiBaseURL": {"type": "string", "pattern": "^https://"},
+            "location": {"type": "string", "enum": ["bkk01"]},
+            "region": {"type": "string", "minLength": 1},
+            "networkUUID": {"type": "string", "pattern": "^(|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$"},
+            "clusterID": {"type": "string", "maxLength": 63, "pattern": "^(|[a-z0-9]([-a-z0-9]*[a-z0-9])?)$"},
+            "apiSecret": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["name", "tokenKey", "billingAccountIDKey"],
+              "properties": {
+                "name": {"type": "string", "minLength": 1, "maxLength": 253},
+                "tokenKey": {"type": "string", "minLength": 1},
+                "billingAccountIDKey": {"type": "string", "minLength": 1}
+              }
+            }
+          }
+        }
+      }
+    },
+    "ccm": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "replicaCount", "image", "serviceAccount", "priorityClassName", "hostNetwork", "podAnnotations", "podLabels", "nodeSelector", "tolerations", "affinity", "resources", "extraArgs", "extraEnv"],
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "replicaCount": {"type": "integer", "minimum": 1, "maximum": 10},
+        "image": {"$ref": "#/definitions/image"},
+        "serviceAccount": {"$ref": "#/definitions/serviceAccount"},
+        "priorityClassName": {"type": "string"},
+        "hostNetwork": {"type": "boolean"},
+        "podAnnotations": {"$ref": "#/definitions/stringMap"},
+        "podLabels": {"$ref": "#/definitions/stringMap"},
+        "nodeSelector": {"$ref": "#/definitions/stringMap"},
+        "tolerations": {"$ref": "#/definitions/objectArray"},
+        "affinity": {"type": "object"},
+        "resources": {"$ref": "#/definitions/resources"},
+        "extraArgs": {"type": "array", "items": {"type": "string"}},
+        "extraEnv": {"$ref": "#/definitions/objectArray"}
+      }
+    },
+    "csi": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "image", "controller", "node", "sidecars", "storageClass"],
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "image": {"$ref": "#/definitions/image"},
+        "controller": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["replicaCount", "serviceAccount", "priorityClassName", "podAnnotations", "podLabels", "nodeSelector", "tolerations", "affinity", "resources"],
+          "properties": {
+            "replicaCount": {"type": "integer", "minimum": 1, "maximum": 10},
+            "serviceAccount": {"$ref": "#/definitions/serviceAccount"},
+            "priorityClassName": {"type": "string"},
+            "podAnnotations": {"$ref": "#/definitions/stringMap"},
+            "podLabels": {"$ref": "#/definitions/stringMap"},
+            "nodeSelector": {"$ref": "#/definitions/stringMap"},
+            "tolerations": {"$ref": "#/definitions/objectArray"},
+            "affinity": {"type": "object"},
+            "resources": {"$ref": "#/definitions/resources"}
+          }
+        },
+        "node": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["serviceAccount", "priorityClassName", "podAnnotations", "podLabels", "kubeletDir", "nodeSelector", "tolerations", "resources"],
+          "properties": {
+            "serviceAccount": {"$ref": "#/definitions/serviceAccount"},
+            "priorityClassName": {"type": "string"},
+            "podAnnotations": {"$ref": "#/definitions/stringMap"},
+            "podLabels": {"$ref": "#/definitions/stringMap"},
+            "kubeletDir": {"type": "string", "pattern": "^/"},
+            "nodeSelector": {"$ref": "#/definitions/stringMap"},
+            "tolerations": {"$ref": "#/definitions/objectArray"},
+            "resources": {"$ref": "#/definitions/resources"}
+          }
+        },
+        "sidecars": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["provisioner", "attacher", "registrar", "livenessProbe"],
+          "properties": {
+            "provisioner": {"type": "object", "additionalProperties": false, "required": ["image"], "properties": {"image": {"type": "string", "minLength": 1}}},
+            "attacher": {"type": "object", "additionalProperties": false, "required": ["image"], "properties": {"image": {"type": "string", "minLength": 1}}},
+            "registrar": {"type": "object", "additionalProperties": false, "required": ["image"], "properties": {"image": {"type": "string", "minLength": 1}}},
+            "livenessProbe": {"type": "object", "additionalProperties": false, "required": ["image"], "properties": {"image": {"type": "string", "minLength": 1}}}
+          }
+        },
+        "storageClass": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["create", "name", "annotations", "reclaimPolicy", "volumeBindingMode", "fsType"],
+          "properties": {
+            "create": {"type": "boolean"},
+            "name": {"type": "string", "minLength": 1},
+            "annotations": {"$ref": "#/definitions/stringMap"},
+            "reclaimPolicy": {"type": "string", "enum": ["Delete", "Retain"]},
+            "volumeBindingMode": {"type": "string", "enum": ["Immediate", "WaitForFirstConsumer"]},
+            "fsType": {"type": "string", "enum": ["ext4"]}
+          }
+        }
+      }
+    },
+    "karpenter": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "namespace", "createNamespace", "replicaCount", "image", "serviceAccount", "clusterName", "defaultNodeClass", "agentTokenSecret", "featureGates", "logLevel", "priorityClassName", "podAnnotations", "podLabels", "nodeSelector", "tolerations", "affinity", "resources", "extraEnv"],
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "namespace": {"type": "string", "maxLength": 63, "pattern": "^(|[a-z0-9]([-a-z0-9]*[a-z0-9])?)$"},
+        "createNamespace": {"type": "boolean"},
+        "replicaCount": {"type": "integer", "minimum": 1, "maximum": 10},
+        "image": {"$ref": "#/definitions/image"},
+        "serviceAccount": {"$ref": "#/definitions/serviceAccount"},
+        "clusterName": {"type": "string", "maxLength": 253, "pattern": "^(|[a-z0-9]([-a-z0-9.]*[a-z0-9])?)$"},
+        "defaultNodeClass": {"type": "string", "maxLength": 253, "pattern": "^(|[a-z0-9]([-a-z0-9.]*[a-z0-9])?)$"},
+        "agentTokenSecret": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["create", "token"],
+          "properties": {
+            "create": {"type": "boolean"},
+            "token": {"type": "string"}
+          }
+        },
+        "featureGates": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["reservedCapacity", "nodeOverlay", "staticCapacity", "spotToSpotConsolidation", "nodeRepair", "capacityBuffer"],
+          "properties": {
+            "reservedCapacity": {"type": "boolean"},
+            "nodeOverlay": {"type": "boolean"},
+            "staticCapacity": {"type": "boolean"},
+            "spotToSpotConsolidation": {"type": "boolean"},
+            "nodeRepair": {"type": "boolean"},
+            "capacityBuffer": {"type": "boolean"}
+          }
+        },
+        "logLevel": {"type": "string", "enum": ["debug", "info", "error"]},
+        "priorityClassName": {"type": "string"},
+        "podAnnotations": {"$ref": "#/definitions/stringMap"},
+        "podLabels": {"$ref": "#/definitions/stringMap"},
+        "nodeSelector": {"$ref": "#/definitions/stringMap"},
+        "tolerations": {"$ref": "#/definitions/objectArray"},
+        "affinity": {"type": "object"},
+        "resources": {"$ref": "#/definitions/resources"},
+        "extraEnv": {"$ref": "#/definitions/objectArray"}
+      }
+    }
+  }
+}

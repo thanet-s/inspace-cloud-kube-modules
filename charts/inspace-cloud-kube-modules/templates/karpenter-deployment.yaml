@@ -1,0 +1,138 @@
+{{- if .Values.karpenter.enabled }}
+{{- $component := "karpenter" }}
+{{- $name := include "inspace.componentName" (dict "root" . "component" $component) }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  namespace: {{ include "inspace.karpenterNamespace" . }}
+  labels:
+    {{- include "inspace.componentLabels" (dict "root" . "component" $component) | nindent 4 }}
+spec:
+  replicas: {{ .Values.karpenter.replicaCount }}
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      {{- include "inspace.selectorLabels" (dict "root" . "component" $component) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "inspace.selectorLabels" (dict "root" . "component" $component) | nindent 8 }}
+        {{- with .Values.karpenter.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.karpenter.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "inspace.serviceAccountName" (dict "root" . "component" $component "serviceAccount" .Values.karpenter.serviceAccount) }}
+      priorityClassName: {{ .Values.karpenter.priorityClassName | quote }}
+      terminationGracePeriodSeconds: 30
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.karpenter.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.karpenter.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.karpenter.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: controller
+          image: {{ include "inspace.image" (dict "root" . "image" .Values.karpenter.image) }}
+          imagePullPolicy: {{ .Values.karpenter.image.pullPolicy }}
+          env:
+            - name: INSPACE_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.global.inspace.apiSecret.name }}
+                  key: {{ .Values.global.inspace.apiSecret.tokenKey }}
+            - name: INSPACE_API_BASE_URL
+              value: {{ .Values.global.inspace.apiBaseURL | quote }}
+            - name: INSPACE_LOCATION
+              value: {{ .Values.global.inspace.location | quote }}
+            - name: INSPACE_CLUSTER_NAME
+              value: {{ .Values.karpenter.clusterName | quote }}
+            - name: INSPACE_DEFAULT_NODECLASS
+              value: {{ .Values.karpenter.defaultNodeClass | quote }}
+            - name: INSPACE_SECRET_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: INSPACE_ALLOW_REMOTE_MUTATIONS
+              value: "true"
+            - name: KUBERNETES_MIN_VERSION
+              value: "1.30.0-0"
+            - name: KARPENTER_SERVICE
+              value: {{ $name | quote }}
+            - name: SYSTEM_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: LEADER_ELECTION_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: MEMORY_LIMIT
+              valueFrom:
+                resourceFieldRef:
+                  containerName: controller
+                  resource: limits.memory
+            - name: CPU_REQUESTS
+              valueFrom:
+                resourceFieldRef:
+                  containerName: controller
+                  divisor: 1m
+                  resource: requests.cpu
+            - name: FEATURE_GATES
+              value: {{ printf "NodeRepair=%t,ReservedCapacity=%t,SpotToSpotConsolidation=%t,NodeOverlay=%t,StaticCapacity=%t,CapacityBuffer=%t" .Values.karpenter.featureGates.nodeRepair .Values.karpenter.featureGates.reservedCapacity .Values.karpenter.featureGates.spotToSpotConsolidation .Values.karpenter.featureGates.nodeOverlay .Values.karpenter.featureGates.staticCapacity .Values.karpenter.featureGates.capacityBuffer | quote }}
+            - name: LOG_LEVEL
+              value: {{ .Values.karpenter.logLevel | quote }}
+            - name: METRICS_PORT
+              value: "8080"
+            - name: HEALTH_PROBE_PORT
+              value: "8081"
+            {{- with .Values.karpenter.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - name: metrics
+              containerPort: 8080
+              protocol: TCP
+            - name: health
+              containerPort: 8081
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            initialDelaySeconds: 5
+            timeoutSeconds: 30
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            initialDelaySeconds: 30
+            timeoutSeconds: 30
+          resources:
+            {{- toYaml .Values.karpenter.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+{{- end }}

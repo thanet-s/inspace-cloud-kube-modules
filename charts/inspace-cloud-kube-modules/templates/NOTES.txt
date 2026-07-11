@@ -1,0 +1,45 @@
+{{- $karpenterNamespace := include "inspace.karpenterNamespace" . -}}
+InSpace Cloud Kubernetes Modules {{ .Chart.AppVersion }} is installed.
+
+Credential contract
+-------------------
+All enabled cloud controllers read exactly one existing Secret:
+  namespace: {{ .Release.Namespace }}
+  name:      {{ .Values.global.inspace.apiSecret.name }}
+  token key: {{ .Values.global.inspace.apiSecret.tokenKey }}
+  billing:   {{ .Values.global.inspace.apiSecret.billingAccountIDKey }}
+
+The chart never creates that Secret. If it does not exist, create it without
+placing credentials in a values file or shell history:
+
+  kubectl -n {{ .Release.Namespace }} create secret generic {{ .Values.global.inspace.apiSecret.name }} \
+    --from-file={{ .Values.global.inspace.apiSecret.tokenKey }}=/secure/path/inspace-api-token \
+    --from-file={{ .Values.global.inspace.apiSecret.billingAccountIDKey }}=/secure/path/inspace-billing-account-id
+
+{{- if .Values.karpenter.enabled }}
+Karpenter also requires an independent K3s agent token at the fixed contract:
+  Secret/{{ "inspace-k3s-agent-token" }} key {{ "token" }} in {{ $karpenterNamespace }}
+{{- if not .Values.karpenter.agentTokenSecret.create }}
+
+  kubectl -n {{ $karpenterNamespace }} create secret generic inspace-k3s-agent-token \
+    --from-file=token=/secure/path/k3s-agent-token
+{{- end }}
+{{- if ne $karpenterNamespace .Release.Namespace }}
+
+Kubernetes cannot reference a Secret across namespaces. Because Karpenter is
+configured for {{ $karpenterNamespace }}, create the same cloud API Secret
+contract there as well (the chart will not copy credential data):
+
+  kubectl -n {{ $karpenterNamespace }} create secret generic {{ .Values.global.inspace.apiSecret.name }} \
+    --from-file={{ .Values.global.inspace.apiSecret.tokenKey }}=/secure/path/inspace-api-token \
+    --from-file={{ .Values.global.inspace.apiSecret.billingAccountIDKey }}=/secure/path/inspace-billing-account-id
+{{- end }}
+{{- end }}
+
+Check the controllers:
+  kubectl get pods -A -l app.kubernetes.io/part-of=inspace-cloud-kube-modules
+
+CRDs are released separately and must be upgraded before this chart:
+  helm upgrade --install inspace-cloud-kube-modules-crds \
+    oci://ghcr.io/thanet-s/charts/inspace-cloud-kube-modules-crds \
+    --version {{ .Chart.Version }}

@@ -1,0 +1,40 @@
+apiVersion: infrastructure.inspace.cloud/v1alpha1
+kind: InSpaceCluster
+metadata:
+  name: example
+  namespace: inspace-system
+spec:
+  location: bkk01
+  billingAccountID: 12345
+  credentialsSecretRef:
+    name: inspace-api
+    key: apikey
+  controlPlane:
+    replicas: 3
+    machine:
+      vcpu: 4
+      memoryMiB: 8192
+      rootDiskGiB: 60
+      hostPoolUUID: aac7dd66-f390-4edd-80c0-dd7cae49bd99
+      image:
+        osName: ubuntu
+        osVersion: "24.04"
+  k3s:
+    version: v1.35.6+k3s1
+    tokenSecretRef:
+      name: example-k3s-token
+      key: token
+    disable:
+      - servicelb
+  network:
+    uuid: 11111111-2222-3333-4444-555555555555
+    podCIDR: 10.42.0.0/16
+    serviceCIDR: 10.43.0.0/16
+  firewall:
+    managed: true
+  publicIPv4:
+    managed: true
+  endpoint:
+    host: api.example.invalid
+    port: 6443
+    public: true
