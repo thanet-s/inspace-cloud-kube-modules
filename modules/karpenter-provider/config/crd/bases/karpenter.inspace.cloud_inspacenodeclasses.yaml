@@ -42,7 +42,6 @@ spec:
               type: object
             spec:
               type: object
-              additionalProperties: false
               required:
                 - clusterName
                 - billingAccountID
@@ -79,7 +78,6 @@ spec:
                 imageSelector:
                   type: object
                   required: [osName, osVersion]
-                  additionalProperties: false
                   properties:
                     osName:
                       type: string
@@ -90,7 +88,6 @@ spec:
                 hostPoolSelector:
                   type: object
                   required: [class]
-                  additionalProperties: false
                   properties:
                     class:
                       type: string
@@ -103,7 +100,6 @@ spec:
                 k3s:
                   type: object
                   required: [version, server, tokenSecretRef]
-                  additionalProperties: false
                   properties:
                     version:
                       type: string
@@ -114,7 +110,6 @@ spec:
                     tokenSecretRef:
                       type: object
                       required: [name, key]
-                      additionalProperties: false
                       properties:
                         name:
                           type: string
