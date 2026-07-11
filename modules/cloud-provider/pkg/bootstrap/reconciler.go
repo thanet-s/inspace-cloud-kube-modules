@@ -281,9 +281,21 @@ func (r *Reconciler) Destroy(ctx context.Context, cluster *v1alpha1.InSpaceClust
 			return result, err
 		}
 		if firewall != nil {
-			if firewall.Description != "Managed K3s node firewall for "+owner ||
-				(firewall.BillingAccountID != 0 && firewall.BillingAccountID != cluster.Spec.BillingAccountID) {
+			expectedDescription := "Managed K3s node firewall for " + owner
+			// The live InSpace API currently returns a null/empty firewall
+			// description even when it accepted one on create. Enforce it when
+			// preserved, then fall back to the deterministic name, billing
+			// account, and exact safe policy that the API does preserve.
+			if (firewall.Description != "" && firewall.Description != expectedDescription) ||
+				firewall.BillingAccountID != cluster.Spec.BillingAccountID {
 				return result, errors.New("bootstrap: refusing to delete firewall without the expected ownership record")
+			}
+			network, networkErr := r.API.GetNetwork(ctx, cluster.Spec.Location, cluster.Spec.Network.UUID)
+			if networkErr != nil {
+				return result, networkErr
+			}
+			if policyErr := validateFirewallPolicy(firewall, network.Subnet, r.ManagementCIDR, r.ManagementTCPPorts); policyErr != nil {
+				return result, fmt.Errorf("bootstrap: refusing to delete firewall with mismatched policy: %w", policyErr)
 			}
 			result.Remaining = append(result.Remaining, "firewall/"+firewall.EffectiveName())
 		}
@@ -582,7 +594,7 @@ func (r *Reconciler) ensureAPILoadBalancer(ctx context.Context, cluster *v1alpha
 		DisplayName: name, BillingAccountID: cluster.Spec.BillingAccountID, NetworkUUID: cluster.Spec.Network.UUID,
 		ReservePublicIP: false,
 		Rules:           []inspace.LoadBalancerRule{{Protocol: "TCP", SourcePort: 6443, TargetPort: 6443}},
-		Targets:         nil,
+		Targets:         []inspace.LoadBalancerTarget{},
 	})
 }
 
@@ -662,6 +674,9 @@ func managedFirewallRules(subnet, managementCIDR string, managementTCPPorts []in
 func validateFirewallPolicy(firewall *inspace.Firewall, subnet, managementCIDR string, managementTCPPorts []int) error {
 	if firewall == nil {
 		return errors.New("bootstrap: firewall is required")
+	}
+	if err := validateManagementAccess(managementCIDR, managementTCPPorts); err != nil {
+		return err
 	}
 	network, err := netip.ParsePrefix(subnet)
 	if err != nil {

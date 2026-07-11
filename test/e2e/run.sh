@@ -66,6 +66,14 @@ kubeconfig=$state_dir/kubeconfig.yaml
 known_hosts=$state_dir/known_hosts
 k3s_token_file=$state_dir/k3s-token
 controller_bin=$state_dir/inspace-cluster-controller
+controller_child_pid=""
+bootstrap_timeout_seconds=2700
+raw_cleanup_attempts=90
+raw_cleanup_interval_seconds=10
+raw_cleanup_timeout_seconds=900
+kubernetes_reachability_timeout_seconds=300
+kubernetes_quiesce_timeout_seconds=1800
+kubernetes_quiesce_attempts=6
 touch "$known_hosts"
 chmod 600 "$known_hosts"
 
@@ -126,7 +134,8 @@ jq -n \
   --arg version "$INSPACE_E2E_VERSION" \
   '{runID:$runID,owner:$owner,clusterName:$clusterName,clusterResourceName:$clusterResourceName,
     clusterResourceNamespace:$clusterResourceNamespace,nodeClassName:$nodeClassName,nodePoolName:$nodePoolName,
-    managementCIDR:$managementCIDR,version:$version,workerFloatingIPNames:[]}' >"$state_file"
+    managementCIDR:$managementCIDR,version:$version,workerFloatingIPNames:[],kubernetesOwnersPossible:false}' >"$state_file"
+chmod 600 "$state_file"
 
 cat >"$cluster_file" <<EOF
 apiVersion: infrastructure.inspace.cloud/v1alpha1
@@ -193,6 +202,35 @@ wait_until() {
   done
 }
 
+remaining_timeout_seconds() {
+  local deadline=$1
+  local maximum=$2
+  local remaining=$((deadline - SECONDS))
+  (( remaining > 0 )) || return 1
+  if (( remaining > maximum )); then
+    remaining=$maximum
+  fi
+  printf '%d\n' "$remaining"
+}
+
+wait_until_deadline() {
+  local deadline=$1
+  local description=$2
+  local sleep_seconds
+  shift 2
+  until "$@"; do
+    if (( SECONDS >= deadline )); then
+      echo "timed out waiting for $description" >&2
+      return 1
+    fi
+    sleep_seconds=$((deadline - SECONDS))
+    if (( sleep_seconds > 10 )); then
+      sleep_seconds=10
+    fi
+    sleep "$sleep_seconds"
+  done
+}
+
 ssh_ready() {
   local ip=$1
   local scan=$state_dir/known-host-$ip
@@ -205,56 +243,228 @@ ssh_ready() {
 }
 
 kubectl_available() {
-  kubectl --request-timeout=10s get --raw=/readyz >/dev/null 2>&1
+  local timeout_seconds=${1:-10}
+  kubectl --request-timeout="${timeout_seconds}s" get --raw=/readyz >/dev/null 2>&1
+}
+
+wait_for_kubernetes_available_until() {
+  local deadline=$1
+  local timeout_seconds sleep_seconds
+  while (( SECONDS < deadline )); do
+    timeout_seconds=$(remaining_timeout_seconds "$deadline" 10) || break
+    if kubectl_available "$timeout_seconds"; then
+      return 0
+    fi
+    sleep_seconds=$((deadline - SECONDS))
+    if (( sleep_seconds > 10 )); then
+      sleep_seconds=10
+    fi
+    if (( sleep_seconds > 0 )); then
+      sleep "$sleep_seconds"
+    fi
+  done
+  echo "timed out waiting for the Kubernetes API to become reachable" >&2
+  return 1
 }
 
 e2e_pods_absent() {
-  local pods
-  pods=$(kubectl -n default get pods -l 'app in (inspace-e2e-web,inspace-e2e-trigger)' -o json 2>/dev/null) || return 1
+  local deadline=${1:-$((SECONDS + 10))}
+  local pods timeout_seconds
+  timeout_seconds=$(remaining_timeout_seconds "$deadline" 10) || return 1
+  pods=$(kubectl --request-timeout="${timeout_seconds}s" -n default get pods \
+    -l 'app in (inspace-e2e-web,inspace-e2e-trigger)' -o json 2>/dev/null) || return 1
   jq -e '.items | length == 0' >/dev/null <<<"$pods"
 }
 
 pv_and_attachments_absent() {
-  local pv attachments
+  local deadline=${1:-$((SECONDS + 10))}
+  local pv pv_name attachments timeout_seconds
   pv=$(jq -r '.pvName // ""' "$state_file")
   [[ -n $pv ]] || return 0
-  if kubectl get pv "$pv" >/dev/null 2>&1; then
+  timeout_seconds=$(remaining_timeout_seconds "$deadline" 10) || return 1
+  pv_name=$(kubectl --request-timeout="${timeout_seconds}s" get pv "$pv" \
+    --ignore-not-found -o name) || return 1
+  if [[ -n $pv_name ]]; then
     return 1
   fi
-  attachments=$(kubectl get volumeattachments -o json 2>/dev/null) || return 1
+  timeout_seconds=$(remaining_timeout_seconds "$deadline" 10) || return 1
+  attachments=$(kubectl --request-timeout="${timeout_seconds}s" get volumeattachments -o json 2>/dev/null) || return 1
   jq -e --arg pv "$pv" 'all(.items[]; .spec.source.persistentVolumeName != $pv)' >/dev/null <<<"$attachments"
 }
 
 owned_nodeclaims_absent() {
-  local claims
-  claims=$(kubectl get nodeclaims -l "karpenter.sh/nodepool=$nodepool_name" -o json 2>/dev/null) || return 1
+  local deadline=${1:-$((SECONDS + 10))}
+  local claims timeout_seconds
+  timeout_seconds=$(remaining_timeout_seconds "$deadline" 10) || return 1
+  claims=$(kubectl --request-timeout="${timeout_seconds}s" get nodeclaims \
+    -l "karpenter.sh/nodepool=$nodepool_name" -o json 2>/dev/null) || return 1
   jq -e '.items | length == 0' >/dev/null <<<"$claims"
+}
+
+persist_service_ownership_from_cluster() {
+  local deadline=${1:-$((SECONDS + 10))}
+  local service_json service_uid expected_lb expected_ip current_lb current_ip timeout_seconds
+  timeout_seconds=$(remaining_timeout_seconds "$deadline" 10) || return 1
+  service_json=$(kubectl --request-timeout="${timeout_seconds}s" -n default get service inspace-e2e-web \
+    --ignore-not-found -o json) || return 1
+  if [[ -z $service_json ]]; then
+    return 0
+  fi
+  service_uid=$(jq -r '.metadata.uid // ""' <<<"$service_json") || return 1
+  [[ -n $service_uid ]] || { echo "refusing to persist Service ownership without a UID" >&2; return 1; }
+  expected_lb="k8s-$(sha16 "$cluster_name")-$(sha16 "$service_uid")"
+  expected_ip="$expected_lb-ip"
+  current_lb=$(jq -r '.serviceLoadBalancerName // ""' "$state_file") || return 1
+  current_ip=$(jq -r '.serviceFloatingIPName // ""' "$state_file") || return 1
+  if [[ -n $current_lb && $current_lb != "$expected_lb" ]] || [[ -n $current_ip && $current_ip != "$expected_ip" ]]; then
+    echo "refusing to replace mismatched Service ownership in E2E state" >&2
+    return 1
+  fi
+  state_update '. + {serviceUID:$uid,serviceLoadBalancerName:$lb,serviceFloatingIPName:$ip}' \
+    --arg uid "$service_uid" --arg lb "$expected_lb" --arg ip "$expected_ip"
+}
+
+persist_pvc_ownership_from_cluster() {
+  local deadline=${1:-$((SECONDS + 10))}
+  local pvc_json pvc_uid expected_disk current_uid current_disk discovered_pv timeout_seconds
+  timeout_seconds=$(remaining_timeout_seconds "$deadline" 10) || return 1
+  pvc_json=$(kubectl --request-timeout="${timeout_seconds}s" -n default get pvc inspace-e2e-rwo \
+    --ignore-not-found -o json) || return 1
+  if [[ -z $pvc_json ]]; then
+    return 0
+  fi
+  pvc_uid=$(jq -r '.metadata.uid // ""' <<<"$pvc_json") || return 1
+  [[ -n $pvc_uid ]] || { echo "refusing to persist PVC ownership without a UID" >&2; return 1; }
+  expected_disk="pvc-$pvc_uid"
+  current_uid=$(jq -r '.pvcUID // ""' "$state_file") || return 1
+  current_disk=$(jq -r '.pvcDiskName // ""' "$state_file") || return 1
+  if [[ -n $current_uid && $current_uid != "$pvc_uid" ]] || [[ -n $current_disk && $current_disk != "$expected_disk" ]]; then
+    echo "refusing to replace mismatched PVC ownership in E2E state" >&2
+    return 1
+  fi
+  discovered_pv=$(jq -r '.spec.volumeName // ""' <<<"$pvc_json") || return 1
+  state_update '. + {pvcUID:$uid,pvcDiskName:$disk} | if $pv == "" then . else .pvName=$pv end' \
+    --arg uid "$pvc_uid" --arg disk "$expected_disk" --arg pv "$discovered_pv"
+}
+
+validate_worker_records() {
+  local records=$1
+  local uuid_pattern='^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+  if ! jq -e --arg prefix "$nodepool_name-" --arg uuidPattern "$uuid_pattern" '
+      type == "array" and all(.[];
+        (.uuid | type) == "string" and (.uuid | test($uuidPattern)) and
+        (.name | type) == "string" and (.name | startswith($prefix)) and (.name | length) > ($prefix | length) and
+        (.fip | type) == "string" and (.fip | startswith($prefix)) and (.fip | length) > ($prefix | length))' \
+      >/dev/null <<<"$records"; then
+    echo "refusing invalid persisted worker ownership record" >&2
+    return 2
+  fi
+}
+
+persist_worker_ownership_from_cloud() {
+  local all_vms matching invalid_workers discovered current combined merged fips
+  all_vms=$(api_get user-resource/vm/list) || return 1
+  matching=$(jq -c --arg cluster "$cluster_name" --arg prefix "$nodepool_name-" '[.[] | . as $vm |
+    ((((.description // "{}") | fromjson?) // {})) as $record |
+    select($record.cluster==$cluster or (($vm.name // "") | startswith($prefix))) |
+    {vm:$vm,record:$record}] | sort_by(.vm.name)' <<<"$all_vms") || return 1
+  invalid_workers=$(jq --arg cluster "$cluster_name" --arg prefix "$nodepool_name-" '[.[] | select(
+    .record.schema != "karpenter.inspace.cloud/v1" or .record.cluster != $cluster or
+    .record.nodeClaim != .vm.name or ((.vm.name // "") | startswith($prefix) | not) or
+    ((.record.floatingIPName // "") | startswith($prefix) | not))] | length' <<<"$matching") || return 1
+  if [[ $invalid_workers != 0 ]]; then
+    echo "refusing to persist incomplete or mismatched worker cloud ownership" >&2
+    return 2
+  fi
+  discovered=$(jq -c '[.[] | {uuid:.vm.uuid,name:.vm.name,fip:.record.floatingIPName}]' <<<"$matching") || return 1
+  current=$(jq -c '.workerVMs // []' "$state_file") || return 1
+  validate_worker_records "$discovered" || return 2
+  validate_worker_records "$current" || return 2
+  combined=$(jq -c -n --argjson current "$current" --argjson discovered "$discovered" '$current + $discovered') || return 1
+  if ! jq -e 'group_by(.uuid) | all(map([.name,.fip]) | unique | length == 1)' >/dev/null <<<"$combined"; then
+    echo "refusing conflicting persisted worker UUID ownership" >&2
+    return 2
+  fi
+  merged=$(jq -c 'unique_by(.uuid) | sort_by([.name,.uuid])' <<<"$combined") || return 1
+  fips=$(jq -c '[.[].fip] | unique' <<<"$merged") || return 1
+  state_update '.workerVMs=$workers | .workerFloatingIPNames=$fips' --argjson workers "$merged" --argjson fips "$fips"
 }
 
 # Quiesce every Kubernetes owner before removing controllers or falling back
 # to raw cloud cleanup. This prevents CSI detach/delete and Karpenter deletion
 # from racing mounted pods or recreating resources after the audit.
 kubernetes_e2e_quiesce() {
-  local discovered_pv
-  kubectl -n default delete service inspace-e2e-web --ignore-not-found --wait=true --timeout=10m >/dev/null || return 1
-  kubectl -n default delete deployment inspace-e2e-web inspace-e2e-trigger --ignore-not-found --wait=true --timeout=10m >/dev/null || return 1
-  wait_until 300 "E2E workload pods to terminate" e2e_pods_absent || return 1
-  if kubectl -n default get pvc inspace-e2e-rwo >/dev/null 2>&1; then
-    discovered_pv=$(kubectl -n default get pvc inspace-e2e-rwo -o jsonpath='{.spec.volumeName}') || return 1
+  local deadline=$1
+  local crd_name discovered_pv pvc_json timeout_seconds
+  (( SECONDS < deadline )) || return 124
+  persist_service_ownership_from_cluster "$deadline" || return 1
+  (( SECONDS < deadline )) || return 124
+  persist_pvc_ownership_from_cluster "$deadline" || return 1
+  (( SECONDS < deadline )) || return 124
+  persist_worker_ownership_from_cloud || return 1
+  timeout_seconds=$(remaining_timeout_seconds "$deadline" 600) || return 124
+  kubectl --request-timeout="${timeout_seconds}s" -n default delete service inspace-e2e-web \
+    --ignore-not-found --wait=true --timeout="${timeout_seconds}s" >/dev/null || return 1
+  timeout_seconds=$(remaining_timeout_seconds "$deadline" 600) || return 124
+  kubectl --request-timeout="${timeout_seconds}s" -n default delete deployment inspace-e2e-web inspace-e2e-trigger \
+    --ignore-not-found --wait=true --timeout="${timeout_seconds}s" >/dev/null || return 1
+  wait_until_deadline "$deadline" "E2E workload pods to terminate" e2e_pods_absent "$deadline" || return 1
+  timeout_seconds=$(remaining_timeout_seconds "$deadline" 10) || return 124
+  pvc_json=$(kubectl --request-timeout="${timeout_seconds}s" -n default get pvc inspace-e2e-rwo \
+    --ignore-not-found -o json) || return 1
+  if [[ -n $pvc_json ]]; then
+    discovered_pv=$(jq -r '.spec.volumeName // ""' <<<"$pvc_json") || return 1
     if [[ -n $discovered_pv ]]; then
       state_update '.pvName=$pv' --arg pv "$discovered_pv" || return 1
     fi
   fi
-  kubectl -n default delete pvc inspace-e2e-rwo --ignore-not-found --wait=true --timeout=10m >/dev/null || return 1
-  wait_until 600 "E2E PV and VolumeAttachment deletion" pv_and_attachments_absent || return 1
+  timeout_seconds=$(remaining_timeout_seconds "$deadline" 600) || return 124
+  kubectl --request-timeout="${timeout_seconds}s" -n default delete pvc inspace-e2e-rwo \
+    --ignore-not-found --wait=true --timeout="${timeout_seconds}s" >/dev/null || return 1
+  wait_until_deadline "$deadline" "E2E PV and VolumeAttachment deletion" \
+    pv_and_attachments_absent "$deadline" || return 1
 
-  if kubectl get crd nodepools.karpenter.sh >/dev/null 2>&1; then
-    kubectl delete nodepool "$nodepool_name" --ignore-not-found --wait=true --timeout=15m >/dev/null || return 1
-    wait_until 600 "owned Karpenter NodeClaims to terminate" owned_nodeclaims_absent || return 1
+  (( SECONDS < deadline )) || return 124
+  persist_worker_ownership_from_cloud || return 1
+  timeout_seconds=$(remaining_timeout_seconds "$deadline" 10) || return 124
+  crd_name=$(kubectl --request-timeout="${timeout_seconds}s" get crd nodepools.karpenter.sh \
+    --ignore-not-found -o name) || return 1
+  if [[ -n $crd_name ]]; then
+    timeout_seconds=$(remaining_timeout_seconds "$deadline" 900) || return 124
+    kubectl --request-timeout="${timeout_seconds}s" delete nodepool "$nodepool_name" \
+      --ignore-not-found --wait=true --timeout="${timeout_seconds}s" >/dev/null || return 1
+    wait_until_deadline "$deadline" "owned Karpenter NodeClaims to terminate" \
+      owned_nodeclaims_absent "$deadline" || return 1
   fi
-  if kubectl get crd inspacenodeclasses.karpenter.inspace.cloud >/dev/null 2>&1; then
-    kubectl delete inspacenodeclass "$nodeclass_name" --ignore-not-found --wait=true --timeout=5m >/dev/null || return 1
+  timeout_seconds=$(remaining_timeout_seconds "$deadline" 10) || return 124
+  crd_name=$(kubectl --request-timeout="${timeout_seconds}s" get crd \
+    inspacenodeclasses.karpenter.inspace.cloud --ignore-not-found -o name) || return 1
+  if [[ -n $crd_name ]]; then
+    timeout_seconds=$(remaining_timeout_seconds "$deadline" 300) || return 124
+    kubectl --request-timeout="${timeout_seconds}s" delete inspacenodeclass "$nodeclass_name" \
+      --ignore-not-found --wait=true --timeout="${timeout_seconds}s" >/dev/null || return 1
   fi
+  return 0
+}
+
+quiesce_kubernetes_e2e_owners_bounded() {
+  local attempt status sleep_seconds
+  local deadline=$((SECONDS + kubernetes_quiesce_timeout_seconds))
+  for attempt in $(seq 1 "$kubernetes_quiesce_attempts"); do
+    if kubernetes_e2e_quiesce "$deadline"; then
+      return 0
+    else
+      status=$?
+    fi
+    if (( status == 124 || SECONDS >= deadline )); then
+      break
+    fi
+    sleep_seconds=$(remaining_timeout_seconds "$deadline" 10) || break
+    sleep "$sleep_seconds"
+    wait_for_kubernetes_available_until "$deadline" || break
+  done
+  echo "Kubernetes E2E owners did not quiesce within the bounded retry window" >&2
+  return 1
 }
 
 owned_audit_json() {
@@ -284,71 +494,160 @@ owned_audit_json() {
       } | .count = ([.vms,.firewalls,.floatingIPs,.loadBalancers,.disks] | map(length) | add)'
 }
 
-cleanup_service_resources() {
-  local lb_name lb_uuid lb_json load_balancers ip_name ip_address assigned assigned_type ip_addresses
-  lb_name=$(jq -r '.serviceLoadBalancerName // ""' "$state_file")
-  ip_name=$(jq -r '.serviceFloatingIPName // ""' "$state_file")
+converge_raw_cleanup() {
+  local description=$1
+  local attempt_function=$2
+  local absent_function=$3
+  local attempt status
+  local deadline=$((SECONDS + raw_cleanup_timeout_seconds))
+  for attempt in $(seq 1 "$raw_cleanup_attempts"); do
+    if "$attempt_function"; then
+      status=0
+    else
+      status=$?
+    fi
+    if "$absent_function"; then
+      return 0
+    fi
+    if (( status == 2 )); then
+      echo "refusing to retry $description after an ownership or safety mismatch" >&2
+      return 2
+    fi
+    if (( SECONDS >= deadline )); then
+      break
+    fi
+    if (( attempt < raw_cleanup_attempts )); then
+      sleep "$raw_cleanup_interval_seconds"
+    fi
+  done
+  echo "$description did not converge within the bounded retry window" >&2
+  return 1
+}
+
+service_resources_absent() {
+  local lb_name ip_name load_balancers ip_addresses
+  lb_name=$(jq -r '.serviceLoadBalancerName // ""' "$state_file") || return 1
+  ip_name=$(jq -r '.serviceFloatingIPName // ""' "$state_file") || return 1
+  [[ -n $lb_name ]] || return 0
+  load_balancers=$(api_get network/load_balancers) || return 1
+  ip_addresses=$(api_get network/ip_addresses) || return 1
+  jq -e -n --arg lb "$lb_name" --arg ip "$ip_name" \
+    --argjson lbs "$load_balancers" --argjson ips "$ip_addresses" '
+      ([$lbs[] | select(.display_name==$lb and ((.is_deleted // false) | not))] | length) == 0 and
+      ($ip == "" or ([$ips[] | select(.name==$ip and ((.is_deleted // false) | not))] | length) == 0)' >/dev/null
+}
+
+cleanup_service_resources_once() {
+  local lb_name lb_uuid lb_json load_balancers ip_name ip_address assigned assigned_type ip_addresses ip_json
+  lb_name=$(jq -r '.serviceLoadBalancerName // ""' "$state_file") || return 1
+  ip_name=$(jq -r '.serviceFloatingIPName // ""' "$state_file") || return 1
   [[ -n $lb_name ]] || return 0
   load_balancers=$(api_get network/load_balancers) || return 1
   lb_json=$(jq -c --arg name "$lb_name" '
     [.[] | select(.display_name==$name and ((.is_deleted // false) | not))] |
-    if length == 0 then empty elif length == 1 then .[0] else error("duplicate Service load balancer name") end' <<<"$load_balancers") || return 1
+    if length == 0 then empty elif length == 1 then .[0] else error("duplicate Service load balancer name") end' <<<"$load_balancers") || return 2
   lb_uuid=""
   if [[ -n $lb_json ]]; then
     lb_uuid=$(jq -r '.uuid // ""' <<<"$lb_json")
+    [[ $lb_uuid =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] || {
+      echo "refusing Service load balancer with an invalid UUID" >&2
+      return 2
+    }
     if ! jq -e --arg network "$INSPACE_NETWORK_UUID" --arg billing "$INSPACE_BILLING_ACCOUNT_ID" '
         .network_uuid == $network and
         ((.billing_account_id // 0) == 0 or ((.billing_account_id | tostring) == $billing))' >/dev/null <<<"$lb_json"; then
       echo "refusing Service load balancer outside the E2E network or billing account" >&2
-      return 1
+      return 2
     fi
   fi
   if [[ -n $ip_name ]]; then
-    local ip_json
     ip_addresses=$(api_get network/ip_addresses) || return 1
     ip_json=$(jq -c --arg name "$ip_name" '
       [.[] | select(.name==$name and ((.is_deleted // false) | not))] |
-      if length == 0 then empty elif length == 1 then .[0] else error("duplicate Service floating IP name") end' <<<"$ip_addresses") || return 1
+      if length == 0 then empty elif length == 1 then .[0] else error("duplicate Service floating IP name") end' <<<"$ip_addresses") || return 2
     if [[ -n $ip_json ]]; then
       ip_address=$(jq -r '.address' <<<"$ip_json")
+      require_public_ipv4 "$ip_address" || { echo "refusing invalid Service floating IPv4" >&2; return 2; }
       assigned=$(jq -r '.assigned_to // ""' <<<"$ip_json")
       assigned_type=$(jq -r '.assigned_to_resource_type // ""' <<<"$ip_json")
       if [[ -n $assigned ]]; then
-        [[ -n $lb_uuid && $assigned == "$lb_uuid" && $assigned_type == load_balancer ]] || {
+        if [[ $assigned_type != load_balancer ]]; then
           echo "refusing unexpected Service FIP assignment" >&2
+          return 2
+        fi
+        if [[ -z $lb_uuid ]]; then
+          echo "waiting for the assigned Service load balancer to become visible" >&2
           return 1
-        }
+        fi
+        if [[ $assigned != "$lb_uuid" ]]; then
+          echo "refusing unexpected Service FIP assignment" >&2
+          return 2
+        fi
         api_post_json "network/ip_addresses/$ip_address/unassign" || return 1
+        return 0
       fi
-      api_delete_json "network/ip_addresses/$ip_address" || true
+      api_delete_json "network/ip_addresses/$ip_address" || return 1
+      return 0
     fi
   fi
-  [[ -z $lb_uuid ]] || api_delete_json "network/load_balancers/$lb_uuid" || true
+  if [[ -n $lb_uuid ]]; then
+    api_delete_json "network/load_balancers/$lb_uuid" || return 1
+  fi
+  return 0
 }
 
-cleanup_disk_resource() {
-  local disk_uuid disk_name disks disk_json disk_details attachment_vms bad_attachments remaining
-  disk_uuid=$(jq -r '.diskUUID // ""' "$state_file")
-  disk_name=$(jq -r '.pvcDiskName // ""' "$state_file")
+cleanup_service_resources() {
+  converge_raw_cleanup "raw Service load balancer cleanup" cleanup_service_resources_once service_resources_absent
+}
+
+disk_resource_absent() {
+  local disk_uuid disk_name disks
+  disk_uuid=$(jq -r '.diskUUID // ""' "$state_file") || return 1
+  disk_name=$(jq -r '.pvcDiskName // ""' "$state_file") || return 1
+  [[ -n $disk_uuid || -n $disk_name ]] || return 0
+  disks=$(api_get storage/disks) || return 1
+  jq -e --arg uuid "$disk_uuid" --arg name "$disk_name" '
+    [.[] | select(($uuid != "" and .uuid==$uuid) or ($name != "" and .display_name==$name))] | length == 0' \
+    >/dev/null <<<"$disks"
+}
+
+cleanup_disk_resource_once() {
+  local disk_uuid disk_name disks disk_matches disk_json disk_details attachment_vms bad_attachments attachment_count
+  disk_uuid=$(jq -r '.diskUUID // ""' "$state_file") || return 1
+  disk_name=$(jq -r '.pvcDiskName // ""' "$state_file") || return 1
+  [[ -n $disk_uuid || -n $disk_name ]] || return 0
   disks=$(api_get storage/disks) || return 1
   if [[ -z $disk_uuid && -n $disk_name ]]; then
-    disk_uuid=$(jq -r --arg name "$disk_name" '[.[] | select(.display_name==$name)] | if length==1 then .[0].uuid else "" end' <<<"$disks")
+    disk_matches=$(jq -c --arg name "$disk_name" '[.[] | select(.display_name==$name)]' <<<"$disks") || return 1
+    if [[ $(jq -r 'length' <<<"$disk_matches") -gt 1 ]]; then
+      echo "refusing duplicate CSI disk ownership name" >&2
+      return 2
+    fi
+    disk_uuid=$(jq -r 'if length==1 then .[0].uuid else "" end' <<<"$disk_matches") || return 1
   fi
   [[ -n $disk_uuid ]] || return 0
   [[ $disk_uuid =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] || {
     echo "refusing invalid CSI disk UUID from state" >&2
-    return 1
+    return 2
   }
-  disk_json=$(jq -c --arg uuid "$disk_uuid" '[.[] | select(.uuid==$uuid)] | if length==1 then .[0] else empty end' <<<"$disks")
+  disk_matches=$(jq -c --arg uuid "$disk_uuid" '[.[] | select(.uuid==$uuid)]' <<<"$disks") || return 1
+  if [[ $(jq -r 'length' <<<"$disk_matches") -gt 1 ]]; then
+    echo "refusing duplicate CSI disk UUID" >&2
+    return 2
+  fi
+  disk_json=$(jq -c 'if length==1 then .[0] else empty end' <<<"$disk_matches") || return 1
   [[ -n $disk_json ]] || return 0
   if [[ -z $disk_name || $(jq -r '.display_name // ""' <<<"$disk_json") != "$disk_name" ]]; then
     echo "refusing CSI disk whose UUID/name ownership does not match the E2E state" >&2
-    return 1
+    return 2
+  fi
+  if [[ $(jq -r '.diskUUID // ""' "$state_file") == "" ]]; then
+    state_update '.diskUUID=$disk' --arg disk "$disk_uuid" || return 1
   fi
   disk_details=$(api_get "storage/disks/$disk_uuid") || return 1
   if [[ $(jq -r '(.snapshots // []) | length' <<<"$disk_details") != 0 ]]; then
     echo "refusing to delete E2E disk while snapshots exist" >&2
-    return 1
+    return 2
   fi
 
   attachment_vms=$(api_get user-resource/vm/list) || return 1
@@ -356,113 +655,341 @@ cleanup_disk_resource() {
     [.[] | select(any(.storage[]?; .uuid==$disk)) | . as $vm |
       (((.description // "{}") | fromjson?) // {}) as $record |
       select($record.schema != "karpenter.inspace.cloud/v1" or $record.cluster != $cluster or
-             $record.nodeClaim != $vm.name or (($vm.name // "") | startswith($prefix) | not))] | length' <<<"$attachment_vms")
+             $record.nodeClaim != $vm.name or (($vm.name // "") | startswith($prefix) | not))] | length' <<<"$attachment_vms") || return 1
   if [[ $bad_attachments != 0 ]]; then
     echo "refusing to detach the E2E disk from a VM without exact Karpenter ownership" >&2
-    return 1
+    return 2
   fi
-
-  local vm_uuid
-  while IFS= read -r vm_uuid; do
-    [[ -n $vm_uuid ]] || continue
-    api_detach_disk "$vm_uuid" "$disk_uuid" || true
-  done < <(jq -r --arg disk "$disk_uuid" '.[] | select(any(.storage[]?; .uuid==$disk)) | .uuid' <<<"$attachment_vms")
-  for _ in $(seq 1 30); do
-    remaining=$(api_get user-resource/vm/list | jq --arg disk "$disk_uuid" '[.[] | select(any(.storage[]?; .uuid==$disk))] | length') || return 1
-    [[ $remaining == 0 ]] && break
-    sleep 10
-  done
-  [[ ${remaining:-1} == 0 ]] || { echo "E2E disk did not detach; refusing raw delete" >&2; return 1; }
-  api_delete_json "storage/disks/$disk_uuid"
+  attachment_count=$(jq -r --arg disk "$disk_uuid" '[.[] | select(any(.storage[]?; .uuid==$disk))] | length' <<<"$attachment_vms") || return 1
+  if [[ $attachment_count != 0 ]]; then
+    local vm_uuid
+    while IFS= read -r vm_uuid; do
+      [[ -n $vm_uuid ]] || continue
+      api_detach_disk "$vm_uuid" "$disk_uuid" || return 1
+    done < <(jq -r --arg disk "$disk_uuid" '.[] | select(any(.storage[]?; .uuid==$disk)) | .uuid' <<<"$attachment_vms")
+    return 0
+  fi
+  api_delete_json "storage/disks/$disk_uuid" || return 1
+  return 0
 }
 
-cleanup_worker_resources() {
-  local all_vms all_ips matching workers invalid_workers
+cleanup_disk_resource() {
+  converge_raw_cleanup "raw CSI disk cleanup" cleanup_disk_resource_once disk_resource_absent
+}
+
+worker_resources_absent() {
+  local all_vms all_ips remaining_vms remaining_ips
   all_vms=$(api_get user-resource/vm/list) || return 1
-  matching=$(jq -c --arg cluster "$cluster_name" '[.[] | . as $vm | ((((.description // "{}") | fromjson?) // {})) as $record | select($record.cluster==$cluster) | {vm:$vm,record:$record}]' <<<"$all_vms")
-  invalid_workers=$(jq --arg prefix "$nodepool_name-" '[.[] | select(
-    .record.schema != "karpenter.inspace.cloud/v1" or .record.nodeClaim != .vm.name or
-    ((.vm.name // "") | startswith($prefix) | not) or
-    ((.record.floatingIPName // "") | startswith($prefix) | not))] | length' <<<"$matching")
+  all_ips=$(api_get network/ip_addresses) || return 1
+  remaining_vms=$(jq -r --arg cluster "$cluster_name" --arg prefix "$nodepool_name-" '[.[] | . as $vm |
+    ((((.description // "{}") | fromjson?) // {})) as $record |
+    select($record.cluster==$cluster or (($vm.name // "") | startswith($prefix)))] | length' <<<"$all_vms") || return 1
+  remaining_ips=$(jq -r --arg prefix "$nodepool_name-" '[.[] |
+    select(((.is_deleted // false) | not) and ((.name // "") | startswith($prefix)))] | length' <<<"$all_ips") || return 1
+  [[ $remaining_vms == 0 && $remaining_ips == 0 ]]
+}
+
+cleanup_worker_resources_once() {
+  local all_vms all_ips matching invalid_workers worker_count uuid name fip_name fip_json address assigned assigned_type orphan_json orphan_name persisted_workers expected_count
+  all_vms=$(api_get user-resource/vm/list) || return 1
+  matching=$(jq -c --arg cluster "$cluster_name" --arg prefix "$nodepool_name-" '[.[] | . as $vm |
+    ((((.description // "{}") | fromjson?) // {})) as $record |
+    select($record.cluster==$cluster or (($vm.name // "") | startswith($prefix))) |
+    {vm:$vm,record:$record}] | sort_by(.vm.name)' <<<"$all_vms") || return 1
+  invalid_workers=$(jq --arg cluster "$cluster_name" --arg prefix "$nodepool_name-" '[.[] | select(
+    .record.schema != "karpenter.inspace.cloud/v1" or .record.cluster != $cluster or
+    .record.nodeClaim != .vm.name or ((.vm.name // "") | startswith($prefix) | not) or
+    ((.record.floatingIPName // "") | startswith($prefix) | not))] | length' <<<"$matching") || return 1
   if [[ $invalid_workers != 0 ]]; then
     echo "refusing raw worker cleanup because cloud ownership metadata is incomplete or mismatched" >&2
-    return 1
+    return 2
   fi
-  workers=$(jq -c '[.[] | {uuid:.vm.uuid,name:.vm.name,fip:.record.floatingIPName}]' <<<"$matching")
-  while IFS=$'\t' read -r uuid name fip_name; do
-    [[ -n $uuid ]] || continue
-    local fip_json address assigned assigned_type
+  worker_count=$(jq -r 'length' <<<"$matching") || return 1
+  if [[ $worker_count != 0 ]]; then
+    IFS=$'\t' read -r uuid name fip_name < <(jq -r '.[0] | [.vm.uuid,.vm.name,.record.floatingIPName] | @tsv' <<<"$matching")
+    [[ $uuid =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] || {
+      echo "refusing worker VM with an invalid UUID" >&2
+      return 2
+    }
     all_ips=$(api_get network/ip_addresses) || return 1
     fip_json=$(jq -c --arg name "$fip_name" '
       [.[] | select(.name==$name and ((.is_deleted // false) | not))] |
-      if length == 0 then empty elif length == 1 then .[0] else error("duplicate worker floating IP name") end' <<<"$all_ips") || return 1
+      if length == 0 then empty elif length == 1 then .[0] else error("duplicate worker floating IP name") end' <<<"$all_ips") || return 2
     if [[ -n $fip_json ]]; then
       address=$(jq -r '.address' <<<"$fip_json")
+      require_public_ipv4 "$address" || { echo "refusing invalid worker floating IPv4" >&2; return 2; }
       assigned=$(jq -r '.assigned_to // ""' <<<"$fip_json")
       assigned_type=$(jq -r '.assigned_to_resource_type // ""' <<<"$fip_json")
       if [[ -n $assigned && ($assigned != "$uuid" || $assigned_type != virtual_machine) ]]; then
         echo "refusing unexpected worker FIP assignment for $name" >&2
-        return 1
+        return 2
       fi
-      [[ -z $assigned ]] || api_post_json "network/ip_addresses/$address/unassign" || return 1
-      api_delete_json "network/ip_addresses/$address" || true
+      if [[ -n $assigned ]]; then
+        api_post_json "network/ip_addresses/$address/unassign" || return 1
+        return 0
+      fi
+      api_delete_json "network/ip_addresses/$address" || return 1
+      return 0
     fi
-    api_delete_vm "$uuid" || true
-  done < <(jq -r '.[] | [.uuid,.name,.fip] | @tsv' <<<"$workers")
+    api_delete_vm "$uuid" || return 1
+    return 0
+  fi
 
   # Clean a late unassigned FIP whose deterministic worker VM never became visible.
   all_ips=$(api_get network/ip_addresses) || return 1
-  while IFS=$'\t' read -r address assigned; do
-    [[ -n $address ]] || continue
-    if [[ -n $assigned ]]; then
-      echo "refusing assigned orphan worker FIP $address" >&2
+  orphan_json=$(jq -c --arg prefix "$nodepool_name-" '[.[] |
+    select(((.is_deleted // false) | not) and ((.name // "") | startswith($prefix)))] | sort_by([.name,.address]) |
+    if length == 0 then empty else .[0] end' <<<"$all_ips") || return 1
+  [[ -n $orphan_json ]] || return 0
+  address=$(jq -r '.address' <<<"$orphan_json")
+  orphan_name=$(jq -r '.name // ""' <<<"$orphan_json")
+  require_public_ipv4 "$address" || { echo "refusing invalid orphan worker floating IPv4" >&2; return 2; }
+  assigned=$(jq -r '.assigned_to // ""' <<<"$orphan_json")
+  if [[ -n $assigned ]]; then
+    assigned_type=$(jq -r '.assigned_to_resource_type // ""' <<<"$orphan_json")
+    if [[ $assigned_type != virtual_machine ]]; then
+      echo "refusing assigned orphan worker FIP $address with unexpected resource type" >&2
+      return 2
+    fi
+    persisted_workers=$(jq -c '.workerVMs // []' "$state_file") || return 1
+    validate_worker_records "$persisted_workers" || return 2
+    expected_count=$(jq -r --arg fip "$orphan_name" --arg uuid "$assigned" \
+      '[.[] | select(.fip==$fip and .uuid==$uuid)] | length' <<<"$persisted_workers") || return 1
+    if [[ $expected_count != 1 ]]; then
+      echo "waiting to validate assigned orphan worker FIP $address against a visible or persisted VM" >&2
       return 1
     fi
-    api_delete_json "network/ip_addresses/$address" || true
-  done < <(jq -r --arg prefix "$nodepool_name-" '.[] | select((.name // "") | startswith($prefix)) | [.address,(.assigned_to // "")] | @tsv' <<<"$all_ips")
+    api_post_json "network/ip_addresses/$address/unassign" || return 1
+    return 0
+  fi
+  api_delete_json "network/ip_addresses/$address" || return 1
+  return 0
+}
+
+cleanup_worker_resources() {
+  converge_raw_cleanup "raw Karpenter worker cleanup" cleanup_worker_resources_once worker_resources_absent
+}
+
+terminate_controller_child() {
+  local pid=${controller_child_pid:-}
+  local grace_deadline
+  [[ -n $pid ]] || return 0
+  if kill -0 "$pid" >/dev/null 2>&1; then
+    kill -TERM "$pid" >/dev/null 2>&1 || true
+    grace_deadline=$((SECONDS + 10))
+    while kill -0 "$pid" >/dev/null 2>&1 && (( SECONDS < grace_deadline )); do
+      sleep 1
+    done
+    if kill -0 "$pid" >/dev/null 2>&1; then
+      kill -KILL "$pid" >/dev/null 2>&1 || true
+    fi
+  fi
+  wait "$pid" >/dev/null 2>&1 || true
+  controller_child_pid=""
+}
+
+wait_for_controller_child_until() {
+  local deadline=$1
+  local pid=${controller_child_pid:-}
+  local status=0
+  [[ -n $pid ]] || return 1
+  while kill -0 "$pid" >/dev/null 2>&1; do
+    if (( SECONDS >= deadline )); then
+      terminate_controller_child
+      return 124
+    fi
+    # This sleep is foreground and therefore reaped on every iteration; there
+    # is no detached watchdog timer process to orphan during shutdown.
+    sleep 1
+  done
+  wait "$pid" || status=$?
+  controller_child_pid=""
+  return "$status"
+}
+
+stop_bootstrap_controller() {
+  terminate_controller_child
+}
+
+run_bootstrap_controller_bounded() {
+  local results_file=$state_dir/reconcile-results.jsonl
+  local controller_status=0
+  local deadline=$((SECONDS + bootstrap_timeout_seconds))
+  : >"$results_file"
+
+  "$controller_bin" --cluster-config "$cluster_file" --ssh-public-key-file "$ssh_public_key" --ssh-username "$ssh_user" \
+    --management-cidr "$management_cidr" --management-tcp-ports 22,6443,30080 \
+    --until-ready --interval 15s --output=json >"$results_file" &
+  controller_child_pid=$!
+  wait_for_controller_child_until "$deadline" || controller_status=$?
+  awk '1' "$results_file"
+
+  if (( controller_status == 124 )); then
+    echo "bootstrap controller timed out after $bootstrap_timeout_seconds seconds" >&2
+  fi
+  return "$controller_status"
+}
+
+destroy_control_plane_once() {
+  local deadline=$1
+  local results_file=$state_dir/destroy-attempt.json
+  local output controller_status=0
+  [[ -x $controller_bin && -f $cluster_file ]] || return 0
+  if (( SECONDS >= deadline )); then
+    return 124
+  fi
+  : >"$results_file"
+  "$controller_bin" --cluster-config "$cluster_file" --delete --once --output=json \
+    --management-cidr "$management_cidr" --management-tcp-ports 22,6443,30080 \
+    >"$results_file" 2>>"$state_dir/destroy.log" &
+  controller_child_pid=$!
+  wait_for_controller_child_until "$deadline" || controller_status=$?
+  if (( controller_status != 0 )); then
+    return "$controller_status"
+  fi
+  output=$(awk '1' "$results_file") || return 1
+  printf '%s\n' "$output" >>"$state_dir/destroy-results.jsonl"
+  if jq -e '.done == true' >/dev/null <<<"$output"; then
+    return 0
+  fi
+  return 3
 }
 
 destroy_control_plane() {
-  [[ -x $controller_bin && -f $cluster_file ]] || return 0
-  local output
-  for _ in $(seq 1 90); do
-    if ! output=$($controller_bin --cluster-config "$cluster_file" --delete --once --output=json 2>>"$state_dir/destroy.log"); then
-      sleep 10
-      continue
-    fi
-    printf '%s\n' "$output" >>"$state_dir/destroy-results.jsonl"
-    if jq -e '.done == true' >/dev/null <<<"$output"; then
+  local status
+  local deadline=$((SECONDS + raw_cleanup_timeout_seconds))
+  for _ in $(seq 1 "$raw_cleanup_attempts"); do
+    if destroy_control_plane_once "$deadline"; then
       return 0
+    else
+      status=$?
     fi
-    sleep 10
+    printf 'control-plane destroy attempt returned status %d\n' "$status" >>"$state_dir/destroy.log"
+    if (( status == 124 || SECONDS >= deadline )); then
+      break
+    fi
+    sleep "$raw_cleanup_interval_seconds"
   done
-  echo "control-plane teardown did not converge" >&2
+  echo "control-plane teardown did not converge within the bounded retry window" >&2
+  return 1
+}
+
+wait_for_zero_owned_audit() {
+  local allow_late_cleanup=$1
+  local audit=""
+  local attempt status
+  local retry_service=$allow_late_cleanup
+  local retry_disk=$allow_late_cleanup
+  local retry_worker=$allow_late_cleanup
+  local retry_control_plane=$allow_late_cleanup
+  local deadline=$((SECONDS + raw_cleanup_timeout_seconds))
+  : >"$state_dir/final-audit.err"
+  : >"$state_dir/final-audit-results.jsonl"
+  for attempt in $(seq 1 "$raw_cleanup_attempts"); do
+    if audit=$(owned_audit_json 2>>"$state_dir/final-audit.err"); then
+      printf '%s\n' "$audit" >"$state_dir/final-audit.json"
+      printf '%s\n' "$audit" >>"$state_dir/final-audit-results.jsonl"
+      if jq -e '.count == 0' >/dev/null <<<"$audit"; then
+        printf '%s\n' "$audit"
+        return 0
+      fi
+    fi
+    if [[ $retry_service == true ]]; then
+      if cleanup_service_resources_once; then
+        :
+      else
+        status=$?
+        printf 'late Service cleanup attempt failed with status %d\n' "$status" >>"$state_dir/final-audit.err"
+        if (( status == 2 )); then retry_service=false; fi
+      fi
+    fi
+    if [[ $retry_disk == true ]]; then
+      if cleanup_disk_resource_once; then
+        :
+      else
+        status=$?
+        printf 'late disk cleanup attempt failed with status %d\n' "$status" >>"$state_dir/final-audit.err"
+        if (( status == 2 )); then retry_disk=false; fi
+      fi
+    fi
+    if [[ $retry_worker == true ]]; then
+      if cleanup_worker_resources_once; then
+        :
+      else
+        status=$?
+        printf 'late worker cleanup attempt failed with status %d\n' "$status" >>"$state_dir/final-audit.err"
+        if (( status == 2 )); then retry_worker=false; fi
+      fi
+    fi
+    if [[ $retry_control_plane == true ]]; then
+      if destroy_control_plane_once "$deadline"; then
+        :
+      else
+        status=$?
+        printf 'late control-plane cleanup attempt returned status %d\n' "$status" >>"$state_dir/final-audit.err"
+        if (( status == 124 )); then retry_control_plane=false; fi
+      fi
+    fi
+    if (( SECONDS >= deadline )); then
+      break
+    fi
+    if (( attempt < raw_cleanup_attempts )); then
+      sleep "$raw_cleanup_interval_seconds"
+    fi
+  done
+  [[ -z $audit ]] || printf '%s\n' "$audit"
+  echo "owned-resource audit did not converge to zero within the bounded retry window" >&2
   return 1
 }
 
 cleanup() {
   local original_status=$?
-  trap - EXIT INT TERM
+  local cleanup_status=0
+  local raw_cleanup_allowed=true
+  local kubernetes_owners_possible
+  local reachability_deadline
+  trap - EXIT
+  trap 'echo "cleanup already in progress; ignoring interrupt" >&2' INT TERM
+  set +e
+  stop_bootstrap_controller
   if [[ ${INSPACE_E2E_KEEP_RESOURCES:-false} == true ]]; then
     echo "E2E resources retained by explicit INSPACE_E2E_KEEP_RESOURCES=true; state: $state_dir" >&2
     exit "$original_status"
   fi
-  set +e
-  local cleanup_status=0
-  local raw_cleanup_allowed=true
-  if [[ -s $kubeconfig ]] && kubectl_available; then
-    if ! kubernetes_e2e_quiesce; then
-      echo "Kubernetes E2E owners did not quiesce; refusing concurrent raw cloud cleanup" >&2
+  if ! kubernetes_owners_possible=$(jq -er '
+      if (.kubernetesOwnersPossible | type) == "boolean" then
+        (.kubernetesOwnersPossible | tostring)
+      else
+        error("kubernetesOwnersPossible must be boolean")
+      end' "$state_file"); then
+    echo "E2E ownership state is missing or invalid; refusing raw cloud cleanup" >&2
+    raw_cleanup_allowed=false
+    cleanup_status=1
+  elif [[ $kubernetes_owners_possible == true ]]; then
+    # The flag is persisted before controller installation can partially
+    # succeed. From that point onward, raw cloud deletion is safe only after
+    # every Kubernetes owner was proven quiescent.
+    raw_cleanup_allowed=false
+    if [[ ! -s $kubeconfig ]]; then
+      echo "Kubernetes owners may exist but kubeconfig is missing; refusing raw cloud cleanup" >&2
       cleanup_status=1
-      raw_cleanup_allowed=false
     else
-      if helm status inspace -n kube-system >/dev/null 2>&1; then
-        helm uninstall inspace -n kube-system --wait --timeout 5m >/dev/null 2>&1 || cleanup_status=1
+      reachability_deadline=$((SECONDS + kubernetes_reachability_timeout_seconds))
+      if ! wait_for_kubernetes_available_until "$reachability_deadline"; then
+        echo "Kubernetes API remained unreachable; refusing concurrent raw cloud cleanup" >&2
+        cleanup_status=1
+      elif ! quiesce_kubernetes_e2e_owners_bounded; then
+        echo "Kubernetes E2E owners did not quiesce; refusing concurrent raw cloud cleanup" >&2
+        cleanup_status=1
+      else
+        raw_cleanup_allowed=true
+        helm uninstall inspace -n kube-system --ignore-not-found --wait --timeout 5m \
+          >/dev/null 2>&1 || cleanup_status=1
+        helm uninstall inspace-crds -n kube-system --ignore-not-found --wait --timeout 5m \
+          >/dev/null 2>&1 || cleanup_status=1
+        kubectl --request-timeout=30s -n kube-system delete secret inspace-cloud-credentials \
+          inspace-k3s-agent-token --ignore-not-found --wait=false >/dev/null 2>&1 || cleanup_status=1
       fi
-      if helm status inspace-crds -n kube-system >/dev/null 2>&1; then
-        helm uninstall inspace-crds -n kube-system --wait --timeout 5m >/dev/null 2>&1 || cleanup_status=1
-      fi
-      kubectl -n kube-system delete secret inspace-cloud-credentials inspace-k3s-agent-token --ignore-not-found --wait=false >/dev/null 2>&1 || cleanup_status=1
     fi
   fi
   if [[ $raw_cleanup_allowed == true ]]; then
@@ -471,12 +998,7 @@ cleanup() {
     cleanup_worker_resources || cleanup_status=1
     destroy_control_plane || cleanup_status=1
   fi
-  local audit
-  audit=$(owned_audit_json 2>"$state_dir/final-audit.err") || cleanup_status=1
-  [[ -n ${audit:-} ]] && printf '%s\n' "$audit" | tee "$state_dir/final-audit.json"
-  if [[ -n ${audit:-} && $(jq -r '.count' <<<"$audit") != 0 ]]; then
-    cleanup_status=1
-  fi
+  wait_for_zero_owned_audit "$raw_cleanup_allowed" || cleanup_status=1
   if (( original_status != 0 || cleanup_status != 0 )); then
     exit 1
   fi
@@ -504,9 +1026,7 @@ if [[ $(jq -r '.count' <<<"$baseline") != 0 ]]; then
 fi
 
 echo "==> provision exactly three control-plane VMs"
-$controller_bin --cluster-config "$cluster_file" --ssh-public-key-file "$ssh_public_key" --ssh-username "$ssh_user" \
-  --management-cidr "$management_cidr" --management-tcp-ports 22,6443,30080 \
-  --until-ready --interval 15s --output=json | tee "$state_dir/reconcile-results.jsonl"
+run_bootstrap_controller_bounded
 reconcile_result=$(tail -n 1 "$state_dir/reconcile-results.jsonl")
 jq -e '.ready == true and (.controlPlaneVMs | length == 3)' >/dev/null <<<"$reconcile_result"
 state_update '. + {firewallUUID:$firewall,apiLoadBalancerUUID:$lb,apiPublicIPv4:$public,privateEndpoint:$private,controlPlaneVMs:$vms}' \
@@ -558,6 +1078,7 @@ kubectl -n kube-system create secret generic inspace-k3s-agent-token \
   --from-literal="token=$k3s_token" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 helm upgrade --install inspace-crds oci://ghcr.io/thanet-s/charts/inspace-cloud-kube-modules-crds \
   --version "$INSPACE_E2E_VERSION" -n kube-system --wait --timeout 5m
+state_update '.kubernetesOwnersPossible=true'
 helm upgrade --install inspace oci://ghcr.io/thanet-s/charts/inspace-cloud-kube-modules \
   --version "$INSPACE_E2E_VERSION" -n kube-system --wait --timeout 15m \
   --set fullnameOverride=inspace \
@@ -673,10 +1194,10 @@ jq -e '.items | length == 1 and all(.[]; any(.status.conditions[]; .type=="Ready
 worker_node=$(kubectl get node -l "karpenter.sh/nodepool=$nodepool_name" -o jsonpath='{.items[0].metadata.name}')
 [[ -n $worker_node ]]
 
-workers=$(api_get user-resource/vm/list | jq -c --arg cluster "$cluster_name" '[.[] | . as $vm | ((((.description // "{}") | fromjson?) // {})) as $owner | select($owner.cluster==$cluster) | {uuid:$vm.uuid,name:$vm.name,fip:$owner.floatingIPName}]')
+persist_worker_ownership_from_cloud
+workers=$(jq -c '.workerVMs // []' "$state_file")
 jq -e 'length == 1' >/dev/null <<<"$workers"
-worker_fip_names=$(jq '[.[].fip]' <<<"$workers")
-state_update '.workerVMs=$workers | .workerFloatingIPNames=$fips | .workerNode=$node' --argjson workers "$workers" --argjson fips "$worker_fip_names" --arg node "$worker_node"
+state_update '.workerNode=$node' --arg node "$worker_node"
 kubectl -n kube-system rollout status daemonset/inspace-csi-node --timeout=10m
 kubectl get csinode "$worker_node" >/dev/null
 
@@ -743,7 +1264,19 @@ spec:
 EOF
 
 echo "==> verify RWO CSI mount, persistence, and TCP public LoadBalancer"
-kubectl apply -f "$state_dir/workload.yaml"
+if ! kubectl apply -f "$state_dir/workload.yaml"; then
+  partial_apply_persistence_status=0
+  if ! persist_service_ownership_from_cluster; then
+    partial_apply_persistence_status=1
+  fi
+  if ! persist_pvc_ownership_from_cluster; then
+    partial_apply_persistence_status=1
+  fi
+  if (( partial_apply_persistence_status != 0 )); then
+    echo "partial workload apply failed and ownership recovery was incomplete" >&2
+  fi
+  exit 1
+fi
 pvc_uid=$(kubectl -n default get pvc inspace-e2e-rwo -o jsonpath='{.metadata.uid}')
 service_uid=$(kubectl -n default get service inspace-e2e-web -o jsonpath='{.metadata.uid}')
 pvc_disk_name="pvc-$pvc_uid"

@@ -259,6 +259,40 @@ func TestDestroyRefusesDeterministicFirewallNameWithoutOwnershipRecord(t *testin
 	}
 }
 
+func TestDestroyAcceptsManagedFirewallWhenAPIOmitsDescription(t *testing.T) {
+	api := newFakeAPI()
+	cluster := testCluster()
+	api.firewalls = append(api.firewalls, inspace.Firewall{
+		UUID: "77777777-1111-4222-8333-444444444444", DisplayName: firewallName(ownerKey(cluster)),
+		BillingAccountID: cluster.Spec.BillingAccountID,
+		Rules:            managedFirewallRules(api.network.Subnet, "", nil),
+	})
+	reconciler := Reconciler{API: api}
+	if _, err := reconciler.Destroy(context.Background(), cluster); err != nil {
+		t.Fatal(err)
+	}
+	if len(api.firewalls) != 0 {
+		t.Fatalf("managed firewall with API-omitted description was not deleted: %#v", api.firewalls)
+	}
+}
+
+func TestDestroyRejectsUnsafeManagementCIDRBeforeFirewallMutation(t *testing.T) {
+	api := newFakeAPI()
+	cluster := testCluster()
+	api.firewalls = append(api.firewalls, inspace.Firewall{
+		UUID: "77777777-1111-4222-8333-444444444444", DisplayName: firewallName(ownerKey(cluster)),
+		BillingAccountID: cluster.Spec.BillingAccountID,
+		Rules:            managedFirewallRules(api.network.Subnet, "0.0.0.0/0", []int{22}),
+	})
+	reconciler := Reconciler{API: api, ManagementCIDR: "0.0.0.0/0", ManagementTCPPorts: []int{22}}
+	if _, err := reconciler.Destroy(context.Background(), cluster); err == nil {
+		t.Fatal("expected unsafe management CIDR to block destroy")
+	}
+	if len(api.firewalls) != 1 {
+		t.Fatalf("destroy mutated firewall after unsafe management input: %#v", api.firewalls)
+	}
+}
+
 func TestRefusesDeterministicNameWithImmutableSpecDrift(t *testing.T) {
 	api := newFakeAPI()
 	reconciler := Reconciler{API: api}

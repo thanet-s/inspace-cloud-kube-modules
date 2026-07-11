@@ -188,12 +188,15 @@ type LoadBalancerTarget struct {
 }
 
 type CreateLoadBalancerRequest struct {
-	DisplayName      string               `json:"display_name,omitempty"`
-	BillingAccountID int64                `json:"billing_account_id,omitempty"`
-	NetworkUUID      string               `json:"network_uuid,omitempty"`
-	ReservePublicIP  bool                 `json:"reserve_public_ip"`
-	Rules            []LoadBalancerRule   `json:"rules,omitempty"`
-	Targets          []LoadBalancerTarget `json:"targets,omitempty"`
+	DisplayName      string             `json:"display_name,omitempty"`
+	BillingAccountID int64              `json:"billing_account_id,omitempty"`
+	NetworkUUID      string             `json:"network_uuid,omitempty"`
+	ReservePublicIP  bool               `json:"reserve_public_ip"`
+	Rules            []LoadBalancerRule `json:"rules,omitempty"`
+	// InSpace documents targets as optional, but its API currently returns
+	// HTTP 500 when the key is omitted. Preserve an explicit empty array for a
+	// load balancer that will receive targets after creation.
+	Targets []LoadBalancerTarget `json:"targets"`
 }
 
 type Firewall struct {

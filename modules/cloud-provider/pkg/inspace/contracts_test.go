@@ -145,6 +145,43 @@ func TestDocumentedResourceContracts(t *testing.T) {
 	}
 }
 
+func TestCreateLoadBalancerRequestPreservesExplicitEmptyTargets(t *testing.T) {
+	data, err := json.Marshal(inspace.CreateLoadBalancerRequest{Targets: []inspace.LoadBalancerTarget{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := raw["targets"]; !ok || string(got) != "[]" {
+		t.Fatalf("targets must be encoded as an explicit empty array, got %s", data)
+	}
+}
+
+func TestCreateLoadBalancerNormalizesNilTargets(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var raw map[string]json.RawMessage
+		decodeJSON(t, r, &raw)
+		if got, ok := raw["targets"]; !ok || string(got) != "[]" {
+			t.Errorf("client must normalize nil targets to an explicit empty array, got %s", got)
+		}
+		writeLiteral(w, http.StatusCreated, loadBalancerLiteral())
+	}))
+	t.Cleanup(server.Close)
+	client, err := inspace.NewClient(inspace.Options{BaseURL: server.URL, APIKey: "literal-fixture-key"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.CreateLoadBalancer(context.Background(), "bkk01", inspace.CreateLoadBalancerRequest{
+		DisplayName: "empty-targets", NetworkUUID: networkUUID,
+		Rules: []inspace.LoadBalancerRule{{Protocol: "TCP", SourcePort: 6443, TargetPort: 6443}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
 func contractHandler(t *testing.T) http.HandlerFunc {
 	t.Helper()
 	return func(w http.ResponseWriter, r *http.Request) {

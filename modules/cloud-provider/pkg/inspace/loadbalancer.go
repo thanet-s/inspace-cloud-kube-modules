@@ -48,6 +48,9 @@ func (c *Client) CreateLoadBalancer(ctx context.Context, location string, input 
 			return nil, err
 		}
 	}
+	if input.Targets == nil {
+		input.Targets = []LoadBalancerTarget{}
+	}
 	path, err := c.locationPath(location, "network/load_balancers")
 	if err != nil {
 		return nil, err
