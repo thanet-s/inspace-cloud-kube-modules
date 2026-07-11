@@ -185,6 +185,7 @@ export INSPACE_K3S_TOKEN=$k3s_token
 export KUBECONFIG=$kubeconfig
 
 ssh_options=(-n -i "$ssh_private_key" -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=10 \
+  -o ServerAliveInterval=5 -o ServerAliveCountMax=3 \
   -o UserKnownHostsFile="$known_hosts" -o StrictHostKeyChecking=yes)
 ssh_user=${INSPACE_E2E_SSH_USERNAME:-inspacee2e}
 
@@ -240,6 +241,15 @@ ssh_ready() {
   cat "$scan" >>"$known_hosts"
   sort -u "$known_hosts" -o "$known_hosts"
   ssh "${ssh_options[@]}" "$ssh_user@$ip" true >/dev/null 2>&1
+}
+
+k3s_etcd_ready() {
+  local ip=$1
+  ssh "${ssh_options[@]}" "$ssh_user@$ip" \
+    "sudo timeout --kill-after=5s 45s bash -o pipefail -c 'cloud-init status --wait >/dev/null 2>&1 &&
+     systemctl is-active --quiet k3s &&
+     timeout 20s k3s kubectl get --raw=\"/readyz?verbose\" 2>/dev/null |
+       grep -F \"[+]etcd ok\"'" >/dev/null 2>&1
 }
 
 kubectl_available() {
@@ -1054,10 +1064,10 @@ done < <(jq -r '.[]' <<<"$control_plane_ips")
 state_update '.controlPlanePublicIPv4s=$ips' --argjson ips "$control_plane_ips"
 
 echo "==> verify SSH, cloud-init, K3s readiness, and embedded etcd"
+control_plane_readiness_deadline=$((SECONDS + 1800))
 while IFS= read -r ip; do
-  wait_until 900 "SSH on $ip" ssh_ready "$ip"
-  ssh -n "${ssh_options[@]}" "$ssh_user@$ip" \
-    "sudo cloud-init status --wait >/dev/null && sudo systemctl is-active --quiet k3s && sudo k3s kubectl get --raw='/readyz?verbose' | grep -F '[+]etcd ok'" >/dev/null
+  wait_until_deadline "$control_plane_readiness_deadline" "SSH on $ip" ssh_ready "$ip"
+  wait_until_deadline "$control_plane_readiness_deadline" "K3s and embedded etcd on $ip" k3s_etcd_ready "$ip"
 done < <(jq -r '.[]' <<<"$control_plane_ips")
 
 cp0_ip=$(jq -r '.[0]' <<<"$control_plane_ips")
