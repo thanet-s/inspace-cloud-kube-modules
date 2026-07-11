@@ -45,6 +45,11 @@ type CreateVMRequest struct {
 	MemoryGiB        int
 	RootDiskGiB      int32
 	PublicIPv4       bool
+	// SSHUsername and SSHPublicKey are optional, public operator-access data.
+	// The production adapter always adds a separate ephemeral random password
+	// at the API boundary; password material never enters this request model.
+	SSHUsername  string
+	SSHPublicKey string
 	// CloudInitJSON is an API-compatible JSON object, not raw #cloud-config.
 	CloudInitJSON string
 	SpecHash      string

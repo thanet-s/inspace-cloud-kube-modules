@@ -17,6 +17,10 @@ spec:
   hostPoolSelector:
     class: intel-scalable
   rootDiskGiB: 40
+  # Optional controlled SSH access. Configure both fields together and provide
+  # exactly one supported OpenSSH authorized_keys public-key line.
+  # sshUsername: operator
+  # sshPublicKey: ssh-ed25519 AAAA... operator@example
   k3s:
     version: v1.35.6+k3s1
     server: https://api.example-k3s.example:6443

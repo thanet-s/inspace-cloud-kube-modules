@@ -1,6 +1,9 @@
 package v1alpha1
 
 import (
+	"encoding/base64"
+	"encoding/binary"
+	"fmt"
 	"net/url"
 	"regexp"
 	"strings"
@@ -10,10 +13,13 @@ import (
 )
 
 var (
-	uuidPattern       = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$`)
-	k3sVersionPattern = regexp.MustCompile(`^v[0-9]+\.[0-9]+\.[0-9]+\+k3s[0-9]+$`)
-	serverHostPattern = regexp.MustCompile(`^[A-Za-z0-9.-]+$`)
+	uuidPattern        = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$`)
+	k3sVersionPattern  = regexp.MustCompile(`^v[0-9]+\.[0-9]+\.[0-9]+\+k3s[0-9]+$`)
+	serverHostPattern  = regexp.MustCompile(`^[A-Za-z0-9.-]+$`)
+	sshUsernamePattern = regexp.MustCompile(`^[a-z_][a-z0-9_-]{0,29}$`)
 )
+
+const maxSSHPublicKeyLength = 16384
 
 // Validate returns all local, deterministic validation failures. It performs no
 // network lookup and is also used by tests and the NodeClass reconciler.
@@ -69,8 +75,90 @@ func (n *InSpaceNodeClass) Validate() field.ErrorList {
 	} else if n.Spec.K3s.TokenSecretRef.Key != K3sAgentTokenSecretKey {
 		errs = append(errs, field.NotSupported(p.Child("k3s", "tokenSecretRef", "key"), n.Spec.K3s.TokenSecretRef.Key, []string{K3sAgentTokenSecretKey}))
 	}
+	if err := ValidateSSHAccess(n.Spec.SSHUsername, n.Spec.SSHPublicKey); err != nil {
+		errs = append(errs, field.Invalid(p.Child("sshPublicKey"), "", err.Error()))
+	}
 	if len(n.Spec.AdditionalUserData) > 65536 {
 		errs = append(errs, field.TooLong(p.Child("additionalUserData"), "", 65536))
 	}
 	return errs
+}
+
+// ValidateSSHAccess accepts either no operator access or one username and one
+// supported OpenSSH authorized_keys line. It deliberately rejects key options,
+// multiple lines, private key material, and mismatched embedded key types.
+func ValidateSSHAccess(username, publicKey string) error {
+	if username == "" && publicKey == "" {
+		return nil
+	}
+	if username == "" || publicKey == "" {
+		return fmt.Errorf("sshUsername and sshPublicKey must be configured together")
+	}
+	if !sshUsernamePattern.MatchString(username) {
+		return fmt.Errorf("sshUsername must be a safe Linux username of at most 30 characters")
+	}
+	if len(publicKey) > maxSSHPublicKeyLength {
+		return fmt.Errorf("sshPublicKey must not exceed %d bytes", maxSSHPublicKeyLength)
+	}
+	if strings.TrimSpace(publicKey) != publicKey || strings.ContainsAny(publicKey, "\r\n") {
+		return fmt.Errorf("sshPublicKey must be exactly one authorized_keys line")
+	}
+	fields := strings.Fields(publicKey)
+	if len(fields) < 2 || !supportedSSHKeyType(fields[0]) {
+		return fmt.Errorf("sshPublicKey must use ssh-rsa, ssh-ed25519, or a supported ecdsa-sha2 key")
+	}
+	decoded, err := base64.StdEncoding.DecodeString(fields[1])
+	if err != nil {
+		decoded, err = base64.RawStdEncoding.DecodeString(fields[1])
+	}
+	if err != nil || len(decoded) < 4 {
+		return fmt.Errorf("sshPublicKey payload must be valid base64-encoded SSH key data")
+	}
+	algorithm, remainder, ok := readSSHString(decoded)
+	if !ok || string(algorithm) != fields[0] {
+		return fmt.Errorf("sshPublicKey payload key type must match its authorized_keys prefix")
+	}
+	if !validSSHKeyPayload(fields[0], remainder) {
+		return fmt.Errorf("sshPublicKey payload is malformed for key type %s", fields[0])
+	}
+	return nil
+}
+
+func supportedSSHKeyType(value string) bool {
+	switch value {
+	case "ssh-rsa", "ssh-ed25519", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384", "ecdsa-sha2-nistp521":
+		return true
+	default:
+		return false
+	}
+}
+
+func validSSHKeyPayload(algorithm string, data []byte) bool {
+	first, remainder, ok := readSSHString(data)
+	if !ok || len(first) == 0 {
+		return false
+	}
+	switch algorithm {
+	case "ssh-ed25519":
+		return len(first) == 32 && len(remainder) == 0
+	case "ssh-rsa":
+		second, remainder, ok := readSSHString(remainder)
+		return ok && len(second) != 0 && len(remainder) == 0
+	default:
+		second, remainder, ok := readSSHString(remainder)
+		curve := strings.TrimPrefix(algorithm, "ecdsa-sha2-")
+		return ok && string(first) == curve && len(second) != 0 && len(remainder) == 0
+	}
+}
+
+func readSSHString(data []byte) ([]byte, []byte, bool) {
+	if len(data) < 4 {
+		return nil, nil, false
+	}
+	length := uint64(binary.BigEndian.Uint32(data[:4]))
+	if length > uint64(len(data)-4) {
+		return nil, nil, false
+	}
+	end := 4 + int(length)
+	return data[4:end], data[end:], true
 }

@@ -2,6 +2,8 @@ package smoke_test
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -81,7 +83,10 @@ func TestFakeProvisioningLifecycleMakesNoNetworkCalls(t *testing.T) {
 	if request.HostPoolUUID != inspacev1.AMDEPYCHostPoolUUID {
 		t.Fatalf("unexpected host pool UUID %q", request.HostPoolUUID)
 	}
-	if strings.Count(request.CloudInitJSON, "karpenter.sh/unregistered:NoExecute") != 1 {
+	if request.SSHUsername != nodeClass.Spec.SSHUsername || request.SSHPublicKey != nodeClass.Spec.SSHPublicKey {
+		t.Fatalf("worker SSH access was not propagated through the provider request")
+	}
+	if strings.Count(decodedCloudInitFiles(t, request.CloudInitJSON), "karpenter.sh/unregistered:NoExecute") != 1 {
 		t.Fatalf("bootstrap must contain exactly one registration taint\n%s", request.CloudInitJSON)
 	}
 
@@ -94,6 +99,32 @@ func TestFakeProvisioningLifecycleMakesNoNetworkCalls(t *testing.T) {
 	if err := cloudProvider.Delete(ctx, created); !cloudprovider.IsNodeClaimNotFoundError(err) {
 		t.Fatalf("Karpenter delete convergence must return NodeClaimNotFound, got %v", err)
 	}
+}
+
+func decodedCloudInitFiles(t *testing.T, data string) string {
+	t.Helper()
+	var doc struct {
+		WriteFiles []struct {
+			Encoding string `json:"encoding"`
+			Content  string `json:"content"`
+		} `json:"write_files"`
+	}
+	if err := json.Unmarshal([]byte(data), &doc); err != nil {
+		t.Fatalf("decode cloud-init: %v", err)
+	}
+	var decoded strings.Builder
+	for _, file := range doc.WriteFiles {
+		if file.Encoding != "b64" {
+			t.Fatalf("cloud-init write_files encoding = %q, want b64", file.Encoding)
+		}
+		content, err := base64.StdEncoding.DecodeString(file.Content)
+		if err != nil {
+			t.Fatalf("decode cloud-init write_files: %v", err)
+		}
+		decoded.Write(content)
+		decoded.WriteByte('\n')
+	}
+	return decoded.String()
 }
 
 func smokeNodeClass() *inspacev1.InSpaceNodeClass {
@@ -109,6 +140,8 @@ func smokeNodeClass() *inspacev1.InSpaceNodeClass {
 			ImageSelector:     inspacev1.ImageSelector{OSName: inspacev1.OSNameUbuntu, OSVersion: inspacev1.OSVersionUbuntu},
 			HostPoolSelector:  inspacev1.HostPoolSelector{Class: inspacev1.HostClassAMDEPYC},
 			RootDiskGiB:       40,
+			SSHUsername:       "inspacee2e",
+			SSHPublicKey:      "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINdamAGCsQq31Uv+08lkBzoO4XLz2qYjJa8CGmj3B1Ea smoke@example",
 			K3s: inspacev1.K3sConfig{
 				Version:        "v1.35.6+k3s1",
 				Server:         "https://api.smoke.example:6443",

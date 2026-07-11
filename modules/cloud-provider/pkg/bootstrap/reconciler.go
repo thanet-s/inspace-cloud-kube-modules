@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -17,6 +18,8 @@ import (
 )
 
 const ControlPlaneReplicas = 3
+
+var sshUsernamePattern = regexp.MustCompile(`^[a-z_][a-z0-9_-]{0,29}$`)
 
 type API interface {
 	GetNetwork(context.Context, string, string) (*inspace.Network, error)
@@ -767,11 +770,17 @@ func validatePrivateSubnet(value string) error {
 func (r *Reconciler) validateOperatorAccess() error {
 	username := strings.TrimSpace(r.SSHUsername)
 	publicKey := strings.TrimSpace(r.SSHPublicKey)
+	if username != r.SSHUsername {
+		return errors.New("bootstrap: SSH username is invalid")
+	}
+	if publicKey != r.SSHPublicKey {
+		return errors.New("bootstrap: SSH public key must be one supported authorized_keys line")
+	}
 	if (username == "") != (publicKey == "") {
 		return errors.New("bootstrap: SSH username and public key must be configured together")
 	}
 	if username != "" {
-		if len(username) > 32 || strings.ContainsAny(username, " \t\r\n:/") {
+		if !sshUsernamePattern.MatchString(username) {
 			return errors.New("bootstrap: SSH username is invalid")
 		}
 		if strings.ContainsAny(publicKey, "\r\n") || !(strings.HasPrefix(publicKey, "ssh-rsa ") || strings.HasPrefix(publicKey, "ssh-ed25519 ") || strings.HasPrefix(publicKey, "ecdsa-sha2-")) {

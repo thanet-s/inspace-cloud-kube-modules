@@ -67,6 +67,10 @@ type InSpaceNodeClassSpec struct {
 	RootDiskGiB int32 `json:"rootDiskGiB"`
 	// K3s configures workers to join the fixed control-plane endpoint.
 	K3s K3sConfig `json:"k3s"`
+	// SSHUsername and SSHPublicKey optionally enable controlled operator access.
+	// They must be configured together. Private key material is never accepted.
+	SSHUsername  string `json:"sshUsername,omitempty"`
+	SSHPublicKey string `json:"sshPublicKey,omitempty"`
 	// AdditionalUserData runs once through cloud-init-per. It must not contain secrets.
 	AdditionalUserData string `json:"additionalUserData,omitempty"`
 }

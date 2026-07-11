@@ -53,6 +53,15 @@ Generated bootstrap also enables UFW with default-deny ingress and permits RFC19
 - adds exactly one `karpenter.sh/unregistered:NoExecute` taint; and
 - runs `additionalUserData` once via `cloud-init-per`.
 
+Every VM create request includes Warren-compatible non-empty login fields. By
+default the provider sends username `user` with a cryptographically random
+32-character password generated immediately before the one VM create POST. The
+provider never logs, returns, persists, or hashes that password. It is not an
+operator credential. For controlled diagnostic access, configure both optional
+NodeClass fields `sshUsername` and `sshPublicKey`; the latter must be exactly one
+supported OpenSSH `authorized_keys` public-key line. Private keys are never
+accepted or sent.
+
 The K3s token is read from `tokenSecretRef`. Because the NodeClass is cluster-scoped, the reference cannot choose an arbitrary namespace: it is fixed to Secret `inspace-k3s-agent-token`, key `token`, in `INSPACE_SECRET_NAMESPACE` (default `karpenter`). The resolver uses an uncached, resource-name-scoped GET and cannot select the separate `inspace-api` cloud credential Secret.
 
 ## Run the controller

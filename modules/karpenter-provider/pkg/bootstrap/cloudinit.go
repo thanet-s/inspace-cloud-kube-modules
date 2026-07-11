@@ -1,6 +1,7 @@
 package bootstrap
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/netip"
@@ -16,7 +17,7 @@ import (
 // SchemaVersion must be bumped whenever generated bootstrap semantics change.
 // It is included in the provider drift hash so existing nodes are replaced.
 const (
-	SchemaVersion           = "stock-ubuntu-k3s-v3"
+	SchemaVersion           = "stock-ubuntu-k3s-v4"
 	ExternalIPv4Placeholder = "__INSPACE_FLOATING_IPV4__"
 )
 
@@ -32,13 +33,14 @@ type Config struct {
 
 type document struct {
 	WriteFiles []writeFile `json:"write_files"`
-	RunCmd     [][]string  `json:"runcmd"`
+	RunCmd     []string    `json:"runcmd"`
 }
 
 type writeFile struct {
 	Path        string `json:"path"`
 	Owner       string `json:"owner"`
 	Permissions string `json:"permissions"`
+	Encoding    string `json:"encoding"`
 	Content     string `json:"content"`
 }
 
@@ -178,29 +180,33 @@ install -o root -g root -m 0755 "$tmpdir/k3s" /usr/local/bin/k3s
 
 	doc := document{
 		WriteFiles: []writeFile{
-			{Path: "/etc/rancher/k3s/config.yaml", Owner: "root:root", Permissions: "0600", Content: k3s.String()},
-			{Path: "/etc/systemd/system/k3s-agent.service", Owner: "root:root", Permissions: "0644", Content: unit},
-			{Path: "/usr/local/sbin/inspace-install-prerequisites", Owner: "root:root", Permissions: "0700", Content: prerequisites},
-			{Path: "/usr/local/sbin/inspace-install-k3s", Owner: "root:root", Permissions: "0700", Content: install},
-			{Path: "/usr/local/sbin/inspace-detect-private-ip", Owner: "root:root", Permissions: "0700", Content: privateIP},
-			{Path: "/usr/local/sbin/inspace-firewall", Owner: "root:root", Permissions: "0700", Content: firewall},
+			encodedWriteFile("/etc/rancher/k3s/config.yaml", "0600", k3s.String()),
+			encodedWriteFile("/etc/systemd/system/k3s-agent.service", "0644", unit),
+			encodedWriteFile("/usr/local/sbin/inspace-install-prerequisites", "0700", prerequisites),
+			encodedWriteFile("/usr/local/sbin/inspace-install-k3s", "0700", install),
+			encodedWriteFile("/usr/local/sbin/inspace-detect-private-ip", "0700", privateIP),
+			encodedWriteFile("/usr/local/sbin/inspace-firewall", "0700", firewall),
 		},
-		RunCmd: [][]string{{"/usr/local/sbin/inspace-install-prerequisites"}, {"/usr/local/sbin/inspace-install-k3s"}, {"/usr/local/sbin/inspace-detect-private-ip"}, {"/usr/local/sbin/inspace-firewall"}},
+		RunCmd: []string{
+			"/usr/local/sbin/inspace-install-prerequisites",
+			"/usr/local/sbin/inspace-install-k3s",
+			"/usr/local/sbin/inspace-detect-private-ip",
+			"/usr/local/sbin/inspace-firewall",
+		},
 	}
 	if strings.TrimSpace(config.AdditionalScript) != "" {
-		doc.WriteFiles = append(doc.WriteFiles, writeFile{
-			Path:        "/usr/local/sbin/inspace-additional-user-data",
-			Owner:       "root:root",
-			Permissions: "0700",
-			Content:     "#!/bin/sh\nset -eu\n" + strings.TrimRight(config.AdditionalScript, "\n") + "\n",
-		})
+		doc.WriteFiles = append(doc.WriteFiles, encodedWriteFile(
+			"/usr/local/sbin/inspace-additional-user-data",
+			"0700",
+			"#!/bin/sh\nset -eu\n"+strings.TrimRight(config.AdditionalScript, "\n")+"\n",
+		))
 		// cloud-init-per's once semaphore makes the extension safe if runcmd is
 		// manually replayed during troubleshooting.
-		doc.RunCmd = append(doc.RunCmd, []string{"cloud-init-per", "once", "inspace-additional-user-data", "/bin/sh", "/usr/local/sbin/inspace-additional-user-data"})
+		doc.RunCmd = append(doc.RunCmd, "cloud-init-per once inspace-additional-user-data /bin/sh /usr/local/sbin/inspace-additional-user-data")
 	}
 	doc.RunCmd = append(doc.RunCmd,
-		[]string{"systemctl", "daemon-reload"},
-		[]string{"systemctl", "enable", "--now", "k3s-agent.service"},
+		"systemctl daemon-reload",
+		"systemctl enable --now k3s-agent.service",
 	)
 
 	data, err := json.Marshal(doc)
@@ -213,11 +219,15 @@ install -o root -g root -m 0755 "$tmpdir/k3s" /usr/local/bin/k3s
 // ValidateExternalIPv4Template ensures adapter substitution is deterministic
 // and cannot silently leave a worker advertising a placeholder address.
 func ValidateExternalIPv4Template(cloudInitJSON string) error {
-	var object map[string]any
-	if err := json.Unmarshal([]byte(cloudInitJSON), &object); err != nil || object == nil {
-		return fmt.Errorf("cloud-init must be a JSON object")
+	doc, err := parseDocument(cloudInitJSON)
+	if err != nil {
+		return err
 	}
-	if count := strings.Count(cloudInitJSON, ExternalIPv4Placeholder); count != 1 {
+	count, err := externalIPv4PlaceholderCount(doc, cloudInitJSON)
+	if err != nil {
+		return err
+	}
+	if count != 1 {
 		return fmt.Errorf("cloud-init must contain exactly one external IPv4 placeholder, found %d", count)
 	}
 	return nil
@@ -233,15 +243,79 @@ func ResolveExternalIPv4(cloudInitJSON, address string) (string, error) {
 	if err != nil || !ip.Is4() || !ip.IsGlobalUnicast() || ip.IsPrivate() {
 		return "", fmt.Errorf("external node IP must be a public IPv4 address")
 	}
-	resolved := strings.Replace(cloudInitJSON, ExternalIPv4Placeholder, address, 1)
-	if strings.Contains(resolved, ExternalIPv4Placeholder) {
+	doc, err := parseDocument(cloudInitJSON)
+	if err != nil {
+		return "", err
+	}
+	replaced := false
+	for i := range doc.WriteFiles {
+		content, err := decodeWriteFile(doc.WriteFiles[i])
+		if err != nil {
+			return "", err
+		}
+		if strings.Contains(content, ExternalIPv4Placeholder) {
+			content = strings.Replace(content, ExternalIPv4Placeholder, address, 1)
+			doc.WriteFiles[i].Content = base64.StdEncoding.EncodeToString([]byte(content))
+			replaced = true
+		}
+	}
+	if !replaced {
+		return "", fmt.Errorf("cloud-init contains no external IPv4 placeholder")
+	}
+	resolved, err := json.Marshal(doc)
+	if err != nil {
+		return "", fmt.Errorf("marshal resolved cloud-init JSON: %w", err)
+	}
+	count, err := externalIPv4PlaceholderCount(doc, string(resolved))
+	if err != nil {
+		return "", err
+	}
+	if count != 0 {
 		return "", fmt.Errorf("cloud-init contains an unresolved external IPv4 placeholder")
 	}
-	var object map[string]any
-	if err := json.Unmarshal([]byte(resolved), &object); err != nil || object == nil {
-		return "", fmt.Errorf("resolved cloud-init must remain a JSON object")
+	return string(resolved), nil
+}
+
+func encodedWriteFile(path, permissions, content string) writeFile {
+	return writeFile{
+		Path: path, Owner: "root:root", Permissions: permissions, Encoding: "b64",
+		Content: base64.StdEncoding.EncodeToString([]byte(content)),
 	}
-	return resolved, nil
+}
+
+func parseDocument(cloudInitJSON string) (document, error) {
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(cloudInitJSON), &object); err != nil || object == nil {
+		return document{}, fmt.Errorf("cloud-init must be a JSON object")
+	}
+	var doc document
+	if err := json.Unmarshal([]byte(cloudInitJSON), &doc); err != nil {
+		return document{}, fmt.Errorf("decode cloud-init document: %w", err)
+	}
+	return doc, nil
+}
+
+func externalIPv4PlaceholderCount(doc document, rawJSON string) (int, error) {
+	count := strings.Count(rawJSON, ExternalIPv4Placeholder)
+	for _, file := range doc.WriteFiles {
+		content, err := decodeWriteFile(file)
+		if err != nil {
+			return 0, err
+		}
+		count += strings.Count(content, ExternalIPv4Placeholder)
+	}
+	return count, nil
+}
+
+func decodeWriteFile(file writeFile) (string, error) {
+	if file.Encoding != "b64" {
+		return "", fmt.Errorf("cloud-init write_files entry %q must use b64 encoding", file.Path)
+	}
+	content, err := base64.StdEncoding.DecodeString(file.Content)
+	if err != nil {
+		return "", fmt.Errorf("decode cloud-init write_files entry %q: %w", file.Path, err)
+	}
+	return string(content), nil
 }
 
 func ensureRegistrationTaint(taints []corev1.Taint) []corev1.Taint {

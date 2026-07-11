@@ -109,6 +109,9 @@ func TestReconcileRejectsUnsafeManagementAccessAndCIDROverlap(t *testing.T) {
 		"private management source": {API: newFakeAPI(), ManagementCIDR: "10.20.30.4/32", ManagementTCPPorts: []int{22}},
 		"port without source":       {API: newFakeAPI(), ManagementTCPPorts: []int{22}},
 		"private key material":      {API: newFakeAPI(), SSHUsername: "root", SSHPublicKey: "-----BEGIN " + "OPENSSH PRIVATE KEY-----"},
+		"username too long":         {API: newFakeAPI(), SSHUsername: "a123456789012345678901234567890", SSHPublicKey: "ssh-ed25519 AAAA"},
+		"padded username":           {API: newFakeAPI(), SSHUsername: " operator ", SSHPublicKey: "ssh-ed25519 AAAA"},
+		"trailing key whitespace":   {API: newFakeAPI(), SSHUsername: "operator", SSHPublicKey: "ssh-ed25519 AAAA\n"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			if _, err := reconciler.Reconcile(context.Background(), testCluster(), "unit-test-secret-token"); err == nil {

@@ -53,6 +53,9 @@ spec:
                 - hostPoolSelector
                 - rootDiskGiB
                 - k3s
+              x-kubernetes-validations:
+                - rule: 'has(self.sshUsername) == has(self.sshPublicKey)'
+                  message: sshUsername and sshPublicKey must be configured together
               properties:
                 clusterName:
                   type: string
@@ -120,6 +123,16 @@ spec:
                           type: string
                           minLength: 1
                           enum: [token]
+                sshUsername:
+                  type: string
+                  minLength: 1
+                  maxLength: 30
+                  pattern: '^[a-z_][a-z0-9_-]{0,29}$'
+                sshPublicKey:
+                  type: string
+                  minLength: 1
+                  maxLength: 16384
+                  pattern: '^(ssh-rsa|ssh-ed25519|ecdsa-sha2-nistp(256|384|521))[ \t]+[A-Za-z0-9+/]+={0,2}([ \t]+[^\r\n]*)?$'
                 additionalUserData:
                   type: string
                   maxLength: 65536

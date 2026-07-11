@@ -1,6 +1,7 @@
 package v1alpha1
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"testing"
@@ -15,6 +16,13 @@ func TestInSpaceNodeClassCRDPassesKubernetesValidation(t *testing.T) {
 	data, err := os.ReadFile("../../../config/crd/bases/karpenter.inspace.cloud_inspacenodeclasses.yaml")
 	if err != nil {
 		t.Fatalf("read CRD: %v", err)
+	}
+	chartData, err := os.ReadFile("../../../../../charts/inspace-cloud-kube-modules-crds/templates/karpenter.inspace.cloud_inspacenodeclasses.yaml")
+	if err != nil {
+		t.Fatalf("read chart CRD: %v", err)
+	}
+	if !bytes.Equal(data, chartData) {
+		t.Fatal("source and chart InSpaceNodeClass CRDs differ")
 	}
 
 	var versioned apiextensionsv1.CustomResourceDefinition

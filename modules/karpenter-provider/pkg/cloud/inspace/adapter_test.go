@@ -2,8 +2,11 @@ package inspace
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"reflect"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -13,7 +16,11 @@ import (
 
 func TestCreateIsReadBeforeCreateIdempotent(t *testing.T) {
 	api := &fakeAPI{pools: []sdk.HostPool{{UUID: "pool-1"}}}
-	adapter, err := New(api)
+	passwordCalls := 0
+	adapter, err := newAdapter(api, func() (string, error) {
+		passwordCalls++
+		return validGeneratedTestPassword, nil
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -29,17 +36,137 @@ func TestCreateIsReadBeforeCreateIdempotent(t *testing.T) {
 	if first.UUID != second.UUID || api.createCalls != 1 {
 		t.Fatalf("idempotent creates returned %q/%q with %d POSTs", first.UUID, second.UUID, api.createCalls)
 	}
+	if passwordCalls != 1 {
+		t.Fatalf("password generator called %d times, want once for the actual POST only", passwordCalls)
+	}
 	if api.lastVMRequest.ReservePublicIP == nil || *api.lastVMRequest.ReservePublicIP {
 		t.Fatalf("VM create must reserve no implicit public IP: %#v", api.lastVMRequest.ReservePublicIP)
 	}
-	if !strings.Contains(api.lastVMRequest.CloudInit, "203.0.113.10") || strings.Contains(api.lastVMRequest.CloudInit, "__INSPACE_FLOATING_IPV4__") {
+	if !strings.Contains(decodedSDKCloudInit(t, api.lastVMRequest.CloudInit), "203.0.113.10") || strings.Contains(decodedSDKCloudInit(t, api.lastVMRequest.CloudInit), "__INSPACE_FLOATING_IPV4__") {
 		t.Fatalf("VM cloud-init external IP was not resolved: %s", api.lastVMRequest.CloudInit)
+	}
+	if api.lastVMRequest.Username != defaultUsername || api.lastVMRequest.Password != validGeneratedTestPassword || api.lastVMRequest.PublicKey != "" {
+		t.Fatalf("default VM access contract not applied: username=%q passwordSet=%t publicKeySet=%t", api.lastVMRequest.Username, api.lastVMRequest.Password != "", api.lastVMRequest.PublicKey != "")
+	}
+	if strings.Contains(api.lastVMRequest.Description, api.lastVMRequest.Password) {
+		t.Fatal("ephemeral password leaked into VM ownership")
+	}
+	var record map[string]any
+	if err := json.Unmarshal([]byte(api.lastVMRequest.Description), &record); err != nil {
+		t.Fatalf("decode ownership: %v", err)
+	}
+	for key := range record {
+		if strings.Contains(strings.ToLower(key), "password") || strings.Contains(strings.ToLower(key), "credential") {
+			t.Fatalf("ownership contains forbidden credential field %q", key)
+		}
+	}
+	if record["keyHash"] != hashKey(request.IdempotencyKey) {
+		t.Fatal("ownership key hash must derive only from the idempotency key")
 	}
 	if len(api.floatingIPs) != 1 || api.floatingIPs[0].AssignedTo != first.UUID {
 		t.Fatalf("expected one owned assigned floating IP, got %#v", api.floatingIPs)
 	}
 	if second.State != cloudapi.LifecyclePending {
 		t.Fatalf("state = %q", second.State)
+	}
+}
+
+func TestCreatePassesOptionalSSHAccess(t *testing.T) {
+	api := &fakeAPI{}
+	adapter, err := newAdapter(api, func() (string, error) { return validGeneratedTestPassword, nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := testRequest()
+	request.SSHUsername = "inspacee2e"
+	request.SSHPublicKey = validAdapterTestPublicKey
+	if _, err := adapter.CreateVM(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	if api.lastVMRequest.Username != request.SSHUsername || api.lastVMRequest.PublicKey != request.SSHPublicKey || api.lastVMRequest.Password != validGeneratedTestPassword {
+		t.Fatalf("SSH access was not passed through: username=%q publicKeyMatch=%t passwordSet=%t", api.lastVMRequest.Username, api.lastVMRequest.PublicKey == request.SSHPublicKey, api.lastVMRequest.Password != "")
+	}
+}
+
+func TestPasswordGenerationFailsClosedBeforeVMPost(t *testing.T) {
+	for name, generator := range map[string]func() (string, error){
+		"error":           func() (string, error) { return "", errors.New("entropy unavailable") },
+		"empty":           func() (string, error) { return "", nil },
+		"wrong length":    func() (string, error) { return "Aa1!short", nil },
+		"missing classes": func() (string, error) { return strings.Repeat("a", 32), nil },
+	} {
+		t.Run(name, func(t *testing.T) {
+			api := &fakeAPI{}
+			adapter, err := newAdapter(api, generator)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := adapter.CreateVM(context.Background(), testRequest()); err == nil {
+				t.Fatal("expected password generation failure")
+			}
+			if api.createCalls != 0 {
+				t.Fatalf("VM POST occurred after password generation failure: %d", api.createCalls)
+			}
+			if len(api.floatingIPs) != 0 {
+				t.Fatalf("floating IP leaked after password generation failure: %#v", api.floatingIPs)
+			}
+		})
+	}
+}
+
+func TestPasswordFailurePreservesPriorAmbiguousCreateAnchor(t *testing.T) {
+	api := &fakeAPI{createErr: errors.New("connection reset")}
+	passwordCalls := 0
+	adapter, err := newAdapter(api, func() (string, error) {
+		passwordCalls++
+		if passwordCalls == 1 {
+			return validGeneratedTestPassword, nil
+		}
+		return "", errors.New("entropy unavailable")
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := testRequest()
+	if _, err := adapter.CreateVM(context.Background(), request); err == nil {
+		t.Fatal("expected ambiguous VM create error")
+	}
+	if api.createCalls != 1 || len(api.floatingIPs) != 1 || api.floatingIPs[0].AssignedTo != "" {
+		t.Fatalf("ambiguous create anchor was not preserved: POSTs=%d floatingIPs=%#v", api.createCalls, api.floatingIPs)
+	}
+	address := api.floatingIPs[0].Address
+	if _, err := adapter.CreateVM(context.Background(), request); err == nil {
+		t.Fatal("expected password generation error on reconciliation")
+	}
+	if api.createCalls != 1 {
+		t.Fatalf("unexpected second VM POST after password failure: %d", api.createCalls)
+	}
+	if len(api.floatingIPs) != 1 || api.floatingIPs[0].Address != address || api.floatingIPs[0].AssignedTo != "" {
+		t.Fatalf("prior ambiguous-create anchor was removed or changed: %#v", api.floatingIPs)
+	}
+}
+
+func TestGeneratedPasswordContract(t *testing.T) {
+	first, err := generatePassword()
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := generatePassword()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first) != 32 || len(second) != 32 {
+		t.Fatalf("generated password lengths = %d/%d, want 32", len(first), len(second))
+	}
+	if first == second {
+		t.Fatal("independent generated passwords unexpectedly matched")
+	}
+	for name, pattern := range map[string]string{
+		"lowercase": `[a-z]`, "uppercase": `[A-Z]`, "digit": `[0-9]`, "symbol": `[^A-Za-z0-9]`,
+	} {
+		if !regexp.MustCompile(pattern).MatchString(first) {
+			t.Fatalf("generated password lacks %s character class", name)
+		}
 	}
 }
 
@@ -184,10 +311,38 @@ func testRequest() cloudapi.CreateVMRequest {
 		Location:         "bkk01", NetworkUUID: "network-1", OSName: "ubuntu", OSVersion: "24.04",
 		FirewallUUID: "33333333-3333-4333-8333-333333333333",
 		HostPoolUUID: "pool-1", HostClass: "intel-scalable", InstanceType: "is-general-2c-4g",
-		VCPU: 2, MemoryGiB: 4, RootDiskGiB: 40, CloudInitJSON: `{"write_files":[{"content":"node-external-ip: __INSPACE_FLOATING_IPV4__"}],"runcmd":[]}`,
+		VCPU: 2, MemoryGiB: 4, RootDiskGiB: 40, CloudInitJSON: `{"write_files":[{"path":"/etc/rancher/k3s/config.yaml","encoding":"b64","content":"bm9kZS1leHRlcm5hbC1pcDogX19JTlNQQUNFX0ZMT0FUSU5HX0lQVjRfXw=="}],"runcmd":[]}`,
 		PublicIPv4: true,
 		SpecHash:   "spec-a", BootstrapHash: "bootstrap-a",
 	}
+}
+
+const validAdapterTestPublicKey = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINdamAGCsQq31Uv+08lkBzoO4XLz2qYjJa8CGmj3B1Ea test@example"
+const validGeneratedTestPassword = "Aa1!xxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+
+func decodedSDKCloudInit(t *testing.T, data string) string {
+	t.Helper()
+	var doc struct {
+		WriteFiles []struct {
+			Encoding string `json:"encoding"`
+			Content  string `json:"content"`
+		} `json:"write_files"`
+	}
+	if err := json.Unmarshal([]byte(data), &doc); err != nil {
+		t.Fatalf("decode cloud-init JSON: %v", err)
+	}
+	var decoded strings.Builder
+	for _, file := range doc.WriteFiles {
+		if file.Encoding != "b64" {
+			t.Fatalf("write_files encoding = %q, want b64", file.Encoding)
+		}
+		content, err := base64.StdEncoding.DecodeString(file.Content)
+		if err != nil {
+			t.Fatalf("decode write_files content: %v", err)
+		}
+		decoded.Write(content)
+	}
+	return decoded.String()
 }
 
 type fakeAPI struct {

@@ -129,6 +129,8 @@ func (p *CloudProvider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim)
 		MemoryGiB:        memoryGiB,
 		RootDiskGiB:      nodeClass.Spec.RootDiskGiB,
 		PublicIPv4:       nodeClass.Spec.ReservePublicIPv4,
+		SSHUsername:      nodeClass.Spec.SSHUsername,
+		SSHPublicKey:     nodeClass.Spec.SSHPublicKey,
 		CloudInitJSON:    userData,
 		SpecHash:         NodeClassHash(nodeClass),
 		BootstrapHash:    BootstrapHash(nodeClass),
@@ -378,8 +380,14 @@ func BootstrapHash(nodeClass *inspacev1.InSpaceNodeClass) string {
 		Schema             string
 		Image              inspacev1.ImageSelector
 		K3s                inspacev1.K3sConfig
+		SSHUsername        string
+		SSHPublicKey       string
 		AdditionalUserData string
-	}{Schema: bootstrap.SchemaVersion, Image: nodeClass.Spec.ImageSelector, K3s: nodeClass.Spec.K3s, AdditionalUserData: nodeClass.Spec.AdditionalUserData})
+	}{
+		Schema: bootstrap.SchemaVersion, Image: nodeClass.Spec.ImageSelector, K3s: nodeClass.Spec.K3s,
+		SSHUsername: nodeClass.Spec.SSHUsername, SSHPublicKey: nodeClass.Spec.SSHPublicKey,
+		AdditionalUserData: nodeClass.Spec.AdditionalUserData,
+	})
 	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:16])
 }

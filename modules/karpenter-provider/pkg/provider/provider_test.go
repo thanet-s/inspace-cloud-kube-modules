@@ -68,6 +68,21 @@ func TestIsDriftedWhenNodeClassImageChanges(t *testing.T) {
 	}
 }
 
+func TestSSHAccessChangesNodeClassAndBootstrapHashes(t *testing.T) {
+	nodeClass := providerNodeClass()
+	nodeClassHash := NodeClassHash(nodeClass)
+	bootstrapHash := BootstrapHash(nodeClass)
+
+	nodeClass.Spec.SSHUsername = "inspacee2e"
+	nodeClass.Spec.SSHPublicKey = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINdamAGCsQq31Uv+08lkBzoO4XLz2qYjJa8CGmj3B1Ea provider@example"
+	if NodeClassHash(nodeClass) == nodeClassHash {
+		t.Fatal("SSH access change did not change NodeClass hash")
+	}
+	if BootstrapHash(nodeClass) == bootstrapHash {
+		t.Fatal("SSH access change did not change bootstrap hash")
+	}
+}
+
 func providerNodeClass() *inspacev1.InSpaceNodeClass {
 	return &inspacev1.InSpaceNodeClass{
 		ObjectMeta: metav1.ObjectMeta{Name: "workers"},

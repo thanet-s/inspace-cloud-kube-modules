@@ -5,7 +5,9 @@ package inspace
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -18,11 +20,16 @@ import (
 
 	sdk "github.com/thanet-s/inspace-cloud-kube-modules/modules/cloud-provider/pkg/inspace"
 
+	inspacev1 "github.com/thanet-s/inspace-cloud-kube-modules/modules/karpenter-provider/pkg/apis/v1alpha1"
 	"github.com/thanet-s/inspace-cloud-kube-modules/modules/karpenter-provider/pkg/bootstrap"
 	cloudapi "github.com/thanet-s/inspace-cloud-kube-modules/modules/karpenter-provider/pkg/cloud"
 )
 
-const ownershipSchema = "karpenter.inspace.cloud/v1"
+const (
+	ownershipSchema  = "karpenter.inspace.cloud/v1"
+	defaultUsername  = "user"
+	passwordByteSize = 21
+)
 
 type API interface {
 	ListHostPools(context.Context, string) ([]sdk.HostPool, error)
@@ -43,13 +50,23 @@ type API interface {
 	DeleteVM(context.Context, string, string) error
 }
 
-type Adapter struct{ api API }
+type Adapter struct {
+	api              API
+	generatePassword func() (string, error)
+}
 
 func New(api API) (*Adapter, error) {
+	return newAdapter(api, generatePassword)
+}
+
+func newAdapter(api API, passwordGenerator func() (string, error)) (*Adapter, error) {
 	if api == nil {
 		return nil, fmt.Errorf("InSpace API client is required")
 	}
-	return &Adapter{api: api}, nil
+	if passwordGenerator == nil {
+		return nil, fmt.Errorf("secure VM password generator is required")
+	}
+	return &Adapter{api: api, generatePassword: passwordGenerator}, nil
 }
 
 type ownership struct {
@@ -77,13 +94,16 @@ func (a *Adapter) CreateVM(ctx context.Context, request cloudapi.CreateVMRequest
 	if err := a.ValidateNodeClass(ctx, request.Location, request.NetworkUUID, request.HostPoolUUID, request.FirewallUUID); err != nil {
 		return nil, fmt.Errorf("preflight NodeClass infrastructure: %w", err)
 	}
-	floatingIP, err := a.ensureFloatingIP(ctx, request)
+	floatingIP, floatingIPCreated, err := a.ensureFloatingIP(ctx, request)
 	if err != nil {
 		return nil, err
 	}
 	resolvedCloudInit, err := bootstrap.ResolveExternalIPv4(request.CloudInitJSON, floatingIP.Address)
 	if err != nil {
-		cleanupErr := a.cleanupUnassignedFloatingIP(ctx, request.Location, *floatingIP)
+		var cleanupErr error
+		if floatingIPCreated {
+			cleanupErr = a.cleanupUnassignedFloatingIP(ctx, request.Location, *floatingIP)
+		}
 		return nil, errors.Join(fmt.Errorf("resolving K3s external node IP: %w", err), cleanupErr)
 	}
 	request.CloudInitJSON = resolvedCloudInit
@@ -96,7 +116,11 @@ func (a *Adapter) CreateVM(ctx context.Context, request cloudapi.CreateVMRequest
 	}
 	description, err := json.Marshal(record)
 	if err != nil {
-		return nil, fmt.Errorf("encoding VM ownership: %w", err)
+		var cleanupErr error
+		if floatingIPCreated {
+			cleanupErr = a.cleanupUnassignedFloatingIP(ctx, request.Location, *floatingIP)
+		}
+		return nil, errors.Join(fmt.Errorf("encoding VM ownership: %w", err), cleanupErr)
 	}
 
 	if existing, err := a.findCreate(ctx, request, record, floatingIP); err != nil {
@@ -111,10 +135,30 @@ func (a *Adapter) CreateVM(ctx context.Context, request cloudapi.CreateVMRequest
 	// The provider owns a separately named floating IP. Asking VM create to
 	// reserve another address would leak an untracked resource.
 	reservePublicIP := false
+	username := request.SSHUsername
+	if username == "" {
+		username = defaultUsername
+	}
+	password, err := a.generatePassword()
+	if err != nil {
+		var cleanupErr error
+		if floatingIPCreated {
+			cleanupErr = a.cleanupUnassignedFloatingIP(ctx, request.Location, *floatingIP)
+		}
+		return nil, errors.Join(fmt.Errorf("generating ephemeral VM password: %w", err), cleanupErr)
+	}
+	if err := validateGeneratedPassword(password); err != nil {
+		var cleanupErr error
+		if floatingIPCreated {
+			cleanupErr = a.cleanupUnassignedFloatingIP(ctx, request.Location, *floatingIP)
+		}
+		return nil, errors.Join(fmt.Errorf("generated ephemeral VM password is invalid: %w", err), cleanupErr)
+	}
 	created, createErr := a.api.CreateVM(ctx, request.Location, sdk.CreateVMRequest{
 		Name: request.Name, Description: string(description), OSName: request.OSName, OSVersion: request.OSVersion,
 		DiskGiB: int(request.RootDiskGiB), VCPU: request.VCPU, MemoryMiB: request.MemoryGiB * 1024,
 		DesignatedPoolUUID: request.HostPoolUUID, NetworkUUID: request.NetworkUUID,
+		Username: username, Password: password, PublicKey: request.SSHPublicKey,
 		BillingAccountID: request.BillingAccountID, CloudInit: request.CloudInitJSON, ReservePublicIP: &reservePublicIP,
 	})
 	if createErr != nil {
@@ -336,8 +380,45 @@ func validateCreateRequest(r cloudapi.CreateVMRequest) error {
 	case r.CloudInitJSON == "":
 		return fmt.Errorf("cloud-init JSON is required")
 	}
+	if err := inspacev1.ValidateSSHAccess(r.SSHUsername, r.SSHPublicKey); err != nil {
+		return fmt.Errorf("invalid worker SSH access: %w", err)
+	}
 	if err := bootstrap.ValidateExternalIPv4Template(r.CloudInitJSON); err != nil {
 		return err
+	}
+	return nil
+}
+
+func generatePassword() (string, error) {
+	random := make([]byte, passwordByteSize)
+	if _, err := rand.Read(random); err != nil {
+		return "", err
+	}
+	// The fixed prefix satisfies Warren's documented character-class contract;
+	// the random suffix supplies 168 bits from crypto/rand. The caller sends the
+	// result directly to the API and never stores, hashes, logs, or returns it.
+	return "Aa1!" + base64.RawURLEncoding.EncodeToString(random), nil
+}
+
+func validateGeneratedPassword(password string) error {
+	if len(password) != 32 {
+		return fmt.Errorf("must be exactly 32 characters")
+	}
+	var lower, upper, digit, symbol bool
+	for _, character := range password {
+		switch {
+		case character >= 'a' && character <= 'z':
+			lower = true
+		case character >= 'A' && character <= 'Z':
+			upper = true
+		case character >= '0' && character <= '9':
+			digit = true
+		default:
+			symbol = true
+		}
+	}
+	if !lower || !upper || !digit || !symbol {
+		return fmt.Errorf("must contain lowercase, uppercase, digit, and symbol characters")
 	}
 	return nil
 }
@@ -380,12 +461,12 @@ func fromSDK(vm *sdk.VM, location string, record ownership) *cloudapi.VM {
 	}
 }
 
-func (a *Adapter) ensureFloatingIP(ctx context.Context, request cloudapi.CreateVMRequest) (*sdk.FloatingIP, error) {
+func (a *Adapter) ensureFloatingIP(ctx context.Context, request cloudapi.CreateVMRequest) (*sdk.FloatingIP, bool, error) {
 	name := floatingIPName(request.ClusterName, request.NodeClaimName)
 	if existing, err := a.findFloatingIPByName(ctx, request.Location, name, request.BillingAccountID); err == nil {
-		return existing, nil
+		return existing, false, nil
 	} else if !errors.Is(err, cloudapi.ErrNotFound) {
-		return nil, err
+		return nil, false, err
 	}
 	created, createErr := a.api.CreateFloatingIP(ctx, request.Location, sdk.CreateFloatingIPRequest{
 		Name: name, BillingAccountID: request.BillingAccountID,
@@ -393,17 +474,17 @@ func (a *Adapter) ensureFloatingIP(ctx context.Context, request cloudapi.CreateV
 	if createErr != nil {
 		if isAmbiguousCreate(createErr) {
 			if recovered, recoveryErr := a.findFloatingIPByName(ctx, request.Location, name, request.BillingAccountID); recoveryErr == nil {
-				return recovered, nil
+				return recovered, true, nil
 			}
 		}
-		return nil, fmt.Errorf("creating named floating IP (POST was not retried): %w", createErr)
+		return nil, false, fmt.Errorf("creating named floating IP (POST was not retried): %w", createErr)
 	}
 	if created == nil || created.Address == "" {
-		return nil, fmt.Errorf("creating named floating IP returned no address")
+		return nil, false, fmt.Errorf("creating named floating IP returned no address")
 	}
 	created.Name = name
 	created.BillingAccountID = request.BillingAccountID
-	return created, nil
+	return created, true, nil
 }
 
 func (a *Adapter) ensureProtection(ctx context.Context, request cloudapi.CreateVMRequest, vmUUID string, floatingIP sdk.FloatingIP) error {

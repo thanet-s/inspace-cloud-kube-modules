@@ -243,6 +243,14 @@ ssh_ready() {
   ssh "${ssh_options[@]}" "$ssh_user@$ip" true >/dev/null 2>&1
 }
 
+k3s_agent_ready() {
+  local ip=$1
+  ssh "${ssh_options[@]}" "$ssh_user@$ip" \
+    "sudo timeout --kill-after=5s 45s bash -o pipefail -c '(cloud-init status --wait >/dev/null 2>&1 || test \$? -eq 2) &&
+     systemctl is-active --quiet k3s-agent &&
+     . /etc/os-release && test \"\$ID\" = ubuntu && test \"\$VERSION_ID\" = 24.04'" >/dev/null 2>&1
+}
+
 k3s_etcd_ready() {
   local ip=$1
   # InSpace's generated cloud-config currently triggers recoverable schema
@@ -401,6 +409,19 @@ persist_worker_ownership_from_cloud() {
   merged=$(jq -c 'unique_by(.uuid) | sort_by([.name,.uuid])' <<<"$combined") || return 1
   fips=$(jq -c '[.[].fip] | unique' <<<"$merged") || return 1
   state_update '.workerVMs=$workers | .workerFloatingIPNames=$fips' --argjson workers "$merged" --argjson fips "$fips"
+}
+
+owned_worker_public_ip() {
+  local fip_name all_ips
+  fip_name=$(jq -er '
+    (.workerVMs // []) as $workers |
+    if ($workers | length) == 1 then $workers[0].fip else error("expected exactly one persisted worker") end' \
+    "$state_file") || return 1
+  all_ips=$(api_get network/ip_addresses) || return 1
+  jq -er --arg name "$fip_name" '
+    [.[] | select(.name==$name and ((.is_deleted // false) | not))] |
+    if length == 1 then .[0].address else error("expected exactly one owned worker floating IP") end' \
+    <<<"$all_ips"
 }
 
 # Quiesce every Kubernetes owner before removing controllers or falling back
@@ -1140,7 +1161,10 @@ spec:
     tokenSecretRef:
       name: inspace-k3s-agent-token
       key: token
+  sshUsername: $ssh_user
+  sshPublicKey: "$configured_public_key"
   additionalUserData: |
+    ufw allow proto tcp from $management_cidr to any port 22
     ufw allow proto tcp from $management_cidr to any port 30080
 ---
 apiVersion: karpenter.sh/v1
@@ -1210,6 +1234,11 @@ worker_node=$(kubectl get node -l "karpenter.sh/nodepool=$nodepool_name" -o json
 persist_worker_ownership_from_cloud
 workers=$(jq -c '.workerVMs // []' "$state_file")
 jq -e 'length == 1' >/dev/null <<<"$workers"
+worker_public_ip=$(owned_worker_public_ip)
+require_public_ipv4 "$worker_public_ip"
+state_update '.workerPublicIPv4=$ip' --arg ip "$worker_public_ip"
+wait_until 600 "SSH on Karpenter worker" ssh_ready "$worker_public_ip"
+wait_until 600 "worker cloud-init, Ubuntu 24.04, and K3s agent" k3s_agent_ready "$worker_public_ip"
 state_update '.workerNode=$node' --arg node "$worker_node"
 kubectl -n kube-system rollout status daemonset/inspace-csi-node --timeout=10m
 kubectl get csinode "$worker_node" >/dev/null
