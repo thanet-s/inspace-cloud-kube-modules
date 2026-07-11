@@ -39,6 +39,11 @@ func (d *Driver) Serve(ctx context.Context, endpoint string) error {
 	}
 	defer listener.Close()
 	defer os.Remove(u.Path)
+	// Controller sidecars share this socket through the Pod fsGroup. Unix
+	// stream clients need write permission on the socket itself to connect.
+	if err := os.Chmod(u.Path, 0o660); err != nil {
+		return fmt.Errorf("set CSI socket permissions: %w", err)
+	}
 
 	server := grpc.NewServer()
 	d.Register(server)

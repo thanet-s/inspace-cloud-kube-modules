@@ -47,6 +47,8 @@ grep -Fx '      dnsPolicy: Default' "$tmpdir/ccm-deployment.yaml" >/dev/null
 helm template bootstrap "$chart" --namespace kube-system --values "$values" \
   --show-only templates/csi-controller.yaml >"$tmpdir/csi-controller.yaml"
 require_toleration "$tmpdir/csi-controller.yaml"
+test "$(grep -Fc '        fsGroup: 65532' "$tmpdir/csi-controller.yaml")" -eq 1
+test "$(grep -Fc '            runAsGroup: 65532' "$tmpdir/csi-controller.yaml")" -eq 1
 
 helm template bootstrap "$chart" --namespace kube-system --values "$values" \
   --show-only templates/karpenter-deployment.yaml >"$tmpdir/karpenter.yaml"
