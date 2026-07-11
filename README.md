@@ -25,6 +25,13 @@ targets also use private VM addresses. Every public VM must be assigned an
 InSpace firewall before the controller considers it ready; unmatched public
 inbound traffic is not part of the supported cluster contract.
 
+Every VM create request carries the configured VPC UUID. Karpenter additionally
+waits for the created VM UUID to appear exactly once in that network's
+authoritative `vm_uuids` read-back before assigning the firewall and floating
+IP. The full-cluster acceptance test also binds that UUID to the Kubernetes
+Node provider ID and verifies its sole `InternalIP` is inside the same VPC
+subnet.
+
 ## Safety contract
 
 - Automated tests and smoke tests must use loopback/in-memory fake APIs.
@@ -43,6 +50,7 @@ workspace `.env` is ignored and should have mode `0600`.
 ```sh
 make test
 make smoke
+make verify
 make helm-verify
 make status
 ```
@@ -87,5 +95,21 @@ CONFIRM_INSPACE_LIVE_TEST="$INSPACE_BILLING_ACCOUNT_ID" make live-test
 The root `.env` supplies local test-account values and is mode `0600`, ignored
 by Git, and excluded from every Docker build context. The live suite covers API
 resource lifecycles for VM/firewall/floating-IP/TCP-NLB/block-disk and the real
-Karpenter adapter. It does not yet prove a three-server K3s boot, worker join,
-in-guest internet access, CSI mount, or workload scheduling.
+Karpenter adapter.
+
+From the matching source checkout, the separate destructive release-acceptance
+suite installs an exact published version and proves the complete cluster
+lifecycle: three stock-Ubuntu K3s control planes with embedded etcd, CCM node
+identity, one Karpenter worker in the configured VPC, public-IP egress and K3s
+join, an RWO CSI volume that keeps data through pod replacement, and a public
+TCP NLB response. It then performs an exact-ownership, zero-leftover cloud
+audit:
+
+```sh
+export INSPACE_E2E_VERSION='<published-version>'
+export CONFIRM_INSPACE_CLUSTER_E2E="$INSPACE_BILLING_ACCOUNT_ID"
+./test/e2e/run.sh
+```
+
+See the [full-cluster E2E guide](test/e2e/README.md) for prerequisites and the
+fail-closed cleanup contract.

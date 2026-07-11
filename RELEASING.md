@@ -19,6 +19,24 @@ single version for the three controller images and both Helm charts.
    then publish the GitHub release. Repository release immutability prevents a
    published release or tag from being changed afterward.
 
+Image builds are native on GitHub's `ubuntu-26.04` amd64 and
+`ubuntu-26.04-arm` arm64 runners; the workflow does not use QEMU. The manifest
+job combines the two platform digests into one multi-architecture tag only
+after both builds succeed. Lightweight tag validation, CI Helm verification,
+and final-release jobs use `ubuntu-slim` where the larger image toolchain is
+unnecessary.
+
+Before promoting a release candidate to stable:
+
+1. Independently verify the immutable tag target, release checksums, OCI chart
+   bytes, image platform indexes, SBOM attestations, and SLSA provenance.
+2. From a clean checkout of that candidate tag, run `test/e2e/run.sh` against
+   the exact published candidate in the isolated account. The script builds
+   the bootstrap controller from the checkout, so source/tag identity matters.
+   It must finish unattended and report zero owned cloud resources.
+3. Create the stable annotated tag from the same tested commit, then repeat the
+   artifact verification for the stable release.
+
 Stable tags additionally update floating minor and `latest` image tags. A
 major alias is published from v1 onward, but never as the ambiguous `:0` tag.
 Prereleases publish only their exact prerelease version. Consumers should pin

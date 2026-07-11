@@ -123,6 +123,12 @@ make live-test
 Ordinary `make test`, `make smoke`, and `make verify` never compile or run that
 live test. Never commit an API token.
 
+The separate [full-cluster release acceptance test](../../test/e2e/README.md)
+installs the released CSI controller and node DaemonSet into the real K3s
+cluster. It provisions and attaches one RWO volume to the Karpenter worker,
+verifies the mounted marker through a pod replacement, then proves the
+VolumeAttachment, PV, PVC, disk, and worker are absent after teardown.
+
 ## Kubernetes manifests
 
 Files in `deploy/kubernetes` provide:
@@ -138,7 +144,8 @@ Replace the example image tag before deployment. The controller Secret must be
 created out of band with `api-token` and `billing-account-id` keys; no
 credential is stored in this repository.
 
-Before declaring a production release, run `csi-sanity`, Kubernetes storage e2e,
-node reboot/remount, forced VM deletion, and destructive detach tests in the
-isolated InSpace account. The local `replace` in `go.mod` points at the sibling
-shared SDK module inside this monorepo.
+The current full-cluster test does not replace `csi-sanity`, upstream
+Kubernetes storage conformance, node reboot/remount, forced VM deletion, or
+destructive detach testing; run those before broadening the first-release RWO
+contract. The local `replace` in `go.mod` points at the sibling shared SDK
+module inside this monorepo.

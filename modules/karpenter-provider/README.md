@@ -23,12 +23,25 @@ InSpace currently has no managed NAT gateway, so each worker needs a floating pu
 The provider uses a fail-closed sequence:
 
 1. Allocate or recover a deterministically named, provider-owned floating IP.
-2. Create the VM with `reserve_public_ip=false`, avoiding an untracked implicit address.
-3. Assign and read back the required InSpace firewall.
-4. Assign and read back the owned floating IP.
-5. Return the NodeClaim only after both protections are confirmed.
+2. Create the VM with the NodeClass `network_uuid` and
+   `reserve_public_ip=false`, avoiding an untracked implicit address.
+3. Read back that exact network until the VM UUID appears exactly once in its
+   authoritative `vm_uuids` membership.
+4. Assign and read back the required InSpace firewall.
+5. Assign and read back the owned floating IP.
+6. Return the NodeClaim only after VPC attachment and both protections are
+   confirmed.
 
-If protection fails, the adapter removes the VM and floating IP. Delete also removes both resources, including an orphan floating IP when the VM has already disappeared. Create POSTs are never blindly retried; read-before-create ownership records recover ambiguous responses.
+Network membership read-back has a 60-second total bound, 10-second request
+bounds, exponential polling, and retries for transient read failures. A newly
+created VM that cannot prove attachment or protection triggers detached,
+bounded rollback of its floating IP and VM; cleanup failures are joined to the
+launch error, and the firewall stays attached if VM deletion is uncertain. An
+existing owned VM is discovered and validated before any new floating IP
+mutation; a temporary adoption read-back failure is returned for reconciliation
+without destroying that VM. Delete removes both resources, including an orphan
+floating IP when the VM has already disappeared. Create POSTs are never blindly
+retried; read-before-create ownership records recover ambiguous responses.
 
 NodeClass readiness verifies that its private network exists and that its firewall:
 
@@ -106,6 +119,12 @@ make live-test
 
 It additionally requires `INSPACE_API_TOKEN`, `INSPACE_BILLING_ACCOUNT_ID`, `INSPACE_NETWORK_UUID`, `INSPACE_FIREWALL_UUID`, and `INSPACE_INTEL_HOST_POOL_UUID`. Normal `go test ./...` compiles this test but skips it before reading those values.
 
-This is an InSpace API resource-lifecycle test, not a full K3s node-join or workload scheduling test. Cluster-level conformance comes after the fixed control plane, CCM, and CSI components are deployed together.
+That smaller test covers the InSpace API lifecycle only. The separate
+[full-cluster release acceptance test](../../test/e2e/README.md) deploys the
+fixed K3s control plane, CCM, CSI, and Karpenter from an exact released version.
+It proves one Ready worker has the persisted VM UUID in the configured VPC,
+the matching provider ID, and one private `InternalIP` inside that VPC subnet;
+then it schedules the RWO/TCP-NLB workload and requires zero owned resources
+after teardown.
 
 The local `replace github.com/thanet-s/inspace-cloud-kube-modules/modules/cloud-provider => ../cloud-provider` resolves the shared SDK module inside this monorepo.

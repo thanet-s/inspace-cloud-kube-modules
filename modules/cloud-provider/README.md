@@ -137,18 +137,26 @@ Read-only discovery is separate and never enables mutation:
 INSPACE_API_TOKEN='...' ./bin/inspace-discovery --location bkk01 --smoke
 ```
 
+The isolated API lifecycle suite and the destructive
+[full-cluster release acceptance test](../../test/e2e/README.md) are separate
+from ordinary verification. The latter boots exactly three K3s servers,
+checks embedded-etcd and CCM convergence, installs the released CSI and
+Karpenter components, exercises an elastic worker/RWO volume/public TCP NLB,
+and requires an exact zero-owned-resource cloud audit after teardown.
+
 ## Remaining production gaps
 
-- The bootstrap binary consumes a YAML file; it does not yet watch the CRD or
-  resolve the Secret references through a Kubernetes management cluster.
-- Bootstrap deletion/finalizers and in-place machine updates are not
-  implemented. It will not delete adopted infrastructure.
+- The bootstrap binary consumes a YAML file; it does not yet watch the CRD,
+  resolve Secret references through a Kubernetes management cluster, or use a
+  Kubernetes finalizer. Lifecycle is explicit CLI reconciliation and owned
+  `--delete` teardown.
+- In-place control-plane machine image or shape updates are not implemented;
+  changes require an explicitly managed replacement lifecycle.
 - `infrastructureReady` is API-level only; K3s health and etcd membership need
-  an authenticated readiness probe.
+  an authenticated readiness probe in the controller itself. The external
+  release-acceptance suite performs those runtime checks separately.
 - The InSpace firewall's unmatched-traffic/default-deny semantics still need a
   live conformance test before treating the managed policy as production
   isolation. The controller nevertheless rejects public inbound prefixes and
   refuses to assign a public IP unless the expected private-inbound and
   outbound-egress rules are present.
-- Published container images and an end-to-end install test on the isolated
-  test account are still required.
