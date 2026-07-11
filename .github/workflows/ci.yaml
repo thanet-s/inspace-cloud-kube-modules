@@ -63,6 +63,12 @@ jobs:
           GOWORK: "off"
         run: go build ./cmd/...
 
+      - name: Scan for known vulnerabilities
+        working-directory: ${{ matrix.module }}
+        env:
+          GOWORK: "off"
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
+
   containers:
     name: Container / ${{ matrix.image }}
     runs-on: ubuntu-latest
@@ -132,7 +138,9 @@ jobs:
             charts/inspace-cloud-kube-modules-crds/templates/infrastructure.inspace.cloud_inspaceclusters.yaml
           cmp karpenter-provider-inspace/config/crd/bases/karpenter.inspace.cloud_inspacenodeclasses.yaml \
             charts/inspace-cloud-kube-modules-crds/templates/karpenter.inspace.cloud_inspacenodeclasses.yaml
-          test "$(grep -h '^kind: CustomResourceDefinition$' charts/inspace-cloud-kube-modules-crds/templates/*.yaml | wc -l | tr -d ' ')" = "6"
+          crd_count="$(grep -h -c '^kind: CustomResourceDefinition$' charts/inspace-cloud-kube-modules-crds/templates/*.yaml \
+            | awk '{ total += $1 } END { print total }')"
+          test "$crd_count" = "6"
 
       - name: Lint charts
         run: |

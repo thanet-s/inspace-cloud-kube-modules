@@ -7,11 +7,12 @@ replace github.com/thanet-s/inspace-cloud-kube-modules/cloud-provider-inspace =>
 require (
 	github.com/container-storage-interface/spec v1.12.0
 	github.com/thanet-s/inspace-cloud-kube-modules/cloud-provider-inspace v0.0.0
-	google.golang.org/grpc v1.79.1
+	google.golang.org/grpc v1.79.3
 	google.golang.org/protobuf v1.36.11
 )
 
 require (
+	go.opentelemetry.io/otel/sdk/metric v1.43.0 // indirect
 	golang.org/x/net v0.55.0 // indirect
 	golang.org/x/sys v0.45.0 // indirect
 	golang.org/x/text v0.37.0 // indirect
