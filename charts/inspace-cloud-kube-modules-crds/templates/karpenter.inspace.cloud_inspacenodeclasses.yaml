@@ -47,15 +47,18 @@ spec:
                 - billingAccountID
                 - location
                 - networkUUID
+                - privateLoadBalancerPool
                 - reservePublicIPv4
                 - firewallUUID
                 - imageSelector
                 - hostPoolSelector
                 - rootDiskGiB
-                - k3s
+                - rke2
               x-kubernetes-validations:
                 - rule: 'has(self.sshUsername) == has(self.sshPublicKey)'
                   message: sshUsername and sshPublicKey must be configured together
+                - rule: 'self.privateLoadBalancerPool == oldSelf.privateLoadBalancerPool'
+                  message: privateLoadBalancerPool is immutable
               properties:
                 clusterName:
                   type: string
@@ -72,12 +75,40 @@ spec:
                 networkUUID:
                   type: string
                   format: uuid
+                  description: >-
+                    Private worker VPC. Its RFC1918 prefix must be /27 or
+                    shorter so it can contain the reserved Service range plus
+                    a distinct usable RKE2 supervisor VIP, and must not overlap
+                    10.42.0.0/16 or 10.43.0.0/16. It must exactly match the
+                    controller-wide network UUID.
+                privateLoadBalancerPool:
+                  type: object
+                  description: >-
+                    Inclusive canonical RFC1918 IPv4 range reserved for
+                    private Cilium LB IPAM Services. Both endpoints must be
+                    usable hosts in networkUUID; the range must contain 16 to
+                    256 addresses and must exclude the RKE2 supervisor VIP,
+                    10.42.0.0/16, and 10.43.0.0/16. Worker NIC addresses are
+                    forbidden from this exact configured range.
+                  required: [start, stop]
+                  properties:
+                    start:
+                      type: string
+                      pattern: '^(10\.((25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\.){2}(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|172\.(1[6-9]|2[0-9]|3[01])\.(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\.(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|192\.168\.(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\.(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9]))$'
+                    stop:
+                      type: string
+                      pattern: '^(10\.((25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\.){2}(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|172\.(1[6-9]|2[0-9]|3[01])\.(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\.(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|192\.168\.(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\.(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9]))$'
                 reservePublicIPv4:
                   type: boolean
                   enum: [true]
                 firewallUUID:
                   type: string
                   format: uuid
+                  description: >-
+                    Pre-created default-deny firewall. It must allow all-port
+                    TCP, UDP, and ICMP ingress from both the VPC subnet and
+                    Cilium pod CIDR 10.42.0.0/16, plus matching
+                    any-destination egress, with no public inbound rule.
                 imageSelector:
                   type: object
                   required: [osName, osVersion]
@@ -100,16 +131,27 @@ spec:
                   format: int32
                   minimum: 30
                   maximum: 2000
-                k3s:
+                rke2:
                   type: object
                   required: [version, server, tokenSecretRef]
                   properties:
                     version:
                       type: string
-                      pattern: '^v[0-9]+\.[0-9]+\.[0-9]+\+k3s[0-9]+$'
+                      pattern: '^v[0-9]+\.[0-9]+\.[0-9]+\+rke2r[0-9]+$'
                     server:
                       type: string
-                      pattern: '^https://[A-Za-z0-9.-]+:6443$'
+                      description: >-
+                        Private RKE2 supervisor endpoint. The literal RFC1918
+                        VIP must be a usable host address inside networkUUID
+                        and outside 10.42.0.0/16 and 10.43.0.0/16; network,
+                        broadcast, DNS, and public endpoints are invalid. The
+                        VIP must exactly match the controller-wide control VIP.
+                      pattern: '^https://(10\.((25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\.){2}(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|172\.(1[6-9]|2[0-9]|3[01])\.(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\.(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|192\.168\.(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\.(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])):9345$'
+                      x-kubernetes-validations:
+                        - rule: "!self.startsWith('https://10.42.')"
+                          message: server must not use Cilium native-routing pod CIDR 10.42.0.0/16
+                        - rule: "!self.startsWith('https://10.43.')"
+                          message: server must not use Kubernetes Service CIDR 10.43.0.0/16
                     tokenSecretRef:
                       type: object
                       required: [name, key]
@@ -118,7 +160,7 @@ spec:
                           type: string
                           minLength: 1
                           maxLength: 253
-                          enum: [inspace-k3s-agent-token]
+                          enum: [inspace-rke2-agent-token]
                         key:
                           type: string
                           minLength: 1

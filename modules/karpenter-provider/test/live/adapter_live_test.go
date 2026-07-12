@@ -47,10 +47,11 @@ func TestLiveAdapterCreateGetListDelete(t *testing.T) {
 	suffix := fmt.Sprintf("%x", time.Now().UnixNano())
 	name := "inspace-e2e-karp-" + suffix
 	clusterName := "inspace-e2e-" + suffix
+	controlPlaneVIP := requireEnv("INSPACE_CONTROL_PLANE_VIP")
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
 	defer cancel()
 	cloudInit, err := bootstrap.RenderCloudInit(bootstrap.Config{
-		NodeName: name, Server: "https://192.0.2.1:6443", Token: "inspace-e2e-disposable-token", K3sVersion: "v1.35.6+k3s1",
+		NodeName: name, Server: "https://" + controlPlaneVIP + ":9345", Token: "inspace-e2e-disposable-token", RKE2Version: "v1.35.6+rke2r1",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -63,9 +64,15 @@ func TestLiveAdapterCreateGetListDelete(t *testing.T) {
 		IdempotencyKey: name, Name: name, ClusterName: clusterName, NodeClaimName: name,
 		BillingAccountID: billingAccountID,
 		Location:         "bkk01", NetworkUUID: requireEnv("INSPACE_NETWORK_UUID"), FirewallUUID: requireEnv("INSPACE_FIREWALL_UUID"),
-		OSName: "ubuntu", OSVersion: "24.04", HostPoolUUID: requireEnv("INSPACE_INTEL_HOST_POOL_UUID"),
+		ControlPlaneVIP:              controlPlaneVIP,
+		PrivateLoadBalancerPoolStart: requireEnv("INSPACE_PRIVATE_LOAD_BALANCER_POOL_START"),
+		PrivateLoadBalancerPoolStop:  requireEnv("INSPACE_PRIVATE_LOAD_BALANCER_POOL_STOP"),
+		OSName:                       "ubuntu", OSVersion: "24.04", HostPoolUUID: requireEnv("INSPACE_INTEL_HOST_POOL_UUID"),
 		HostClass: "intel-scalable", InstanceType: "is-compute-2c-2g", VCPU: 2, MemoryGiB: 2, RootDiskGiB: 30,
 		PublicIPv4: true, CloudInitJSON: cloudInit, SpecHash: "inspace-e2e", BootstrapHash: "inspace-e2e",
+	}
+	if err := adapter.ValidateNodeClass(ctx, request.Location, request.NetworkUUID, request.ControlPlaneVIP, request.PrivateLoadBalancerPoolStart, request.PrivateLoadBalancerPoolStop, request.HostPoolUUID, request.FirewallUUID); err != nil {
+		t.Fatalf("read-only NodeClass infrastructure preflight failed before live resource creation: %v", err)
 	}
 
 	var createdUUID string

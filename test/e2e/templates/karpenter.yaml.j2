@@ -1,0 +1,59 @@
+apiVersion: karpenter.inspace.cloud/v1alpha1
+kind: InSpaceNodeClass
+metadata:
+  name: {{ e2e_nodeclass_name }}
+spec:
+  clusterName: {{ e2e_cluster_name }}
+  billingAccountID: {{ lookup('env', 'INSPACE_BILLING_ACCOUNT_ID') }}
+  location: {{ lookup('env', 'INSPACE_LOCATION') }}
+  networkUUID: {{ lookup('env', 'INSPACE_NETWORK_UUID') }}
+  privateLoadBalancerPool:
+    start: "{{ lookup('env', 'INSPACE_PRIVATE_LOAD_BALANCER_POOL_START') }}"
+    stop: "{{ lookup('env', 'INSPACE_PRIVATE_LOAD_BALANCER_POOL_STOP') }}"
+  reservePublicIPv4: true
+  firewallUUID: {{ e2e_bootstrap_result.firewallUUID }}
+  imageSelector:
+    osName: {{ lookup('env', 'INSPACE_OS_NAME') | default('ubuntu', true) }}
+    osVersion: "{{ lookup('env', 'INSPACE_OS_VERSION') | default('24.04', true) }}"
+  hostPoolSelector:
+    class: intel-scalable
+  rootDiskGiB: 30
+  rke2:
+    version: v1.35.6+rke2r1
+    server: {{ e2e_bootstrap_result.privateRegistrationEndpoint }}
+    tokenSecretRef:
+      name: inspace-rke2-agent-token
+      key: token
+  sshUsername: {{ e2e_ssh_user }}
+  sshPublicKey: {{ e2e_ssh_public_key | to_json }}
+---
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: {{ e2e_nodepool_name }}
+spec:
+  limits:
+    cpu: "2"
+    memory: 4Gi
+  template:
+    spec:
+      nodeClassRef:
+        group: karpenter.inspace.cloud
+        kind: InSpaceNodeClass
+        name: {{ e2e_nodeclass_name }}
+      requirements:
+        - key: inspace.cloud/instance-family
+          operator: In
+          values: [general]
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: [on-demand]
+        - key: kubernetes.io/arch
+          operator: In
+          values: [amd64]
+        - key: kubernetes.io/os
+          operator: In
+          values: [linux]
+  disruption:
+    consolidationPolicy: WhenEmpty
+    consolidateAfter: 1m

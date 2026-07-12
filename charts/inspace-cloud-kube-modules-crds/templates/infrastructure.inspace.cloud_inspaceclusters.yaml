@@ -38,7 +38,10 @@ spec:
               type: object
             spec:
               type: object
-              required: [location, billingAccountID, credentialsSecretRef, controlPlane, k3s, network, firewall, publicIPv4, endpoint]
+              required: [location, billingAccountID, credentialsSecretRef, controlPlane, rke2, network, firewall, publicIPv4, endpoint]
+              x-kubernetes-validations:
+                - rule: '!self.endpoint.virtualIPv4.startsWith("10.42.") && !self.endpoint.virtualIPv4.startsWith("10.43.")'
+                  message: control-plane virtualIPv4 must not overlap podCIDR or serviceCIDR
               properties:
                 location:
                   type: string
@@ -73,12 +76,12 @@ spec:
                         vcpu:
                           type: integer
                           format: int32
-                          minimum: 1
+                          minimum: 2
                           maximum: 16
                         memoryMiB:
                           type: integer
                           format: int32
-                          minimum: 2048
+                          minimum: 4096
                           maximum: 65536
                         rootDiskGiB:
                           type: integer
@@ -97,14 +100,14 @@ spec:
                               enum: [ubuntu]
                             osVersion:
                               type: string
-                              minLength: 1
-                k3s:
+                              enum: ["24.04"]
+                rke2:
                   type: object
                   required: [version, tokenSecretRef]
                   properties:
                     version:
                       type: string
-                      minLength: 1
+                      pattern: '^v[0-9]+\.[0-9]+\.[0-9]+\+rke2r[0-9]+$'
                     tokenSecretRef:
                       type: object
                       required: [name, key]
@@ -117,15 +120,19 @@ spec:
                           minLength: 1
                     disable:
                       type: array
+                      uniqueItems: true
                       items:
                         type: string
+                      x-kubernetes-validations:
+                        - rule: 'self.all(component, component != "rke2-cilium")'
+                          message: rke2-cilium cannot be disabled while kube-proxy replacement is enabled
                     tlsSubjectAltNames:
                       type: array
                       items:
                         type: string
                 network:
                   type: object
-                  required: [uuid, podCIDR, serviceCIDR]
+                  required: [uuid, podCIDR, serviceCIDR, privateLoadBalancerPool]
                   x-kubernetes-validations:
                     - rule: 'self.podCIDR != self.serviceCIDR'
                       message: podCIDR and serviceCIDR must differ
@@ -141,17 +148,52 @@ spec:
                       type: string
                       format: cidr
                       enum: [10.43.0.0/16]
+                    privateLoadBalancerPool:
+                      type: object
+                      required: [start, stop]
+                      x-kubernetes-validations:
+                        - rule: 'self == oldSelf'
+                          message: privateLoadBalancerPool is immutable
+                        - rule: >-
+                            (int(self.start.split('.')[0]) * 16777216 + int(self.start.split('.')[1]) * 65536 + int(self.start.split('.')[2]) * 256 + int(self.start.split('.')[3])) <=
+                            (int(self.stop.split('.')[0]) * 16777216 + int(self.stop.split('.')[1]) * 65536 + int(self.stop.split('.')[2]) * 256 + int(self.stop.split('.')[3]))
+                          message: privateLoadBalancerPool start must be less than or equal to stop
+                        - rule: >-
+                            ((int(self.stop.split('.')[0]) * 16777216 + int(self.stop.split('.')[1]) * 65536 + int(self.stop.split('.')[2]) * 256 + int(self.stop.split('.')[3])) -
+                            (int(self.start.split('.')[0]) * 16777216 + int(self.start.split('.')[1]) * 65536 + int(self.start.split('.')[2]) * 256 + int(self.start.split('.')[3])) + 1) >= 16 &&
+                            ((int(self.stop.split('.')[0]) * 16777216 + int(self.stop.split('.')[1]) * 65536 + int(self.stop.split('.')[2]) * 256 + int(self.stop.split('.')[3])) -
+                            (int(self.start.split('.')[0]) * 16777216 + int(self.start.split('.')[1]) * 65536 + int(self.start.split('.')[2]) * 256 + int(self.start.split('.')[3])) + 1) <= 256
+                          message: privateLoadBalancerPool must contain between 16 and 256 addresses
+                        - rule: >-
+                            (int(self.stop.split('.')[0]) * 16777216 + int(self.stop.split('.')[1]) * 65536 + int(self.stop.split('.')[2]) * 256 + int(self.stop.split('.')[3])) < 170524672 ||
+                            (int(self.start.split('.')[0]) * 16777216 + int(self.start.split('.')[1]) * 65536 + int(self.start.split('.')[2]) * 256 + int(self.start.split('.')[3])) > 170655743
+                          message: privateLoadBalancerPool must not overlap podCIDR or serviceCIDR
+                      properties:
+                        start:
+                          type: string
+                          format: ipv4
+                          maxLength: 15
+                          x-kubernetes-validations:
+                            - rule: 'isIP(self) && ip.isCanonical(self) && ip(self).family() == 4'
+                              message: start must be a canonical IPv4 address
+                            - rule: 'self.startsWith("10.") || self.matches("^192\\.168\\.") || self.matches("^172\\.(1[6-9]|2[0-9]|3[01])\\.")'
+                              message: start must be an RFC1918 IPv4 address
+                        stop:
+                          type: string
+                          format: ipv4
+                          maxLength: 15
+                          x-kubernetes-validations:
+                            - rule: 'isIP(self) && ip.isCanonical(self) && ip(self).family() == 4'
+                              message: stop must be a canonical IPv4 address
+                            - rule: 'self.startsWith("10.") || self.matches("^192\\.168\\.") || self.matches("^172\\.(1[6-9]|2[0-9]|3[01])\\.")'
+                              message: stop must be an RFC1918 IPv4 address
                 firewall:
                   type: object
+                  required: [managed]
                   properties:
-                    uuid:
-                      type: string
-                      format: uuid
                     managed:
                       type: boolean
-                  x-kubernetes-validations:
-                    - rule: '(has(self.uuid) && !has(self.managed)) || (!has(self.uuid) && has(self.managed) && self.managed)'
-                      message: set exactly one of uuid or managed true
+                      enum: [true]
                 publicIPv4:
                   type: object
                   required: [managed]
@@ -161,20 +203,20 @@ spec:
                       enum: [true]
                 endpoint:
                   type: object
-                  required: [host, port]
+                  required: [virtualIPv4, port]
                   properties:
-                    host:
+                    virtualIPv4:
                       type: string
-                      minLength: 1
+                      format: ipv4
+                      x-kubernetes-validations:
+                        - rule: 'self.startsWith("10.") || self.matches("^192\\.168\\.") || self.matches("^172\\.(1[6-9]|2[0-9]|3[01])\\.")'
+                          message: virtualIPv4 must be an RFC1918 private IPv4 address
                     port:
                       type: integer
                       format: int32
                       minimum: 6443
                       maximum: 6443
                       default: 6443
-                    public:
-                      type: boolean
-                      default: false
             status:
               type: object
               properties:

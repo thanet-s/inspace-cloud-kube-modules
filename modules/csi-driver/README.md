@@ -75,7 +75,7 @@ Controller mode requires:
 
 Node mode requires only `INSPACE_LOCATION` and `NODE_ID`. It does not read or
 receive the InSpace API token. Its image must include `blkid`, `mkfs.ext4`,
-`mount`, and `umount`, and it must run privileged with `/dev` and the K3s
+`mount`, and `umount`, and it must run privileged with `/dev` and the RKE2
 `/var/lib/kubelet` directory mounted as shown in `deploy/kubernetes/node.yaml`.
 
 `--mode=all` is accepted only with `--development-fake`; it exists for local
@@ -124,7 +124,7 @@ Ordinary `make test`, `make smoke`, and `make verify` never compile or run that
 live test. Never commit an API token.
 
 The separate [full-cluster release acceptance test](../../test/e2e/README.md)
-installs the released CSI controller and node DaemonSet into the real K3s
+installs the released CSI controller and node DaemonSet into the real RKE2
 cluster. It provisions and attaches one RWO volume to the Karpenter worker,
 verifies the mounted marker through a pod replacement, then proves the
 VolumeAttachment, PV, PVC, disk, and worker are absent after teardown.
@@ -136,7 +136,7 @@ Files in `deploy/kubernetes` provide:
 - a persistent, attach-required `CSIDriver`;
 - a strict-topology RWO `StorageClass`;
 - a controller Deployment with provisioner and attacher sidecars, scheduled on
-  fixed K3s control-plane nodes;
+  fixed RKE2 control-plane nodes;
 - a privileged node DaemonSet with kubelet bidirectional mount propagation;
 - controller RBAC, including read-only Node resolution.
 

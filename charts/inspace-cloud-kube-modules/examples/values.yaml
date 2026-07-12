@@ -1,17 +1,23 @@
 # Replace the zero UUID and example names with the cluster's real values.
 global:
   inspace:
-    networkUUID: 00000000-0000-0000-0000-000000000001
-    clusterID: example-k3s
+    networkUUID: 11111111-1111-4111-8111-111111111111
+    clusterID: example-rke2
+    controlPlaneVIP: 10.20.30.10
+    # This inclusive range must already be excluded from InSpace VM and NLB
+    # allocation. It must exactly match the range in InSpaceCluster.
+    privateLoadBalancerPool:
+      start: 10.20.30.200
+      stop: 10.20.30.239
     apiSecret:
       name: inspace-cloud-credentials
       tokenKey: api-token
       billingAccountIDKey: billing-account-id
 
 karpenter:
-  clusterName: example-k3s
+  clusterName: example-rke2
   defaultNodeClass: ubuntu-workers-intel
-  # Prefer an externally managed Secret/inspace-k3s-agent-token.
+  # Prefer an externally managed Secret/inspace-rke2-agent-token.
   agentTokenSecret:
     create: false
 

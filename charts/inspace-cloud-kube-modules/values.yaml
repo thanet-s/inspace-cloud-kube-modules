@@ -9,6 +9,15 @@ global:
     region: thailand
     networkUUID: ""
     clusterID: ""
+    # Private kube-vip used by the RKE2 API and supervisor endpoints. CCM uses
+    # it to reject an InSpace NLB address collision.
+    controlPlaneVIP: ""
+    # An inclusive 16-256-address RFC1918 range reserved exclusively for Cilium
+    # LoadBalancer IPAM. The operator must exclude it from InSpace VM and NLB
+    # allocation; the current InSpace API cannot reserve it for the chart.
+    privateLoadBalancerPool:
+      start: ""
+      stop: ""
     # This chart never creates or copies the cloud API credential. Create one
     # Secret with both keys before installing; all three controllers use it.
     apiSecret:

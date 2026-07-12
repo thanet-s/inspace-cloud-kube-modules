@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"os"
+	"strings"
 	"testing"
 
 	apiextensions "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions"
@@ -17,12 +18,33 @@ func TestInSpaceNodeClassCRDPassesKubernetesValidation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read CRD: %v", err)
 	}
+	for _, expected := range []string{
+		"- privateLoadBalancerPool",
+		"privateLoadBalancerPool:",
+		"range must contain 16 to",
+		"self.privateLoadBalancerPool == oldSelf.privateLoadBalancerPool",
+		"privateLoadBalancerPool is immutable",
+		"- rke2",
+		"rke2:",
+		`\+rke2r[0-9]+$`,
+		":9345$",
+		"!self.startsWith('https://10.42.')",
+		"!self.startsWith('https://10.43.')",
+		"inspace-rke2-agent-token",
+	} {
+		if !strings.Contains(string(data), expected) {
+			t.Errorf("RKE2 CRD is missing %q", expected)
+		}
+	}
+	if strings.Contains(strings.ToLower(string(data)), "k3s") {
+		t.Fatal("RKE2 CRD retained a K3s schema field")
+	}
 	chartData, err := os.ReadFile("../../../../../charts/inspace-cloud-kube-modules-crds/templates/karpenter.inspace.cloud_inspacenodeclasses.yaml")
 	if err != nil {
 		t.Fatalf("read chart CRD: %v", err)
 	}
 	if !bytes.Equal(data, chartData) {
-		t.Fatal("source and chart InSpaceNodeClass CRDs differ")
+		t.Error("source and chart InSpaceNodeClass CRDs differ")
 	}
 
 	var versioned apiextensionsv1.CustomResourceDefinition

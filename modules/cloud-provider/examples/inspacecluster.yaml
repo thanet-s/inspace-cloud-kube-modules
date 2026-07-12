@@ -12,29 +12,31 @@ spec:
   controlPlane:
     replicas: 3
     machine:
-      vcpu: 4
-      memoryMiB: 8192
+      vcpu: 2
+      memoryMiB: 4096
       rootDiskGiB: 60
       hostPoolUUID: aac7dd66-f390-4edd-80c0-dd7cae49bd99
       image:
         osName: ubuntu
         osVersion: "24.04"
-  k3s:
-    version: v1.35.6+k3s1
+  rke2:
+    version: v1.35.6+rke2r1
     tokenSecretRef:
-      name: example-k3s-token
+      name: example-rke2-token
       key: token
     disable:
-      - servicelb
+      - rke2-ingress-nginx
   network:
     uuid: 11111111-2222-3333-4444-555555555555
     podCIDR: 10.42.0.0/16
     serviceCIDR: 10.43.0.0/16
+    privateLoadBalancerPool:
+      start: 10.20.30.200
+      stop: 10.20.30.239
   firewall:
     managed: true
   publicIPv4:
     managed: true
   endpoint:
-    host: api.example.invalid
+    virtualIPv4: 10.20.30.10
     port: 6443
-    public: true

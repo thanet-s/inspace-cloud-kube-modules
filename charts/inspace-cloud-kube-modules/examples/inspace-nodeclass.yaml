@@ -3,13 +3,19 @@ kind: InSpaceNodeClass
 metadata:
   name: ubuntu-workers-intel
 spec:
-  clusterName: example-k3s
+  clusterName: example-rke2
   billingAccountID: 12345
   location: bkk01
   networkUUID: 11111111-1111-4111-8111-111111111111
+  # Must exactly match global.inspace.privateLoadBalancerPool in values.yaml.
+  privateLoadBalancerPool:
+    start: 10.20.30.200
+    stop: 10.20.30.239
   # InSpace has no managed NAT. Every worker needs a floating IPv4 for egress;
-  # K3s still uses the RFC1918 NIC address as its internal node IP.
+  # RKE2 still uses the RFC1918 NIC address as its internal node IP.
   reservePublicIPv4: true
+  # This existing default-deny firewall must allow all-port TCP, UDP, and ICMP
+  # from both the VPC subnet and 10.42.0.0/16, plus outbound TCP/UDP/ICMP.
   firewallUUID: 22222222-2222-4222-8222-222222222222
   imageSelector:
     osName: ubuntu
@@ -17,14 +23,17 @@ spec:
   hostPoolSelector:
     class: intel-scalable
   rootDiskGiB: 40
-  # Optional controlled SSH access. Configure both fields together and provide
-  # exactly one supported OpenSSH authorized_keys public-key line.
+  # Optional private-VPC SSH access through a bastion. Configure both fields
+  # together and provide exactly one supported OpenSSH authorized_keys line.
+  # Do not add a public inbound worker firewall rule.
   # sshUsername: operator
   # sshPublicKey: ssh-ed25519 AAAA... operator@example
-  k3s:
-    version: v1.35.6+k3s1
-    server: https://api.example-k3s.example:6443
+  rke2:
+    version: v1.35.6+rke2r1
+    # Literal private kube-vip inside spec.networkUUID. Agents register on
+    # TCP/9345; the same VIP serves the Kubernetes API on TCP/6443.
+    server: https://10.20.30.10:9345
     tokenSecretRef:
       # The provider validates this fixed, non-cloud credential contract.
-      name: inspace-k3s-agent-token
+      name: inspace-rke2-agent-token
       key: token

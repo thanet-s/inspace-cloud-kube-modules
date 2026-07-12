@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"net/netip"
 	"reflect"
 	"regexp"
 	"strings"
@@ -12,6 +13,8 @@ import (
 	"time"
 
 	sdk "github.com/thanet-s/inspace-cloud-kube-modules/modules/client"
+	inspacev1 "github.com/thanet-s/inspace-cloud-kube-modules/modules/karpenter-provider/pkg/apis/v1alpha1"
+	"github.com/thanet-s/inspace-cloud-kube-modules/modules/karpenter-provider/pkg/bootstrap"
 	cloudapi "github.com/thanet-s/inspace-cloud-kube-modules/modules/karpenter-provider/pkg/cloud"
 )
 
@@ -49,6 +52,9 @@ func TestCreateIsReadBeforeCreateIdempotent(t *testing.T) {
 	if !strings.Contains(decodedSDKCloudInit(t, api.lastVMRequest.CloudInit), "203.0.113.10") || strings.Contains(decodedSDKCloudInit(t, api.lastVMRequest.CloudInit), "__INSPACE_FLOATING_IPV4__") {
 		t.Fatalf("VM cloud-init external IP was not resolved: %s", api.lastVMRequest.CloudInit)
 	}
+	if !strings.Contains(decodedSDKCloudInit(t, api.lastVMRequest.CloudInit), "10.0.0.0/24") || strings.Contains(decodedSDKCloudInit(t, api.lastVMRequest.CloudInit), bootstrap.VPCSubnetPlaceholder) {
+		t.Fatalf("VM cloud-init exact VPC subnet was not resolved: %s", api.lastVMRequest.CloudInit)
+	}
 	if api.lastVMRequest.Username != defaultUsername || api.lastVMRequest.Password != validGeneratedTestPassword || api.lastVMRequest.PublicKey != "" {
 		t.Fatalf("default VM access contract not applied: username=%q passwordSet=%t publicKeySet=%t", api.lastVMRequest.Username, api.lastVMRequest.Password != "", api.lastVMRequest.PublicKey != "")
 	}
@@ -66,6 +72,9 @@ func TestCreateIsReadBeforeCreateIdempotent(t *testing.T) {
 	}
 	if record["keyHash"] != hashKey(request.IdempotencyKey) {
 		t.Fatal("ownership key hash must derive only from the idempotency key")
+	}
+	if record["privateLoadBalancerPoolStart"] != request.PrivateLoadBalancerPoolStart || record["privateLoadBalancerPoolStop"] != request.PrivateLoadBalancerPoolStop {
+		t.Fatalf("ownership omitted exact private Service pool: %#v", record)
 	}
 	if len(api.floatingIPs) != 1 || api.floatingIPs[0].AssignedTo != first.UUID {
 		t.Fatalf("expected one owned assigned floating IP, got %#v", api.floatingIPs)
@@ -202,6 +211,356 @@ func TestCreateWaitsForNetworkAttachmentWithoutDuplicatePOST(t *testing.T) {
 	}
 }
 
+func TestCreateWaitsForExactlyOneWorkerPrivateIPv4(t *testing.T) {
+	api := &fakeAPI{privateIPv4VisibleAfter: 3}
+	adapter, _ := New(api)
+	configureFastNetworkReadback(adapter, 250*time.Millisecond)
+	created, err := adapter.CreateVM(context.Background(), testRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created.PrivateIPv4 != "10.0.0.20" || api.vmGetCalls != 4 || api.createCalls != 1 {
+		t.Fatalf("private-IP readback result=%#v GETs=%d POSTs=%d", created, api.vmGetCalls, api.createCalls)
+	}
+}
+
+func TestWorkerPrivateIPv4MustBeExactlyOneRFC1918AddressInsideVPC(t *testing.T) {
+	network := netip.MustParsePrefix("10.0.0.0/24")
+	vip := netip.MustParseAddr("10.0.0.10")
+	for name, test := range map[string]struct {
+		value     string
+		wantError bool
+	}{
+		"valid":             {value: "10.0.0.20"},
+		"missing":           {wantError: true},
+		"multiple":          {value: "10.0.0.20,10.0.0.21", wantError: true},
+		"surrounding space": {value: " 10.0.0.20", wantError: true},
+		"public":            {value: "203.0.113.20", wantError: true},
+		"outside VPC":       {value: "10.1.0.20", wantError: true},
+		"network address":   {value: "10.0.0.0", wantError: true},
+		"broadcast address": {value: "10.0.0.255", wantError: true},
+		"VIP collision":     {value: "10.0.0.10", wantError: true},
+		"Service pool":      {value: "10.0.0.200", wantError: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			got, err := validateWorkerPrivateIPv4(sdk.VM{UUID: "worker-1", PrivateIPv4: test.value}, network, vip, testPrivateLoadBalancerPool())
+			if (err != nil) != test.wantError {
+				t.Fatalf("validateWorkerPrivateIPv4(%q) = %s, %v; wantError=%t", test.value, got, err, test.wantError)
+			}
+		})
+	}
+}
+
+func TestCreatedWorkerPrivateIPCollisionRollsBackOwnedResources(t *testing.T) {
+	api := &fakeAPI{createdPrivateIPv4: "10.0.0.10"}
+	adapter, _ := New(api)
+	_, err := adapter.CreateVM(context.Background(), testRequest())
+	if err == nil || !strings.Contains(err.Error(), "collides with the private RKE2 supervisor VIP") {
+		t.Fatalf("CreateVM() error = %v, want supervisor VIP collision", err)
+	}
+	if len(api.vms) != 0 || len(api.floatingIPs) != 0 || api.createCalls != 1 || api.deleteVMCalls != 1 {
+		t.Fatalf("collision rollback leaked resources: VMs=%#v FIPs=%#v VMPOSTs=%d deletes=%d", api.vms, api.floatingIPs, api.createCalls, api.deleteVMCalls)
+	}
+	if api.firewallAssignCalls != 0 || api.floatingIPAssignCalls != 0 {
+		t.Fatalf("collision reached protection mutation: firewall=%d floatingIP=%d", api.firewallAssignCalls, api.floatingIPAssignCalls)
+	}
+	if !reflect.DeepEqual(api.operations, []string{"delete-floating-ip", "delete-vm"}) {
+		t.Fatalf("unsafe collision rollback order: %v", api.operations)
+	}
+}
+
+func TestAmbiguousCommittedWorkerVIPCollisionRollsBackOwnedResources(t *testing.T) {
+	api := &fakeAPI{createdPrivateIPv4: "10.0.0.10", createErr: errors.New("connection reset after request"), commitOnCreateError: true}
+	adapter, _ := New(api)
+	_, err := adapter.CreateVM(context.Background(), testRequest())
+	if err == nil || !strings.Contains(err.Error(), "collides with the private RKE2 supervisor VIP") {
+		t.Fatalf("CreateVM() error = %v, want supervisor VIP collision", err)
+	}
+	if len(api.vms) != 0 || len(api.floatingIPs) != 0 || api.createCalls != 1 || api.deleteVMCalls != 1 {
+		t.Fatalf("ambiguous collision rollback leaked resources: VMs=%#v FIPs=%#v VMPOSTs=%d deletes=%d", api.vms, api.floatingIPs, api.createCalls, api.deleteVMCalls)
+	}
+}
+
+func TestPositivelyOwnedExistingWorkerVIPCollisionRollsBack(t *testing.T) {
+	api := &fakeAPI{}
+	adapter, _ := New(api)
+	request := testRequest()
+	if _, err := adapter.CreateVM(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	api.vms[0].PrivateIPv4 = request.ControlPlaneVIP
+	api.operations = nil
+	if _, err := adapter.CreateVM(context.Background(), request); err == nil || !strings.Contains(err.Error(), "collides with the private RKE2 supervisor VIP") {
+		t.Fatalf("CreateVM() error = %v, want supervisor VIP collision", err)
+	}
+	if len(api.vms) != 0 || len(api.floatingIPs) != 0 || api.createCalls != 1 || api.deleteVMCalls != 1 {
+		t.Fatalf("existing collision was not rolled back: VMs=%#v FIPs=%#v POSTs=%d deletes=%d operations=%v", api.vms, api.floatingIPs, api.createCalls, api.deleteVMCalls, api.operations)
+	}
+	wantOrder := []string{"unassign-floating-ip", "delete-floating-ip", "delete-vm", "unassign-firewall"}
+	if !reflect.DeepEqual(api.operations, wantOrder) {
+		t.Fatalf("unsafe existing-collision rollback order %v, want %v", api.operations, wantOrder)
+	}
+}
+
+func TestCreatedWorkerServiceVIPPoolCollisionRollsBackOwnedResources(t *testing.T) {
+	api := &fakeAPI{createdPrivateIPv4: "10.0.0.200"}
+	adapter, _ := New(api)
+	_, err := adapter.CreateVM(context.Background(), testRequest())
+	if !errors.Is(err, errWorkerServiceVIPPoolCollision) {
+		t.Fatalf("CreateVM() error = %v, want reserved Service VIP-pool collision", err)
+	}
+	if len(api.vms) != 0 || len(api.floatingIPs) != 0 || api.createCalls != 1 || api.deleteVMCalls != 1 {
+		t.Fatalf("Service-pool collision rollback leaked resources: VMs=%#v FIPs=%#v VMPOSTs=%d deletes=%d", api.vms, api.floatingIPs, api.createCalls, api.deleteVMCalls)
+	}
+	if api.firewallAssignCalls != 0 || api.floatingIPAssignCalls != 0 {
+		t.Fatalf("Service-pool collision reached protection mutation: firewall=%d floatingIP=%d", api.firewallAssignCalls, api.floatingIPAssignCalls)
+	}
+	if !reflect.DeepEqual(api.operations, []string{"delete-floating-ip", "delete-vm"}) {
+		t.Fatalf("unsafe Service-pool collision rollback order: %v", api.operations)
+	}
+}
+
+func TestAmbiguousCommittedWorkerServiceVIPPoolCollisionRollsBackOwnedResources(t *testing.T) {
+	api := &fakeAPI{createdPrivateIPv4: "10.0.0.219", createErr: errors.New("connection reset after request"), commitOnCreateError: true}
+	adapter, _ := New(api)
+	_, err := adapter.CreateVM(context.Background(), testRequest())
+	if !errors.Is(err, errWorkerServiceVIPPoolCollision) {
+		t.Fatalf("CreateVM() error = %v, want reserved Service VIP-pool collision", err)
+	}
+	if len(api.vms) != 0 || len(api.floatingIPs) != 0 || api.createCalls != 1 || api.deleteVMCalls != 1 {
+		t.Fatalf("ambiguous Service-pool collision rollback leaked resources: VMs=%#v FIPs=%#v VMPOSTs=%d deletes=%d", api.vms, api.floatingIPs, api.createCalls, api.deleteVMCalls)
+	}
+}
+
+func TestPositivelyOwnedExistingWorkerServiceVIPPoolCollisionRollsBack(t *testing.T) {
+	api := &fakeAPI{}
+	adapter, _ := New(api)
+	request := testRequest()
+	if _, err := adapter.CreateVM(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	api.vms[0].PrivateIPv4 = "10.0.0.210"
+	api.operations = nil
+	if _, err := adapter.CreateVM(context.Background(), request); !errors.Is(err, errWorkerServiceVIPPoolCollision) {
+		t.Fatalf("CreateVM() error = %v, want reserved Service VIP-pool collision", err)
+	}
+	if len(api.vms) != 0 || len(api.floatingIPs) != 0 || api.createCalls != 1 || api.deleteVMCalls != 1 {
+		t.Fatalf("existing Service-pool collision was not rolled back: VMs=%#v FIPs=%#v POSTs=%d deletes=%d operations=%v", api.vms, api.floatingIPs, api.createCalls, api.deleteVMCalls, api.operations)
+	}
+	wantOrder := []string{"unassign-floating-ip", "delete-floating-ip", "delete-vm", "unassign-firewall"}
+	if !reflect.DeepEqual(api.operations, wantOrder) {
+		t.Fatalf("unsafe existing Service-pool collision rollback order %v, want %v", api.operations, wantOrder)
+	}
+}
+
+func TestAmbiguousCommittedGenericOwnershipMismatchIsNotDeleted(t *testing.T) {
+	api := &fakeAPI{
+		createdNetworkUUID:  "other-network",
+		createErr:           errors.New("connection reset after request"),
+		commitOnCreateError: true,
+	}
+	adapter, _ := New(api)
+	_, err := adapter.CreateVM(context.Background(), testRequest())
+	if err == nil || !strings.Contains(err.Error(), "launch parameters differ") {
+		t.Fatalf("CreateVM() error = %v, want generic launch mismatch", err)
+	}
+	if len(api.vms) != 1 || len(api.floatingIPs) != 1 || api.deleteVMCalls != 0 || slicesContain(api.operations, "delete-vm") {
+		t.Fatalf("generic ambiguous mismatch deleted resources: VMs=%#v FIPs=%#v deletes=%d operations=%v", api.vms, api.floatingIPs, api.deleteVMCalls, api.operations)
+	}
+}
+
+func TestOwnedVIPCollisionRollsBackBeforeUnusableFIPOrFirewallAssignment(t *testing.T) {
+	api := &fakeAPI{}
+	adapter, _ := New(api)
+	request := testRequest()
+	if _, err := adapter.CreateVM(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	api.vms[0].PrivateIPv4 = request.ControlPlaneVIP
+	api.floatingIPs[0].Enabled = false
+	api.firewalls[0].ResourcesAssigned = nil
+	api.operations = nil
+	api.firewallAssignCalls = 0
+	api.floatingIPAssignCalls = 0
+	_, err := adapter.CreateVM(context.Background(), request)
+	if !errors.Is(err, errWorkerSupervisorVIPCollision) {
+		t.Fatalf("CreateVM() error = %v, want owned VIP collision", err)
+	}
+	if len(api.vms) != 0 || len(api.floatingIPs) != 0 || api.firewallAssignCalls != 0 || api.floatingIPAssignCalls != 0 {
+		t.Fatalf("collision was not rolled back before protection assignment: VMs=%#v FIPs=%#v firewall=%d floating=%d", api.vms, api.floatingIPs, api.firewallAssignCalls, api.floatingIPAssignCalls)
+	}
+}
+
+func TestExistingWorkerRejectsUnexpectedSecondFloatingIPWithoutMutation(t *testing.T) {
+	api := &fakeAPI{}
+	adapter, _ := New(api)
+	request := testRequest()
+	created, err := adapter.CreateVM(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	api.floatingIPs = append(api.floatingIPs, sdk.FloatingIP{
+		Name: "foreign-address", Address: "203.0.113.11", BillingAccountID: request.BillingAccountID,
+		AssignedTo: created.UUID, AssignedToResourceType: "virtual_machine", Enabled: true, Type: "public",
+	})
+	api.operations = nil
+	_, err = adapter.CreateVM(context.Background(), request)
+	if !errors.Is(err, cloudapi.ErrOwnershipMismatch) || !strings.Contains(err.Error(), "exactly one floating IP") {
+		t.Fatalf("CreateVM() error = %v, want extra floating-IP rejection", err)
+	}
+	if api.createCalls != 1 || api.deleteVMCalls != 0 || len(api.operations) != 0 || len(api.floatingIPs) != 2 {
+		t.Fatalf("extra floating-IP audit mutated resources: POSTs=%d deletes=%d operations=%v FIPs=%#v", api.createCalls, api.deleteVMCalls, api.operations, api.floatingIPs)
+	}
+}
+
+func TestFloatingIPMustBeUsablePublicNonVirtualAddress(t *testing.T) {
+	base := sdk.FloatingIP{Address: "203.0.113.10", Name: "worker-public", Enabled: true, Type: "public"}
+	tests := map[string]func(*sdk.FloatingIP){
+		"disabled":   func(address *sdk.FloatingIP) { address.Enabled = false },
+		"deleted":    func(address *sdk.FloatingIP) { address.IsDeleted = true },
+		"virtual":    func(address *sdk.FloatingIP) { address.IsVirtual = true },
+		"empty type": func(address *sdk.FloatingIP) { address.Type = "" },
+		"wrong type": func(address *sdk.FloatingIP) { address.Type = "private" },
+		"private IP": func(address *sdk.FloatingIP) { address.Address = "10.0.0.20" },
+		"IPv6":       func(address *sdk.FloatingIP) { address.Address = "2001:db8::20" },
+	}
+	if err := validateUsableFloatingIP(base); err != nil {
+		t.Fatalf("valid floating IP rejected: %v", err)
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			address := base
+			mutate(&address)
+			if err := validateUsableFloatingIP(address); err == nil {
+				t.Fatalf("unusable floating IP accepted: %#v", address)
+			}
+		})
+	}
+}
+
+func TestExistingWorkerDoesNotAdoptUnusableFloatingIP(t *testing.T) {
+	for name, mutate := range map[string]func(*sdk.FloatingIP){
+		"disabled":   func(address *sdk.FloatingIP) { address.Enabled = false },
+		"virtual":    func(address *sdk.FloatingIP) { address.IsVirtual = true },
+		"wrong type": func(address *sdk.FloatingIP) { address.Type = "private" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			api := &fakeAPI{}
+			adapter, _ := New(api)
+			request := testRequest()
+			if _, err := adapter.CreateVM(context.Background(), request); err != nil {
+				t.Fatal(err)
+			}
+			mutate(&api.floatingIPs[0])
+			api.operations = nil
+			_, err := adapter.CreateVM(context.Background(), request)
+			if !errors.Is(err, cloudapi.ErrOwnershipMismatch) || !strings.Contains(err.Error(), "unusable") {
+				t.Fatalf("CreateVM() error = %v, want unusable floating-IP rejection", err)
+			}
+			if api.createCalls != 1 || api.deleteVMCalls != 0 || len(api.vms) != 1 || len(api.operations) != 0 {
+				t.Fatalf("unusable FIP adoption mutated VM: POSTs=%d deletes=%d VMs=%#v operations=%v", api.createCalls, api.deleteVMCalls, api.vms, api.operations)
+			}
+		})
+	}
+}
+
+func TestUnusableNewFloatingIPIsCleanedBeforeVMCreate(t *testing.T) {
+	for name, mutate := range map[string]func(*sdk.FloatingIP){
+		"disabled":   func(address *sdk.FloatingIP) { address.Enabled = false },
+		"virtual":    func(address *sdk.FloatingIP) { address.IsVirtual = true },
+		"wrong type": func(address *sdk.FloatingIP) { address.Type = "private" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			api := &fakeAPI{createFloatingIPHook: mutate}
+			adapter, _ := New(api)
+			_, err := adapter.CreateVM(context.Background(), testRequest())
+			if err == nil || !strings.Contains(err.Error(), "created floating IP is unusable") {
+				t.Fatalf("CreateVM() error = %v, want unusable new floating-IP rejection", err)
+			}
+			if api.createCalls != 0 || len(api.floatingIPs) != 0 || api.floatingIPCreateCalls != 1 {
+				t.Fatalf("unusable new FIP reached VM create or leaked: VMPOSTs=%d FIPs=%#v FIPPOSTs=%d", api.createCalls, api.floatingIPs, api.floatingIPCreateCalls)
+			}
+		})
+	}
+}
+
+func TestCreatedWorkerUnexpectedFirewallRollsBackAfterVMDeletion(t *testing.T) {
+	extra := secureFirewall()
+	extra.UUID = "44444444-4444-4444-8444-444444444444"
+	api := &fakeAPI{
+		firewalls:                     []sdk.Firewall{secureFirewall(), extra},
+		attachCreatedVMToFirewallUUID: extra.UUID,
+	}
+	adapter, _ := New(api)
+	_, err := adapter.CreateVM(context.Background(), testRequest())
+	if !errors.Is(err, cloudapi.ErrOwnershipMismatch) || !strings.Contains(err.Error(), "attached exactly once to intended firewall") {
+		t.Fatalf("CreateVM() error = %v, want unexpected-firewall rejection", err)
+	}
+	if len(api.vms) != 0 || len(api.floatingIPs) != 0 || api.deleteVMCalls != 1 {
+		t.Fatalf("unexpected-firewall rollback leaked resources: VMs=%#v FIPs=%#v deletes=%d", api.vms, api.floatingIPs, api.deleteVMCalls)
+	}
+	for _, firewall := range api.firewalls {
+		if firewallHasVM(firewall, "11111111-1111-4111-8111-111111111111") {
+			t.Fatalf("deleted VM retained firewall assignment: %#v", api.firewalls)
+		}
+	}
+	deleteIndex, detachIndex := -1, -1
+	for index, operation := range api.operations {
+		if operation == "delete-vm" {
+			deleteIndex = index
+		}
+		if operation == "unassign-firewall" && detachIndex == -1 {
+			detachIndex = index
+		}
+	}
+	if deleteIndex < 0 || detachIndex <= deleteIndex {
+		t.Fatalf("firewall was not retained until VM deletion: %v", api.operations)
+	}
+}
+
+func TestPostAssignmentSecondFirewallAuditRollsBackNewWorker(t *testing.T) {
+	extra := secureFirewall()
+	extra.UUID = "44444444-4444-4444-8444-444444444444"
+	api := &fakeAPI{
+		firewalls:                  []sdk.Firewall{secureFirewall(), extra},
+		secondFirewallOnAssignUUID: extra.UUID,
+	}
+	adapter, _ := New(api)
+	_, err := adapter.CreateVM(context.Background(), testRequest())
+	if !errors.Is(err, cloudapi.ErrOwnershipMismatch) || !strings.Contains(err.Error(), "attached exactly once to intended firewall") {
+		t.Fatalf("CreateVM() error = %v, want post-assignment firewall audit rejection", err)
+	}
+	if api.firewallAssignCalls != 1 || api.floatingIPAssignCalls != 0 || len(api.vms) != 0 || len(api.floatingIPs) != 0 {
+		t.Fatalf("post-assignment drift was not safely rolled back: firewallAssigns=%d floatingAssigns=%d VMs=%#v FIPs=%#v", api.firewallAssignCalls, api.floatingIPAssignCalls, api.vms, api.floatingIPs)
+	}
+	for _, firewall := range api.firewalls {
+		if len(firewall.ResourcesAssigned) != 0 {
+			t.Fatalf("firewall assignment leaked after rollback: %#v", api.firewalls)
+		}
+	}
+}
+
+func TestExistingWorkerSecondFirewallFailsClosedWithoutDeletion(t *testing.T) {
+	extra := secureFirewall()
+	extra.UUID = "44444444-4444-4444-8444-444444444444"
+	api := &fakeAPI{firewalls: []sdk.Firewall{secureFirewall(), extra}}
+	adapter, _ := New(api)
+	request := testRequest()
+	created, err := adapter.CreateVM(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	api.firewalls[1].ResourcesAssigned = append(api.firewalls[1].ResourcesAssigned, sdk.FirewallResource{ResourceType: "vm", ResourceUUID: created.UUID})
+	api.operations = nil
+	_, err = adapter.CreateVM(context.Background(), request)
+	if !errors.Is(err, cloudapi.ErrOwnershipMismatch) || !strings.Contains(err.Error(), "attached exactly once to intended firewall") {
+		t.Fatalf("CreateVM() error = %v, want second-firewall rejection", err)
+	}
+	if len(api.vms) != 1 || len(api.floatingIPs) != 1 || api.deleteVMCalls != 0 || len(api.operations) != 0 {
+		t.Fatalf("existing second-firewall drift caused mutation: VMs=%#v FIPs=%#v deletes=%d operations=%v", api.vms, api.floatingIPs, api.deleteVMCalls, api.operations)
+	}
+}
+
 func TestCreateRetriesTransientNetworkReadbackErrors(t *testing.T) {
 	for name, transientErr := range map[string]error{
 		"service unavailable": &sdk.APIError{StatusCode: 503, Retryable: true},
@@ -335,6 +694,53 @@ func TestCreateRejectsNetworkUUIDReadbackMismatchBeforeMutation(t *testing.T) {
 	}
 }
 
+func TestCreatedWorkerRejectsServiceCIDROverlapAppearingDuringNetworkReadback(t *testing.T) {
+	api := &fakeAPI{}
+	api.networkGetHook = func(call int) {
+		if call == 2 {
+			api.network = &sdk.Network{
+				UUID:    "network-1",
+				Subnet:  "10.43.0.0/16",
+				VMUUIDs: []string{"11111111-1111-4111-8111-111111111111"},
+			}
+		}
+	}
+	adapter, _ := New(api)
+	_, err := adapter.CreateVM(context.Background(), testRequest())
+	if err == nil || !strings.Contains(err.Error(), "must not overlap Kubernetes Service CIDR 10.43.0.0/16") {
+		t.Fatalf("CreateVM() error = %v, want Service-CIDR overlap during readback", err)
+	}
+	if len(api.vms) != 0 || len(api.floatingIPs) != 0 || api.createCalls != 1 || api.deleteVMCalls != 1 {
+		t.Fatalf("readback overlap rollback leaked resources: VMs=%#v FIPs=%#v POSTs=%d deletes=%d", api.vms, api.floatingIPs, api.createCalls, api.deleteVMCalls)
+	}
+	if api.firewallAssignCalls != 0 || api.floatingIPAssignCalls != 0 {
+		t.Fatalf("readback overlap reached protection mutation: firewall=%d floatingIP=%d", api.firewallAssignCalls, api.floatingIPAssignCalls)
+	}
+}
+
+func TestCreateRejectsImpossibleControlPlaneVIPBeforeMutation(t *testing.T) {
+	for name, vip := range map[string]string{
+		"public":          "203.0.113.10",
+		"pod CIDR":        "10.42.0.10",
+		"Service CIDR":    "10.43.0.10",
+		"outside network": "10.1.0.10",
+	} {
+		t.Run(name, func(t *testing.T) {
+			api := &fakeAPI{}
+			adapter, _ := New(api)
+			request := testRequest()
+			request.ControlPlaneVIP = vip
+			_, err := adapter.CreateVM(context.Background(), request)
+			if err == nil {
+				t.Fatalf("CreateVM() accepted impossible control-plane VIP %q", vip)
+			}
+			if api.floatingIPCreateCalls != 0 || api.createCalls != 0 || api.firewallAssignCalls != 0 || api.floatingIPAssignCalls != 0 || len(api.operations) != 0 {
+				t.Fatalf("impossible VIP reached mutation: floatingIPPOSTs=%d VMPOSTs=%d firewall=%d floatingIP=%d operations=%v", api.floatingIPCreateCalls, api.createCalls, api.firewallAssignCalls, api.floatingIPAssignCalls, api.operations)
+			}
+		})
+	}
+}
+
 func TestCreateRejectsNonEmptyMismatchedVMNetwork(t *testing.T) {
 	api := &fakeAPI{createdNetworkUUID: "other-network"}
 	adapter, _ := New(api)
@@ -444,13 +850,104 @@ func TestGetListDeleteAreOwnershipBound(t *testing.T) {
 	}
 }
 
+func TestEstablishedWorkerReadsFailClosedOnProtectionDrift(t *testing.T) {
+	tests := map[string]func(*fakeAPI, string){
+		"disabled floating IP": func(api *fakeAPI, _ string) {
+			api.floatingIPs[0].Enabled = false
+		},
+		"lost floating IP": func(api *fakeAPI, _ string) {
+			api.floatingIPs = nil
+		},
+		"private VIP collision": func(api *fakeAPI, _ string) {
+			api.vms[0].PrivateIPv4 = "10.0.0.10"
+		},
+		"private Service VIP pool collision": func(api *fakeAPI, _ string) {
+			api.vms[0].PrivateIPv4 = "10.0.0.200"
+		},
+		"VPC overlaps Kubernetes Service CIDR": func(api *fakeAPI, vmUUID string) {
+			api.network = &sdk.Network{UUID: "network-1", Subnet: "10.43.0.0/16", VMUUIDs: []string{vmUUID}}
+		},
+		"second firewall": func(api *fakeAPI, vmUUID string) {
+			extra := secureFirewall()
+			extra.UUID = "44444444-4444-4444-8444-444444444444"
+			extra.ResourcesAssigned = []sdk.FirewallResource{{ResourceType: "vm", ResourceUUID: vmUUID}}
+			api.firewalls = append(api.firewalls, extra)
+		},
+		"public firewall rule": func(api *fakeAPI, _ string) {
+			port := int32(22)
+			api.firewalls[0].Rules = append(api.firewalls[0].Rules, sdk.FirewallRule{
+				UUID: "public-ssh", Protocol: "tcp", Direction: "inbound", PortStart: &port, PortEnd: &port,
+				EndpointSpecType: "ip_prefixes", EndpointSpec: []string{"198.51.100.10/32"},
+			})
+		},
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			api := &fakeAPI{}
+			adapter, _ := New(api)
+			created, err := adapter.CreateVM(context.Background(), testRequest())
+			if err != nil {
+				t.Fatal(err)
+			}
+			mutate(api, created.UUID)
+			api.operations = nil
+			if _, err := adapter.GetVM(context.Background(), "bkk01", created.UUID, "cluster-a"); err == nil || !strings.Contains(err.Error(), "protection drift") {
+				t.Fatalf("GetVM() error = %v, want protection drift", err)
+			}
+			if _, err := adapter.ListVMs(context.Background(), "bkk01", "cluster-a"); err == nil || !strings.Contains(err.Error(), "protection drift") {
+				t.Fatalf("ListVMs() error = %v, want protection drift", err)
+			}
+			if api.deleteVMCalls != 0 || len(api.operations) != 0 {
+				t.Fatalf("read-only drift audit mutated cloud state: delete calls=%d operations=%v", api.deleteVMCalls, api.operations)
+			}
+		})
+	}
+}
+
+func TestEstablishedWorkerListProtectionAuditUsesOneSharedSnapshot(t *testing.T) {
+	api := &fakeAPI{}
+	adapter, _ := New(api)
+	if _, err := adapter.CreateVM(context.Background(), testRequest()); err != nil {
+		t.Fatal(err)
+	}
+	api.networkGetCalls = 0
+	api.firewallListCalls = 0
+	api.floatingIPListCalls = 0
+	listed, err := adapter.ListVMs(context.Background(), "bkk01", "cluster-a")
+	if err != nil || len(listed) != 1 {
+		t.Fatalf("ListVMs() = %#v, %v", listed, err)
+	}
+	if api.networkGetCalls != 1 || api.firewallListCalls != 1 || api.floatingIPListCalls != 1 {
+		t.Fatalf("protection snapshot API calls: networks=%d firewalls=%d floatingIPs=%d, want 1 each", api.networkGetCalls, api.firewallListCalls, api.floatingIPListCalls)
+	}
+}
+
+func TestEstablishedWorkerProtectionAuditIsBounded(t *testing.T) {
+	api := &fakeAPI{}
+	adapter, _ := New(api)
+	created, err := adapter.CreateVM(context.Background(), testRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	api.blockFirewallList = true
+	adapter.protectionAuditTimeout = 20 * time.Millisecond
+	started := time.Now()
+	_, err = adapter.GetVM(context.Background(), "bkk01", created.UUID, "cluster-a")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("GetVM() error = %v, want bounded audit deadline", err)
+	}
+	if elapsed := time.Since(started); elapsed >= time.Second {
+		t.Fatalf("bounded protection audit took %s", elapsed)
+	}
+}
+
 func TestValidateNodeClassChecksHostPool(t *testing.T) {
 	api := &fakeAPI{pools: []sdk.HostPool{{UUID: "pool-1"}}}
 	adapter, _ := New(api)
-	if err := adapter.ValidateNodeClass(context.Background(), "bkk01", "network-1", "pool-1", "33333333-3333-4333-8333-333333333333"); err != nil {
+	if err := adapter.ValidateNodeClass(context.Background(), "bkk01", "network-1", "10.0.0.10", "10.0.0.200", "10.0.0.219", "pool-1", "33333333-3333-4333-8333-333333333333"); err != nil {
 		t.Fatal(err)
 	}
-	if err := adapter.ValidateNodeClass(context.Background(), "bkk01", "network-1", "missing", "33333333-3333-4333-8333-333333333333"); err == nil {
+	if err := adapter.ValidateNodeClass(context.Background(), "bkk01", "network-1", "10.0.0.10", "10.0.0.200", "10.0.0.219", "missing", "33333333-3333-4333-8333-333333333333"); err == nil {
 		t.Fatal("expected missing pool error")
 	}
 }
@@ -499,28 +996,248 @@ func TestFirewallValidationRejectsPublicInbound(t *testing.T) {
 		Rules: []sdk.FirewallRule{{Protocol: "tcp", Direction: "inbound", EndpointSpecType: "any"}},
 	}}}
 	adapter, _ := New(api)
-	if err := adapter.ValidateNodeClass(context.Background(), "bkk01", "network-1", "pool-1", "33333333-3333-4333-8333-333333333333"); err == nil {
+	if err := adapter.ValidateNodeClass(context.Background(), "bkk01", "network-1", "10.0.0.10", "10.0.0.200", "10.0.0.219", "pool-1", "33333333-3333-4333-8333-333333333333"); err == nil {
 		t.Fatal("expected public inbound firewall rejection")
 	}
 }
 
-func TestFirewallValidationAllowsHostScopedExplicitPublicPorts(t *testing.T) {
-	firewall := secureFirewall()
-	start, end := int32(30080), int32(30080)
-	firewall.Rules = append(firewall.Rules, sdk.FirewallRule{
-		UUID: "e2e-http", Protocol: "tcp", Direction: "inbound", PortStart: &start, PortEnd: &end,
-		EndpointSpecType: "ip_prefixes", EndpointSpec: []string{"198.51.100.24/32"},
-	})
-	api := &fakeAPI{pools: []sdk.HostPool{{UUID: "pool-1"}}, firewalls: []sdk.Firewall{firewall}}
-	adapter, _ := New(api)
-	if err := adapter.ValidateNodeClass(context.Background(), "bkk01", "network-1", "pool-1", firewall.UUID); err != nil {
-		t.Fatalf("host-scoped explicit public port was rejected: %v", err)
+func TestNodeClassValidationRejectsVPCOverlappingFixedClusterCIDRs(t *testing.T) {
+	for name, test := range map[string]struct {
+		subnet string
+		want   string
+	}{
+		"Cilium pod CIDR":         {subnet: "10.42.128.0/17", want: "must not overlap Cilium native-routing pod CIDR 10.42.0.0/16"},
+		"Kubernetes Service CIDR": {subnet: "10.43.128.0/17", want: "must not overlap Kubernetes Service CIDR 10.43.0.0/16"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			api := &fakeAPI{network: &sdk.Network{UUID: "network-1", Subnet: test.subnet}}
+			adapter, _ := New(api)
+			err := adapter.ValidateNodeClass(context.Background(), "bkk01", "network-1", "10.0.0.10", "10.0.0.200", "10.0.0.219", "pool-1", secureFirewall().UUID)
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("overlapping VPC validation error = %v, want %q", err, test.want)
+			}
+			if api.floatingIPCreateCalls != 0 || api.createCalls != 0 || api.firewallAssignCalls != 0 || api.floatingIPAssignCalls != 0 || len(api.operations) != 0 {
+				t.Fatalf("overlapping VPC reached cloud mutation: %#v", api)
+			}
+		})
+	}
+}
+
+func TestNodeClassValidationRejectsUnusableSupervisorVIP(t *testing.T) {
+	for name, test := range map[string]struct {
+		subnet string
+		vip    string
+		want   string
+	}{
+		"network address":   {subnet: "10.0.0.0/24", vip: "10.0.0.0", want: "network address"},
+		"broadcast address": {subnet: "10.0.0.0/24", vip: "10.0.0.255", want: "broadcast address"},
+		"slash 31":          {subnet: "10.0.0.0/31", vip: "10.0.0.0", want: "unusable IPv4 subnet"},
+		"slash 32":          {subnet: "10.0.0.10/32", vip: "10.0.0.10", want: "unusable IPv4 subnet"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			api := &fakeAPI{network: &sdk.Network{UUID: "network-1", Subnet: test.subnet}}
+			adapter, _ := New(api)
+			err := adapter.ValidateNodeClass(context.Background(), "bkk01", "network-1", test.vip, "10.0.0.200", "10.0.0.219", "pool-1", secureFirewall().UUID)
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("ValidateNodeClass() error = %v, want %q", err, test.want)
+			}
+			if api.floatingIPCreateCalls != 0 || api.createCalls != 0 || api.firewallAssignCalls != 0 || api.floatingIPAssignCalls != 0 {
+				t.Fatalf("unusable VIP reached mutation: %#v", api)
+			}
+		})
 	}
 
-	firewall.Rules[len(firewall.Rules)-1].EndpointSpec = []string{"198.51.100.0/24"}
-	api.firewalls = []sdk.Firewall{firewall}
-	if err := adapter.ValidateNodeClass(context.Background(), "bkk01", "network-1", "pool-1", firewall.UUID); err == nil {
-		t.Fatal("broad public prefix was accepted")
+	api := &fakeAPI{network: &sdk.Network{UUID: "network-1", Subnet: "10.0.0.0/27"}}
+	adapter, _ := New(api)
+	if err := adapter.ValidateNodeClass(context.Background(), "bkk01", "network-1", "10.0.0.1", "10.0.0.2", "10.0.0.17", "pool-1", secureFirewall().UUID); err != nil {
+		t.Fatalf("usable /27 supervisor VIP and minimum Service pool rejected: %v", err)
+	}
+}
+
+func TestNodeClassValidationRequiresExactServicePoolInsideUsableVPCHosts(t *testing.T) {
+	for name, test := range map[string]struct {
+		subnet string
+		vip    string
+		start  string
+		stop   string
+		want   string
+	}{
+		"outside VPC":        {subnet: "10.0.0.0/24", vip: "10.0.0.10", start: "10.0.1.16", stop: "10.0.1.31", want: "must be inside subnet"},
+		"network address":    {subnet: "10.0.0.0/24", vip: "10.0.0.200", start: "10.0.0.0", stop: "10.0.0.15", want: "network address"},
+		"broadcast address":  {subnet: "10.0.0.0/24", vip: "10.0.0.10", start: "10.0.0.240", stop: "10.0.0.255", want: "broadcast address"},
+		"supervisor overlap": {subnet: "10.0.0.0/24", vip: "10.0.0.10", start: "10.0.0.1", stop: "10.0.0.16", want: "contains private RKE2 supervisor VIP"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			api := &fakeAPI{network: &sdk.Network{UUID: "network-1", Subnet: test.subnet}}
+			adapter, _ := New(api)
+			err := adapter.ValidateNodeClass(context.Background(), "bkk01", "network-1", test.vip, test.start, test.stop, "pool-1", secureFirewall().UUID)
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("ValidateNodeClass() error = %v, want %q", err, test.want)
+			}
+			if api.floatingIPCreateCalls != 0 || api.createCalls != 0 || api.firewallAssignCalls != 0 || api.floatingIPAssignCalls != 0 || len(api.operations) != 0 {
+				t.Fatalf("invalid Service pool reached mutation: %#v", api)
+			}
+		})
+	}
+
+	api := &fakeAPI{network: &sdk.Network{UUID: "network-1", Subnet: "10.0.0.0/24"}}
+	adapter, _ := New(api)
+	if err := adapter.ValidateNodeClass(context.Background(), "bkk01", "network-1", "10.0.0.10", "10.0.0.200", "10.0.0.219", "pool-1", secureFirewall().UUID); err != nil {
+		t.Fatalf("usable exact Service pool rejected: %v", err)
+	}
+}
+
+func TestFirewallValidationRejectsUnsupportedProtocol(t *testing.T) {
+	firewall := secureFirewall()
+	firewall.Rules = append(firewall.Rules, sdk.FirewallRule{
+		UUID: "out-gre", Protocol: "gre", Direction: "outbound", EndpointSpecType: "any",
+	})
+	err := validateDefaultDenyFirewall(firewall, netip.MustParsePrefix("10.0.0.0/24"))
+	if err == nil || !strings.Contains(err.Error(), `unsupported rule protocol "gre"`) {
+		t.Fatalf("unsupported protocol validation error = %v", err)
+	}
+}
+
+func TestFirewallValidationRejectsEveryPublicInboundPrefix(t *testing.T) {
+	for _, prefix := range []string{"198.51.100.24/32", "198.51.100.0/24", "2001:db8::1/128"} {
+		firewall := secureFirewall()
+		start, end := int32(22), int32(22)
+		firewall.Rules = append(firewall.Rules, sdk.FirewallRule{
+			UUID: "public-ssh", Protocol: "tcp", Direction: "inbound", PortStart: &start, PortEnd: &end,
+			EndpointSpecType: "ip_prefixes", EndpointSpec: []string{prefix},
+		})
+		err := validateDefaultDenyFirewall(firewall, netip.MustParsePrefix("10.0.0.0/24"))
+		if err == nil || !strings.Contains(err.Error(), "must not allow public inbound prefix") {
+			t.Fatalf("public prefix %s validation error = %v", prefix, err)
+		}
+	}
+}
+
+func TestFirewallValidationRequiresEveryNativeRoutingProtocol(t *testing.T) {
+	network := netip.MustParsePrefix("10.0.0.0/24")
+	type testCase struct {
+		name   string
+		mutate func(*sdk.Firewall)
+		want   string
+	}
+	tests := []testCase{{name: "complete firewall"}}
+	for i, protocol := range []string{"TCP", "UDP", "ICMP"} {
+		ruleIndex := i
+		protocol := protocol
+		tests = append(tests,
+			testCase{
+				name: "missing VPC " + protocol,
+				mutate: func(firewall *sdk.Firewall) {
+					firewall.Rules[ruleIndex].EndpointSpec = []string{bootstrap.NativeRoutingPodCIDR}
+				},
+				want: "all inbound " + protocol + " traffic from network subnet 10.0.0.0/24",
+			},
+			testCase{
+				name: "missing pod " + protocol,
+				mutate: func(firewall *sdk.Firewall) {
+					firewall.Rules[ruleIndex].EndpointSpec = []string{"10.0.0.0/24"}
+				},
+				want: "all inbound " + protocol + " traffic from Cilium native-routing pod CIDR 10.42.0.0/16",
+			},
+			testCase{
+				name: "missing any-destination " + protocol + " egress",
+				mutate: func(firewall *sdk.Firewall) {
+					firewall.Rules[ruleIndex+3].EndpointSpecType = "ip_prefixes"
+					firewall.Rules[ruleIndex+3].EndpointSpec = []string{"10.0.0.0/8"}
+				},
+				want: "all outbound " + protocol + " traffic to any endpoint for public-IP egress",
+			},
+		)
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			firewall := secureFirewall()
+			if test.mutate != nil {
+				test.mutate(&firewall)
+			}
+			err := validateDefaultDenyFirewall(firewall, network)
+			if test.want == "" {
+				if err != nil {
+					t.Fatalf("complete native-routing firewall rejected: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("validation error = %v, want substring %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestFirewallValidationAcceptsCompleteSplitPrefixCoverage(t *testing.T) {
+	firewall := secureFirewall()
+	for i := 0; i < 3; i++ {
+		firewall.Rules[i].EndpointSpec = []string{
+			"10.0.0.0/25", "10.0.0.128/25",
+			"10.42.0.0/17", "10.42.128.0/17",
+		}
+	}
+	if err := validateDefaultDenyFirewall(firewall, netip.MustParsePrefix("10.0.0.0/24")); err != nil {
+		t.Fatalf("complete split-prefix coverage rejected: %v", err)
+	}
+
+	firewall.Rules[1].EndpointSpec = []string{
+		"10.0.0.0/25", "10.0.0.128/25",
+		"10.42.0.0/17", "10.42.192.0/18",
+	}
+	err := validateDefaultDenyFirewall(firewall, netip.MustParsePrefix("10.0.0.0/24"))
+	if err == nil || !strings.Contains(err.Error(), "all inbound UDP traffic from Cilium native-routing pod CIDR") {
+		t.Fatalf("gapped split-prefix coverage error = %v", err)
+	}
+}
+
+func TestFirewallValidationRequiresPortlessICMP(t *testing.T) {
+	start, end := int32(1), int32(65535)
+	firewall := secureFirewall()
+	firewall.Rules[2].PortStart = &start
+	firewall.Rules[2].PortEnd = &end
+	err := validateDefaultDenyFirewall(firewall, netip.MustParsePrefix("10.0.0.0/24"))
+	if err == nil || !strings.Contains(err.Error(), "all inbound ICMP traffic from network subnet") {
+		t.Fatalf("ICMP ingress with synthetic port range error = %v", err)
+	}
+
+	firewall = secureFirewall()
+	firewall.Rules[5].PortStart = &start
+	firewall.Rules[5].PortEnd = &end
+	err = validateDefaultDenyFirewall(firewall, netip.MustParsePrefix("10.0.0.0/24"))
+	if err == nil || !strings.Contains(err.Error(), "all outbound ICMP traffic to any endpoint") {
+		t.Fatalf("ICMP egress with synthetic port range error = %v", err)
+	}
+}
+
+func TestCreateRejectsExactVPCOnlyFirewallBeforeMutation(t *testing.T) {
+	firewall := secureFirewall()
+	for i := range firewall.Rules {
+		if firewall.Rules[i].Direction == "inbound" {
+			firewall.Rules[i].EndpointSpec = []string{"10.0.0.0/24"}
+		}
+	}
+	original := firewall
+	original.Rules = append([]sdk.FirewallRule(nil), firewall.Rules...)
+	for i := range original.Rules {
+		original.Rules[i].EndpointSpec = append([]string(nil), original.Rules[i].EndpointSpec...)
+	}
+	api := &fakeAPI{firewalls: []sdk.Firewall{firewall}}
+	adapter, err := newAdapter(api, func() (string, error) { return validGeneratedTestPassword, nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = adapter.CreateVM(context.Background(), testRequest())
+	if err == nil || !strings.Contains(err.Error(), "Cilium native-routing pod CIDR 10.42.0.0/16") {
+		t.Fatalf("CreateVM error = %v, want exact-VPC-only firewall rejection", err)
+	}
+	if api.floatingIPCreateCalls != 0 || api.createCalls != 0 || api.firewallAssignCalls != 0 || api.floatingIPAssignCalls != 0 || len(api.operations) != 0 {
+		t.Fatalf("invalid firewall reached cloud mutation: floatingIPPOSTs=%d VMPOSTs=%d firewallAssignments=%d floatingIPAssignments=%d operations=%v",
+			api.floatingIPCreateCalls, api.createCalls, api.firewallAssignCalls, api.floatingIPAssignCalls, api.operations)
+	}
+	if !reflect.DeepEqual(original, api.firewalls[0]) {
+		t.Fatalf("provider mutated user firewall rules: before=%#v after=%#v", original, api.firewalls[0])
 	}
 }
 
@@ -529,12 +1246,19 @@ func testRequest() cloudapi.CreateVMRequest {
 		IdempotencyKey: "uid-a", Name: "nodeclaim-a", ClusterName: "cluster-a", NodeClaimName: "nodeclaim-a",
 		BillingAccountID: 1,
 		Location:         "bkk01", NetworkUUID: "network-1", OSName: "ubuntu", OSVersion: "24.04",
-		FirewallUUID: "33333333-3333-4333-8333-333333333333",
-		HostPoolUUID: "pool-1", HostClass: "intel-scalable", InstanceType: "is-general-2c-4g",
-		VCPU: 2, MemoryGiB: 4, RootDiskGiB: 40, CloudInitJSON: `{"write_files":[{"path":"/etc/rancher/k3s/config.yaml","encoding":"b64","content":"bm9kZS1leHRlcm5hbC1pcDogX19JTlNQQUNFX0ZMT0FUSU5HX0lQVjRfXw=="}],"runcmd":[]}`,
+		ControlPlaneVIP:              "10.0.0.10",
+		PrivateLoadBalancerPoolStart: "10.0.0.200",
+		PrivateLoadBalancerPoolStop:  "10.0.0.219",
+		FirewallUUID:                 "33333333-3333-4333-8333-333333333333",
+		HostPoolUUID:                 "pool-1", HostClass: "intel-scalable", InstanceType: "is-general-2c-4g",
+		VCPU: 2, MemoryGiB: 4, RootDiskGiB: 40, CloudInitJSON: `{"write_files":[{"path":"/etc/rancher/rke2/config.yaml","encoding":"b64","content":"bm9kZS1leHRlcm5hbC1pcDogX19JTlNQQUNFX0ZMT0FUSU5HX0lQVjRfXw=="},{"path":"/usr/local/sbin/inspace-detect-private-ip","encoding":"b64","content":"X19JTlNQQUNFX1ZQQ19TVUJORVRfXw=="}],"runcmd":[]}`,
 		PublicIPv4: true,
 		SpecHash:   "spec-a", BootstrapHash: "bootstrap-a",
 	}
+}
+
+func testPrivateLoadBalancerPool() inspacev1.PrivateLoadBalancerPool {
+	return inspacev1.PrivateLoadBalancerPool{Start: "10.0.0.200", Stop: "10.0.0.219"}
 }
 
 const validAdapterTestPublicKey = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINdamAGCsQq31Uv+08lkBzoO4XLz2qYjJa8CGmj3B1Ea test@example"
@@ -596,10 +1320,19 @@ type fakeAPI struct {
 	networkGetCalls                 int
 	networkMembershipAfter          int
 	createdNetworkUUID              string
+	createdPrivateIPv4              string
+	attachCreatedVMToFirewallUUID   string
+	secondFirewallOnAssignUUID      string
+	privateIPv4VisibleAfter         int
+	vmGetCalls                      int
+	firewallListCalls               int
+	blockFirewallList               bool
+	floatingIPListCalls             int
 	networkErrors                   map[int]error
 	networkNilOnCalls               map[int]bool
 	networkGetHook                  func(int)
 	floatingIPCreateCalls           int
+	createFloatingIPHook            func(*sdk.FloatingIP)
 	floatingIPAssignCalls           int
 	firewallAssignCalls             int
 	deleteVMCalls                   int
@@ -637,7 +1370,12 @@ func (f *fakeAPI) GetNetwork(context.Context, string, string) (*sdk.Network, err
 	}
 	return network, nil
 }
-func (f *fakeAPI) ListFirewalls(context.Context, string) ([]sdk.Firewall, error) {
+func (f *fakeAPI) ListFirewalls(ctx context.Context, _ string) ([]sdk.Firewall, error) {
+	f.firewallListCalls++
+	if f.blockFirewallList {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
 	if f.firewalls == nil {
 		f.firewalls = []sdk.Firewall{secureFirewall()}
 	}
@@ -651,6 +1389,13 @@ func (f *fakeAPI) AssignFirewallToVM(_ context.Context, _ string, firewallUUID, 
 	for i := range f.firewalls {
 		if f.firewalls[i].UUID == firewallUUID {
 			f.firewalls[i].ResourcesAssigned = append(f.firewalls[i].ResourcesAssigned, sdk.FirewallResource{ResourceType: "vm", ResourceUUID: vmUUID})
+			if f.secondFirewallOnAssignUUID != "" {
+				for j := range f.firewalls {
+					if f.firewalls[j].UUID == f.secondFirewallOnAssignUUID {
+						f.firewalls[j].ResourcesAssigned = append(f.firewalls[j].ResourcesAssigned, sdk.FirewallResource{ResourceType: "vm", ResourceUUID: vmUUID})
+					}
+				}
+			}
 			return nil
 		}
 	}
@@ -676,6 +1421,7 @@ func (f *fakeAPI) UnassignFirewallFromVM(_ context.Context, _ string, firewallUU
 	return errors.New("firewall not found")
 }
 func (f *fakeAPI) ListFloatingIPs(_ context.Context, _ string, filters *sdk.FloatingIPFilters) ([]sdk.FloatingIP, error) {
+	f.floatingIPListCalls++
 	var result []sdk.FloatingIP
 	for _, address := range f.floatingIPs {
 		if filters == nil || filters.BillingAccountID == 0 || address.BillingAccountID == filters.BillingAccountID {
@@ -686,7 +1432,10 @@ func (f *fakeAPI) ListFloatingIPs(_ context.Context, _ string, filters *sdk.Floa
 }
 func (f *fakeAPI) CreateFloatingIP(_ context.Context, _ string, request sdk.CreateFloatingIPRequest) (*sdk.FloatingIP, error) {
 	f.floatingIPCreateCalls++
-	address := sdk.FloatingIP{Name: request.Name, Address: "203.0.113.10", BillingAccountID: request.BillingAccountID, Enabled: true}
+	address := sdk.FloatingIP{Name: request.Name, Address: "203.0.113.10", BillingAccountID: request.BillingAccountID, Enabled: true, Type: "public"}
+	if f.createFloatingIPHook != nil {
+		f.createFloatingIPHook(&address)
+	}
 	f.floatingIPs = append(f.floatingIPs, address)
 	return &address, nil
 }
@@ -735,17 +1484,23 @@ func secureFirewall() sdk.Firewall {
 	return sdk.Firewall{
 		UUID: "33333333-3333-4333-8333-333333333333",
 		Rules: []sdk.FirewallRule{{
-			UUID: "rule-private", Protocol: "tcp", Direction: "inbound",
-			EndpointSpecType: "ip_prefixes", EndpointSpec: []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"},
-		}, {UUID: "rule-private-udp", Protocol: "udp", Direction: "inbound", EndpointSpecType: "ip_prefixes", EndpointSpec: []string{"10.0.0.0/8"}},
+			UUID: "in-vpc-pods-tcp", Protocol: "tcp", Direction: "inbound",
+			EndpointSpecType: "ip_prefixes", EndpointSpec: []string{"10.0.0.0/24", bootstrap.NativeRoutingPodCIDR},
+		}, {UUID: "in-vpc-pods-udp", Protocol: "udp", Direction: "inbound", EndpointSpecType: "ip_prefixes", EndpointSpec: []string{"10.0.0.0/24", bootstrap.NativeRoutingPodCIDR}},
+			{UUID: "in-vpc-pods-icmp", Protocol: "icmp", Direction: "inbound", EndpointSpecType: "ip_prefixes", EndpointSpec: []string{"10.0.0.0/24", bootstrap.NativeRoutingPodCIDR}},
 			{UUID: "out-tcp", Protocol: "tcp", Direction: "outbound", EndpointSpecType: "any"},
-			{UUID: "out-udp", Protocol: "udp", Direction: "outbound", EndpointSpecType: "any"}},
+			{UUID: "out-udp", Protocol: "udp", Direction: "outbound", EndpointSpecType: "any"},
+			{UUID: "out-icmp", Protocol: "icmp", Direction: "outbound", EndpointSpecType: "any"}},
 	}
 }
 func (f *fakeAPI) GetVM(_ context.Context, _, uuid string) (*sdk.VM, error) {
+	f.vmGetCalls++
 	for i := range f.vms {
 		if f.vms[i].UUID == uuid {
 			copy := f.vms[i]
+			if f.vmGetCalls <= f.privateIPv4VisibleAfter {
+				copy.PrivateIPv4 = ""
+			}
 			return &copy, nil
 		}
 	}
@@ -760,11 +1515,22 @@ func (f *fakeAPI) CreateVM(_ context.Context, _ string, request sdk.CreateVMRequ
 		OSVersion: request.OSVersion, DesignatedPoolUUID: request.DesignatedPoolUUID, NetworkUUID: request.NetworkUUID,
 		Storage: []sdk.VMStorage{{SizeGiB: request.DiskGiB, Primary: true}},
 	}
+	vm.PrivateIPv4 = f.createdPrivateIPv4
+	if vm.PrivateIPv4 == "" {
+		vm.PrivateIPv4 = "10.0.0.20"
+	}
 	if f.createdNetworkUUID != "" {
 		vm.NetworkUUID = f.createdNetworkUUID
 	}
 	if f.createErr == nil || f.commitOnCreateError {
 		f.vms = append(f.vms, vm)
+		if f.attachCreatedVMToFirewallUUID != "" {
+			for i := range f.firewalls {
+				if f.firewalls[i].UUID == f.attachCreatedVMToFirewallUUID {
+					f.firewalls[i].ResourcesAssigned = append(f.firewalls[i].ResourcesAssigned, sdk.FirewallResource{ResourceType: "vm", ResourceUUID: vm.UUID})
+				}
+			}
+		}
 	}
 	if f.createErr != nil {
 		return nil, f.createErr

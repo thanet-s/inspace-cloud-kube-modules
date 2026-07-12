@@ -2,7 +2,7 @@ SHELL := /bin/sh
 
 MODULES := modules/client modules/cloud-provider modules/csi-driver modules/karpenter-provider
 
-.PHONY: all fmt test smoke vet helm-verify helm-package verify images status live-audit live-test cluster-e2e
+.PHONY: all fmt test smoke vet helm-verify helm-package e2e-static verify images status live-audit live-test cluster-e2e
 
 all: test
 
@@ -20,6 +20,7 @@ test:
 			-u INSPACE_API_KEY \
 			-u INSPACE_ALLOW_REMOTE_MUTATIONS \
 			-u INSPACE_RUN_LIVE_TESTS \
+			GOWORK=off \
 			go test ./...); \
 	done
 
@@ -31,13 +32,14 @@ smoke:
 			-u INSPACE_API_KEY \
 			-u INSPACE_ALLOW_REMOTE_MUTATIONS \
 			-u INSPACE_RUN_LIVE_TESTS \
+			GOWORK=off \
 			$(MAKE) smoke); \
 	done
 
 vet:
 	@set -eu; for module in $(MODULES); do \
 		echo "==> vet $$module"; \
-		(cd "$$module" && go vet ./...); \
+		(cd "$$module" && GOWORK=off go vet ./...); \
 	done
 
 helm-verify:
@@ -53,7 +55,13 @@ helm-package: helm-verify
 	helm package charts/inspace-cloud-kube-modules-crds --destination dist
 	helm package charts/inspace-cloud-kube-modules --destination dist
 
-verify: test smoke vet helm-verify
+e2e-static:
+	python3 test/e2e/verify-static.py
+	@set -eu; for script in test/e2e/run.sh test/e2e/scripts/*.sh; do \
+		bash -n "$$script"; \
+	done
+
+verify: test smoke vet helm-verify e2e-static
 
 images:
 	docker build --platform=linux/amd64 -f modules/cloud-provider/Dockerfile -t inspace-cloud-controller-manager:dev .

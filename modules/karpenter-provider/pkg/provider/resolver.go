@@ -3,6 +3,7 @@ package provider
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 
 	corev1 "k8s.io/api/core/v1"
@@ -36,18 +37,18 @@ func (r *KubernetesResolver) GetNodeClass(ctx context.Context, name string) (*in
 }
 
 func (r *KubernetesResolver) ResolveAgentToken(ctx context.Context, nodeClass *inspacev1.InSpaceNodeClass) (string, error) {
-	ref := nodeClass.Spec.K3s.TokenSecretRef
-	if ref.Name != inspacev1.K3sAgentTokenSecretName || ref.Key != inspacev1.K3sAgentTokenSecretKey {
-		return "", fmt.Errorf("agent token must use dedicated Secret %q key %q", inspacev1.K3sAgentTokenSecretName, inspacev1.K3sAgentTokenSecretKey)
+	ref := nodeClass.Spec.RKE2.TokenSecretRef
+	if ref.Name != inspacev1.RKE2AgentTokenSecretName || ref.Key != inspacev1.RKE2AgentTokenSecretKey {
+		return "", fmt.Errorf("agent token must use dedicated Secret %q key %q", inspacev1.RKE2AgentTokenSecretName, inspacev1.RKE2AgentTokenSecretKey)
 	}
 	var secret corev1.Secret
 	key := types.NamespacedName{Namespace: r.secretNamespace, Name: ref.Name}
 	if err := r.client.Get(ctx, key, &secret); err != nil {
-		return "", fmt.Errorf("getting K3s agent token Secret %s: %w", key.String(), err)
+		return "", fmt.Errorf("getting RKE2 agent token Secret %s: %w", key.String(), err)
 	}
-	token := string(secret.Data[ref.Key])
+	token := strings.TrimSpace(string(secret.Data[ref.Key]))
 	if token == "" {
-		return "", fmt.Errorf("K3s agent token Secret %s has no non-empty %q key", key.String(), ref.Key)
+		return "", fmt.Errorf("RKE2 agent token Secret %s has no non-empty %q key", key.String(), ref.Key)
 	}
 	return token, nil
 }
@@ -98,11 +99,12 @@ func (r *StaticResolver) GetNodeClass(_ context.Context, name string) (*inspacev
 func (r *StaticResolver) ResolveAgentToken(_ context.Context, nodeClass *inspacev1.InSpaceNodeClass) (string, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	ref := nodeClass.Spec.K3s.TokenSecretRef
-	if ref.Name != inspacev1.K3sAgentTokenSecretName || ref.Key != inspacev1.K3sAgentTokenSecretKey {
-		return "", fmt.Errorf("agent token must use dedicated Secret %q key %q", inspacev1.K3sAgentTokenSecretName, inspacev1.K3sAgentTokenSecretKey)
+	ref := nodeClass.Spec.RKE2.TokenSecretRef
+	if ref.Name != inspacev1.RKE2AgentTokenSecretName || ref.Key != inspacev1.RKE2AgentTokenSecretKey {
+		return "", fmt.Errorf("agent token must use dedicated Secret %q key %q", inspacev1.RKE2AgentTokenSecretName, inspacev1.RKE2AgentTokenSecretKey)
 	}
 	token, ok := r.tokens[ref.Name+"/"+ref.Key]
+	token = strings.TrimSpace(token)
 	if !ok || token == "" {
 		return "", fmt.Errorf("agent token Secret %q key %q not found", ref.Name, ref.Key)
 	}

@@ -51,9 +51,9 @@ func run() error {
 	flag.BoolVar(&untilReady, "until-ready", false, "reconcile until infrastructure is ready, then exit")
 	flag.StringVar(&output, "output", "text", "result output format: text or json")
 	flag.StringVar(&sshPublicKeyFile, "ssh-public-key-file", "", "path to one OpenSSH public key (never a private key)")
-	flag.StringVar(&sshUsername, "ssh-username", "", "username created by InSpace for SSH access")
-	flag.StringVar(&managementCIDR, "management-cidr", "", "single public IPv4 /32 allowed to reach management TCP ports")
-	flag.StringVar(&managementTCPPorts, "management-tcp-ports", "", "comma-separated explicit TCP ports allowed from management-cidr")
+	flag.StringVar(&sshUsername, "ssh-username", "", "required for creation: bastion SSH username created by InSpace")
+	flag.StringVar(&managementCIDR, "management-cidr", "", "required public IPv4 /32 allowed to reach the bastion")
+	flag.StringVar(&managementTCPPorts, "management-tcp-ports", "", "must be exactly 22 for bastion SSH")
 	flag.BoolVar(&deleteOwned, "delete", false, "delete only this cluster's deterministically owned infrastructure, then exit")
 	flag.Parse()
 	if version {
@@ -93,9 +93,9 @@ func run() error {
 	if apiToken == "" {
 		return errors.New("INSPACE_API_TOKEN is required")
 	}
-	k3sToken := strings.TrimSpace(os.Getenv("INSPACE_K3S_TOKEN"))
-	if !deleteOwned && k3sToken == "" {
-		return errors.New("INSPACE_K3S_TOKEN is required")
+	rke2Token := strings.TrimSpace(os.Getenv("INSPACE_RKE2_TOKEN"))
+	if !deleteOwned && rke2Token == "" {
+		return errors.New("INSPACE_RKE2_TOKEN is required")
 	}
 	allowMutations, err := strconv.ParseBool(defaultValue(os.Getenv("INSPACE_ALLOW_REMOTE_MUTATIONS"), "false"))
 	if err != nil {
@@ -140,7 +140,7 @@ func run() error {
 			}
 			continue
 		}
-		result, reconcileErr := reconciler.Reconcile(ctx, &cluster, k3sToken)
+		result, reconcileErr := reconciler.Reconcile(ctx, &cluster, rke2Token)
 		if reconcileErr != nil {
 			if once || !isRetryable(reconcileErr) {
 				return reconcileErr
@@ -190,9 +190,10 @@ func emitResult(output *os.File, format string, result bootstrap.Result) error {
 		encoder.SetEscapeHTML(false)
 		return encoder.Encode(result)
 	}
-	_, err := fmt.Fprintf(output, "infrastructureReady=%t controlPlaneVMs=%d endpoint=%q privateEndpoint=%q allocatedEndpointIPv4=%q owner=%q firewallUUID=%q apiLoadBalancerUUID=%q message=%q\n",
+	_, err := fmt.Fprintf(output, "infrastructureReady=%t controlPlaneVMs=%d endpoint=%q privateEndpoint=%q privateRegistrationEndpoint=%q owner=%q firewallUUID=%q bastionFirewallUUID=%q bastionVMUUID=%q bastionPublicIPv4=%q bastionPrivateIPv4=%q message=%q\n",
 		result.Ready, len(result.ControlPlaneVMs), result.ControlPlaneEndpoint, result.PrivateControlPlaneEndpoint,
-		result.AllocatedEndpointIPv4, result.Owner, result.FirewallUUID, result.APILoadBalancerUUID, result.Message)
+		result.PrivateRegistrationEndpoint, result.Owner, result.FirewallUUID, result.BastionFirewallUUID,
+		result.BastionVMUUID, result.BastionPublicIPv4, result.BastionPrivateIPv4, result.Message)
 	return err
 }
 

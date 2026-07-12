@@ -83,7 +83,7 @@ metadata:
 rules:
   - apiGroups: [""]
     resources: ["secrets"]
-    resourceNames: ["inspace-k3s-agent-token"]
+    resourceNames: ["inspace-rke2-agent-token"]
     verbs: ["get"]
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]

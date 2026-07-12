@@ -41,8 +41,20 @@ grep -Fx '    resources: ["tokenreviews"]' "$tmpdir/ccm-rbac.yaml" >/dev/null
 grep -Fx '    resources: ["subjectaccessreviews"]' "$tmpdir/ccm-rbac.yaml" >/dev/null
 
 helm template bootstrap "$chart" --namespace kube-system --values "$values" \
+  --show-only templates/ccm-configmap.yaml >"$tmpdir/ccm-configmap.yaml"
+grep -Fx '  controlPlaneVIP: "10.20.30.10"' "$tmpdir/ccm-configmap.yaml" >/dev/null
+grep -Fx '  privateLoadBalancerPoolStart: "10.20.30.200"' "$tmpdir/ccm-configmap.yaml" >/dev/null
+grep -Fx '  privateLoadBalancerPoolStop: "10.20.30.239"' "$tmpdir/ccm-configmap.yaml" >/dev/null
+
+helm template bootstrap "$chart" --namespace kube-system --values "$values" \
   --show-only templates/ccm-deployment.yaml >"$tmpdir/ccm-deployment.yaml"
 grep -Fx '      dnsPolicy: Default' "$tmpdir/ccm-deployment.yaml" >/dev/null
+test "$(grep -Fc '            - name: INSPACE_CONTROL_PLANE_VIP' "$tmpdir/ccm-deployment.yaml")" -eq 1
+test "$(grep -Fc '            - name: INSPACE_PRIVATE_LOAD_BALANCER_POOL_START' "$tmpdir/ccm-deployment.yaml")" -eq 1
+test "$(grep -Fc '            - name: INSPACE_PRIVATE_LOAD_BALANCER_POOL_STOP' "$tmpdir/ccm-deployment.yaml")" -eq 1
+grep -Fx '                  key: controlPlaneVIP' "$tmpdir/ccm-deployment.yaml" >/dev/null
+grep -Fx '                  key: privateLoadBalancerPoolStart' "$tmpdir/ccm-deployment.yaml" >/dev/null
+grep -Fx '                  key: privateLoadBalancerPoolStop' "$tmpdir/ccm-deployment.yaml" >/dev/null
 
 helm template bootstrap "$chart" --namespace kube-system --values "$values" \
   --show-only templates/csi-controller.yaml >"$tmpdir/csi-controller.yaml"
@@ -53,6 +65,71 @@ test "$(grep -Fc '            runAsGroup: 65532' "$tmpdir/csi-controller.yaml")"
 helm template bootstrap "$chart" --namespace kube-system --values "$values" \
   --show-only templates/karpenter-deployment.yaml >"$tmpdir/karpenter.yaml"
 require_toleration "$tmpdir/karpenter.yaml"
+test "$(grep -Fc '            - name: INSPACE_NETWORK_UUID' "$tmpdir/karpenter.yaml")" -eq 1
+test "$(grep -Fc '            - name: INSPACE_CONTROL_PLANE_VIP' "$tmpdir/karpenter.yaml")" -eq 1
+test "$(grep -Fc '            - name: INSPACE_PRIVATE_LOAD_BALANCER_POOL_START' "$tmpdir/karpenter.yaml")" -eq 1
+test "$(grep -Fc '            - name: INSPACE_PRIVATE_LOAD_BALANCER_POOL_STOP' "$tmpdir/karpenter.yaml")" -eq 1
+grep -Fx '              value: "11111111-1111-4111-8111-111111111111"' "$tmpdir/karpenter.yaml" >/dev/null
+grep -Fx '              value: "10.20.30.10"' "$tmpdir/karpenter.yaml" >/dev/null
+grep -Fx '              value: "10.20.30.200"' "$tmpdir/karpenter.yaml" >/dev/null
+grep -Fx '              value: "10.20.30.239"' "$tmpdir/karpenter.yaml" >/dev/null
+
+if helm template invalid "$chart" --namespace kube-system --values "$values" \
+  --set-string global.inspace.privateLoadBalancerPool.start=10.20.30.240 \
+  --set-string global.inspace.privateLoadBalancerPool.stop=10.20.30.200 >/dev/null 2>&1; then
+  echo "reversed private load-balancer pool unexpectedly rendered" >&2
+  exit 1
+fi
+if helm template invalid "$chart" --namespace kube-system --values "$values" \
+  --set-string global.inspace.privateLoadBalancerPool.start=203.0.113.10 >/dev/null 2>&1; then
+  echo "public private-load-balancer pool address unexpectedly rendered" >&2
+  exit 1
+fi
+if helm template invalid "$chart" --namespace kube-system --values "$values" \
+  --set-string global.inspace.privateLoadBalancerPool.start=10.20.30.200 \
+  --set-string global.inspace.privateLoadBalancerPool.stop=10.20.30.214 >/dev/null 2>&1; then
+  echo "private load-balancer pool smaller than 16 addresses unexpectedly rendered" >&2
+  exit 1
+fi
+if helm template invalid "$chart" --namespace kube-system --values "$values" \
+  --set-string global.inspace.privateLoadBalancerPool.start=10.20.30.1 \
+  --set-string global.inspace.privateLoadBalancerPool.stop=10.20.31.1 >/dev/null 2>&1; then
+  echo "private load-balancer pool larger than 256 addresses unexpectedly rendered" >&2
+  exit 1
+fi
+if helm template invalid "$chart" --namespace kube-system --values "$values" \
+  --set-string global.inspace.controlPlaneVIP=10.20.30.210 >/dev/null 2>&1; then
+  echo "control-plane VIP inside the private load-balancer pool unexpectedly rendered" >&2
+  exit 1
+fi
+if helm template invalid "$chart" --namespace kube-system --values "$values" \
+  --set-string global.inspace.controlPlaneVIP=10.42.0.10 >/dev/null 2>&1; then
+  echo "control-plane VIP inside the pod CIDR unexpectedly rendered" >&2
+  exit 1
+fi
+if helm template invalid "$chart" --namespace kube-system --values "$values" \
+  --set-string global.inspace.controlPlaneVIP=10.43.0.10 >/dev/null 2>&1; then
+  echo "control-plane VIP inside the Service CIDR unexpectedly rendered" >&2
+  exit 1
+fi
+if helm template invalid "$chart" --namespace kube-system --values "$values" \
+  --set-string global.inspace.privateLoadBalancerPool.start=10.41.255.250 \
+  --set-string global.inspace.privateLoadBalancerPool.stop=10.42.0.9 >/dev/null 2>&1; then
+  echo "private load-balancer pool overlapping the pod CIDR unexpectedly rendered" >&2
+  exit 1
+fi
+if helm template invalid "$chart" --namespace kube-system --values "$values" \
+  --set-string global.inspace.privateLoadBalancerPool.start=10.42.255.250 \
+  --set-string global.inspace.privateLoadBalancerPool.stop=10.43.0.9 >/dev/null 2>&1; then
+  echo "private load-balancer pool overlapping the Service CIDR unexpectedly rendered" >&2
+  exit 1
+fi
+if helm template invalid "$chart" --namespace kube-system --values "$values" \
+  --set ccm.enabled=false --set csi.enabled=false --set karpenter.enabled=true \
+  --set-string global.inspace.networkUUID= >/dev/null 2>&1; then
+  echo "Karpenter unexpectedly rendered without its controller-wide network UUID" >&2
+  exit 1
+fi
 
 grep -Fx 'kind: RoleBinding' "$standalone_ccm" >/dev/null
 grep -Fx '  name: extension-apiserver-authentication-reader' "$standalone_ccm" >/dev/null
@@ -62,3 +139,5 @@ grep -Fx '    resources: ["tokenreviews"]' "$standalone_ccm" >/dev/null
 grep -Fx '    resources: ["subjectaccessreviews"]' "$standalone_ccm" >/dev/null
 require_toleration "$standalone_csi"
 require_toleration "$standalone_karpenter"
+grep -F '            - name: INSPACE_NETWORK_UUID' "$standalone_karpenter" >/dev/null
+grep -F '            - name: INSPACE_CONTROL_PLANE_VIP' "$standalone_karpenter" >/dev/null

@@ -4,9 +4,11 @@ import (
 	"context"
 	"crypto/sha256"
 	"fmt"
+	"net/netip"
 	"sort"
 	"sync"
 
+	inspacev1 "github.com/thanet-s/inspace-cloud-kube-modules/modules/karpenter-provider/pkg/apis/v1alpha1"
 	"github.com/thanet-s/inspace-cloud-kube-modules/modules/karpenter-provider/pkg/cloud"
 )
 
@@ -38,26 +40,31 @@ func (f *Cloud) CreateVM(_ context.Context, request cloud.CreateVMRequest) (*clo
 	}
 	id := deterministicUUID(request.IdempotencyKey)
 	vm := &cloud.VM{
-		UUID:             id,
-		Name:             request.Name,
-		ClusterName:      request.ClusterName,
-		BillingAccountID: request.BillingAccountID,
-		NodeClaimName:    request.NodeClaimName,
-		Location:         request.Location,
-		OSName:           request.OSName,
-		OSVersion:        request.OSVersion,
-		HostClass:        request.HostClass,
-		InstanceType:     request.InstanceType,
-		VCPU:             request.VCPU,
-		MemoryGiB:        request.MemoryGiB,
-		RootDiskGiB:      request.RootDiskGiB,
-		FirewallUUID:     request.FirewallUUID,
-		SpecHash:         request.SpecHash,
-		BootstrapHash:    request.BootstrapHash,
-		PublicIPv4:       "203.0.113.10",
-		FloatingIPName:   request.Name + "-public",
-		State:            cloud.LifecycleRunning,
-		RawState:         "running",
+		UUID:                         id,
+		Name:                         request.Name,
+		ClusterName:                  request.ClusterName,
+		BillingAccountID:             request.BillingAccountID,
+		NodeClaimName:                request.NodeClaimName,
+		Location:                     request.Location,
+		OSName:                       request.OSName,
+		OSVersion:                    request.OSVersion,
+		HostClass:                    request.HostClass,
+		InstanceType:                 request.InstanceType,
+		VCPU:                         request.VCPU,
+		MemoryGiB:                    request.MemoryGiB,
+		RootDiskGiB:                  request.RootDiskGiB,
+		FirewallUUID:                 request.FirewallUUID,
+		NetworkUUID:                  request.NetworkUUID,
+		ControlPlaneVIP:              request.ControlPlaneVIP,
+		PrivateLoadBalancerPoolStart: request.PrivateLoadBalancerPoolStart,
+		PrivateLoadBalancerPoolStop:  request.PrivateLoadBalancerPoolStop,
+		SpecHash:                     request.SpecHash,
+		BootstrapHash:                request.BootstrapHash,
+		PrivateIPv4:                  "10.0.0.20",
+		PublicIPv4:                   "203.0.113.10",
+		FloatingIPName:               request.Name + "-public",
+		State:                        cloud.LifecycleRunning,
+		RawState:                     "running",
 	}
 	f.byID[id] = vm
 	f.byKey[request.IdempotencyKey] = id
@@ -105,9 +112,12 @@ func (f *Cloud) ListVMs(_ context.Context, location, clusterName string) ([]*clo
 	return result, nil
 }
 
-func (f *Cloud) ValidateNodeClass(_ context.Context, location, networkUUID, hostPoolUUID, firewallUUID string) error {
-	if location == "" || networkUUID == "" || hostPoolUUID == "" || firewallUUID == "" {
-		return fmt.Errorf("location, network UUID, host pool UUID, and firewall UUID are required")
+func (f *Cloud) ValidateNodeClass(_ context.Context, location, networkUUID, controlPlaneVIP, privateLoadBalancerPoolStart, privateLoadBalancerPoolStop, hostPoolUUID, firewallUUID string) error {
+	vip, err := netip.ParseAddr(controlPlaneVIP)
+	pool := inspacev1.PrivateLoadBalancerPool{Start: privateLoadBalancerPoolStart, Stop: privateLoadBalancerPoolStop}
+	reservedVIP := err == nil && (netip.MustParsePrefix(inspacev1.CiliumNativeRoutingPodCIDR).Contains(vip) || netip.MustParsePrefix(inspacev1.KubernetesServiceCIDR).Contains(vip))
+	if location == "" || networkUUID == "" || hostPoolUUID == "" || firewallUUID == "" || err != nil || !vip.Is4() || !vip.IsPrivate() || reservedVIP || pool.ValidateForSupervisor(vip) != nil {
+		return fmt.Errorf("location, network UUID, private control-plane VIP and Service pool, host pool UUID, and firewall UUID are required")
 	}
 	return nil
 }

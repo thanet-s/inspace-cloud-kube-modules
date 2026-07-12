@@ -62,6 +62,14 @@ spec:
               value: {{ .Values.global.inspace.apiBaseURL | quote }}
             - name: INSPACE_LOCATION
               value: {{ .Values.global.inspace.location | quote }}
+            - name: INSPACE_NETWORK_UUID
+              value: {{ .Values.global.inspace.networkUUID | quote }}
+            - name: INSPACE_CONTROL_PLANE_VIP
+              value: {{ .Values.global.inspace.controlPlaneVIP | quote }}
+            - name: INSPACE_PRIVATE_LOAD_BALANCER_POOL_START
+              value: {{ .Values.global.inspace.privateLoadBalancerPool.start | quote }}
+            - name: INSPACE_PRIVATE_LOAD_BALANCER_POOL_STOP
+              value: {{ .Values.global.inspace.privateLoadBalancerPool.stop | quote }}
             - name: INSPACE_CLUSTER_NAME
               value: {{ .Values.karpenter.clusterName | quote }}
             - name: INSPACE_DEFAULT_NODECLASS

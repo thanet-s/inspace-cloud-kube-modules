@@ -97,6 +97,21 @@ spec:
                 configMapKeyRef:
                   name: {{ $name }}
                   key: clusterID
+            - name: INSPACE_CONTROL_PLANE_VIP
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ $name }}
+                  key: controlPlaneVIP
+            - name: INSPACE_PRIVATE_LOAD_BALANCER_POOL_START
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ $name }}
+                  key: privateLoadBalancerPoolStart
+            - name: INSPACE_PRIVATE_LOAD_BALANCER_POOL_STOP
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ $name }}
+                  key: privateLoadBalancerPoolStop
             {{- with .Values.ccm.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

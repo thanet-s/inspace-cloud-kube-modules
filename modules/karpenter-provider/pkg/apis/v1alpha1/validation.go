@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"fmt"
+	"net/netip"
 	"net/url"
 	"regexp"
 	"strings"
@@ -14,8 +15,7 @@ import (
 
 var (
 	uuidPattern        = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$`)
-	k3sVersionPattern  = regexp.MustCompile(`^v[0-9]+\.[0-9]+\.[0-9]+\+k3s[0-9]+$`)
-	serverHostPattern  = regexp.MustCompile(`^[A-Za-z0-9.-]+$`)
+	rke2VersionPattern = regexp.MustCompile(`^v[0-9]+\.[0-9]+\.[0-9]+\+rke2r[0-9]+$`)
 	sshUsernamePattern = regexp.MustCompile(`^[a-z_][a-z0-9_-]{0,29}$`)
 )
 
@@ -36,8 +36,15 @@ func (n *InSpaceNodeClass) Validate() field.ErrorList {
 	if n.Spec.Location != LocationBangkok {
 		errs = append(errs, field.NotSupported(p.Child("location"), n.Spec.Location, []string{LocationBangkok}))
 	}
-	if !uuidPattern.MatchString(n.Spec.NetworkUUID) {
+	if err := ValidateNetworkUUID(n.Spec.NetworkUUID); err != nil {
 		errs = append(errs, field.Invalid(p.Child("networkUUID"), n.Spec.NetworkUUID, "must be a UUID"))
+	}
+	if supervisorVIP, err := n.Spec.RKE2.ServerVIP(); err == nil {
+		if err := n.Spec.PrivateLoadBalancerPool.ValidateForSupervisor(supervisorVIP); err != nil {
+			errs = append(errs, field.Invalid(p.Child("privateLoadBalancerPool"), n.Spec.PrivateLoadBalancerPool, err.Error()))
+		}
+	} else if _, _, poolErr := n.Spec.PrivateLoadBalancerPool.Range(); poolErr != nil {
+		errs = append(errs, field.Invalid(p.Child("privateLoadBalancerPool"), n.Spec.PrivateLoadBalancerPool, poolErr.Error()))
 	}
 	if !n.Spec.ReservePublicIPv4 {
 		errs = append(errs, field.NotSupported(p.Child("reservePublicIPv4"), false, []string{"true"}))
@@ -57,23 +64,23 @@ func (n *InSpaceNodeClass) Validate() field.ErrorList {
 	if n.Spec.RootDiskGiB < 30 || n.Spec.RootDiskGiB > 2000 {
 		errs = append(errs, field.Invalid(p.Child("rootDiskGiB"), n.Spec.RootDiskGiB, "must be between 30 and 2000 GiB"))
 	}
-	if !k3sVersionPattern.MatchString(n.Spec.K3s.Version) {
-		errs = append(errs, field.Invalid(p.Child("k3s", "version"), n.Spec.K3s.Version, "must look like v1.35.1+k3s1"))
+	if !rke2VersionPattern.MatchString(n.Spec.RKE2.Version) {
+		errs = append(errs, field.Invalid(p.Child("rke2", "version"), n.Spec.RKE2.Version, "must look like v1.35.6+rke2r1"))
 	}
-	if u, err := url.Parse(n.Spec.K3s.Server); err != nil || u.Scheme != "https" || !serverHostPattern.MatchString(u.Hostname()) || u.Port() != "6443" || u.Path != "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
-		errs = append(errs, field.Invalid(p.Child("k3s", "server"), n.Spec.K3s.Server, "must be an https URL on port 6443 without a path"))
+	if _, err := n.Spec.RKE2.ServerVIP(); err != nil {
+		errs = append(errs, field.Invalid(p.Child("rke2", "server"), n.Spec.RKE2.Server, err.Error()))
 	}
-	if messages := validation.IsDNS1123Subdomain(n.Spec.K3s.TokenSecretRef.Name); len(messages) != 0 {
-		errs = append(errs, field.Invalid(p.Child("k3s", "tokenSecretRef", "name"), n.Spec.K3s.TokenSecretRef.Name, strings.Join(messages, "; ")))
-	} else if n.Spec.K3s.TokenSecretRef.Name != K3sAgentTokenSecretName {
-		errs = append(errs, field.NotSupported(p.Child("k3s", "tokenSecretRef", "name"), n.Spec.K3s.TokenSecretRef.Name, []string{K3sAgentTokenSecretName}))
+	if messages := validation.IsDNS1123Subdomain(n.Spec.RKE2.TokenSecretRef.Name); len(messages) != 0 {
+		errs = append(errs, field.Invalid(p.Child("rke2", "tokenSecretRef", "name"), n.Spec.RKE2.TokenSecretRef.Name, strings.Join(messages, "; ")))
+	} else if n.Spec.RKE2.TokenSecretRef.Name != RKE2AgentTokenSecretName {
+		errs = append(errs, field.NotSupported(p.Child("rke2", "tokenSecretRef", "name"), n.Spec.RKE2.TokenSecretRef.Name, []string{RKE2AgentTokenSecretName}))
 	}
-	if n.Spec.K3s.TokenSecretRef.Key == "" {
-		errs = append(errs, field.Required(p.Child("k3s", "tokenSecretRef", "key"), "must not be empty"))
-	} else if messages := validation.IsConfigMapKey(n.Spec.K3s.TokenSecretRef.Key); len(messages) != 0 {
-		errs = append(errs, field.Invalid(p.Child("k3s", "tokenSecretRef", "key"), n.Spec.K3s.TokenSecretRef.Key, strings.Join(messages, "; ")))
-	} else if n.Spec.K3s.TokenSecretRef.Key != K3sAgentTokenSecretKey {
-		errs = append(errs, field.NotSupported(p.Child("k3s", "tokenSecretRef", "key"), n.Spec.K3s.TokenSecretRef.Key, []string{K3sAgentTokenSecretKey}))
+	if n.Spec.RKE2.TokenSecretRef.Key == "" {
+		errs = append(errs, field.Required(p.Child("rke2", "tokenSecretRef", "key"), "must not be empty"))
+	} else if messages := validation.IsConfigMapKey(n.Spec.RKE2.TokenSecretRef.Key); len(messages) != 0 {
+		errs = append(errs, field.Invalid(p.Child("rke2", "tokenSecretRef", "key"), n.Spec.RKE2.TokenSecretRef.Key, strings.Join(messages, "; ")))
+	} else if n.Spec.RKE2.TokenSecretRef.Key != RKE2AgentTokenSecretKey {
+		errs = append(errs, field.NotSupported(p.Child("rke2", "tokenSecretRef", "key"), n.Spec.RKE2.TokenSecretRef.Key, []string{RKE2AgentTokenSecretKey}))
 	}
 	if err := ValidateSSHAccess(n.Spec.SSHUsername, n.Spec.SSHPublicKey); err != nil {
 		errs = append(errs, field.Invalid(p.Child("sshPublicKey"), "", err.Error()))
@@ -82,6 +89,34 @@ func (n *InSpaceNodeClass) Validate() field.ErrorList {
 		errs = append(errs, field.TooLong(p.Child("additionalUserData"), "", 65536))
 	}
 	return errs
+}
+
+// ServerVIP returns the literal private IPv4 address from the fixed RKE2
+// supervisor endpoint. Requiring a literal address keeps worker bootstrap and
+// collision checks independent of DNS and prevents a public registration
+// endpoint from entering the NodeClass contract.
+func (r RKE2Config) ServerVIP() (netip.Addr, error) {
+	u, err := url.Parse(r.Server)
+	if err != nil || u.Scheme != "https" || u.Port() != "9345" || u.Path != "" || u.RawPath != "" ||
+		u.Opaque != "" || u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
+		return netip.Addr{}, fmt.Errorf("must be https://<RFC1918-IPv4>:9345 without a path, query, fragment, or userinfo")
+	}
+	vip, err := ParseControlPlaneVIP(u.Hostname())
+	if err != nil {
+		return netip.Addr{}, fmt.Errorf("host %w", err)
+	}
+	if r.Server != "https://"+vip.String()+":9345" {
+		return netip.Addr{}, fmt.Errorf("must use the canonical form https://<RFC1918-IPv4>:9345")
+	}
+	return vip, nil
+}
+
+// ValidateNetworkUUID validates the exact controller/NodeClass VPC identity.
+func ValidateNetworkUUID(value string) error {
+	if !uuidPattern.MatchString(value) {
+		return fmt.Errorf("must be a UUID")
+	}
+	return nil
 }
 
 // ValidateSSHAccess accepts either no operator access or one username and one

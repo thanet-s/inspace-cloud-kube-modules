@@ -1,16 +1,26 @@
 .env
 .env.*
+*.env
+*.env.*
 !.env.example
 .DS_Store
 dist/
+__pycache__/
+*.py[cod]
 
-# Defensive credential exclusions. E2E reads only ~/.ssh/id_rsa.pub in memory.
+# Defensive credential exclusions. E2E mounts SSH keys read-only into its runner.
 **/id_rsa
+**/id_rsa.*
 **/id_dsa
+**/id_dsa.*
 **/id_ecdsa
+**/id_ecdsa.*
 **/id_ed25519
+**/id_ed25519.*
 **/*.pem
 **/*.key
+**/*.p12
+**/*.pfx
 
 # Local full-cluster E2E journals, kubeconfigs, generated tokens, and host keys.
 .e2e/

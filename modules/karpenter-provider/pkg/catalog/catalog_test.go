@@ -45,7 +45,7 @@ func TestCatalogHasAll24BoundedVariants(t *testing.T) {
 			t.Fatalf("%s is not on-demand", instanceType.Name)
 		}
 		if got := instanceType.Allocatable()[corev1.ResourceEphemeralStorage]; got.Cmp(instanceType.Capacity[corev1.ResourceEphemeralStorage]) >= 0 {
-			t.Fatalf("%s does not reserve root-disk space for Ubuntu/K3s", instanceType.Name)
+			t.Fatalf("%s does not reserve root-disk space for Ubuntu/RKE2", instanceType.Name)
 		}
 	}
 

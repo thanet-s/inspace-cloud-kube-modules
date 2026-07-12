@@ -18,8 +18,8 @@ func TestKubernetesResolverUsesOnlyFixedSecretNamespace(t *testing.T) {
 	_ = inspacev1.AddToScheme(scheme)
 	nodeClass := providerNodeClass()
 	secret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: nodeClass.Spec.K3s.TokenSecretRef.Name, Namespace: "other"},
-		Data:       map[string][]byte{nodeClass.Spec.K3s.TokenSecretRef.Key: []byte("must-not-be-read")},
+		ObjectMeta: metav1.ObjectMeta{Name: nodeClass.Spec.RKE2.TokenSecretRef.Name, Namespace: "other"},
+		Data:       map[string][]byte{nodeClass.Spec.RKE2.TokenSecretRef.Key: []byte("must-not-be-read")},
 	}
 	resolver, err := NewKubernetesResolver(fake.NewClientBuilder().WithScheme(scheme).WithObjects(nodeClass, secret).Build(), "karpenter")
 	if err != nil {
@@ -35,7 +35,7 @@ func TestKubernetesResolverNeverReadsCloudAPISecret(t *testing.T) {
 	_ = corev1.AddToScheme(scheme)
 	_ = inspacev1.AddToScheme(scheme)
 	nodeClass := providerNodeClass()
-	nodeClass.Spec.K3s.TokenSecretRef = inspacev1.SecretKeySelector{Name: "inspace-api", Key: "token"}
+	nodeClass.Spec.RKE2.TokenSecretRef = inspacev1.SecretKeySelector{Name: "inspace-api", Key: "token"}
 	apiSecret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{Name: "inspace-api", Namespace: "karpenter"},
 		Data:       map[string][]byte{"token": []byte("cloud-api-credential")},
@@ -45,6 +45,28 @@ func TestKubernetesResolverNeverReadsCloudAPISecret(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := resolver.ResolveAgentToken(context.Background(), nodeClass); err == nil {
-		t.Fatal("resolver allowed the cloud API credential Secret as a K3s agent token")
+		t.Fatal("resolver allowed the cloud API credential Secret as an RKE2 agent token")
+	}
+}
+
+func TestKubernetesResolverReadsDedicatedRKE2Token(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = inspacev1.AddToScheme(scheme)
+	nodeClass := providerNodeClass()
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: inspacev1.RKE2AgentTokenSecretName, Namespace: "karpenter"},
+		Data:       map[string][]byte{inspacev1.RKE2AgentTokenSecretKey: []byte("rke2-agent-token\n")},
+	}
+	resolver, err := NewKubernetesResolver(fake.NewClientBuilder().WithScheme(scheme).WithObjects(nodeClass, secret).Build(), "karpenter")
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, err := resolver.ResolveAgentToken(context.Background(), nodeClass)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if token != "rke2-agent-token" {
+		t.Fatalf("resolved token = %q", token)
 	}
 }

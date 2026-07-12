@@ -74,6 +74,9 @@ data:
   networkUUID: REPLACE_WITH_PRIVATE_NETWORK_UUID
   billingAccountID: "REPLACE_WITH_BILLING_ACCOUNT_ID"
   clusterID: REPLACE_WITH_STABLE_CLUSTER_ID
+  controlPlaneVIP: REPLACE_WITH_CONTROL_PLANE_VIP
+  privateLoadBalancerPoolStart: REPLACE_WITH_PRIVATE_LOAD_BALANCER_POOL_START
+  privateLoadBalancerPoolStop: REPLACE_WITH_PRIVATE_LOAD_BALANCER_POOL_STOP
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -152,6 +155,21 @@ spec:
                 configMapKeyRef:
                   name: inspace-cloud-config
                   key: clusterID
+            - name: INSPACE_CONTROL_PLANE_VIP
+              valueFrom:
+                configMapKeyRef:
+                  name: inspace-cloud-config
+                  key: controlPlaneVIP
+            - name: INSPACE_PRIVATE_LOAD_BALANCER_POOL_START
+              valueFrom:
+                configMapKeyRef:
+                  name: inspace-cloud-config
+                  key: privateLoadBalancerPoolStart
+            - name: INSPACE_PRIVATE_LOAD_BALANCER_POOL_STOP
+              valueFrom:
+                configMapKeyRef:
+                  name: inspace-cloud-config
+                  key: privateLoadBalancerPoolStop
           resources:
             requests:
               cpu: 100m

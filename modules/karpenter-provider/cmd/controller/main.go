@@ -21,13 +21,16 @@ import (
 const defaultAPIBaseURL = "https://api.inspace.cloud"
 
 type settings struct {
-	apiBaseURL          string
-	apiToken            string
-	clusterName         string
-	defaultNodeClass    string
-	secretNamespace     string
-	location            string
-	allowRemoteMutation bool
+	apiBaseURL              string
+	apiToken                string
+	clusterName             string
+	defaultNodeClass        string
+	secretNamespace         string
+	location                string
+	networkUUID             string
+	controlPlaneVIP         string
+	privateLoadBalancerPool inspacev1.PrivateLoadBalancerPool
+	allowRemoteMutation     bool
 }
 
 func main() {
@@ -69,13 +72,16 @@ func run() error {
 	}
 	undecorated, err := provider.New(cloud, resolver, provider.Options{
 		ClusterName: cfg.clusterName, DefaultNodeClassName: cfg.defaultNodeClass, Location: cfg.location,
+		NetworkUUID: cfg.networkUUID, ControlPlaneVIP: cfg.controlPlaneVIP, PrivateLoadBalancerPool: cfg.privateLoadBalancerPool,
 	})
 	if err != nil {
 		return err
 	}
 	cloudProvider := overlay.Decorate(undecorated, op.GetClient(), op.InstanceTypeStore)
 	clusterState := state.NewCluster(op.Clock, op.GetClient(), cloudProvider)
-	nodeClassController, err := nodeclasscontroller.NewController(op.GetClient(), resolver, cloud, cfg.clusterName)
+	nodeClassController, err := nodeclasscontroller.NewController(
+		op.GetClient(), resolver, cloud, cfg.clusterName, cfg.networkUUID, cfg.controlPlaneVIP, cfg.privateLoadBalancerPool,
+	)
 	if err != nil {
 		return err
 	}
@@ -96,12 +102,28 @@ func loadSettings() (settings, error) {
 		defaultNodeClass: strings.TrimSpace(os.Getenv("INSPACE_DEFAULT_NODECLASS")),
 		secretNamespace:  envOr("INSPACE_SECRET_NAMESPACE", "karpenter"),
 		location:         envOr("INSPACE_LOCATION", inspacev1.LocationBangkok),
+		networkUUID:      strings.TrimSpace(os.Getenv("INSPACE_NETWORK_UUID")),
+		controlPlaneVIP:  strings.TrimSpace(os.Getenv("INSPACE_CONTROL_PLANE_VIP")),
+		privateLoadBalancerPool: inspacev1.PrivateLoadBalancerPool{
+			Start: strings.TrimSpace(os.Getenv("INSPACE_PRIVATE_LOAD_BALANCER_POOL_START")),
+			Stop:  strings.TrimSpace(os.Getenv("INSPACE_PRIVATE_LOAD_BALANCER_POOL_STOP")),
+		},
 	}
-	if cfg.apiToken == "" || cfg.clusterName == "" || cfg.defaultNodeClass == "" {
-		return settings{}, fmt.Errorf("INSPACE_API_TOKEN, INSPACE_CLUSTER_NAME, and INSPACE_DEFAULT_NODECLASS are required")
+	if cfg.apiToken == "" || cfg.clusterName == "" || cfg.defaultNodeClass == "" || cfg.networkUUID == "" || cfg.controlPlaneVIP == "" {
+		return settings{}, fmt.Errorf("INSPACE_API_TOKEN, INSPACE_CLUSTER_NAME, INSPACE_DEFAULT_NODECLASS, INSPACE_NETWORK_UUID, and INSPACE_CONTROL_PLANE_VIP are required")
 	}
 	if cfg.location != inspacev1.LocationBangkok {
 		return settings{}, fmt.Errorf("INSPACE_LOCATION must be %q", inspacev1.LocationBangkok)
+	}
+	if err := inspacev1.ValidateNetworkUUID(cfg.networkUUID); err != nil {
+		return settings{}, fmt.Errorf("INSPACE_NETWORK_UUID: %w", err)
+	}
+	controlPlaneVIP, err := inspacev1.ParseControlPlaneVIP(cfg.controlPlaneVIP)
+	if err != nil {
+		return settings{}, fmt.Errorf("INSPACE_CONTROL_PLANE_VIP: %w", err)
+	}
+	if err := cfg.privateLoadBalancerPool.ValidateForSupervisor(controlPlaneVIP); err != nil {
+		return settings{}, fmt.Errorf("INSPACE_PRIVATE_LOAD_BALANCER_POOL_START/STOP: %w", err)
 	}
 	if strings.TrimSpace(os.Getenv("INSPACE_ALLOW_REMOTE_MUTATIONS")) != "true" {
 		return settings{}, fmt.Errorf("INSPACE_ALLOW_REMOTE_MUTATIONS=true is required to start the production controller")

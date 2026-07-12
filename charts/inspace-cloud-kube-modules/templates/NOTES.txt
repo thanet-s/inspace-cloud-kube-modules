@@ -1,6 +1,37 @@
 {{- $karpenterNamespace := include "inspace.karpenterNamespace" . -}}
 InSpace Cloud Kubernetes Modules {{ .Chart.AppVersion }} is installed.
 
+Private load-balancer contract
+------------------------------
+Private RKE2 control-plane VIP:
+  {{ .Values.global.inspace.controlPlaneVIP }}
+
+Reserved Cilium LB IPAM range (inclusive):
+  {{ .Values.global.inspace.privateLoadBalancerPool.start }} - {{ .Values.global.inspace.privateLoadBalancerPool.stop }}
+
+The v1alpha1 range must contain 16-256 addresses. This chart passes the range
+to CCM and Karpenter for collision checks. RKE2
+bootstrap owns the CiliumLoadBalancerIPPool and CiliumL2AnnouncementPolicy; this
+workload chart deliberately does not duplicate them. The entire range must
+already be excluded from InSpace VM and NLB allocation. The current InSpace API
+cannot reserve it, and the range must not be changed after cluster creation.
+The control-plane VIP must stay outside this range. CCM rejects and cleans up
+an owned public NLB if its private address collides with either contract.
+
+Private Services use Cilium LB IPAM + L2 Announcements:
+  label:             inspace.cloud/load-balancer-scope=private
+  loadBalancerClass: io.cilium/l2-announcer
+  traffic policy:    Cluster
+
+Cilium Node IPAM and loadBalancerClass io.cilium/node are unsupported. Public
+InSpace NLBs are an explicit paid TCP-only path: leave loadBalancerClass unset,
+set inspace.cloud/load-balancer-scope=public, and set annotation
+service.beta.kubernetes.io/inspace-load-balancer-public=true.
+
+L2 Announcements is beta. Confirm this VPC accepts ARP and gratuitous ARP for
+the reserved VIPs before production use. See the private and public Service
+manifests under charts/inspace-cloud-kube-modules/examples/.
+
 Credential contract
 -------------------
 All enabled cloud controllers read exactly one existing Secret:
@@ -17,12 +48,12 @@ placing credentials in a values file or shell history:
     --from-file={{ .Values.global.inspace.apiSecret.billingAccountIDKey }}=/secure/path/inspace-billing-account-id
 
 {{- if .Values.karpenter.enabled }}
-Karpenter also requires an independent K3s agent token at the fixed contract:
-  Secret/{{ "inspace-k3s-agent-token" }} key {{ "token" }} in {{ $karpenterNamespace }}
+Karpenter also requires an independent RKE2 agent token at the fixed contract:
+  Secret/{{ "inspace-rke2-agent-token" }} key {{ "token" }} in {{ $karpenterNamespace }}
 {{- if not .Values.karpenter.agentTokenSecret.create }}
 
-  kubectl -n {{ $karpenterNamespace }} create secret generic inspace-k3s-agent-token \
-    --from-file=token=/secure/path/k3s-agent-token
+  kubectl -n {{ $karpenterNamespace }} create secret generic inspace-rke2-agent-token \
+    --from-file=token=/secure/path/rke2-agent-token
 {{- end }}
 {{- if ne $karpenterNamespace .Release.Namespace }}
 

@@ -1,0 +1,1897 @@
+---
+- name: Provision the RKE2 control plane through the product bootstrap controller
+  hosts: localhost
+  gather_facts: false
+  vars:
+    e2e_run_id: "{{ lookup('env', 'E2E_RUN_ID') }}"
+    e2e_state_dir: "{{ lookup('env', 'E2E_STATE_DIR') }}"
+    e2e_cluster_resource_name: "inspace-e2e-{{ lookup('env', 'E2E_RUN_ID') }}"
+    e2e_cluster_name: "inspace-e2e-{{ lookup('env', 'E2E_RUN_ID') }}"
+    e2e_nodeclass_name: "inspace-e2e-workers-{{ lookup('env', 'E2E_RUN_ID') }}"
+    e2e_nodepool_name: "inspace-e2e-{{ lookup('env', 'E2E_RUN_ID') }}"
+    e2e_cluster_file: "{{ lookup('env', 'E2E_STATE_DIR') }}/cluster.yaml"
+    e2e_state_file: "{{ lookup('env', 'E2E_STATE_DIR') }}/state.json"
+    e2e_token_file: "{{ lookup('env', 'E2E_STATE_DIR') }}/rke2-token"
+    e2e_kubeconfig: "{{ lookup('env', 'E2E_STATE_DIR') }}/kubeconfig.yaml"
+    e2e_bootstrap_result_file: "{{ lookup('env', 'E2E_STATE_DIR') }}/bootstrap-result.json"
+    e2e_baseline_inventory_file: "{{ lookup('env', 'E2E_STATE_DIR') }}/baseline-inventory.json"
+    e2e_ssh_config: "{{ lookup('env', 'E2E_STATE_DIR') }}/ssh-config"
+    e2e_virtual_ip: "{{ lookup('env', 'INSPACE_CONTROL_PLANE_VIP') }}"
+    e2e_private_lb_pool_start: "{{ lookup('env', 'INSPACE_PRIVATE_LOAD_BALANCER_POOL_START') }}"
+    e2e_private_lb_pool_stop: "{{ lookup('env', 'INSPACE_PRIVATE_LOAD_BALANCER_POOL_STOP') }}"
+    e2e_ssh_user: "{{ lookup('env', 'INSPACE_E2E_SSH_USERNAME') | default('inspacee2e', true) }}"
+    e2e_api_base: "{{ lookup('env', 'INSPACE_API_URL') | regex_replace('/+$', '') }}/v1/{{ lookup('env', 'INSPACE_LOCATION') }}"
+  tasks:
+    - name: Require an exact released version and isolated-account confirmation
+      ansible.builtin.assert:
+        that:
+          - lookup('env', 'INSPACE_E2E_VERSION') is match('^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?$')
+          - lookup('env', 'CONFIRM_INSPACE_CLUSTER_E2E') == lookup('env', 'INSPACE_BILLING_ACCOUNT_ID')
+          - e2e_run_id | length <= 24
+          - e2e_run_id is match('^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$')
+          - e2e_ssh_user is match('^[a-z_][a-z0-9_-]{0,31}$')
+
+    - name: Require a private control-plane VIP and bounded private Service VIP range
+      ansible.builtin.command:
+        argv:
+          - python3
+          - -c
+          - >-
+            import ipaddress,sys;
+            vip,start,stop=map(ipaddress.ip_address,sys.argv[1:]);
+            assert all(a.version == 4 and a.is_private and not a.is_loopback and not a.is_multicast for a in (vip,start,stop));
+            assert all(str(a) == raw for a,raw in zip((vip,start,stop),sys.argv[1:]));
+            assert int(start) <= int(stop) and 16 <= int(stop)-int(start)+1 <= 256;
+            assert not int(start) <= int(vip) <= int(stop);
+            assert all(a not in ipaddress.ip_network('10.42.0.0/16') and a not in ipaddress.ip_network('10.43.0.0/16') for a in (start,stop))
+          - "{{ e2e_virtual_ip }}"
+          - "{{ e2e_private_lb_pool_start }}"
+          - "{{ e2e_private_lb_pool_stop }}"
+      changed_when: false
+
+    - name: Detect the runner public IPv4
+      ansible.builtin.uri:
+        url: https://api.ipify.org
+        return_content: true
+        timeout: 30
+      register: e2e_management_ip_response
+      retries: 5
+      delay: 3
+      until: e2e_management_ip_response.status == 200
+
+    - name: Validate the runner public IPv4
+      ansible.builtin.command:
+        argv:
+          - python3
+          - -c
+          - >-
+            import ipaddress,sys;
+            a=ipaddress.ip_address(sys.argv[1]);
+            assert a.version == 4 and not a.is_private and not a.is_loopback and not a.is_multicast
+          - "{{ e2e_management_ip_response.content | trim }}"
+      changed_when: false
+
+    - name: Record deterministic lifecycle facts
+      ansible.builtin.set_fact:
+        e2e_management_cidr: "{{ e2e_management_ip_response.content | trim }}/32"
+        e2e_owner: "{{ ('inspace-e2e/' + e2e_cluster_resource_name) | hash('sha256') | truncate(16, true, '') }}"
+        e2e_ssh_public_key: "{{ lookup('file', lookup('env', 'E2E_PUBLIC_KEY')) | trim }}"
+
+    - name: Check whether an RKE2 token already exists for a resumed run
+      ansible.builtin.stat:
+        path: "{{ e2e_token_file }}"
+      register: e2e_token_stat
+
+    - name: Generate the RKE2 registration token inside the runner
+      ansible.builtin.command:
+        argv: [openssl, rand, -hex, "32"]
+      register: e2e_generated_token
+      no_log: true
+      when: not e2e_token_stat.stat.exists
+
+    - name: Persist the RKE2 registration token with restrictive permissions
+      ansible.builtin.copy:
+        content: "{{ e2e_generated_token.stdout }}"
+        dest: "{{ e2e_token_file }}"
+        mode: "0600"
+      no_log: true
+      when: not e2e_token_stat.stat.exists
+
+    - name: Render the RKE2 bootstrap resource
+      ansible.builtin.template:
+        src: templates/cluster.yaml.j2
+        dest: "{{ e2e_cluster_file }}"
+        mode: "0600"
+
+    - name: Verify released OCI charts exist before creating infrastructure
+      ansible.builtin.command:
+        argv:
+          - helm
+          - show
+          - chart
+          - "oci://ghcr.io/thanet-s/charts/{{ item }}"
+          - --version
+          - "{{ lookup('env', 'INSPACE_E2E_VERSION') }}"
+      changed_when: false
+      loop:
+        - inspace-cloud-kube-modules-crds
+        - inspace-cloud-kube-modules
+
+    - name: Verify all released controller images exist before creating infrastructure
+      ansible.builtin.command:
+        argv:
+          - skopeo
+          - inspect
+          - --retry-times
+          - "5"
+          - "docker://ghcr.io/thanet-s/{{ item }}:{{ lookup('env', 'INSPACE_E2E_VERSION') }}"
+      changed_when: false
+      loop:
+        - inspace-cloud-controller-manager
+        - inspace-csi-driver
+        - karpenter-provider-inspace
+
+    - name: Inspect the pinned kube-vip release before infrastructure creation
+      ansible.builtin.command:
+        argv:
+          - skopeo
+          - inspect
+          - --retry-times
+          - "5"
+          - docker://ghcr.io/kube-vip/kube-vip:v1.2.1
+      register: e2e_kube_vip_image
+      changed_when: false
+
+    - name: Require the audited kube-vip manifest digest
+      ansible.builtin.assert:
+        that:
+          - (e2e_kube_vip_image.stdout | from_json).Digest == 'sha256:49b77655f9f109bedc5eb25723bb0e4c57d8513ba33cc69c31be3f243eb2386d'
+        fail_msg: "kube-vip v1.2.1 tag no longer resolves to the audited digest"
+
+    - name: Audit that this deterministic identity has no pre-existing resources
+      ansible.builtin.command:
+        argv:
+          - /opt/e2e/scripts/cloud-audit.py
+          - --state
+          - "{{ e2e_state_file }}"
+          - --owner
+          - "{{ e2e_owner }}"
+          - --cluster
+          - "{{ e2e_cluster_name }}"
+          - --nodepool
+          - "{{ e2e_nodepool_name }}"
+      environment:
+        E2E_AUDIT_ALLOW_MISSING_STATE: "true"
+      register: e2e_baseline_audit
+      changed_when: false
+      no_log: true
+
+    - name: Refuse to adopt pre-existing resources
+      ansible.builtin.assert:
+        that: (e2e_baseline_audit.stdout | from_json).count == 0
+        fail_msg: "The deterministic E2E identity already owns cloud resources; refusing adoption"
+
+    - name: Capture every API-visible billable resource before mutation
+      ansible.builtin.command:
+        argv:
+          - /opt/e2e/scripts/account-inventory.py
+          - capture
+          - --output
+          - "{{ e2e_baseline_inventory_file }}"
+      register: e2e_baseline_inventory
+      changed_when: true
+      no_log: true
+
+    - name: Require the dedicated test account to contain no billable resources
+      ansible.builtin.assert:
+        that: >-
+          ((e2e_baseline_inventory.stdout | from_json).counts.vms | int) == 0 and
+          ((e2e_baseline_inventory.stdout | from_json).counts.firewalls | int) == 0 and
+          ((e2e_baseline_inventory.stdout | from_json).counts.floatingIPs | int) == 0 and
+          ((e2e_baseline_inventory.stdout | from_json).counts.loadBalancers | int) == 0 and
+          ((e2e_baseline_inventory.stdout | from_json).counts.disks | int) == 0
+        fail_msg: >-
+          The release E2E account is not empty; no mutation is allowed outside a
+          dedicated account with zero VMs, firewalls, FIPs, NLBs, and disks.
+
+    - name: Initialize the fail-closed ownership journal
+      ansible.builtin.copy:
+        content: >-
+          {{ {
+            'runID': e2e_run_id,
+            'owner': e2e_owner,
+            'clusterName': e2e_cluster_name,
+            'clusterResourceName': e2e_cluster_resource_name,
+            'clusterResourceNamespace': 'inspace-e2e',
+            'nodeClassName': e2e_nodeclass_name,
+            'nodePoolName': e2e_nodepool_name,
+            'managementCIDR': e2e_management_cidr,
+            'version': lookup('env', 'INSPACE_E2E_VERSION'),
+            'virtualIPv4': e2e_virtual_ip,
+            'privateLoadBalancerPoolStart': e2e_private_lb_pool_start,
+            'privateLoadBalancerPoolStop': e2e_private_lb_pool_stop,
+            'sshUsername': e2e_ssh_user,
+            'kubernetesOwnersPossible': false
+          } | to_nice_json }}
+        dest: "{{ e2e_state_file }}"
+        mode: "0600"
+
+    - name: Persist that remote mutations may now begin
+      ansible.builtin.copy:
+        content: "remote mutations may exist\n"
+        dest: "{{ e2e_state_dir }}/mutations-may-exist"
+        mode: "0600"
+
+    - name: Clear the preflight-only checkpoint before the first mutation
+      ansible.builtin.file:
+        path: "{{ e2e_state_dir }}/mutations-not-started"
+        state: absent
+
+    - name: Launch the bootstrap reconciler asynchronously
+      ansible.builtin.command:
+        argv:
+          - inspace-cluster-controller
+          - --cluster-config
+          - "{{ e2e_cluster_file }}"
+          - --ssh-public-key-file
+          - "{{ lookup('env', 'E2E_PUBLIC_KEY') }}"
+          - --ssh-username
+          - "{{ e2e_ssh_user }}"
+          - --management-cidr
+          - "{{ e2e_management_cidr }}"
+          - --management-tcp-ports
+          - "22"
+          - --until-ready
+          - --interval
+          - 15s
+          - --output=json
+      environment:
+        INSPACE_ALLOW_REMOTE_MUTATIONS: "true"
+        INSPACE_API_URL: "{{ lookup('env', 'INSPACE_API_URL') }}"
+        INSPACE_API_TOKEN: "{{ lookup('env', 'INSPACE_API_TOKEN') }}"
+        INSPACE_RKE2_TOKEN: "{{ lookup('file', e2e_token_file) | trim }}"
+      async: 2700
+      poll: 0
+      register: e2e_bootstrap_job
+      no_log: true
+
+    - name: Wait robustly for the product reconciler to finish
+      ansible.builtin.async_status:
+        jid: "{{ e2e_bootstrap_job.ansible_job_id }}"
+      register: e2e_bootstrap_wait
+      until: e2e_bootstrap_wait.finished
+      retries: 270
+      delay: 10
+      no_log: true
+
+    - name: Decode the final reconciler result
+      ansible.builtin.set_fact:
+        e2e_bootstrap_result: >-
+          {{ (e2e_bootstrap_wait.stdout_lines | select('match', '^\{') | list | last) | from_json }}
+
+    - name: Persist the reconciler result for authoritative cloud binding
+      ansible.builtin.copy:
+        content: "{{ e2e_bootstrap_result | to_nice_json }}\n"
+        dest: "{{ e2e_bootstrap_result_file }}"
+        mode: "0600"
+
+    - name: Prove exact and parallel three-control-plane provisioning
+      ansible.builtin.assert:
+        that:
+          - e2e_bootstrap_result.ready | bool
+          - e2e_bootstrap_result.controlPlaneVMs | length == 3
+          - e2e_bootstrap_result.controlPlaneVMs | unique | length == 3
+          - e2e_bootstrap_result.maxParallelControlPlaneCreates | int == 3
+          - e2e_bootstrap_result.controlPlaneEndpoint == 'https://' + e2e_virtual_ip + ':6443'
+          - e2e_bootstrap_result.privateControlPlaneEndpoint == 'https://' + e2e_virtual_ip + ':6443'
+          - e2e_bootstrap_result.privateRegistrationEndpoint == 'https://' + e2e_virtual_ip + ':9345'
+          - e2e_bootstrap_result.bastionVMUUID | length > 0
+          - e2e_bootstrap_result.bastionFirewallUUID | length > 0
+          - e2e_bootstrap_result.bastionPublicIPv4 | length > 0
+          - e2e_bootstrap_result.bastionPrivateIPv4 | length > 0
+          - e2e_bootstrap_result.apiLoadBalancerUUID is not defined
+          - e2e_bootstrap_result.registrationLoadBalancerUUID is not defined
+          - e2e_bootstrap_result.allocatedEndpointIPv4 is not defined
+        fail_msg: "Bootstrap did not prove the fixed three-way concurrent RKE2 control plane"
+
+    - name: Bind the result to exact VPC VMs egress FIPs firewalls and zero control NLBs
+      ansible.builtin.command:
+        argv:
+          - /opt/e2e/scripts/discover-bootstrap.py
+          - --state
+          - "{{ e2e_state_file }}"
+          - --result
+          - "{{ e2e_bootstrap_result_file }}"
+      register: e2e_bootstrap_cloud
+      changed_when: true
+      no_log: true
+
+    - name: Reload the exact private bootstrap topology
+      ansible.builtin.set_fact:
+        e2e_state: "{{ lookup('file', e2e_state_file) | from_json }}"
+
+    - name: Render the pinned bastion and private-node SSH configuration
+      ansible.builtin.command:
+        argv:
+          - /opt/e2e/scripts/render-ssh-config.py
+          - --state
+          - "{{ e2e_state_file }}"
+          - --output
+          - "{{ e2e_ssh_config }}"
+      changed_when: true
+
+    - name: Add the exact public bastion host
+      ansible.builtin.add_host:
+        name: e2e-bastion
+        groups: rke2_bastion
+        ansible_host: e2e-bastion
+        ansible_user: "{{ e2e_ssh_user }}"
+        ansible_ssh_common_args: "-F {{ e2e_ssh_config }}"
+        e2e_public_ip: "{{ e2e_state.bastionPublicIPv4 }}"
+        e2e_private_ip: "{{ e2e_state.bastionPrivateIPv4 }}"
+
+    - name: Add exactly three dynamic RKE2 control-plane hosts
+      ansible.builtin.add_host:
+        name: "rke2-cp-{{ '%02d' | format(e2e_cp_index + 1) }}"
+        groups: rke2_control_plane
+        ansible_host: "rke2-cp-{{ '%02d' | format(e2e_cp_index + 1) }}"
+        ansible_user: "{{ e2e_ssh_user }}"
+        ansible_ssh_common_args: "-F {{ e2e_ssh_config }}"
+        e2e_vm_uuid: "{{ item.uuid }}"
+        e2e_private_ip: "{{ item.privateIPv4 }}"
+        e2e_public_ip: "{{ item.publicIPv4 }}"
+        e2e_known_hosts: "{{ e2e_state_dir }}/known-hosts-cp-{{ e2e_cp_index }}"
+      loop: "{{ e2e_state.controlPlanes }}"
+      loop_control:
+        index_var: e2e_cp_index
+        label: "{{ item.uuid }}"
+
+    - name: Persist the observed creation concurrency in the ownership journal
+      ansible.builtin.command:
+        argv:
+          - /opt/e2e/scripts/state-update.py
+          - "{{ e2e_state_file }}"
+          - maxParallelControlPlaneCreates
+          - "{{ e2e_bootstrap_result.maxParallelControlPlaneCreates | int | string }}"
+      changed_when: true
+
+- name: Establish the pinned public bastion
+  hosts: rke2_bastion
+  gather_facts: false
+  tasks:
+    - name: Wait for the bastion public SSH port
+      ansible.builtin.wait_for:
+        host: "{{ e2e_public_ip }}"
+        port: 22
+        connect_timeout: 10
+        sleep: 5
+        timeout: 1200
+      delegate_to: localhost
+
+    - name: Scan the exact bastion host key
+      ansible.builtin.command:
+        argv: [ssh-keyscan, -T, "15", -H, "{{ e2e_public_ip }}"]
+      register: e2e_bastion_keyscan
+      delegate_to: localhost
+      changed_when: false
+      retries: 20
+      delay: 5
+      until: e2e_bastion_keyscan.rc == 0 and e2e_bastion_keyscan.stdout | length > 0
+
+    - name: Pin the bastion host key before authentication
+      ansible.builtin.copy:
+        content: "{{ e2e_bastion_keyscan.stdout }}\n"
+        dest: "{{ lookup('env', 'E2E_STATE_DIR') }}/known-hosts-bastion"
+        mode: "0600"
+      delegate_to: localhost
+
+    - name: Wait for authenticated bastion SSH
+      ansible.builtin.wait_for_connection:
+        connect_timeout: 10
+        sleep: 5
+        timeout: 1200
+
+    - name: Wait for bounded bastion cloud-init completion
+      ansible.builtin.raw: >-
+        timeout --kill-after=5s 1200s sh -c
+        'cloud-init status --wait >/dev/null 2>&1 || test $? -eq 2'
+      become: true
+      changed_when: false
+
+    - name: Prove the bastion private address Ubuntu version and cloud-firewall-only state
+      ansible.builtin.shell: |
+        set -euo pipefail
+        ip -4 -o addr show scope global | grep -F -- "{{ e2e_private_ip }}/"
+        ! ip -4 -o addr show scope global | grep -F -- "{{ e2e_public_ip }}/"
+        if command -v ufw >/dev/null 2>&1; then
+          ufw_status=$(ufw status)
+          ! grep -Eiq '^Status:[[:space:]]+active' <<<"$ufw_status"
+        fi
+        ufw_load_state=$(systemctl show ufw.service --property=LoadState --value)
+        case "$ufw_load_state" in
+          loaded)
+            ! systemctl is-active --quiet ufw.service
+            ufw_enabled=$(systemctl is-enabled ufw.service 2>/dev/null || true)
+            test "$ufw_enabled" = disabled || test "$ufw_enabled" = masked
+            ;;
+          not-found) ;;
+          *) exit 1 ;;
+        esac
+        . /etc/os-release
+        test "$ID" = ubuntu
+        test "$VERSION_ID" = 24.04
+      args:
+        executable: /bin/bash
+      become: true
+      changed_when: false
+
+- name: Wait for all RKE2 servers independently and in parallel through the bastion
+  hosts: rke2_control_plane
+  gather_facts: false
+  strategy: free
+  tasks:
+    - name: Probe every private control-plane SSH port from the bastion in parallel
+      ansible.builtin.command:
+        argv:
+          - ssh
+          - -F
+          - "{{ lookup('env', 'E2E_STATE_DIR') }}/ssh-config"
+          - e2e-bastion
+          - "timeout --kill-after=2s 10s bash -c '</dev/tcp/{{ e2e_private_ip }}/22'"
+      register: e2e_private_ssh_probe
+      delegate_to: localhost
+      changed_when: false
+      retries: 120
+      delay: 5
+      until: e2e_private_ssh_probe.rc == 0
+
+    - name: Scan each private control-plane host key from the bastion
+      ansible.builtin.command:
+        argv:
+          - ssh
+          - -F
+          - "{{ lookup('env', 'E2E_STATE_DIR') }}/ssh-config"
+          - e2e-bastion
+          - "ssh-keyscan -T 15 -H {{ e2e_private_ip }}"
+      register: e2e_host_keyscan
+      delegate_to: localhost
+      changed_when: false
+      retries: 20
+      delay: 5
+      until: e2e_host_keyscan.rc == 0 and e2e_host_keyscan.stdout | length > 0
+
+    - name: Pin the scanned host key before SSH login
+      ansible.builtin.copy:
+        content: "{{ e2e_host_keyscan.stdout }}\n"
+        dest: "{{ e2e_known_hosts }}"
+        mode: "0600"
+      delegate_to: localhost
+
+    - name: Wait for authenticated SSH on every control plane in parallel
+      ansible.builtin.wait_for_connection:
+        connect_timeout: 10
+        sleep: 5
+        timeout: 1200
+
+    - name: Wait for cloud-init completion on every control plane in parallel
+      ansible.builtin.raw: >-
+        timeout --kill-after=5s 1800s sh -c
+        'cloud-init status --wait >/dev/null 2>&1 || test $? -eq 2'
+      become: true
+      changed_when: false
+
+    - name: Wait for every rke2-server service in parallel
+      ansible.builtin.command: systemctl is-active rke2-server
+      become: true
+      register: e2e_rke2_service
+      changed_when: false
+      retries: 180
+      delay: 10
+      until: e2e_rke2_service.rc == 0 and e2e_rke2_service.stdout == 'active'
+
+    - name: Wait for embedded etcd and the local API on every server in parallel
+      ansible.builtin.shell: |
+        set -euo pipefail
+        timeout 30s /var/lib/rancher/rke2/bin/kubectl \
+          --kubeconfig /etc/rancher/rke2/rke2.yaml get --raw='/readyz?verbose' |
+          grep -F '[+]etcd ok'
+      args:
+        executable: /bin/bash
+      become: true
+      register: e2e_local_readyz
+      changed_when: false
+      retries: 120
+      delay: 10
+      until: e2e_local_readyz.rc == 0
+
+    - name: Verify pinned RKE2 and Ubuntu versions on every control plane
+      ansible.builtin.shell: |
+        set -euo pipefail
+        /usr/local/bin/rke2 --version | grep -F 'v1.35.6+rke2r1'
+        grep -F 'ghcr.io/kube-vip/kube-vip:v1.2.1@sha256:49b77655f9f109bedc5eb25723bb0e4c57d8513ba33cc69c31be3f243eb2386d' \
+          /var/lib/rancher/rke2/agent/pod-manifests/kube-vip.yaml
+        ip -4 -o addr show scope global | grep -F -- "{{ e2e_private_ip }}/"
+        ! ip -4 -o addr show scope global | grep -F -- "{{ e2e_public_ip }}/"
+        ! pgrep -x kube-proxy
+        if command -v ufw >/dev/null 2>&1; then
+          ufw_status=$(ufw status)
+          ! grep -Eiq '^Status:[[:space:]]+active' <<<"$ufw_status"
+        fi
+        ufw_load_state=$(systemctl show ufw.service --property=LoadState --value)
+        case "$ufw_load_state" in
+          loaded)
+            ! systemctl is-active --quiet ufw.service
+            ufw_enabled=$(systemctl is-enabled ufw.service 2>/dev/null || true)
+            test "$ufw_enabled" = disabled || test "$ufw_enabled" = masked
+            ;;
+          not-found) ;;
+          *) exit 1 ;;
+        esac
+        . /etc/os-release
+        test "$ID" = ubuntu
+        test "$VERSION_ID" = 24.04
+      args:
+        executable: /bin/bash
+      become: true
+      changed_when: false
+
+    - name: Persist one readiness checkpoint per parallel host
+      ansible.builtin.copy:
+        content: "ready\n"
+        dest: "{{ lookup('env', 'E2E_STATE_DIR') }}/{{ inventory_hostname }}.ready"
+        mode: "0600"
+      delegate_to: localhost
+
+- name: Configure the tunneled private API and install the released controllers
+  hosts: localhost
+  gather_facts: false
+  vars:
+    e2e_state_dir: "{{ lookup('env', 'E2E_STATE_DIR') }}"
+    e2e_state_file: "{{ lookup('env', 'E2E_STATE_DIR') }}/state.json"
+    e2e_kubeconfig: "{{ lookup('env', 'E2E_STATE_DIR') }}/kubeconfig.yaml"
+    e2e_cluster_name: "inspace-e2e-{{ lookup('env', 'E2E_RUN_ID') }}"
+    e2e_nodeclass_name: "inspace-e2e-workers-{{ lookup('env', 'E2E_RUN_ID') }}"
+    e2e_nodepool_name: "inspace-e2e-{{ lookup('env', 'E2E_RUN_ID') }}"
+    e2e_marker: "inspace-e2e-{{ lookup('env', 'E2E_RUN_ID') }}"
+    e2e_ssh_user: "{{ lookup('env', 'INSPACE_E2E_SSH_USERNAME') | default('inspacee2e', true) }}"
+    e2e_ssh_public_key: "{{ lookup('file', lookup('env', 'E2E_PUBLIC_KEY')) | trim }}"
+    e2e_state: "{{ lookup('file', lookup('env', 'E2E_STATE_DIR') + '/state.json') | from_json }}"
+    e2e_bootstrap_result:
+      firewallUUID: "{{ e2e_state.firewallUUID }}"
+      privateRegistrationEndpoint: "{{ e2e_state.privateRegistrationEndpoint }}"
+  environment:
+    KUBECONFIG: "{{ e2e_kubeconfig }}"
+  tasks:
+    - name: Prove all three parallel readiness checkpoints exist
+      ansible.builtin.stat:
+        path: "{{ e2e_state_dir }}/{{ item }}.ready"
+      loop: "{{ groups['rke2_control_plane'] }}"
+      register: e2e_readiness_files
+
+    - name: Require exactly three independently ready RKE2 servers
+      ansible.builtin.assert:
+        that:
+          - groups['rke2_control_plane'] | length == 3
+          - e2e_readiness_files.results | selectattr('stat.exists') | list | length == 3
+
+    - name: Require private API and registration VIP reachability from the VPC bastion
+      ansible.builtin.command:
+        argv:
+          - ssh
+          - -F
+          - "{{ e2e_state_dir }}/ssh-config"
+          - e2e-bastion
+          - >-
+            timeout --kill-after=2s 10s bash -c
+            '</dev/tcp/{{ e2e_state.virtualIPv4 }}/6443 && </dev/tcp/{{ e2e_state.virtualIPv4 }}/9345'
+      register: e2e_private_vip_ports
+      changed_when: false
+      retries: 120
+      delay: 5
+      until: e2e_private_vip_ports.rc == 0
+
+    - name: Read the RKE2 administrator kubeconfig from one ready server
+      ansible.builtin.slurp:
+        src: /etc/rancher/rke2/rke2.yaml
+      become: true
+      delegate_to: "{{ groups['rke2_control_plane'] | first }}"
+      register: e2e_remote_kubeconfig
+      no_log: true
+
+    - name: Persist the kubeconfig only inside the state volume
+      ansible.builtin.copy:
+        content: "{{ e2e_remote_kubeconfig.content | b64decode }}"
+        dest: "{{ e2e_kubeconfig }}"
+        mode: "0600"
+      no_log: true
+
+    - name: Establish the container-local API tunnel through the bastion
+      ansible.builtin.command:
+        argv: [/opt/e2e/scripts/api-tunnel.sh, start, "{{ e2e_state_file }}"]
+      changed_when: true
+
+    - name: Point the kubeconfig at the local tunnel with the private VIP TLS name
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - config
+          - set-cluster
+          - default
+          - --server=https://127.0.0.1:16443
+          - "--tls-server-name={{ e2e_state.virtualIPv4 }}"
+      changed_when: true
+
+    - name: Wait robustly for the private RKE2 API through the local tunnel
+      ansible.builtin.command:
+        argv: [kubectl, --request-timeout=10s, get, --raw=/readyz]
+      register: e2e_public_readyz
+      changed_when: false
+      retries: 120
+      delay: 5
+      until: e2e_public_readyz.rc == 0
+
+    - name: Prove kubeconfig never exposes a node or public API endpoint
+      ansible.builtin.shell: |
+        set -euo pipefail
+        kubectl config view --raw -o json | jq -e '
+          any(.clusters[];
+            .name == "default" and
+            .cluster.server == "https://127.0.0.1:16443" and
+            .cluster["tls-server-name"] == "{{ e2e_state.virtualIPv4 }}")'
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Wait for exactly three Ready fixed control-plane nodes
+      ansible.builtin.shell: |
+        set -euo pipefail
+        kubectl wait --for=condition=Ready node --all --timeout=10m
+        kubectl get nodes -o json | jq -e '
+          .items | length == 3 and
+          all(.[]; any(.status.conditions[]; .type == "Ready" and .status == "True"))'
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Verify Cilium native routing and full kube-proxy replacement plus private L2 configuration
+      ansible.builtin.shell: |
+        set -euo pipefail
+        kubectl -n kube-system rollout status daemonset/cilium --timeout=15m
+        kubectl -n kube-system get configmap cilium-config -o json | jq -e '
+          .data["routing-mode"] == "native" and
+          .data["ipv4-native-routing-cidr"] == "10.42.0.0/16" and
+          .data["auto-direct-node-routes"] == "true" and
+          .data["kube-proxy-replacement"] == "true" and
+          .data["enable-l2-announcements"] == "true" and
+          .data["default-lb-service-ipam"] == "none"'
+        values=$(kubectl -n kube-system get helmchartconfig rke2-cilium -o jsonpath='{.spec.valuesContent}')
+        grep -Eq '^[[:space:]]*defaultLBServiceIPAM:[[:space:]]*none[[:space:]]*$' <<<"$values"
+        grep -Eq '^[[:space:]]*nodeIPAM:[[:space:]]*$' <<<"$values"
+        grep -Eq '^[[:space:]]*enabled:[[:space:]]*false[[:space:]]*$' <<<"$values"
+        grep -Eq '^[[:space:]]*l2announcements:[[:space:]]*$' <<<"$values"
+        export E2E_CILIUM_VALUES="$values"
+        python3 - "$INSPACE_PRIVATE_LOAD_BALANCER_POOL_START" "$INSPACE_PRIVATE_LOAD_BALANCER_POOL_STOP" <<'PY'
+        import ipaddress
+        import math
+        import os
+        import sys
+        import yaml
+
+        values = yaml.safe_load(os.environ["E2E_CILIUM_VALUES"])
+        start, stop = map(ipaddress.ip_address, sys.argv[1:])
+        addresses = int(stop) - int(start) + 1
+        qps = max(10, math.ceil(addresses / 5))
+        assert values["l2announcements"]["enabled"] is True
+        assert values["defaultLBServiceIPAM"] == "none"
+        assert values["nodeIPAM"]["enabled"] is False
+        assert values["k8sClientRateLimit"] == {"qps": qps, "burst": max(20, 2 * qps)}
+        PY
+        kubectl get ciliumloadbalancerippool inspace-private -o json | jq -e \
+          --arg start "$INSPACE_PRIVATE_LOAD_BALANCER_POOL_START" \
+          --arg stop "$INSPACE_PRIVATE_LOAD_BALANCER_POOL_STOP" '
+          .spec.disabled == false and
+          .spec.blocks == [{"start":$start,"stop":$stop}] and
+          .spec.serviceSelector.matchLabels["inspace.cloud/load-balancer-scope"] == "private" and
+          all(.status.conditions[]?; .type != "cilium.io/PoolConflict" or .status == "False")'
+        kubectl get ciliuml2announcementpolicy inspace-private -o json | jq -e '
+          .spec.externalIPs == false and
+          .spec.loadBalancerIPs == true and
+          .spec.serviceSelector.matchLabels["inspace.cloud/load-balancer-scope"] == "private" and
+          any(.spec.nodeSelector.matchExpressions[];
+            .key == "kubernetes.io/os" and .operator == "In" and .values == ["linux"]) and
+          any(.spec.nodeSelector.matchExpressions[];
+            .key == "inspace.cloud/l2-announcement-disabled" and .operator == "DoesNotExist") and
+          (.spec.interfaces | not)'
+        kubectl -n kube-system get daemonsets -o json | jq -e '
+          all(.items[]; .metadata.name != "kube-proxy")'
+        kubectl -n kube-system get pods -o json | jq -e '
+          all(.items[]; (.metadata.name | startswith("kube-proxy-")) | not)'
+        cilium_status=$(kubectl -n kube-system exec daemonset/cilium -- cilium-dbg status --verbose)
+        grep -E 'KubeProxyReplacement:[[:space:]]+True' <<<"$cilium_status"
+        grep -E '(Routing:.*Native|Direct Routing)' <<<"$cilium_status"
+      args:
+        executable: /bin/bash
+      register: e2e_cilium_private_lb_ready
+      changed_when: false
+      retries: 120
+      delay: 5
+      until: e2e_cilium_private_lb_ready.rc == 0
+
+    - name: Prove three pinned kube-vip mirror pods and one elected lease holder
+      ansible.builtin.shell: |
+        set -euo pipefail
+        pods=$(kubectl -n kube-system get pods \
+          -l 'app.kubernetes.io/name=kube-vip,app.kubernetes.io/component=control-plane-vip' -o json)
+        jq -e '
+          .items | length == 3 and
+          ([.[].spec.nodeName] | unique | length) == 3 and
+          all(.[];
+            .status.phase == "Running" and
+            any(.spec.containers[];
+              .name == "kube-vip" and
+              .image == "ghcr.io/kube-vip/kube-vip:v1.2.1@sha256:49b77655f9f109bedc5eb25723bb0e4c57d8513ba33cc69c31be3f243eb2386d"))' <<<"$pods"
+        kubectl -n kube-system get lease inspace-control-plane-vip -o json | jq -e '
+          (.spec.holderIdentity // "") | length > 0'
+      args:
+        executable: /bin/bash
+      register: e2e_kube_vip_ready
+      changed_when: false
+      retries: 120
+      delay: 5
+      until: e2e_kube_vip_ready.rc == 0
+
+    - name: Exercise bounded kube-vip leader failover without stopping RKE2
+      block:
+        - name: Identify the one current VIP owner
+          ansible.builtin.shell: |
+            set -euo pipefail
+            owners=''
+            owner_index=''
+            topology={{ e2e_state.controlPlanes | to_json | quote }}
+            for index in 0 1 2; do
+              host=$(printf 'rke2-cp-%02d' "$((index + 1))")
+              addresses=$(ssh -F "{{ e2e_state_dir }}/ssh-config" "$host" \
+                "ip -4 -o addr show scope global")
+              if grep -Fq -- "{{ e2e_state.virtualIPv4 }}/" <<<"$addresses"; then
+                owners+="$host"$'\n'
+                owner_index=$index
+              fi
+            done
+            test "$(grep -c . <<<"$owners")" -eq 1
+            owner_node=$(jq -er --argjson index "$owner_index" '.[$index].name' <<<"$topology")
+            holder=$(kubectl -n kube-system get lease inspace-control-plane-vip -o jsonpath='{.spec.holderIdentity}')
+            pods=$(kubectl -n kube-system get pods \
+              -l 'app.kubernetes.io/name=kube-vip,app.kubernetes.io/component=control-plane-vip' -o json)
+            holder_node=$(jq -er --arg holder "$holder" '
+              [.items[] |
+                select(.metadata.name == $holder or .spec.nodeName == $holder) |
+                .spec.nodeName] | unique |
+              if length == 1 then .[0] else error("kube-vip Lease holder does not resolve to exactly one pod") end' \
+              <<<"$pods")
+            test "$holder_node" = "$owner_node"
+            head -n 1 <<<"$owners"
+          args:
+            executable: /bin/bash
+          register: e2e_kube_vip_leader
+          changed_when: false
+          retries: 30
+          delay: 2
+          until: e2e_kube_vip_leader.rc == 0
+
+        - name: Capture the original kube-vip lease holder
+          ansible.builtin.command:
+            argv:
+              - kubectl
+              - -n
+              - kube-system
+              - get
+              - lease
+              - inspace-control-plane-vip
+              - -o
+              - jsonpath={.spec.holderIdentity}
+          register: e2e_kube_vip_holder_before
+          changed_when: false
+
+        - name: Remove any stale API continuity markers
+          ansible.builtin.file:
+            path: "{{ item }}"
+            state: absent
+          loop:
+            - "{{ e2e_state_dir }}/stop-api-monitor"
+            - "{{ e2e_state_dir }}/ready-api-monitor"
+
+        - name: Start strict API continuity monitoring
+          ansible.builtin.command:
+            argv:
+              - /opt/e2e/scripts/monitor-readyz.sh
+              - "{{ e2e_state_dir }}/stop-api-monitor"
+              - "{{ e2e_state_dir }}/ready-api-monitor"
+              - "300"
+          async: 330
+          poll: 0
+          register: e2e_api_monitor_job
+          changed_when: true
+
+        - name: Wait for the continuity monitor first successful API probe
+          ansible.builtin.wait_for:
+            path: "{{ e2e_state_dir }}/ready-api-monitor"
+            state: present
+            timeout: 30
+
+        - name: Temporarily remove the elected node static kube-vip manifest
+          ansible.builtin.command:
+            argv:
+              - ssh
+              - -F
+              - "{{ e2e_state_dir }}/ssh-config"
+              - "{{ e2e_kube_vip_leader.stdout | trim }}"
+              - >-
+                sudo mv /var/lib/rancher/rke2/agent/pod-manifests/kube-vip.yaml
+                /var/lib/rancher/rke2/agent/pod-manifests/kube-vip.yaml.e2e-disabled
+          changed_when: true
+
+        - name: Require VIP ownership to move to exactly one different control plane
+          ansible.builtin.shell: |
+            set -euo pipefail
+            owners=''
+            owner_index=''
+            topology={{ e2e_state.controlPlanes | to_json | quote }}
+            for index in 0 1 2; do
+              host=$(printf 'rke2-cp-%02d' "$((index + 1))")
+              addresses=$(ssh -F "{{ e2e_state_dir }}/ssh-config" "$host" \
+                "ip -4 -o addr show scope global")
+              if grep -Fq -- "{{ e2e_state.virtualIPv4 }}/" <<<"$addresses"; then
+                owners+="$host"$'\n'
+                owner_index=$index
+              fi
+            done
+            test "$(grep -c . <<<"$owners")" -eq 1
+            test "$(head -n 1 <<<"$owners")" != "{{ e2e_kube_vip_leader.stdout | trim }}"
+            owner_node=$(jq -er --argjson index "$owner_index" '.[$index].name' <<<"$topology")
+            holder=$(kubectl -n kube-system get lease inspace-control-plane-vip -o jsonpath='{.spec.holderIdentity}')
+            pods=$(kubectl -n kube-system get pods \
+              -l 'app.kubernetes.io/name=kube-vip,app.kubernetes.io/component=control-plane-vip' -o json)
+            holder_node=$(jq -er --arg holder "$holder" '
+              [.items[] |
+                select(.metadata.name == $holder or .spec.nodeName == $holder) |
+                .spec.nodeName] | unique |
+              if length == 1 then .[0] else error("kube-vip Lease holder does not resolve to exactly one pod") end' \
+              <<<"$pods")
+            test "$holder_node" = "$owner_node"
+            test "$holder" != "{{ e2e_kube_vip_holder_before.stdout | trim }}"
+            kubectl --request-timeout=5s get --raw=/readyz >/dev/null
+          args:
+            executable: /bin/bash
+          register: e2e_kube_vip_failover
+          changed_when: false
+          retries: 60
+          delay: 2
+          until: e2e_kube_vip_failover.rc == 0
+      always:
+        - name: Restore the elected node static kube-vip manifest
+          ansible.builtin.command:
+            argv:
+              - ssh
+              - -F
+              - "{{ e2e_state_dir }}/ssh-config"
+              - "{{ e2e_kube_vip_leader.stdout | default('') | trim }}"
+              - >-
+                sudo sh -c 'if test -e
+                /var/lib/rancher/rke2/agent/pod-manifests/kube-vip.yaml.e2e-disabled;
+                then mv /var/lib/rancher/rke2/agent/pod-manifests/kube-vip.yaml.e2e-disabled
+                /var/lib/rancher/rke2/agent/pod-manifests/kube-vip.yaml; fi'
+          register: e2e_kube_vip_restore
+          retries: 12
+          delay: 5
+          until: e2e_kube_vip_restore.rc == 0
+          changed_when: true
+          when: e2e_kube_vip_leader is defined and e2e_kube_vip_leader.stdout | default('') | trim | length > 0
+
+        - name: Require all three kube-vip mirror pods after restoration
+          ansible.builtin.shell: |
+            set -euo pipefail
+            kubectl -n kube-system get pods \
+              -l 'app.kubernetes.io/name=kube-vip,app.kubernetes.io/component=control-plane-vip' -o json | jq -e '
+                .items | length == 3 and
+                ([.[].spec.nodeName] | unique | length) == 3 and
+                all(.[]; .status.phase == "Running")'
+            owners=''
+            owner_index=''
+            topology={{ e2e_state.controlPlanes | to_json | quote }}
+            for index in 0 1 2; do
+              host=$(printf 'rke2-cp-%02d' "$((index + 1))")
+              addresses=$(ssh -F "{{ e2e_state_dir }}/ssh-config" "$host" \
+                "ip -4 -o addr show scope global")
+              if grep -Fq -- "{{ e2e_state.virtualIPv4 }}/" <<<"$addresses"; then
+                owners+="$host"$'\n'
+                owner_index=$index
+              fi
+            done
+            test "$(grep -c . <<<"$owners")" -eq 1
+            owner_node=$(jq -er --argjson index "$owner_index" '.[$index].name' <<<"$topology")
+            holder=$(kubectl -n kube-system get lease inspace-control-plane-vip -o jsonpath='{.spec.holderIdentity}')
+            pods=$(kubectl -n kube-system get pods \
+              -l 'app.kubernetes.io/name=kube-vip,app.kubernetes.io/component=control-plane-vip' -o json)
+            holder_node=$(jq -er --arg holder "$holder" '
+              [.items[] |
+                select(.metadata.name == $holder or .spec.nodeName == $holder) |
+                .spec.nodeName] | unique |
+              if length == 1 then .[0] else error("kube-vip Lease holder does not resolve to exactly one pod") end' \
+              <<<"$pods")
+            test "$holder_node" = "$owner_node"
+          args:
+            executable: /bin/bash
+          register: e2e_kube_vip_recovered
+          retries: 120
+          delay: 5
+          until: e2e_kube_vip_recovered.rc == 0
+          changed_when: false
+          when: e2e_kube_vip_leader is defined and e2e_kube_vip_leader.stdout | default('') | trim | length > 0
+
+        - name: Stop the API continuity observation window
+          ansible.builtin.file:
+            path: "{{ e2e_state_dir }}/stop-api-monitor"
+            state: touch
+            mode: "0600"
+          when: e2e_api_monitor_job is defined and e2e_api_monitor_job.ansible_job_id is defined
+
+        - name: Require uninterrupted API reachability during kube-vip failover
+          ansible.builtin.async_status:
+            jid: "{{ e2e_api_monitor_job.ansible_job_id }}"
+          register: e2e_api_monitor_wait
+          retries: 30
+          delay: 1
+          until: e2e_api_monitor_wait.finished
+          when: e2e_api_monitor_job is defined and e2e_api_monitor_job.ansible_job_id is defined
+
+        - name: Assert the API continuity monitor succeeded
+          ansible.builtin.assert:
+            that: e2e_api_monitor_wait.rc == 0
+            fail_msg: "the tunneled Kubernetes API was interrupted during kube-vip failover"
+          when: e2e_api_monitor_job is defined and e2e_api_monitor_job.ansible_job_id is defined
+
+    - name: Create the cloud and RKE2 registration secrets
+      ansible.builtin.shell: |
+        set -euo pipefail
+        kubectl -n kube-system create secret generic inspace-cloud-credentials \
+          --from-literal="api-token=$INSPACE_API_TOKEN" \
+          --from-literal="billing-account-id=$INSPACE_BILLING_ACCOUNT_ID" \
+          --dry-run=client -o yaml | kubectl apply -f -
+        kubectl -n kube-system create secret generic inspace-rke2-agent-token \
+          --from-file="token={{ e2e_state_dir }}/rke2-token" \
+          --dry-run=client -o yaml | kubectl apply -f -
+      args:
+        executable: /bin/bash
+      no_log: true
+
+    - name: Mark Kubernetes ownership possible before installing controllers
+      ansible.builtin.command:
+        argv:
+          - /opt/e2e/scripts/state-update.py
+          - "{{ e2e_state_file }}"
+          - kubernetesOwnersPossible
+          - "true"
+      changed_when: true
+
+    - name: Install the released CRDs chart
+      ansible.builtin.command:
+        argv:
+          - helm
+          - upgrade
+          - --install
+          - inspace-crds
+          - oci://ghcr.io/thanet-s/charts/inspace-cloud-kube-modules-crds
+          - --version
+          - "{{ lookup('env', 'INSPACE_E2E_VERSION') }}"
+          - --namespace
+          - kube-system
+          - --wait
+          - --timeout
+          - 5m
+      changed_when: true
+
+    - name: Install released CCM CSI and Karpenter controllers
+      ansible.builtin.command:
+        argv:
+          - helm
+          - upgrade
+          - --install
+          - inspace
+          - oci://ghcr.io/thanet-s/charts/inspace-cloud-kube-modules
+          - --version
+          - "{{ lookup('env', 'INSPACE_E2E_VERSION') }}"
+          - --namespace
+          - kube-system
+          - --wait
+          - --timeout
+          - 15m
+          - --set
+          - fullnameOverride=inspace
+          - --set
+          - "global.inspace.networkUUID={{ lookup('env', 'INSPACE_NETWORK_UUID') }}"
+          - --set
+          - "global.inspace.clusterID={{ e2e_cluster_name }}"
+          - --set
+          - "global.inspace.controlPlaneVIP={{ e2e_state.virtualIPv4 }}"
+          - --set
+          - "global.inspace.privateLoadBalancerPool.start={{ lookup('env', 'INSPACE_PRIVATE_LOAD_BALANCER_POOL_START') }}"
+          - --set
+          - "global.inspace.privateLoadBalancerPool.stop={{ lookup('env', 'INSPACE_PRIVATE_LOAD_BALANCER_POOL_STOP') }}"
+          - --set
+          - ccm.replicaCount=1
+          - --set
+          - karpenter.replicaCount=1
+          - --set
+          - "karpenter.clusterName={{ e2e_cluster_name }}"
+          - --set
+          - "karpenter.defaultNodeClass={{ e2e_nodeclass_name }}"
+      changed_when: true
+
+    - name: Wait for all released controller workloads
+      ansible.builtin.command:
+        argv: [kubectl, -n, kube-system, rollout, status, "{{ item }}", --timeout=10m]
+      loop:
+        - deployment/inspace-ccm
+        - deployment/inspace-csi-controller
+        - daemonset/inspace-csi-node
+        - deployment/inspace-karpenter
+      changed_when: false
+
+    - name: Prove the chart launched the exact released product image tags
+      ansible.builtin.shell: |
+        set -euo pipefail
+        version={{ lookup('env', 'INSPACE_E2E_VERSION') | quote }}
+        test "$(kubectl -n kube-system get deployment/inspace-ccm -o json | jq -r '.spec.template.spec.containers[] | select(.name=="cloud-controller-manager") | .image')" = \
+          "ghcr.io/thanet-s/inspace-cloud-controller-manager:$version"
+        test "$(kubectl -n kube-system get deployment/inspace-csi-controller -o json | jq -r '.spec.template.spec.containers[] | select(.name=="driver") | .image')" = \
+          "ghcr.io/thanet-s/inspace-csi-driver:$version"
+        test "$(kubectl -n kube-system get daemonset/inspace-csi-node -o json | jq -r '.spec.template.spec.containers[] | select(.name=="driver") | .image')" = \
+          "ghcr.io/thanet-s/inspace-csi-driver:$version"
+        test "$(kubectl -n kube-system get deployment/inspace-karpenter -o json | jq -r '.spec.template.spec.containers[] | select(.name=="controller") | .image')" = \
+          "ghcr.io/thanet-s/karpenter-provider-inspace:$version"
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Verify CCM identity and dual node addresses converge
+      ansible.builtin.shell: |
+        set -euo pipefail
+        kubectl get nodes -o json | jq -e --arg location "$INSPACE_LOCATION" '
+          .items | length == 3 and all(.[];
+            (.spec.providerID | startswith("inspace://" + $location + "/")) and
+            any(.status.addresses[]; .type == "InternalIP") and
+            any(.status.addresses[]; .type == "ExternalIP") and
+            all(.spec.taints[]?; .key != "node.cloudprovider.kubernetes.io/uninitialized"))'
+      args:
+        executable: /bin/bash
+      register: e2e_ccm_convergence
+      changed_when: false
+      retries: 120
+      delay: 5
+      until: e2e_ccm_convergence.rc == 0
+
+    - name: Render the RKE2 Karpenter node class and bounded pool
+      ansible.builtin.template:
+        src: templates/karpenter.yaml.j2
+        dest: "{{ e2e_state_dir }}/karpenter.yaml"
+        mode: "0600"
+
+    - name: Apply Karpenter resources and require NodeClass readiness
+      ansible.builtin.shell: |
+        set -euo pipefail
+        kubectl apply -f "{{ e2e_state_dir }}/karpenter.yaml"
+        kubectl wait --for=condition=Ready "inspacenodeclass/{{ e2e_nodeclass_name }}" --timeout=10m
+      args:
+        executable: /bin/bash
+      changed_when: true
+
+    - name: Render and apply the single-worker trigger
+      ansible.builtin.template:
+        src: templates/trigger.yaml.j2
+        dest: "{{ e2e_state_dir }}/trigger.yaml"
+        mode: "0600"
+
+    - name: Force and verify exactly one Karpenter worker
+      ansible.builtin.shell: |
+        set -euo pipefail
+        kubectl apply -f "{{ e2e_state_dir }}/trigger.yaml"
+        kubectl -n default rollout status deployment/inspace-e2e-trigger --timeout=20m
+        kubectl wait --for=condition=Ready node -l "karpenter.sh/nodepool={{ e2e_nodepool_name }}" --timeout=10m
+        kubectl get nodeclaims -l "karpenter.sh/nodepool={{ e2e_nodepool_name }}" -o json | jq -e '
+          .items | length == 1 and
+          all(.[]; any(.status.conditions[]; .type == "Ready" and .status == "True"))'
+      args:
+        executable: /bin/bash
+      changed_when: true
+
+    - name: Read the exact Karpenter worker identity
+      ansible.builtin.shell: |
+        set -euo pipefail
+        kubectl get nodes -l "karpenter.sh/nodepool={{ e2e_nodepool_name }}" -o json | jq -cer '
+          if (.items | length) == 1 then .items[0] else error("expected exactly one worker") end |
+          {name:.metadata.name,providerID:.spec.providerID,internalIPs:[.status.addresses[]|select(.type=="InternalIP")|.address]}'
+      args:
+        executable: /bin/bash
+      register: e2e_worker_node_command
+      changed_when: false
+
+    - name: Persist exact worker cloud ownership and VPC proof
+      ansible.builtin.command:
+        argv:
+          - /opt/e2e/scripts/discover-worker.py
+          - --state
+          - "{{ e2e_state_file }}"
+          - --node
+          - "{{ e2e_worker_node_command.stdout }}"
+      register: e2e_worker_cloud_command
+      changed_when: true
+      no_log: true
+
+    - name: Decode the worker cloud identity
+      ansible.builtin.set_fact:
+        e2e_worker_cloud: "{{ e2e_worker_cloud_command.stdout | from_json }}"
+
+    - name: Regenerate SSH configuration with the private worker route
+      ansible.builtin.command:
+        argv:
+          - /opt/e2e/scripts/render-ssh-config.py
+          - --state
+          - "{{ e2e_state_file }}"
+          - --output
+          - "{{ e2e_state_dir }}/ssh-config"
+      changed_when: true
+
+    - name: Add the dynamically created RKE2 worker for parallel-safe validation
+      ansible.builtin.add_host:
+        name: rke2-worker-01
+        groups: rke2_worker
+        ansible_host: rke2-worker-01
+        ansible_user: "{{ e2e_ssh_user }}"
+        ansible_ssh_common_args: "-F {{ e2e_state_dir }}/ssh-config"
+        e2e_private_ip: "{{ e2e_worker_cloud.internalIPv4 }}"
+        e2e_public_ip: "{{ e2e_worker_cloud.publicIPv4 }}"
+        e2e_known_hosts: "{{ e2e_state_dir }}/known-hosts-worker"
+
+- name: Verify the dynamically provisioned RKE2 worker
+  hosts: rke2_worker
+  gather_facts: false
+  vars:
+    e2e_private_registration_endpoint: >-
+      {{ (lookup('file', lookup('env', 'E2E_STATE_DIR') + '/state.json') | from_json).privateRegistrationEndpoint }}
+  tasks:
+    - name: Probe worker private SSH from the bastion
+      ansible.builtin.command:
+        argv:
+          - ssh
+          - -F
+          - "{{ lookup('env', 'E2E_STATE_DIR') }}/ssh-config"
+          - e2e-bastion
+          - "timeout --kill-after=2s 10s bash -c '</dev/tcp/{{ e2e_private_ip }}/22'"
+      register: e2e_worker_private_ssh
+      delegate_to: localhost
+      changed_when: false
+      retries: 120
+      delay: 5
+      until: e2e_worker_private_ssh.rc == 0
+
+    - name: Scan the worker private SSH host key from the bastion
+      ansible.builtin.command:
+        argv:
+          - ssh
+          - -F
+          - "{{ lookup('env', 'E2E_STATE_DIR') }}/ssh-config"
+          - e2e-bastion
+          - "ssh-keyscan -T 15 -H {{ e2e_private_ip }}"
+      register: e2e_worker_keyscan
+      delegate_to: localhost
+      changed_when: false
+      retries: 20
+      delay: 5
+      until: e2e_worker_keyscan.rc == 0 and e2e_worker_keyscan.stdout | length > 0
+
+    - name: Store the pinned worker key
+      ansible.builtin.copy:
+        content: "{{ e2e_worker_keyscan.stdout }}\n"
+        dest: "{{ e2e_known_hosts }}"
+        mode: "0600"
+      delegate_to: localhost
+
+    - name: Wait for authenticated worker SSH
+      ansible.builtin.wait_for_connection:
+        connect_timeout: 10
+        sleep: 5
+        timeout: 900
+
+    - name: Wait for worker cloud-init within a hard outer timeout
+      ansible.builtin.raw: >-
+        timeout --kill-after=5s 1200s sh -c
+        'cloud-init status --wait >/dev/null 2>&1 || test $? -eq 2'
+      become: true
+      changed_when: false
+
+    - name: Verify cloud-init Ubuntu and the RKE2 agent
+      ansible.builtin.shell: |
+        set -euo pipefail
+        systemctl is-active --quiet rke2-agent
+        /usr/local/bin/rke2 --version | grep -F 'v1.35.6+rke2r1'
+        grep -F -- 'server: "{{ e2e_private_registration_endpoint }}"' /etc/rancher/rke2/config.yaml
+        ip -4 -o addr show scope global | grep -F -- "{{ e2e_private_ip }}/"
+        ! ip -4 -o addr show scope global | grep -F -- "{{ e2e_public_ip }}/"
+        ! pgrep -x kube-proxy
+        if command -v ufw >/dev/null 2>&1; then
+          ufw_status=$(ufw status)
+          ! grep -Eiq '^Status:[[:space:]]+active' <<<"$ufw_status"
+        fi
+        ufw_load_state=$(systemctl show ufw.service --property=LoadState --value)
+        case "$ufw_load_state" in
+          loaded)
+            ! systemctl is-active --quiet ufw.service
+            ufw_enabled=$(systemctl is-enabled ufw.service 2>/dev/null || true)
+            test "$ufw_enabled" = disabled || test "$ufw_enabled" = masked
+            ;;
+          not-found) ;;
+          *) exit 1 ;;
+        esac
+        . /etc/os-release
+        test "$ID" = ubuntu
+        test "$VERSION_ID" = 24.04
+      args:
+        executable: /bin/bash
+      become: true
+      register: e2e_worker_ready
+      changed_when: false
+      retries: 120
+      delay: 10
+      until: e2e_worker_ready.rc == 0
+
+- name: Verify CSI persistence private Cilium L2 VIPs and the public TCP-only NLB
+  hosts: localhost
+  gather_facts: false
+  vars:
+    e2e_state_dir: "{{ lookup('env', 'E2E_STATE_DIR') }}"
+    e2e_state_file: "{{ lookup('env', 'E2E_STATE_DIR') }}/state.json"
+    e2e_kubeconfig: "{{ lookup('env', 'E2E_STATE_DIR') }}/kubeconfig.yaml"
+    e2e_nodepool_name: "inspace-e2e-{{ lookup('env', 'E2E_RUN_ID') }}"
+    e2e_marker: "inspace-e2e-{{ lookup('env', 'E2E_RUN_ID') }}"
+  environment:
+    KUBECONFIG: "{{ e2e_kubeconfig }}"
+  tasks:
+    - name: Prove native-routing kube-proxy replacement and L2 announcements on every node
+      ansible.builtin.shell: |
+        set -euo pipefail
+        kubectl -n kube-system rollout status daemonset/cilium --timeout=15m
+        kubectl -n kube-system get configmap cilium-config -o json | jq -e '
+          .data["routing-mode"] == "native" and
+          .data["ipv4-native-routing-cidr"] == "10.42.0.0/16" and
+          .data["auto-direct-node-routes"] == "true" and
+          .data["kube-proxy-replacement"] == "true" and
+          .data["enable-l2-announcements"] == "true" and
+          .data["default-lb-service-ipam"] == "none"'
+        kubectl get ciliumloadbalancerippool inspace-private
+        kubectl get ciliuml2announcementpolicy inspace-private
+        nodes=$(kubectl get nodes -o json | jq -c '[.items[].metadata.name] | sort')
+        test "$(jq 'length' <<<"$nodes")" -eq 4
+        cilium=$(kubectl -n kube-system get pods -l k8s-app=cilium -o json)
+        jq -e --argjson nodes "$nodes" '
+          .items | length == 4 and
+          ([.[].spec.nodeName] | sort) == $nodes and
+          all(.[]; .status.phase == "Running")' <<<"$cilium"
+        while IFS=$'\t' read -r pod node; do
+          test -n "$pod"
+          status=$(timeout --kill-after=5s 60s kubectl -n kube-system exec "$pod" -- cilium-dbg status --verbose)
+          grep -E 'KubeProxyReplacement:[[:space:]]+True' <<<"$status"
+          grep -E '(Routing:.*Native|Direct Routing)' <<<"$status"
+          config=$(timeout --kill-after=5s 60s kubectl -n kube-system exec "$pod" -- cilium-dbg config --all)
+          grep -E 'EnableL2Announcements[[:space:]]*:[[:space:]]*true' <<<"$config"
+          printf 'verified cilium datapath on %s via %s\n' "$node" "$pod"
+        done < <(jq -r '.items[] | [.metadata.name,.spec.nodeName] | @tsv' <<<"$cilium")
+        kubectl -n kube-system get daemonsets -o json | jq -e '
+          all(.items[]; .metadata.name != "kube-proxy")'
+        kubectl -n kube-system get pods -o json | jq -e '
+          all(.items[]; (.metadata.name | startswith("kube-proxy-")) | not)'
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Require worker CSI registration
+      ansible.builtin.shell: |
+        set -euo pipefail
+        worker=$(kubectl get node -l "karpenter.sh/nodepool={{ e2e_nodepool_name }}" -o jsonpath='{.items[0].metadata.name}')
+        test -n "$worker"
+        kubectl -n kube-system rollout status daemonset/inspace-csi-node --timeout=10m
+        kubectl get csinode "$worker"
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Render the RWO public NLB and two same-port private L2 workloads
+      ansible.builtin.template:
+        src: templates/workload.yaml.j2
+        dest: "{{ e2e_state_dir }}/workload.yaml"
+        mode: "0600"
+
+    - name: Apply the RWO public NLB and two same-port private L2 workloads
+      ansible.builtin.command:
+        argv: [kubectl, apply, -f, "{{ e2e_state_dir }}/workload.yaml"]
+      changed_when: true
+
+    - name: Persist workload ownership before waiting
+      ansible.builtin.command:
+        argv:
+          - /opt/e2e/scripts/persist-workload.py
+          - --state
+          - "{{ e2e_state_file }}"
+          - --kubeconfig
+          - "{{ e2e_kubeconfig }}"
+      changed_when: true
+
+    - name: Wait for the RWO private L2 workloads and bound PVC
+      ansible.builtin.shell: |
+        set -euo pipefail
+        kubectl -n default rollout status deployment/inspace-e2e-web --timeout=20m
+        kubectl -n default rollout status deployment/inspace-e2e-private-a --timeout=20m
+        kubectl -n default rollout status deployment/inspace-e2e-private-b --timeout=20m
+        kubectl -n default wait --for=jsonpath='{.status.phase}'=Bound pvc/inspace-e2e-rwo --timeout=10m
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Persist PV disk ownership after binding
+      ansible.builtin.command:
+        argv:
+          - /opt/e2e/scripts/persist-workload.py
+          - --state
+          - "{{ e2e_state_file }}"
+          - --kubeconfig
+          - "{{ e2e_kubeconfig }}"
+      changed_when: true
+
+    - name: Require an attached CSI VolumeAttachment
+      ansible.builtin.shell: |
+        set -euo pipefail
+        pv=$(kubectl -n default get pvc inspace-e2e-rwo -o jsonpath='{.spec.volumeName}')
+        worker=$(kubectl get nodes -l "karpenter.sh/nodepool={{ e2e_nodepool_name }}" -o json | jq -er '
+          [.items[].metadata.name] |
+          if length == 1 then .[0] else error("expected exactly one Karpenter worker") end')
+        kubectl get volumeattachments -o json | jq -e --arg pv "$pv" --arg worker "$worker" '
+          [.items[] | select(.spec.source.persistentVolumeName == $pv)] as $attachments |
+          ($attachments | length) == 1 and
+          $attachments[0].spec.attacher == "csi.inspace.cloud" and
+          $attachments[0].spec.nodeName == $worker and
+          $attachments[0].status.attached == true'
+      args:
+        executable: /bin/bash
+      register: e2e_attachment
+      changed_when: false
+      retries: 120
+      delay: 5
+      until: e2e_attachment.rc == 0
+
+    - name: Require two distinct reserved private VIPs on the same TCP port
+      ansible.builtin.shell: |
+        set -euo pipefail
+        export E2E_PRIVATE_SERVICES_JSON
+        E2E_PRIVATE_SERVICES_JSON=$(kubectl -n default get services \
+          inspace-e2e-private-a inspace-e2e-private-b -o json)
+        python3 - "$INSPACE_PRIVATE_LOAD_BALANCER_POOL_START" "$INSPACE_PRIVATE_LOAD_BALANCER_POOL_STOP" <<'PY'
+        import ipaddress
+        import json
+        import os
+        import sys
+
+        start, stop = map(ipaddress.ip_address, sys.argv[1:])
+        services = json.loads(os.environ["E2E_PRIVATE_SERVICES_JSON"])["items"]
+        if len(services) != 2:
+            raise SystemExit("expected exactly two private Services")
+        result = {}
+        for service in services:
+            metadata = service["metadata"]
+            spec = service["spec"]
+            if (
+                metadata.get("labels", {}).get("inspace.cloud/load-balancer-scope") != "private"
+                or spec.get("loadBalancerClass") != "io.cilium/l2-announcer"
+                or spec.get("externalTrafficPolicy") != "Cluster"
+                or len(spec.get("ports", [])) != 1
+                or spec["ports"][0].get("protocol") != "TCP"
+                or spec["ports"][0].get("port") != 80
+                or "lbipam.cilium.io/sharing-key" in metadata.get("annotations", {})
+            ):
+                raise SystemExit("private Service does not match the classed L2 contract")
+            ingresses = service.get("status", {}).get("loadBalancer", {}).get("ingress", [])
+            if len(ingresses) != 1 or not ingresses[0].get("ip"):
+                raise SystemExit("private Service does not have exactly one LB-IPAM address")
+            address = ipaddress.ip_address(ingresses[0]["ip"])
+            if address.version != 4 or not int(start) <= int(address) <= int(stop):
+                raise SystemExit("private Service VIP is outside the reserved range")
+            conditions = service.get("status", {}).get("conditions", [])
+            if not any(
+                condition.get("type") == "io.cilium/lb-ipam-request-satisfied"
+                and condition.get("status") == "True"
+                for condition in conditions
+            ):
+                raise SystemExit("Cilium LB-IPAM did not report a satisfied allocation")
+            result[metadata["name"]] = str(address)
+        if len(set(result.values())) != 2:
+            raise SystemExit("same-port private Services must receive distinct VIPs")
+        print(json.dumps(result, sort_keys=True))
+        PY
+      args:
+        executable: /bin/bash
+      register: e2e_private_service_command
+      changed_when: false
+      retries: 120
+      delay: 5
+      until: e2e_private_service_command.rc == 0
+
+    - name: Decode the exact private Service VIPs
+      ansible.builtin.set_fact:
+        e2e_private_service_vips: "{{ e2e_private_service_command.stdout | from_json }}"
+
+    - name: Persist private Service ownership and VIPs
+      ansible.builtin.command:
+        argv:
+          - /opt/e2e/scripts/persist-workload.py
+          - --state
+          - "{{ e2e_state_file }}"
+          - --kubeconfig
+          - "{{ e2e_kubeconfig }}"
+      changed_when: true
+
+    - name: Prove two Cilium L2 leases announcements and allocated addresses
+      ansible.builtin.shell: |
+        set -euo pipefail
+        kubectl get ciliumloadbalancerippool inspace-private -o json | jq -e '
+          any(.status.conditions[]?; .type == "cilium.io/IPsUsed" and .message == "2") and
+          all(.status.conditions[]?; .type != "cilium.io/PoolConflict" or .status == "False")'
+        while IFS=$'\t' read -r service vip; do
+          lease="cilium-l2announce-default-$service"
+          holder=$(kubectl -n kube-system get lease "$lease" -o jsonpath='{.spec.holderIdentity}')
+          test -n "$holder"
+          pod=$(kubectl -n kube-system get pods -l k8s-app=cilium \
+            --field-selector "spec.nodeName=$holder" -o jsonpath='{.items[0].metadata.name}')
+          test -n "$pod"
+          state=$(kubectl -n kube-system exec "$pod" -- cilium-dbg shell -- db/show l2-announce)
+          grep -F -- "$vip" <<<"$state"
+        done < <(jq -r 'to_entries[] | [.key,.value] | @tsv' <<<'{{ e2e_private_service_vips | to_json }}')
+      args:
+        executable: /bin/bash
+      register: e2e_l2_announcement_proof
+      changed_when: false
+      retries: 120
+      delay: 5
+      until: e2e_l2_announcement_proof.rc == 0
+
+    - name: Reach both same-port private VIPs from the VPC bastion
+      ansible.builtin.uri:
+        url: "http://{{ e2e_private_service_vips[item.name] }}/"
+        return_content: true
+        timeout: 10
+        use_proxy: false
+      delegate_to: e2e-bastion
+      register: e2e_private_marker_response
+      retries: 60
+      delay: 5
+      until: >-
+        e2e_private_marker_response.status == 200 and
+        e2e_private_marker_response.content | trim == e2e_marker + item.suffix
+      loop:
+        - {name: inspace-e2e-private-a, suffix: "-private-a"}
+        - {name: inspace-e2e-private-b, suffix: "-private-b"}
+
+    - name: Exercise private L2 lease migration after a Cilium-agent failure
+      block:
+        - name: Capture the original private L2 lease holder
+          ansible.builtin.command:
+            argv:
+              - kubectl
+              - -n
+              - kube-system
+              - get
+              - lease
+              - cilium-l2announce-default-inspace-e2e-private-a
+              - -o
+              - jsonpath={.spec.holderIdentity}
+          register: e2e_l2_original_holder
+          changed_when: false
+
+        - name: Bind the original lease holder to its node address and Cilium pod UID
+          ansible.builtin.shell: |
+            set -euo pipefail
+            holder={{ e2e_l2_original_holder.stdout | quote }}
+            node_ip=$(kubectl get node "$holder" -o json | jq -er '
+              [.status.addresses[] | select(.type == "InternalIP") | .address] |
+              if length == 1 then .[0] else error("expected one InternalIP") end')
+            pod=$(kubectl -n kube-system get pods -l k8s-app=cilium \
+              --field-selector "spec.nodeName=$holder" -o json | jq -cer '
+              if (.items | length) == 1 then
+                {name:.items[0].metadata.name,uid:.items[0].metadata.uid}
+              else error("expected one Cilium pod on holder") end')
+            jq -cn --arg nodeIP "$node_ip" --argjson pod "$pod" \
+              '{nodeIP:$nodeIP,podName:$pod.name,podUID:$pod.uid}'
+          args:
+            executable: /bin/bash
+          register: e2e_l2_original_topology
+          changed_when: false
+
+        - name: Prove the original VIP neighbor MAC is the original holder NIC
+          ansible.builtin.shell: |
+            set -euo pipefail
+            vip={{ e2e_private_service_vips['inspace-e2e-private-a'] | quote }}
+            node_ip={{ (e2e_l2_original_topology.stdout | from_json).nodeIP | quote }}
+            ip -4 neigh flush to "$vip"
+            ip -4 neigh flush to "$node_ip"
+            python3 - "$node_ip" <<'PY'
+            import socket
+            import sys
+            with socket.create_connection((sys.argv[1], 22), timeout=10):
+                pass
+            PY
+            python3 - "$vip" "{{ e2e_marker }}-private-a" <<'PY'
+            import sys
+            import urllib.request
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            with opener.open(f"http://{sys.argv[1]}/", timeout=10) as response:
+                assert response.status == 200
+                assert response.read().decode().strip() == sys.argv[2]
+            PY
+            neighbor_mac() {
+              ip -4 neigh show to "$1" | awk '
+                { for (i = 1; i <= NF; i++) if ($i == "lladdr") { print $(i + 1); exit } }'
+            }
+            node_mac=$(neighbor_mac "$node_ip")
+            vip_mac=$(neighbor_mac "$vip")
+            test -n "$node_mac"
+            test "$vip_mac" = "$node_mac"
+            jq -cn --arg nodeMAC "$node_mac" --arg vipMAC "$vip_mac" \
+              '{nodeMAC:$nodeMAC,vipMAC:$vipMAC}'
+          args:
+            executable: /bin/bash
+          become: true
+          delegate_to: e2e-bastion
+          register: e2e_l2_original_neighbor
+          changed_when: true
+          retries: 30
+          delay: 1
+          until: e2e_l2_original_neighbor.rc == 0
+
+        - name: Exclude the original holder and terminate its Cilium agent
+          ansible.builtin.shell: |
+            set -euo pipefail
+            kubectl label node "{{ e2e_l2_original_holder.stdout }}" \
+              inspace.cloud/l2-announcement-disabled=true --overwrite
+            pod={{ (e2e_l2_original_topology.stdout | from_json).podName | quote }}
+            uid={{ (e2e_l2_original_topology.stdout | from_json).podUID | quote }}
+            kubectl -n kube-system delete pod "$pod" --wait=false
+            kubectl -n kube-system wait --for=delete "pod/$pod" --timeout=2m
+            kubectl -n kube-system get pods -l k8s-app=cilium -o json | jq -e --arg uid "$uid" '
+              all(.items[]; .metadata.uid != $uid)'
+          args:
+            executable: /bin/bash
+          changed_when: true
+
+        - name: Wait for the private Service lease to move to another node
+          ansible.builtin.shell: |
+            set -euo pipefail
+            lease=$(kubectl -n kube-system get lease \
+              cilium-l2announce-default-inspace-e2e-private-a -o json)
+            jq -er --arg old "{{ e2e_l2_original_holder.stdout }}" '
+              (.spec.holderIdentity // "") as $holder |
+              if (($holder | length) > 0 and $holder != $old and
+                  (.spec.leaseTransitions // 0) >= 1)
+              then $holder else error("lease has not migrated") end' <<<"$lease"
+          args:
+            executable: /bin/bash
+          register: e2e_l2_new_holder
+          changed_when: false
+          retries: 60
+          delay: 1
+          until: e2e_l2_new_holder.rc == 0
+
+        - name: Read the migrated lease holder private node address
+          ansible.builtin.shell: |
+            set -euo pipefail
+            kubectl get node "{{ e2e_l2_new_holder.stdout }}" -o json | jq -er '
+              [.status.addresses[] | select(.type == "InternalIP") | .address] |
+              if length == 1 then .[0] else error("expected one InternalIP") end'
+          args:
+            executable: /bin/bash
+          register: e2e_l2_new_holder_ip
+          changed_when: false
+
+        - name: Require gratuitous ARP to update the existing VIP neighbor to the migrated holder
+          ansible.builtin.shell: |
+            set -euo pipefail
+            vip={{ e2e_private_service_vips['inspace-e2e-private-a'] | quote }}
+            node_ip={{ e2e_l2_new_holder_ip.stdout | quote }}
+            old_mac={{ (e2e_l2_original_neighbor.stdout | from_json).nodeMAC | quote }}
+            ip -4 neigh flush to "$node_ip"
+            python3 - "$node_ip" <<'PY'
+            import socket
+            import sys
+            with socket.create_connection((sys.argv[1], 22), timeout=10):
+                pass
+            PY
+            neighbor_mac() {
+              ip -4 neigh show to "$1" | awk '
+                { for (i = 1; i <= NF; i++) if ($i == "lladdr") { print $(i + 1); exit } }'
+            }
+            node_mac=$(neighbor_mac "$node_ip")
+            vip_mac=$(neighbor_mac "$vip")
+            test -n "$node_mac"
+            test "$vip_mac" = "$node_mac"
+            test "$vip_mac" != "$old_mac"
+            python3 - "$vip" "{{ e2e_marker }}-private-a" <<'PY'
+            import sys
+            import urllib.request
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            with opener.open(f"http://{sys.argv[1]}/", timeout=10) as response:
+                assert response.status == 200
+                assert response.read().decode().strip() == sys.argv[2]
+            PY
+          args:
+            executable: /bin/bash
+          become: true
+          delegate_to: e2e-bastion
+          register: e2e_l2_gratuitous_arp
+          changed_when: false
+          retries: 30
+          delay: 1
+          until: e2e_l2_gratuitous_arp.rc == 0
+
+        - name: Flush the VIP neighbor and prove fresh ARP resolves to the migrated holder
+          ansible.builtin.shell: |
+            set -euo pipefail
+            vip={{ e2e_private_service_vips['inspace-e2e-private-a'] | quote }}
+            node_ip={{ e2e_l2_new_holder_ip.stdout | quote }}
+            old_mac={{ (e2e_l2_original_neighbor.stdout | from_json).nodeMAC | quote }}
+            ip -4 neigh flush to "$vip"
+            python3 - "$vip" "{{ e2e_marker }}-private-a" <<'PY'
+            import sys
+            import urllib.request
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            with opener.open(f"http://{sys.argv[1]}/", timeout=10) as response:
+                assert response.status == 200
+                assert response.read().decode().strip() == sys.argv[2]
+            PY
+            neighbor_mac() {
+              ip -4 neigh show to "$1" | awk '
+                { for (i = 1; i <= NF; i++) if ($i == "lladdr") { print $(i + 1); exit } }'
+            }
+            node_mac=$(neighbor_mac "$node_ip")
+            vip_mac=$(neighbor_mac "$vip")
+            test -n "$node_mac"
+            test "$vip_mac" = "$node_mac"
+            test "$vip_mac" != "$old_mac"
+          args:
+            executable: /bin/bash
+          become: true
+          delegate_to: e2e-bastion
+          register: e2e_l2_fresh_arp
+          changed_when: true
+          retries: 30
+          delay: 1
+          until: e2e_l2_fresh_arp.rc == 0
+      always:
+        - name: Restore the original node to L2 announcement eligibility
+          ansible.builtin.command:
+            argv:
+              - kubectl
+              - label
+              - node
+              - "{{ e2e_l2_original_holder.stdout }}"
+              - inspace.cloud/l2-announcement-disabled-
+          changed_when: true
+          when: e2e_l2_original_holder is defined and (e2e_l2_original_holder.stdout | default('')) | length > 0
+
+        - name: Wait for every Cilium agent after the failover exercise
+          ansible.builtin.command:
+            argv: [kubectl, -n, kube-system, rollout, status, daemonset/cilium, --timeout=10m]
+          changed_when: false
+
+    - name: Wait for the public TCP load balancer address
+      ansible.builtin.shell: |
+        kubectl -n default get service inspace-e2e-web -o jsonpath='{.status.loadBalancer.ingress[0].ip}'
+      args:
+        executable: /bin/bash
+      register: e2e_service_ip_command
+      changed_when: false
+      retries: 120
+      delay: 5
+      until: e2e_service_ip_command.rc == 0 and e2e_service_ip_command.stdout | length > 0
+
+    - name: Validate the service address is public IPv4
+      ansible.builtin.command:
+        argv:
+          - python3
+          - -c
+          - >-
+            import ipaddress,sys;
+            a=ipaddress.ip_address(sys.argv[1]);
+            assert a.version == 4 and not a.is_private and not a.is_loopback and not a.is_multicast
+          - "{{ e2e_service_ip_command.stdout }}"
+      changed_when: false
+
+    - name: Prove private Services own zero cloud resources and public ownership is exact
+      ansible.builtin.command:
+        argv:
+          - /opt/e2e/scripts/verify-service-cloud.py
+          - --state
+          - "{{ e2e_state_file }}"
+          - --public
+          - present
+      register: e2e_public_cloud_proof
+      changed_when: false
+      retries: 120
+      delay: 5
+      until: >-
+        e2e_public_cloud_proof.rc == 0 and
+        (e2e_public_cloud_proof.stdout | from_json).publicIPv4 == e2e_service_ip_command.stdout
+      no_log: true
+
+    - name: Prove explicit public CCM ownership and no Node IPAM selection
+      ansible.builtin.shell: |
+        set -euo pipefail
+        kubectl -n default get service inspace-e2e-web -o json | jq -e '
+          .metadata.labels["inspace.cloud/load-balancer-scope"] == "public" and
+          .metadata.annotations["service.beta.kubernetes.io/inspace-load-balancer-public"] == "true" and
+          (.spec.loadBalancerClass == null) and
+          .spec.externalTrafficPolicy == "Cluster" and
+          all(.status.conditions[]?; (.type | startswith("io.cilium/")) | not)'
+        kubectl get services --all-namespaces -o json | jq -e '
+          all(.items[]; .spec.loadBalancerClass != "io.cilium/node")'
+        kubectl -n kube-system get leases -o json | jq -e '
+          all(.items[]; .metadata.name != "cilium-l2announce-default-inspace-e2e-web")'
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Require the expected marker through the TCP-only InSpace NLB
+      ansible.builtin.uri:
+        url: "http://{{ e2e_service_ip_command.stdout }}/"
+        return_content: true
+        timeout: 10
+        use_proxy: false
+      register: e2e_marker_response
+      retries: 120
+      delay: 5
+      until: e2e_marker_response.status == 200 and e2e_marker_response.content | trim == e2e_marker
+
+    - name: Remove public intent while keeping the Service type LoadBalancer
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - -n
+          - default
+          - annotate
+          - service
+          - inspace-e2e-web
+          - service.beta.kubernetes.io/inspace-load-balancer-public-
+      changed_when: true
+
+    - name: Require public status and exact owned NLB FIP cleanup
+      ansible.builtin.shell: |
+        set -euo pipefail
+        kubectl -n default get service inspace-e2e-web -o json | jq -e '
+          ((.status.loadBalancer.ingress // []) | length) == 0'
+        /opt/e2e/scripts/verify-service-cloud.py \
+          --state "{{ e2e_state_file }}" --public absent >/dev/null
+      args:
+        executable: /bin/bash
+      register: e2e_public_transition_cleanup
+      changed_when: false
+      retries: 120
+      delay: 5
+      until: e2e_public_transition_cleanup.rc == 0
+      no_log: true
+
+    - name: Restore explicit public NLB intent
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - -n
+          - default
+          - annotate
+          - service
+          - inspace-e2e-web
+          - service.beta.kubernetes.io/inspace-load-balancer-public=true
+          - --overwrite
+      changed_when: true
+
+    - name: Wait for the recreated public TCP NLB address
+      ansible.builtin.shell: |
+        kubectl -n default get service inspace-e2e-web -o jsonpath='{.status.loadBalancer.ingress[0].ip}'
+      args:
+        executable: /bin/bash
+      register: e2e_service_ip_command
+      changed_when: false
+      retries: 120
+      delay: 5
+      until: e2e_service_ip_command.rc == 0 and e2e_service_ip_command.stdout | length > 0
+
+    - name: Re-prove exact public cloud ownership after transition
+      ansible.builtin.command:
+        argv:
+          - /opt/e2e/scripts/verify-service-cloud.py
+          - --state
+          - "{{ e2e_state_file }}"
+          - --public
+          - present
+      register: e2e_recreated_public_cloud
+      changed_when: false
+      retries: 120
+      delay: 5
+      until: >-
+        e2e_recreated_public_cloud.rc == 0 and
+        (e2e_recreated_public_cloud.stdout | from_json).publicIPv4 == e2e_service_ip_command.stdout
+      no_log: true
+
+    - name: Recheck the restored public TCP NLB
+      ansible.builtin.uri:
+        url: "http://{{ e2e_service_ip_command.stdout }}/"
+        return_content: true
+        timeout: 10
+        use_proxy: false
+      register: e2e_restored_public_marker
+      retries: 120
+      delay: 5
+      until: e2e_restored_public_marker.status == 200 and e2e_restored_public_marker.content | trim == e2e_marker
+
+    - name: Delete the serving pod to prove RWO persistence
+      ansible.builtin.shell: |
+        set -euo pipefail
+        old=$(kubectl -n default get pod -l app=inspace-e2e-web -o jsonpath='{.items[0].metadata.name}')
+        test -n "$old"
+        sentinel={{ (e2e_marker + '-persistence-sentinel') | quote }}
+        kubectl -n default exec "$old" -c nginx -- sh -ec \
+          'printf "%s\n" "$1" > /usr/share/nginx/html/e2e-persistence-sentinel; sync' \
+          sh "$sentinel"
+        test "$(kubectl -n default exec "$old" -c nginx -- \
+          cat /usr/share/nginx/html/e2e-persistence-sentinel)" = "$sentinel"
+        printf '%s' "$old" >"{{ e2e_state_dir }}/old-pod"
+        kubectl -n default delete pod "$old" --wait=true --timeout=5m
+        kubectl -n default rollout status deployment/inspace-e2e-web --timeout=10m
+      args:
+        executable: /bin/bash
+      changed_when: true
+
+    - name: Prove pod replacement retained the exact disk marker
+      ansible.builtin.shell: |
+        set -euo pipefail
+        old=$(cat "{{ e2e_state_dir }}/old-pod")
+        new=$(kubectl -n default get pod -l app=inspace-e2e-web -o jsonpath='{.items[0].metadata.name}')
+        test -n "$new"
+        test "$new" != "$old"
+        test "$(kubectl -n default exec "$new" -c nginx -- cat /usr/share/nginx/html/index.html)" = "{{ e2e_marker }}"
+        test "$(kubectl -n default exec "$new" -c nginx -- \
+          cat /usr/share/nginx/html/e2e-persistence-sentinel)" = \
+          "{{ e2e_marker }}-persistence-sentinel"
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Recheck the public TCP NLB after pod replacement
+      ansible.builtin.uri:
+        url: "http://{{ e2e_service_ip_command.stdout }}/"
+        return_content: true
+        timeout: 10
+        use_proxy: false
+      register: e2e_replacement_marker
+      retries: 60
+      delay: 5
+      until: e2e_replacement_marker.status == 200 and e2e_replacement_marker.content | trim == e2e_marker
+
+    - name: Mark the full RKE2 CCM CSI Karpenter acceptance suite complete
+      ansible.builtin.command:
+        argv:
+          - /opt/e2e/scripts/state-update.py
+          - "{{ e2e_state_file }}"
+          - completed
+          - "true"
+      changed_when: true
+
+    - name: Report acceptance completion
+      ansible.builtin.debug:
+        msg: >-
+          Full InSpace RKE2/Cilium-native-routing/kube-proxy-replacement,
+          CCM, CSI RWO, Karpenter, two same-port private LB-IPAM/L2 VIPs,
+          L2 lease failover, and explicit public TCP NLB E2E passed; cleanup follows.

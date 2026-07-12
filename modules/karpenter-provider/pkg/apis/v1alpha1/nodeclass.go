@@ -6,11 +6,11 @@ import (
 )
 
 const (
-	LocationBangkok         = "bkk01"
-	OSNameUbuntu            = "ubuntu"
-	OSVersionUbuntu         = "24.04"
-	K3sAgentTokenSecretName = "inspace-k3s-agent-token"
-	K3sAgentTokenSecretKey  = "token"
+	LocationBangkok          = "bkk01"
+	OSNameUbuntu             = "ubuntu"
+	OSVersionUbuntu          = "24.04"
+	RKE2AgentTokenSecretName = "inspace-rke2-agent-token"
+	RKE2AgentTokenSecretKey  = "token"
 
 	HostClassIntelScalable = "intel-scalable"
 	HostClassAMDEPYC       = "amd-epyc"
@@ -19,7 +19,7 @@ const (
 	AMDEPYCHostPoolUUID       = "6976fdc8-4492-465b-bd16-9ad5f6b00b03"
 )
 
-// InSpaceNodeClass describes the immutable infrastructure and K3s bootstrap
+// InSpaceNodeClass describes the immutable infrastructure and RKE2 bootstrap
 // policy shared by one or more Karpenter NodePools.
 // +kubebuilder:object:root=true
 // +kubebuilder:resource:path=inspacenodeclasses,scope=Cluster,categories=karpenter
@@ -49,14 +49,25 @@ type InSpaceNodeClassSpec struct {
 	BillingAccountID int64 `json:"billingAccountID"`
 	// Location is deliberately limited to bkk01 for the first release.
 	Location string `json:"location"`
-	// NetworkUUID is the existing private network joined by workers.
+	// NetworkUUID is the existing private network joined by workers. Its subnet
+	// must be RFC1918, /27 or shorter so it can contain the reserved Service
+	// range plus a distinct usable supervisor VIP, and must not overlap Cilium
+	// native-routing pod CIDR 10.42.0.0/16 or Kubernetes Service CIDR
+	// 10.43.0.0/16. It must exactly match the controller-wide network UUID.
 	NetworkUUID string `json:"networkUUID"`
+	// PrivateLoadBalancerPool is the inclusive private IPv4 range reserved for
+	// Cilium LB IPAM Services. It contains 16 to 256 addresses; worker NICs are
+	// forbidden from this range.
+	PrivateLoadBalancerPool PrivateLoadBalancerPool `json:"privateLoadBalancerPool"`
 	// ReservePublicIPv4 makes the provider own a separately named floating IPv4
 	// because InSpace has no managed NAT gateway. The VM create call itself
-	// reserves no implicit IP. The address is for egress only; K3s uses RFC1918.
+	// reserves no implicit IP. The address is for egress only; RKE2 uses RFC1918.
 	ReservePublicIPv4 bool `json:"reservePublicIPv4"`
 	// FirewallUUID is a pre-created default-deny InSpace firewall assigned to
-	// every worker before the provider reports a successful launch.
+	// every worker before the provider reports a successful launch. Readiness
+	// requires all-port TCP, UDP, and ICMP ingress from both the VPC subnet and
+	// Cilium pod CIDR 10.42.0.0/16, plus matching any-destination egress, and
+	// rejects every public inbound rule.
 	FirewallUUID string `json:"firewallUUID"`
 	// ImageSelector selects a stock operating-system image supported by the VM
 	// create API. The first release supports Ubuntu 24.04 only.
@@ -65,8 +76,8 @@ type InSpaceNodeClassSpec struct {
 	HostPoolSelector HostPoolSelector `json:"hostPoolSelector"`
 	// RootDiskGiB is ephemeral node storage. Persistent data belongs on CSI volumes.
 	RootDiskGiB int32 `json:"rootDiskGiB"`
-	// K3s configures workers to join the fixed control-plane endpoint.
-	K3s K3sConfig `json:"k3s"`
+	// RKE2 configures agents to join the fixed supervisor endpoint.
+	RKE2 RKE2Config `json:"rke2"`
 	// SSHUsername and SSHPublicKey optionally enable controlled operator access.
 	// They must be configured together. Private key material is never accepted.
 	SSHUsername  string `json:"sshUsername,omitempty"`
@@ -100,12 +111,16 @@ func (h HostPoolSelector) UUID() (string, bool) {
 	}
 }
 
-type K3sConfig struct {
-	// Version must exactly match the K3s server version.
+type RKE2Config struct {
+	// Version must exactly match the RKE2 server version.
 	Version string `json:"version"`
-	// Server is the stable TCP/6443 registration endpoint.
+	// Server is the stable private TCP/9345 RKE2 supervisor endpoint. Its host
+	// must be a usable literal RFC1918 virtual IPv4 inside NetworkUUID, not its
+	// network/broadcast address, and outside the fixed pod and Service CIDRs;
+	// workers never join through a public endpoint. The VIP must exactly match
+	// the controller-wide control-plane VIP.
 	Server string `json:"server"`
-	// TokenSecretRef points to a Secret containing the K3s agent token.
+	// TokenSecretRef points to a Secret containing the RKE2 agent token.
 	TokenSecretRef SecretKeySelector `json:"tokenSecretRef"`
 }
 

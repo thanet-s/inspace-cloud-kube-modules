@@ -31,9 +31,11 @@ Before promoting a release candidate to stable:
 1. Independently verify the immutable tag target, release checksums, OCI chart
    bytes, image platform indexes, SBOM attestations, and SLSA provenance.
 2. From a clean checkout of that candidate tag, run `test/e2e/run.sh` against
-   the exact published candidate in the isolated account. The script builds
-   the bootstrap controller from the checkout, so source/tag identity matters.
-   It must finish unattended and report zero owned cloud resources.
+   the exact published candidate in the isolated account. The runner is built
+   from that checkout but copies the bootstrap controller from the candidate's
+   published CCM image, so the destructive test cannot mix local controller
+   code with released charts or images. It must finish unattended and report
+   zero owned cloud resources.
 3. Create the stable annotated tag from the same tested commit, then repeat the
    artifact verification for the stable release.
 
@@ -45,7 +47,7 @@ an image digest or an exact chart version in production.
 Versions are append-only even if a workflow fails after partially publishing
 to GHCR. Never move or repush a failed version; fix the source and issue the
 next prerelease such as `rc.2`. After a package is first created, verify all
-three images and both `charts/*` packages are public before an anonymous K3s
+three images and both `charts/*` packages are public before an anonymous RKE2
 cluster attempts to pull them.
 
 Published artifacts:

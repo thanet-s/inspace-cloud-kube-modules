@@ -2,259 +2,246 @@ package v1alpha1
 
 import (
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
 
-func TestClusterE2ERendersWorkerSSHAccess(t *testing.T) {
-	data, err := os.ReadFile("../../../../../test/e2e/run.sh")
+const e2eRoot = "../../../../../test/e2e"
+
+func TestClusterE2EHostEntrypointOnlyLaunchesDocker(t *testing.T) {
+	runPath := filepath.Join(e2eRoot, "run.sh")
+	run := readE2E(t, "run.sh")
+	info, err := os.Stat(runPath)
 	if err != nil {
-		t.Fatalf("read cluster E2E: %v", err)
+		t.Fatalf("stat cluster E2E launcher: %v", err)
 	}
-	script := string(data)
+	if info.Mode().Perm()&0o111 == 0 {
+		t.Fatal("cluster E2E launcher must be executable because the root Makefile invokes it directly")
+	}
 	for _, expected := range []string{
-		`sshUsername: $ssh_user`,
-		`sshPublicKey: "$configured_public_key"`,
-		`ufw allow proto tcp from $management_cidr to any port 22`,
-		`wait_until 600 "SSH on Karpenter worker" ssh_ready "$worker_public_ip"`,
-		`wait_until 600 "worker cloud-init, Ubuntu 24.04, and K3s agent" k3s_agent_ready "$worker_public_ip"`,
+		"command -v docker",
+		`docker volume inspect "$state_volume"`,
+		`docker volume create "$state_volume"`,
+		`--file test/e2e/Dockerfile`,
+		`--target published-live`,
+		`CONTROLLER_IMAGE=ghcr.io/thanet-s/inspace-cloud-controller-manager:$INSPACE_E2E_VERSION`,
+		`--tag "$runner_image"`,
+		"docker run --rm",
+		`type=bind,src=$env_file,dst=/run/config/workspace.env,readonly`,
+		`type=bind,src=$ssh_private_key,dst=/run/secrets/e2e_ssh_key,readonly`,
+		`type=volume,src=$state_volume,dst=/state`,
 	} {
-		if !strings.Contains(script, expected) {
-			t.Fatalf("cluster E2E does not render %q into its worker NodeClass", expected)
+		mustContain(t, "host launcher", run, expected)
+	}
+	for _, forbidden := range []string{
+		"ansible-playbook", "kubectl ", "helm ", "curl ", "python3 ", "ssh-keygen ", "go test", "go build", `source "$env_file"`, "--init", "--env-file",
+	} {
+		if strings.Contains(run, forbidden) {
+			t.Fatalf("host launcher executes non-Docker tooling %q", forbidden)
 		}
+	}
+
+	dockerfile := readE2E(t, "Dockerfile")
+	entrypoint := readE2E(t, "scripts/container-entrypoint.sh")
+	for _, expected := range []string{
+		"FROM ubuntu:24.04",
+		"COPY test/e2e /opt/e2e",
+		`ENTRYPOINT ["/usr/bin/tini", "-g", "--", "/opt/e2e/scripts/container-entrypoint.sh"]`,
+		"FROM base AS local-validation",
+		"FROM base AS published-live",
+		"COPY --from=published-controller /usr/local/bin/inspace-cluster-controller",
+	} {
+		mustContain(t, "runner Dockerfile", dockerfile, expected)
+	}
+	for _, expected := range []string{
+		"run_ansible /opt/e2e/playbook.yml",
+		"run_ansible /opt/e2e/cleanup.yml",
+		`ansible-playbook "$@" --forks 10 &`,
+		"trap 'cleanup_on_signal INT' INT",
+		"trap 'cleanup_on_signal TERM' TERM",
+	} {
+		mustContain(t, "container entrypoint", entrypoint, expected)
 	}
 }
 
-func TestClusterE2EProvesWorkerVPCAttachment(t *testing.T) {
-	script := readClusterE2E(t)
-	vpcCheck := shellFunction(t, script, "owned_worker_vpc_ready", "karpenter_pods_absent")
-	for _, gate := range []string{
-		`validate_worker_records "$workers"`,
-		`[[ $(jq -r 'length' <<<"$workers") == 1 ]]`,
-		`worker_uuid=$(jq -er '.[0].uuid'`,
-		`worker_name=$(jq -er '.[0].name'`,
-		`[[ $worker_name == "$node_name" ]]`,
-		`api_get "network/network/$INSPACE_NETWORK_UUID"`,
-		`.uuid == $network`,
-		`(.vm_uuids | type) == "array"`,
-		`([.vm_uuids[] | select(. == $worker)] | length) == 1`,
-		`--arg provider "inspace://$INSPACE_LOCATION/$worker_uuid"`,
-		`.spec.providerID == $provider`,
-		`select(.type == "InternalIP")`,
-		`if length == 1 then .[0]`,
-		`ipaddress.ip_network(sys.argv[1], strict=False)`,
-		`network.subnet_of(prefix)`,
-		`address not in network`,
+func TestClusterE2EProvisionsAndWaitsForThreeControlPlanesInParallel(t *testing.T) {
+	clusterTemplate := readE2E(t, "templates/cluster.yaml.j2")
+	playbook := readE2E(t, "playbook.yml")
+	for _, expected := range []string{
+		"replicas: 3",
+		"version: v1.35.6+rke2r1",
+		"name: inspace-rke2-agent-token",
+		"podCIDR: 10.42.0.0/16",
+		"virtualIPv4:",
 	} {
-		if !strings.Contains(vpcCheck, gate) {
-			t.Fatalf("worker VPC proof is missing gate %q", gate)
-		}
+		mustContain(t, "cluster template", clusterTemplate, expected)
 	}
-	workerPhaseStart := strings.Index(script, `cat >"$state_dir/karpenter.yaml"`)
-	if workerPhaseStart < 0 {
-		t.Fatal("cluster E2E is missing the rendered Karpenter resources")
+	for _, expected := range []string{
+		"async: 2700",
+		"poll: 0",
+		"ansible.builtin.async_status:",
+		"until: e2e_bootstrap_wait.finished",
+		"retries: 270",
+		"e2e_bootstrap_result.controlPlaneVMs | length == 3",
+		"e2e_bootstrap_result.controlPlaneVMs | unique | length == 3",
+		"e2e_bootstrap_result.maxParallelControlPlaneCreates | int == 3",
+		"e2e_bootstrap_result.apiLoadBalancerUUID is not defined",
+		"e2e_bootstrap_result.registrationLoadBalancerUUID is not defined",
+		"e2e_bootstrap_result.privateRegistrationEndpoint == 'https://' + e2e_virtual_ip + ':9345'",
+		"e2e_bootstrap_result.bastionVMUUID | length > 0",
+		"groups['rke2_control_plane'] | length == 3",
+		"hosts: rke2_control_plane",
+		"strategy: free",
+		"ansible.builtin.wait_for:",
+		"ansible.builtin.wait_for_connection:",
+		"until: e2e_rke2_service.rc == 0 and e2e_rke2_service.stdout == 'active'",
+		"until: e2e_local_readyz.rc == 0",
+	} {
+		mustContain(t, "Ansible playbook", playbook, expected)
 	}
-	assertOrdered(t, script[workerPhaseStart:],
-		`networkUUID: $INSPACE_NETWORK_UUID`,
-		`kubectl apply -f "$state_dir/trigger.yaml"`,
-		`kubectl -n default rollout status deployment/inspace-e2e-trigger`,
-		`kubectl wait --for=condition=Ready node -l "karpenter.sh/nodepool=$nodepool_name"`,
-		`jq -e '.items | length == 1 and all(.[]; any(.status.conditions[]; .type=="Ready" and .status=="True"))'`,
-		`kubectl get nodeclaims -l "karpenter.sh/nodepool=$nodepool_name"`,
-		`worker_node=$(kubectl get node -l "karpenter.sh/nodepool=$nodepool_name"`,
-		`persist_worker_ownership_from_cloud`,
-		`jq -e 'length == 1'`,
-		`wait_until 300 "Karpenter worker attachment to the configured private VPC"`,
-		`owned_worker_vpc_ready "$worker_node"`,
-		`worker_public_ip=$(owned_worker_public_ip)`,
-		`wait_until 600 "SSH on Karpenter worker"`,
-		`wait_until 600 "worker cloud-init, Ubuntu 24.04, and K3s agent"`,
-		`rollout status daemonset/inspace-csi-node`,
-		`echo "==> verify RWO CSI mount, persistence, and TCP public LoadBalancer"`,
-		`kubectl apply -f "$state_dir/workload.yaml"`,
+	assertOrdered(t, playbook,
+		"Launch the bootstrap reconciler asynchronously",
+		"Wait robustly for the product reconciler to finish",
+		"Prove exact and parallel three-control-plane provisioning",
+		"Add exactly three dynamic RKE2 control-plane hosts",
+		"Wait for all RKE2 servers independently and in parallel",
+		"Require exactly three independently ready RKE2 servers",
 	)
 }
 
-func TestClusterE2EDeletesNodeClaimsBeforeNodePool(t *testing.T) {
-	script := readClusterE2E(t)
-	quiesce := shellFunction(t, script, "kubernetes_e2e_quiesce", "quiesce_kubernetes_e2e_owners_bounded")
-	assertOrdered(t, quiesce,
-		`delete nodeclaims \`,
-		`owned_nodeclaims_absent "$claim_grace_deadline"`,
-		`force_finalize_drained_owned_worker "$deadline"`,
-		`owned_worker_node_absent "$deadline"`,
-		`delete nodepool "$nodepool_name"`,
-		`delete inspacenodeclass "$nodeclass_name"`,
-	)
-}
-
-func TestClusterE2EForcedWorkerCleanupIsGatedAndOrdered(t *testing.T) {
-	script := readClusterE2E(t)
-	fallback := shellFunction(t, script, "force_finalize_drained_owned_worker", "kubernetes_e2e_quiesce")
-	assertOrdered(t, fallback,
-		`validate_forced_worker_cleanup_state "$deadline"`,
-		`scale deployment inspace-karpenter`,
-		`karpenter_pods_absent "$deadline"`,
-	)
-	if strings.Count(fallback, `validate_forced_worker_cleanup_state "$deadline"`) != 4 {
-		t.Fatal("forced cleanup must revalidate after controller shutdown, cloud cleanup, and Node finalization")
-	}
-	assertOrdered(t, fallback,
-		`# fallback. All safety predicates are re-read after its Pods are gone.`,
-		`validate_forced_worker_cleanup_state "$deadline"`,
-		`cleanup_forced_worker_resources "$deadline"`,
-		`forced_worker_resources_absent "$deadline"`,
-		`# Bind every finalizer mutation to a post-cloud-cleanup Kubernetes snapshot.`,
-		`validate_forced_worker_cleanup_state "$deadline" || return $?`,
-		`node_json=$validated_worker_node_json`,
-		`patch node "$worker_name"`,
-		`owned_worker_node_absent "$deadline"`,
-		`validate_forced_worker_cleanup_state "$deadline" || return $?`,
-		`claim_json=$validated_worker_claim_json`,
-		`patch nodeclaim "$worker_name"`,
-		`owned_worker_nodeclaim_absent "$deadline"`,
-		`owned_nodeclaims_absent "$deadline"`,
-	)
-	if strings.Count(fallback, `path:"/metadata/finalizers",value:["karpenter.sh/termination"]`) != 2 {
-		t.Fatal("forced cleanup must atomically test exact Node and NodeClaim finalizers")
-	}
-	for _, identityTest := range []string{`path:"/metadata/uid"`, `path:"/metadata/resourceVersion"`, `path:"/metadata/deletionTimestamp"`} {
-		if strings.Count(fallback, identityTest) != 2 {
-			t.Fatalf("forced cleanup must atomically test %s for both Node and NodeClaim", identityTest)
-		}
-	}
-	for _, boundedMutation := range []string{
-		`--current-replicas="$replicas" --resource-version="$deployment_rv" --replicas=0`,
-		`kubectl --request-timeout="${timeout_seconds}s" patch node "$worker_name"`,
-		`kubectl --request-timeout="${timeout_seconds}s" patch nodeclaim "$worker_name"`,
+func TestClusterE2ERendersRKE2WorkerAndCiliumKubeProxyReplacement(t *testing.T) {
+	workerTemplate := readE2E(t, "templates/karpenter.yaml.j2")
+	playbook := readE2E(t, "playbook.yml")
+	for _, expected := range []string{
+		"rke2:",
+		"version: v1.35.6+rke2r1",
+		"server: {{ e2e_bootstrap_result.privateRegistrationEndpoint }}",
+		"name: inspace-rke2-agent-token",
+		"sshUsername: {{ e2e_ssh_user }}",
+		"sshPublicKey: {{ e2e_ssh_public_key | to_json }}",
 	} {
-		if !strings.Contains(fallback, boundedMutation) {
-			t.Fatalf("forced cleanup is missing bounded identity-bound mutation %q", boundedMutation)
+		mustContain(t, "Karpenter template", workerTemplate, expected)
+	}
+	for _, forbidden := range []string{"k3s", "ufw", "iptables", "nft"} {
+		if strings.Contains(strings.ToLower(workerTemplate), forbidden) {
+			t.Fatalf("Karpenter E2E template retained forbidden host bootstrap artifact %q", forbidden)
 		}
 	}
-	for _, forbiddenRefresh := range []string{`get node "$worker_name"`, `get nodeclaim "$worker_name"`} {
-		if strings.Contains(fallback, forbiddenRefresh) {
-			t.Fatalf("forced cleanup refreshes an unvalidated finalizer input with %q", forbiddenRefresh)
-		}
-	}
-	for _, mandatoryGate := range []string{
-		`validate_forced_worker_cleanup_state "$deadline" || return $?`,
-		`cleanup_forced_worker_resources "$deadline" || return $?`,
-		`forced_worker_resources_absent "$deadline" || return $?`,
-		`owned_worker_node_absent "$deadline" || return $?`,
-		`owned_worker_nodeclaim_absent "$deadline" || return $?`,
-		`owned_nodeclaims_absent "$deadline" || return $?`,
+	for _, expected := range []string{
+		"--management-cidr",
+		"--management-tcp-ports",
+		`- "22"`,
+		"systemctl is-active --quiet rke2-agent",
+		"/usr/local/bin/rke2 --version | grep -F 'v1.35.6+rke2r1'",
+		"Verify Cilium native routing and full kube-proxy replacement",
+		`.data["routing-mode"] == "native"`,
+		`.data["ipv4-native-routing-cidr"] == "10.42.0.0/16"`,
+		`.data["kube-proxy-replacement"] == "true"`,
+		`all(.items[]; .metadata.name != "kube-proxy")`,
+		`all(.items[]; (.metadata.name | startswith("kube-proxy-")) | not)`,
+		"KubeProxyReplacement:[[:space:]]+True",
+		"(Routing:.*Native|Direct Routing)",
 	} {
-		if !strings.Contains(fallback, mandatoryGate) {
-			t.Fatalf("forced cleanup does not fail closed on gate %q", mandatoryGate)
-		}
+		mustContain(t, "Ansible playbook", playbook, expected)
 	}
 }
 
-func TestClusterE2EForcedWorkerCleanupValidatesOwnershipAndDrainState(t *testing.T) {
-	script := readClusterE2E(t)
-	validation := shellFunction(t, script, "validate_forced_worker_cleanup_state", "force_finalize_drained_owned_worker")
-	for _, gate := range []string{
-		`e2e_pods_absent "$deadline"`,
-		`pv_and_attachments_absent "$deadline"`,
-		`worker_volume_attachments_absent "$deadline" "$worker_name"`,
-		`($nodeclass.spec.clusterName == $cluster)`,
-		`($nodeclass.spec.networkUUID == $network)`,
-		`($claim.status.providerID == ("inspace://" + $location + "/" + $worker.uuid))`,
-		`.apiVersion == "karpenter.sh/v1" and .kind == "NodePool"`,
-		`.type == "Drained" and .status == "True"`,
-		`.type == "VolumesDetached" and .status == "True"`,
-		`($ownedNodes[0].metadata.deletionTimestamp != null)`,
-		`validated_worker_claim_json=$(jq`,
-		`<<<"$claims") || return 2`,
-		`validated_worker_node_json=$(jq`,
-		`end' <<<"$nodes") || return 2`,
+func TestClusterE2EProvesWorkerCloudIdentityAndVPCAttachment(t *testing.T) {
+	playbook := readE2E(t, "playbook.yml")
+	discovery := readE2E(t, "scripts/discover-worker.py")
+	for _, expected := range []string{
+		"Read the exact Karpenter worker identity",
+		"Persist exact worker cloud ownership and VPC proof",
+		"/opt/e2e/scripts/discover-worker.py",
+		"Add the dynamically created RKE2 worker for parallel-safe validation",
 	} {
-		if !strings.Contains(validation, gate) {
-			t.Fatalf("forced worker cleanup validation is missing gate %q", gate)
-		}
+		mustContain(t, "Ansible playbook", playbook, expected)
+	}
+	for _, expected := range []string{
+		`if len(matches) != 1:`,
+		`node.get("providerID") != f"inspace://{location}/{vm_uuid}"`,
+		`if not isinstance(internal_ips, list) or len(internal_ips) != 1:`,
+		`network_uuid = os.environ["INSPACE_NETWORK_UUID"]`,
+		`network = api_get(f"network/network/{network_uuid}")`,
+		`list(network.get("vm_uuids", [])).count(vm_uuid) != 1`,
+		`subnet = ipaddress.ip_network(network["subnet"], strict=False)`,
+		`if internal_ip not in subnet:`,
+		`if len(addresses) != 1:`,
+		`"publicIPv4": str(public_ip)`,
+	} {
+		mustContain(t, "worker discovery", discovery, expected)
 	}
 }
 
-func TestClusterE2EForcedCloudCleanupUsesOnlyExactPersistedWorker(t *testing.T) {
-	script := readClusterE2E(t)
-	snapshot := shellFunction(t, script, "forced_worker_cloud_snapshot", "forced_worker_resources_absent")
-	for _, gate := range []string{
-		`api_get user-resource/vm/list "$deadline"`,
-		`api_get network/ip_addresses "$deadline"`,
-		`(($ownedVMs | length) <= 1)`,
-		`.vm.uuid == $worker.uuid and .vm.name == $worker.name`,
-		`.record.schema == "karpenter.inspace.cloud/v1"`,
-		`.record.nodeClaim == $worker.name`,
-		`.record.floatingIPName == $worker.fip`,
-		`(($ownedIPs | length) <= 1)`,
-		`.name == $worker.fip`,
-		`(.assigned_to == $worker.uuid)`,
-		`(.assigned_to_resource_type == "virtual_machine")`,
+func TestClusterE2ECleanupIsBoundedFailClosedAndOrdered(t *testing.T) {
+	entrypoint := readE2E(t, "scripts/container-entrypoint.sh")
+	cleanup := readE2E(t, "cleanup.yml")
+	for _, expected := range []string{
+		"suite_status=$?",
+		"cleanup_status=0",
+		"if [[ $INSPACE_E2E_KEEP_RESOURCES == true ]]",
+		"ansible-playbook /opt/e2e/cleanup.yml --forks 10",
+		"if (( cleanup_status != 0 ))",
+		`exit "$suite_status"`,
 	} {
-		if !strings.Contains(snapshot, gate) {
-			t.Fatalf("forced cloud snapshot is missing exact ownership gate %q", gate)
-		}
+		mustContain(t, "container entrypoint", entrypoint, expected)
 	}
-	cleanup := shellFunction(t, script, "cleanup_forced_worker_resources_once", "cleanup_forced_worker_resources")
+	for _, expected := range []string{
+		"cloud infrastructure is the fail-closed outcome",
+		"retries: 180",
+		"delay: 10",
+		"until: e2e_cleanup_storage_quiesced.rc == 0",
+		"until: e2e_cleanup_worker_quiesced.rc == 0",
+		"async: 1800",
+		"poll: 0",
+		"ansible.builtin.async_status:",
+		"until: e2e_destroy_wait.finished",
+		"retries: 90",
+		"until: (e2e_final_audit.stdout | from_json).count == 0",
+	} {
+		mustContain(t, "cleanup playbook", cleanup, expected)
+	}
 	assertOrdered(t, cleanup,
-		`forced_worker_cloud_snapshot "$deadline"`,
-		`api_post_json "network/ip_addresses/$address/unassign" "$deadline"`,
-		`api_delete_json "network/ip_addresses/$address" "$deadline"`,
-		`api_delete_vm "$uuid" "$deadline"`,
+		"Refuse cloud deletion while Kubernetes API reachability is uncertain",
+		"Delete workload owners before infrastructure owners",
+		"Wait for E2E pods PVs and VolumeAttachments to disappear",
+		"Delete the NodePool while Karpenter is still running",
+		"Wait for owned NodeClaims and worker Nodes to disappear",
+		"Delete the NodeClass after all worker ownership is gone",
+		"Wait until CCM CSI and Karpenter removed all non-control-plane cloud resources",
+		"Uninstall controllers only after their owners are quiescent",
+		"Remove E2E credentials after controller shutdown",
+		"Destroy only bootstrap-controller-owned infrastructure asynchronously",
+		"Wait robustly for bootstrap destroy convergence",
+		"Require the final deterministic cloud audit to converge to zero",
 	)
 }
 
-func TestClusterE2EParentDeletionAbsenceProofsAreBroad(t *testing.T) {
-	script := readClusterE2E(t)
-	claims := shellFunction(t, script, "owned_nodeclaims_absent", "persist_service_ownership_from_cluster")
-	nodes := shellFunction(t, script, "owned_worker_node_absent", "owned_worker_nodeclaim_absent")
-	for name, body := range map[string]string{"NodeClaim": claims, "Node": nodes} {
-		for _, gate := range []string{
-			`startswith($prefix)`,
-			`.metadata.labels["karpenter.sh/nodepool"] == $pool`,
-			`any($workers[]; .name ==`,
-			`] | length == 0`,
-		} {
-			if !strings.Contains(body, gate) {
-				t.Fatalf("%s absence proof is missing broad ownership gate %q", name, gate)
-			}
-		}
-	}
-}
-
-func readClusterE2E(t *testing.T) string {
+func readE2E(t *testing.T, name string) string {
 	t.Helper()
-	data, err := os.ReadFile("../../../../../test/e2e/run.sh")
+	data, err := os.ReadFile(filepath.Join(e2eRoot, name))
 	if err != nil {
-		t.Fatalf("read cluster E2E: %v", err)
+		t.Fatalf("read E2E artifact %s: %v", name, err)
 	}
 	return string(data)
 }
 
-func shellFunction(t *testing.T, script, name, nextName string) string {
+func mustContain(t *testing.T, subject, value, expected string) {
 	t.Helper()
-	startMarker := name + "() {"
-	endMarker := "\n" + nextName + "() {"
-	start := strings.Index(script, startMarker)
-	if start < 0 {
-		t.Fatalf("cluster E2E is missing %s", name)
+	if !strings.Contains(value, expected) {
+		t.Fatalf("%s is missing %q", subject, expected)
 	}
-	relativeEnd := strings.Index(script[start:], endMarker)
-	if relativeEnd < 0 {
-		t.Fatalf("cluster E2E cannot find the end of %s", name)
-	}
-	return script[start : start+relativeEnd]
 }
 
-func assertOrdered(t *testing.T, text string, markers ...string) {
+func assertOrdered(t *testing.T, value string, fragments ...string) {
 	t.Helper()
 	position := 0
-	for _, marker := range markers {
-		relative := strings.Index(text[position:], marker)
-		if relative < 0 {
-			t.Fatalf("expected %q after byte %d", marker, position)
+	for _, fragment := range fragments {
+		offset := strings.Index(value[position:], fragment)
+		if offset < 0 {
+			t.Fatalf("artifact is missing ordered fragment %q after byte %d", fragment, position)
 		}
-		position += relative + len(marker)
+		position += offset + len(fragment)
 	}
 }

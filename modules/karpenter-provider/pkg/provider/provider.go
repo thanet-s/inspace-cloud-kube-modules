@@ -39,9 +39,12 @@ const (
 var _ cloudprovider.CloudProvider = (*CloudProvider)(nil)
 
 type Options struct {
-	ClusterName          string
-	DefaultNodeClassName string
-	Location             string
+	ClusterName             string
+	DefaultNodeClassName    string
+	Location                string
+	NetworkUUID             string
+	ControlPlaneVIP         string
+	PrivateLoadBalancerPool inspacev1.PrivateLoadBalancerPool
 }
 
 type CloudProvider struct {
@@ -54,8 +57,19 @@ func New(cloud cloudapi.Cloud, resolver NodeClassResolver, opts Options) (*Cloud
 	if cloud == nil || resolver == nil {
 		return nil, fmt.Errorf("cloud and NodeClass resolver are required")
 	}
-	if opts.ClusterName == "" || opts.DefaultNodeClassName == "" {
-		return nil, fmt.Errorf("cluster name and default NodeClass name are required")
+	if opts.ClusterName == "" || opts.DefaultNodeClassName == "" || opts.NetworkUUID == "" || opts.ControlPlaneVIP == "" {
+		return nil, fmt.Errorf("cluster name, default NodeClass name, network UUID, and control-plane VIP are required")
+	}
+	if err := inspacev1.ValidateNetworkUUID(opts.NetworkUUID); err != nil {
+		return nil, fmt.Errorf("controller network UUID: %w", err)
+	}
+	controlPlaneVIP, err := inspacev1.ParseControlPlaneVIP(opts.ControlPlaneVIP)
+	if err != nil {
+		return nil, fmt.Errorf("controller control-plane VIP: %w", err)
+	}
+	opts.ControlPlaneVIP = controlPlaneVIP.String()
+	if err := opts.PrivateLoadBalancerPool.ValidateForSupervisor(controlPlaneVIP); err != nil {
+		return nil, fmt.Errorf("controller private load-balancer pool: %w", err)
 	}
 	if opts.Location == "" {
 		opts.Location = inspacev1.LocationBangkok
@@ -71,13 +85,14 @@ func (p *CloudProvider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim)
 	if errs := nodeClass.Validate(); len(errs) != 0 {
 		return nil, cloudprovider.NewNodeClassNotReadyError(errs.ToAggregate())
 	}
-	if nodeClass.Spec.ClusterName != p.opts.ClusterName {
-		return nil, cloudprovider.NewNodeClassNotReadyError(fmt.Errorf("NodeClass cluster %q does not match provider cluster %q", nodeClass.Spec.ClusterName, p.opts.ClusterName))
-	}
-	if nodeClass.Spec.Location != p.opts.Location {
-		return nil, cloudprovider.NewNodeClassNotReadyError(fmt.Errorf("NodeClass location %q does not match provider location %q", nodeClass.Spec.Location, p.opts.Location))
+	if err := p.validateNodeClassControllerContract(nodeClass); err != nil {
+		return nil, cloudprovider.NewNodeClassNotReadyError(err)
 	}
 	if err := ensureNodeClassReady(nodeClass); err != nil {
+		return nil, cloudprovider.NewNodeClassNotReadyError(err)
+	}
+	controlPlaneVIP, err := nodeClass.Spec.RKE2.ServerVIP()
+	if err != nil {
 		return nil, cloudprovider.NewNodeClassNotReadyError(err)
 	}
 	instanceTypes, err := instanceTypesFor(nodeClass)
@@ -95,9 +110,9 @@ func (p *CloudProvider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim)
 	}
 	userData, err := bootstrap.RenderCloudInit(bootstrap.Config{
 		NodeName:         nodeClaim.Name,
-		Server:           nodeClass.Spec.K3s.Server,
+		Server:           nodeClass.Spec.RKE2.Server,
 		Token:            token,
-		K3sVersion:       nodeClass.Spec.K3s.Version,
+		RKE2Version:      nodeClass.Spec.RKE2.Version,
 		Labels:           labels,
 		Taints:           append(append([]corev1.Taint{}, nodeClaim.Spec.Taints...), nodeClaim.Spec.StartupTaints...),
 		AdditionalScript: nodeClass.Spec.AdditionalUserData,
@@ -112,28 +127,31 @@ func (p *CloudProvider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim)
 	}
 	memoryGiB := int(instanceType.Capacity.Memory().Value() / (1024 * 1024 * 1024))
 	request := cloudapi.CreateVMRequest{
-		IdempotencyKey:   idempotencyKey,
-		Name:             nodeClaim.Name,
-		ClusterName:      p.opts.ClusterName,
-		BillingAccountID: nodeClass.Spec.BillingAccountID,
-		NodeClaimName:    nodeClaim.Name,
-		Location:         nodeClass.Spec.Location,
-		NetworkUUID:      nodeClass.Spec.NetworkUUID,
-		FirewallUUID:     nodeClass.Spec.FirewallUUID,
-		OSName:           nodeClass.Spec.ImageSelector.OSName,
-		OSVersion:        nodeClass.Spec.ImageSelector.OSVersion,
-		HostPoolUUID:     hostPoolUUID,
-		HostClass:        nodeClass.Spec.HostPoolSelector.Class,
-		InstanceType:     instanceType.Name,
-		VCPU:             int(instanceType.Capacity.Cpu().Value()),
-		MemoryGiB:        memoryGiB,
-		RootDiskGiB:      nodeClass.Spec.RootDiskGiB,
-		PublicIPv4:       nodeClass.Spec.ReservePublicIPv4,
-		SSHUsername:      nodeClass.Spec.SSHUsername,
-		SSHPublicKey:     nodeClass.Spec.SSHPublicKey,
-		CloudInitJSON:    userData,
-		SpecHash:         NodeClassHash(nodeClass),
-		BootstrapHash:    BootstrapHash(nodeClass),
+		IdempotencyKey:               idempotencyKey,
+		Name:                         nodeClaim.Name,
+		ClusterName:                  p.opts.ClusterName,
+		BillingAccountID:             nodeClass.Spec.BillingAccountID,
+		NodeClaimName:                nodeClaim.Name,
+		Location:                     nodeClass.Spec.Location,
+		NetworkUUID:                  nodeClass.Spec.NetworkUUID,
+		ControlPlaneVIP:              controlPlaneVIP.String(),
+		PrivateLoadBalancerPoolStart: nodeClass.Spec.PrivateLoadBalancerPool.Start,
+		PrivateLoadBalancerPoolStop:  nodeClass.Spec.PrivateLoadBalancerPool.Stop,
+		FirewallUUID:                 nodeClass.Spec.FirewallUUID,
+		OSName:                       nodeClass.Spec.ImageSelector.OSName,
+		OSVersion:                    nodeClass.Spec.ImageSelector.OSVersion,
+		HostPoolUUID:                 hostPoolUUID,
+		HostClass:                    nodeClass.Spec.HostPoolSelector.Class,
+		InstanceType:                 instanceType.Name,
+		VCPU:                         int(instanceType.Capacity.Cpu().Value()),
+		MemoryGiB:                    memoryGiB,
+		RootDiskGiB:                  nodeClass.Spec.RootDiskGiB,
+		PublicIPv4:                   nodeClass.Spec.ReservePublicIPv4,
+		SSHUsername:                  nodeClass.Spec.SSHUsername,
+		SSHPublicKey:                 nodeClass.Spec.SSHPublicKey,
+		CloudInitJSON:                userData,
+		SpecHash:                     NodeClassHash(nodeClass),
+		BootstrapHash:                BootstrapHash(nodeClass),
 	}
 	vm, err := p.cloud.CreateVM(ctx, request)
 	if err != nil {
@@ -190,6 +208,9 @@ func (p *CloudProvider) Get(ctx context.Context, value string) (*karpv1.NodeClai
 	if vm.Location != id.Location {
 		return nil, cloudprovider.NewNodeClaimNotFoundError(fmt.Errorf("VM location %q does not match provider ID location %q", vm.Location, id.Location))
 	}
+	if err := p.validateVMControllerContract(vm); err != nil {
+		return nil, err
+	}
 	return nodeClaimFromVM(vm), nil
 }
 
@@ -200,6 +221,9 @@ func (p *CloudProvider) List(ctx context.Context) ([]*karpv1.NodeClaim, error) {
 	}
 	result := make([]*karpv1.NodeClaim, 0, len(vms))
 	for _, vm := range vms {
+		if err := p.validateVMControllerContract(vm); err != nil {
+			return nil, err
+		}
 		result = append(result, nodeClaimFromVM(vm))
 	}
 	return result, nil
@@ -221,8 +245,8 @@ func (p *CloudProvider) GetInstanceTypes(ctx context.Context, nodePool *karpv1.N
 	if errs := nodeClass.Validate(); len(errs) != 0 {
 		return nil, cloudprovider.NewNodeClassNotReadyError(errs.ToAggregate())
 	}
-	if nodeClass.Spec.ClusterName != p.opts.ClusterName {
-		return nil, cloudprovider.NewNodeClassNotReadyError(fmt.Errorf("NodeClass cluster %q does not match provider cluster %q", nodeClass.Spec.ClusterName, p.opts.ClusterName))
+	if err := p.validateNodeClassControllerContract(nodeClass); err != nil {
+		return nil, cloudprovider.NewNodeClassNotReadyError(err)
 	}
 	return instanceTypesFor(nodeClass)
 }
@@ -231,6 +255,9 @@ func (p *CloudProvider) IsDrifted(ctx context.Context, nodeClaim *karpv1.NodeCla
 	nodeClass, err := p.resolveNodeClass(ctx, nodeClaim.Spec.NodeClassRef)
 	if err != nil {
 		return "", err
+	}
+	if err := p.validateNodeClassControllerContract(nodeClass); err != nil {
+		return "", cloudprovider.NewNodeClassNotReadyError(err)
 	}
 	if nodeClaim.Annotations[AnnotationNodeClassHash] != "" && nodeClaim.Annotations[AnnotationNodeClassHash] != NodeClassHash(nodeClass) {
 		return DriftReasonNodeClass, nil
@@ -242,6 +269,43 @@ func (p *CloudProvider) IsDrifted(ctx context.Context, nodeClaim *karpv1.NodeCla
 		return DriftReasonNodeClass, nil
 	}
 	return "", nil
+}
+
+func (p *CloudProvider) validateNodeClassControllerContract(nodeClass *inspacev1.InSpaceNodeClass) error {
+	if nodeClass == nil {
+		return fmt.Errorf("NodeClass is required")
+	}
+	if nodeClass.Spec.ClusterName != p.opts.ClusterName {
+		return fmt.Errorf("NodeClass cluster %q does not match provider cluster %q", nodeClass.Spec.ClusterName, p.opts.ClusterName)
+	}
+	if nodeClass.Spec.Location != p.opts.Location {
+		return fmt.Errorf("NodeClass location %q does not match provider location %q", nodeClass.Spec.Location, p.opts.Location)
+	}
+	if nodeClass.Spec.NetworkUUID != p.opts.NetworkUUID {
+		return fmt.Errorf("NodeClass network %q does not match controller network %q", nodeClass.Spec.NetworkUUID, p.opts.NetworkUUID)
+	}
+	controlPlaneVIP, err := nodeClass.Spec.RKE2.ServerVIP()
+	if err != nil {
+		return err
+	}
+	if controlPlaneVIP.String() != p.opts.ControlPlaneVIP {
+		return fmt.Errorf("NodeClass control-plane VIP %q does not match controller control-plane VIP %q", controlPlaneVIP, p.opts.ControlPlaneVIP)
+	}
+	if nodeClass.Spec.PrivateLoadBalancerPool != p.opts.PrivateLoadBalancerPool {
+		return fmt.Errorf("NodeClass private load-balancer pool %+v does not match controller pool %+v", nodeClass.Spec.PrivateLoadBalancerPool, p.opts.PrivateLoadBalancerPool)
+	}
+	return nil
+}
+
+func (p *CloudProvider) validateVMControllerContract(vm *cloudapi.VM) error {
+	if vm == nil {
+		return fmt.Errorf("cloud VM is required")
+	}
+	if vm.NetworkUUID != p.opts.NetworkUUID || vm.ControlPlaneVIP != p.opts.ControlPlaneVIP ||
+		vm.PrivateLoadBalancerPoolStart != p.opts.PrivateLoadBalancerPool.Start || vm.PrivateLoadBalancerPoolStop != p.opts.PrivateLoadBalancerPool.Stop {
+		return fmt.Errorf("cloud VM %s network, control-plane VIP, or private load-balancer pool does not match controller configuration", vm.UUID)
+	}
+	return nil
 }
 
 func (p *CloudProvider) RepairPolicies() []cloudprovider.RepairPolicy { return nil }
@@ -379,12 +443,12 @@ func BootstrapHash(nodeClass *inspacev1.InSpaceNodeClass) string {
 	data, _ := json.Marshal(struct {
 		Schema             string
 		Image              inspacev1.ImageSelector
-		K3s                inspacev1.K3sConfig
+		RKE2               inspacev1.RKE2Config
 		SSHUsername        string
 		SSHPublicKey       string
 		AdditionalUserData string
 	}{
-		Schema: bootstrap.SchemaVersion, Image: nodeClass.Spec.ImageSelector, K3s: nodeClass.Spec.K3s,
+		Schema: bootstrap.SchemaVersion, Image: nodeClass.Spec.ImageSelector, RKE2: nodeClass.Spec.RKE2,
 		SSHUsername: nodeClass.Spec.SSHUsername, SSHPublicKey: nodeClass.Spec.SSHPublicKey,
 		AdditionalUserData: nodeClass.Spec.AdditionalUserData,
 	})
