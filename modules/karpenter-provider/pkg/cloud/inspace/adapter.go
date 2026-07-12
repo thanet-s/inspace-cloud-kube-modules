@@ -40,6 +40,7 @@ var (
 	errWorkerSupervisorVIPCollision  = errors.New("worker private IPv4 collides with the private RKE2 supervisor VIP")
 	errWorkerServiceVIPPoolCollision = errors.New("worker private IPv4 collides with the reserved private Service VIP pool")
 	errFirewallAssignmentNotVisible  = errors.New("intended worker firewall assignment is not visible")
+	errPersistedOwnershipIncomplete  = errors.New("persisted VM ownership record is incomplete")
 	fixedClusterNetworks             = [...]struct {
 		description string
 		prefix      netip.Prefix
@@ -696,20 +697,128 @@ func validatePersistedVM(vm sdk.VM, vmUUID string, request cloudapi.CreateVMRequ
 	if vm.UUID != vmUUID {
 		return fmt.Errorf("%w: VM detail read-back UUID %q does not match launched VM %q", cloudapi.ErrOwnershipMismatch, vm.UUID, vmUUID)
 	}
-	actual, managed := parseOwnership(vm.Description)
-	if !managed {
-		return fmt.Errorf("%w: VM %s detail read-back lacks a complete persisted Karpenter ownership record", cloudapi.ErrOwnershipMismatch, vmUUID)
+	incomplete := false
+	var actual ownership
+	if err := json.Unmarshal([]byte(vm.Description), &actual); err != nil {
+		incomplete = true
+	} else if actual != expected {
+		if ownershipMatchesExpectedWherePresent(actual, expected) {
+			incomplete = true
+		} else {
+			return fmt.Errorf("%w: VM %s persisted Karpenter ownership differs from the launched NodeClaim", cloudapi.ErrOwnershipMismatch, vmUUID)
+		}
 	}
-	if actual != expected {
-		return fmt.Errorf("%w: VM %s persisted Karpenter ownership differs from the launched NodeClaim", cloudapi.ErrOwnershipMismatch, vmUUID)
-	}
-	if vm.NetworkUUID != "" && vm.NetworkUUID != request.NetworkUUID {
-		return fmt.Errorf("%w: worker VM %s is attached to network %q instead of %q", cloudapi.ErrOwnershipMismatch, vmUUID, vm.NetworkUUID, request.NetworkUUID)
-	}
-	if err := validateExisting(vm, request, actual, expected); err != nil {
+	launchIdentityIncomplete, err := validatePersistedLaunchIdentity(vm, request)
+	if err != nil {
 		return fmt.Errorf("%w: VM %s persisted launch identity differs from the launched NodeClaim: %v", cloudapi.ErrOwnershipMismatch, vmUUID, err)
 	}
+	if incomplete || launchIdentityIncomplete {
+		return fmt.Errorf("%w: VM %s detail read-back lacks complete persisted ownership or launch identity: %w", cloudapi.ErrOwnershipMismatch, vmUUID, errPersistedOwnershipIncomplete)
+	}
 	return nil
+}
+
+// validatePersistedLaunchIdentity returns incomplete=true only when every
+// value the API supplied agrees with the create request but at least one
+// required field is still absent. Any present conflict fails immediately.
+func validatePersistedLaunchIdentity(vm sdk.VM, request cloudapi.CreateVMRequest) (incomplete bool, err error) {
+	checkString := func(field, actual, expected string) error {
+		if actual == "" {
+			incomplete = true
+			return nil
+		}
+		if actual != expected {
+			return fmt.Errorf("%s %q does not match %q", field, actual, expected)
+		}
+		return nil
+	}
+	checkPositive := func(field string, actual, expected int) error {
+		if actual == 0 {
+			incomplete = true
+			return nil
+		}
+		if actual != expected {
+			return fmt.Errorf("%s %d does not match %d", field, actual, expected)
+		}
+		return nil
+	}
+	for _, check := range []func() error{
+		func() error { return checkString("name", vm.Name, request.Name) },
+		func() error { return checkPositive("vCPU", vm.VCPU, request.VCPU) },
+		func() error { return checkPositive("memory MiB", vm.MemoryMiB, request.MemoryGiB*1024) },
+		func() error { return checkString("OS name", vm.OSName, request.OSName) },
+		func() error { return checkString("OS version", vm.OSVersion, request.OSVersion) },
+		func() error { return checkString("designated pool UUID", vm.DesignatedPoolUUID, request.HostPoolUUID) },
+		func() error {
+			if vm.NetworkUUID == "" {
+				incomplete = true
+				return nil
+			}
+			if vm.NetworkUUID != request.NetworkUUID {
+				return fmt.Errorf("worker is attached to network %q instead of %q", vm.NetworkUUID, request.NetworkUUID)
+			}
+			return nil
+		},
+	} {
+		if err := check(); err != nil {
+			return false, err
+		}
+	}
+	if vm.BillingAccountID == 0 {
+		incomplete = true
+	} else if vm.BillingAccountID != request.BillingAccountID {
+		return false, fmt.Errorf("billing account %d does not match %d", vm.BillingAccountID, request.BillingAccountID)
+	}
+	primaryDisks := 0
+	for _, disk := range vm.Storage {
+		if !disk.Primary {
+			continue
+		}
+		primaryDisks++
+		if primaryDisks > 1 {
+			return false, fmt.Errorf("VM reports multiple primary root disks")
+		}
+		if disk.SizeGiB == 0 {
+			incomplete = true
+		} else if disk.SizeGiB != int(request.RootDiskGiB) {
+			return false, fmt.Errorf("primary root disk size %d GiB does not match %d GiB", disk.SizeGiB, request.RootDiskGiB)
+		}
+	}
+	if primaryDisks == 0 {
+		incomplete = true
+	}
+	return incomplete, nil
+}
+
+// ownershipMatchesExpectedWherePresent distinguishes an eventually
+// consistent partial read-back from a complete conflicting ownership record.
+// Empty fields are allowed only as missing evidence; every field the API did
+// return must already agree with the exact record sent on create.
+func ownershipMatchesExpectedWherePresent(actual, expected ownership) bool {
+	return fieldMatchesOrIsMissing(actual.Schema, expected.Schema) &&
+		fieldMatchesOrIsMissing(actual.Cluster, expected.Cluster) &&
+		fieldMatchesOrIsMissing(actual.NodeClaim, expected.NodeClaim) &&
+		fieldMatchesOrIsMissing(actual.KeyHash, expected.KeyHash) &&
+		fieldMatchesOrIsMissing(actual.HostClass, expected.HostClass) &&
+		fieldMatchesOrIsMissing(actual.InstanceType, expected.InstanceType) &&
+		fieldMatchesOrIsMissing(actual.RootDiskGiB, expected.RootDiskGiB) &&
+		fieldMatchesOrIsMissing(actual.SpecHash, expected.SpecHash) &&
+		fieldMatchesOrIsMissing(actual.BootstrapHash, expected.BootstrapHash) &&
+		fieldMatchesOrIsMissing(actual.FirewallUUID, expected.FirewallUUID) &&
+		fieldMatchesOrIsMissing(actual.NetworkUUID, expected.NetworkUUID) &&
+		fieldMatchesOrIsMissing(actual.ControlPlaneVIP, expected.ControlPlaneVIP) &&
+		fieldMatchesOrIsMissing(actual.PrivateLoadBalancerPoolStart, expected.PrivateLoadBalancerPoolStart) &&
+		fieldMatchesOrIsMissing(actual.PrivateLoadBalancerPoolStop, expected.PrivateLoadBalancerPoolStop) &&
+		fieldMatchesOrIsMissing(actual.OSName, expected.OSName) &&
+		fieldMatchesOrIsMissing(actual.OSVersion, expected.OSVersion) &&
+		fieldMatchesOrIsMissing(actual.BillingAccountID, expected.BillingAccountID) &&
+		fieldMatchesOrIsMissing(actual.FloatingIPName, expected.FloatingIPName) &&
+		fieldMatchesOrIsMissing(actual.PublicIPv4, expected.PublicIPv4)
+}
+
+func fieldMatchesOrIsMissing[T comparable](actual, expected T) bool {
+	var zero T
+	return actual == zero || actual == expected
 }
 
 func validateExistingFloatingIP(floatingIP sdk.FloatingIP, record ownership, vmUUID string) error {
@@ -918,23 +1027,26 @@ func (a *Adapter) ensureWorkerPrivateIPv4(ctx context.Context, request cloudapi.
 		} else if vm == nil {
 			return nil, netip.Addr{}, ownershipProven, fmt.Errorf("getting worker VM %s for private IPv4 read-back: API returned no VM", vmUUID)
 		} else {
-			if err := validatePersistedVM(*vm, vmUUID, request, expected); err != nil {
+			if validationErr := validatePersistedVM(*vm, vmUUID, request, expected); errors.Is(validationErr, errPersistedOwnershipIncomplete) {
+				lastObservation = validationErr
+			} else if validationErr != nil {
 				// A conflicting authoritative detail invalidates any sparse-list
 				// ownership signal. The caller must not delete or protect this VM.
-				return nil, netip.Addr{}, false, err
+				return nil, netip.Addr{}, false, validationErr
+			} else {
+				ownershipProven = true
+				privateIPv4, privateIPv4Err := validateWorkerPrivateIPv4(*vm, networkPrefix, controlPlaneVIP, privateLoadBalancerPool)
+				if privateIPv4Err == nil {
+					return vm, privateIPv4, true, nil
+				}
+				if vm.PrivateIPv4 != "" {
+					return nil, netip.Addr{}, true, privateIPv4Err
+				}
+				lastObservation = privateIPv4Err
 			}
-			ownershipProven = true
-			privateIPv4, validationErr := validateWorkerPrivateIPv4(*vm, networkPrefix, controlPlaneVIP, privateLoadBalancerPool)
-			if validationErr == nil {
-				return vm, privateIPv4, true, nil
-			}
-			if vm.PrivateIPv4 != "" {
-				return nil, netip.Addr{}, true, validationErr
-			}
-			lastObservation = validationErr
 		}
 		if err := waitForReadback(readbackCtx, readbackDelay); err != nil {
-			return nil, netip.Addr{}, ownershipProven, fmt.Errorf("VM %s did not obtain exactly one safe private IPv4 before the read-back deadline: %w", vmUUID, errors.Join(lastObservation, err))
+			return nil, netip.Addr{}, ownershipProven, fmt.Errorf("VM %s did not expose complete persisted identity and exactly one safe private IPv4 before the read-back deadline: %w", vmUUID, errors.Join(lastObservation, err))
 		}
 		readbackDelay = nextReadbackDelay(readbackDelay, a.networkAttachmentReadbackMaxDelay)
 	}

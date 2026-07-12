@@ -99,35 +99,176 @@ func TestCreateSparseResponseUsesPersistedVMDetailAuthority(t *testing.T) {
 	}
 }
 
-func TestCreateRejectsUnpersistedOwnershipBeforeProtection(t *testing.T) {
-	tests := map[string]func(string) string{
-		"missing": func(string) string { return "" },
-		"truncated": func(description string) string {
-			return description[:len(description)/2]
+func TestCreateWaitsForIncompletePersistedOwnership(t *testing.T) {
+	remainingIncompleteReads := 2
+	api := &fakeAPI{
+		sparseCreateResponse: true,
+		mutateGetVMResponse: func(vm *sdk.VM) {
+			switch remainingIncompleteReads {
+			case 2:
+				vm.Description = ""
+			case 1:
+				var partial ownership
+				if err := json.Unmarshal([]byte(vm.Description), &partial); err != nil {
+					t.Fatalf("decode ownership fixture: %v", err)
+				}
+				partial.SpecHash = ""
+				encoded, err := json.Marshal(partial)
+				if err != nil {
+					t.Fatalf("encode partial ownership fixture: %v", err)
+				}
+				vm.Description = string(encoded)
+			}
+			if remainingIncompleteReads > 0 {
+				remainingIncompleteReads--
+			}
 		},
-		"mismatched": func(description string) string {
-			var record ownership
-			if err := json.Unmarshal([]byte(description), &record); err != nil {
-				t.Fatalf("decode ownership fixture: %v", err)
+	}
+	adapter, _ := New(api)
+	configureFastNetworkReadback(adapter, 200*time.Millisecond)
+	created, err := adapter.CreateVM(context.Background(), testRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created.UUID != "11111111-1111-4111-8111-111111111111" || api.vmGetCalls != 3 {
+		t.Fatalf("CreateVM() result=%#v GETs=%d, want canonical ownership on the third detail read", created, api.vmGetCalls)
+	}
+	if api.deleteVMCalls != 0 || api.firewallAssignCalls != 1 || api.floatingIPAssignCalls != 1 {
+		t.Fatalf("eventual ownership read-back caused rollback or skipped protection: deletes=%d firewall=%d floatingIP=%d", api.deleteVMCalls, api.firewallAssignCalls, api.floatingIPAssignCalls)
+	}
+}
+
+func TestCreateWaitsForIncompletePersistedLaunchIdentity(t *testing.T) {
+	remainingIncompleteReads := 2
+	api := &fakeAPI{
+		mutateGetVMResponse: func(vm *sdk.VM) {
+			if remainingIncompleteReads == 0 {
+				return
 			}
-			record.SpecHash = "foreign-spec"
-			encoded, err := json.Marshal(record)
-			if err != nil {
-				t.Fatalf("encode ownership fixture: %v", err)
-			}
-			return string(encoded)
+			remainingIncompleteReads--
+			vm.Name = ""
+			vm.VCPU = 0
+			vm.MemoryMiB = 0
+			vm.OSName = ""
+			vm.OSVersion = ""
+			vm.DesignatedPoolUUID = ""
+			vm.NetworkUUID = ""
+			vm.BillingAccountID = 0
+			vm.Storage = nil
+		},
+	}
+	adapter, _ := New(api)
+	configureFastNetworkReadback(adapter, 200*time.Millisecond)
+	created, err := adapter.CreateVM(context.Background(), testRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created.Name != "nodeclaim-a" || created.VCPU != 2 || created.MemoryGiB != 4 || api.vmGetCalls != 3 {
+		t.Fatalf("CreateVM() result=%#v GETs=%d, want complete launch identity on the third detail read", created, api.vmGetCalls)
+	}
+	if api.deleteVMCalls != 0 || api.firewallAssignCalls != 1 || api.floatingIPAssignCalls != 1 {
+		t.Fatalf("eventual launch identity caused rollback or skipped protection: deletes=%d firewall=%d floatingIP=%d", api.deleteVMCalls, api.firewallAssignCalls, api.floatingIPAssignCalls)
+	}
+}
+
+func TestCreateBoundsIncompletePersistedLaunchIdentity(t *testing.T) {
+	api := &fakeAPI{mutateGetVMResponse: func(vm *sdk.VM) { vm.NetworkUUID = "" }}
+	adapter, _ := New(api)
+	configureFastNetworkReadback(adapter, 40*time.Millisecond)
+	_, err := adapter.CreateVM(context.Background(), testRequest())
+	if !errors.Is(err, cloudapi.ErrOwnershipMismatch) || !strings.Contains(err.Error(), "did not expose complete persisted identity") {
+		t.Fatalf("CreateVM() error = %v, want bounded incomplete launch identity failure", err)
+	}
+	if api.vmGetCalls < 2 || api.deleteVMCalls != 1 || len(api.vms) != 0 || len(api.floatingIPs) != 0 {
+		t.Fatalf("bounded launch identity cleanup: GETs=%d deletes=%d VMs=%#v FIPs=%#v", api.vmGetCalls, api.deleteVMCalls, api.vms, api.floatingIPs)
+	}
+	if api.firewallAssignCalls != 0 || api.floatingIPAssignCalls != 0 {
+		t.Fatalf("incomplete launch identity reached protection: firewall=%d floatingIP=%d", api.firewallAssignCalls, api.floatingIPAssignCalls)
+	}
+}
+
+func TestCreateRejectsPresentLaunchIdentityConflictImmediately(t *testing.T) {
+	tests := map[string]func(*sdk.VM){
+		"name": func(vm *sdk.VM) { vm.Name = "foreign" },
+		"name with incomplete ownership": func(vm *sdk.VM) {
+			vm.Description = ""
+			vm.Name = "foreign"
+		},
+		"vCPU":                 func(vm *sdk.VM) { vm.VCPU++ },
+		"memory":               func(vm *sdk.VM) { vm.MemoryMiB++ },
+		"OS name":              func(vm *sdk.VM) { vm.OSName = "debian" },
+		"OS version":           func(vm *sdk.VM) { vm.OSVersion = "22.04" },
+		"designated pool UUID": func(vm *sdk.VM) { vm.DesignatedPoolUUID = "foreign-pool" },
+		"network UUID":         func(vm *sdk.VM) { vm.NetworkUUID = "foreign-network" },
+		"billing account":      func(vm *sdk.VM) { vm.BillingAccountID++ },
+		"root disk size":       func(vm *sdk.VM) { vm.Storage[0].SizeGiB++ },
+		"multiple root disks": func(vm *sdk.VM) {
+			vm.Storage = append(vm.Storage, sdk.VMStorage{SizeGiB: int(testRequest().RootDiskGiB), Primary: true})
 		},
 	}
 	for name, mutate := range tests {
 		t.Run(name, func(t *testing.T) {
-			api := &fakeAPI{persistDescription: mutate}
+			api := &fakeAPI{mutateGetVMResponse: mutate}
 			adapter, _ := New(api)
+			_, err := adapter.CreateVM(context.Background(), testRequest())
+			if !errors.Is(err, cloudapi.ErrOwnershipMismatch) {
+				t.Fatalf("CreateVM() error = %v, want launch identity conflict", err)
+			}
+			if api.vmGetCalls != 1 || api.deleteVMCalls != 1 || len(api.vms) != 0 || len(api.floatingIPs) != 0 {
+				t.Fatalf("present conflict was retried or leaked fresh launch: GETs=%d deletes=%d VMs=%#v FIPs=%#v", api.vmGetCalls, api.deleteVMCalls, api.vms, api.floatingIPs)
+			}
+			if api.firewallAssignCalls != 0 || api.floatingIPAssignCalls != 0 {
+				t.Fatalf("present conflict reached protection: firewall=%d floatingIP=%d", api.firewallAssignCalls, api.floatingIPAssignCalls)
+			}
+		})
+	}
+}
+
+func TestCreateRejectsUnpersistedOwnershipBeforeProtection(t *testing.T) {
+	tests := map[string]struct {
+		mutate     func(string) string
+		incomplete bool
+	}{
+		"missing": {
+			mutate: func(string) string { return "" }, incomplete: true,
+		},
+		"truncated": {
+			mutate: func(description string) string { return description[:len(description)/2] }, incomplete: true,
+		},
+		"mismatched": {
+			mutate: func(description string) string {
+				var record ownership
+				if err := json.Unmarshal([]byte(description), &record); err != nil {
+					t.Fatalf("decode ownership fixture: %v", err)
+				}
+				record.SpecHash = "foreign-spec"
+				encoded, err := json.Marshal(record)
+				if err != nil {
+					t.Fatalf("encode ownership fixture: %v", err)
+				}
+				return string(encoded)
+			},
+		},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			api := &fakeAPI{persistDescription: test.mutate}
+			adapter, _ := New(api)
+			if test.incomplete {
+				configureFastNetworkReadback(adapter, 40*time.Millisecond)
+			}
 			_, err := adapter.CreateVM(context.Background(), testRequest())
 			if !errors.Is(err, cloudapi.ErrOwnershipMismatch) {
 				t.Fatalf("CreateVM() error = %v, want persisted ownership rejection", err)
 			}
-			if len(api.vms) != 0 || len(api.floatingIPs) != 0 || api.createCalls != 1 || api.vmGetCalls != 1 || api.deleteVMCalls != 1 {
+			if len(api.vms) != 0 || len(api.floatingIPs) != 0 || api.createCalls != 1 || api.deleteVMCalls != 1 {
 				t.Fatalf("ownership rejection leaked launched resources: VMs=%#v FIPs=%#v POSTs=%d GETs=%d deletes=%d", api.vms, api.floatingIPs, api.createCalls, api.vmGetCalls, api.deleteVMCalls)
+			}
+			if test.incomplete && api.vmGetCalls < 2 {
+				t.Fatalf("incomplete ownership was not retried within the read-back bound: GETs=%d", api.vmGetCalls)
+			}
+			if !test.incomplete && api.vmGetCalls != 1 {
+				t.Fatalf("complete conflicting ownership was retried: GETs=%d", api.vmGetCalls)
 			}
 			if api.firewallAssignCalls != 0 || api.floatingIPAssignCalls != 0 {
 				t.Fatalf("ownership rejection reached protection mutation: firewall=%d floatingIP=%d", api.firewallAssignCalls, api.floatingIPAssignCalls)
@@ -182,38 +323,64 @@ func TestAmbiguousCreateInvalidListOwnershipNeverProtectsOrDeletesUnprovenVM(t *
 	}
 }
 
-func TestAmbiguousCreateCanonicalOwnershipDisagreementNeverMutatesListMatchedVM(t *testing.T) {
-	tests := map[string]func(*sdk.VM){
-		"missing description":   func(vm *sdk.VM) { vm.Description = "" },
-		"truncated description": func(vm *sdk.VM) { vm.Description = vm.Description[:len(vm.Description)/2] },
-		"mismatched ownership": func(vm *sdk.VM) {
-			var record ownership
-			if err := json.Unmarshal([]byte(vm.Description), &record); err != nil {
-				t.Fatalf("decode ownership fixture: %v", err)
-			}
-			record.SpecHash = "foreign-spec"
-			encoded, err := json.Marshal(record)
-			if err != nil {
-				t.Fatalf("encode ownership fixture: %v", err)
-			}
-			vm.Description = string(encoded)
+func TestAmbiguousCreateCanonicalOwnershipUncertaintyNeverMutatesListMatchedVM(t *testing.T) {
+	tests := map[string]struct {
+		mutate     func(*sdk.VM)
+		incomplete bool
+	}{
+		"missing description": {
+			mutate: func(vm *sdk.VM) { vm.Description = "" }, incomplete: true,
 		},
-		"mismatched UUID": func(vm *sdk.VM) { vm.UUID = "99999999-9999-4999-8999-999999999999" },
+		"truncated description": {
+			mutate: func(vm *sdk.VM) { vm.Description = vm.Description[:len(vm.Description)/2] }, incomplete: true,
+		},
+		"missing launch identity": {
+			mutate: func(vm *sdk.VM) { vm.DesignatedPoolUUID = "" }, incomplete: true,
+		},
+		"mismatched ownership": {
+			mutate: func(vm *sdk.VM) {
+				var record ownership
+				if err := json.Unmarshal([]byte(vm.Description), &record); err != nil {
+					t.Fatalf("decode ownership fixture: %v", err)
+				}
+				record.SpecHash = "foreign-spec"
+				encoded, err := json.Marshal(record)
+				if err != nil {
+					t.Fatalf("encode ownership fixture: %v", err)
+				}
+				vm.Description = string(encoded)
+			},
+		},
+		"mismatched UUID": {
+			mutate: func(vm *sdk.VM) { vm.UUID = "99999999-9999-4999-8999-999999999999" },
+		},
+		"mismatched name": {
+			mutate: func(vm *sdk.VM) { vm.Name = "foreign" },
+		},
 	}
-	for name, mutate := range tests {
+	for name, test := range tests {
 		t.Run(name, func(t *testing.T) {
 			api := &fakeAPI{
 				createErr:           errors.New("connection reset after request"),
 				commitOnCreateError: true,
-				mutateGetVMResponse: mutate,
+				mutateGetVMResponse: test.mutate,
 			}
 			adapter, _ := New(api)
+			if test.incomplete {
+				configureFastNetworkReadback(adapter, 40*time.Millisecond)
+			}
 			_, err := adapter.CreateVM(context.Background(), testRequest())
 			if !errors.Is(err, cloudapi.ErrOwnershipMismatch) {
 				t.Fatalf("CreateVM() error = %v, want canonical ownership rejection", err)
 			}
-			if len(api.vms) != 1 || api.createCalls != 1 || api.vmGetCalls != 1 || api.deleteVMCalls != 0 {
+			if len(api.vms) != 1 || api.createCalls != 1 || api.deleteVMCalls != 0 {
 				t.Fatalf("canonical disagreement retried or deleted list-matched VM: VMs=%#v POSTs=%d GETs=%d deletes=%d", api.vms, api.createCalls, api.vmGetCalls, api.deleteVMCalls)
+			}
+			if test.incomplete && api.vmGetCalls < 2 {
+				t.Fatalf("incomplete canonical ownership was not retried: GETs=%d", api.vmGetCalls)
+			}
+			if !test.incomplete && api.vmGetCalls != 1 {
+				t.Fatalf("complete canonical ownership conflict was retried: GETs=%d", api.vmGetCalls)
 			}
 			if record, managed := parseOwnership(api.vms[0].Description); !managed || record.SpecHash != "spec-a" {
 				t.Fatalf("ListVMs fixture did not retain exact ownership: %#v, managed=%t", record, managed)
@@ -1683,7 +1850,8 @@ func (f *fakeAPI) CreateVM(_ context.Context, _ string, request sdk.CreateVMRequ
 		UUID: "11111111-1111-4111-8111-111111111111", Name: request.Name, Description: request.Description,
 		Status: "provisioning", VCPU: request.VCPU, MemoryMiB: request.MemoryMiB, OSName: request.OSName,
 		OSVersion: request.OSVersion, DesignatedPoolUUID: request.DesignatedPoolUUID, NetworkUUID: request.NetworkUUID,
-		Storage: []sdk.VMStorage{{SizeGiB: request.DiskGiB, Primary: true}},
+		BillingAccountID: request.BillingAccountID,
+		Storage:          []sdk.VMStorage{{SizeGiB: request.DiskGiB, Primary: true}},
 	}
 	vm.PrivateIPv4 = f.createdPrivateIPv4
 	if vm.PrivateIPv4 == "" {
