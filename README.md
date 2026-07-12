@@ -9,9 +9,8 @@ This monorepo contains four independently buildable Go modules:
 | `modules/csi-driver` | RWO-only CSI controller and node plugin |
 | `modules/karpenter-provider` | Karpenter `InSpaceNodeClass`, instance catalog, and elastic RKE2 worker lifecycle |
 
-The repository root owns all source, tests, manifests, and E2E tooling.
-`go.work` links the four modules for local development while their separate
-`go.mod` files keep controller dependencies bounded.
+For local setup, verification, and live-test workflows, see the
+[development guide](DEVELOPMENT.md).
 
 ## Network contract
 
@@ -51,9 +50,8 @@ Private Services use `loadBalancerClass: io.cilium/l2-announcer` and
 ARP inside the VPC. Bootstrap sets `defaultLBServiceIPAM: none` so Cilium only
 claims its explicit class and cannot race the generic external CCM. Cilium Node
 IPAM remains disabled, and the `io.cilium/node` class is not supported. A
-public InSpace NLB remains available only as an explicit,
-TCP-only paid option with the public scope label and annotation documented in
-the chart examples.
+public InSpace NLB remains available only as an explicit, TCP-only paid option
+with the public scope label and annotation documented in the chart examples.
 
 The operator must reserve an inclusive 16-256-address RFC1918 range for Cilium
 LB IPAM and exclude it from InSpace VM and NLB allocation. The current InSpace
@@ -61,8 +59,8 @@ API has no range-reservation operation, so the bootstrap and controllers
 validate and fail closed on collisions but cannot create the reservation.
 Treat the range as immutable after cluster creation: changing a live Cilium
 pool can reassign Service VIPs. L2 Announcements is a Cilium beta feature and
-requires the InSpace VPC to accept ARP and gratuitous ARP for VIPs not assigned to a VM NIC;
-prove that behavior in release acceptance before production use.
+requires the InSpace VPC to accept ARP and gratuitous ARP for VIPs not assigned
+to a VM NIC; prove that behavior in release acceptance before production use.
 The workload chart also requires `global.inspace.controlPlaneVIP`, matching the
 bootstrap kube-vip address, so CCM can reject a public NLB private-address
 collision with either that VIP or the Cilium pool. It passes the same VPC UUID,
@@ -76,39 +74,12 @@ IP. The full-cluster acceptance test also binds that UUID to the Kubernetes
 Node provider ID and verifies its sole `InternalIP` is inside the same VPC
 subnet.
 
-## Safety contract
-
-- Automated tests and smoke tests must use loopback/in-memory fake APIs.
-- Live discovery is read-only and must be explicitly selected.
-- Live lifecycle tests are separate from normal tests, require both
-  `INSPACE_RUN_LIVE_TESTS=true` and `INSPACE_ALLOW_REMOTE_MUTATIONS=true`, use
-  unique resource names, and clean up everything they create.
-- Mutating requests are denied for `api.inspace.cloud` by default in the shared client.
-- API tokens must never be committed, written to fixtures, or printed in logs.
-
-Copy [`.env.example`](.env.example) to `.env` for local credentials. The real
-workspace `.env` is ignored and should have mode `0600`.
-
-## Commands
-
-```sh
-make test
-make smoke
-make verify
-make helm-verify
-make status
-```
-
-`make smoke` runs only fake-cloud lifecycle tests. It does not require an InSpace API token.
-
 ## Helm and releases
 
 Production artifacts are published from SemVer tags as three GHCR images and
 two OCI Helm charts. Images target `linux/amd64` by default because current
-InSpace Intel and AMD instances are x86-64. Native `linux/arm64` CI and release
-jobs remain available through the `ENABLE_ARM64_IMAGES=true` repository
-variable. Install the CRD chart first, then install the workload chart into
-`kube-system`:
+InSpace Intel and AMD instances are x86-64. Install the CRD chart first, then
+install the workload chart into `kube-system`:
 
 ```sh
 helm upgrade --install inspace-cloud-kube-modules-crds \
@@ -131,40 +102,3 @@ the [private L2 Service example](charts/inspace-cloud-kube-modules/examples/serv
 the [public NLB Service example](charts/inspace-cloud-kube-modules/examples/service-public-nlb.yaml),
 the [chart guide](charts/inspace-cloud-kube-modules/README.md), and the
 [release process](RELEASING.md).
-
-The isolated-account lifecycle suite is deliberately separate. It creates
-only resources named `inspace-e2e-*`, preserves firewall protection when a
-delete is uncertain, and performs a zero-leftover audit before and after:
-
-```sh
-make live-audit
-CONFIRM_INSPACE_LIVE_TEST="$INSPACE_BILLING_ACCOUNT_ID" make live-test
-```
-
-The root `.env` supplies local test-account values and is mode `0600`, ignored
-by Git, and excluded from every Docker build context. The live suite covers API
-resource lifecycles for VM/firewall/floating-IP/TCP-NLB/block-disk and the real
-Karpenter adapter.
-
-From the matching source checkout, the separate destructive release-acceptance
-suite installs an exact published version and proves the complete cluster
-lifecycle: three stock-Ubuntu RKE2 control planes with embedded etcd, Cilium
-native routing and kube-proxy replacement, CCM node identity, one Karpenter
-worker in the configured VPC, public-IP egress and RKE2
-join, an RWO CSI volume that keeps data through pod replacement, and a public
-TCP NLB response. It then performs an exact-ownership, zero-leftover cloud
-audit:
-
-```sh
-export INSPACE_E2E_VERSION='<published-version>'
-export CONFIRM_INSPACE_CLUSTER_E2E="$INSPACE_BILLING_ACCOUNT_ID"
-./test/e2e/run.sh
-```
-
-The host entrypoint only builds and starts the pinned E2E runner image. The
-Ansible controller, private-node access through the minimal bastion, Helm, and
-Kubernetes clients all run inside that container; the host never runs the live
-test toolchain.
-
-See the [full-cluster E2E guide](test/e2e/README.md) for prerequisites and the
-fail-closed cleanup contract.
