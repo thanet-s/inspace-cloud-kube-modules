@@ -1,6 +1,6 @@
 SHELL := /bin/sh
 
-MODULES := modules/cloud-provider modules/csi-driver modules/karpenter-provider
+MODULES := modules/client modules/cloud-provider modules/csi-driver modules/karpenter-provider
 
 .PHONY: all fmt test smoke vet helm-verify helm-package verify images status live-audit live-test cluster-e2e
 
@@ -56,7 +56,7 @@ helm-package: helm-verify
 verify: test smoke vet helm-verify
 
 images:
-	docker build --platform=linux/amd64 -f modules/cloud-provider/Dockerfile -t inspace-cloud-controller-manager:dev modules/cloud-provider
+	docker build --platform=linux/amd64 -f modules/cloud-provider/Dockerfile -t inspace-cloud-controller-manager:dev .
 	docker build --platform=linux/amd64 -f modules/csi-driver/Dockerfile -t inspace-csi-driver:dev .
 	docker build --platform=linux/amd64 -f modules/karpenter-provider/Dockerfile -t karpenter-provider-inspace:dev .
 

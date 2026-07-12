@@ -6,7 +6,13 @@ ARG TARGETOS
 ARG TARGETARCH
 
 WORKDIR /workspace
-COPY modules/cloud-provider/ ./cloud-provider/
+COPY modules/client/go.mod ./client/
+COPY modules/csi-driver/go.mod modules/csi-driver/go.sum ./csi-driver/
+WORKDIR /workspace/csi-driver
+RUN GOWORK=off go mod download
+
+WORKDIR /workspace
+COPY modules/client/ ./client/
 COPY modules/csi-driver/ ./csi-driver/
 WORKDIR /workspace/csi-driver
 RUN GOWORK=off CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags='-s -w' -o /out/inspace-csi-driver ./cmd/inspace-csi-driver

@@ -17,7 +17,7 @@ import (
 	utilvalidation "k8s.io/apimachinery/pkg/util/validation"
 	cloud "k8s.io/cloud-provider"
 
-	"github.com/thanet-s/inspace-cloud-kube-modules/modules/cloud-provider/pkg/inspace"
+	"github.com/thanet-s/inspace-cloud-kube-modules/modules/client"
 	"github.com/thanet-s/inspace-cloud-kube-modules/modules/cloud-provider/pkg/providerid"
 )
 

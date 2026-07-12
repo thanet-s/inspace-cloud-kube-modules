@@ -2,6 +2,7 @@
 
 /.github/ @thanet-s
 /charts/ @thanet-s
+/modules/client/ @thanet-s
 /modules/cloud-provider/ @thanet-s
 /modules/csi-driver/ @thanet-s
 /modules/karpenter-provider/ @thanet-s

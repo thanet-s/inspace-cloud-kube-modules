@@ -6,16 +6,16 @@ ARG TARGETOS=linux
 ARG TARGETARCH=amd64
 
 WORKDIR /src
-COPY modules/cloud-provider/go.mod modules/cloud-provider/go.sum ./cloud-provider/
+COPY modules/client/go.mod ./client/
 COPY modules/karpenter-provider/go.mod modules/karpenter-provider/go.sum ./karpenter-provider/
 WORKDIR /src/karpenter-provider
-RUN go mod download
+RUN GOWORK=off go mod download
 
 WORKDIR /src
-COPY modules/cloud-provider ./cloud-provider
+COPY modules/client ./client
 COPY modules/karpenter-provider ./karpenter-provider
 WORKDIR /src/karpenter-provider
-RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags="-s -w" -o /out/karpenter-provider-inspace ./cmd/controller
+RUN GOWORK=off CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags="-s -w" -o /out/karpenter-provider-inspace ./cmd/controller
 
 FROM gcr.io/distroless/static-debian12:nonroot
 LABEL org.opencontainers.image.title="Karpenter Provider for InSpace Cloud" \

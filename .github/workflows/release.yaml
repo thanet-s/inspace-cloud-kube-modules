@@ -98,7 +98,7 @@ jobs:
             runner: ubuntu-26.04
             title: InSpace Cloud Controller Manager
             description: External Kubernetes cloud controller manager for InSpace Cloud
-            context: modules/cloud-provider
+            context: .
             dockerfile: modules/cloud-provider/Dockerfile
           - image: inspace-cloud-controller-manager
             arch: arm64
@@ -106,7 +106,7 @@ jobs:
             runner: ubuntu-26.04-arm
             title: InSpace Cloud Controller Manager
             description: External Kubernetes cloud controller manager for InSpace Cloud
-            context: modules/cloud-provider
+            context: .
             dockerfile: modules/cloud-provider/Dockerfile
           - image: inspace-csi-driver
             arch: amd64

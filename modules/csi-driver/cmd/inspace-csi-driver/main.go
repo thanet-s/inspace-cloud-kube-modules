@@ -10,7 +10,7 @@ import (
 	"strings"
 	"syscall"
 
-	sdk "github.com/thanet-s/inspace-cloud-kube-modules/modules/cloud-provider/pkg/inspace"
+	sdk "github.com/thanet-s/inspace-cloud-kube-modules/modules/client"
 	"github.com/thanet-s/inspace-cloud-kube-modules/modules/csi-driver/pkg/cloud"
 	cloudfake "github.com/thanet-s/inspace-cloud-kube-modules/modules/csi-driver/pkg/cloud/fake"
 	cloudinspace "github.com/thanet-s/inspace-cloud-kube-modules/modules/csi-driver/pkg/cloud/inspace"

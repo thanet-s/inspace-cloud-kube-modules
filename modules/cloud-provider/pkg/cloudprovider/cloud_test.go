@@ -8,7 +8,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
-	"github.com/thanet-s/inspace-cloud-kube-modules/modules/cloud-provider/pkg/inspace"
+	"github.com/thanet-s/inspace-cloud-kube-modules/modules/client"
 )
 
 const (

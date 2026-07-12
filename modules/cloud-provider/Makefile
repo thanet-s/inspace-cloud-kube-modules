@@ -12,7 +12,6 @@ test:
 	GOWORK=$(GOWORK) go test ./...
 
 smoke:
-	GOWORK=$(GOWORK) go test ./pkg/inspace -run '^TestSmoke$$' -count=1 -v
 	GOWORK=$(GOWORK) go test ./pkg/bootstrap -run '^TestReconcileBuildsExactlyThreeProtectedControlPlaneVMs$$' -count=1 -v
 	GOWORK=$(GOWORK) go test ./pkg/cloudprovider -run '^TestPublicLoadBalancerUsesExplicitOwnedFloatingIP$$' -count=1 -v
 
@@ -35,7 +34,7 @@ build:
 	GOWORK=$(GOWORK) go build -o bin/inspace-discovery ./cmd/inspace-discovery
 
 image:
-	docker build --platform=$(IMAGE_PLATFORM) -t "$${INSPACE_CCM_IMAGE:-ghcr.io/thanet-s/inspace-cloud-controller-manager:dev}" .
+	docker build --platform=$(IMAGE_PLATFORM) -f Dockerfile -t "$${INSPACE_CCM_IMAGE:-ghcr.io/thanet-s/inspace-cloud-controller-manager:dev}" ../..
 
 clean:
 	rm -rf bin coverage.out

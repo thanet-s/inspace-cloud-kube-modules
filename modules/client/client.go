@@ -1,5 +1,5 @@
 // Package inspace implements the location-aware subset of the InSpace Cloud API
-// used by the bootstrap controller and cloud-controller-manager.
+// shared by the cloud provider, CSI driver, and Karpenter provider.
 package inspace
 
 import (

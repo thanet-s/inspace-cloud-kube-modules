@@ -11,7 +11,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/operator"
 
-	sdk "github.com/thanet-s/inspace-cloud-kube-modules/modules/cloud-provider/pkg/inspace"
+	sdk "github.com/thanet-s/inspace-cloud-kube-modules/modules/client"
 	inspacev1 "github.com/thanet-s/inspace-cloud-kube-modules/modules/karpenter-provider/pkg/apis/v1alpha1"
 	inspacecloud "github.com/thanet-s/inspace-cloud-kube-modules/modules/karpenter-provider/pkg/cloud/inspace"
 	nodeclasscontroller "github.com/thanet-s/inspace-cloud-kube-modules/modules/karpenter-provider/pkg/controllers/nodeclass"

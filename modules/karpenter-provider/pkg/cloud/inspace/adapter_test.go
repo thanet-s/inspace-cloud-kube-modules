@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	sdk "github.com/thanet-s/inspace-cloud-kube-modules/modules/cloud-provider/pkg/inspace"
+	sdk "github.com/thanet-s/inspace-cloud-kube-modules/modules/client"
 	cloudapi "github.com/thanet-s/inspace-cloud-kube-modules/modules/karpenter-provider/pkg/cloud"
 )
 

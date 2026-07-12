@@ -2,8 +2,8 @@
 !modules
 !modules/client
 !modules/client/**
-!modules/csi-driver
-!modules/csi-driver/**
+!modules/cloud-provider
+!modules/cloud-provider/**
 **/.git
 **/.DS_Store
 **/.env

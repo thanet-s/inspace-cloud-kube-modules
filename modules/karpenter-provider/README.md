@@ -127,4 +127,4 @@ the matching provider ID, and one private `InternalIP` inside that VPC subnet;
 then it schedules the RWO/TCP-NLB workload and requires zero owned resources
 after teardown.
 
-The local `replace github.com/thanet-s/inspace-cloud-kube-modules/modules/cloud-provider => ../cloud-provider` resolves the shared SDK module inside this monorepo.
+The local `replace github.com/thanet-s/inspace-cloud-kube-modules/modules/client => ../client` resolves the Kubernetes-independent shared API client inside this monorepo.

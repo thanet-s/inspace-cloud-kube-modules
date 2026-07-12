@@ -21,12 +21,18 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          - module: client
+            directory: modules/client
+            cache_dependency_path: modules/client/go.mod
           - module: cloud-provider
             directory: modules/cloud-provider
+            cache_dependency_path: modules/cloud-provider/go.sum
           - module: csi-driver
             directory: modules/csi-driver
+            cache_dependency_path: modules/csi-driver/go.sum
           - module: karpenter-provider
             directory: modules/karpenter-provider
+            cache_dependency_path: modules/karpenter-provider/go.sum
     steps:
       - name: Check out source
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -36,7 +42,7 @@ jobs:
         with:
           go-version-file: ${{ matrix.directory }}/go.mod
           cache: true
-          cache-dependency-path: ${{ matrix.directory }}/go.sum
+          cache-dependency-path: ${{ matrix.cache_dependency_path }}
 
       - name: Check formatting
         working-directory: ${{ matrix.directory }}
@@ -61,11 +67,11 @@ jobs:
           GOWORK: "off"
         run: go vet ./...
 
-      - name: Build commands
+      - name: Build packages
         working-directory: ${{ matrix.directory }}
         env:
           GOWORK: "off"
-        run: go build ./cmd/...
+        run: go build ./...
 
       - name: Scan for known vulnerabilities
         working-directory: ${{ matrix.directory }}
@@ -85,13 +91,13 @@ jobs:
             arch: amd64
             platform: linux/amd64
             runner: ubuntu-26.04
-            context: modules/cloud-provider
+            context: .
             dockerfile: modules/cloud-provider/Dockerfile
           - image: inspace-cloud-controller-manager
             arch: arm64
             platform: linux/arm64
             runner: ubuntu-26.04-arm
-            context: modules/cloud-provider
+            context: .
             dockerfile: modules/cloud-provider/Dockerfile
           - image: inspace-csi-driver
             arch: amd64
@@ -152,6 +158,7 @@ jobs:
         run: |
           set -euo pipefail
           for directory in \
+            modules/client \
             modules/cloud-provider \
             modules/csi-driver \
             modules/karpenter-provider \

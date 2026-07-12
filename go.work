@@ -1,6 +1,7 @@
 go 1.26.5
 
 use (
+	./modules/client
 	./modules/cloud-provider
 	./modules/csi-driver
 	./modules/karpenter-provider
