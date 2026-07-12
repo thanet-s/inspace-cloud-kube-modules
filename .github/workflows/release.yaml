@@ -21,6 +21,7 @@ jobs:
     outputs:
       version: ${{ steps.semver.outputs.version }}
       prerelease: ${{ steps.semver.outputs.prerelease }}
+      arm64_images: ${{ steps.platforms.outputs.arm64_images }}
     steps:
       - name: Require a SemVer tag
         id: semver
@@ -40,6 +41,20 @@ jobs:
           else
             echo "prerelease=false" >>"$GITHUB_OUTPUT"
           fi
+
+      - name: Select release image platforms
+        id: platforms
+        shell: bash
+        env:
+          ENABLE_ARM64_IMAGES: ${{ vars.ENABLE_ARM64_IMAGES }}
+        run: |
+          set -euo pipefail
+          arm64_images=false
+          if [[ "$ENABLE_ARM64_IMAGES" == "true" ]]; then
+            arm64_images=true
+          fi
+          echo "arm64_images=$arm64_images" >>"$GITHUB_OUTPUT"
+          echo "ARM64 image publication: $arm64_images"
 
       - name: Refuse to republish a completed release
         shell: bash
@@ -83,7 +98,7 @@ jobs:
   image-platforms:
     name: Native image / ${{ matrix.image }} / ${{ matrix.arch }}
     needs: [validate, quality]
-    runs-on: ${{ matrix.runner }}
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-26.04-arm' || 'ubuntu-26.04' }}
     permissions:
       contents: read
       packages: write
@@ -92,51 +107,25 @@ jobs:
       fail-fast: false
       # GitHub-hosted Ubuntu 26.04 runners are currently public preview.
       matrix:
+        # InSpace currently offers x86-64 CPUs. Keep native ARM64 publication
+        # available without paying its release cost until it is needed.
+        image:
+          - inspace-cloud-controller-manager
+          - inspace-csi-driver
+          - karpenter-provider-inspace
+        arch: ${{ fromJSON(needs.validate.outputs.arm64_images == 'true' && '["amd64","arm64"]' || '["amd64"]') }}
         include:
           - image: inspace-cloud-controller-manager
-            arch: amd64
-            platform: linux/amd64
-            runner: ubuntu-26.04
-            title: InSpace Cloud Controller Manager
-            description: External Kubernetes cloud controller manager for InSpace Cloud
-            context: .
-            dockerfile: modules/cloud-provider/Dockerfile
-          - image: inspace-cloud-controller-manager
-            arch: arm64
-            platform: linux/arm64
-            runner: ubuntu-26.04-arm
             title: InSpace Cloud Controller Manager
             description: External Kubernetes cloud controller manager for InSpace Cloud
             context: .
             dockerfile: modules/cloud-provider/Dockerfile
           - image: inspace-csi-driver
-            arch: amd64
-            platform: linux/amd64
-            runner: ubuntu-26.04
-            title: InSpace CSI Driver
-            description: Kubernetes RWO block storage CSI driver for InSpace Cloud
-            context: .
-            dockerfile: modules/csi-driver/Dockerfile
-          - image: inspace-csi-driver
-            arch: arm64
-            platform: linux/arm64
-            runner: ubuntu-26.04-arm
             title: InSpace CSI Driver
             description: Kubernetes RWO block storage CSI driver for InSpace Cloud
             context: .
             dockerfile: modules/csi-driver/Dockerfile
           - image: karpenter-provider-inspace
-            arch: amd64
-            platform: linux/amd64
-            runner: ubuntu-26.04
-            title: Karpenter Provider for InSpace Cloud
-            description: Karpenter provider for elastic RKE2 workers on InSpace Cloud
-            context: .
-            dockerfile: modules/karpenter-provider/Dockerfile
-          - image: karpenter-provider-inspace
-            arch: arm64
-            platform: linux/arm64
-            runner: ubuntu-26.04-arm
             title: Karpenter Provider for InSpace Cloud
             description: Karpenter provider for elastic RKE2 workers on InSpace Cloud
             context: .
@@ -175,13 +164,13 @@ jobs:
             org.opencontainers.image.version=${{ needs.validate.outputs.version }}
             org.opencontainers.image.revision=${{ github.sha }}
 
-      - name: Build and push ${{ matrix.platform }} image by digest
+      - name: Build and push linux/${{ matrix.arch }} image by digest
         id: build
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: ${{ matrix.context }}
           file: ${{ matrix.dockerfile }}
-          platforms: ${{ matrix.platform }}
+          platforms: linux/${{ matrix.arch }}
           labels: ${{ steps.meta.outputs.labels }}
           sbom: true
           provenance: false
@@ -276,14 +265,21 @@ jobs:
         id: merge
         shell: bash
         env:
+          ENABLE_ARM64_IMAGES: ${{ needs.validate.outputs.arm64_images }}
           IMAGE: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
           METADATA_JSON: ${{ steps.meta.outputs.json }}
         run: |
           set -euo pipefail
           shopt -s nullglob
+          expected_arches=(amd64)
+          if [[ "$ENABLE_ARM64_IMAGES" == "true" ]]; then
+            expected_arches+=(arm64)
+          fi
+          expected_platforms="${#expected_arches[@]}"
+
           digest_files=(/tmp/platform-digests/*)
-          if (( ${#digest_files[@]} != 2 )); then
-            echo "expected two platform digests, found ${#digest_files[@]}" >&2
+          if (( ${#digest_files[@]} != expected_platforms )); then
+            echo "expected $expected_platforms platform digest(s), found ${#digest_files[@]}" >&2
             exit 1
           fi
 
@@ -340,19 +336,41 @@ jobs:
             fi
 
             valid_index=true
-            for arch in amd64 arm64; do
-              if ! jq -e --arg arch "$arch" \
-                'any(.manifests[]?; .platform.os == "linux" and .platform.architecture == $arch)' \
-                /tmp/final-index.json >/dev/null; then
-                echo "merged image index is missing linux/$arch" >&2
+            linux_platforms="$(jq \
+              '[.manifests[]? | select(.platform.os == "linux")] | length' \
+              /tmp/final-index.json)"
+            if (( linux_platforms != expected_platforms )); then
+              echo "merged image index has $linux_platforms Linux platform(s); expected $expected_platforms" >&2
+              valid_index=false
+            fi
+            for arch in "${expected_arches[@]}"; do
+              arch_count="$(jq --arg arch "$arch" \
+                '[.manifests[]? | select(.platform.os == "linux" and .platform.architecture == $arch)] | length' \
+                /tmp/final-index.json)"
+              if (( arch_count != 1 )); then
+                echo "merged image index has $arch_count linux/$arch manifest(s); expected one" >&2
+                valid_index=false
+                continue
+              fi
+              arch_digest="$(jq -r --arg arch "$arch" \
+                '.manifests[]? | select(.platform.os == "linux" and .platform.architecture == $arch) | .digest' \
+                /tmp/final-index.json)"
+              arch_sbom_count="$(jq --arg digest "$arch_digest" \
+                '[.manifests[]? | select(
+                  .annotations["vnd.docker.reference.type"] == "attestation-manifest" and
+                  .annotations["vnd.docker.reference.digest"] == $digest
+                )] | length' \
+                /tmp/final-index.json)"
+              if (( arch_sbom_count != 1 )); then
+                echo "merged image index has $arch_sbom_count SBOM attestation(s) for linux/$arch; expected one" >&2
                 valid_index=false
               fi
             done
             sbom_count="$(jq \
               '[.manifests[]? | select(.annotations["vnd.docker.reference.type"] == "attestation-manifest")] | length' \
               /tmp/final-index.json)"
-            if (( sbom_count < 2 )); then
-              echo "merged image index did not retain both platform SBOM attestations" >&2
+            if (( sbom_count != expected_platforms )); then
+              echo "merged image index retained $sbom_count SBOM attestation(s); expected $expected_platforms" >&2
               valid_index=false
             fi
 

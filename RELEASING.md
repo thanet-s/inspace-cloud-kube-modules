@@ -11,20 +11,23 @@ single version for the three controller images and both Helm charts.
 3. Create and push an annotated tag such as `v0.1.0` (or `v0.2.0-rc.1`).
 4. The release workflow requires the tag target to be reachable from `main`
    and reruns the complete CI workflow against the tagged source.
-5. It builds `linux/amd64` and `linux/arm64` images, pushes versioned GHCR
-   tags, attaches SBOM and keyless GitHub build-provenance attestations, and
-   publishes and attests both OCI charts.
+5. It builds `linux/amd64` images by default, pushes versioned GHCR tags,
+   attaches SBOM and keyless GitHub build-provenance attestations, and
+   publishes and attests both OCI charts. Native `linux/arm64` builds remain
+   available by setting the repository variable `ENABLE_ARM64_IMAGES=true`.
 6. Only after every image and chart succeeds does the workflow create a draft,
    attach chart archives, `SHA256SUMS`, and immutable image-digest records,
    then publish the GitHub release. Repository release immutability prevents a
    published release or tag from being changed afterward.
 
-Image builds are native on GitHub's `ubuntu-26.04` amd64 and
-`ubuntu-26.04-arm` arm64 runners; the workflow does not use QEMU. The manifest
-job combines the two platform digests into one multi-architecture tag only
-after both builds succeed. Lightweight tag validation, CI Helm verification,
-and final-release jobs use `ubuntu-slim` where the larger image toolchain is
-unnecessary.
+Image builds are native on GitHub's `ubuntu-26.04` amd64 runner. When
+`ENABLE_ARM64_IMAGES` is exactly `true`, the same CI and release workflows add
+native `ubuntu-26.04-arm` jobs; the workflows never use QEMU. The manifest job
+requires exactly the enabled platform set and its matching SBOM attestations
+before publishing the version tag. Unset, `false`, and every value other than
+exactly `true` mean amd64 only. Lightweight tag validation, CI Helm
+verification, and final-release jobs use `ubuntu-slim` where the larger image
+toolchain is unnecessary.
 
 Before promoting a release candidate to stable:
 
