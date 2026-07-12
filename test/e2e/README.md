@@ -3,7 +3,7 @@
 This is the destructive release-acceptance suite for the complete InSpace
 stack. The host entrypoint is intentionally only a Docker launcher: Ansible,
 Helm, kubectl, SSH, curl, provisioning, live assertions, and cleanup all run
-inside a purpose-built Ubuntu 24.04 controller image. The destructive image
+inside a purpose-built Ubuntu 26.04 controller image. The destructive image
 copies its bootstrap binary from the exact published CCM image tag; a separate
 non-live target compiles local source for CI. The host needs no Go toolchain,
 and nothing is installed or executed directly on it except Docker.

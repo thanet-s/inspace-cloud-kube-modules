@@ -103,9 +103,12 @@ make status
 
 ## Helm and releases
 
-Production artifacts are published from SemVer tags as three multi-platform
-GHCR images and two OCI Helm charts. Install the CRD chart first, then install
-the workload chart into `kube-system`:
+Production artifacts are published from SemVer tags as three GHCR images and
+two OCI Helm charts. Images target `linux/amd64` by default because current
+InSpace Intel and AMD instances are x86-64. Native `linux/arm64` CI and release
+jobs remain available through the `ENABLE_ARM64_IMAGES=true` repository
+variable. Install the CRD chart first, then install the workload chart into
+`kube-system`:
 
 ```sh
 helm upgrade --install inspace-cloud-kube-modules-crds \

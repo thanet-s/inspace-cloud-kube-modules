@@ -45,7 +45,7 @@ func TestClusterE2EHostEntrypointOnlyLaunchesDocker(t *testing.T) {
 	dockerfile := readE2E(t, "Dockerfile")
 	entrypoint := readE2E(t, "scripts/container-entrypoint.sh")
 	for _, expected := range []string{
-		"FROM ubuntu:24.04",
+		"FROM ubuntu:26.04",
 		"COPY test/e2e /opt/e2e",
 		`ENTRYPOINT ["/usr/bin/tini", "-g", "--", "/opt/e2e/scripts/container-entrypoint.sh"]`,
 		"FROM base AS local-validation",
