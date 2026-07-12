@@ -1,6 +1,6 @@
 apiVersion: v2
 name: inspace-cloud-kube-modules
-description: InSpace Cloud CCM, CSI driver, and Karpenter provider for K3s
+description: InSpace Cloud CCM, CSI driver, and Karpenter provider for RKE2
 type: application
 version: 0.1.0
 appVersion: "0.1.0"

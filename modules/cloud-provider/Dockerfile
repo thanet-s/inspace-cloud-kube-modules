@@ -2,8 +2,8 @@
 #   docker build -f modules/cloud-provider/Dockerfile -t inspace-cloud-controller-manager:dev .
 FROM --platform=$BUILDPLATFORM golang:1.26.5 AS build
 
-ARG TARGETOS=linux
-ARG TARGETARCH=amd64
+ARG TARGETOS
+ARG TARGETARCH
 
 WORKDIR /workspace
 COPY modules/client/go.mod ./client/

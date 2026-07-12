@@ -23,17 +23,33 @@ import (
 const retryAfter = time.Minute
 
 type Controller struct {
-	kubeClient  client.Client
-	resolver    provider.NodeClassResolver
-	validator   cloudapi.NodeClassValidator
-	clusterName string
+	kubeClient              client.Client
+	resolver                provider.NodeClassResolver
+	validator               cloudapi.NodeClassValidator
+	clusterName             string
+	networkUUID             string
+	controlPlaneVIP         string
+	privateLoadBalancerPool inspacev1.PrivateLoadBalancerPool
 }
 
-func NewController(kubeClient client.Client, resolver provider.NodeClassResolver, validator cloudapi.NodeClassValidator, clusterName string) (*Controller, error) {
-	if kubeClient == nil || resolver == nil || validator == nil || clusterName == "" {
-		return nil, fmt.Errorf("Kubernetes client, resolver, cloud validator, and cluster name are required")
+func NewController(kubeClient client.Client, resolver provider.NodeClassResolver, validator cloudapi.NodeClassValidator, clusterName, networkUUID, controlPlaneVIP string, privateLoadBalancerPool inspacev1.PrivateLoadBalancerPool) (*Controller, error) {
+	if kubeClient == nil || resolver == nil || validator == nil || clusterName == "" || networkUUID == "" || controlPlaneVIP == "" {
+		return nil, fmt.Errorf("Kubernetes client, resolver, cloud validator, cluster name, network UUID, and control-plane VIP are required")
 	}
-	return &Controller{kubeClient: kubeClient, resolver: resolver, validator: validator, clusterName: clusterName}, nil
+	if err := inspacev1.ValidateNetworkUUID(networkUUID); err != nil {
+		return nil, fmt.Errorf("controller network UUID: %w", err)
+	}
+	vip, err := inspacev1.ParseControlPlaneVIP(controlPlaneVIP)
+	if err != nil {
+		return nil, fmt.Errorf("controller control-plane VIP: %w", err)
+	}
+	if err := privateLoadBalancerPool.ValidateForSupervisor(vip); err != nil {
+		return nil, fmt.Errorf("controller private load-balancer pool: %w", err)
+	}
+	return &Controller{
+		kubeClient: kubeClient, resolver: resolver, validator: validator,
+		clusterName: clusterName, networkUUID: networkUUID, controlPlaneVIP: vip.String(), privateLoadBalancerPool: privateLoadBalancerPool,
+	}, nil
 }
 
 func (c *Controller) Name() string { return "inspace.nodeclass.readiness" }
@@ -47,12 +63,19 @@ func (c *Controller) Reconcile(ctx context.Context, nodeClass *inspacev1.InSpace
 		readinessErr = errs.ToAggregate()
 	} else if nodeClass.Spec.ClusterName != c.clusterName {
 		readinessErr = fmt.Errorf("NodeClass cluster %q does not match controller cluster %q", nodeClass.Spec.ClusterName, c.clusterName)
+	} else if nodeClass.Spec.NetworkUUID != c.networkUUID {
+		readinessErr = fmt.Errorf("NodeClass network %q does not match controller network %q", nodeClass.Spec.NetworkUUID, c.networkUUID)
+	} else if controlPlaneVIP, _ := nodeClass.Spec.RKE2.ServerVIP(); controlPlaneVIP.String() != c.controlPlaneVIP {
+		readinessErr = fmt.Errorf("NodeClass control-plane VIP %q does not match controller control-plane VIP %q", controlPlaneVIP, c.controlPlaneVIP)
+	} else if nodeClass.Spec.PrivateLoadBalancerPool != c.privateLoadBalancerPool {
+		readinessErr = fmt.Errorf("NodeClass private load-balancer pool %+v does not match controller pool %+v", nodeClass.Spec.PrivateLoadBalancerPool, c.privateLoadBalancerPool)
 	} else if _, err := c.resolver.ResolveAgentToken(ctx, nodeClass); err != nil {
 		readinessErr = err
 		requeue = true
 	} else {
 		hostPoolUUID, _ := nodeClass.Spec.HostPoolSelector.UUID()
-		if err := c.validator.ValidateNodeClass(ctx, nodeClass.Spec.Location, nodeClass.Spec.NetworkUUID, hostPoolUUID, nodeClass.Spec.FirewallUUID); err != nil {
+		controlPlaneVIP, _ := nodeClass.Spec.RKE2.ServerVIP()
+		if err := c.validator.ValidateNodeClass(ctx, nodeClass.Spec.Location, nodeClass.Spec.NetworkUUID, controlPlaneVIP.String(), nodeClass.Spec.PrivateLoadBalancerPool.Start, nodeClass.Spec.PrivateLoadBalancerPool.Stop, hostPoolUUID, nodeClass.Spec.FirewallUUID); err != nil {
 			readinessErr = err
 			requeue = true
 		}
@@ -74,7 +97,7 @@ func (c *Controller) Reconcile(ctx context.Context, nodeClass *inspacev1.InSpace
 		nodeClass.Status.ObservedSpecHash = provider.NodeClassHash(nodeClass)
 		nodeClass.Status.ObservedGeneration = nodeClass.Generation
 		nodeClass.Status.ObservedBillingAccountID = nodeClass.Spec.BillingAccountID
-		nodeClass.StatusConditions().SetTrueWithReason(status.ConditionReady, "NodeClassReady", "InSpace host pool and K3s token are ready")
+		nodeClass.StatusConditions().SetTrueWithReason(status.ConditionReady, "NodeClassReady", "Private RKE2 supervisor VIP and Service pool, InSpace VPC, Cilium native-routing firewall, host pool, and RKE2 token are ready")
 	}
 
 	if !equality.Semantic.DeepEqual(stored.Status, nodeClass.Status) {

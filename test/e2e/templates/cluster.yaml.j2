@@ -1,0 +1,44 @@
+apiVersion: infrastructure.inspace.cloud/v1alpha1
+kind: InSpaceCluster
+metadata:
+  name: {{ e2e_cluster_resource_name }}
+  namespace: inspace-e2e
+spec:
+  location: {{ lookup('env', 'INSPACE_LOCATION') }}
+  billingAccountID: {{ lookup('env', 'INSPACE_BILLING_ACCOUNT_ID') }}
+  credentialsSecretRef:
+    name: inspace-cloud-credentials
+    key: api-token
+  controlPlane:
+    replicas: 3
+    machine:
+      vcpu: 2
+      memoryMiB: 4096
+      rootDiskGiB: 30
+      hostPoolUUID: {{ lookup('env', 'INSPACE_INTEL_HOST_POOL_UUID') }}
+      image:
+        osName: {{ lookup('env', 'INSPACE_OS_NAME') | default('ubuntu', true) }}
+        osVersion: "{{ lookup('env', 'INSPACE_OS_VERSION') | default('24.04', true) }}"
+  rke2:
+    version: v1.35.6+rke2r1
+    tokenSecretRef:
+      name: inspace-rke2-agent-token
+      key: token
+    disable:
+      - rke2-ingress-nginx
+    tlsSubjectAltNames:
+      - "{{ lookup('env', 'INSPACE_CONTROL_PLANE_VIP') }}"
+  network:
+    uuid: {{ lookup('env', 'INSPACE_NETWORK_UUID') }}
+    podCIDR: 10.42.0.0/16
+    serviceCIDR: 10.43.0.0/16
+    privateLoadBalancerPool:
+      start: "{{ lookup('env', 'INSPACE_PRIVATE_LOAD_BALANCER_POOL_START') }}"
+      stop: "{{ lookup('env', 'INSPACE_PRIVATE_LOAD_BALANCER_POOL_STOP') }}"
+  firewall:
+    managed: true
+  publicIPv4:
+    managed: true
+  endpoint:
+    virtualIPv4: "{{ lookup('env', 'INSPACE_CONTROL_PLANE_VIP') }}"
+    port: 6443

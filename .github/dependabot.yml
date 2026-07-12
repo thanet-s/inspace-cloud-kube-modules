@@ -19,7 +19,7 @@ updates:
     schedule:
       interval: weekly
     ignore:
-      # Keep the CCM on the Kubernetes minor used by the K3s control plane.
+      # Keep the CCM on the Kubernetes minor used by the RKE2 control plane.
       # Patch updates within the current minor remain enabled.
       - dependency-name: "k8s.io/*"
         update-types:
@@ -63,5 +63,13 @@ updates:
       interval: weekly
   - package-ecosystem: docker
     directory: /modules/karpenter-provider
+    schedule:
+      interval: weekly
+  - package-ecosystem: docker
+    directory: /test/e2e
+    schedule:
+      interval: weekly
+  - package-ecosystem: pip
+    directory: /test/e2e
     schedule:
       interval: weekly

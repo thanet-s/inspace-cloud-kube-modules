@@ -12,5 +12,5 @@ Use GitHub's **Security → Report a vulnerability** private reporting flow for
 this repository. Include affected versions, impact, reproduction steps, and any
 suggested mitigation.
 
-Never include a live InSpace API token, K3s join token, kubeconfig, SSH private
+Never include a live InSpace API token, RKE2 join token, kubeconfig, SSH private
 key, or unredacted E2E state journal in a report.

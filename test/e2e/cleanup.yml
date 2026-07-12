@@ -1,0 +1,435 @@
+---
+- name: Quiesce Kubernetes owners before deleting the RKE2 control plane
+  hosts: localhost
+  gather_facts: false
+  vars:
+    e2e_state_dir: "{{ lookup('env', 'E2E_STATE_DIR') }}"
+    e2e_state_file: "{{ lookup('env', 'E2E_STATE_DIR') }}/state.json"
+    e2e_cluster_file: "{{ lookup('env', 'E2E_STATE_DIR') }}/cluster.yaml"
+    e2e_kubeconfig: "{{ lookup('env', 'E2E_STATE_DIR') }}/kubeconfig.yaml"
+    e2e_baseline_inventory_file: "{{ lookup('env', 'E2E_STATE_DIR') }}/baseline-inventory.json"
+  tasks:
+    - name: Detect whether this run reached the ownership journal
+      ansible.builtin.stat:
+        path: "{{ e2e_state_file }}"
+      register: e2e_cleanup_state_stat
+
+    - name: Inspect the durable remote-mutation checkpoints
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop:
+        - "{{ e2e_state_dir }}/mutations-not-started"
+        - "{{ e2e_state_dir }}/mutations-may-exist"
+      register: e2e_cleanup_mutation_checkpoints
+
+    - name: Require positive proof that a missing journal preceded all mutations
+      ansible.builtin.assert:
+        that:
+          - e2e_cleanup_mutation_checkpoints.results[0].stat.exists
+          - not e2e_cleanup_mutation_checkpoints.results[1].stat.exists
+        fail_msg: >-
+          The ownership journal is missing without a mutations-not-started
+          checkpoint; preserving all cloud resources is the fail-closed outcome.
+      when: not e2e_cleanup_state_stat.stat.exists
+
+    - name: Persist a final zero audit only for proven preflight-only failure
+      ansible.builtin.copy:
+        content: "{{ {'count': 0, 'mutationsNeverStarted': true} | to_nice_json }}\n"
+        dest: "{{ e2e_state_dir }}/final-audit.json"
+        mode: "0600"
+      when: not e2e_cleanup_state_stat.stat.exists
+
+    - name: End cleanup after proven preflight-only failure
+      ansible.builtin.meta: end_play
+      when: not e2e_cleanup_state_stat.stat.exists
+
+    - name: Load the exact ownership journal
+      ansible.builtin.set_fact:
+        e2e_cleanup_state: "{{ lookup('file', e2e_state_file) | from_json }}"
+
+    - name: Detect whether a Kubernetes kubeconfig exists
+      ansible.builtin.stat:
+        path: "{{ e2e_kubeconfig }}"
+      register: e2e_cleanup_kubeconfig_stat
+
+    - name: Validate private-VIP recovery facts before Kubernetes cleanup
+      ansible.builtin.assert:
+        that:
+          - e2e_cleanup_state.virtualIPv4 | default('') | length > 0
+          - e2e_cleanup_state.bastionVMUUID | default('') | length > 0
+          - e2e_cleanup_state.bastionPublicIPv4 | default('') | length > 0
+          - e2e_cleanup_state.bastionPrivateIPv4 | default('') | length > 0
+          - e2e_cleanup_state.sshUsername | default('') | length > 0
+        fail_msg: >-
+          Kubernetes owners may exist but private-VIP/bastion recovery facts are
+          incomplete; preserving cloud infrastructure is the fail-closed outcome.
+      when: e2e_cleanup_state.kubernetesOwnersPossible | default(false) | bool
+
+    - name: Refuse raw cleanup when Kubernetes owners may exist without a kubeconfig
+      ansible.builtin.assert:
+        that:
+          - not (e2e_cleanup_state.kubernetesOwnersPossible | default(false) | bool) or e2e_cleanup_kubeconfig_stat.stat.exists
+        fail_msg: >-
+          Kubernetes owners may exist but the kubeconfig is missing; preserving
+          cloud infrastructure is the fail-closed outcome.
+
+    - name: Detect whether the pinned bastion host key exists
+      ansible.builtin.stat:
+        path: "{{ e2e_state_dir }}/known-hosts-bastion"
+      register: e2e_cleanup_bastion_key_stat
+      when: e2e_cleanup_state.kubernetesOwnersPossible | default(false) | bool
+
+    - name: Wait for the exact bastion SSH endpoint during recovery
+      ansible.builtin.wait_for:
+        host: "{{ e2e_cleanup_state.bastionPublicIPv4 }}"
+        port: 22
+        connect_timeout: 10
+        sleep: 5
+        timeout: 300
+      when:
+        - e2e_cleanup_state.kubernetesOwnersPossible | default(false) | bool
+        - not e2e_cleanup_bastion_key_stat.stat.exists
+
+    - name: Recover the bastion host key only when the persisted pin is missing
+      ansible.builtin.command:
+        argv: [ssh-keyscan, -T, "15", -H, "{{ e2e_cleanup_state.bastionPublicIPv4 }}"]
+      register: e2e_cleanup_bastion_keyscan
+      changed_when: false
+      retries: 20
+      delay: 5
+      until: e2e_cleanup_bastion_keyscan.rc == 0 and e2e_cleanup_bastion_keyscan.stdout | length > 0
+      when:
+        - e2e_cleanup_state.kubernetesOwnersPossible | default(false) | bool
+        - not e2e_cleanup_bastion_key_stat.stat.exists
+
+    - name: Persist the recovered bastion key before authentication
+      ansible.builtin.copy:
+        content: "{{ e2e_cleanup_bastion_keyscan.stdout }}\n"
+        dest: "{{ e2e_state_dir }}/known-hosts-bastion"
+        mode: "0600"
+      when:
+        - e2e_cleanup_state.kubernetesOwnersPossible | default(false) | bool
+        - not e2e_cleanup_bastion_key_stat.stat.exists
+
+    - name: Re-establish the container-local private API tunnel for cleanup
+      ansible.builtin.command:
+        argv: [/opt/e2e/scripts/api-tunnel.sh, start, "{{ e2e_state_file }}"]
+      changed_when: true
+      when: e2e_cleanup_state.kubernetesOwnersPossible | default(false) | bool
+
+    - name: Wait for Kubernetes API reachability before owner quiescence
+      ansible.builtin.command:
+        argv: [kubectl, --kubeconfig, "{{ e2e_kubeconfig }}", --request-timeout=10s, get, --raw=/readyz]
+      register: e2e_cleanup_api
+      changed_when: false
+      failed_when: false
+      retries: 60
+      delay: 5
+      until: e2e_cleanup_api.rc == 0
+      when: e2e_cleanup_state.kubernetesOwnersPossible | default(false) | bool
+
+    - name: Refuse cloud deletion while Kubernetes API reachability is uncertain
+      ansible.builtin.assert:
+        that: e2e_cleanup_api.rc == 0
+        fail_msg: >-
+          Kubernetes API remained unreachable; preserving cloud infrastructure
+          prevents raw deletion racing CSI, CCM, or Karpenter owners.
+      when: e2e_cleanup_state.kubernetesOwnersPossible | default(false) | bool
+
+    - name: Recover Service PVC and PV ownership before deleting Kubernetes objects
+      ansible.builtin.command:
+        argv:
+          - /opt/e2e/scripts/persist-workload.py
+          - --state
+          - "{{ e2e_state_file }}"
+          - --kubeconfig
+          - "{{ e2e_kubeconfig }}"
+      changed_when: true
+      when: e2e_cleanup_state.kubernetesOwnersPossible | default(false) | bool
+
+    - name: Reload the ownership journal after recovery
+      ansible.builtin.set_fact:
+        e2e_cleanup_state: "{{ lookup('file', e2e_state_file) | from_json }}"
+      when: e2e_cleanup_state.kubernetesOwnersPossible | default(false) | bool
+
+    - name: Delete workload owners before infrastructure owners
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - --kubeconfig
+          - "{{ e2e_kubeconfig }}"
+          - -n
+          - default
+          - delete
+          - deployment/inspace-e2e-web
+          - deployment/inspace-e2e-trigger
+          - deployment/inspace-e2e-private-a
+          - deployment/inspace-e2e-private-b
+          - service/inspace-e2e-web
+          - service/inspace-e2e-private-a
+          - service/inspace-e2e-private-b
+          - pvc/inspace-e2e-rwo
+          - --ignore-not-found
+          - --wait=false
+      changed_when: true
+      when: e2e_cleanup_state.kubernetesOwnersPossible | default(false) | bool
+
+    - name: Wait for E2E pods PVs and VolumeAttachments to disappear
+      ansible.builtin.shell: |
+        set -euo pipefail
+        pods=$(kubectl --kubeconfig "{{ e2e_kubeconfig }}" -n default get pods \
+          -l 'app in (inspace-e2e-web,inspace-e2e-trigger,inspace-e2e-private-a,inspace-e2e-private-b)' -o json)
+        test "$(jq '.items | length' <<<"$pods")" -eq 0
+        pv={{ e2e_cleanup_state.pvName | default('') | quote }}
+        pvc_uid={{ e2e_cleanup_state.pvcUID | default('') | quote }}
+        if test -n "$pvc_uid"; then
+          kubectl --kubeconfig "{{ e2e_kubeconfig }}" get pv -o json | jq -e --arg uid "$pvc_uid" '
+            all(.items[]; (.spec.claimRef.uid // "") != $uid)'
+        fi
+        if test -n "$pv"; then
+          test -z "$(kubectl --kubeconfig "{{ e2e_kubeconfig }}" get pv "$pv" --ignore-not-found -o name)"
+          kubectl --kubeconfig "{{ e2e_kubeconfig }}" get volumeattachments -o json | jq -e --arg pv "$pv" '
+            all(.items[]; .spec.source.persistentVolumeName != $pv)'
+        fi
+      args:
+        executable: /bin/bash
+      register: e2e_cleanup_storage_quiesced
+      changed_when: false
+      retries: 180
+      delay: 10
+      until: e2e_cleanup_storage_quiesced.rc == 0
+      when: e2e_cleanup_state.kubernetesOwnersPossible | default(false) | bool
+
+    - name: Wait for private Cilium L2 leases and LB IPAM allocations to quiesce
+      ansible.builtin.shell: |
+        set -euo pipefail
+        for lease in \
+          cilium-l2announce-default-inspace-e2e-private-a \
+          cilium-l2announce-default-inspace-e2e-private-b; do
+          test -z "$(kubectl --kubeconfig "{{ e2e_kubeconfig }}" -n kube-system \
+            get lease "$lease" --ignore-not-found -o name)"
+        done
+        kubectl --kubeconfig "{{ e2e_kubeconfig }}" \
+          get ciliumloadbalancerippool inspace-private -o json | jq -e '
+          any(.status.conditions[]?;
+            .type == "cilium.io/IPsUsed" and
+            (.message | tonumber) == 0)'
+      args:
+        executable: /bin/bash
+      register: e2e_cleanup_cilium_private_lb_quiesced
+      changed_when: false
+      retries: 180
+      delay: 10
+      until: e2e_cleanup_cilium_private_lb_quiesced.rc == 0
+      when: e2e_cleanup_state.kubernetesOwnersPossible | default(false) | bool
+
+    - name: Delete the NodePool while Karpenter is still running
+      ansible.builtin.shell: |
+        set -euo pipefail
+        resources=$(kubectl --kubeconfig "{{ e2e_kubeconfig }}" api-resources -o name)
+        if grep -qx nodepools.karpenter.sh <<<"$resources"; then
+          kubectl --kubeconfig "{{ e2e_kubeconfig }}" delete nodepool \
+            "{{ e2e_cleanup_state.nodePoolName }}" --ignore-not-found --wait=false
+        fi
+      args:
+        executable: /bin/bash
+      changed_when: true
+      when: e2e_cleanup_state.kubernetesOwnersPossible | default(false) | bool
+
+    - name: Wait for owned NodeClaims and worker Nodes to disappear
+      ansible.builtin.shell: |
+        set -euo pipefail
+        resources=$(kubectl --kubeconfig "{{ e2e_kubeconfig }}" api-resources -o name)
+        if grep -qx nodeclaims.karpenter.sh <<<"$resources"; then
+          kubectl --kubeconfig "{{ e2e_kubeconfig }}" get nodeclaims \
+            -l "karpenter.sh/nodepool={{ e2e_cleanup_state.nodePoolName }}" -o json | jq -e '.items | length == 0'
+        fi
+        kubectl --kubeconfig "{{ e2e_kubeconfig }}" get nodes \
+          -l "karpenter.sh/nodepool={{ e2e_cleanup_state.nodePoolName }}" -o json | jq -e '.items | length == 0'
+      args:
+        executable: /bin/bash
+      register: e2e_cleanup_worker_quiesced
+      changed_when: false
+      retries: 180
+      delay: 10
+      until: e2e_cleanup_worker_quiesced.rc == 0
+      when: e2e_cleanup_state.kubernetesOwnersPossible | default(false) | bool
+
+    - name: Delete the NodeClass after all worker ownership is gone
+      ansible.builtin.shell: |
+        set -euo pipefail
+        resources=$(kubectl --kubeconfig "{{ e2e_kubeconfig }}" api-resources -o name)
+        if grep -qx inspacenodeclasses.karpenter.inspace.cloud <<<"$resources"; then
+          kubectl --kubeconfig "{{ e2e_kubeconfig }}" delete inspacenodeclass \
+            "{{ e2e_cleanup_state.nodeClassName }}" --ignore-not-found --wait=true --timeout=5m
+        fi
+      args:
+        executable: /bin/bash
+      changed_when: true
+      when: e2e_cleanup_state.kubernetesOwnersPossible | default(false) | bool
+
+    - name: Wait until CCM CSI and Karpenter removed all non-control-plane cloud resources
+      ansible.builtin.command:
+        argv:
+          - /opt/e2e/scripts/cloud-audit.py
+          - --state
+          - "{{ e2e_state_file }}"
+          - --owner
+          - "{{ e2e_cleanup_state.owner }}"
+          - --cluster
+          - "{{ e2e_cleanup_state.clusterName }}"
+          - --nodepool
+          - "{{ e2e_cleanup_state.nodePoolName }}"
+      register: e2e_cleanup_owner_audit
+      changed_when: false
+      retries: 180
+      delay: 10
+      until: >-
+        (e2e_cleanup_owner_audit.stdout | from_json).disks | length == 0 and
+        (e2e_cleanup_owner_audit.stdout | from_json).vms | length == 4 and
+        ((e2e_cleanup_owner_audit.stdout | from_json).vms |
+          rejectattr('name', 'match', '^rke2-' + e2e_cleanup_state.owner + '-(cp-[0-2]|bastion)$') |
+          list | length) == 0 and
+        ((e2e_cleanup_owner_audit.stdout | from_json).floatingIPs |
+          rejectattr('name', 'match', '^rke2-' + e2e_cleanup_state.owner + '-(cp-[0-2]|bastion)-ip$') |
+          list | length) == 0 and
+        (e2e_cleanup_owner_audit.stdout | from_json).floatingIPs | length == 4 and
+        (e2e_cleanup_owner_audit.stdout | from_json).firewalls | length == 2 and
+        (e2e_cleanup_owner_audit.stdout | from_json).loadBalancers | length == 0
+      no_log: true
+      when: e2e_cleanup_state.kubernetesOwnersPossible | default(false) | bool
+
+    - name: Uninstall controllers only after their owners are quiescent
+      ansible.builtin.command:
+        argv:
+          - helm
+          - --kubeconfig
+          - "{{ e2e_kubeconfig }}"
+          - uninstall
+          - "{{ item }}"
+          - --namespace
+          - kube-system
+          - --ignore-not-found
+          - --wait
+          - --timeout
+          - 5m
+      loop: [inspace, inspace-crds]
+      changed_when: true
+      when: e2e_cleanup_state.kubernetesOwnersPossible | default(false) | bool
+
+    - name: Remove E2E credentials after controller shutdown
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - --kubeconfig
+          - "{{ e2e_kubeconfig }}"
+          - -n
+          - kube-system
+          - delete
+          - secret
+          - inspace-cloud-credentials
+          - inspace-rke2-agent-token
+          - --ignore-not-found
+          - --wait=false
+      changed_when: true
+      when: e2e_cleanup_state.kubernetesOwnersPossible | default(false) | bool
+
+    - name: Persist Kubernetes owner quiescence before bootstrap deletion
+      ansible.builtin.command:
+        argv:
+          - /opt/e2e/scripts/state-update.py
+          - "{{ e2e_state_file }}"
+          - kubernetesOwnersPossible
+          - "false"
+      changed_when: true
+      when: e2e_cleanup_state.kubernetesOwnersPossible | default(false) | bool
+
+    - name: Destroy only bootstrap-controller-owned infrastructure asynchronously
+      ansible.builtin.command:
+        argv:
+          - inspace-cluster-controller
+          - --cluster-config
+          - "{{ e2e_cluster_file }}"
+          - --delete
+          - --interval
+          - 10s
+          - --output=json
+          - --management-cidr
+          - "{{ e2e_cleanup_state.managementCIDR }}"
+          - --management-tcp-ports
+          - "22"
+      environment:
+        INSPACE_ALLOW_REMOTE_MUTATIONS: "true"
+        INSPACE_API_URL: "{{ lookup('env', 'INSPACE_API_URL') }}"
+        INSPACE_API_TOKEN: "{{ lookup('env', 'INSPACE_API_TOKEN') }}"
+      async: 1800
+      poll: 0
+      register: e2e_destroy_job
+      no_log: true
+
+    - name: Wait robustly for bootstrap destroy convergence
+      ansible.builtin.async_status:
+        jid: "{{ e2e_destroy_job.ansible_job_id }}"
+      register: e2e_destroy_wait
+      retries: 180
+      delay: 10
+      until: e2e_destroy_wait.finished
+      no_log: true
+
+    - name: Require the controller to report complete destruction
+      ansible.builtin.assert:
+        that: >-
+          ((e2e_destroy_wait.stdout_lines | select('match', '^\{') | list | last) | from_json).done | bool
+        fail_msg: "bootstrap controller did not converge to done=true"
+
+    - name: Require the final deterministic cloud audit to converge to zero
+      ansible.builtin.command:
+        argv:
+          - /opt/e2e/scripts/cloud-audit.py
+          - --state
+          - "{{ e2e_state_file }}"
+          - --owner
+          - "{{ e2e_cleanup_state.owner }}"
+          - --cluster
+          - "{{ e2e_cleanup_state.clusterName }}"
+          - --nodepool
+          - "{{ e2e_cleanup_state.nodePoolName }}"
+      register: e2e_final_audit
+      changed_when: false
+      retries: 90
+      delay: 10
+      until: (e2e_final_audit.stdout | from_json).count == 0
+      no_log: true
+
+    - name: Require the complete isolated-account inventory to match its baseline
+      ansible.builtin.command:
+        argv:
+          - /opt/e2e/scripts/account-inventory.py
+          - compare
+          - --baseline
+          - "{{ e2e_baseline_inventory_file }}"
+      register: e2e_final_account_inventory
+      changed_when: false
+      retries: 90
+      delay: 10
+      until: >-
+        e2e_final_account_inventory.rc == 0 and
+        (e2e_final_account_inventory.stdout | from_json).matches | bool
+      no_log: true
+
+    - name: Persist the final zero audit
+      ansible.builtin.copy:
+        content: >-
+          {{ {
+            'count': 0,
+            'deterministicOwners': e2e_final_audit.stdout | from_json,
+            'accountInventory': e2e_final_account_inventory.stdout | from_json
+          } | to_nice_json }}
+        dest: "{{ e2e_state_dir }}/final-audit.json"
+        mode: "0600"
+
+    - name: Close the private API tunnel after the final zero audit
+      ansible.builtin.command:
+        argv: [/opt/e2e/scripts/api-tunnel.sh, stop, "{{ e2e_state_file }}"]
+      changed_when: true
+      when: e2e_cleanup_state.kubernetesOwnersPossible | default(false) | bool

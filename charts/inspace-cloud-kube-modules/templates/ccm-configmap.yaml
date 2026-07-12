@@ -12,4 +12,7 @@ data:
   region: {{ .Values.global.inspace.region | quote }}
   networkUUID: {{ .Values.global.inspace.networkUUID | quote }}
   clusterID: {{ .Values.global.inspace.clusterID | quote }}
+  controlPlaneVIP: {{ .Values.global.inspace.controlPlaneVIP | quote }}
+  privateLoadBalancerPoolStart: {{ .Values.global.inspace.privateLoadBalancerPool.start | quote }}
+  privateLoadBalancerPoolStop: {{ .Values.global.inspace.privateLoadBalancerPool.stop | quote }}
 {{- end }}

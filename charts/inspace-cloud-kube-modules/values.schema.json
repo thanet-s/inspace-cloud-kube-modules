@@ -28,7 +28,12 @@
     },
     "resources": {"type": "object", "additionalProperties": true},
     "stringMap": {"type": "object", "additionalProperties": {"type": "string"}},
-    "objectArray": {"type": "array", "items": {"type": "object"}}
+    "objectArray": {"type": "array", "items": {"type": "object"}},
+    "privateIPv4": {
+      "type": "string",
+      "format": "ipv4",
+      "pattern": "^(?:10\\.(?:[0-9]{1,3}\\.){2}[0-9]{1,3}|172\\.(?:1[6-9]|2[0-9]|3[01])\\.[0-9]{1,3}\\.[0-9]{1,3}|192\\.168\\.[0-9]{1,3}\\.[0-9]{1,3})$"
+    }
   },
   "properties": {
     "nameOverride": {"type": "string", "maxLength": 63},
@@ -42,13 +47,23 @@
         "inspace": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["apiBaseURL", "location", "region", "networkUUID", "clusterID", "apiSecret"],
+          "required": ["apiBaseURL", "location", "region", "networkUUID", "clusterID", "controlPlaneVIP", "privateLoadBalancerPool", "apiSecret"],
           "properties": {
             "apiBaseURL": {"type": "string", "pattern": "^https://"},
             "location": {"type": "string", "enum": ["bkk01"]},
             "region": {"type": "string", "minLength": 1},
-            "networkUUID": {"type": "string", "pattern": "^(|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$"},
+            "networkUUID": {"type": "string", "pattern": "^(|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12})$"},
             "clusterID": {"type": "string", "maxLength": 63, "pattern": "^(|[a-z0-9]([-a-z0-9]*[a-z0-9])?)$"},
+            "controlPlaneVIP": {"$ref": "#/definitions/privateIPv4"},
+            "privateLoadBalancerPool": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["start", "stop"],
+              "properties": {
+                "start": {"$ref": "#/definitions/privateIPv4"},
+                "stop": {"$ref": "#/definitions/privateIPv4"}
+              }
+            },
             "apiSecret": {
               "type": "object",
               "additionalProperties": false,

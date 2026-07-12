@@ -35,16 +35,24 @@ type CreateVMRequest struct {
 	NodeClaimName    string
 	Location         string
 	NetworkUUID      string
-	FirewallUUID     string
-	OSName           string
-	OSVersion        string
-	HostPoolUUID     string
-	HostClass        string
-	InstanceType     string
-	VCPU             int
-	MemoryGiB        int
-	RootDiskGiB      int32
-	PublicIPv4       bool
+	// ControlPlaneVIP is the literal RFC1918 address of the private RKE2
+	// supervisor endpoint. Production creation rejects any worker whose private
+	// address collides with it.
+	ControlPlaneVIP string
+	// PrivateLoadBalancerPoolStart/Stop are the exact inclusive 16-to-256
+	// address range reserved from worker private-IP assignment.
+	PrivateLoadBalancerPoolStart string
+	PrivateLoadBalancerPoolStop  string
+	FirewallUUID                 string
+	OSName                       string
+	OSVersion                    string
+	HostPoolUUID                 string
+	HostClass                    string
+	InstanceType                 string
+	VCPU                         int
+	MemoryGiB                    int
+	RootDiskGiB                  int32
+	PublicIPv4                   bool
 	// SSHUsername and SSHPublicKey are optional, public operator-access data.
 	// The production adapter always adds a separate ephemeral random password
 	// at the API boundary; password material never enters this request model.
@@ -57,26 +65,31 @@ type CreateVMRequest struct {
 }
 
 type VM struct {
-	UUID             string
-	Name             string
-	ClusterName      string
-	BillingAccountID int64
-	NodeClaimName    string
-	Location         string
-	OSName           string
-	OSVersion        string
-	HostClass        string
-	InstanceType     string
-	VCPU             int
-	MemoryGiB        int
-	RootDiskGiB      int32
-	FirewallUUID     string
-	SpecHash         string
-	BootstrapHash    string
-	PublicIPv4       string
-	FloatingIPName   string
-	State            LifecycleState
-	RawState         string
+	UUID                         string
+	Name                         string
+	ClusterName                  string
+	BillingAccountID             int64
+	NodeClaimName                string
+	Location                     string
+	OSName                       string
+	OSVersion                    string
+	HostClass                    string
+	InstanceType                 string
+	VCPU                         int
+	MemoryGiB                    int
+	RootDiskGiB                  int32
+	FirewallUUID                 string
+	NetworkUUID                  string
+	ControlPlaneVIP              string
+	PrivateLoadBalancerPoolStart string
+	PrivateLoadBalancerPoolStop  string
+	SpecHash                     string
+	BootstrapHash                string
+	PrivateIPv4                  string
+	PublicIPv4                   string
+	FloatingIPName               string
+	State                        LifecycleState
+	RawState                     string
 }
 
 func (v *VM) ImageID() string { return v.OSName + "@" + v.OSVersion }
@@ -94,5 +107,5 @@ type Cloud interface {
 // NodeClassValidator is implemented by production and fake clouds for the
 // readiness reconciler's read-only host-pool check.
 type NodeClassValidator interface {
-	ValidateNodeClass(ctx context.Context, location, networkUUID, hostPoolUUID, firewallUUID string) error
+	ValidateNodeClass(ctx context.Context, location, networkUUID, controlPlaneVIP, privateLoadBalancerPoolStart, privateLoadBalancerPoolStop, hostPoolUUID, firewallUUID string) error
 }

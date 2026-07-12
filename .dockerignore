@@ -1,5 +1,7 @@
 .env
 .env.*
+**/*.env
+**/*.env.*
 !.env.example
 **/.git
 **/bin
@@ -8,8 +10,16 @@
 **/*.out
 **/.DS_Store
 **/id_rsa
+**/id_rsa.*
 **/id_dsa
+**/id_dsa.*
 **/id_ecdsa
+**/id_ecdsa.*
 **/id_ed25519
+**/id_ed25519.*
 **/*.pem
 **/*.key
+**/*.p12
+**/*.pfx
+**/__pycache__
+**/*.py[cod]

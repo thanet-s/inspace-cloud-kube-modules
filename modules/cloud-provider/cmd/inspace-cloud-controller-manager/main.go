@@ -72,11 +72,14 @@ func initializeCloud(config *cloudconfig.CompletedConfig) cloud.Interface {
 		klog.Fatalf("initialize InSpace client: %v", err)
 	}
 	provider, err := inspaceprovider.New(api, inspaceprovider.Config{
-		Location:         os.Getenv("INSPACE_LOCATION"),
-		Region:           os.Getenv("INSPACE_REGION"),
-		NetworkUUID:      os.Getenv("INSPACE_NETWORK_UUID"),
-		BillingAccountID: billingID,
-		ClusterID:        os.Getenv("INSPACE_CLUSTER_ID"),
+		Location:                     os.Getenv("INSPACE_LOCATION"),
+		Region:                       os.Getenv("INSPACE_REGION"),
+		NetworkUUID:                  os.Getenv("INSPACE_NETWORK_UUID"),
+		BillingAccountID:             billingID,
+		ClusterID:                    os.Getenv("INSPACE_CLUSTER_ID"),
+		ControlPlaneVIP:              os.Getenv("INSPACE_CONTROL_PLANE_VIP"),
+		PrivateLoadBalancerPoolStart: os.Getenv("INSPACE_PRIVATE_LOAD_BALANCER_POOL_START"),
+		PrivateLoadBalancerPoolStop:  os.Getenv("INSPACE_PRIVATE_LOAD_BALANCER_POOL_STOP"),
 	})
 	if err != nil {
 		klog.Fatalf("initialize InSpace cloud provider: %v", err)

@@ -9,7 +9,8 @@ permissions:
   contents: read
 
 concurrency:
-  # All releases can update shared major, minor, and latest tags.
+  # Stable releases update shared major, minor, and latest tags; serialize all
+  # releases so a prerelease cannot race a stable manifest publication.
   group: release
   cancel-in-progress: false
 
@@ -129,7 +130,7 @@ jobs:
             platform: linux/amd64
             runner: ubuntu-26.04
             title: Karpenter Provider for InSpace Cloud
-            description: Karpenter provider for elastic K3s workers on InSpace Cloud
+            description: Karpenter provider for elastic RKE2 workers on InSpace Cloud
             context: .
             dockerfile: modules/karpenter-provider/Dockerfile
           - image: karpenter-provider-inspace
@@ -137,7 +138,7 @@ jobs:
             platform: linux/arm64
             runner: ubuntu-26.04-arm
             title: Karpenter Provider for InSpace Cloud
-            description: Karpenter provider for elastic K3s workers on InSpace Cloud
+            description: Karpenter provider for elastic RKE2 workers on InSpace Cloud
             context: .
             dockerfile: modules/karpenter-provider/Dockerfile
     steps:
@@ -161,8 +162,8 @@ jobs:
           images: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
           tags: |
             type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}},enable=${{ !startsWith(github.ref, 'refs/tags/v0.') }}
+            type=semver,pattern={{major}}.{{minor}},enable=${{ needs.validate.outputs.prerelease == 'false' }}
+            type=semver,pattern={{major}},enable=${{ needs.validate.outputs.prerelease == 'false' && !startsWith(github.ref, 'refs/tags/v0.') }}
             type=raw,value=latest,enable=${{ needs.validate.outputs.prerelease == 'false' }}
           labels: |
             org.opencontainers.image.title=${{ matrix.title }}
@@ -232,7 +233,7 @@ jobs:
             description: Kubernetes RWO block storage CSI driver for InSpace Cloud
           - image: karpenter-provider-inspace
             title: Karpenter Provider for InSpace Cloud
-            description: Karpenter provider for elastic K3s workers on InSpace Cloud
+            description: Karpenter provider for elastic RKE2 workers on InSpace Cloud
     steps:
       - name: Set up Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
@@ -251,8 +252,8 @@ jobs:
           images: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
           tags: |
             type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}},enable=${{ !startsWith(github.ref, 'refs/tags/v0.') }}
+            type=semver,pattern={{major}}.{{minor}},enable=${{ needs.validate.outputs.prerelease == 'false' }}
+            type=semver,pattern={{major}},enable=${{ needs.validate.outputs.prerelease == 'false' && !startsWith(github.ref, 'refs/tags/v0.') }}
             type=raw,value=latest,enable=${{ needs.validate.outputs.prerelease == 'false' }}
           labels: |
             org.opencontainers.image.title=${{ matrix.title }}

@@ -1,6 +1,6 @@
 .PHONY: all fmt test smoke live-test vet verify image
 
-GOWORK ?= auto
+GOWORK ?= off
 IMAGE ?= ghcr.io/thanet-s/karpenter-provider-inspace:dev
 PLATFORM ?= linux/amd64
 

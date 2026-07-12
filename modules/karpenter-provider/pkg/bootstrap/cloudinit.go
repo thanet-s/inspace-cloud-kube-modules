@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/netip"
 	"net/url"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -17,15 +18,20 @@ import (
 // SchemaVersion must be bumped whenever generated bootstrap semantics change.
 // It is included in the provider drift hash so existing nodes are replaced.
 const (
-	SchemaVersion           = "stock-ubuntu-k3s-v4"
+	SchemaVersion           = "stock-ubuntu-rke2-v3"
 	ExternalIPv4Placeholder = "__INSPACE_FLOATING_IPV4__"
+	VPCSubnetPlaceholder    = "__INSPACE_VPC_SUBNET__"
+	NativeRoutingPodCIDR    = "10.42.0.0/16"
+	KubernetesServiceCIDR   = "10.43.0.0/16"
 )
+
+var exactRKE2VersionPattern = regexp.MustCompile(`^v[0-9]+\.[0-9]+\.[0-9]+\+rke2r[0-9]+$`)
 
 type Config struct {
 	NodeName         string
 	Server           string
 	Token            string
-	K3sVersion       string
+	RKE2Version      string
 	Labels           map[string]string
 	Taints           []corev1.Taint
 	AdditionalScript string
@@ -45,20 +51,34 @@ type writeFile struct {
 }
 
 // RenderCloudInit returns the JSON object expected by the InSpace cloud_init
-// form field. It bootstraps a stock Ubuntu image and pins both the K3s binary
-// and checksum asset to the exact NodeClass version.
+// form field. It bootstraps a stock Ubuntu image and pins both the RKE2
+// distribution tarball and checksum asset to the exact NodeClass version.
 func RenderCloudInit(config Config) (string, error) {
-	if config.NodeName == "" || config.Server == "" || config.Token == "" || config.K3sVersion == "" {
-		return "", fmt.Errorf("node name, server, token, and K3s version are required")
+	if config.NodeName == "" || config.Server == "" || config.Token == "" || config.RKE2Version == "" {
+		return "", fmt.Errorf("node name, server, token, and RKE2 version are required")
+	}
+	if !exactRKE2VersionPattern.MatchString(config.RKE2Version) {
+		return "", fmt.Errorf("RKE2 version must be an exact vX.Y.Z+rke2rN release")
+	}
+	server, err := url.Parse(config.Server)
+	if err != nil || server.Scheme != "https" || server.Port() != "9345" || server.Path != "" || server.RawPath != "" || server.Opaque != "" || server.User != nil || server.RawQuery != "" || server.ForceQuery || server.Fragment != "" {
+		return "", fmt.Errorf("RKE2 server must be https://<RFC1918-IPv4>:9345 without a path, query, fragment, or userinfo")
+	}
+	serverVIP, err := netip.ParseAddr(server.Hostname())
+	if err != nil || !serverVIP.Is4() || !serverVIP.IsPrivate() ||
+		netip.MustParsePrefix(NativeRoutingPodCIDR).Contains(serverVIP) ||
+		netip.MustParsePrefix(KubernetesServiceCIDR).Contains(serverVIP) ||
+		config.Server != "https://"+serverVIP.String()+":9345" {
+		return "", fmt.Errorf("RKE2 server host must be a canonical literal RFC1918 IPv4 outside pod CIDR %s and Service CIDR %s", NativeRoutingPodCIDR, KubernetesServiceCIDR)
 	}
 	taints := ensureRegistrationTaint(config.Taints)
 
-	var k3s strings.Builder
-	fmt.Fprintf(&k3s, "server: %s\n", quote(config.Server))
-	fmt.Fprintf(&k3s, "token: %s\n", quote(config.Token))
-	fmt.Fprintf(&k3s, "node-name: %s\n", quote(config.NodeName))
-	fmt.Fprintf(&k3s, "node-external-ip: %s\n", quote(ExternalIPv4Placeholder))
-	k3s.WriteString("kubelet-arg:\n  - cloud-provider=external\n")
+	var rke2 strings.Builder
+	fmt.Fprintf(&rke2, "server: %s\n", quote(config.Server))
+	fmt.Fprintf(&rke2, "token: %s\n", quote(config.Token))
+	fmt.Fprintf(&rke2, "node-name: %s\n", quote(config.NodeName))
+	fmt.Fprintf(&rke2, "node-external-ip: %s\n", quote(ExternalIPv4Placeholder))
+	rke2.WriteString("kubelet-arg:\n  - cloud-provider=external\n")
 
 	labelKeys := make([]string, 0, len(config.Labels))
 	for key := range config.Labels {
@@ -66,92 +86,128 @@ func RenderCloudInit(config Config) (string, error) {
 	}
 	sort.Strings(labelKeys)
 	if len(labelKeys) != 0 {
-		k3s.WriteString("node-label:\n")
+		rke2.WriteString("node-label:\n")
 		for _, key := range labelKeys {
-			fmt.Fprintf(&k3s, "  - %s\n", quote(key+"="+config.Labels[key]))
+			fmt.Fprintf(&rke2, "  - %s\n", quote(key+"="+config.Labels[key]))
 		}
 	}
 	if len(taints) != 0 {
-		k3s.WriteString("node-taint:\n")
+		rke2.WriteString("node-taint:\n")
 		for _, taint := range taints {
-			fmt.Fprintf(&k3s, "  - %s\n", quote(formatTaint(taint)))
+			fmt.Fprintf(&rke2, "  - %s\n", quote(formatTaint(taint)))
 		}
 	}
 
-	unit := `[Unit]
-Description=Lightweight Kubernetes Agent
-After=network-online.target
-Wants=network-online.target
-ConditionPathIsExecutable=/usr/local/bin/k3s
-
-[Service]
-Type=notify
-KillMode=process
-Delegate=yes
-LimitNOFILE=1048576
-LimitNPROC=infinity
-LimitCORE=infinity
+	serviceDropIn := `[Service]
 ExecStartPre=/usr/local/sbin/inspace-detect-private-ip
-ExecStart=/usr/local/bin/k3s agent
-Restart=always
-RestartSec=5s
-
-[Install]
-WantedBy=multi-user.target
+ExecStartPre=/usr/local/sbin/inspace-verify-host-firewall
 `
-	privateIP := `#!/bin/sh
+	privateIP := fmt.Sprintf(`#!/bin/sh
 set -eu
-private_ip="$(ip -4 -o addr show scope global | awk '
-  {
-    split($4, cidr, "/"); split(cidr[1], octet, ".")
-    if (octet[1] == 10 || (octet[1] == 172 && octet[2] >= 16 && octet[2] <= 31) || (octet[1] == 192 && octet[2] == 168)) {
-      print cidr[1]; exit
-    }
-  }
-')"
-[ -n "$private_ip" ]
-install -d -o root -g root -m 0700 /etc/rancher/k3s/config.yaml.d
-umask 077
-printf 'node-ip: "%s"\n' "$private_ip" > /etc/rancher/k3s/config.yaml.d/10-private-node-ip.yaml
-`
-	firewall := `#!/bin/sh
-set -eu
-private_if="$(ip -4 -o addr show scope global | awk '
-  {
-    split($4, cidr, "/"); split(cidr[1], octet, ".")
-    if (octet[1] == 10 || (octet[1] == 172 && octet[2] >= 16 && octet[2] <= 31) || (octet[1] == 192 && octet[2] == 168)) {
-      print $2; exit
-    }
-  }
-')"
+vpc_subnet='%s'
+supervisor_vip='%s'
+vpc_identities="$(ip -o -4 addr show to "$vpc_subnet" scope global | awk -v vip="$supervisor_vip" '$3 == "inet" { split($4, address, "/"); if (address[1] != vip) print $2, address[1] }')"
+[ -n "$vpc_identities" ]
+[ "$(printf '%%s\n' "$vpc_identities" | awk 'NF { count++ } END { print count + 0 }')" -eq 1 ]
+set -- $vpc_identities
+private_if=${1%%%%@*}
+private_ip=$2
 [ -n "$private_if" ]
-ufw --force default deny incoming
-ufw --force default allow outgoing
-ufw allow in on "$private_if" from 10.0.0.0/8
-ufw allow in on "$private_if" from 172.16.0.0/12
-ufw allow in on "$private_if" from 192.168.0.0/16
-ufw --force enable
+[ -n "$private_ip" ]
+config=/etc/rancher/rke2/config.yaml
+[ -f "$config" ]
+tmp="$(mktemp)"
+trap 'rm -f "$tmp"' EXIT INT TERM
+awk -v private_ip="$private_ip" '
+  BEGIN { replaced = 0 }
+  /^node-ip:/ {
+    if (!replaced) {
+	      printf "node-ip: \"%%s\"\n", private_ip
+      replaced = 1
+    }
+    next
+  }
+  { print }
+  END {
+    if (!replaced) {
+	      printf "node-ip: \"%%s\"\n", private_ip
+    }
+  }
+' "$config" > "$tmp"
+install -o root -g root -m 0600 "$tmp" "$config"
+`, VPCSubnetPlaceholder, serverVIP.String())
+	verifyHostFirewallBody := `if command -v ufw >/dev/null 2>&1; then
+	LC_ALL=C ufw status | grep -Fq "Status: inactive"
+fi
+if command -v systemctl >/dev/null 2>&1; then
+	unit_state="$(systemctl list-unit-files ufw.service --no-legend 2>/dev/null | awk '$1 == "ufw.service" { print $2; exit }')"
+	if [ -n "$unit_state" ]; then
+		if systemctl is-active --quiet ufw.service; then
+			echo "ufw.service is still active" >&2
+			exit 1
+		fi
+		enabled_state="$(systemctl is-enabled ufw.service 2>/dev/null || true)"
+		case "$enabled_state" in
+			disabled|masked) ;;
+			*) echo "ufw.service is not disabled (state: $enabled_state)" >&2; exit 1 ;;
+		esac
+	fi
+fi
+`
+	verifyHostFirewall := "#!/bin/sh\nset -eu\n" + verifyHostFirewallBody
+	disableHostFirewall := `#!/bin/sh
+set -eu
+if command -v ufw >/dev/null 2>&1; then
+	ufw --force disable
+fi
+if command -v systemctl >/dev/null 2>&1; then
+	unit_state="$(systemctl list-unit-files ufw.service --no-legend 2>/dev/null | awk '$1 == "ufw.service" { print $2; exit }')"
+	if [ -n "$unit_state" ]; then
+		systemctl disable --now ufw.service
+	fi
+fi
+` + verifyHostFirewallBody
+	startAgent := `#!/bin/sh
+set -eu
+systemctl daemon-reload
+systemctl enable rke2-agent.service
+systemctl start --no-block rke2-agent.service
+attempt=0
+until systemctl is-active --quiet rke2-agent.service; do
+	attempt=$((attempt + 1))
+	if systemctl is-failed --quiet rke2-agent.service || [ "$attempt" -ge 180 ]; then
+		echo "rke2-agent.service failed to become active after $attempt checks" >&2
+		exit 1
+	fi
+	sleep 5
+done
 `
 	prerequisites := `#!/bin/sh
 set -eu
 attempt=0
-while :; do
+while [ "$attempt" -lt 60 ]; do
   attempt=$((attempt + 1))
   if apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 update && \
-     DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=30 install -y --no-install-recommends ca-certificates curl iproute2 ufw; then
+     DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=30 install -y --no-install-recommends ca-certificates curl gzip iproute2 tar; then
     exit 0
   fi
   echo "waiting for floating-IP egress before package installation (attempt $attempt)" >&2
-  sleep 5
+  if [ "$attempt" -lt 60 ]; then
+    sleep 5
+  fi
 done
+echo "package installation failed after $attempt attempts" >&2
+exit 1
 `
 
-	versionURL := url.PathEscape(config.K3sVersion)
-	releaseBase := "https://github.com/k3s-io/k3s/releases/download/" + versionURL
+	versionURL := url.PathEscape(config.RKE2Version)
+	releaseBase := "https://github.com/rancher/rke2/releases/download/" + versionURL
 	install := fmt.Sprintf(`#!/bin/sh
 set -eu
 version=%s
-if [ -x /usr/local/bin/k3s ] && /usr/local/bin/k3s --version 2>/dev/null | grep -F -- "k3s version $version" >/dev/null; then
+if [ -x /usr/local/bin/rke2 ] && \
+   [ -f /usr/local/lib/systemd/system/rke2-agent.service ] && \
+   /usr/local/bin/rke2 --version 2>/dev/null | grep -F -- "rke2 version $version" >/dev/null; then
   exit 0
 fi
 tmpdir="$(mktemp -d)"
@@ -160,54 +216,63 @@ download_asset() {
   url="$1"
   output="$2"
   attempt=0
-  while :; do
+  while [ "$attempt" -lt 60 ]; do
     attempt=$((attempt + 1))
     if curl --fail --location --silent --show-error --connect-timeout 15 --max-time 300 --retry 3 --retry-all-errors --output "$output" "$url"; then
       return 0
     fi
-    sleep 5
+    if [ "$attempt" -lt 60 ]; then
+      sleep 5
+    fi
   done
+  echo "download of $url failed after $attempt attempts" >&2
+  return 1
 }
-download_asset %s/k3s "$tmpdir/k3s"
+download_asset %s/rke2.linux-amd64.tar.gz "$tmpdir/rke2.linux-amd64.tar.gz"
 download_asset %s/sha256sum-amd64.txt "$tmpdir/sha256sum-amd64.txt"
-expected="$(awk '$2 == "k3s" || $2 == "./k3s" { print $1; exit }' "$tmpdir/sha256sum-amd64.txt")"
+expected="$(awk '$2 == "rke2.linux-amd64.tar.gz" || $2 == "./rke2.linux-amd64.tar.gz" { print $1; exit }' "$tmpdir/sha256sum-amd64.txt")"
 [ -n "$expected" ]
-actual="$(sha256sum "$tmpdir/k3s" | awk '{ print $1 }')"
+actual="$(sha256sum "$tmpdir/rke2.linux-amd64.tar.gz" | awk '{ print $1 }')"
 [ "$actual" = "$expected" ]
-install -o root -g root -m 0755 "$tmpdir/k3s" /usr/local/bin/k3s
-/usr/local/bin/k3s --version | grep -F -- "k3s version $version" >/dev/null
-`, shellQuote(config.K3sVersion), shellQuote(releaseBase), shellQuote(releaseBase))
+tar -xzf "$tmpdir/rke2.linux-amd64.tar.gz" -C /usr/local
+/usr/local/bin/rke2 --version | grep -F -- "rke2 version $version" >/dev/null
+`, shellQuote(config.RKE2Version), shellQuote(releaseBase), shellQuote(releaseBase))
 
 	doc := document{
 		WriteFiles: []writeFile{
-			encodedWriteFile("/etc/rancher/k3s/config.yaml", "0600", k3s.String()),
-			encodedWriteFile("/etc/systemd/system/k3s-agent.service", "0644", unit),
+			encodedWriteFile("/etc/rancher/rke2/config.yaml", "0600", rke2.String()),
+			encodedWriteFile("/etc/systemd/system/rke2-agent.service.d/10-inspace-private-ip.conf", "0644", serviceDropIn),
 			encodedWriteFile("/usr/local/sbin/inspace-install-prerequisites", "0700", prerequisites),
-			encodedWriteFile("/usr/local/sbin/inspace-install-k3s", "0700", install),
+			encodedWriteFile("/usr/local/sbin/inspace-install-rke2", "0700", install),
 			encodedWriteFile("/usr/local/sbin/inspace-detect-private-ip", "0700", privateIP),
-			encodedWriteFile("/usr/local/sbin/inspace-firewall", "0700", firewall),
-		},
-		RunCmd: []string{
-			"/usr/local/sbin/inspace-install-prerequisites",
-			"/usr/local/sbin/inspace-install-k3s",
-			"/usr/local/sbin/inspace-detect-private-ip",
-			"/usr/local/sbin/inspace-firewall",
+			encodedWriteFile("/usr/local/sbin/inspace-disable-host-firewall", "0700", disableHostFirewall),
+			encodedWriteFile("/usr/local/sbin/inspace-verify-host-firewall", "0700", verifyHostFirewall),
+			encodedWriteFile("/usr/local/sbin/inspace-start-rke2-agent", "0700", startAgent),
 		},
 	}
+	var orchestrator strings.Builder
+	orchestrator.WriteString(`#!/bin/sh
+set -eu
+/usr/local/sbin/inspace-install-prerequisites
+/usr/local/sbin/inspace-install-rke2
+/usr/local/sbin/inspace-detect-private-ip
+`)
 	if strings.TrimSpace(config.AdditionalScript) != "" {
 		doc.WriteFiles = append(doc.WriteFiles, encodedWriteFile(
 			"/usr/local/sbin/inspace-additional-user-data",
 			"0700",
 			"#!/bin/sh\nset -eu\n"+strings.TrimRight(config.AdditionalScript, "\n")+"\n",
 		))
-		// cloud-init-per's once semaphore makes the extension safe if runcmd is
-		// manually replayed during troubleshooting.
-		doc.RunCmd = append(doc.RunCmd, "cloud-init-per once inspace-additional-user-data /bin/sh /usr/local/sbin/inspace-additional-user-data")
+		// cloud-init-per's once semaphore makes the extension safe if the
+		// fail-fast orchestrator is manually replayed during troubleshooting.
+		orchestrator.WriteString("cloud-init-per once inspace-additional-user-data /bin/sh /usr/local/sbin/inspace-additional-user-data\n")
 	}
-	doc.RunCmd = append(doc.RunCmd,
-		"systemctl daemon-reload",
-		"systemctl enable --now k3s-agent.service",
-	)
+	orchestrator.WriteString(`/usr/local/sbin/inspace-disable-host-firewall
+/usr/local/sbin/inspace-verify-host-firewall
+/usr/local/sbin/inspace-start-rke2-agent
+`)
+	doc.WriteFiles = append(doc.WriteFiles, encodedWriteFile("/usr/local/sbin/inspace-bootstrap-rke2-agent", "0700", orchestrator.String()))
+	doc.RunCmd = []string{"/usr/local/sbin/inspace-bootstrap-rke2-agent"}
 
 	data, err := json.Marshal(doc)
 	if err != nil {
@@ -223,12 +288,29 @@ func ValidateExternalIPv4Template(cloudInitJSON string) error {
 	if err != nil {
 		return err
 	}
-	count, err := externalIPv4PlaceholderCount(doc, cloudInitJSON)
+	count, err := placeholderCount(doc, cloudInitJSON, ExternalIPv4Placeholder)
 	if err != nil {
 		return err
 	}
 	if count != 1 {
 		return fmt.Errorf("cloud-init must contain exactly one external IPv4 placeholder, found %d", count)
+	}
+	return nil
+}
+
+// ValidateVPCSubnetTemplate ensures the production adapter can bind private-IP
+// discovery to the exact API-reported VPC prefix before the VM is created.
+func ValidateVPCSubnetTemplate(cloudInitJSON string) error {
+	doc, err := parseDocument(cloudInitJSON)
+	if err != nil {
+		return err
+	}
+	count, err := placeholderCount(doc, cloudInitJSON, VPCSubnetPlaceholder)
+	if err != nil {
+		return err
+	}
+	if count != 1 {
+		return fmt.Errorf("cloud-init must contain exactly one VPC subnet placeholder, found %d", count)
 	}
 	return nil
 }
@@ -243,37 +325,34 @@ func ResolveExternalIPv4(cloudInitJSON, address string) (string, error) {
 	if err != nil || !ip.Is4() || !ip.IsGlobalUnicast() || ip.IsPrivate() {
 		return "", fmt.Errorf("external node IP must be a public IPv4 address")
 	}
-	doc, err := parseDocument(cloudInitJSON)
-	if err != nil {
+	return resolvePlaceholder(cloudInitJSON, ExternalIPv4Placeholder, address, "external IPv4")
+}
+
+// ResolveVPCSubnet replaces the exact private-network prefix after the adapter
+// has read and validated the selected InSpace network and before VM creation.
+func ResolveVPCSubnet(cloudInitJSON, subnet string) (string, error) {
+	if err := ValidateVPCSubnetTemplate(cloudInitJSON); err != nil {
 		return "", err
 	}
-	replaced := false
-	for i := range doc.WriteFiles {
-		content, err := decodeWriteFile(doc.WriteFiles[i])
-		if err != nil {
-			return "", err
+	prefix, err := netip.ParsePrefix(subnet)
+	if err != nil || !isRFC1918Prefix(prefix) {
+		return "", fmt.Errorf("worker VPC subnet must be an RFC1918 IPv4 prefix")
+	}
+	if prefix.Bits() > 27 {
+		return "", fmt.Errorf("worker VPC subnet prefix length must be /27 or shorter")
+	}
+	for _, reserved := range []struct {
+		description string
+		cidr        string
+	}{
+		{description: "pod CIDR", cidr: NativeRoutingPodCIDR},
+		{description: "Service CIDR", cidr: KubernetesServiceCIDR},
+	} {
+		if prefixesOverlap(prefix, netip.MustParsePrefix(reserved.cidr)) {
+			return "", fmt.Errorf("worker VPC subnet %s must not overlap %s %s", prefix, reserved.description, reserved.cidr)
 		}
-		if strings.Contains(content, ExternalIPv4Placeholder) {
-			content = strings.Replace(content, ExternalIPv4Placeholder, address, 1)
-			doc.WriteFiles[i].Content = base64.StdEncoding.EncodeToString([]byte(content))
-			replaced = true
-		}
 	}
-	if !replaced {
-		return "", fmt.Errorf("cloud-init contains no external IPv4 placeholder")
-	}
-	resolved, err := json.Marshal(doc)
-	if err != nil {
-		return "", fmt.Errorf("marshal resolved cloud-init JSON: %w", err)
-	}
-	count, err := externalIPv4PlaceholderCount(doc, string(resolved))
-	if err != nil {
-		return "", err
-	}
-	if count != 0 {
-		return "", fmt.Errorf("cloud-init contains an unresolved external IPv4 placeholder")
-	}
-	return string(resolved), nil
+	return resolvePlaceholder(cloudInitJSON, VPCSubnetPlaceholder, prefix.Masked().String(), "VPC subnet")
 }
 
 func encodedWriteFile(path, permissions, content string) writeFile {
@@ -295,16 +374,69 @@ func parseDocument(cloudInitJSON string) (document, error) {
 	return doc, nil
 }
 
-func externalIPv4PlaceholderCount(doc document, rawJSON string) (int, error) {
-	count := strings.Count(rawJSON, ExternalIPv4Placeholder)
+func placeholderCount(doc document, rawJSON, placeholder string) (int, error) {
+	count := strings.Count(rawJSON, placeholder)
 	for _, file := range doc.WriteFiles {
 		content, err := decodeWriteFile(file)
 		if err != nil {
 			return 0, err
 		}
-		count += strings.Count(content, ExternalIPv4Placeholder)
+		count += strings.Count(content, placeholder)
 	}
 	return count, nil
+}
+
+func resolvePlaceholder(cloudInitJSON, placeholder, replacement, description string) (string, error) {
+	doc, err := parseDocument(cloudInitJSON)
+	if err != nil {
+		return "", err
+	}
+	replaced := false
+	for i := range doc.WriteFiles {
+		content, err := decodeWriteFile(doc.WriteFiles[i])
+		if err != nil {
+			return "", err
+		}
+		if strings.Contains(content, placeholder) {
+			content = strings.Replace(content, placeholder, replacement, 1)
+			doc.WriteFiles[i].Content = base64.StdEncoding.EncodeToString([]byte(content))
+			replaced = true
+		}
+	}
+	if !replaced {
+		return "", fmt.Errorf("cloud-init contains no %s placeholder", description)
+	}
+	resolved, err := json.Marshal(doc)
+	if err != nil {
+		return "", fmt.Errorf("marshal resolved cloud-init JSON: %w", err)
+	}
+	count, err := placeholderCount(doc, string(resolved), placeholder)
+	if err != nil {
+		return "", err
+	}
+	if count != 0 {
+		return "", fmt.Errorf("cloud-init contains an unresolved %s placeholder", description)
+	}
+	return string(resolved), nil
+}
+
+func isRFC1918Prefix(prefix netip.Prefix) bool {
+	if !prefix.IsValid() || !prefix.Addr().Is4() {
+		return false
+	}
+	for _, allowed := range []netip.Prefix{
+		netip.MustParsePrefix("10.0.0.0/8"), netip.MustParsePrefix("172.16.0.0/12"), netip.MustParsePrefix("192.168.0.0/16"),
+	} {
+		if prefix.Bits() >= allowed.Bits() && allowed.Contains(prefix.Addr()) {
+			return true
+		}
+	}
+	return false
+}
+
+func prefixesOverlap(first, second netip.Prefix) bool {
+	return first.IsValid() && second.IsValid() && first.Addr().BitLen() == second.Addr().BitLen() &&
+		(first.Contains(second.Masked().Addr()) || second.Contains(first.Masked().Addr()))
 }
 
 func decodeWriteFile(file writeFile) (string, error) {

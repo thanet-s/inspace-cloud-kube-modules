@@ -12,8 +12,8 @@ make images
 
 Normal tests must not contact InSpace or read local credentials. API lifecycle
 tests require their explicit two mutation gates. The full cluster E2E is a
-maintainer-operated release acceptance test for the isolated billing account;
-it must never run from pull requests.
+maintainer-operated, Docker-only Ansible release acceptance test for the
+isolated billing account; it must never run from pull requests.
 
 Keep cloud ownership checks fail-closed, never blindly retry a mutating POST,
 and ensure cleanup errors remain visible. Do not commit generated kubeconfigs,

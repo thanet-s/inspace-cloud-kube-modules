@@ -1,0 +1,20 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: inspace-e2e-trigger
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: inspace-e2e-trigger}
+  template:
+    metadata:
+      labels: {app: inspace-e2e-trigger}
+    spec:
+      nodeSelector:
+        karpenter.sh/nodepool: {{ e2e_nodepool_name }}
+      containers:
+        - name: pause
+          image: registry.k8s.io/pause:3.10.1
+          resources:
+            requests: {cpu: 100m, memory: 64Mi}

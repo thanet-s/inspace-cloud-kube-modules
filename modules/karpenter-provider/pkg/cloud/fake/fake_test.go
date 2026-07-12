@@ -34,3 +34,15 @@ func TestCreateAndDeleteDesiredStateIsIdempotent(t *testing.T) {
 		t.Fatalf("repeated delete should report desired not-found state, got %v", err)
 	}
 }
+
+func TestNodeClassValidationRequiresPrivateControlPlaneVIP(t *testing.T) {
+	cloud := New()
+	if err := cloud.ValidateNodeClass(context.Background(), "bkk01", "network-1", "10.0.0.10", "10.0.0.200", "10.0.0.219", "pool-1", "firewall-1"); err != nil {
+		t.Fatalf("valid private VIP rejected: %v", err)
+	}
+	for _, vip := range []string{"", "registration.example", "203.0.113.10", "fd00::10", "10.42.0.10", "10.43.0.10"} {
+		if err := cloud.ValidateNodeClass(context.Background(), "bkk01", "network-1", vip, "10.0.0.200", "10.0.0.219", "pool-1", "firewall-1"); err == nil {
+			t.Fatalf("invalid control-plane VIP %q accepted", vip)
+		}
+	}
+}
