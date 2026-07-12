@@ -71,9 +71,14 @@ Create POSTs are never blindly retried; read-before-create ownership records
 recover ambiguous responses.
 
 `GetVM` and `ListVMs` repeat these checks through a bounded read-only snapshot.
-One firewall list, one Floating-IP list, and one network read per unique VPC
-detect a lost/disabled address, a second or public firewall, membership drift,
-or a private-IP/supervisor-or-Service-VIP collision without mutating resources.
+VM list rows are only discovery and collision evidence: exact per-VM detail is
+the ownership authority, including when the list omits descriptions. `ListVMs`
+resolves detail with at most eight parallel reads, omits a row that became 404
+after the snapshot, and fails closed on any other read or list/detail identity
+uncertainty. One firewall list, one Floating-IP list, and one network read per
+unique VPC then detect a lost/disabled address, a second or public firewall,
+membership drift, or a private-IP/supervisor-or-Service-VIP collision without
+mutating resources.
 
 `spec.networkUUID` and the literal VIP in `spec.rke2.server` must exactly match
 the controller-wide `INSPACE_NETWORK_UUID` and `INSPACE_CONTROL_PLANE_VIP`.

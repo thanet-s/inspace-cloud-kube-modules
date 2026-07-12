@@ -5,10 +5,12 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/netip"
 	"reflect"
 	"regexp"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -81,6 +83,102 @@ func TestCreateIsReadBeforeCreateIdempotent(t *testing.T) {
 	}
 	if second.State != cloudapi.LifecyclePending {
 		t.Fatalf("state = %q", second.State)
+	}
+}
+
+func TestCreateAdoptsExactNameFromSparseListAfterCanonicalDetail(t *testing.T) {
+	api := &fakeAPI{}
+	adapter, _ := New(api)
+	request := testRequest()
+	first, err := adapter.CreateVM(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	getCallsBefore := api.vmGetCalls
+	api.omitVMListDescriptions = true
+	second, err := adapter.CreateVM(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.UUID != first.UUID || api.createCalls != 1 || len(api.vms) != 1 || len(api.floatingIPs) != 1 {
+		t.Fatalf("sparse-list adoption result=%#v POSTs=%d VMs=%#v FIPs=%#v", second, api.createCalls, api.vms, api.floatingIPs)
+	}
+	if api.vmGetCalls-getCallsBefore < 2 {
+		t.Fatalf("sparse-list adoption did not use canonical detail before protection: GET delta=%d", api.vmGetCalls-getCallsBefore)
+	}
+}
+
+func TestAmbiguousCreateRecoversSparseListCandidateThroughCanonicalDetail(t *testing.T) {
+	api := &fakeAPI{
+		createErr:              errors.New("connection reset after request"),
+		commitOnCreateError:    true,
+		omitVMListDescriptions: true,
+	}
+	adapter, _ := New(api)
+	created, err := adapter.CreateVM(context.Background(), testRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created.UUID == "" || api.createCalls != 1 || len(api.vms) != 1 || len(api.floatingIPs) != 1 {
+		t.Fatalf("ambiguous sparse-list recovery result=%#v POSTs=%d VMs=%#v FIPs=%#v", created, api.createCalls, api.vms, api.floatingIPs)
+	}
+	if api.vmGetCalls < 2 || api.firewallAssignCalls != 1 || api.floatingIPAssignCalls != 1 {
+		t.Fatalf("ambiguous recovery lacked canonical proof/protection: GETs=%d firewall=%d floatingIP=%d", api.vmGetCalls, api.firewallAssignCalls, api.floatingIPAssignCalls)
+	}
+}
+
+func TestCreateRejectsInvalidOrDuplicateListCandidateAuthorityBeforeMutation(t *testing.T) {
+	tests := map[string][]sdk.VM{
+		"invalid UUID": {{UUID: "not-a-uuid", Name: "foreign"}},
+		"duplicate UUID": {
+			{UUID: "11111111-1111-4111-8111-111111111111", Name: "foreign-a"},
+			{UUID: "11111111-1111-4111-8111-111111111111", Name: "foreign-b"},
+		},
+		"duplicate deterministic name": {
+			{UUID: "11111111-1111-4111-8111-111111111111", Name: "nodeclaim-a"},
+			{UUID: "22222222-2222-4222-8222-222222222222", Name: "nodeclaim-a"},
+		},
+	}
+	for name, vms := range tests {
+		t.Run(name, func(t *testing.T) {
+			api := &fakeAPI{vms: vms}
+			adapter, _ := New(api)
+			if _, err := adapter.CreateVM(context.Background(), testRequest()); err == nil {
+				t.Fatal("CreateVM() accepted invalid or duplicate list candidate authority")
+			}
+			if api.floatingIPCreateCalls != 0 || api.createCalls != 0 || api.vmGetCalls != 0 || len(api.operations) != 0 {
+				t.Fatalf("list authority failure reached mutation/detail lookup: FIPPOSTs=%d VMPOSTs=%d GETs=%d operations=%v", api.floatingIPCreateCalls, api.createCalls, api.vmGetCalls, api.operations)
+			}
+		})
+	}
+}
+
+func TestCreateCanonicalCandidateNotFoundOrNilFailsClosed(t *testing.T) {
+	tests := map[string]func(*fakeAPI, string){
+		"not found": func(api *fakeAPI, uuid string) {
+			api.getVMErrorByUUID = map[string]error{uuid: &sdk.APIError{StatusCode: 404}}
+		},
+		"nil response": func(api *fakeAPI, uuid string) { api.nilGetVMUUID = uuid },
+	}
+	for name, inject := range tests {
+		t.Run(name, func(t *testing.T) {
+			api := &fakeAPI{}
+			adapter, _ := New(api)
+			created, err := adapter.CreateVM(context.Background(), testRequest())
+			if err != nil {
+				t.Fatal(err)
+			}
+			api.omitVMListDescriptions = true
+			inject(api, created.UUID)
+			getCallsBefore := api.vmGetCalls
+			configureFastNetworkReadback(adapter, 40*time.Millisecond)
+			if _, err := adapter.CreateVM(context.Background(), testRequest()); err == nil {
+				t.Fatal("CreateVM() accepted an uncertain canonical candidate")
+			}
+			if api.vmGetCalls-getCallsBefore < 2 || api.createCalls != 1 || api.deleteVMCalls != 0 || len(api.vms) != 1 || len(api.floatingIPs) != 1 {
+				t.Fatalf("uncertain canonical candidate mutated resources: GET delta=%d POSTs=%d deletes=%d VMs=%#v FIPs=%#v", api.vmGetCalls-getCallsBefore, api.createCalls, api.deleteVMCalls, api.vms, api.floatingIPs)
+			}
+		})
 	}
 }
 
@@ -281,37 +379,53 @@ func TestCreateRejectsUnpersistedOwnershipBeforeProtection(t *testing.T) {
 }
 
 func TestAmbiguousCreateInvalidListOwnershipNeverProtectsOrDeletesUnprovenVM(t *testing.T) {
-	tests := map[string]func(string) string{
-		"missing": func(string) string { return "" },
-		"truncated": func(description string) string {
-			return description[:len(description)/2]
+	tests := map[string]struct {
+		mutate     func(string) string
+		incomplete bool
+	}{
+		"missing": {
+			mutate: func(string) string { return "" }, incomplete: true,
 		},
-		"mismatched identity": func(description string) string {
-			var record ownership
-			if err := json.Unmarshal([]byte(description), &record); err != nil {
-				t.Fatalf("decode ownership fixture: %v", err)
-			}
-			record.NodeClaim = "foreign-nodeclaim"
-			encoded, err := json.Marshal(record)
-			if err != nil {
-				t.Fatalf("encode ownership fixture: %v", err)
-			}
-			return string(encoded)
+		"truncated": {
+			mutate: func(description string) string { return description[:len(description)/2] }, incomplete: true,
+		},
+		"mismatched identity": {
+			mutate: func(description string) string {
+				var record ownership
+				if err := json.Unmarshal([]byte(description), &record); err != nil {
+					t.Fatalf("decode ownership fixture: %v", err)
+				}
+				record.NodeClaim = "foreign-nodeclaim"
+				encoded, err := json.Marshal(record)
+				if err != nil {
+					t.Fatalf("encode ownership fixture: %v", err)
+				}
+				return string(encoded)
+			},
 		},
 	}
-	for name, mutate := range tests {
+	for name, test := range tests {
 		t.Run(name, func(t *testing.T) {
 			api := &fakeAPI{
 				createErr:           errors.New("connection reset after request"),
 				commitOnCreateError: true,
-				persistDescription:  mutate,
+				persistDescription:  test.mutate,
 			}
 			adapter, _ := New(api)
+			if test.incomplete {
+				configureFastNetworkReadback(adapter, 40*time.Millisecond)
+			}
 			if _, err := adapter.CreateVM(context.Background(), testRequest()); err == nil {
 				t.Fatal("CreateVM() unexpectedly trusted invalid ListVMs ownership")
 			}
-			if len(api.vms) != 1 || api.createCalls != 1 || api.vmGetCalls != 0 || api.deleteVMCalls != 0 {
+			if len(api.vms) != 1 || api.createCalls != 1 || api.deleteVMCalls != 0 {
 				t.Fatalf("ambiguous unproven VM was retried, trusted, or unsafely deleted: VMs=%#v POSTs=%d GETs=%d deletes=%d", api.vms, api.createCalls, api.vmGetCalls, api.deleteVMCalls)
+			}
+			if test.incomplete && api.vmGetCalls < 2 {
+				t.Fatalf("incomplete canonical ownership was not retried: GETs=%d", api.vmGetCalls)
+			}
+			if !test.incomplete && api.vmGetCalls != 1 {
+				t.Fatalf("complete canonical ownership conflict was retried: GETs=%d", api.vmGetCalls)
 			}
 			if len(api.floatingIPs) != 1 || api.floatingIPs[0].AssignedTo != "" {
 				t.Fatalf("ambiguous ownership anchor was changed: %#v", api.floatingIPs)
@@ -407,7 +521,7 @@ func TestAmbiguousCreateDoesNotRollbackBeforeCanonicalOwnershipProof(t *testing.
 	if err == nil || !strings.Contains(err.Error(), "attachment to network") {
 		t.Fatalf("CreateVM() error = %v, want pre-ownership network read-back failure", err)
 	}
-	if len(api.vms) != 1 || len(api.floatingIPs) != 1 || api.createCalls != 1 || api.vmGetCalls != 0 || api.deleteVMCalls != 0 {
+	if len(api.vms) != 1 || len(api.floatingIPs) != 1 || api.createCalls != 1 || api.vmGetCalls != 1 || api.deleteVMCalls != 0 {
 		t.Fatalf("pre-proof failure changed ambiguous resources: VMs=%#v FIPs=%#v POSTs=%d GETs=%d deletes=%d", api.vms, api.floatingIPs, api.createCalls, api.vmGetCalls, api.deleteVMCalls)
 	}
 	if api.firewallAssignCalls != 0 || api.floatingIPAssignCalls != 0 || len(api.operations) != 0 {
@@ -692,7 +806,7 @@ func TestAmbiguousCommittedGenericOwnershipMismatchIsNotDeleted(t *testing.T) {
 	}
 	adapter, _ := New(api)
 	_, err := adapter.CreateVM(context.Background(), testRequest())
-	if err == nil || !strings.Contains(err.Error(), "launch parameters differ") {
+	if err == nil || !strings.Contains(err.Error(), "persisted launch identity differs") {
 		t.Fatalf("CreateVM() error = %v, want generic launch mismatch", err)
 	}
 	if len(api.vms) != 1 || len(api.floatingIPs) != 1 || api.deleteVMCalls != 0 || slicesContain(api.operations, "delete-vm") {
@@ -1095,7 +1209,7 @@ func TestCreateRefusesToAdoptOwnedVMFromAnotherNetwork(t *testing.T) {
 	api.floatingIPs = nil
 	api.operations = nil
 	api.vms[0].NetworkUUID = "other-network"
-	if _, err := adapter.CreateVM(context.Background(), testRequest()); err == nil || !strings.Contains(err.Error(), "launch parameters differ") {
+	if _, err := adapter.CreateVM(context.Background(), testRequest()); err == nil || !strings.Contains(err.Error(), "persisted launch identity differs") {
 		t.Fatalf("CreateVM() error = %v, want wrong-network adoption refusal", err)
 	}
 	if api.createCalls != 1 || len(api.vms) != 1 || api.floatingIPCreateCalls != 1 || len(api.operations) != 0 {
@@ -1127,7 +1241,6 @@ func TestCreateDoesNotDestroyAdoptedVMWhenVPCAttachmentIsTemporarilyAbsent(t *te
 	if _, err := adapter.CreateVM(context.Background(), request); err != nil {
 		t.Fatal(err)
 	}
-	api.vms[0].NetworkUUID = ""
 	api.network = &sdk.Network{UUID: request.NetworkUUID, Subnet: "10.0.0.0/24"}
 	api.operations = nil
 	configureFastNetworkReadback(adapter, 60*time.Millisecond)
@@ -1178,6 +1291,141 @@ func TestGetListDeleteAreOwnershipBound(t *testing.T) {
 	wantOrder := []string{"unassign-floating-ip", "delete-floating-ip", "delete-vm", "unassign-firewall"}
 	if !reflect.DeepEqual(api.operations, wantOrder) {
 		t.Fatalf("unsafe deletion order %v, want %v", api.operations, wantOrder)
+	}
+}
+
+func TestListVMsUsesCanonicalDetailsWhenListDescriptionsAreSparse(t *testing.T) {
+	api := &fakeAPI{}
+	adapter, _ := New(api)
+	created, err := adapter.CreateVM(context.Background(), testRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	api.omitVMListDescriptions = true
+	getCallsBefore := api.vmGetCalls
+	listed, err := adapter.ListVMs(context.Background(), "bkk01", "cluster-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(listed) != 1 || listed[0].UUID != created.UUID || listed[0].SpecHash != "spec-a" {
+		t.Fatalf("ListVMs() = %#v, want one canonically owned worker", listed)
+	}
+	if api.vmGetCalls-getCallsBefore != 1 {
+		t.Fatalf("ListVMs canonical detail GET delta=%d, want one", api.vmGetCalls-getCallsBefore)
+	}
+}
+
+func TestListVMsCanonicalizesForeignInventoryInParallelWithoutNameCoupling(t *testing.T) {
+	api := &fakeAPI{}
+	adapter, _ := New(api)
+	created, err := adapter.CreateVM(context.Background(), testRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index := 0; index < 24; index++ {
+		name := "foreign-duplicate"
+		if index == 0 {
+			name = ""
+		}
+		api.vms = append(api.vms, sdk.VM{
+			UUID: fmt.Sprintf("%08d-2222-4333-8444-555555555555", index+100),
+			Name: name, Description: "foreign", Status: "running",
+		})
+	}
+	api.omitVMListDescriptions = true
+	var concurrencyMu sync.Mutex
+	activeReads, maxReads := 0, 0
+	api.getVMHook = func(string) {
+		concurrencyMu.Lock()
+		activeReads++
+		if activeReads > maxReads {
+			maxReads = activeReads
+		}
+		concurrencyMu.Unlock()
+		time.Sleep(5 * time.Millisecond)
+		concurrencyMu.Lock()
+		activeReads--
+		concurrencyMu.Unlock()
+	}
+	listed, err := adapter.ListVMs(context.Background(), "bkk01", "cluster-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(listed) != 1 || listed[0].UUID != created.UUID {
+		t.Fatalf("ListVMs() = %#v, want only the canonical owned worker", listed)
+	}
+	if maxReads < 2 || maxReads > canonicalVMReadConcurrency {
+		t.Fatalf("canonical detail concurrency=%d, want 2..%d", maxReads, canonicalVMReadConcurrency)
+	}
+}
+
+func TestListVMsSkipsStaleNotFoundRowButRejectsNilCanonicalDetail(t *testing.T) {
+	for name, nilResponse := range map[string]bool{"stale not found": false, "nil response": true} {
+		t.Run(name, func(t *testing.T) {
+			api := &fakeAPI{}
+			adapter, _ := New(api)
+			created, err := adapter.CreateVM(context.Background(), testRequest())
+			if err != nil {
+				t.Fatal(err)
+			}
+			foreignUUID := "99999999-9999-4999-8999-999999999999"
+			api.vms = append(api.vms, sdk.VM{UUID: foreignUUID, Name: "foreign"})
+			if nilResponse {
+				api.nilGetVMUUID = foreignUUID
+			} else {
+				api.getVMErrorByUUID = map[string]error{foreignUUID: &sdk.APIError{StatusCode: 404}}
+			}
+			listed, err := adapter.ListVMs(context.Background(), "bkk01", "cluster-a")
+			if nilResponse {
+				if !errors.Is(err, cloudapi.ErrOwnershipMismatch) {
+					t.Fatalf("ListVMs() error = %v, want nil-detail rejection", err)
+				}
+				return
+			}
+			if err != nil || len(listed) != 1 || listed[0].UUID != created.UUID {
+				t.Fatalf("ListVMs() = %#v, %v, want stale foreign row skipped", listed, err)
+			}
+		})
+	}
+}
+
+func TestListVMsRejectsForeignCanonicalReadErrorOrIdentityMismatch(t *testing.T) {
+	tests := map[string]func(*fakeAPI, string){
+		"non-not-found error": func(api *fakeAPI, uuid string) {
+			api.getVMErrorByUUID = map[string]error{uuid: &sdk.APIError{StatusCode: 503, Retryable: true}}
+		},
+		"UUID mismatch": func(api *fakeAPI, uuid string) {
+			api.mutateGetVMResponse = func(vm *sdk.VM) {
+				if vm.UUID == uuid {
+					vm.UUID = "88888888-8888-4888-8888-888888888888"
+				}
+			}
+		},
+		"name mismatch": func(api *fakeAPI, uuid string) {
+			api.mutateGetVMResponse = func(vm *sdk.VM) {
+				if vm.UUID == uuid {
+					vm.Name = "changed"
+				}
+			}
+		},
+	}
+	for name, inject := range tests {
+		t.Run(name, func(t *testing.T) {
+			api := &fakeAPI{}
+			adapter, _ := New(api)
+			if _, err := adapter.CreateVM(context.Background(), testRequest()); err != nil {
+				t.Fatal(err)
+			}
+			foreignUUID := "99999999-9999-4999-8999-999999999999"
+			api.vms = append(api.vms, sdk.VM{UUID: foreignUUID, Name: "foreign"})
+			inject(api, foreignUUID)
+			if _, err := adapter.ListVMs(context.Background(), "bkk01", "cluster-a"); err == nil {
+				t.Fatal("ListVMs() accepted uncertain canonical foreign detail")
+			}
+			if api.deleteVMCalls != 0 {
+				t.Fatalf("read-only canonical failure deleted a VM: %d", api.deleteVMCalls)
+			}
+		})
 	}
 }
 
@@ -1637,6 +1885,7 @@ func slicesContain(values []string, expected string) bool {
 }
 
 type fakeAPI struct {
+	mu                              sync.Mutex
 	vms                             []sdk.VM
 	pools                           []sdk.HostPool
 	firewalls                       []sdk.Firewall
@@ -1645,6 +1894,10 @@ type fakeAPI struct {
 	sparseCreateResponse            bool
 	persistDescription              func(string) string
 	mutateGetVMResponse             func(*sdk.VM)
+	omitVMListDescriptions          bool
+	getVMErrorByUUID                map[string]error
+	nilGetVMUUID                    string
+	getVMHook                       func(string)
 	createCalls                     int
 	floatingIPs                     []sdk.FloatingIP
 	lastVMRequest                   sdk.CreateVMRequest
@@ -1811,7 +2064,15 @@ func (f *fakeAPI) DeleteFloatingIP(ctx context.Context, _ string, address string
 	return &sdk.APIError{StatusCode: 404}
 }
 func (f *fakeAPI) ListVMs(context.Context, string) ([]sdk.VM, error) {
-	return append([]sdk.VM(nil), f.vms...), nil
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	items := append([]sdk.VM(nil), f.vms...)
+	if f.omitVMListDescriptions {
+		for i := range items {
+			items[i].Description = ""
+		}
+	}
+	return items, nil
 }
 
 func secureFirewall() sdk.Firewall {
@@ -1828,20 +2089,40 @@ func secureFirewall() sdk.Firewall {
 	}
 }
 func (f *fakeAPI) GetVM(_ context.Context, _, uuid string) (*sdk.VM, error) {
+	f.mu.Lock()
 	f.vmGetCalls++
+	injected := f.getVMErrorByUUID[uuid]
+	returnNil := f.nilGetVMUUID == uuid
+	mutate := f.mutateGetVMResponse
+	hook := f.getVMHook
+	var found *sdk.VM
 	for i := range f.vms {
 		if f.vms[i].UUID == uuid {
 			copy := f.vms[i]
 			if f.vmGetCalls <= f.privateIPv4VisibleAfter {
 				copy.PrivateIPv4 = ""
 			}
-			if f.mutateGetVMResponse != nil {
-				f.mutateGetVMResponse(&copy)
-			}
-			return &copy, nil
+			found = &copy
+			break
 		}
 	}
-	return nil, &sdk.APIError{StatusCode: 404}
+	f.mu.Unlock()
+	if hook != nil {
+		hook(uuid)
+	}
+	if injected != nil {
+		return nil, injected
+	}
+	if returnNil {
+		return nil, nil
+	}
+	if found == nil {
+		return nil, &sdk.APIError{StatusCode: 404}
+	}
+	if mutate != nil {
+		mutate(found)
+	}
+	return found, nil
 }
 func (f *fakeAPI) CreateVM(_ context.Context, _ string, request sdk.CreateVMRequest) (*sdk.VM, error) {
 	f.createCalls++

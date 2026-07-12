@@ -14,8 +14,10 @@ import (
 	"fmt"
 	"net/http"
 	"net/netip"
+	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	sdk "github.com/thanet-s/inspace-cloud-kube-modules/modules/client"
@@ -34,6 +36,7 @@ const (
 	defaultNetworkAttachmentReadbackMinInterval = 500 * time.Millisecond
 	defaultNetworkAttachmentReadbackMaxInterval = 5 * time.Second
 	defaultProtectionAuditTimeout               = 15 * time.Second
+	canonicalVMReadConcurrency                  = 8
 )
 
 var (
@@ -41,6 +44,7 @@ var (
 	errWorkerServiceVIPPoolCollision = errors.New("worker private IPv4 collides with the reserved private Service VIP pool")
 	errFirewallAssignmentNotVisible  = errors.New("intended worker firewall assignment is not visible")
 	errPersistedOwnershipIncomplete  = errors.New("persisted VM ownership record is incomplete")
+	vmUUIDPattern                    = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
 	fixedClusterNetworks             = [...]struct {
 		description string
 		prefix      netip.Prefix
@@ -302,29 +306,99 @@ func (a *Adapter) findOwnedVM(ctx context.Context, request cloudapi.CreateVMRequ
 	if err != nil {
 		return nil, ownership{}, fmt.Errorf("listing VMs before create: %w", err)
 	}
-	type match struct {
-		vm     sdk.VM
-		record ownership
+	if err := validateVMListSnapshot(vms); err != nil {
+		return nil, ownership{}, fmt.Errorf("validating VM list before create: %w", err)
 	}
-	var matches []match
+	var candidates []sdk.VM
 	keyHash := hashKey(request.IdempotencyKey)
 	for i := range vms {
 		record, managed := parseOwnership(vms[i].Description)
-		if managed && record.Cluster == request.ClusterName && record.NodeClaim == request.NodeClaimName && record.KeyHash == keyHash {
-			matches = append(matches, match{vm: vms[i], record: record})
-			continue
-		}
-		if vms[i].Name == request.Name {
-			return nil, ownership{}, fmt.Errorf("refusing create: VM name %q already exists without matching ownership", request.Name)
+		listOwnershipCandidate := managed && record.Cluster == request.ClusterName &&
+			record.NodeClaim == request.NodeClaimName && record.KeyHash == keyHash
+		if vms[i].Name == request.Name || listOwnershipCandidate {
+			candidates = append(candidates, vms[i])
 		}
 	}
-	if len(matches) > 1 {
-		return nil, ownership{}, fmt.Errorf("refusing create: %d VMs have the same Karpenter ownership identity", len(matches))
+	if len(candidates) > 1 {
+		return nil, ownership{}, fmt.Errorf("refusing create: %d VM list rows match the deterministic name or Karpenter ownership key", len(candidates))
 	}
-	if len(matches) == 1 {
-		return &matches[0].vm, matches[0].record, nil
+	if len(candidates) == 0 {
+		return nil, ownership{}, nil
 	}
-	return nil, ownership{}, nil
+	vm, record, err := a.readCanonicalCreateCandidate(ctx, request, candidates[0])
+	if err != nil {
+		return nil, ownership{}, fmt.Errorf("refusing create: canonical detail for listed VM %q: %w", candidates[0].Name, err)
+	}
+	return vm, record, nil
+}
+
+func validateVMListSnapshot(vms []sdk.VM) error {
+	uuids := make(map[string]bool, len(vms))
+	for i := range vms {
+		if !vmUUIDPattern.MatchString(vms[i].UUID) {
+			return fmt.Errorf("VM list row %d has invalid UUID %q", i, vms[i].UUID)
+		}
+		if uuids[vms[i].UUID] {
+			return fmt.Errorf("VM list contains duplicate UUID %s", vms[i].UUID)
+		}
+		uuids[vms[i].UUID] = true
+	}
+	return nil
+}
+
+// readCanonicalCreateCandidate treats ListVMs only as location-wide discovery
+// and collision evidence. Ownership, launch identity, and adoption authority
+// all come from bounded GetVM detail reads for the exact listed UUID.
+func (a *Adapter) readCanonicalCreateCandidate(ctx context.Context, request cloudapi.CreateVMRequest, summary sdk.VM) (*sdk.VM, ownership, error) {
+	readbackCtx, cancel := context.WithTimeout(ctx, a.networkAttachmentReadbackTimeout)
+	defer cancel()
+	var lastObservation error
+	readbackDelay := a.networkAttachmentReadbackMinDelay
+	for {
+		requestCtx, requestCancel := context.WithTimeout(readbackCtx, a.networkAttachmentRequestTimeout)
+		vm, err := a.api.GetVM(requestCtx, request.Location, summary.UUID)
+		requestCancel()
+		if err != nil {
+			lastObservation = fmt.Errorf("getting canonical VM %s: %w", summary.UUID, err)
+		}
+		if readbackErr := readbackCtx.Err(); readbackErr != nil {
+			return nil, ownership{}, fmt.Errorf("canonical VM %s read-back stopped: %w", summary.UUID, errors.Join(lastObservation, readbackErr))
+		}
+		switch {
+		case err != nil:
+			if !sdk.IsNotFound(err) && !isRetryableReadback(readbackCtx, err) {
+				return nil, ownership{}, lastObservation
+			}
+		case vm == nil:
+			lastObservation = fmt.Errorf("%w: canonical VM %s detail response is empty: %w", cloudapi.ErrOwnershipMismatch, summary.UUID, errPersistedOwnershipIncomplete)
+		case vm.UUID != summary.UUID:
+			return nil, ownership{}, fmt.Errorf("%w: canonical VM detail UUID %q does not match listed UUID %q", cloudapi.ErrOwnershipMismatch, vm.UUID, summary.UUID)
+		case summary.Name != "" && vm.Name != "" && vm.Name != summary.Name:
+			return nil, ownership{}, fmt.Errorf("%w: canonical VM detail name %q does not match listed name %q", cloudapi.ErrOwnershipMismatch, vm.Name, summary.Name)
+		default:
+			var actual ownership
+			_ = json.Unmarshal([]byte(vm.Description), &actual)
+			expected := newOwnership(request, sdk.FloatingIP{
+				Name: floatingIPName(request.ClusterName, request.NodeClaimName), Address: actual.PublicIPv4,
+				BillingAccountID: request.BillingAccountID,
+			})
+			validationErr := validatePersistedVM(*vm, summary.UUID, request, expected)
+			if validationErr == nil && actual.PublicIPv4 == "" {
+				validationErr = fmt.Errorf("%w: VM %s canonical ownership lacks its public IPv4: %w", cloudapi.ErrOwnershipMismatch, summary.UUID, errPersistedOwnershipIncomplete)
+			}
+			if errors.Is(validationErr, errPersistedOwnershipIncomplete) {
+				lastObservation = validationErr
+			} else if validationErr != nil {
+				return nil, ownership{}, validationErr
+			} else {
+				return vm, actual, nil
+			}
+		}
+		if err := waitForReadback(readbackCtx, readbackDelay); err != nil {
+			return nil, ownership{}, fmt.Errorf("canonical VM %s ownership did not converge before the read-back deadline: %w", summary.UUID, errors.Join(lastObservation, err))
+		}
+		readbackDelay = nextReadbackDelay(readbackDelay, a.networkAttachmentReadbackMaxDelay)
+	}
 }
 
 func (a *Adapter) GetVM(ctx context.Context, location, uuid, clusterName string) (*cloudapi.VM, error) {
@@ -346,7 +420,11 @@ func (a *Adapter) GetVM(ctx context.Context, location, uuid, clusterName string)
 }
 
 func (a *Adapter) ListVMs(ctx context.Context, location, clusterName string) ([]*cloudapi.VM, error) {
-	vms, err := a.api.ListVMs(ctx, location)
+	listed, err := a.api.ListVMs(ctx, location)
+	if err != nil {
+		return nil, err
+	}
+	vms, err := a.canonicalListedVMDetails(ctx, location, listed)
 	if err != nil {
 		return nil, err
 	}
@@ -354,6 +432,9 @@ func (a *Adapter) ListVMs(ctx context.Context, location, clusterName string) ([]
 	for i := range vms {
 		record, managed := parseOwnership(vms[i].Description)
 		if managed && record.Cluster == clusterName {
+			if vms[i].Name == "" {
+				return nil, fmt.Errorf("%w: owned VM %s canonical detail has no name", cloudapi.ErrOwnershipMismatch, vms[i].UUID)
+			}
 			owned = append(owned, ownedVM{vm: vms[i], record: record})
 		}
 	}
@@ -365,6 +446,71 @@ func (a *Adapter) ListVMs(ctx context.Context, location, clusterName string) ([]
 		result = append(result, fromSDK(&owned[i].vm, location, owned[i].record))
 	}
 	sort.Slice(result, func(i, j int) bool { return result[i].UUID < result[j].UUID })
+	return result, nil
+}
+
+func (a *Adapter) canonicalListedVMDetails(ctx context.Context, location string, listed []sdk.VM) ([]sdk.VM, error) {
+	if err := validateVMListSnapshot(listed); err != nil {
+		return nil, fmt.Errorf("validating VM list for canonical read audit: %w", err)
+	}
+	auditCtx, cancel := context.WithTimeout(ctx, a.protectionAuditTimeout)
+	defer cancel()
+	summaries := append([]sdk.VM(nil), listed...)
+	sort.Slice(summaries, func(i, j int) bool { return summaries[i].UUID < summaries[j].UUID })
+	details := make([]*sdk.VM, len(summaries))
+	errs := make([]error, len(summaries))
+	jobs := make(chan int, len(summaries))
+	for index := range summaries {
+		jobs <- index
+	}
+	close(jobs)
+	workers := canonicalVMReadConcurrency
+	if len(summaries) < workers {
+		workers = len(summaries)
+	}
+	var reads sync.WaitGroup
+	for range workers {
+		reads.Add(1)
+		go func() {
+			defer reads.Done()
+			for index := range jobs {
+				if auditCtx.Err() != nil {
+					errs[index] = auditCtx.Err()
+					continue
+				}
+				vm, err := a.api.GetVM(auditCtx, location, summaries[index].UUID)
+				if sdk.IsNotFound(err) {
+					// The list row became stale after the snapshot. Canonical current
+					// state says the VM is absent, so omitting it is authoritative.
+					continue
+				}
+				if err != nil {
+					errs[index] = fmt.Errorf("reading canonical detail for listed VM %s: %w", summaries[index].UUID, err)
+					continue
+				}
+				if vm == nil {
+					errs[index] = fmt.Errorf("%w: canonical detail for listed VM %s is empty", cloudapi.ErrOwnershipMismatch, summaries[index].UUID)
+					continue
+				}
+				if vm.UUID != summaries[index].UUID ||
+					(summaries[index].Name != "" && vm.Name != "" && vm.Name != summaries[index].Name) {
+					errs[index] = fmt.Errorf("%w: canonical detail identity for listed VM %s/%q does not match its list row", cloudapi.ErrOwnershipMismatch, summaries[index].UUID, summaries[index].Name)
+					continue
+				}
+				details[index] = vm
+			}
+		}()
+	}
+	reads.Wait()
+	result := make([]sdk.VM, 0, len(details))
+	for i := range details {
+		if errs[i] != nil {
+			return nil, errs[i]
+		}
+		if details[i] != nil {
+			result = append(result, *details[i])
+		}
+	}
 	return result, nil
 }
 
