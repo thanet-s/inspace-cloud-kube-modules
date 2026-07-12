@@ -19,6 +19,15 @@ ssh_private_key=${INSPACE_E2E_SSH_PRIVATE_KEY:-$HOME/.ssh/id_rsa}
 ssh_public_key=${INSPACE_E2E_SSH_PUBLIC_KEY:-$HOME/.ssh/id_rsa.pub}
 state_volume=${INSPACE_E2E_STATE_VOLUME:-inspace-cloud-rke2-e2e-state}
 runner_image=${INSPACE_E2E_RUNNER_IMAGE:-inspace-cloud-rke2-e2e:local}
+runner_platform=${INSPACE_E2E_RUNNER_PLATFORM:-linux/amd64}
+
+case "$runner_platform" in
+  linux/amd64 | linux/arm64) ;;
+  *)
+    echo "INSPACE_E2E_RUNNER_PLATFORM must be linux/amd64 or linux/arm64" >&2
+    exit 2
+    ;;
+esac
 
 [[ -f "$env_file" && -r "$env_file" ]] || {
   echo "E2E environment file is not readable: $env_file" >&2
@@ -47,12 +56,14 @@ runner_image=${INSPACE_E2E_RUNNER_IMAGE:-inspace-cloud-rke2-e2e:local}
 
 docker volume inspect "$state_volume" >/dev/null 2>&1 || docker volume create "$state_volume" >/dev/null
 docker build \
+  --platform "$runner_platform" \
   --file test/e2e/Dockerfile \
   --target published-live \
   --build-arg "CONTROLLER_IMAGE=ghcr.io/thanet-s/inspace-cloud-controller-manager:$INSPACE_E2E_VERSION" \
   --tag "$runner_image" \
   .
 docker run --rm \
+  --platform "$runner_platform" \
   --env "CONFIRM_INSPACE_CLUSTER_E2E=$CONFIRM_INSPACE_CLUSTER_E2E" \
   --env "INSPACE_E2E_VERSION=$INSPACE_E2E_VERSION" \
   --env "INSPACE_E2E_KEEP_RESOURCES=${INSPACE_E2E_KEEP_RESOURCES:-false}" \

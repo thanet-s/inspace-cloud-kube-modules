@@ -133,6 +133,17 @@ export CONFIRM_INSPACE_CLUSTER_E2E='<isolated-billing-account-id>'
 ./test/e2e/run.sh
 ```
 
+The runner image is built and executed as `linux/amd64` by default, matching
+the Intel and AMD CPU host pools currently available from InSpace. A future
+ARM-backed test account can opt in without changing the launcher:
+
+```sh
+export INSPACE_E2E_RUNNER_PLATFORM='linux/arm64'
+```
+
+Only `linux/amd64` and `linux/arm64` are accepted. The selected platform is
+applied to both the Docker build and the Docker run.
+
 Required `.env` values are `INSPACE_API_URL`, `INSPACE_API_TOKEN`,
 `INSPACE_LOCATION`, `INSPACE_BILLING_ACCOUNT_ID`, `INSPACE_NETWORK_UUID`,
 `INSPACE_CONTROL_PLANE_VIP`, `INSPACE_PRIVATE_LOAD_BALANCER_POOL_START`,
