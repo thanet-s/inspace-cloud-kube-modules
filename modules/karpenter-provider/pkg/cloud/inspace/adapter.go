@@ -158,9 +158,9 @@ func (a *Adapter) CreateVM(ctx context.Context, request cloudapi.CreateVMRequest
 		if err := validateExisting(*existing, request, actual, expected); err != nil {
 			return nil, err
 		}
-		persisted, networkPrefix, err := a.ensureWorkerNetworkIdentity(ctx, request, existing.UUID, expected)
+		persisted, networkPrefix, ownershipProven, err := a.ensureWorkerNetworkIdentity(ctx, request, existing.UUID, expected)
 		if err != nil {
-			if actual.ControlPlaneVIP != "" && (errors.Is(err, errWorkerSupervisorVIPCollision) || errors.Is(err, errWorkerServiceVIPPoolCollision)) {
+			if ownershipProven && actual.ControlPlaneVIP != "" && (errors.Is(err, errWorkerSupervisorVIPCollision) || errors.Is(err, errWorkerServiceVIPPoolCollision)) {
 				return nil, a.cleanupLaunch(ctx, request.Location, request.FirewallUUID, existing.UUID, expectedFloatingIP, err)
 			}
 			return nil, fmt.Errorf("verifying network identity for owned VM %s: %w", existing.UUID, err)
@@ -266,7 +266,7 @@ func (a *Adapter) CreateVM(ctx context.Context, request cloudapi.CreateVMRequest
 	// A create response may be sparse and is not durable ownership authority.
 	// Use only its UUID, then require the subsequent VM detail read to contain
 	// the complete, exact ownership record before making protection mutations.
-	persisted, err := a.ensureProtection(ctx, request, created.UUID, *floatingIP, record)
+	persisted, _, err := a.ensureProtection(ctx, request, created.UUID, *floatingIP, record)
 	if err != nil {
 		return nil, a.cleanupLaunch(ctx, request.Location, request.FirewallUUID, created.UUID, *floatingIP, err)
 	}
@@ -284,9 +284,11 @@ func (a *Adapter) findCreate(ctx context.Context, request cloudapi.CreateVMReque
 	if err := validateExistingFloatingIP(*floatingIP, actual, vm.UUID); err != nil {
 		return nil, err
 	}
-	persisted, err := a.ensureProtection(ctx, request, vm.UUID, *floatingIP, expected)
+	persisted, ownershipProven, err := a.ensureProtection(ctx, request, vm.UUID, *floatingIP, expected)
 	if err != nil {
-		if (actual.ControlPlaneVIP != "" && (errors.Is(err, errWorkerSupervisorVIPCollision) || errors.Is(err, errWorkerServiceVIPPoolCollision))) || rollbackNewLaunch {
+		unsafeAddressCollision := actual.ControlPlaneVIP != "" &&
+			(errors.Is(err, errWorkerSupervisorVIPCollision) || errors.Is(err, errWorkerServiceVIPPoolCollision))
+		if ownershipProven && (unsafeAddressCollision || rollbackNewLaunch) {
 			return nil, a.cleanupLaunch(ctx, request.Location, request.FirewallUUID, vm.UUID, *floatingIP, err)
 		}
 		return nil, fmt.Errorf("verifying protection for owned VM %s: %w", vm.UUID, err)
@@ -785,39 +787,39 @@ func (a *Adapter) ensureFloatingIP(ctx context.Context, request cloudapi.CreateV
 	return created, true, nil
 }
 
-func (a *Adapter) ensureProtection(ctx context.Context, request cloudapi.CreateVMRequest, vmUUID string, floatingIP sdk.FloatingIP, expected ownership) (*sdk.VM, error) {
-	persisted, networkPrefix, err := a.ensureWorkerNetworkIdentity(ctx, request, vmUUID, expected)
+func (a *Adapter) ensureProtection(ctx context.Context, request cloudapi.CreateVMRequest, vmUUID string, floatingIP sdk.FloatingIP, expected ownership) (*sdk.VM, bool, error) {
+	persisted, networkPrefix, ownershipProven, err := a.ensureWorkerNetworkIdentity(ctx, request, vmUUID, expected)
 	if err != nil {
-		return nil, err
+		return nil, ownershipProven, err
 	}
 	if err := a.ensureCloudProtections(ctx, request, vmUUID, floatingIP, networkPrefix); err != nil {
-		return nil, err
+		return nil, true, err
 	}
-	return persisted, nil
+	return persisted, true, nil
 }
 
-func (a *Adapter) ensureWorkerNetworkIdentity(ctx context.Context, request cloudapi.CreateVMRequest, vmUUID string, expected ownership) (*sdk.VM, netip.Prefix, error) {
+func (a *Adapter) ensureWorkerNetworkIdentity(ctx context.Context, request cloudapi.CreateVMRequest, vmUUID string, expected ownership) (*sdk.VM, netip.Prefix, bool, error) {
 	if vmUUID == "" {
-		return nil, netip.Prefix{}, fmt.Errorf("worker VM UUID is required for protection read-back")
+		return nil, netip.Prefix{}, false, fmt.Errorf("worker VM UUID is required for protection read-back")
 	}
 	vip, err := validateControlPlaneVIP(request.ControlPlaneVIP)
 	if err != nil {
-		return nil, netip.Prefix{}, err
+		return nil, netip.Prefix{}, false, err
 	}
 	privateLoadBalancerPool := inspacev1.PrivateLoadBalancerPool{Start: request.PrivateLoadBalancerPoolStart, Stop: request.PrivateLoadBalancerPoolStop}
 	if err := privateLoadBalancerPool.ValidateForSupervisor(vip); err != nil {
-		return nil, netip.Prefix{}, err
+		return nil, netip.Prefix{}, false, err
 	}
 	networkPrefix, err := a.ensureNetworkAttachment(ctx, request.Location, request.NetworkUUID, vmUUID, vip, privateLoadBalancerPool)
 	if err != nil {
-		return nil, netip.Prefix{}, err
+		return nil, netip.Prefix{}, false, err
 	}
-	persisted, privateIPv4, err := a.ensureWorkerPrivateIPv4(ctx, request, vmUUID, networkPrefix, vip, privateLoadBalancerPool, expected)
+	persisted, privateIPv4, ownershipProven, err := a.ensureWorkerPrivateIPv4(ctx, request, vmUUID, networkPrefix, vip, privateLoadBalancerPool, expected)
 	if err != nil {
-		return nil, netip.Prefix{}, err
+		return nil, netip.Prefix{}, ownershipProven, err
 	}
 	persisted.PrivateIPv4 = privateIPv4.String()
-	return persisted, networkPrefix, nil
+	return persisted, networkPrefix, true, nil
 }
 
 func (a *Adapter) ensureCloudProtections(ctx context.Context, request cloudapi.CreateVMRequest, vmUUID string, floatingIP sdk.FloatingIP, networkPrefix netip.Prefix) error {
@@ -895,40 +897,44 @@ func (a *Adapter) ensureNetworkAttachment(ctx context.Context, location, network
 	}
 }
 
-func (a *Adapter) ensureWorkerPrivateIPv4(ctx context.Context, request cloudapi.CreateVMRequest, vmUUID string, networkPrefix netip.Prefix, controlPlaneVIP netip.Addr, privateLoadBalancerPool inspacev1.PrivateLoadBalancerPool, expected ownership) (*sdk.VM, netip.Addr, error) {
+func (a *Adapter) ensureWorkerPrivateIPv4(ctx context.Context, request cloudapi.CreateVMRequest, vmUUID string, networkPrefix netip.Prefix, controlPlaneVIP netip.Addr, privateLoadBalancerPool inspacev1.PrivateLoadBalancerPool, expected ownership) (*sdk.VM, netip.Addr, bool, error) {
 	readbackCtx, cancel := context.WithTimeout(ctx, a.networkAttachmentReadbackTimeout)
 	defer cancel()
 	var lastObservation error
+	ownershipProven := false
 	readbackDelay := a.networkAttachmentReadbackMinDelay
 	for {
 		requestCtx, requestCancel := context.WithTimeout(readbackCtx, a.networkAttachmentRequestTimeout)
 		vm, err := a.api.GetVM(requestCtx, request.Location, vmUUID)
 		requestCancel()
 		if readbackErr := readbackCtx.Err(); readbackErr != nil {
-			return nil, netip.Addr{}, fmt.Errorf("VM %s private IPv4 read-back stopped: %w", vmUUID, readbackErr)
+			return nil, netip.Addr{}, ownershipProven, fmt.Errorf("VM %s private IPv4 read-back stopped: %w", vmUUID, readbackErr)
 		}
 		if err != nil {
 			lastObservation = fmt.Errorf("getting worker VM %s for private IPv4 read-back: %w", vmUUID, err)
 			if !sdk.IsNotFound(err) && !isRetryableReadback(readbackCtx, err) {
-				return nil, netip.Addr{}, lastObservation
+				return nil, netip.Addr{}, ownershipProven, lastObservation
 			}
 		} else if vm == nil {
-			return nil, netip.Addr{}, fmt.Errorf("getting worker VM %s for private IPv4 read-back: API returned no VM", vmUUID)
+			return nil, netip.Addr{}, ownershipProven, fmt.Errorf("getting worker VM %s for private IPv4 read-back: API returned no VM", vmUUID)
 		} else {
 			if err := validatePersistedVM(*vm, vmUUID, request, expected); err != nil {
-				return nil, netip.Addr{}, err
+				// A conflicting authoritative detail invalidates any sparse-list
+				// ownership signal. The caller must not delete or protect this VM.
+				return nil, netip.Addr{}, false, err
 			}
+			ownershipProven = true
 			privateIPv4, validationErr := validateWorkerPrivateIPv4(*vm, networkPrefix, controlPlaneVIP, privateLoadBalancerPool)
 			if validationErr == nil {
-				return vm, privateIPv4, nil
+				return vm, privateIPv4, true, nil
 			}
 			if vm.PrivateIPv4 != "" {
-				return nil, netip.Addr{}, validationErr
+				return nil, netip.Addr{}, true, validationErr
 			}
 			lastObservation = validationErr
 		}
 		if err := waitForReadback(readbackCtx, readbackDelay); err != nil {
-			return nil, netip.Addr{}, fmt.Errorf("VM %s did not obtain exactly one safe private IPv4 before the read-back deadline: %w", vmUUID, errors.Join(lastObservation, err))
+			return nil, netip.Addr{}, ownershipProven, fmt.Errorf("VM %s did not obtain exactly one safe private IPv4 before the read-back deadline: %w", vmUUID, errors.Join(lastObservation, err))
 		}
 		readbackDelay = nextReadbackDelay(readbackDelay, a.networkAttachmentReadbackMaxDelay)
 	}

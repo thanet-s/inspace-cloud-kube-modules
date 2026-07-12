@@ -182,6 +182,72 @@ func TestAmbiguousCreateInvalidListOwnershipNeverProtectsOrDeletesUnprovenVM(t *
 	}
 }
 
+func TestAmbiguousCreateCanonicalOwnershipDisagreementNeverMutatesListMatchedVM(t *testing.T) {
+	tests := map[string]func(*sdk.VM){
+		"missing description":   func(vm *sdk.VM) { vm.Description = "" },
+		"truncated description": func(vm *sdk.VM) { vm.Description = vm.Description[:len(vm.Description)/2] },
+		"mismatched ownership": func(vm *sdk.VM) {
+			var record ownership
+			if err := json.Unmarshal([]byte(vm.Description), &record); err != nil {
+				t.Fatalf("decode ownership fixture: %v", err)
+			}
+			record.SpecHash = "foreign-spec"
+			encoded, err := json.Marshal(record)
+			if err != nil {
+				t.Fatalf("encode ownership fixture: %v", err)
+			}
+			vm.Description = string(encoded)
+		},
+		"mismatched UUID": func(vm *sdk.VM) { vm.UUID = "99999999-9999-4999-8999-999999999999" },
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			api := &fakeAPI{
+				createErr:           errors.New("connection reset after request"),
+				commitOnCreateError: true,
+				mutateGetVMResponse: mutate,
+			}
+			adapter, _ := New(api)
+			_, err := adapter.CreateVM(context.Background(), testRequest())
+			if !errors.Is(err, cloudapi.ErrOwnershipMismatch) {
+				t.Fatalf("CreateVM() error = %v, want canonical ownership rejection", err)
+			}
+			if len(api.vms) != 1 || api.createCalls != 1 || api.vmGetCalls != 1 || api.deleteVMCalls != 0 {
+				t.Fatalf("canonical disagreement retried or deleted list-matched VM: VMs=%#v POSTs=%d GETs=%d deletes=%d", api.vms, api.createCalls, api.vmGetCalls, api.deleteVMCalls)
+			}
+			if record, managed := parseOwnership(api.vms[0].Description); !managed || record.SpecHash != "spec-a" {
+				t.Fatalf("ListVMs fixture did not retain exact ownership: %#v, managed=%t", record, managed)
+			}
+			if len(api.floatingIPs) != 1 || api.floatingIPs[0].AssignedTo != "" {
+				t.Fatalf("ambiguous ownership anchor was changed: %#v", api.floatingIPs)
+			}
+			if api.firewallAssignCalls != 0 || api.floatingIPAssignCalls != 0 || len(api.operations) != 0 {
+				t.Fatalf("canonical disagreement reached mutation: firewall=%d floatingIP=%d operations=%v", api.firewallAssignCalls, api.floatingIPAssignCalls, api.operations)
+			}
+		})
+	}
+}
+
+func TestAmbiguousCreateDoesNotRollbackBeforeCanonicalOwnershipProof(t *testing.T) {
+	api := &fakeAPI{
+		createErr:           errors.New("connection reset after request"),
+		commitOnCreateError: true,
+		network:             &sdk.Network{UUID: "network-1", Subnet: "10.0.0.0/24"},
+	}
+	adapter, _ := New(api)
+	configureFastNetworkReadback(adapter, 40*time.Millisecond)
+	_, err := adapter.CreateVM(context.Background(), testRequest())
+	if err == nil || !strings.Contains(err.Error(), "attachment to network") {
+		t.Fatalf("CreateVM() error = %v, want pre-ownership network read-back failure", err)
+	}
+	if len(api.vms) != 1 || len(api.floatingIPs) != 1 || api.createCalls != 1 || api.vmGetCalls != 0 || api.deleteVMCalls != 0 {
+		t.Fatalf("pre-proof failure changed ambiguous resources: VMs=%#v FIPs=%#v POSTs=%d GETs=%d deletes=%d", api.vms, api.floatingIPs, api.createCalls, api.vmGetCalls, api.deleteVMCalls)
+	}
+	if api.firewallAssignCalls != 0 || api.floatingIPAssignCalls != 0 || len(api.operations) != 0 {
+		t.Fatalf("pre-proof failure reached mutation: firewall=%d floatingIP=%d operations=%v", api.firewallAssignCalls, api.floatingIPAssignCalls, api.operations)
+	}
+}
+
 func TestCreatePassesOptionalSSHAccess(t *testing.T) {
 	api := &fakeAPI{}
 	adapter, err := newAdapter(api, func() (string, error) { return validGeneratedTestPassword, nil })
@@ -1411,6 +1477,7 @@ type fakeAPI struct {
 	commitOnCreateError             bool
 	sparseCreateResponse            bool
 	persistDescription              func(string) string
+	mutateGetVMResponse             func(*sdk.VM)
 	createCalls                     int
 	floatingIPs                     []sdk.FloatingIP
 	lastVMRequest                   sdk.CreateVMRequest
@@ -1600,6 +1667,9 @@ func (f *fakeAPI) GetVM(_ context.Context, _, uuid string) (*sdk.VM, error) {
 			copy := f.vms[i]
 			if f.vmGetCalls <= f.privateIPv4VisibleAfter {
 				copy.PrivateIPv4 = ""
+			}
+			if f.mutateGetVMResponse != nil {
+				f.mutateGetVMResponse(&copy)
 			}
 			return &copy, nil
 		}
