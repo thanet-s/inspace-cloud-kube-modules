@@ -624,11 +624,10 @@ func (r *Reconciler) ensureManagedNodeFirewall(ctx context.Context, cluster *v1a
 	if err != nil {
 		return nil, err
 	}
-	if created == nil {
-		return nil, errors.New("bootstrap: create node firewall returned an empty response")
-	}
-	if err := validateManagedNodeFirewall(created, cluster, network, owner); err != nil {
-		return nil, err
+	if err := validateCreatedFirewallResponse(
+		created, firewallName(owner), "Managed RKE2 node firewall for "+owner, cluster.Spec.BillingAccountID,
+	); err != nil {
+		return nil, fmt.Errorf("bootstrap: create node firewall response: %w", err)
 	}
 	items, err := r.API.ListFirewalls(ctx, cluster.Spec.Location)
 	if err != nil {
@@ -656,11 +655,10 @@ func (r *Reconciler) ensureManagedBastionFirewall(ctx context.Context, cluster *
 	if err != nil {
 		return nil, err
 	}
-	if created == nil {
-		return nil, errors.New("bootstrap: create bastion firewall returned an empty response")
-	}
-	if err := validateManagedBastionFirewall(created, cluster, owner, r.ManagementCIDR); err != nil {
-		return nil, err
+	if err := validateCreatedFirewallResponse(
+		created, bastionFirewallName(owner), "Managed RKE2 bastion firewall for "+owner, cluster.Spec.BillingAccountID,
+	); err != nil {
+		return nil, fmt.Errorf("bootstrap: create bastion firewall response: %w", err)
 	}
 	items, err := r.API.ListFirewalls(ctx, cluster.Spec.Location)
 	if err != nil {
@@ -674,6 +672,33 @@ func (r *Reconciler) ensureManagedBastionFirewall(ctx context.Context, cluster *
 		return nil, err
 	}
 	return readback, nil
+}
+
+// validateCreatedFirewallResponse treats a firewall POST response as only a
+// provisional resource handle. InSpace may omit identity fields and return an
+// empty rules array even though the authoritative list readback is complete.
+// Any identity evidence it does return must agree with the request; policy and
+// assignment authority always comes from the subsequent ListFirewalls call.
+func validateCreatedFirewallResponse(firewall *inspace.Firewall, expectedName, expectedDescription string, billingAccountID int64) error {
+	if firewall == nil {
+		return errors.New("returned an empty response")
+	}
+	if !vmUUIDPattern.MatchString(firewall.UUID) {
+		return errors.New("has an invalid UUID")
+	}
+	if firewall.Name != "" && firewall.Name != expectedName {
+		return fmt.Errorf("name %q does not match %q", firewall.Name, expectedName)
+	}
+	if firewall.DisplayName != "" && firewall.DisplayName != expectedName {
+		return fmt.Errorf("display name %q does not match %q", firewall.DisplayName, expectedName)
+	}
+	if firewall.Description != "" && firewall.Description != expectedDescription {
+		return errors.New("has an unexpected description")
+	}
+	if firewall.BillingAccountID != 0 && firewall.BillingAccountID != billingAccountID {
+		return errors.New("belongs to another billing account")
+	}
+	return nil
 }
 
 func validateManagedNodeFirewall(firewall *inspace.Firewall, cluster *v1alpha1.InSpaceCluster, network *inspace.Network, owner string) error {

@@ -133,6 +133,67 @@ func TestReconcileAndDestroyWhenFirewallDescriptionsAreOmitted(t *testing.T) {
 	}
 }
 
+func TestReconcileAcceptsSparseFirewallCreateResponsesAfterAuthoritativeReadback(t *testing.T) {
+	api := newFakeAPI()
+	api.sparseFirewallCreateResponses = true
+	cluster := testCluster()
+	reconciler := testReconciler(api)
+
+	result := reconcileUntilReady(t, reconciler, cluster)
+	if !result.Ready || len(api.firewallCreates) != 2 || len(api.firewallCreateResponses) != 2 {
+		t.Fatalf("result=%#v firewallCreates=%#v responses=%#v", result, api.firewallCreates, api.firewallCreateResponses)
+	}
+	for _, response := range api.firewallCreateResponses {
+		if response.UUID == "" || response.EffectiveName() != "" || response.Description != "" || response.BillingAccountID != 0 || len(response.Rules) != 0 || len(response.ResourcesAssigned) != 0 {
+			t.Fatalf("firewall POST response was not sparse: %#v", response)
+		}
+	}
+	owner := ownerKey(cluster)
+	readback, err := api.ListFirewalls(context.Background(), cluster.Spec.Location)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nodeFirewall := mustFirewall(t, readback, firewallName(owner))
+	bastionFirewall := mustFirewall(t, readback, bastionFirewallName(owner))
+	if len(nodeFirewall.Rules) != 6 || len(nodeFirewall.ResourcesAssigned) != ControlPlaneReplicas ||
+		len(bastionFirewall.Rules) != 4 || len(bastionFirewall.ResourcesAssigned) != 1 {
+		t.Fatalf("authoritative firewall readback was not fully validated: node=%#v bastion=%#v", nodeFirewall, bastionFirewall)
+	}
+}
+
+func TestReconcileRejectsSuppliedFirewallCreateIdentityDriftWithoutDeletion(t *testing.T) {
+	tests := map[string]func(*inspace.Firewall){
+		"invalid UUID":    func(firewall *inspace.Firewall) { firewall.UUID = "not-a-uuid" },
+		"name":            func(firewall *inspace.Firewall) { firewall.Name = "foreign" },
+		"display name":    func(firewall *inspace.Firewall) { firewall.DisplayName = "foreign" },
+		"description":     func(firewall *inspace.Firewall) { firewall.Description = "foreign" },
+		"billing account": func(firewall *inspace.Firewall) { firewall.BillingAccountID++ },
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			api := newFakeAPI()
+			api.mutateCreateFirewallResponse = func(_ inspace.CreateFirewallRequest, response *inspace.Firewall) {
+				mutate(response)
+			}
+			cluster := testCluster()
+			reconciler := testReconciler(api)
+			if _, err := reconciler.Reconcile(context.Background(), cluster, "unit-test-secret-token"); err == nil || !strings.Contains(err.Error(), "create node firewall response") {
+				t.Fatalf("expected provisional identity rejection, got %v", err)
+			}
+			if len(api.firewalls) != 1 || len(api.firewallCreates) != 1 || len(api.firewallDeletes) != 0 || len(api.vms) != 0 || len(api.floatingIPs) != 0 {
+				t.Fatalf("ambiguous POST response caused unsafe mutation or deletion: firewalls=%#v creates=%#v deletes=%#v VMs=%#v FIPs=%#v", api.firewalls, api.firewallCreates, api.firewallDeletes, api.vms, api.floatingIPs)
+			}
+			api.mutateCreateFirewallResponse = nil
+			if _, err := reconciler.Reconcile(context.Background(), cluster, "unit-test-secret-token"); err != nil {
+				t.Fatalf("authoritative list readback could not safely recover: %v", err)
+			}
+			if len(api.firewallCreates) != 2 {
+				t.Fatalf("existing node firewall was recreated instead of adopted: %#v", api.firewallCreates)
+			}
+		})
+	}
+}
+
 func TestReconcileStartsAllThreeControlPlaneCreatesBehindOneBarrier(t *testing.T) {
 	api := newFakeAPI()
 	cluster := testCluster()
@@ -1024,14 +1085,16 @@ func mustFirewall(t *testing.T, firewalls []inspace.Firewall, name string) *insp
 }
 
 type fakeAPI struct {
-	mu            sync.Mutex
-	network       inspace.Network
-	loadBalancers []inspace.LoadBalancer
-	vms           []inspace.VM
-	firewalls     []inspace.Firewall
-	floatingIPs   []inspace.FloatingIP
-	vmCreates     []inspace.CreateVMRequest
-	vmDeletes     []string
+	mu                      sync.Mutex
+	network                 inspace.Network
+	loadBalancers           []inspace.LoadBalancer
+	vms                     []inspace.VM
+	firewalls               []inspace.Firewall
+	floatingIPs             []inspace.FloatingIP
+	vmCreates               []inspace.CreateVMRequest
+	vmDeletes               []string
+	firewallCreates         []inspace.CreateFirewallRequest
+	firewallCreateResponses []inspace.Firewall
 
 	floatingIPDeletes []string
 	firewallDeletes   []string
@@ -1043,8 +1106,10 @@ type fakeAPI struct {
 	mutateCreateVMResponse         func(inspace.CreateVMRequest, *inspace.VM)
 	mutateCreateFloatingIPResponse func(*inspace.FloatingIP)
 	mutateAssignFloatingIPResponse func(*inspace.FloatingIP)
+	mutateCreateFirewallResponse   func(inspace.CreateFirewallRequest, *inspace.Firewall)
 	floatingIPAssignError          error
 	omitFirewallDescriptions       bool
+	sparseFirewallCreateResponses  bool
 	createVMBarrier                chan struct{}
 	createVMStarted                chan string
 }
@@ -1156,13 +1221,21 @@ func (f *fakeAPI) ListFirewalls(context.Context, string) ([]inspace.Firewall, er
 func (f *fakeAPI) CreateFirewall(_ context.Context, _ string, request inspace.CreateFirewallRequest) (*inspace.Firewall, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.firewallCreates = append(f.firewallCreates, request)
 	item := inspace.Firewall{UUID: fmt.Sprintf("7777777%d-1111-4222-8333-444444444444", len(f.firewalls)), DisplayName: request.DisplayName, Description: request.Description, BillingAccountID: request.BillingAccountID, Rules: request.Rules}
 	f.firewalls = append(f.firewalls, item)
 	f.events = append(f.events, "create-firewall/"+request.DisplayName)
 	response := item
+	if f.sparseFirewallCreateResponses {
+		response = inspace.Firewall{UUID: item.UUID}
+	}
+	if f.mutateCreateFirewallResponse != nil {
+		f.mutateCreateFirewallResponse(request, &response)
+	}
 	if f.omitFirewallDescriptions {
 		response.Description = ""
 	}
+	f.firewallCreateResponses = append(f.firewallCreateResponses, response)
 	return &response, nil
 }
 func (f *fakeAPI) AssignFirewallToVM(_ context.Context, _ string, firewallUUID, vmUUID string) error {
