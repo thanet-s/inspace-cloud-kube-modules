@@ -46,6 +46,7 @@ var (
 	errWorkerServiceVIPPoolCollision = errors.New("worker private IPv4 collides with the reserved private Service VIP pool")
 	errFirewallAssignmentNotVisible  = errors.New("intended worker firewall assignment is not visible")
 	errPersistedOwnershipIncomplete  = errors.New("persisted VM ownership record is incomplete")
+	errVMAbsenceUncertain            = errors.New("VM absence could not be established")
 	vmUUIDPattern                    = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
 	ownedInstanceTypePattern         = regexp.MustCompile(`^is-(compute|general|memory)-([0-9]+)c-([0-9]+)g$`)
 	karpenterOwnershipPrefixPattern  = regexp.MustCompile(`^\s*\{\s*"schema"\s*:\s*"karpenter\.inspace\.cloud/v1"(?:\s*[,}]|\s*$)`)
@@ -732,15 +733,12 @@ func auditEstablishedVMProtection(vm sdk.VM, record ownership, network *sdk.Netw
 }
 
 func (a *Adapter) DeleteVM(ctx context.Context, location, uuid, clusterName, nodeClaimName string) error {
-	vm, getErr := a.api.GetVM(ctx, location, uuid)
-	var record ownership
-	vmMissing := false
+	vm, vmMissing, getErr := a.readVMForDelete(ctx, location, uuid)
 	if getErr != nil {
-		if !sdk.IsNotFound(getErr) {
-			return getErr
-		}
-		vmMissing = true
-	} else {
+		return getErr
+	}
+	var record ownership
+	if !vmMissing {
 		var managed bool
 		record, managed = parseOwnership(vm.Description)
 		if !managed || record.Cluster != clusterName || record.NodeClaim != nodeClaimName {
@@ -800,6 +798,86 @@ func (a *Adapter) DeleteVM(ctx context.Context, location, uuid, clusterName, nod
 		return cloudapi.ErrNotFound
 	}
 	return nil
+}
+
+// readVMForDelete never treats one eventually consistent 404 as permission to
+// clean dependent resources. Absence requires two consecutive confirmations
+// from both GetVM and the location-wide VM list. If either source still sees
+// the UUID, reads continue within a fixed bound and no mutation is attempted.
+func (a *Adapter) readVMForDelete(ctx context.Context, location, uuid string) (*sdk.VM, bool, error) {
+	readbackCtx, cancel := context.WithTimeout(ctx, a.networkAttachmentReadbackTimeout)
+	defer cancel()
+	absenceConfirmations := 0
+	var lastObservation error
+	readbackDelay := a.networkAttachmentReadbackMinDelay
+	for {
+		if readbackErr := readbackCtx.Err(); readbackErr != nil {
+			return nil, false, fmt.Errorf("VM %s delete preflight stopped: %w", uuid, errors.Join(errVMAbsenceUncertain, lastObservation, readbackErr))
+		}
+		requestCtx, requestCancel := context.WithTimeout(readbackCtx, a.networkAttachmentRequestTimeout)
+		vm, getErr := a.api.GetVM(requestCtx, location, uuid)
+		requestCancel()
+		var currentObservation error
+		if getErr != nil {
+			currentObservation = fmt.Errorf("getting VM %s before delete: %w", uuid, getErr)
+		}
+		if readbackErr := readbackCtx.Err(); readbackErr != nil {
+			return nil, false, fmt.Errorf("VM %s delete preflight stopped: %w", uuid, errors.Join(errVMAbsenceUncertain, lastObservation, currentObservation, readbackErr))
+		}
+		switch {
+		case getErr == nil && vm == nil:
+			absenceConfirmations = 0
+			lastObservation = fmt.Errorf("%w: VM %s detail response is empty", errVMAbsenceUncertain, uuid)
+		case getErr == nil && vm.UUID != uuid:
+			return nil, false, fmt.Errorf("%w: canonical VM detail UUID %q does not match delete target %q", cloudapi.ErrOwnershipMismatch, vm.UUID, uuid)
+		case getErr == nil:
+			return vm, false, nil
+		case !sdk.IsNotFound(getErr):
+			absenceConfirmations = 0
+			if !isRetryableReadback(readbackCtx, getErr) {
+				return nil, false, currentObservation
+			}
+			lastObservation = currentObservation
+		default:
+			requestCtx, requestCancel := context.WithTimeout(readbackCtx, a.networkAttachmentRequestTimeout)
+			listed, listErr := a.api.ListVMs(requestCtx, location)
+			requestCancel()
+			if readbackErr := readbackCtx.Err(); readbackErr != nil {
+				return nil, false, fmt.Errorf("VM %s delete preflight stopped: %w", uuid, errors.Join(errVMAbsenceUncertain, lastObservation, currentObservation, listErr, readbackErr))
+			}
+			if listErr != nil {
+				absenceConfirmations = 0
+				lastObservation = fmt.Errorf("listing VMs to confirm absence of %s: %w", uuid, listErr)
+				if !isRetryableReadback(readbackCtx, listErr) {
+					return nil, false, lastObservation
+				}
+			} else if err := validateVMListSnapshot(listed); err != nil {
+				return nil, false, fmt.Errorf("validating VM list to confirm absence of %s: %w", uuid, err)
+			} else {
+				listedPresent := false
+				for i := range listed {
+					if listed[i].UUID == uuid {
+						listedPresent = true
+						break
+					}
+				}
+				if listedPresent {
+					absenceConfirmations = 0
+					lastObservation = fmt.Errorf("%w: GetVM reports %s absent while ListVMs still contains it", cloudapi.ErrOwnershipMismatch, uuid)
+				} else {
+					absenceConfirmations++
+					lastObservation = fmt.Errorf("VM %s absence confirmation %d of 2", uuid, absenceConfirmations)
+					if absenceConfirmations == 2 {
+						return nil, true, nil
+					}
+				}
+			}
+		}
+		if err := waitForReadback(readbackCtx, readbackDelay); err != nil {
+			return nil, false, fmt.Errorf("VM %s absence did not converge before delete preflight deadline: %w", uuid, errors.Join(errVMAbsenceUncertain, lastObservation, err))
+		}
+		readbackDelay = nextReadbackDelay(readbackDelay, a.networkAttachmentReadbackMaxDelay)
+	}
 }
 
 func (a *Adapter) ValidateNodeClass(ctx context.Context, location, networkUUID, controlPlaneVIP, privateLoadBalancerPoolStart, privateLoadBalancerPoolStop, hostPoolUUID, firewallUUID string) error {

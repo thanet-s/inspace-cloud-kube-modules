@@ -1950,16 +1950,80 @@ func TestValidateNodeClassChecksHostPool(t *testing.T) {
 func TestDeleteCleansNamedFloatingIPWhenVMAlreadyMissing(t *testing.T) {
 	api := &fakeAPI{}
 	adapter, _ := New(api)
+	configureFastNetworkReadback(adapter, boundedReadbackTestTimeout)
 	created, err := adapter.CreateVM(context.Background(), testRequest())
 	if err != nil {
 		t.Fatal(err)
 	}
 	api.vms = nil // simulate out-of-band VM disappearance
+	api.operations = nil
+	getCallsBefore, listCallsBefore := api.vmGetCalls, api.vmListCalls
 	if err := adapter.DeleteVM(context.Background(), "bkk01", created.UUID, "cluster-a", "nodeclaim-a"); !errors.Is(err, cloudapi.ErrNotFound) {
 		t.Fatalf("DeleteVM error = %v", err)
 	}
 	if len(api.floatingIPs) != 0 {
 		t.Fatalf("orphan floating IP was not cleaned: %#v", api.floatingIPs)
+	}
+	if api.vmGetCalls-getCallsBefore != 2 || api.vmListCalls-listCallsBefore != 2 {
+		t.Fatalf("absence proof GET/List deltas=%d/%d, want two confirmations from both sources", api.vmGetCalls-getCallsBefore, api.vmListCalls-listCallsBefore)
+	}
+	wantOperations := []string{"unassign-floating-ip", "delete-floating-ip", "unassign-firewall"}
+	if !reflect.DeepEqual(api.operations, wantOperations) {
+		t.Fatalf("persistent absence cleanup operations=%v, want %v", api.operations, wantOperations)
+	}
+}
+
+func TestDeleteTransientNotFoundRecoversOwnedDetailBeforeNormalDelete(t *testing.T) {
+	api := &fakeAPI{}
+	adapter, _ := New(api)
+	configureFastNetworkReadback(adapter, boundedReadbackTestTimeout)
+	created, err := adapter.CreateVM(context.Background(), testRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	api.getVMErrorByUUID = map[string]error{created.UUID: &sdk.APIError{StatusCode: 404}}
+	api.getVMHook = func(string) {
+		api.mu.Lock()
+		delete(api.getVMErrorByUUID, created.UUID)
+		api.mu.Unlock()
+	}
+	api.operations = nil
+	getCallsBefore, listCallsBefore := api.vmGetCalls, api.vmListCalls
+	if err := adapter.DeleteVM(context.Background(), "bkk01", created.UUID, "cluster-a", "nodeclaim-a"); err != nil {
+		t.Fatal(err)
+	}
+	if api.vmGetCalls-getCallsBefore != 2 || api.vmListCalls-listCallsBefore != 1 {
+		t.Fatalf("transient 404 recovery GET/List deltas=%d/%d, want 2/1", api.vmGetCalls-getCallsBefore, api.vmListCalls-listCallsBefore)
+	}
+	wantOperations := []string{"unassign-floating-ip", "delete-floating-ip", "delete-vm", "unassign-firewall"}
+	if !reflect.DeepEqual(api.operations, wantOperations) {
+		t.Fatalf("transient 404 delete operations=%v, want normal delete %v", api.operations, wantOperations)
+	}
+	if len(api.vms) != 0 || len(api.floatingIPs) != 0 || firewallHasVM(api.firewalls[0], created.UUID) {
+		t.Fatalf("normal delete after transient 404 did not clean resources: VMs=%#v FIPs=%#v firewall=%#v", api.vms, api.floatingIPs, api.firewalls[0])
+	}
+}
+
+func TestDeletePersistentGetListDisagreementFailsWithoutMutation(t *testing.T) {
+	api := &fakeAPI{}
+	adapter, _ := New(api)
+	configureFastNetworkReadback(adapter, boundedReadbackTestTimeout)
+	created, err := adapter.CreateVM(context.Background(), testRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	api.getVMErrorByUUID = map[string]error{created.UUID: &sdk.APIError{StatusCode: 404}}
+	api.operations = nil
+	getCallsBefore, listCallsBefore := api.vmGetCalls, api.vmListCalls
+	err = adapter.DeleteVM(context.Background(), "bkk01", created.UUID, "cluster-a", "nodeclaim-a")
+	if !errors.Is(err, errVMAbsenceUncertain) || !errors.Is(err, cloudapi.ErrOwnershipMismatch) || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("DeleteVM() error = %v, want bounded Get/List absence uncertainty", err)
+	}
+	if api.vmGetCalls-getCallsBefore < 2 || api.vmListCalls-listCallsBefore < 2 {
+		t.Fatalf("uncertain absence GET/List deltas=%d/%d, want bounded repeated reads", api.vmGetCalls-getCallsBefore, api.vmListCalls-listCallsBefore)
+	}
+	if api.deleteVMCalls != 0 || len(api.operations) != 0 || len(api.vms) != 1 || len(api.floatingIPs) != 1 || !firewallHasVM(api.firewalls[0], created.UUID) {
+		t.Fatalf("uncertain absence mutated resources: deletes=%d operations=%v VMs=%#v FIPs=%#v firewall=%#v", api.deleteVMCalls, api.operations, api.vms, api.floatingIPs, api.firewalls[0])
 	}
 }
 
@@ -2328,6 +2392,7 @@ type fakeAPI struct {
 	secondFirewallOnAssignUUID      string
 	privateIPv4VisibleAfter         int
 	vmGetCalls                      int
+	vmListCalls                     int
 	firewallListCalls               int
 	blockFirewallList               bool
 	floatingIPListCalls             int
@@ -2482,6 +2547,7 @@ func (f *fakeAPI) DeleteFloatingIP(ctx context.Context, _ string, address string
 func (f *fakeAPI) ListVMs(context.Context, string) ([]sdk.VM, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.vmListCalls++
 	items := append([]sdk.VM(nil), f.vms...)
 	if f.omitVMListDescriptions {
 		for i := range items {

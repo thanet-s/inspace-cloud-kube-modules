@@ -66,9 +66,12 @@ without destroying that VM. A positively owned VM whose private address equals
 its ownership-recorded supervisor VIP or falls inside its ownership-recorded
 Service VIP range is unsafe and is rolled back, including a late ambiguous
 commit; generic ownership mismatches are never deleted. Delete removes both
-resources, including an orphan floating IP when the VM has already disappeared.
-Create POSTs are never blindly retried; read-before-create ownership records
-recover ambiguous responses.
+resources. One VM-detail 404 never authorizes cleanup: an already-missing VM
+must be absent from both `GetVM` and `ListVMs` in two consecutive bounded
+observations before its orphan floating IP or firewall assignments are changed.
+A later owned detail resumes the normal ownership-checked delete path; any
+presence uncertainty fails without mutation. Create POSTs are never blindly
+retried; read-before-create ownership records recover ambiguous responses.
 
 `GetVM` and `ListVMs` repeat these checks through a bounded read-only snapshot.
 VM list rows are only discovery and collision evidence: exact per-VM detail is
