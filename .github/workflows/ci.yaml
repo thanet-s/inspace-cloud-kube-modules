@@ -146,8 +146,20 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$(docker image inspect --format '{{.Architecture}}' 'local/${{ matrix.image }}:ci')" = "${{ matrix.arch }}"
-          docker run --rm 'local/${{ matrix.image }}:ci' --help >/dev/null
+          image='local/${{ matrix.image }}:ci'
+          test "$(docker image inspect --format '{{.Architecture}}' "$image")" = "${{ matrix.arch }}"
+          if [[ '${{ matrix.image }}' == karpenter-provider-inspace ]]; then
+            set +e
+            output="$(docker run --rm "$image" --help 2>&1)"
+            rc=$?
+            set -e
+            test "$rc" -eq 1
+            grep -F \
+              'INSPACE_API_TOKEN, INSPACE_CLUSTER_NAME, INSPACE_DEFAULT_NODECLASS, INSPACE_NETWORK_UUID, and INSPACE_CONTROL_PLANE_VIP are required' \
+              <<<"$output" >/dev/null
+          else
+            docker run --rm "$image" --help >/dev/null 2>&1
+          fi
 
   helm:
     name: Helm
