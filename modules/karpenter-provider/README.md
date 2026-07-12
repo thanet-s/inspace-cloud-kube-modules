@@ -79,10 +79,12 @@ Karpenter ownership evidence for the requested cluster (or cannot yet expose
 the cluster), and fails closed if that evidence does not converge within the
 read bound. Complete list and detail ownership records must agree exactly.
 Definitively unmanaged descriptions and explicit records for another cluster
-remain cluster-independent inventory and are ignored. Any other read or list/detail
-identity uncertainty also fails closed. One firewall list, one Floating-IP
-list, and one network read per unique VPC then detect a lost/disabled address,
-a second or public firewall,
+remain cluster-independent inventory and are ignored. A schema in the reserved
+`karpenter.inspace.cloud/` namespace must be the supported exact version; an
+unknown version fails closed instead of silently hiding a managed VM. Any other
+read or list/detail identity uncertainty also fails closed. One firewall list,
+one Floating-IP list, and one network read per unique VPC then detect a
+lost/disabled address, a second or public firewall,
 membership drift, or a private-IP/supervisor-or-Service-VIP collision without
 mutating resources.
 

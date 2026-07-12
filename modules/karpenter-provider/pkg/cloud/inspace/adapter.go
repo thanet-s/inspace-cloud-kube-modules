@@ -28,7 +28,8 @@ import (
 )
 
 const (
-	ownershipSchema                             = "karpenter.inspace.cloud/v1"
+	ownershipSchemaNamespace                    = "karpenter.inspace.cloud/"
+	ownershipSchema                             = ownershipSchemaNamespace + "v1"
 	defaultUsername                             = "user"
 	passwordByteSize                            = 21
 	defaultNetworkAttachmentReadbackTimeout     = 60 * time.Second
@@ -514,7 +515,10 @@ func (a *Adapter) canonicalListedVMDetails(ctx context.Context, location, cluste
 // ownership evidence, however, an incomplete canonical record is uncertainty:
 // poll it within the shared ListVMs bound and fail closed if it never converges.
 func (a *Adapter) readCanonicalListedVM(ctx context.Context, location, clusterName string, summary sdk.VM) (*sdk.VM, error) {
-	listedRecord, listedKarpenter, listedRecordComplete := inspectOwnershipDescription(summary.Description)
+	listedRecord, listedKarpenter, listedRecordComplete, err := inspectOwnershipDescription(summary.Description)
+	if err != nil {
+		return nil, fmt.Errorf("listed VM %s ownership: %w", summary.UUID, err)
+	}
 	ownershipEvidence := listedKarpenter && (listedRecord.Cluster == "" || listedRecord.Cluster == clusterName)
 	var lastObservation error
 	readbackDelay := a.networkAttachmentReadbackMinDelay
@@ -562,7 +566,10 @@ func (a *Adapter) readCanonicalListedVM(ctx context.Context, location, clusterNa
 		if vm.UUID != summary.UUID || (summary.Name != "" && vm.Name != "" && vm.Name != summary.Name) {
 			return nil, fmt.Errorf("%w: canonical detail identity for listed VM %s/%q does not match its list row", cloudapi.ErrOwnershipMismatch, summary.UUID, summary.Name)
 		}
-		record, canonicalKarpenter, canonicalRecordComplete := inspectOwnershipDescription(vm.Description)
+		record, canonicalKarpenter, canonicalRecordComplete, err := inspectOwnershipDescription(vm.Description)
+		if err != nil {
+			return nil, fmt.Errorf("canonical VM %s ownership: %w", summary.UUID, err)
+		}
 		if listedKarpenter && canonicalKarpenter && listedRecord.Cluster != "" && record.Cluster != "" && listedRecord.Cluster != record.Cluster {
 			return nil, fmt.Errorf("%w: canonical Karpenter cluster %q for listed VM %s differs from list cluster %q", cloudapi.ErrOwnershipMismatch, record.Cluster, summary.UUID, listedRecord.Cluster)
 		}
@@ -1860,23 +1867,26 @@ func parseOwnership(description string) (ownership, bool) {
 	return record, true
 }
 
-func inspectOwnershipDescription(description string) (record ownership, karpenter, complete bool) {
+func inspectOwnershipDescription(description string) (record ownership, karpenter, complete bool, err error) {
 	if json.Unmarshal([]byte(description), &record) == nil {
-		if record.Schema != ownershipSchema {
-			return ownership{}, false, false
+		if strings.HasPrefix(record.Schema, ownershipSchemaNamespace) && record.Schema != ownershipSchema {
+			return ownership{}, false, false, fmt.Errorf("%w: unsupported Karpenter ownership schema %q", cloudapi.ErrOwnershipMismatch, record.Schema)
 		}
-		return record, true, ownershipRecordComplete(record)
+		if record.Schema != ownershipSchema {
+			return ownership{}, false, false, nil
+		}
+		return record, true, ownershipRecordComplete(record), nil
 	}
 	// Ownership JSON is encoded with schema first. An anchored prefix retains
 	// evidence from an eventually consistent truncated response without
 	// treating arbitrary user notes that mention the schema as managed state.
 	if !karpenterOwnershipPrefixPattern.MatchString(description) {
-		return ownership{}, false, false
+		return ownership{}, false, false, nil
 	}
 	if match := karpenterClusterPattern.FindStringSubmatch(description); len(match) == 2 {
 		record.Cluster = match[1]
 	}
-	return record, true, false
+	return record, true, false, nil
 }
 
 func ownershipRecordComplete(record ownership) bool {

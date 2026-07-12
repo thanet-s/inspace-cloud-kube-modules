@@ -1508,6 +1508,49 @@ func TestListVMsIgnoresDefinitivelyForeignDescriptions(t *testing.T) {
 	}
 }
 
+func TestListVMsRejectsUnsupportedReservedOwnershipSchema(t *testing.T) {
+	t.Run("list summary", func(t *testing.T) {
+		api := &fakeAPI{vms: []sdk.VM{{
+			UUID: "77777777-7777-4777-8777-777777777777", Name: "future-owned",
+			Description: `{"schema":"karpenter.inspace.cloud/v2","cluster":"cluster-a"}`,
+		}}}
+		adapter, _ := New(api)
+		_, err := adapter.ListVMs(context.Background(), "bkk01", "cluster-a")
+		if !errors.Is(err, cloudapi.ErrOwnershipMismatch) || !strings.Contains(err.Error(), `unsupported Karpenter ownership schema "karpenter.inspace.cloud/v2"`) {
+			t.Fatalf("ListVMs() error = %v, want unsupported reserved list schema rejection", err)
+		}
+		if api.vmGetCalls != 0 || len(api.operations) != 0 {
+			t.Fatalf("unsupported list schema reached canonical read or mutation: GETs=%d operations=%v", api.vmGetCalls, api.operations)
+		}
+	})
+
+	t.Run("canonical detail", func(t *testing.T) {
+		api := &fakeAPI{}
+		adapter, _ := New(api)
+		created, err := adapter.CreateVM(context.Background(), testRequest())
+		if err != nil {
+			t.Fatal(err)
+		}
+		api.mutateGetVMResponse = func(vm *sdk.VM) {
+			if vm.UUID == created.UUID {
+				vm.Description = strings.Replace(vm.Description, ownershipSchema, ownershipSchemaNamespace+"v2", 1)
+			}
+		}
+		getCallsBefore := api.vmGetCalls
+		operationsBefore := append([]string(nil), api.operations...)
+		_, err = adapter.ListVMs(context.Background(), "bkk01", "cluster-a")
+		if !errors.Is(err, cloudapi.ErrOwnershipMismatch) || !strings.Contains(err.Error(), `unsupported Karpenter ownership schema "karpenter.inspace.cloud/v2"`) {
+			t.Fatalf("ListVMs() error = %v, want unsupported reserved canonical schema rejection", err)
+		}
+		if delta := api.vmGetCalls - getCallsBefore; delta != 1 {
+			t.Fatalf("unsupported canonical schema GET delta=%d, want immediate rejection", delta)
+		}
+		if !reflect.DeepEqual(api.operations, operationsBefore) || api.deleteVMCalls != 0 {
+			t.Fatalf("unsupported canonical schema mutated resources: before=%v after=%v deletes=%d", operationsBefore, api.operations, api.deleteVMCalls)
+		}
+	})
+}
+
 func TestListVMsRejectsManagedListAndCanonicalOwnershipDisagreement(t *testing.T) {
 	tests := map[string]struct {
 		mutate func(*ownership)
