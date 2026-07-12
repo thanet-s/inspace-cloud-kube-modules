@@ -118,8 +118,12 @@ loop, not by blindly repeating the POST.
 
 Owned teardown is deterministic and fail-closed. Before its first mutation it
 validates every deterministic VM/FIP name, assignment, billing account,
-firewall ownership description, exact policy, and firewall assignment. It
-then removes all four owned FIPs, deletes the bastion and three control-plane
+owner-derived firewall name, exact firewall policy, and firewall assignment.
+Sparse VM list entries are canonicalized through the per-VM detail endpoint
+before adoption or deletion.
+InSpace accepts firewall descriptions on create but omits them from readback,
+so an absent description is tolerated while any returned mismatch is rejected.
+It then removes all four owned FIPs, deletes the bastion and three control-plane
 VMs, and deletes both managed firewalls only after assignments are absent:
 
 ```sh
@@ -254,5 +258,5 @@ and requires an exact zero-owned-resource cloud audit after teardown.
 - The InSpace firewall's unmatched-traffic/default-deny semantics still need a
   live conformance test before treating the managed policy as production
   isolation. The controller nevertheless validates the exact node and bastion
-  policies, ownership descriptions, billing account, and assignments before
-  every mutation.
+  policies, owner-derived names, billing account, and assignments before every
+  mutation; any non-empty description is also checked for drift.

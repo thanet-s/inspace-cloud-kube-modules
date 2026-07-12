@@ -41,9 +41,10 @@ The provider uses a fail-closed sequence:
    `reserve_public_ip=false`, avoiding an untracked implicit address.
 4. Read back that exact network until the VM UUID appears exactly once in its
    authoritative `vm_uuids` membership.
-5. Read back the VM until it has exactly one usable RFC1918 private IPv4 inside
-   that VPC, and reject an address equal to the private RKE2 supervisor VIP or
-   inside the reserved Service VIP range.
+5. Read back the VM until its complete NodeClaim ownership/spec record is
+   persisted and it has exactly one usable RFC1918 private IPv4 inside that
+   VPC; reject an address equal to the private RKE2 supervisor VIP or inside
+   the reserved Service VIP range.
 6. Audit all InSpace firewalls, assign the intended firewall, and require the
    worker to be attached exactly once to that firewall and no other.
 7. Assign and read back the owned Floating IP.
