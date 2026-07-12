@@ -14,7 +14,7 @@ RUN cd modules/cloud-provider && \
     CGO_ENABLED=0 GOWORK=off go build -trimpath -ldflags='-s -w' \
       -o /out/inspace-cluster-controller ./cmd/inspace-cluster-controller
 
-FROM ubuntu:24.04 AS base
+FROM ubuntu:26.04 AS base
 
 ARG TARGETARCH
 ARG KUBECTL_VERSION=v1.35.6
