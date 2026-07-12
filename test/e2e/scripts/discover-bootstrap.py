@@ -328,10 +328,20 @@ def main() -> None:
     if bastion_assigned_firewalls != [bastion_firewall.get("uuid")]:
         raise SystemExit("the bastion must be attached only to the managed bastion firewall")
     billing_account = int(os.environ["INSPACE_BILLING_ACCOUNT_ID"])
-    if node_firewall.get("billing_account_id") != billing_account or node_firewall.get("description") != f"Managed RKE2 node firewall for {owner}":
-        raise SystemExit("node firewall lacks the exact billing-account ownership record")
-    if bastion_firewall.get("billing_account_id") != billing_account or bastion_firewall.get("description") != f"Managed RKE2 bastion firewall for {owner}":
-        raise SystemExit("bastion firewall lacks the exact billing-account ownership record")
+    if node_firewall.get("billing_account_id") != billing_account:
+        raise SystemExit("node firewall lacks the exact billing-account identity")
+    if bastion_firewall.get("billing_account_id") != billing_account:
+        raise SystemExit("bastion firewall lacks the exact billing-account identity")
+    # InSpace accepts firewall descriptions on create but omits them from the
+    # authoritative create/list responses. A description is therefore only an
+    # optional drift signal; exact names, account, rules, and assignments are
+    # the ownership proof used above and below.
+    node_description = node_firewall.get("description")
+    if node_description not in (None, "", f"Managed RKE2 node firewall for {owner}"):
+        raise SystemExit("node firewall has an unexpected description")
+    bastion_description = bastion_firewall.get("description")
+    if bastion_description not in (None, "", f"Managed RKE2 bastion firewall for {owner}"):
+        raise SystemExit("bastion firewall has an unexpected description")
     validate_node_firewall(node_firewall, str(subnet), "10.42.0.0/16", set(result_cp_ids))
     validate_bastion_firewall(bastion_firewall, state["managementCIDR"], bastion["uuid"])
 

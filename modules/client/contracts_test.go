@@ -103,16 +103,16 @@ func TestDocumentedResourceContracts(t *testing.T) {
 
 	port := int32(6443)
 	firewall, err := client.CreateFirewall(ctx, "bkk01", inspace.CreateFirewallRequest{
-		DisplayName: "k8s-firewall", BillingAccountID: 129673,
+		DisplayName: "k8s-firewall", Description: "accepted-but-omitted", BillingAccountID: 129673,
 		Rules: []inspace.FirewallRule{{Protocol: "tcp", Direction: "inbound", PortStart: &port, PortEnd: &port, EndpointSpecType: "ip_prefixes", EndpointSpec: []string{"10.4.200.0/24"}}},
 	})
-	if err != nil || firewall.UUID != firewallUUID {
+	if err != nil || firewall.UUID != firewallUUID || firewall.Description != "" {
 		t.Fatalf("CreateFirewall() = %#v, %v", firewall, err)
 	}
-	if items, err := client.ListFirewalls(ctx, "bkk01"); err != nil || len(items) != 1 {
+	if items, err := client.ListFirewalls(ctx, "bkk01"); err != nil || len(items) != 1 || items[0].Description != "" {
 		t.Fatalf("ListFirewalls() = %#v, %v", items, err)
 	}
-	if got, err := client.GetFirewall(ctx, "bkk01", firewallUUID); err != nil || got.EffectiveName() != "k8s-firewall" {
+	if got, err := client.GetFirewall(ctx, "bkk01", firewallUUID); err != nil || got.EffectiveName() != "k8s-firewall" || got.Description != "" {
 		t.Fatalf("GetFirewall() = %#v, %v", got, err)
 	}
 	if err := client.AssignFirewallToVM(ctx, "bkk01", firewallUUID, vmUUID); err != nil {
@@ -234,6 +234,11 @@ func contractHandler(t *testing.T) http.HandlerFunc {
 		case "GET /v1/bkk01/network/firewalls":
 			writeLiteral(w, http.StatusOK, `[{"uuid":"`+firewallUUID+`","display_name":"k8s-firewall","billing_account_id":129673,"rules":[{"protocol":"tcp","direction":"inbound","port_start":6443,"port_end":6443,"endpoint_spec_type":"ip_prefixes","endpoint_spec":["10.4.200.0/24"]}],"resources_assigned":[]}]`)
 		case "POST /v1/bkk01/network/firewalls":
+			var got inspace.CreateFirewallRequest
+			decodeJSON(t, r, &got)
+			if got.DisplayName != "k8s-firewall" || got.Description != "accepted-but-omitted" || got.BillingAccountID != 129673 || len(got.Rules) != 1 {
+				t.Errorf("CreateFirewall body = %#v", got)
+			}
 			writeLiteral(w, http.StatusCreated, `{"uuid":"`+firewallUUID+`","display_name":"k8s-firewall","billing_account_id":129673,"rules":[],"resources_assigned":[]}`)
 		case "POST /v1/bkk01/network/firewalls/" + firewallUUID + "/vms":
 			if r.URL.Query().Get("vm_uuid") != vmUUID {

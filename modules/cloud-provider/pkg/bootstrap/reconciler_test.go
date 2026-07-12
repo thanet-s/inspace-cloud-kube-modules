@@ -96,6 +96,43 @@ func TestReconcileBuildsBastionThenExactlyThreeControlPlaneVMs(t *testing.T) {
 	}
 }
 
+func TestReconcileAndDestroyWhenFirewallDescriptionsAreOmitted(t *testing.T) {
+	api := newFakeAPI()
+	api.omitFirewallDescriptions = true
+	cluster := testCluster()
+	reconciler := testReconciler(api)
+
+	result := reconcileUntilReady(t, reconciler, cluster)
+	if !result.Ready || len(api.firewalls) != 2 {
+		t.Fatalf("reconcile result=%#v firewalls=%#v", result, api.firewalls)
+	}
+	readback, err := api.ListFirewalls(context.Background(), cluster.Spec.Location)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, firewall := range readback {
+		if firewall.Description != "" || firewall.BillingAccountID != cluster.Spec.BillingAccountID {
+			t.Fatalf("firewall readback contract=%#v", firewall)
+		}
+	}
+
+	reconciler.SSHUsername = ""
+	reconciler.SSHPublicKey = ""
+	var destroyed DestroyResult
+	for i := 0; i < 40; i++ {
+		destroyed, err = reconciler.Destroy(context.Background(), cluster)
+		if err != nil {
+			t.Fatalf("destroy %d: %v", i, err)
+		}
+		if destroyed.Done {
+			break
+		}
+	}
+	if !destroyed.Done || len(api.vms) != 0 || len(api.floatingIPs) != 0 || len(api.firewalls) != 0 || len(api.firewallDeletes) != 2 {
+		t.Fatalf("destroy result=%#v VMs=%#v FIPs=%#v firewalls=%#v firewallDeletes=%#v", destroyed, api.vms, api.floatingIPs, api.firewalls, api.firewallDeletes)
+	}
+}
+
 func TestReconcileStartsAllThreeControlPlaneCreatesBehindOneBarrier(t *testing.T) {
 	api := newFakeAPI()
 	cluster := testCluster()
@@ -1007,6 +1044,7 @@ type fakeAPI struct {
 	mutateCreateFloatingIPResponse func(*inspace.FloatingIP)
 	mutateAssignFloatingIPResponse func(*inspace.FloatingIP)
 	floatingIPAssignError          error
+	omitFirewallDescriptions       bool
 	createVMBarrier                chan struct{}
 	createVMStarted                chan string
 }
@@ -1107,7 +1145,13 @@ func (f *fakeAPI) DeleteVM(_ context.Context, _ string, uuid string) error {
 func (f *fakeAPI) ListFirewalls(context.Context, string) ([]inspace.Firewall, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return append([]inspace.Firewall(nil), f.firewalls...), nil
+	items := append([]inspace.Firewall(nil), f.firewalls...)
+	if f.omitFirewallDescriptions {
+		for i := range items {
+			items[i].Description = ""
+		}
+	}
+	return items, nil
 }
 func (f *fakeAPI) CreateFirewall(_ context.Context, _ string, request inspace.CreateFirewallRequest) (*inspace.Firewall, error) {
 	f.mu.Lock()
@@ -1115,7 +1159,11 @@ func (f *fakeAPI) CreateFirewall(_ context.Context, _ string, request inspace.Cr
 	item := inspace.Firewall{UUID: fmt.Sprintf("7777777%d-1111-4222-8333-444444444444", len(f.firewalls)), DisplayName: request.DisplayName, Description: request.Description, BillingAccountID: request.BillingAccountID, Rules: request.Rules}
 	f.firewalls = append(f.firewalls, item)
 	f.events = append(f.events, "create-firewall/"+request.DisplayName)
-	return &item, nil
+	response := item
+	if f.omitFirewallDescriptions {
+		response.Description = ""
+	}
+	return &response, nil
 }
 func (f *fakeAPI) AssignFirewallToVM(_ context.Context, _ string, firewallUUID, vmUUID string) error {
 	f.mu.Lock()

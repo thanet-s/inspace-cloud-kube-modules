@@ -680,9 +680,15 @@ func validateManagedNodeFirewall(firewall *inspace.Firewall, cluster *v1alpha1.I
 	if firewall == nil {
 		return nil
 	}
-	if firewall.EffectiveName() != firewallName(owner) || firewall.BillingAccountID != cluster.Spec.BillingAccountID ||
-		firewall.Description != "Managed RKE2 node firewall for "+owner {
-		return errors.New("bootstrap: node firewall lacks the expected ownership record")
+	expectedDescription := "Managed RKE2 node firewall for " + owner
+	if firewall.EffectiveName() != firewallName(owner) || firewall.BillingAccountID != cluster.Spec.BillingAccountID {
+		return errors.New("bootstrap: node firewall lacks the expected owner-derived name or billing-account identity")
+	}
+	// InSpace accepts a description on create but currently omits it from both
+	// create and list responses. Treat a returned mismatch as drift, but never
+	// require this unreadable field as deletion authority.
+	if firewall.Description != "" && firewall.Description != expectedDescription {
+		return errors.New("bootstrap: node firewall has an unexpected description")
 	}
 	if err := validateFirewallPolicy(firewall, network.Subnet, cluster.Spec.Network.PodCIDR, "", nil); err != nil {
 		return fmt.Errorf("bootstrap: node firewall policy: %w", err)
@@ -694,9 +700,12 @@ func validateManagedBastionFirewall(firewall *inspace.Firewall, cluster *v1alpha
 	if firewall == nil {
 		return nil
 	}
-	if firewall.EffectiveName() != bastionFirewallName(owner) || firewall.BillingAccountID != cluster.Spec.BillingAccountID ||
-		firewall.Description != "Managed RKE2 bastion firewall for "+owner {
-		return errors.New("bootstrap: bastion firewall lacks the expected ownership record")
+	expectedDescription := "Managed RKE2 bastion firewall for " + owner
+	if firewall.EffectiveName() != bastionFirewallName(owner) || firewall.BillingAccountID != cluster.Spec.BillingAccountID {
+		return errors.New("bootstrap: bastion firewall lacks the expected owner-derived name or billing-account identity")
+	}
+	if firewall.Description != "" && firewall.Description != expectedDescription {
+		return errors.New("bootstrap: bastion firewall has an unexpected description")
 	}
 	if err := validateBastionFirewallPolicy(firewall, managementCIDR); err != nil {
 		return fmt.Errorf("bootstrap: bastion firewall policy: %w", err)
