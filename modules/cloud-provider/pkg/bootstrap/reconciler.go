@@ -542,9 +542,6 @@ func (r *Reconciler) Destroy(ctx context.Context, cluster *v1alpha1.InSpaceClust
 		if vm == nil {
 			continue
 		}
-		if err := r.API.DeleteVM(ctx, cluster.Spec.Location, vm.UUID); err != nil && !inspace.IsNotFound(err) {
-			return result, err
-		}
 		firewallUUID := ""
 		if name == bastionName(owner) {
 			if bastionFirewall != nil {
@@ -554,6 +551,12 @@ func (r *Reconciler) Destroy(ctx context.Context, cluster *v1alpha1.InSpaceClust
 			firewallUUID = nodeFirewall.UUID
 		}
 		r.rememberPendingVMDeletion(owner, cluster.Spec.Location, vm, firewallUUID)
+		if err := r.API.DeleteVM(ctx, cluster.Spec.Location, vm.UUID); err != nil && !inspace.IsNotFound(err) {
+			if deleteVMFailureProvesNoCommit(err) {
+				r.forgetPendingVMDeletion(owner, cluster.Spec.Location, vm.UUID)
+			}
+			return result, err
+		}
 		result.Message = "deleted " + vm.Name
 		return result, nil
 	}
@@ -671,6 +674,24 @@ func (r *Reconciler) rememberPendingVMDeletion(owner, location string, vm *inspa
 		Owner: owner, Location: location, Name: vm.Name, UUID: vm.UUID, FirewallUUID: firewallUUID,
 		ExpiresAt: time.Now().Add(ownedVMDeletionTransitionTTL),
 	}
+}
+
+func (r *Reconciler) forgetPendingVMDeletion(owner, location, uuid string) {
+	r.pendingDeletionMu.Lock()
+	defer r.pendingDeletionMu.Unlock()
+	delete(r.pendingVMDeletions, pendingVMDeletionKey(owner, location, uuid))
+}
+
+// deleteVMFailureProvesNoCommit recognizes only failures known to occur before
+// a VM deletion can commit. Retryable API responses, transport errors, and
+// cancellations are ambiguous and deliberately retain the exact deletion
+// transition for the next read-before-mutate pass.
+func deleteVMFailureProvesNoCommit(err error) bool {
+	if errors.Is(err, inspace.ErrMutationBlocked) {
+		return true
+	}
+	var apiErr *inspace.APIError
+	return errors.As(err, &apiErr) && !apiErr.Retryable
 }
 
 // activePendingVMDeletions returns only unexpired transitions whose UUID still

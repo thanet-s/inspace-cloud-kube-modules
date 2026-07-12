@@ -935,6 +935,89 @@ func TestDestroyConvergesThroughKnownFirewallAssignmentLag(t *testing.T) {
 	}
 }
 
+func TestDestroyRetainsDeletionIntentWhenAmbiguousErrorCommits(t *testing.T) {
+	api := newFakeAPI()
+	api.retainFirewallAssignmentsOnDelete = true
+	ambiguousErr := &inspace.APIError{StatusCode: 500, Method: "DELETE", Path: "/vm", Message: "injected post-commit failure", Retryable: true}
+	api.vmDeleteError = ambiguousErr
+	api.vmDeleteErrorCommits = true
+	cluster := testCluster()
+	reconciler := testReconciler(api)
+	reconcileUntilReady(t, reconciler, cluster)
+
+	var deleteErr error
+	for i := 0; i < 20; i++ {
+		_, deleteErr = reconciler.Destroy(context.Background(), cluster)
+		if deleteErr != nil {
+			break
+		}
+	}
+	if deleteErr != ambiguousErr || len(api.vmDeletes) != 1 || len(api.vms) != ControlPlaneReplicas {
+		t.Fatalf("ambiguous committed delete state: error=%v deletes=%#v VMs=%#v", deleteErr, api.vmDeletes, api.vms)
+	}
+	if len(reconciler.pendingVMDeletions) != 1 {
+		t.Fatalf("ambiguous committed delete lost its exact intent: %#v", reconciler.pendingVMDeletions)
+	}
+
+	api.vmDeleteError = nil
+	api.vmDeleteErrorCommits = false
+	for i := 0; i < 20 && len(api.vms) != 0; i++ {
+		if _, err := reconciler.Destroy(context.Background(), cluster); err != nil {
+			t.Fatalf("destroy after ambiguous commit %d: %v", i, err)
+		}
+	}
+	waiting, err := reconciler.Destroy(context.Background(), cluster)
+	if err != nil || !strings.Contains(waiting.Message, "waiting for firewall assignments to clear") || len(api.firewallDeletes) != 0 {
+		t.Fatalf("ambiguous committed delete did not reach safe assignment wait: result=%#v error=%v", waiting, err)
+	}
+	api.clearAllFirewallAssignments()
+	var result DestroyResult
+	for i := 0; i < 10; i++ {
+		result, err = reconciler.Destroy(context.Background(), cluster)
+		if err != nil {
+			t.Fatalf("destroy after ambiguous assignment convergence %d: %v", i, err)
+		}
+		if result.Done {
+			break
+		}
+	}
+	if !result.Done || len(api.firewalls) != 0 || len(reconciler.pendingVMDeletions) != 0 {
+		t.Fatalf("ambiguous committed delete did not converge: result=%#v firewalls=%#v pending=%#v", result, api.firewalls, reconciler.pendingVMDeletions)
+	}
+}
+
+func TestDestroyDropsDeletionIntentAfterProvenNonCommitFailure(t *testing.T) {
+	api := newFakeAPI()
+	api.retainFirewallAssignmentsOnDelete = true
+	rejectedErr := &inspace.APIError{StatusCode: 400, Method: "DELETE", Path: "/vm", Message: "injected request rejection"}
+	api.vmDeleteError = rejectedErr
+	cluster := testCluster()
+	reconciler := testReconciler(api)
+	reconcileUntilReady(t, reconciler, cluster)
+
+	var deleteErr error
+	for i := 0; i < 20; i++ {
+		_, deleteErr = reconciler.Destroy(context.Background(), cluster)
+		if deleteErr != nil {
+			break
+		}
+	}
+	if deleteErr != rejectedErr || len(api.vmDeletes) != 1 || len(api.vms) != 1+ControlPlaneReplicas {
+		t.Fatalf("proven non-commit delete state: error=%v deletes=%#v VMs=%#v", deleteErr, api.vmDeletes, api.vms)
+	}
+	if len(reconciler.pendingVMDeletions) != 0 {
+		t.Fatalf("proven non-commit failure retained deletion authority: %#v", reconciler.pendingVMDeletions)
+	}
+
+	api.vmDeleteError = nil
+	if _, err := reconciler.Destroy(context.Background(), cluster); err != nil {
+		t.Fatalf("retry after proven non-commit rejection: %v", err)
+	}
+	if len(api.vms) != ControlPlaneReplicas || len(reconciler.pendingVMDeletions) != 1 {
+		t.Fatalf("successful retry did not establish one exact transition: VMs=%#v pending=%#v", api.vms, reconciler.pendingVMDeletions)
+	}
+}
+
 func TestDestroyPendingDeletionNeverAllowsForeignFirewallAssignment(t *testing.T) {
 	api := newFakeAPI()
 	api.retainFirewallAssignmentsOnDelete = true
@@ -1428,6 +1511,8 @@ type fakeAPI struct {
 	sparseVMListResponses             bool
 	sparseFirewallCreateResponses     bool
 	retainFirewallAssignmentsOnDelete bool
+	vmDeleteError                     error
+	vmDeleteErrorCommits              bool
 	createVMBarrier                   chan struct{}
 	createVMStarted                   chan string
 }
@@ -1539,6 +1624,9 @@ func (f *fakeAPI) DeleteVM(_ context.Context, _ string, uuid string) error {
 	defer f.mu.Unlock()
 	f.vmDeletes = append(f.vmDeletes, uuid)
 	f.events = append(f.events, "delete-vm/"+uuid)
+	if f.vmDeleteError != nil && !f.vmDeleteErrorCommits {
+		return f.vmDeleteError
+	}
 	for i := range f.vms {
 		if f.vms[i].UUID == uuid {
 			f.vms = append(f.vms[:i], f.vms[i+1:]...)
@@ -1562,7 +1650,7 @@ func (f *fakeAPI) DeleteVM(_ context.Context, _ string, uuid string) error {
 			f.firewalls[i].ResourcesAssigned = kept
 		}
 	}
-	return nil
+	return f.vmDeleteError
 }
 
 // removeVMFromReadback simulates eventual convergence after the per-VM
