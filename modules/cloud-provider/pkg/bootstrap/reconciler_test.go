@@ -161,6 +161,133 @@ func TestReconcileAcceptsSparseFirewallCreateResponsesAfterAuthoritativeReadback
 	}
 }
 
+func TestReconcileAndDestroyUseCanonicalVMDetailsWhenListIsSparse(t *testing.T) {
+	api := newFakeAPI()
+	api.sparseVMListResponses = true
+	cluster := testCluster()
+	reconciler := testReconciler(api)
+
+	result := reconcileUntilReady(t, reconciler, cluster)
+	if !result.Ready || len(api.vms) != 1+ControlPlaneReplicas {
+		t.Fatalf("result=%#v VMs=%#v", result, api.vms)
+	}
+	listed, err := api.ListVMs(context.Background(), cluster.Spec.Location)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, vm := range listed {
+		if vm.DesignatedPoolUUID != "" || vm.NetworkUUID != "" {
+			t.Fatalf("VM list response was not sparse: %#v", vm)
+		}
+	}
+	readUUIDs := make(map[string]bool, len(api.getVMCalls))
+	for _, uuid := range api.getVMCalls {
+		readUUIDs[uuid] = true
+	}
+	for _, vm := range api.vms {
+		if vm.DesignatedPoolUUID == "" || vm.NetworkUUID == "" || !readUUIDs[vm.UUID] {
+			t.Fatalf("VM %q was not validated through complete canonical detail: %#v calls=%#v", vm.Name, vm, api.getVMCalls)
+		}
+	}
+
+	getCallsBeforeDestroy := len(api.getVMCalls)
+	var destroyed DestroyResult
+	for i := 0; i < 40; i++ {
+		destroyed, err = reconciler.Destroy(context.Background(), cluster)
+		if err != nil {
+			t.Fatalf("destroy %d: %v", i, err)
+		}
+		if destroyed.Done {
+			break
+		}
+	}
+	if !destroyed.Done || len(api.vms) != 0 || len(api.floatingIPs) != 0 || len(api.firewalls) != 0 {
+		t.Fatalf("destroy result=%#v VMs=%#v FIPs=%#v firewalls=%#v", destroyed, api.vms, api.floatingIPs, api.firewalls)
+	}
+	if len(api.getVMCalls) <= getCallsBeforeDestroy {
+		t.Fatal("destroy did not re-read canonical VM details")
+	}
+}
+
+func TestSparseVMListRetainsNetworkMembershipCollisionChecks(t *testing.T) {
+	api := newFakeAPI()
+	api.sparseVMListResponses = true
+	cluster := testCluster()
+	vm := inspace.VM{
+		UUID: "99999999-1111-4222-8333-bbbbbbbbbbbb", Name: "unrelated",
+		PrivateIPv4: cluster.Spec.Endpoint.VirtualIPv4, NetworkUUID: cluster.Spec.Network.UUID,
+	}
+	api.vms = append(api.vms, vm)
+	api.network.VMUUIDs = append(api.network.VMUUIDs, vm.UUID)
+
+	if _, err := testReconciler(api).Reconcile(context.Background(), cluster, "unit-test-secret-token"); err == nil || !strings.Contains(err.Error(), "already uses control-plane virtual IPv4") {
+		t.Fatalf("sparse list membership collision error = %v", err)
+	}
+	if len(api.events) != 0 || len(api.getVMCalls) != 0 {
+		t.Fatalf("location-wide list collision did not fail before owned-detail reads/mutation: calls=%#v events=%#v", api.getVMCalls, api.events)
+	}
+}
+
+func TestReconcileRejectsMismatchedOrMissingCanonicalVMDetailBeforeMutation(t *testing.T) {
+	tests := map[string]func(*fakeAPI, string){
+		"UUID mismatch": func(api *fakeAPI, _ string) {
+			api.mutateGetVMResponse = func(vm *inspace.VM) { vm.UUID = "99999999-1111-4222-8333-bbbbbbbbbbbb" }
+		},
+		"name mismatch": func(api *fakeAPI, _ string) {
+			api.mutateGetVMResponse = func(vm *inspace.VM) { vm.Name = "foreign" }
+		},
+		"nil detail": func(api *fakeAPI, uuid string) { api.nilGetVMUUID = uuid },
+		"missing detail": func(api *fakeAPI, uuid string) {
+			api.getVMErrorByUUID = map[string]error{uuid: &inspace.APIError{StatusCode: 404, Method: "GET", Path: "/vm", Message: "not found"}}
+		},
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			api := newFakeAPI()
+			cluster := testCluster()
+			reconciler := testReconciler(api)
+			if _, err := reconciler.Reconcile(context.Background(), cluster, "unit-test-secret-token"); err != nil {
+				t.Fatal(err)
+			}
+			bastion := mustVM(t, api.vms, bastionName(ownerKey(cluster)))
+			mutate(api, bastion.UUID)
+			eventsBefore := len(api.events)
+			if _, err := reconciler.Reconcile(context.Background(), cluster, "unit-test-secret-token"); err == nil || !strings.Contains(err.Error(), "authoritative detail") {
+				t.Fatalf("canonical-detail error = %v", err)
+			}
+			if len(api.events) != eventsBefore {
+				t.Fatalf("detail uncertainty mutated infrastructure: %v", api.events[eventsBefore:])
+			}
+		})
+	}
+}
+
+func TestDestroyRejectsMismatchedOrMissingCanonicalVMDetailBeforeMutation(t *testing.T) {
+	tests := map[string]func(*fakeAPI, string){
+		"name mismatch": func(api *fakeAPI, _ string) {
+			api.mutateGetVMResponse = func(vm *inspace.VM) { vm.Name = "foreign" }
+		},
+		"missing detail": func(api *fakeAPI, uuid string) { api.nilGetVMUUID = uuid },
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			api := newFakeAPI()
+			cluster := testCluster()
+			reconciler := testReconciler(api)
+			reconcileUntilReady(t, reconciler, cluster)
+			bastion := mustVM(t, api.vms, bastionName(ownerKey(cluster)))
+			mutate(api, bastion.UUID)
+			eventsBefore := len(api.events)
+			if _, err := reconciler.Destroy(context.Background(), cluster); err == nil || !strings.Contains(err.Error(), "authoritative detail") {
+				t.Fatalf("canonical-detail error = %v", err)
+			}
+			if len(api.events) != eventsBefore {
+				t.Fatalf("detail uncertainty mutated infrastructure during destroy: %v", api.events[eventsBefore:])
+			}
+		})
+	}
+}
+
 func TestReconcileRejectsSuppliedFirewallCreateIdentityDriftWithoutDeletion(t *testing.T) {
 	tests := map[string]func(*inspace.Firewall){
 		"invalid UUID":    func(firewall *inspace.Firewall) { firewall.UUID = "not-a-uuid" },
@@ -1095,6 +1222,7 @@ type fakeAPI struct {
 	vmDeletes               []string
 	firewallCreates         []inspace.CreateFirewallRequest
 	firewallCreateResponses []inspace.Firewall
+	getVMCalls              []string
 
 	floatingIPDeletes []string
 	firewallDeletes   []string
@@ -1107,8 +1235,12 @@ type fakeAPI struct {
 	mutateCreateFloatingIPResponse func(*inspace.FloatingIP)
 	mutateAssignFloatingIPResponse func(*inspace.FloatingIP)
 	mutateCreateFirewallResponse   func(inspace.CreateFirewallRequest, *inspace.Firewall)
+	mutateGetVMResponse            func(*inspace.VM)
+	getVMErrorByUUID               map[string]error
+	nilGetVMUUID                   string
 	floatingIPAssignError          error
 	omitFirewallDescriptions       bool
+	sparseVMListResponses          bool
 	sparseFirewallCreateResponses  bool
 	createVMBarrier                chan struct{}
 	createVMStarted                chan string
@@ -1133,7 +1265,44 @@ func (f *fakeAPI) ListLoadBalancers(context.Context, string) ([]inspace.LoadBala
 func (f *fakeAPI) ListVMs(context.Context, string) ([]inspace.VM, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return append([]inspace.VM(nil), f.vms...), nil
+	items := append([]inspace.VM(nil), f.vms...)
+	if f.sparseVMListResponses {
+		for i := range items {
+			items[i].DesignatedPoolUUID = ""
+			items[i].NetworkUUID = ""
+		}
+	}
+	return items, nil
+}
+func (f *fakeAPI) GetVM(_ context.Context, _, uuid string) (*inspace.VM, error) {
+	f.mu.Lock()
+	f.getVMCalls = append(f.getVMCalls, uuid)
+	injected := f.getVMErrorByUUID[uuid]
+	returnNil := f.nilGetVMUUID == uuid
+	mutate := f.mutateGetVMResponse
+	var found *inspace.VM
+	for i := range f.vms {
+		if f.vms[i].UUID == uuid {
+			copy := f.vms[i]
+			copy.Storage = append([]inspace.VMStorage(nil), f.vms[i].Storage...)
+			found = &copy
+			break
+		}
+	}
+	f.mu.Unlock()
+	if injected != nil {
+		return nil, injected
+	}
+	if returnNil {
+		return nil, nil
+	}
+	if found == nil {
+		return nil, &inspace.APIError{StatusCode: 404, Method: "GET", Path: "/vm", Message: "not found"}
+	}
+	if mutate != nil {
+		mutate(found)
+	}
+	return found, nil
 }
 func (f *fakeAPI) CreateVM(ctx context.Context, _ string, request inspace.CreateVMRequest) (*inspace.VM, error) {
 	f.mu.Lock()

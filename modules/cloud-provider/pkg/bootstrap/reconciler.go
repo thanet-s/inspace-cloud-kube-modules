@@ -34,6 +34,7 @@ type API interface {
 	GetNetwork(context.Context, string, string) (*inspace.Network, error)
 	ListLoadBalancers(context.Context, string) ([]inspace.LoadBalancer, error)
 	ListVMs(context.Context, string) ([]inspace.VM, error)
+	GetVM(context.Context, string, string) (*inspace.VM, error)
 	CreateVM(context.Context, string, inspace.CreateVMRequest) (*inspace.VM, error)
 	DeleteVM(context.Context, string, string) error
 	ListFirewalls(context.Context, string) ([]inspace.Firewall, error)
@@ -164,6 +165,10 @@ func (r *Reconciler) Reconcile(ctx context.Context, cluster *v1alpha1.InSpaceClu
 		return Result{}, err
 	}
 	if err := validateNoVMPoolCollision(configuredNetworkVMs, privatePool); err != nil {
+		return Result{}, err
+	}
+	byName, err = r.canonicalOwnedVMDetails(ctx, cluster.Spec.Location, byName)
+	if err != nil {
 		return Result{}, err
 	}
 	floatingIPSnapshot, err := r.API.ListFloatingIPs(ctx, cluster.Spec.Location, nil)
@@ -393,6 +398,10 @@ func (r *Reconciler) Destroy(ctx context.Context, cluster *v1alpha1.InSpaceClust
 	if err != nil {
 		return result, err
 	}
+	ownedVMs, err = r.canonicalOwnedVMDetails(ctx, cluster.Spec.Location, ownedVMs)
+	if err != nil {
+		return result, err
+	}
 	if err := validateDestroyVMOwnership(ownedVMs, owner); err != nil {
 		return result, err
 	}
@@ -551,6 +560,39 @@ func validateDestroyVMOwnership(vms map[string]*inspace.VM, owner string) error 
 		}
 	}
 	return nil
+}
+
+// canonicalOwnedVMDetails replaces the intentionally sparse ListVMs records
+// for deterministic owned names with authoritative per-VM detail responses.
+// The list remains the source for location-wide name/address collision checks;
+// a detail response may only enrich an already identified list record, never
+// introduce a new deletion or adoption candidate.
+func (r *Reconciler) canonicalOwnedVMDetails(ctx context.Context, location string, listed map[string]*inspace.VM) (map[string]*inspace.VM, error) {
+	names := make([]string, 0, len(listed))
+	for name := range listed {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	details := make(map[string]*inspace.VM, len(listed))
+	for _, name := range names {
+		summary := listed[name]
+		if summary == nil || !vmUUIDPattern.MatchString(summary.UUID) {
+			return nil, fmt.Errorf("bootstrap: refusing authoritative detail lookup for VM %q with an invalid list UUID", name)
+		}
+		detail, err := r.API.GetVM(ctx, location, summary.UUID)
+		if err != nil {
+			return nil, fmt.Errorf("bootstrap: get authoritative detail for VM %q: %w", name, err)
+		}
+		if detail == nil {
+			return nil, fmt.Errorf("bootstrap: authoritative detail for VM %q is missing", name)
+		}
+		if detail.UUID != summary.UUID || detail.Name != name {
+			return nil, fmt.Errorf("bootstrap: authoritative detail identity for VM %q does not match list UUID/name", name)
+		}
+		details[name] = detail
+	}
+	return details, nil
 }
 
 // validateCreatedVMResponse only trusts fields that the create response
