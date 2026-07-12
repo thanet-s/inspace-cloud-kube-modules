@@ -60,6 +60,13 @@ def main() -> None:
     for forbidden in ("ansible-playbook", " go ", "helm ", "kubectl ", "ssh ", "curl "):
         require(forbidden not in executable_host, f"host launcher executes forbidden tool marker: {forbidden!r}")
     require("docker build" in executable_host and "docker run" in executable_host, "host launcher must build and run Docker")
+    require("runner_platform=${INSPACE_E2E_RUNNER_PLATFORM:-linux/amd64}" in executable_host,
+            "E2E runner must default explicitly to linux/amd64")
+    require("linux/amd64 | linux/arm64" in executable_host and
+            "INSPACE_E2E_RUNNER_PLATFORM must be linux/amd64 or linux/arm64" in host,
+            "E2E runner platform override must reject unsupported platforms")
+    require(executable_host.count('--platform "$runner_platform"') == 2,
+            "E2E runner platform must be passed to both Docker build and Docker run")
     require("--target published-live" in executable_host and
             "CONTROLLER_IMAGE=ghcr.io/thanet-s/inspace-cloud-controller-manager:" in executable_host,
             "destructive launcher must copy the bootstrap binary from the exact published image")
