@@ -84,6 +84,104 @@ func TestCreateIsReadBeforeCreateIdempotent(t *testing.T) {
 	}
 }
 
+func TestCreateSparseResponseUsesPersistedVMDetailAuthority(t *testing.T) {
+	api := &fakeAPI{sparseCreateResponse: true}
+	adapter, _ := New(api)
+	created, err := adapter.CreateVM(context.Background(), testRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created.UUID != "11111111-1111-4111-8111-111111111111" || created.PrivateIPv4 != "10.0.0.20" || created.SpecHash != "spec-a" {
+		t.Fatalf("CreateVM() did not return authoritative persisted details: %#v", created)
+	}
+	if api.vmGetCalls != 1 || api.firewallAssignCalls != 1 || api.floatingIPAssignCalls != 1 {
+		t.Fatalf("sparse create did not pass through persisted detail proof: GETs=%d firewall=%d floatingIP=%d", api.vmGetCalls, api.firewallAssignCalls, api.floatingIPAssignCalls)
+	}
+}
+
+func TestCreateRejectsUnpersistedOwnershipBeforeProtection(t *testing.T) {
+	tests := map[string]func(string) string{
+		"missing": func(string) string { return "" },
+		"truncated": func(description string) string {
+			return description[:len(description)/2]
+		},
+		"mismatched": func(description string) string {
+			var record ownership
+			if err := json.Unmarshal([]byte(description), &record); err != nil {
+				t.Fatalf("decode ownership fixture: %v", err)
+			}
+			record.SpecHash = "foreign-spec"
+			encoded, err := json.Marshal(record)
+			if err != nil {
+				t.Fatalf("encode ownership fixture: %v", err)
+			}
+			return string(encoded)
+		},
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			api := &fakeAPI{persistDescription: mutate}
+			adapter, _ := New(api)
+			_, err := adapter.CreateVM(context.Background(), testRequest())
+			if !errors.Is(err, cloudapi.ErrOwnershipMismatch) {
+				t.Fatalf("CreateVM() error = %v, want persisted ownership rejection", err)
+			}
+			if len(api.vms) != 0 || len(api.floatingIPs) != 0 || api.createCalls != 1 || api.vmGetCalls != 1 || api.deleteVMCalls != 1 {
+				t.Fatalf("ownership rejection leaked launched resources: VMs=%#v FIPs=%#v POSTs=%d GETs=%d deletes=%d", api.vms, api.floatingIPs, api.createCalls, api.vmGetCalls, api.deleteVMCalls)
+			}
+			if api.firewallAssignCalls != 0 || api.floatingIPAssignCalls != 0 {
+				t.Fatalf("ownership rejection reached protection mutation: firewall=%d floatingIP=%d", api.firewallAssignCalls, api.floatingIPAssignCalls)
+			}
+			if !reflect.DeepEqual(api.operations, []string{"delete-floating-ip", "delete-vm"}) {
+				t.Fatalf("unsafe ownership rollback operations: %v", api.operations)
+			}
+		})
+	}
+}
+
+func TestAmbiguousCreateInvalidListOwnershipNeverProtectsOrDeletesUnprovenVM(t *testing.T) {
+	tests := map[string]func(string) string{
+		"missing": func(string) string { return "" },
+		"truncated": func(description string) string {
+			return description[:len(description)/2]
+		},
+		"mismatched identity": func(description string) string {
+			var record ownership
+			if err := json.Unmarshal([]byte(description), &record); err != nil {
+				t.Fatalf("decode ownership fixture: %v", err)
+			}
+			record.NodeClaim = "foreign-nodeclaim"
+			encoded, err := json.Marshal(record)
+			if err != nil {
+				t.Fatalf("encode ownership fixture: %v", err)
+			}
+			return string(encoded)
+		},
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			api := &fakeAPI{
+				createErr:           errors.New("connection reset after request"),
+				commitOnCreateError: true,
+				persistDescription:  mutate,
+			}
+			adapter, _ := New(api)
+			if _, err := adapter.CreateVM(context.Background(), testRequest()); err == nil {
+				t.Fatal("CreateVM() unexpectedly trusted invalid ListVMs ownership")
+			}
+			if len(api.vms) != 1 || api.createCalls != 1 || api.vmGetCalls != 0 || api.deleteVMCalls != 0 {
+				t.Fatalf("ambiguous unproven VM was retried, trusted, or unsafely deleted: VMs=%#v POSTs=%d GETs=%d deletes=%d", api.vms, api.createCalls, api.vmGetCalls, api.deleteVMCalls)
+			}
+			if len(api.floatingIPs) != 1 || api.floatingIPs[0].AssignedTo != "" {
+				t.Fatalf("ambiguous ownership anchor was changed: %#v", api.floatingIPs)
+			}
+			if api.firewallAssignCalls != 0 || api.floatingIPAssignCalls != 0 || len(api.operations) != 0 {
+				t.Fatalf("invalid ListVMs ownership reached a mutation: firewall=%d floatingIP=%d operations=%v", api.firewallAssignCalls, api.floatingIPAssignCalls, api.operations)
+			}
+		})
+	}
+}
+
 func TestCreatePassesOptionalSSHAccess(t *testing.T) {
 	api := &fakeAPI{}
 	adapter, err := newAdapter(api, func() (string, error) { return validGeneratedTestPassword, nil })
@@ -1311,6 +1409,8 @@ type fakeAPI struct {
 	firewalls                       []sdk.Firewall
 	createErr                       error
 	commitOnCreateError             bool
+	sparseCreateResponse            bool
+	persistDescription              func(string) string
 	createCalls                     int
 	floatingIPs                     []sdk.FloatingIP
 	lastVMRequest                   sdk.CreateVMRequest
@@ -1523,7 +1623,11 @@ func (f *fakeAPI) CreateVM(_ context.Context, _ string, request sdk.CreateVMRequ
 		vm.NetworkUUID = f.createdNetworkUUID
 	}
 	if f.createErr == nil || f.commitOnCreateError {
-		f.vms = append(f.vms, vm)
+		persisted := vm
+		if f.persistDescription != nil {
+			persisted.Description = f.persistDescription(persisted.Description)
+		}
+		f.vms = append(f.vms, persisted)
 		if f.attachCreatedVMToFirewallUUID != "" {
 			for i := range f.firewalls {
 				if f.firewalls[i].UUID == f.attachCreatedVMToFirewallUUID {
@@ -1534,6 +1638,9 @@ func (f *fakeAPI) CreateVM(_ context.Context, _ string, request sdk.CreateVMRequ
 	}
 	if f.createErr != nil {
 		return nil, f.createErr
+	}
+	if f.sparseCreateResponse {
+		return &sdk.VM{UUID: vm.UUID}, nil
 	}
 	return &vm, nil
 }
