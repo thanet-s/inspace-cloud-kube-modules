@@ -260,6 +260,8 @@ def main() -> None:
     digest = "sha256:49b77655f9f109bedc5eb25723bb0e4c57d8513ba33cc69c31be3f243eb2386d"
     require(playbook.count(digest) >= 2, "kube-vip tag and live pods must use the audited digest")
     require("expected one exact egress FIP for each control plane and bastion" in bootstrap_discovery and
+            "vm_by_name = canonical_owned_vm_details(listed_owned_vms)" in bootstrap_discovery and
+            "user-resource/vm?" in bootstrap_discovery and
             "enabled non-virtual InSpace type=public FIP" in bootstrap_discovery and
             'assigned_to_resource_type") != "virtual_machine"' in bootstrap_discovery and
             "private-VIP bootstrap must not create or adopt a control-plane load balancer" in bootstrap_discovery and
@@ -268,6 +270,66 @@ def main() -> None:
             "node firewall must be assigned to exactly the three control-plane VMs" in bootstrap_discovery and
             "bastion public ingress must be only management /32 TCP/22" in bootstrap_discovery,
             "bootstrap discovery must prove exact VM FIPs, zero control NLBs, and firewall isolation")
+
+    bootstrap_discovery_module = load_script_module(
+        "e2e_discover_bootstrap_static", ROOT / "scripts/discover-bootstrap.py"
+    )
+    sparse_owned_vms = [
+        {"uuid": "11111111-2222-4333-8444-555555555555", "name": "rke2-owner-cp-0"},
+        {"uuid": "66666666-7777-4888-8999-aaaaaaaaaaaa", "name": "rke2-owner-bastion"},
+    ]
+    canonical_vm_records = {
+        item["uuid"]: {
+            **item,
+            "description": "persisted ownership",
+            "network_uuid": "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff",
+            "designated_pool_uuid": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+            "storage": [{"primary": True, "size": 30}],
+        }
+        for item in sparse_owned_vms
+    }
+    detail_queries = []
+
+    def canonical_vm_getter(path: str):
+        detail_queries.append(path)
+        prefix = "user-resource/vm?uuid="
+        require(path.startswith(prefix), "bootstrap VM detail lookup used the wrong endpoint")
+        return canonical_vm_records[path.removeprefix(prefix)]
+
+    canonical = bootstrap_discovery_module.canonical_owned_vm_details(
+        sparse_owned_vms, canonical_vm_getter
+    )
+    require(set(canonical) == {item["name"] for item in sparse_owned_vms},
+            "bootstrap VM detail canonicalization lost an owned name")
+    require(all(item.get("network_uuid") for item in canonical.values()) and len(detail_queries) == 2,
+            "bootstrap discovery did not replace every sparse list row with complete detail")
+
+    def mismatched_vm_getter(_path: str):
+        return {"uuid": sparse_owned_vms[0]["uuid"], "name": "foreign"}
+
+    try:
+        bootstrap_discovery_module.canonical_owned_vm_details(
+            sparse_owned_vms[:1], mismatched_vm_getter
+        )
+    except SystemExit as error:
+        require("does not match its list UUID/name" in str(error),
+                "bootstrap discovery returned the wrong mismatch diagnostic")
+    else:
+        require(False, "bootstrap discovery accepted a mismatched canonical VM identity")
+
+    detail_error = RuntimeError("injected detail lookup failure")
+
+    def failing_vm_getter(_path: str):
+        raise detail_error
+
+    try:
+        bootstrap_discovery_module.canonical_owned_vm_details(
+            sparse_owned_vms[:1], failing_vm_getter
+        )
+    except RuntimeError as error:
+        require(error is detail_error, "bootstrap discovery replaced the authoritative lookup error")
+    else:
+        require(False, "bootstrap discovery ignored an authoritative VM detail lookup failure")
     require("ProxyJump e2e-bastion" in ssh_config and "HostName {private}" in ssh_config,
             "all control-plane and worker SSH must use private IPs through the bastion")
     require("127.0.0.1:16443:$virtual_ip:6443" in tunnel and "StrictHostKeyChecking=yes" in tunnel,
