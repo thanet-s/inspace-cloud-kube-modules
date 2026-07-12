@@ -126,6 +126,14 @@ so an absent description is tolerated while any returned mismatch is rejected.
 It then removes all four owned FIPs, deletes the bastion and three control-plane
 VMs, and deletes both managed firewalls only after assignments are absent:
 
+After each accepted VM deletion, the running controller retains that exact
+owned VM UUID and its expected managed-firewall UUID for at most five minutes.
+This bounded transition tolerates delayed firewall-assignment cleanup without
+allowing an unknown UUID, another firewall, a duplicate assignment, or an
+expired record to become deletion authority. A process restart forgets the
+transition and therefore fails closed until the cloud assignment readback has
+cleared.
+
 ```sh
 go run ./cmd/inspace-cluster-controller \
   --cluster-config ./examples/inspacecluster.yaml \

@@ -23,6 +23,8 @@ const (
 	BastionVCPU          = 1
 	BastionMemoryMiB     = 2048
 	BastionRootDiskGiB   = 30
+
+	ownedVMDeletionTransitionTTL = 5 * time.Minute
 )
 
 var (
@@ -61,6 +63,18 @@ type Reconciler struct {
 	// TCP ports listed here. This is intended for guarded bootstrap/E2E access.
 	ManagementCIDR     string
 	ManagementTCPPorts []int
+
+	pendingDeletionMu  sync.Mutex
+	pendingVMDeletions map[string]pendingVMDeletion
+}
+
+type pendingVMDeletion struct {
+	Owner        string
+	Location     string
+	Name         string
+	UUID         string
+	FirewallUUID string
+	ExpiresAt    time.Time
 }
 
 type privateIPv4Range struct {
@@ -454,10 +468,26 @@ func (r *Reconciler) Destroy(ctx context.Context, cluster *v1alpha1.InSpaceClust
 	if err := validateManagedBastionFirewall(bastionFirewall, cluster, owner, r.ManagementCIDR); err != nil {
 		return result, err
 	}
-	if err := validateOwnedFirewallAssignments(nodeFirewall, controlPlaneUUIDSet(ownedVMs, owner)); err != nil {
+	pendingDeletions, err := r.activePendingVMDeletions(owner, cluster.Spec.Location, firewalls)
+	if err != nil {
+		return result, err
+	}
+	nodeAllowed := controlPlaneUUIDSet(ownedVMs, owner)
+	bastionAllowed := bastionUUIDSet(ownedVMs, owner)
+	for _, deletion := range pendingDeletions {
+		switch {
+		case nodeFirewall != nil && deletion.FirewallUUID == nodeFirewall.UUID:
+			nodeAllowed[deletion.UUID] = true
+		case bastionFirewall != nil && deletion.FirewallUUID == bastionFirewall.UUID:
+			bastionAllowed[deletion.UUID] = true
+		default:
+			return result, fmt.Errorf("bootstrap: pending deletion for VM %q references an unexpected managed firewall", deletion.Name)
+		}
+	}
+	if err := validateOwnedFirewallAssignments(nodeFirewall, nodeAllowed); err != nil {
 		return result, fmt.Errorf("bootstrap: refusing node firewall assignment drift: %w", err)
 	}
-	if err := validateOwnedFirewallAssignments(bastionFirewall, bastionUUIDSet(ownedVMs, owner)); err != nil {
+	if err := validateOwnedFirewallAssignments(bastionFirewall, bastionAllowed); err != nil {
 		return result, fmt.Errorf("bootstrap: refusing bastion firewall assignment drift: %w", err)
 	}
 	if err := validateReverseFirewallAssignments(firewalls, nodeFirewall, bastionFirewall, ownedVMs, owner); err != nil {
@@ -515,6 +545,15 @@ func (r *Reconciler) Destroy(ctx context.Context, cluster *v1alpha1.InSpaceClust
 		if err := r.API.DeleteVM(ctx, cluster.Spec.Location, vm.UUID); err != nil && !inspace.IsNotFound(err) {
 			return result, err
 		}
+		firewallUUID := ""
+		if name == bastionName(owner) {
+			if bastionFirewall != nil {
+				firewallUUID = bastionFirewall.UUID
+			}
+		} else if nodeFirewall != nil {
+			firewallUUID = nodeFirewall.UUID
+		}
+		r.rememberPendingVMDeletion(owner, cluster.Spec.Location, vm, firewallUUID)
 		result.Message = "deleted " + vm.Name
 		return result, nil
 	}
@@ -609,6 +648,72 @@ func (r *Reconciler) canonicalOwnedVMDetails(ctx context.Context, location strin
 		details[name] = detail
 	}
 	return details, "", nil
+}
+
+func pendingVMDeletionKey(owner, location, uuid string) string {
+	return owner + "\x00" + location + "\x00" + uuid
+}
+
+// rememberPendingVMDeletion retains only the exact canonical VM and managed
+// firewall identity that this Reconciler has just submitted for deletion. The
+// bounded transition lets a later pass distinguish delayed assignment cleanup
+// from a foreign UUID without treating arbitrary absent VMs as owned.
+func (r *Reconciler) rememberPendingVMDeletion(owner, location string, vm *inspace.VM, firewallUUID string) {
+	if vm == nil {
+		return
+	}
+	r.pendingDeletionMu.Lock()
+	defer r.pendingDeletionMu.Unlock()
+	if r.pendingVMDeletions == nil {
+		r.pendingVMDeletions = make(map[string]pendingVMDeletion)
+	}
+	r.pendingVMDeletions[pendingVMDeletionKey(owner, location, vm.UUID)] = pendingVMDeletion{
+		Owner: owner, Location: location, Name: vm.Name, UUID: vm.UUID, FirewallUUID: firewallUUID,
+		ExpiresAt: time.Now().Add(ownedVMDeletionTransitionTTL),
+	}
+}
+
+// activePendingVMDeletions returns only unexpired transitions whose UUID still
+// appears exactly once as a VM assignment on the exact managed firewall that
+// protected it at deletion time. Cleared transitions are discarded. Any
+// wrong-firewall, wrong-type, duplicate, or expired residual assignment fails
+// closed instead of widening deletion authority.
+func (r *Reconciler) activePendingVMDeletions(owner, location string, firewalls []inspace.Firewall) ([]pendingVMDeletion, error) {
+	r.pendingDeletionMu.Lock()
+	defer r.pendingDeletionMu.Unlock()
+
+	now := time.Now()
+	active := make([]pendingVMDeletion, 0, len(r.pendingVMDeletions))
+	for key, deletion := range r.pendingVMDeletions {
+		if deletion.Owner != owner || deletion.Location != location {
+			continue
+		}
+		assignmentCount := 0
+		for i := range firewalls {
+			for _, resource := range firewalls[i].ResourcesAssigned {
+				if resource.ResourceUUID != deletion.UUID {
+					continue
+				}
+				assignmentCount++
+				if resource.ResourceType != "vm" || deletion.FirewallUUID == "" || firewalls[i].UUID != deletion.FirewallUUID {
+					return nil, fmt.Errorf("bootstrap: pending deletion for VM %q has assignment drift", deletion.Name)
+				}
+			}
+		}
+		if assignmentCount == 0 {
+			delete(r.pendingVMDeletions, key)
+			continue
+		}
+		if assignmentCount != 1 {
+			return nil, fmt.Errorf("bootstrap: pending deletion for VM %q has duplicate firewall assignments", deletion.Name)
+		}
+		if !now.Before(deletion.ExpiresAt) {
+			return nil, fmt.Errorf("bootstrap: pending deletion assignment for VM %q did not clear within %s", deletion.Name, ownedVMDeletionTransitionTTL)
+		}
+		active = append(active, deletion)
+	}
+	sort.Slice(active, func(i, j int) bool { return active[i].Name < active[j].Name })
+	return active, nil
 }
 
 // validateCreatedVMResponse only trusts fields that the create response

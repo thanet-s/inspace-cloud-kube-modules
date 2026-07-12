@@ -896,6 +896,122 @@ func TestDestroyRemovesOnlyOwnedResourcesInSafeOrder(t *testing.T) {
 	}
 }
 
+func TestDestroyConvergesThroughKnownFirewallAssignmentLag(t *testing.T) {
+	api := newFakeAPI()
+	api.retainFirewallAssignmentsOnDelete = true
+	cluster := testCluster()
+	reconciler := testReconciler(api)
+	reconcileUntilReady(t, reconciler, cluster)
+
+	for i := 0; i < 30 && len(api.vms) != 0; i++ {
+		if _, err := reconciler.Destroy(context.Background(), cluster); err != nil {
+			t.Fatalf("destroy with lagging assignments %d: %v", i, err)
+		}
+	}
+	if len(api.vms) != 0 || len(api.vmDeletes) != 1+ControlPlaneReplicas {
+		t.Fatalf("owned VMs did not delete while exact assignments lagged: VMs=%#v deletes=%#v", api.vms, api.vmDeletes)
+	}
+	waiting, err := reconciler.Destroy(context.Background(), cluster)
+	if err != nil {
+		t.Fatalf("exact pending assignments must wait without an error: %v", err)
+	}
+	if waiting.Done || !strings.Contains(waiting.Message, "waiting for firewall assignments to clear") || len(api.firewallDeletes) != 0 {
+		t.Fatalf("lagging assignment result=%#v firewallDeletes=%#v", waiting, api.firewallDeletes)
+	}
+
+	api.clearAllFirewallAssignments()
+	var result DestroyResult
+	for i := 0; i < 10; i++ {
+		result, err = reconciler.Destroy(context.Background(), cluster)
+		if err != nil {
+			t.Fatalf("destroy after assignment convergence %d: %v", i, err)
+		}
+		if result.Done {
+			break
+		}
+	}
+	if !result.Done || len(api.firewalls) != 0 || len(reconciler.pendingVMDeletions) != 0 {
+		t.Fatalf("destroy did not converge after assignments cleared: result=%#v firewalls=%#v pending=%#v", result, api.firewalls, reconciler.pendingVMDeletions)
+	}
+}
+
+func TestDestroyPendingDeletionNeverAllowsForeignFirewallAssignment(t *testing.T) {
+	api := newFakeAPI()
+	api.retainFirewallAssignmentsOnDelete = true
+	cluster := testCluster()
+	reconciler := testReconciler(api)
+	reconcileUntilReady(t, reconciler, cluster)
+	destroyUntilFirstVMDelete(t, reconciler, api, cluster)
+
+	nodeFirewall := mustFirewall(t, api.firewalls, firewallName(ownerKey(cluster)))
+	nodeFirewall.ResourcesAssigned = append(nodeFirewall.ResourcesAssigned, inspace.FirewallResource{
+		ResourceType: "vm", ResourceUUID: "99999999-1111-4222-8333-bbbbbbbbbbbb",
+	})
+	mutationsBefore := len(api.vmDeletes) + len(api.floatingIPDeletes) + len(api.firewallDeletes)
+	if _, err := reconciler.Destroy(context.Background(), cluster); err == nil || !strings.Contains(err.Error(), "assignment drift") {
+		t.Fatalf("foreign assignment was not rejected: %v", err)
+	}
+	if got := len(api.vmDeletes) + len(api.floatingIPDeletes) + len(api.firewallDeletes); got != mutationsBefore {
+		t.Fatal("foreign assignment caused a teardown mutation")
+	}
+}
+
+func TestDestroyPendingDeletionRejectsRememberedUUIDOnSecondFirewall(t *testing.T) {
+	api := newFakeAPI()
+	api.retainFirewallAssignmentsOnDelete = true
+	cluster := testCluster()
+	reconciler := testReconciler(api)
+	reconcileUntilReady(t, reconciler, cluster)
+	destroyUntilFirstVMDelete(t, reconciler, api, cluster)
+
+	api.firewalls = append(api.firewalls, inspace.Firewall{
+		UUID: "66666666-1111-4222-8333-444444444444", DisplayName: "foreign",
+		ResourcesAssigned: []inspace.FirewallResource{{ResourceType: "vm", ResourceUUID: api.vmDeletes[0]}},
+	})
+	mutationsBefore := len(api.vmDeletes) + len(api.floatingIPDeletes) + len(api.firewallDeletes)
+	if _, err := reconciler.Destroy(context.Background(), cluster); err == nil || !strings.Contains(err.Error(), "assignment drift") {
+		t.Fatalf("remembered UUID on a second firewall was not rejected: %v", err)
+	}
+	if got := len(api.vmDeletes) + len(api.floatingIPDeletes) + len(api.firewallDeletes); got != mutationsBefore {
+		t.Fatal("second firewall assignment caused a teardown mutation")
+	}
+}
+
+func TestDestroyRejectsExpiredPendingDeletionAssignment(t *testing.T) {
+	api := newFakeAPI()
+	api.retainFirewallAssignmentsOnDelete = true
+	cluster := testCluster()
+	reconciler := testReconciler(api)
+	reconcileUntilReady(t, reconciler, cluster)
+	destroyUntilFirstVMDelete(t, reconciler, api, cluster)
+
+	reconciler.pendingDeletionMu.Lock()
+	for key, deletion := range reconciler.pendingVMDeletions {
+		deletion.ExpiresAt = time.Now().Add(-time.Second)
+		reconciler.pendingVMDeletions[key] = deletion
+	}
+	reconciler.pendingDeletionMu.Unlock()
+	mutationsBefore := len(api.vmDeletes) + len(api.floatingIPDeletes) + len(api.firewallDeletes)
+	if _, err := reconciler.Destroy(context.Background(), cluster); err == nil || !strings.Contains(err.Error(), "did not clear within") {
+		t.Fatalf("expired pending assignment was not rejected: %v", err)
+	}
+	if got := len(api.vmDeletes) + len(api.floatingIPDeletes) + len(api.firewallDeletes); got != mutationsBefore {
+		t.Fatal("expired pending assignment caused a teardown mutation")
+	}
+}
+
+func destroyUntilFirstVMDelete(t *testing.T, reconciler *Reconciler, api *fakeAPI, cluster *v1alpha1.InSpaceCluster) {
+	t.Helper()
+	for i := 0; i < 20 && len(api.vmDeletes) == 0; i++ {
+		if _, err := reconciler.Destroy(context.Background(), cluster); err != nil {
+			t.Fatalf("destroy before first VM deletion %d: %v", i, err)
+		}
+	}
+	if len(api.vmDeletes) != 1 {
+		t.Fatalf("expected one owned VM deletion, got %#v", api.vmDeletes)
+	}
+}
+
 func TestDestroyRejectsAssignmentAndPolicyDriftBeforeMutation(t *testing.T) {
 	for _, mutate := range []func(*fakeAPI, *v1alpha1.InSpaceCluster){
 		func(api *fakeAPI, cluster *v1alpha1.InSpaceCluster) {
@@ -1297,22 +1413,23 @@ type fakeAPI struct {
 	firewallDeletes   []string
 	events            []string
 
-	failFirewallAssignmentForName  string
-	failVMCreateNames              map[string]error
-	privateIPByName                map[string]string
-	mutateCreateVMResponse         func(inspace.CreateVMRequest, *inspace.VM)
-	mutateCreateFloatingIPResponse func(*inspace.FloatingIP)
-	mutateAssignFloatingIPResponse func(*inspace.FloatingIP)
-	mutateCreateFirewallResponse   func(inspace.CreateFirewallRequest, *inspace.Firewall)
-	mutateGetVMResponse            func(*inspace.VM)
-	getVMErrorByUUID               map[string]error
-	nilGetVMUUID                   string
-	floatingIPAssignError          error
-	omitFirewallDescriptions       bool
-	sparseVMListResponses          bool
-	sparseFirewallCreateResponses  bool
-	createVMBarrier                chan struct{}
-	createVMStarted                chan string
+	failFirewallAssignmentForName     string
+	failVMCreateNames                 map[string]error
+	privateIPByName                   map[string]string
+	mutateCreateVMResponse            func(inspace.CreateVMRequest, *inspace.VM)
+	mutateCreateFloatingIPResponse    func(*inspace.FloatingIP)
+	mutateAssignFloatingIPResponse    func(*inspace.FloatingIP)
+	mutateCreateFirewallResponse      func(inspace.CreateFirewallRequest, *inspace.Firewall)
+	mutateGetVMResponse               func(*inspace.VM)
+	getVMErrorByUUID                  map[string]error
+	nilGetVMUUID                      string
+	floatingIPAssignError             error
+	omitFirewallDescriptions          bool
+	sparseVMListResponses             bool
+	sparseFirewallCreateResponses     bool
+	retainFirewallAssignmentsOnDelete bool
+	createVMBarrier                   chan struct{}
+	createVMStarted                   chan string
 }
 
 func newFakeAPI() *fakeAPI {
@@ -1434,14 +1551,16 @@ func (f *fakeAPI) DeleteVM(_ context.Context, _ string, uuid string) error {
 			break
 		}
 	}
-	for i := range f.firewalls {
-		kept := f.firewalls[i].ResourcesAssigned[:0]
-		for _, resource := range f.firewalls[i].ResourcesAssigned {
-			if resource.ResourceUUID != uuid {
-				kept = append(kept, resource)
+	if !f.retainFirewallAssignmentsOnDelete {
+		for i := range f.firewalls {
+			kept := f.firewalls[i].ResourcesAssigned[:0]
+			for _, resource := range f.firewalls[i].ResourcesAssigned {
+				if resource.ResourceUUID != uuid {
+					kept = append(kept, resource)
+				}
 			}
+			f.firewalls[i].ResourcesAssigned = kept
 		}
-		f.firewalls[i].ResourcesAssigned = kept
 	}
 	return nil
 }
@@ -1479,6 +1598,14 @@ func (f *fakeAPI) removeVMFromReadback(uuid string) {
 			f.floatingIPs[i].AssignedToResourceType = ""
 			f.floatingIPs[i].AssignedToPrivateIP = ""
 		}
+	}
+}
+
+func (f *fakeAPI) clearAllFirewallAssignments() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i := range f.firewalls {
+		f.firewalls[i].ResourcesAssigned = nil
 	}
 }
 
