@@ -23,7 +23,7 @@ import (
 const boundedReadbackTestTimeout = 200 * time.Millisecond
 
 func TestCreateIsReadBeforeCreateIdempotent(t *testing.T) {
-	api := &fakeAPI{pools: []sdk.HostPool{{UUID: "pool-1"}}}
+	api := &fakeAPI{pools: []sdk.HostPool{{UUID: inspacev1.IntelScalableHostPoolUUID}}}
 	passwordCalls := 0
 	adapter, err := newAdapter(api, func() (string, error) {
 		passwordCalls++
@@ -85,6 +85,19 @@ func TestCreateIsReadBeforeCreateIdempotent(t *testing.T) {
 	}
 	if second.State != cloudapi.LifecyclePending {
 		t.Fatalf("state = %q", second.State)
+	}
+}
+
+func TestCreateRequiresVMNameToMatchNodeClaimBeforeMutation(t *testing.T) {
+	api := &fakeAPI{}
+	adapter, _ := New(api)
+	request := testRequest()
+	request.Name = "different-vm-name"
+	if _, err := adapter.CreateVM(context.Background(), request); err == nil || !strings.Contains(err.Error(), "must exactly match NodeClaim") {
+		t.Fatalf("CreateVM() error = %v, want VM/NodeClaim name contract", err)
+	}
+	if api.createCalls != 0 || api.floatingIPCreateCalls != 0 || len(api.operations) != 0 {
+		t.Fatalf("invalid VM/NodeClaim name reached mutation: VMPOSTs=%d FIPPOSTs=%d operations=%v", api.createCalls, api.floatingIPCreateCalls, api.operations)
 	}
 }
 
@@ -1718,6 +1731,120 @@ func TestListVMsRejectsForeignCanonicalReadErrorOrIdentityMismatch(t *testing.T)
 	}
 }
 
+func TestEstablishedWorkerReadsFailClosedOnLaunchIdentityDrift(t *testing.T) {
+	tests := map[string]func(*sdk.VM){
+		"name":              func(vm *sdk.VM) { vm.Name = "other-nodeclaim" },
+		"vCPU":              func(vm *sdk.VM) { vm.VCPU++ },
+		"memory":            func(vm *sdk.VM) { vm.MemoryMiB += 1024 },
+		"OS name":           func(vm *sdk.VM) { vm.OSName = "debian" },
+		"OS version":        func(vm *sdk.VM) { vm.OSVersion = "22.04" },
+		"host pool":         func(vm *sdk.VM) { vm.DesignatedPoolUUID = "other-pool" },
+		"network":           func(vm *sdk.VM) { vm.NetworkUUID = "other-network" },
+		"billing account":   func(vm *sdk.VM) { vm.BillingAccountID++ },
+		"root disk size":    func(vm *sdk.VM) { vm.Storage[0].SizeGiB++ },
+		"missing root disk": func(vm *sdk.VM) { vm.Storage = nil },
+		"second root disk": func(vm *sdk.VM) {
+			vm.Storage = append(vm.Storage, sdk.VMStorage{SizeGiB: vm.Storage[0].SizeGiB, Primary: true})
+		},
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			api := &fakeAPI{}
+			adapter, _ := New(api)
+			created, err := adapter.CreateVM(context.Background(), testRequest())
+			if err != nil {
+				t.Fatal(err)
+			}
+			mutate(&api.vms[0])
+			api.operations = nil
+			if _, err := adapter.GetVM(context.Background(), "bkk01", created.UUID, "cluster-a"); !errors.Is(err, cloudapi.ErrOwnershipMismatch) || !strings.Contains(err.Error(), "launch identity drift") {
+				t.Fatalf("GetVM() error = %v, want established launch identity drift", err)
+			}
+			if _, err := adapter.ListVMs(context.Background(), "bkk01", "cluster-a"); !errors.Is(err, cloudapi.ErrOwnershipMismatch) || !strings.Contains(err.Error(), "launch identity drift") {
+				t.Fatalf("ListVMs() error = %v, want established launch identity drift", err)
+			}
+			if api.deleteVMCalls != 0 || len(api.operations) != 0 {
+				t.Fatalf("read-only launch drift audit mutated cloud state: deletes=%d operations=%v", api.deleteVMCalls, api.operations)
+			}
+		})
+	}
+}
+
+func TestEstablishedWorkerReadsSupportDerivableLegacyV1LaunchIdentity(t *testing.T) {
+	api := &fakeAPI{}
+	adapter, _ := New(api)
+	created, err := adapter.CreateVM(context.Background(), testRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var record ownership
+	if err := json.Unmarshal([]byte(api.vms[0].Description), &record); err != nil {
+		t.Fatal(err)
+	}
+	record.HostPoolUUID = ""
+	record.VCPU = 0
+	record.MemoryGiB = 0
+	legacyDescription, err := json.Marshal(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	api.vms[0].Description = string(legacyDescription)
+	if strings.Contains(api.vms[0].Description, `"hostPoolUUID"`) || strings.Contains(api.vms[0].Description, `"vCPU"`) || strings.Contains(api.vms[0].Description, `"memoryGiB"`) {
+		t.Fatalf("legacy v1 fixture retained new exact identity fields: %s", api.vms[0].Description)
+	}
+	got, err := adapter.GetVM(context.Background(), "bkk01", created.UUID, "cluster-a")
+	if err != nil || got.VCPU != 2 || got.MemoryGiB != 4 {
+		t.Fatalf("GetVM() = %#v, %v, want derivable legacy v1 worker", got, err)
+	}
+	listed, err := adapter.ListVMs(context.Background(), "bkk01", "cluster-a")
+	if err != nil || len(listed) != 1 || listed[0].UUID != created.UUID {
+		t.Fatalf("ListVMs() = %#v, %v, want derivable legacy v1 worker", listed, err)
+	}
+	operationsBefore := append([]string(nil), api.operations...)
+	adopted, err := adapter.CreateVM(context.Background(), testRequest())
+	if err != nil || adopted.UUID != created.UUID || api.createCalls != 1 {
+		t.Fatalf("CreateVM() legacy adoption = %#v, %v, POSTs=%d; want existing worker", adopted, err, api.createCalls)
+	}
+	if !reflect.DeepEqual(api.operations, operationsBefore) {
+		t.Fatalf("legacy v1 adoption mutated cloud state: before=%v after=%v", operationsBefore, api.operations)
+	}
+}
+
+func TestGetVMRequiresCompleteEstablishedOwnershipRecord(t *testing.T) {
+	for _, field := range []string{"spec hash", "bootstrap hash"} {
+		t.Run(field, func(t *testing.T) {
+			api := &fakeAPI{}
+			adapter, _ := New(api)
+			created, err := adapter.CreateVM(context.Background(), testRequest())
+			if err != nil {
+				t.Fatal(err)
+			}
+			var record ownership
+			if err := json.Unmarshal([]byte(api.vms[0].Description), &record); err != nil {
+				t.Fatal(err)
+			}
+			if field == "spec hash" {
+				record.SpecHash = ""
+			} else {
+				record.BootstrapHash = ""
+			}
+			encoded, err := json.Marshal(record)
+			if err != nil {
+				t.Fatal(err)
+			}
+			api.vms[0].Description = string(encoded)
+			api.operations = nil
+			_, err = adapter.GetVM(context.Background(), "bkk01", created.UUID, "cluster-a")
+			if !errors.Is(err, cloudapi.ErrOwnershipMismatch) || !errors.Is(err, errPersistedOwnershipIncomplete) {
+				t.Fatalf("GetVM() error = %v, want incomplete full ownership rejection", err)
+			}
+			if len(api.operations) != 0 || api.deleteVMCalls != 0 {
+				t.Fatalf("incomplete ownership read mutated cloud state: operations=%v deletes=%d", api.operations, api.deleteVMCalls)
+			}
+		})
+	}
+}
+
 func TestEstablishedWorkerReadsFailClosedOnProtectionDrift(t *testing.T) {
 	tests := map[string]func(*fakeAPI, string){
 		"disabled floating IP": func(api *fakeAPI, _ string) {
@@ -2118,7 +2245,7 @@ func testRequest() cloudapi.CreateVMRequest {
 		PrivateLoadBalancerPoolStart: "10.0.0.200",
 		PrivateLoadBalancerPoolStop:  "10.0.0.219",
 		FirewallUUID:                 "33333333-3333-4333-8333-333333333333",
-		HostPoolUUID:                 "pool-1", HostClass: "intel-scalable", InstanceType: "is-general-2c-4g",
+		HostPoolUUID:                 inspacev1.IntelScalableHostPoolUUID, HostClass: inspacev1.HostClassIntelScalable, InstanceType: "is-general-2c-4g",
 		VCPU: 2, MemoryGiB: 4, RootDiskGiB: 40, CloudInitJSON: `{"write_files":[{"path":"/etc/rancher/rke2/config.yaml","encoding":"b64","content":"bm9kZS1leHRlcm5hbC1pcDogX19JTlNQQUNFX0ZMT0FUSU5HX0lQVjRfXw=="},{"path":"/usr/local/sbin/inspace-detect-private-ip","encoding":"b64","content":"X19JTlNQQUNFX1ZQQ19TVUJORVRfXw=="}],"runcmd":[]}`,
 		PublicIPv4: true,
 		SpecHash:   "spec-a", BootstrapHash: "bootstrap-a",
@@ -2218,7 +2345,7 @@ type fakeAPI struct {
 
 func (f *fakeAPI) ListHostPools(context.Context, string) ([]sdk.HostPool, error) {
 	if f.pools == nil {
-		f.pools = []sdk.HostPool{{UUID: "pool-1"}}
+		f.pools = []sdk.HostPool{{UUID: inspacev1.IntelScalableHostPoolUUID}, {UUID: "pool-1"}}
 	}
 	return append([]sdk.HostPool(nil), f.pools...), nil
 }

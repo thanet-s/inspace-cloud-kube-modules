@@ -16,6 +16,7 @@ import (
 	"net/netip"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -46,6 +47,7 @@ var (
 	errFirewallAssignmentNotVisible  = errors.New("intended worker firewall assignment is not visible")
 	errPersistedOwnershipIncomplete  = errors.New("persisted VM ownership record is incomplete")
 	vmUUIDPattern                    = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
+	ownedInstanceTypePattern         = regexp.MustCompile(`^is-(compute|general|memory)-([0-9]+)c-([0-9]+)g$`)
 	karpenterOwnershipPrefixPattern  = regexp.MustCompile(`^\s*\{\s*"schema"\s*:\s*"karpenter\.inspace\.cloud/v1"(?:\s*[,}]|\s*$)`)
 	karpenterClusterPattern          = regexp.MustCompile(`"cluster"\s*:\s*"([^"]*)"`)
 	fixedClusterNetworks             = [...]struct {
@@ -115,6 +117,9 @@ type ownership struct {
 	KeyHash                      string `json:"keyHash"`
 	HostClass                    string `json:"hostClass"`
 	InstanceType                 string `json:"instanceType"`
+	HostPoolUUID                 string `json:"hostPoolUUID,omitempty"`
+	VCPU                         int    `json:"vCPU,omitempty"`
+	MemoryGiB                    int    `json:"memoryGiB,omitempty"`
 	RootDiskGiB                  int32  `json:"rootDiskGiB"`
 	SpecHash                     string `json:"specHash"`
 	BootstrapHash                string `json:"bootstrapHash"`
@@ -134,6 +139,7 @@ func newOwnership(request cloudapi.CreateVMRequest, floatingIP sdk.FloatingIP) o
 	return ownership{
 		Schema: ownershipSchema, Cluster: request.ClusterName, NodeClaim: request.NodeClaimName,
 		KeyHash: hashKey(request.IdempotencyKey), HostClass: request.HostClass, InstanceType: request.InstanceType,
+		HostPoolUUID: request.HostPoolUUID, VCPU: request.VCPU, MemoryGiB: request.MemoryGiB,
 		RootDiskGiB: request.RootDiskGiB, SpecHash: request.SpecHash, BootstrapHash: request.BootstrapHash,
 		FirewallUUID: request.FirewallUUID, NetworkUUID: request.NetworkUUID, ControlPlaneVIP: request.ControlPlaneVIP,
 		PrivateLoadBalancerPoolStart: request.PrivateLoadBalancerPoolStart, PrivateLoadBalancerPoolStop: request.PrivateLoadBalancerPoolStop,
@@ -414,9 +420,21 @@ func (a *Adapter) GetVM(ctx context.Context, location, uuid, clusterName string)
 		}
 		return nil, err
 	}
-	record, managed := parseOwnership(vm.Description)
+	if vm == nil || vm.UUID != uuid {
+		return nil, fmt.Errorf("%w: canonical VM %s returned invalid detail identity", cloudapi.ErrOwnershipMismatch, uuid)
+	}
+	record, managed, complete, err := inspectOwnershipDescription(vm.Description)
+	if err != nil {
+		return nil, fmt.Errorf("canonical VM %s ownership: %w", uuid, err)
+	}
 	if !managed || record.Cluster != clusterName {
 		return nil, fmt.Errorf("%w: VM %s is not managed for cluster %q", cloudapi.ErrOwnershipMismatch, uuid, clusterName)
+	}
+	if !complete {
+		return nil, fmt.Errorf("%w: established worker VM %s lacks complete persisted ownership: %w", cloudapi.ErrOwnershipMismatch, uuid, errPersistedOwnershipIncomplete)
+	}
+	if err := validateEstablishedLaunchIdentity(*vm, record); err != nil {
+		return nil, fmt.Errorf("established worker VM %s launch identity drift: %w", uuid, err)
 	}
 	if err := a.auditEstablishedVMProtections(ctx, location, []ownedVM{{vm: *vm, record: record}}); err != nil {
 		return nil, err
@@ -435,10 +453,16 @@ func (a *Adapter) ListVMs(ctx context.Context, location, clusterName string) ([]
 	}
 	owned := make([]ownedVM, 0, len(vms))
 	for i := range vms {
-		record, managed := parseOwnership(vms[i].Description)
+		record, managed, complete, err := inspectOwnershipDescription(vms[i].Description)
+		if err != nil {
+			return nil, fmt.Errorf("canonical VM %s ownership: %w", vms[i].UUID, err)
+		}
 		if managed && record.Cluster == clusterName {
-			if vms[i].Name == "" {
-				return nil, fmt.Errorf("%w: owned VM %s canonical detail has no name", cloudapi.ErrOwnershipMismatch, vms[i].UUID)
+			if !complete {
+				return nil, fmt.Errorf("%w: established worker VM %s lacks complete persisted ownership: %w", cloudapi.ErrOwnershipMismatch, vms[i].UUID, errPersistedOwnershipIncomplete)
+			}
+			if err := validateEstablishedLaunchIdentity(vms[i], record); err != nil {
+				return nil, fmt.Errorf("established worker VM %s launch identity drift: %w", vms[i].UUID, err)
 			}
 			owned = append(owned, ownedVM{vm: vms[i], record: record})
 		}
@@ -845,6 +869,8 @@ func validateCreateRequest(r cloudapi.CreateVMRequest) error {
 		return fmt.Errorf("idempotency key is required")
 	case r.Name == "" || r.ClusterName == "" || r.NodeClaimName == "":
 		return fmt.Errorf("VM name, cluster name, and NodeClaim name are required")
+	case r.Name != r.NodeClaimName:
+		return fmt.Errorf("VM name must exactly match NodeClaim name")
 	case r.BillingAccountID <= 0:
 		return fmt.Errorf("billing account ID must be positive")
 	case r.Location == "" || r.NetworkUUID == "" || r.HostPoolUUID == "" || r.FirewallUUID == "":
@@ -862,6 +888,13 @@ func validateCreateRequest(r cloudapi.CreateVMRequest) error {
 	}
 	if _, err := validateControlPlaneVIP(r.ControlPlaneVIP); err != nil {
 		return err
+	}
+	if _, partial, err := normalizeOwnershipLaunchIdentity(ownership{
+		HostClass: r.HostClass, InstanceType: r.InstanceType, HostPoolUUID: r.HostPoolUUID, VCPU: r.VCPU, MemoryGiB: r.MemoryGiB,
+	}); err != nil {
+		return fmt.Errorf("invalid worker launch identity: %v", err)
+	} else if partial {
+		return fmt.Errorf("invalid worker launch identity: host class and instance type are required")
 	}
 	vip, _ := validateControlPlaneVIP(r.ControlPlaneVIP)
 	privateLoadBalancerPool := inspacev1.PrivateLoadBalancerPool{Start: r.PrivateLoadBalancerPoolStart, Stop: r.PrivateLoadBalancerPoolStop}
@@ -915,7 +948,10 @@ func validateGeneratedPassword(password string) error {
 }
 
 func validateExisting(vm sdk.VM, request cloudapi.CreateVMRequest, actual, expected ownership) error {
-	if actual != expected || vm.Name != request.Name || vm.VCPU != request.VCPU || vm.MemoryMiB != request.MemoryGiB*1024 ||
+	normalizedActual, actualPartial, actualErr := normalizeOwnershipLaunchIdentity(actual)
+	normalizedExpected, expectedPartial, expectedErr := normalizeOwnershipLaunchIdentity(expected)
+	if actualErr != nil || expectedErr != nil || actualPartial || expectedPartial || normalizedActual != normalizedExpected ||
+		vm.Name != request.Name || vm.VCPU != request.VCPU || vm.MemoryMiB != request.MemoryGiB*1024 ||
 		(vm.OSName != "" && vm.OSName != request.OSName) || (vm.OSVersion != "" && vm.OSVersion != request.OSVersion) ||
 		(vm.DesignatedPoolUUID != "" && vm.DesignatedPoolUUID != request.HostPoolUUID) ||
 		(vm.NetworkUUID != "" && vm.NetworkUUID != request.NetworkUUID) {
@@ -932,10 +968,18 @@ func validatePersistedVM(vm sdk.VM, vmUUID string, request cloudapi.CreateVMRequ
 	var actual ownership
 	if err := json.Unmarshal([]byte(vm.Description), &actual); err != nil {
 		incomplete = true
-	} else if actual != expected {
-		if ownershipMatchesExpectedWherePresent(actual, expected) {
+	} else {
+		normalizedActual, actualPartial, actualErr := normalizeOwnershipLaunchIdentity(actual)
+		normalizedExpected, expectedPartial, expectedErr := normalizeOwnershipLaunchIdentity(expected)
+		if actualErr != nil || expectedErr != nil {
+			return fmt.Errorf("%w: VM %s persisted Karpenter ownership has conflicting launch identity", cloudapi.ErrOwnershipMismatch, vmUUID)
+		}
+		if actualPartial || expectedPartial {
 			incomplete = true
-		} else {
+		}
+		if normalizedActual != normalizedExpected && ownershipMatchesExpectedWherePresent(normalizedActual, normalizedExpected) {
+			incomplete = true
+		} else if normalizedActual != normalizedExpected {
 			return fmt.Errorf("%w: VM %s persisted Karpenter ownership differs from the launched NodeClaim", cloudapi.ErrOwnershipMismatch, vmUUID)
 		}
 	}
@@ -1021,6 +1065,76 @@ func validatePersistedLaunchIdentity(vm sdk.VM, request cloudapi.CreateVMRequest
 	return incomplete, nil
 }
 
+func normalizeOwnershipLaunchIdentity(record ownership) (normalized ownership, partial bool, err error) {
+	normalized = record
+	if record.HostClass == "" || record.InstanceType == "" {
+		return normalized, true, nil
+	}
+	derivedHostPoolUUID, knownHostClass := (inspacev1.HostPoolSelector{Class: record.HostClass}).UUID()
+	if !knownHostClass {
+		return ownership{}, false, fmt.Errorf("unsupported recorded host class %q", record.HostClass)
+	}
+	if record.HostPoolUUID == "" {
+		normalized.HostPoolUUID = derivedHostPoolUUID
+	} else if record.HostPoolUUID != derivedHostPoolUUID {
+		return ownership{}, false, fmt.Errorf("recorded host pool %q does not match host class %q", record.HostPoolUUID, record.HostClass)
+	}
+	matches := ownedInstanceTypePattern.FindStringSubmatch(record.InstanceType)
+	if len(matches) != 4 {
+		return ownership{}, false, fmt.Errorf("recorded instance type %q is not canonical", record.InstanceType)
+	}
+	derivedVCPU, vCPUErr := strconv.Atoi(matches[2])
+	derivedMemoryGiB, memoryErr := strconv.Atoi(matches[3])
+	memoryPerVCPU := map[string]int{"compute": 1, "general": 2, "memory": 4}[matches[1]]
+	if vCPUErr != nil || memoryErr != nil || derivedVCPU < 2 || derivedVCPU > 16 || derivedVCPU%2 != 0 || derivedMemoryGiB != derivedVCPU*memoryPerVCPU {
+		return ownership{}, false, fmt.Errorf("recorded instance type %q has invalid capacity", record.InstanceType)
+	}
+	if record.VCPU == 0 && record.MemoryGiB == 0 {
+		normalized.VCPU = derivedVCPU
+		normalized.MemoryGiB = derivedMemoryGiB
+		return normalized, false, nil
+	}
+	if record.VCPU < 0 || record.MemoryGiB < 0 {
+		return ownership{}, false, fmt.Errorf("recorded exact capacity must be positive")
+	}
+	if (record.VCPU != 0 && record.VCPU != derivedVCPU) || (record.MemoryGiB != 0 && record.MemoryGiB != derivedMemoryGiB) {
+		return ownership{}, false, fmt.Errorf("recorded exact capacity %d vCPU/%d GiB differs from instance type %q", record.VCPU, record.MemoryGiB, record.InstanceType)
+	}
+	partial = record.VCPU == 0 || record.MemoryGiB == 0
+	normalized.VCPU = derivedVCPU
+	normalized.MemoryGiB = derivedMemoryGiB
+	return normalized, partial, nil
+}
+
+func validateEstablishedLaunchIdentity(vm sdk.VM, record ownership) error {
+	normalized, partial, err := normalizeOwnershipLaunchIdentity(record)
+	if err != nil {
+		return fmt.Errorf("%w: established ownership cannot resolve exact launch identity: %v", cloudapi.ErrOwnershipMismatch, err)
+	}
+	if partial {
+		return fmt.Errorf("%w: established ownership lacks complete exact launch identity: %w", cloudapi.ErrOwnershipMismatch, errPersistedOwnershipIncomplete)
+	}
+	expected := cloudapi.CreateVMRequest{
+		Name:             normalized.NodeClaim,
+		BillingAccountID: normalized.BillingAccountID,
+		NetworkUUID:      normalized.NetworkUUID,
+		OSName:           normalized.OSName,
+		OSVersion:        normalized.OSVersion,
+		HostPoolUUID:     normalized.HostPoolUUID,
+		VCPU:             normalized.VCPU,
+		MemoryGiB:        normalized.MemoryGiB,
+		RootDiskGiB:      normalized.RootDiskGiB,
+	}
+	incomplete, err := validatePersistedLaunchIdentity(vm, expected)
+	if err != nil {
+		return fmt.Errorf("%w: established VM launch identity differs from persisted ownership: %v", cloudapi.ErrOwnershipMismatch, err)
+	}
+	if incomplete {
+		return fmt.Errorf("%w: established VM lacks complete launch identity", cloudapi.ErrOwnershipMismatch)
+	}
+	return nil
+}
+
 // ownershipMatchesExpectedWherePresent distinguishes an eventually
 // consistent partial read-back from a complete conflicting ownership record.
 // Empty fields are allowed only as missing evidence; every field the API did
@@ -1032,6 +1146,9 @@ func ownershipMatchesExpectedWherePresent(actual, expected ownership) bool {
 		fieldMatchesOrIsMissing(actual.KeyHash, expected.KeyHash) &&
 		fieldMatchesOrIsMissing(actual.HostClass, expected.HostClass) &&
 		fieldMatchesOrIsMissing(actual.InstanceType, expected.InstanceType) &&
+		fieldMatchesOrIsMissing(actual.HostPoolUUID, expected.HostPoolUUID) &&
+		fieldMatchesOrIsMissing(actual.VCPU, expected.VCPU) &&
+		fieldMatchesOrIsMissing(actual.MemoryGiB, expected.MemoryGiB) &&
 		fieldMatchesOrIsMissing(actual.RootDiskGiB, expected.RootDiskGiB) &&
 		fieldMatchesOrIsMissing(actual.SpecHash, expected.SpecHash) &&
 		fieldMatchesOrIsMissing(actual.BootstrapHash, expected.BootstrapHash) &&
@@ -1875,7 +1992,14 @@ func inspectOwnershipDescription(description string) (record ownership, karpente
 		if record.Schema != ownershipSchema {
 			return ownership{}, false, false, nil
 		}
-		return record, true, ownershipRecordComplete(record), nil
+		if !ownershipRecordStructurallyComplete(record) {
+			return record, true, false, nil
+		}
+		normalized, partial, err := normalizeOwnershipLaunchIdentity(record)
+		if err != nil {
+			return ownership{}, false, false, fmt.Errorf("%w: invalid Karpenter ownership launch identity: %v", cloudapi.ErrOwnershipMismatch, err)
+		}
+		return normalized, true, !partial, nil
 	}
 	// Ownership JSON is encoded with schema first. An anchored prefix retains
 	// evidence from an eventually consistent truncated response without
@@ -1889,7 +2013,7 @@ func inspectOwnershipDescription(description string) (record ownership, karpente
 	return record, true, false, nil
 }
 
-func ownershipRecordComplete(record ownership) bool {
+func ownershipRecordStructurallyComplete(record ownership) bool {
 	return record.Schema == ownershipSchema && record.Cluster != "" && record.NodeClaim != "" && record.KeyHash != "" &&
 		record.HostClass != "" && record.InstanceType != "" && record.RootDiskGiB > 0 && record.SpecHash != "" &&
 		record.BootstrapHash != "" && record.FirewallUUID != "" && record.NetworkUUID != "" && record.ControlPlaneVIP != "" &&

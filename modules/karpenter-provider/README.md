@@ -88,6 +88,16 @@ lost/disabled address, a second or public firewall,
 membership drift, or a private-IP/supervisor-or-Service-VIP collision without
 mutating resources.
 
+New v1 ownership records persist the exact host-pool UUID, vCPU count, and
+memory size used at launch. Established reads compare canonical VM name,
+capacity, image, host pool, VPC, billing account, and exactly one primary root
+disk against that record before reporting a worker healthy. The v1 schema was
+not bumped: older complete v1 records that lack those additive fields remain
+compatible by deriving capacity from the frozen 24-variant instance name and
+the pool UUID from the frozen host-class mapping. Partial or contradictory
+exact fields fail closed; operators should recycle any legacy worker whose v1
+identity cannot be derived.
+
 `spec.networkUUID` and the literal VIP in `spec.rke2.server` must exactly match
 the controller-wide `INSPACE_NETWORK_UUID` and `INSPACE_CONTROL_PLANE_VIP`.
 This prevents a valid-looking NodeClass for another VPC or supervisor from
