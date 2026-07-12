@@ -1,9 +1,0 @@
-.git
-.env
-.env.*
-!.env.example
-**/.env
-**/.env.*
-bin
-coverage.out
-*.log

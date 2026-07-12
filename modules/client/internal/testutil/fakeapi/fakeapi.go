@@ -12,7 +12,7 @@ import (
 	"strconv"
 	"sync"
 
-	"github.com/thanet-s/inspace-cloud-kube-modules/modules/cloud-provider/pkg/inspace"
+	inspace "github.com/thanet-s/inspace-cloud-kube-modules/modules/client"
 )
 
 const VMUUID = "aaaaaaaa-1111-4222-8333-bbbbbbbbbbbb"

@@ -10,7 +10,7 @@ import (
 	"os"
 	"time"
 
-	"github.com/thanet-s/inspace-cloud-kube-modules/modules/cloud-provider/pkg/inspace"
+	"github.com/thanet-s/inspace-cloud-kube-modules/modules/client"
 )
 
 type report struct {

@@ -8,6 +8,13 @@ updates:
       github-actions:
         patterns: ["*"]
   - package-ecosystem: gomod
+    directory: /modules/client
+    schedule:
+      interval: weekly
+    groups:
+      go-dependencies:
+        patterns: ["*"]
+  - package-ecosystem: gomod
     directory: /modules/cloud-provider
     schedule:
       interval: weekly

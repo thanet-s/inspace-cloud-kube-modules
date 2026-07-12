@@ -13,8 +13,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/thanet-s/inspace-cloud-kube-modules/modules/client"
 	"github.com/thanet-s/inspace-cloud-kube-modules/modules/cloud-provider/api/v1alpha1"
-	"github.com/thanet-s/inspace-cloud-kube-modules/modules/cloud-provider/pkg/inspace"
 )
 
 const ControlPlaneReplicas = 3

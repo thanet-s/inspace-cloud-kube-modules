@@ -4,7 +4,7 @@ CSI v1.12 driver for InSpace block storage. The first release supports ext4
 `SINGLE_NODE_WRITER`, which Kubernetes exposes as `ReadWriteOnce` (RWO).
 
 The production controller uses the shared
-`github.com/thanet-s/inspace-cloud-kube-modules/modules/cloud-provider/pkg/inspace` client for disk
+`github.com/thanet-s/inspace-cloud-kube-modules/modules/client` client for disk
 create/get/list/delete and VM disk attach/detach. The production node service
 uses stable virtio by-id links, safe ext4 detection/formatting, mount conflict
 inspection, bind mounts, and idempotent unmounts on Linux.

@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/thanet-s/inspace-cloud-kube-modules/modules/cloud-provider/pkg/inspace"
+	"github.com/thanet-s/inspace-cloud-kube-modules/modules/client"
 )
 
 // TestLiveLifecycle is intentionally excluded from ordinary test and smoke

@@ -22,8 +22,8 @@ import (
 	_ "k8s.io/component-base/metrics/prometheus/version"
 	"k8s.io/klog/v2"
 
+	"github.com/thanet-s/inspace-cloud-kube-modules/modules/client"
 	inspaceprovider "github.com/thanet-s/inspace-cloud-kube-modules/modules/cloud-provider/pkg/cloudprovider"
-	"github.com/thanet-s/inspace-cloud-kube-modules/modules/cloud-provider/pkg/inspace"
 )
 
 func main() {

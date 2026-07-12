@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/thanet-s/inspace-cloud-kube-modules/modules/cloud-provider/internal/testutil/fakeapi"
-	"github.com/thanet-s/inspace-cloud-kube-modules/modules/cloud-provider/pkg/inspace"
+	inspace "github.com/thanet-s/inspace-cloud-kube-modules/modules/client"
+	"github.com/thanet-s/inspace-cloud-kube-modules/modules/client/internal/testutil/fakeapi"
 )
 
 func TestSmoke(t *testing.T) {

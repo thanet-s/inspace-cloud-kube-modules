@@ -2,8 +2,8 @@
 !modules
 !modules/client
 !modules/client/**
-!modules/csi-driver
-!modules/csi-driver/**
+!modules/karpenter-provider
+!modules/karpenter-provider/**
 **/.git
 **/.DS_Store
 **/.env
