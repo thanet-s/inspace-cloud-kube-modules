@@ -127,12 +127,13 @@ It then removes all four owned FIPs, deletes the bastion and three control-plane
 VMs, and deletes both managed firewalls only after assignments are absent:
 
 Before each owned VM deletion, the running controller records that exact VM
-UUID and its expected managed-firewall UUID. It keeps the record across
-retryable API or transport failures whose commit status is ambiguous, marks
-those outcomes explicitly retryable, and retains it for five minutes after
-DELETE returns. It removes the record after a proven local/non-retryable
-rejection. This bounded transition tolerates delayed firewall-assignment
-cleanup without
+UUID and its expected managed-firewall UUID. A successful or normalized
+not-found DELETE refreshes the record. Every other HTTP/API or transport failure
+keeps it because response retry metadata does not prove whether DELETE committed,
+and the controller marks that outcome explicitly retryable. It retains the
+record for five minutes after DELETE returns and removes it only when the
+explicit local pre-dispatch mutation guard rejects the request. This bounded
+transition tolerates delayed firewall-assignment cleanup without
 allowing an unknown UUID, another firewall, a duplicate assignment, or an
 expired record to become deletion authority. A process restart forgets the
 transition and therefore fails closed until the cloud assignment readback has

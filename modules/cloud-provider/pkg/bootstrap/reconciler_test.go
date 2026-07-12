@@ -936,54 +936,65 @@ func TestDestroyConvergesThroughKnownFirewallAssignmentLag(t *testing.T) {
 	}
 }
 
-func TestDestroyRetainsDeletionIntentWhenAmbiguousErrorCommits(t *testing.T) {
-	api := newFakeAPI()
-	api.retainFirewallAssignmentsOnDelete = true
-	ambiguousErr := &inspace.APIError{StatusCode: 500, Method: "DELETE", Path: "/vm", Message: "injected post-commit failure", Retryable: true}
-	api.vmDeleteError = ambiguousErr
-	api.vmDeleteErrorCommits = true
-	cluster := testCluster()
-	reconciler := testReconciler(api)
-	reconcileUntilReady(t, reconciler, cluster)
+func TestDestroyRetainsDeletionIntentWhenAPIErrorCommits(t *testing.T) {
+	tests := map[string]*inspace.APIError{
+		"retryable API response": {
+			StatusCode: 500, Method: "DELETE", Path: "/vm", Message: "injected post-commit failure", Retryable: true,
+		},
+		"non-retryable API response": {
+			StatusCode: 400, Method: "DELETE", Path: "/vm", Message: "injected post-commit rejection wording", Retryable: false,
+		},
+	}
+	for name, ambiguousErr := range tests {
+		t.Run(name, func(t *testing.T) {
+			api := newFakeAPI()
+			api.retainFirewallAssignmentsOnDelete = true
+			api.vmDeleteError = ambiguousErr
+			api.vmDeleteErrorCommits = true
+			cluster := testCluster()
+			reconciler := testReconciler(api)
+			reconcileUntilReady(t, reconciler, cluster)
 
-	var deleteErr error
-	for i := 0; i < 20; i++ {
-		_, deleteErr = reconciler.Destroy(context.Background(), cluster)
-		if deleteErr != nil {
-			break
-		}
-	}
-	if !errors.Is(deleteErr, ErrRetryableAmbiguousVMDelete) || !errors.Is(deleteErr, ambiguousErr) || len(api.vmDeletes) != 1 || len(api.vms) != ControlPlaneReplicas {
-		t.Fatalf("ambiguous committed delete state: error=%v deletes=%#v VMs=%#v", deleteErr, api.vmDeletes, api.vms)
-	}
-	if len(reconciler.pendingVMDeletions) != 1 {
-		t.Fatalf("ambiguous committed delete lost its exact intent: %#v", reconciler.pendingVMDeletions)
-	}
+			var deleteErr error
+			for i := 0; i < 20; i++ {
+				_, deleteErr = reconciler.Destroy(context.Background(), cluster)
+				if deleteErr != nil {
+					break
+				}
+			}
+			if !errors.Is(deleteErr, ErrRetryableAmbiguousVMDelete) || !errors.Is(deleteErr, ambiguousErr) || len(api.vmDeletes) != 1 || len(api.vms) != ControlPlaneReplicas {
+				t.Fatalf("ambiguous committed delete state: error=%v deletes=%#v VMs=%#v", deleteErr, api.vmDeletes, api.vms)
+			}
+			if len(reconciler.pendingVMDeletions) != 1 {
+				t.Fatalf("ambiguous committed delete lost its exact intent: %#v", reconciler.pendingVMDeletions)
+			}
 
-	api.vmDeleteError = nil
-	api.vmDeleteErrorCommits = false
-	for i := 0; i < 20 && len(api.vms) != 0; i++ {
-		if _, err := reconciler.Destroy(context.Background(), cluster); err != nil {
-			t.Fatalf("destroy after ambiguous commit %d: %v", i, err)
-		}
-	}
-	waiting, err := reconciler.Destroy(context.Background(), cluster)
-	if err != nil || !strings.Contains(waiting.Message, "waiting for firewall assignments to clear") || len(api.firewallDeletes) != 0 {
-		t.Fatalf("ambiguous committed delete did not reach safe assignment wait: result=%#v error=%v", waiting, err)
-	}
-	api.clearAllFirewallAssignments()
-	var result DestroyResult
-	for i := 0; i < 10; i++ {
-		result, err = reconciler.Destroy(context.Background(), cluster)
-		if err != nil {
-			t.Fatalf("destroy after ambiguous assignment convergence %d: %v", i, err)
-		}
-		if result.Done {
-			break
-		}
-	}
-	if !result.Done || len(api.firewalls) != 0 || len(reconciler.pendingVMDeletions) != 0 {
-		t.Fatalf("ambiguous committed delete did not converge: result=%#v firewalls=%#v pending=%#v", result, api.firewalls, reconciler.pendingVMDeletions)
+			api.vmDeleteError = nil
+			api.vmDeleteErrorCommits = false
+			for i := 0; i < 20 && len(api.vms) != 0; i++ {
+				if _, err := reconciler.Destroy(context.Background(), cluster); err != nil {
+					t.Fatalf("destroy after ambiguous commit %d: %v", i, err)
+				}
+			}
+			waiting, err := reconciler.Destroy(context.Background(), cluster)
+			if err != nil || !strings.Contains(waiting.Message, "waiting for firewall assignments to clear") || len(api.firewallDeletes) != 0 {
+				t.Fatalf("ambiguous committed delete did not reach safe assignment wait: result=%#v error=%v", waiting, err)
+			}
+			api.clearAllFirewallAssignments()
+			var result DestroyResult
+			for i := 0; i < 10; i++ {
+				result, err = reconciler.Destroy(context.Background(), cluster)
+				if err != nil {
+					t.Fatalf("destroy after ambiguous assignment convergence %d: %v", i, err)
+				}
+				if result.Done {
+					break
+				}
+			}
+			if !result.Done || len(api.firewalls) != 0 || len(reconciler.pendingVMDeletions) != 0 {
+				t.Fatalf("ambiguous committed delete did not converge: result=%#v firewalls=%#v pending=%#v", result, api.firewalls, reconciler.pendingVMDeletions)
+			}
+		})
 	}
 }
 
@@ -1033,10 +1044,10 @@ func TestDestroyRefreshesDeletionIntentAfterSlowDeleteOutcome(t *testing.T) {
 	}
 }
 
-func TestDestroyDropsDeletionIntentAfterProvenNonCommitFailure(t *testing.T) {
+func TestDestroyDropsDeletionIntentAfterLocalMutationGuard(t *testing.T) {
 	api := newFakeAPI()
 	api.retainFirewallAssignmentsOnDelete = true
-	rejectedErr := &inspace.APIError{StatusCode: 400, Method: "DELETE", Path: "/vm", Message: "injected request rejection"}
+	rejectedErr := fmt.Errorf("injected pre-dispatch guard: %w", inspace.ErrMutationBlocked)
 	api.vmDeleteError = rejectedErr
 	cluster := testCluster()
 	reconciler := testReconciler(api)
@@ -1050,15 +1061,15 @@ func TestDestroyDropsDeletionIntentAfterProvenNonCommitFailure(t *testing.T) {
 		}
 	}
 	if deleteErr != rejectedErr || len(api.vmDeletes) != 1 || len(api.vms) != 1+ControlPlaneReplicas {
-		t.Fatalf("proven non-commit delete state: error=%v deletes=%#v VMs=%#v", deleteErr, api.vmDeletes, api.vms)
+		t.Fatalf("local pre-dispatch rejection state: error=%v deletes=%#v VMs=%#v", deleteErr, api.vmDeletes, api.vms)
 	}
 	if len(reconciler.pendingVMDeletions) != 0 {
-		t.Fatalf("proven non-commit failure retained deletion authority: %#v", reconciler.pendingVMDeletions)
+		t.Fatalf("local pre-dispatch rejection retained deletion authority: %#v", reconciler.pendingVMDeletions)
 	}
 
 	api.vmDeleteError = nil
 	if _, err := reconciler.Destroy(context.Background(), cluster); err != nil {
-		t.Fatalf("retry after proven non-commit rejection: %v", err)
+		t.Fatalf("retry after local pre-dispatch rejection: %v", err)
 	}
 	if len(api.vms) != ControlPlaneReplicas || len(reconciler.pendingVMDeletions) != 1 {
 		t.Fatalf("successful retry did not establish one exact transition: VMs=%#v pending=%#v", api.vms, reconciler.pendingVMDeletions)

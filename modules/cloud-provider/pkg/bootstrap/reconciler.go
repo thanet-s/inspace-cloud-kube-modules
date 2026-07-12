@@ -560,7 +560,7 @@ func (r *Reconciler) Destroy(ctx context.Context, cluster *v1alpha1.InSpaceClust
 		switch {
 		case deleteErr == nil || inspace.IsNotFound(deleteErr):
 			r.refreshPendingVMDeletion(owner, cluster.Spec.Location, vm.UUID)
-		case deleteVMFailureProvesNoCommit(deleteErr):
+		case deleteVMFailureProvesNoDispatch(deleteErr):
 			r.forgetPendingVMDeletion(owner, cluster.Spec.Location, vm.UUID)
 			return result, deleteErr
 		default:
@@ -711,16 +711,12 @@ func (r *Reconciler) forgetPendingVMDeletion(owner, location, uuid string) {
 	delete(r.pendingVMDeletions, pendingVMDeletionKey(owner, location, uuid))
 }
 
-// deleteVMFailureProvesNoCommit recognizes only failures known to occur before
-// a VM deletion can commit. Retryable API responses, transport errors, and
-// cancellations are ambiguous and deliberately retain the exact deletion
-// transition for the next read-before-mutate pass.
-func deleteVMFailureProvesNoCommit(err error) bool {
-	if errors.Is(err, inspace.ErrMutationBlocked) {
-		return true
-	}
-	var apiErr *inspace.APIError
-	return errors.As(err, &apiErr) && !apiErr.Retryable
+// deleteVMFailureProvesNoDispatch recognizes only the explicit local mutation
+// guard, which rejects the request before it can reach the network. HTTP/API
+// retry metadata is not commit evidence: every such failure, plus transport
+// errors and cancellations, must retain the exact deletion transition.
+func deleteVMFailureProvesNoDispatch(err error) bool {
+	return errors.Is(err, inspace.ErrMutationBlocked)
 }
 
 // activePendingVMDeletions returns only unexpired transitions whose UUID still
