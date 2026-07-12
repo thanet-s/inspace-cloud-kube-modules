@@ -238,6 +238,9 @@ func parseTCPPorts(value string) ([]int, error) {
 }
 
 func isRetryable(err error) bool {
+	if errors.Is(err, bootstrap.ErrRetryableAmbiguousVMDelete) {
+		return true
+	}
 	var apiErr *inspace.APIError
 	if errors.As(err, &apiErr) {
 		return apiErr.Retryable

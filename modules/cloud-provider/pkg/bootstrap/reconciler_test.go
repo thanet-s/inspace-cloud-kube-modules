@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -952,7 +953,7 @@ func TestDestroyRetainsDeletionIntentWhenAmbiguousErrorCommits(t *testing.T) {
 			break
 		}
 	}
-	if deleteErr != ambiguousErr || len(api.vmDeletes) != 1 || len(api.vms) != ControlPlaneReplicas {
+	if !errors.Is(deleteErr, ErrRetryableAmbiguousVMDelete) || !errors.Is(deleteErr, ambiguousErr) || len(api.vmDeletes) != 1 || len(api.vms) != ControlPlaneReplicas {
 		t.Fatalf("ambiguous committed delete state: error=%v deletes=%#v VMs=%#v", deleteErr, api.vmDeletes, api.vms)
 	}
 	if len(reconciler.pendingVMDeletions) != 1 {
@@ -983,6 +984,52 @@ func TestDestroyRetainsDeletionIntentWhenAmbiguousErrorCommits(t *testing.T) {
 	}
 	if !result.Done || len(api.firewalls) != 0 || len(reconciler.pendingVMDeletions) != 0 {
 		t.Fatalf("ambiguous committed delete did not converge: result=%#v firewalls=%#v pending=%#v", result, api.firewalls, reconciler.pendingVMDeletions)
+	}
+}
+
+func TestDestroyRefreshesDeletionIntentAfterSlowDeleteOutcome(t *testing.T) {
+	tests := map[string]struct {
+		deleteErr error
+		ambiguous bool
+	}{
+		"success":   {},
+		"not found": {deleteErr: &inspace.APIError{StatusCode: 404, Method: "DELETE", Path: "/vm", Message: "not found"}},
+		"raw EOF":   {deleteErr: io.ErrUnexpectedEOF, ambiguous: true},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			api := newFakeAPI()
+			api.retainFirewallAssignmentsOnDelete = true
+			api.vmDeleteError = test.deleteErr
+			api.vmDeleteErrorCommits = test.deleteErr != nil
+			cluster := testCluster()
+			reconciler := testReconciler(api)
+			current := time.Unix(1_800_000_000, 0)
+			reconciler.now = func() time.Time { return current }
+			reconcileUntilReady(t, reconciler, cluster)
+			api.vmDeleteHook = func() { current = current.Add(ownedVMDeletionTransitionTTL + time.Minute) }
+
+			var deleteErr error
+			for i := 0; i < 20 && len(api.vmDeletes) == 0; i++ {
+				_, deleteErr = reconciler.Destroy(context.Background(), cluster)
+			}
+			if len(api.vmDeletes) != 1 || len(reconciler.pendingVMDeletions) != 1 {
+				t.Fatalf("slow delete did not retain one exact intent: deletes=%#v pending=%#v", api.vmDeletes, reconciler.pendingVMDeletions)
+			}
+			if test.ambiguous {
+				if !errors.Is(deleteErr, ErrRetryableAmbiguousVMDelete) || !errors.Is(deleteErr, test.deleteErr) {
+					t.Fatalf("raw ambiguous error was not wrapped and preserved: %v", deleteErr)
+				}
+			} else if deleteErr != nil {
+				t.Fatalf("definitive delete outcome returned an error: %v", deleteErr)
+			}
+			for _, deletion := range reconciler.pendingVMDeletions {
+				wantExpiry := current.Add(ownedVMDeletionTransitionTTL)
+				if !deletion.ExpiresAt.Equal(wantExpiry) {
+					t.Fatalf("transition expiry=%s, want refresh from DELETE return %s", deletion.ExpiresAt, wantExpiry)
+				}
+			}
+		})
 	}
 }
 
@@ -1513,6 +1560,7 @@ type fakeAPI struct {
 	retainFirewallAssignmentsOnDelete bool
 	vmDeleteError                     error
 	vmDeleteErrorCommits              bool
+	vmDeleteHook                      func()
 	createVMBarrier                   chan struct{}
 	createVMStarted                   chan string
 }
@@ -1624,6 +1672,9 @@ func (f *fakeAPI) DeleteVM(_ context.Context, _ string, uuid string) error {
 	defer f.mu.Unlock()
 	f.vmDeletes = append(f.vmDeletes, uuid)
 	f.events = append(f.events, "delete-vm/"+uuid)
+	if f.vmDeleteHook != nil {
+		f.vmDeleteHook()
+	}
 	if f.vmDeleteError != nil && !f.vmDeleteErrorCommits {
 		return f.vmDeleteError
 	}

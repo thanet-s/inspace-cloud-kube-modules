@@ -30,6 +30,10 @@ const (
 var (
 	sshUsernamePattern = regexp.MustCompile(`^[a-z_][a-z0-9_-]{0,29}$`)
 	vmUUIDPattern      = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
+
+	// ErrRetryableAmbiguousVMDelete marks a VM DELETE whose commit status is
+	// uncertain and whose exact in-memory deletion intent must survive a retry.
+	ErrRetryableAmbiguousVMDelete = errors.New("bootstrap: retryable ambiguous VM deletion outcome")
 )
 
 type API interface {
@@ -66,6 +70,7 @@ type Reconciler struct {
 
 	pendingDeletionMu  sync.Mutex
 	pendingVMDeletions map[string]pendingVMDeletion
+	now                func() time.Time
 }
 
 type pendingVMDeletion struct {
@@ -551,11 +556,16 @@ func (r *Reconciler) Destroy(ctx context.Context, cluster *v1alpha1.InSpaceClust
 			firewallUUID = nodeFirewall.UUID
 		}
 		r.rememberPendingVMDeletion(owner, cluster.Spec.Location, vm, firewallUUID)
-		if err := r.API.DeleteVM(ctx, cluster.Spec.Location, vm.UUID); err != nil && !inspace.IsNotFound(err) {
-			if deleteVMFailureProvesNoCommit(err) {
-				r.forgetPendingVMDeletion(owner, cluster.Spec.Location, vm.UUID)
-			}
-			return result, err
+		deleteErr := r.API.DeleteVM(ctx, cluster.Spec.Location, vm.UUID)
+		switch {
+		case deleteErr == nil || inspace.IsNotFound(deleteErr):
+			r.refreshPendingVMDeletion(owner, cluster.Spec.Location, vm.UUID)
+		case deleteVMFailureProvesNoCommit(deleteErr):
+			r.forgetPendingVMDeletion(owner, cluster.Spec.Location, vm.UUID)
+			return result, deleteErr
+		default:
+			r.refreshPendingVMDeletion(owner, cluster.Spec.Location, vm.UUID)
+			return result, fmt.Errorf("%w: %w", ErrRetryableAmbiguousVMDelete, deleteErr)
 		}
 		result.Message = "deleted " + vm.Name
 		return result, nil
@@ -657,6 +667,13 @@ func pendingVMDeletionKey(owner, location, uuid string) string {
 	return owner + "\x00" + location + "\x00" + uuid
 }
 
+func (r *Reconciler) currentTime() time.Time {
+	if r.now != nil {
+		return r.now()
+	}
+	return time.Now()
+}
+
 // rememberPendingVMDeletion retains only the exact canonical VM and managed
 // firewall identity that this Reconciler has just submitted for deletion. The
 // bounded transition lets a later pass distinguish delayed assignment cleanup
@@ -672,8 +689,20 @@ func (r *Reconciler) rememberPendingVMDeletion(owner, location string, vm *inspa
 	}
 	r.pendingVMDeletions[pendingVMDeletionKey(owner, location, vm.UUID)] = pendingVMDeletion{
 		Owner: owner, Location: location, Name: vm.Name, UUID: vm.UUID, FirewallUUID: firewallUUID,
-		ExpiresAt: time.Now().Add(ownedVMDeletionTransitionTTL),
+		ExpiresAt: r.currentTime().Add(ownedVMDeletionTransitionTTL),
 	}
+}
+
+func (r *Reconciler) refreshPendingVMDeletion(owner, location, uuid string) {
+	r.pendingDeletionMu.Lock()
+	defer r.pendingDeletionMu.Unlock()
+	key := pendingVMDeletionKey(owner, location, uuid)
+	deletion, exists := r.pendingVMDeletions[key]
+	if !exists {
+		return
+	}
+	deletion.ExpiresAt = r.currentTime().Add(ownedVMDeletionTransitionTTL)
+	r.pendingVMDeletions[key] = deletion
 }
 
 func (r *Reconciler) forgetPendingVMDeletion(owner, location, uuid string) {
@@ -703,7 +732,7 @@ func (r *Reconciler) activePendingVMDeletions(owner, location string, firewalls 
 	r.pendingDeletionMu.Lock()
 	defer r.pendingDeletionMu.Unlock()
 
-	now := time.Now()
+	now := r.currentTime()
 	active := make([]pendingVMDeletion, 0, len(r.pendingVMDeletions))
 	for key, deletion := range r.pendingVMDeletions {
 		if deletion.Owner != owner || deletion.Location != location {

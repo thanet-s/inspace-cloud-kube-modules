@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"io"
 	"os"
 	"reflect"
 	"strings"
@@ -17,6 +19,7 @@ import (
 type sequenceReconciler struct {
 	reconcileResults []bootstrap.Result
 	destroyResults   []bootstrap.DestroyResult
+	destroyErrors    []error
 	reconcileCalls   int
 	destroyCalls     int
 }
@@ -31,12 +34,20 @@ func (s *sequenceReconciler) Reconcile(context.Context, *v1alpha1.InSpaceCluster
 }
 
 func (s *sequenceReconciler) Destroy(context.Context, *v1alpha1.InSpaceCluster) (bootstrap.DestroyResult, error) {
-	if s.destroyCalls >= len(s.destroyResults) {
+	index := s.destroyCalls
+	if index >= len(s.destroyResults) && index >= len(s.destroyErrors) {
 		return bootstrap.DestroyResult{}, errors.New("unexpected extra destroy call")
 	}
-	result := s.destroyResults[s.destroyCalls]
 	s.destroyCalls++
-	return result, nil
+	var result bootstrap.DestroyResult
+	if index < len(s.destroyResults) {
+		result = s.destroyResults[index]
+	}
+	var err error
+	if index < len(s.destroyErrors) {
+		err = s.destroyErrors[index]
+	}
+	return result, err
 }
 
 func TestParseTCPPorts(t *testing.T) {
@@ -152,5 +163,31 @@ func TestDeleteLoopRetriesStaleVMDetailProgressAndConverges(t *testing.T) {
 	}
 	if stderr.Len() != 0 {
 		t.Fatalf("delete wrote an error for non-error progress: %q", stderr.String())
+	}
+}
+
+func TestDeleteLoopRetriesRawEOFAmbiguousOutcomeAndConverges(t *testing.T) {
+	ambiguousErr := fmt.Errorf("%w: %w", bootstrap.ErrRetryableAmbiguousVMDelete, io.ErrUnexpectedEOF)
+	reconciler := &sequenceReconciler{
+		destroyResults: []bootstrap.DestroyResult{{}, {Done: true, Owner: "owner", Message: "absent"}},
+		destroyErrors:  []error{ambiguousErr, nil},
+	}
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	err := runControllerLoop(ctx, reconciler, &v1alpha1.InSpaceCluster{}, "", controllerLoopOptions{
+		DeleteOwned: true, Interval: time.Nanosecond, OutputFormat: "json",
+		StandardOutput: &stdout, StandardError: &stderr,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reconciler.destroyCalls != 2 || !strings.Contains(stderr.String(), io.ErrUnexpectedEOF.Error()) || !strings.Contains(stdout.String(), `"done":true`) {
+		t.Fatalf("raw EOF retry did not converge: calls=%d stdout=%q stderr=%q", reconciler.destroyCalls, stdout.String(), stderr.String())
+	}
+	if !errors.Is(ambiguousErr, io.ErrUnexpectedEOF) || !isRetryable(ambiguousErr) {
+		t.Fatalf("ambiguous wrapper did not preserve or classify raw EOF: %v", ambiguousErr)
 	}
 }
