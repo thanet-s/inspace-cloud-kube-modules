@@ -167,9 +167,14 @@ func (r *Reconciler) Reconcile(ctx context.Context, cluster *v1alpha1.InSpaceClu
 	if err := validateNoVMPoolCollision(configuredNetworkVMs, privatePool); err != nil {
 		return Result{}, err
 	}
-	byName, err = r.canonicalOwnedVMDetails(ctx, cluster.Spec.Location, byName)
+	byName, pendingVMDetail, err := r.canonicalOwnedVMDetails(ctx, cluster.Spec.Location, byName)
 	if err != nil {
 		return Result{}, err
+	}
+	if pendingVMDetail != "" {
+		result := progressResult(nil, fmt.Sprintf("waiting for stale VM list entry %q to converge with authoritative detail", pendingVMDetail))
+		result.Owner = owner
+		return result, nil
 	}
 	floatingIPSnapshot, err := r.API.ListFloatingIPs(ctx, cluster.Spec.Location, nil)
 	if err != nil {
@@ -398,9 +403,14 @@ func (r *Reconciler) Destroy(ctx context.Context, cluster *v1alpha1.InSpaceClust
 	if err != nil {
 		return result, err
 	}
-	ownedVMs, err = r.canonicalOwnedVMDetails(ctx, cluster.Spec.Location, ownedVMs)
+	ownedVMs, pendingVMDetail, err := r.canonicalOwnedVMDetails(ctx, cluster.Spec.Location, ownedVMs)
 	if err != nil {
 		return result, err
+	}
+	if pendingVMDetail != "" {
+		result.Remaining = []string{"vm/" + pendingVMDetail}
+		result.Message = fmt.Sprintf("waiting for stale VM list entry %q to disappear after authoritative detail was not found", pendingVMDetail)
+		return result, nil
 	}
 	if err := validateDestroyVMOwnership(ownedVMs, owner); err != nil {
 		return result, err
@@ -567,7 +577,7 @@ func validateDestroyVMOwnership(vms map[string]*inspace.VM, owner string) error 
 // The list remains the source for location-wide name/address collision checks;
 // a detail response may only enrich an already identified list record, never
 // introduce a new deletion or adoption candidate.
-func (r *Reconciler) canonicalOwnedVMDetails(ctx context.Context, location string, listed map[string]*inspace.VM) (map[string]*inspace.VM, error) {
+func (r *Reconciler) canonicalOwnedVMDetails(ctx context.Context, location string, listed map[string]*inspace.VM) (map[string]*inspace.VM, string, error) {
 	names := make([]string, 0, len(listed))
 	for name := range listed {
 		names = append(names, name)
@@ -578,21 +588,27 @@ func (r *Reconciler) canonicalOwnedVMDetails(ctx context.Context, location strin
 	for _, name := range names {
 		summary := listed[name]
 		if summary == nil || !vmUUIDPattern.MatchString(summary.UUID) {
-			return nil, fmt.Errorf("bootstrap: refusing authoritative detail lookup for VM %q with an invalid list UUID", name)
+			return nil, "", fmt.Errorf("bootstrap: refusing authoritative detail lookup for VM %q with an invalid list UUID", name)
 		}
 		detail, err := r.API.GetVM(ctx, location, summary.UUID)
 		if err != nil {
-			return nil, fmt.Errorf("bootstrap: get authoritative detail for VM %q: %w", name, err)
+			if inspace.IsNotFound(err) {
+				// A location-wide list can lag the per-VM endpoint after create or
+				// delete. The stale row is neither adoption nor deletion authority;
+				// stop this pass and wait for the two read models to converge.
+				return nil, name, nil
+			}
+			return nil, "", fmt.Errorf("bootstrap: get authoritative detail for VM %q: %w", name, err)
 		}
 		if detail == nil {
-			return nil, fmt.Errorf("bootstrap: authoritative detail for VM %q is missing", name)
+			return nil, "", fmt.Errorf("bootstrap: authoritative detail for VM %q is missing", name)
 		}
 		if detail.UUID != summary.UUID || detail.Name != name {
-			return nil, fmt.Errorf("bootstrap: authoritative detail identity for VM %q does not match list UUID/name", name)
+			return nil, "", fmt.Errorf("bootstrap: authoritative detail identity for VM %q does not match list UUID/name", name)
 		}
 		details[name] = detail
 	}
-	return details, nil
+	return details, "", nil
 }
 
 // validateCreatedVMResponse only trusts fields that the create response

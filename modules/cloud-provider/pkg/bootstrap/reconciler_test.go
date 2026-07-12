@@ -228,7 +228,7 @@ func TestSparseVMListRetainsNetworkMembershipCollisionChecks(t *testing.T) {
 	}
 }
 
-func TestReconcileRejectsMismatchedOrMissingCanonicalVMDetailBeforeMutation(t *testing.T) {
+func TestReconcileRejectsMalformedCanonicalVMDetailBeforeMutation(t *testing.T) {
 	tests := map[string]func(*fakeAPI, string){
 		"UUID mismatch": func(api *fakeAPI, _ string) {
 			api.mutateGetVMResponse = func(vm *inspace.VM) { vm.UUID = "99999999-1111-4222-8333-bbbbbbbbbbbb" }
@@ -237,9 +237,6 @@ func TestReconcileRejectsMismatchedOrMissingCanonicalVMDetailBeforeMutation(t *t
 			api.mutateGetVMResponse = func(vm *inspace.VM) { vm.Name = "foreign" }
 		},
 		"nil detail": func(api *fakeAPI, uuid string) { api.nilGetVMUUID = uuid },
-		"missing detail": func(api *fakeAPI, uuid string) {
-			api.getVMErrorByUUID = map[string]error{uuid: &inspace.APIError{StatusCode: 404, Method: "GET", Path: "/vm", Message: "not found"}}
-		},
 	}
 	for name, mutate := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -262,8 +259,42 @@ func TestReconcileRejectsMismatchedOrMissingCanonicalVMDetailBeforeMutation(t *t
 	}
 }
 
-func TestDestroyRejectsMismatchedOrMissingCanonicalVMDetailBeforeMutation(t *testing.T) {
+func TestReconcileWaitsWithoutMutationWhenVMListDetailIsStale(t *testing.T) {
+	api := newFakeAPI()
+	cluster := testCluster()
+	reconciler := testReconciler(api)
+	if _, err := reconciler.Reconcile(context.Background(), cluster, "unit-test-secret-token"); err != nil {
+		t.Fatal(err)
+	}
+	bastion := mustVM(t, api.vms, bastionName(ownerKey(cluster)))
+	api.getVMErrorByUUID = map[string]error{
+		bastion.UUID: &inspace.APIError{StatusCode: 400, Method: "GET", Path: "/vm", Message: "Error: No such virtual machine exists: " + bastion.UUID},
+	}
+	eventsBefore := len(api.events)
+
+	result, err := reconciler.Reconcile(context.Background(), cluster, "unit-test-secret-token")
+	if err != nil {
+		t.Fatalf("stale list/detail race must requeue without an error: %v", err)
+	}
+	if result.Ready || result.RequeueAfter <= 0 || result.Owner != ownerKey(cluster) || !strings.Contains(result.Message, "stale VM list entry") {
+		t.Fatalf("stale list/detail progress result = %#v", result)
+	}
+	if len(api.events) != eventsBefore {
+		t.Fatalf("stale list/detail race mutated infrastructure: %v", api.events[eventsBefore:])
+	}
+
+	delete(api.getVMErrorByUUID, bastion.UUID)
+	ready := reconcileUntilReady(t, reconciler, cluster)
+	if !ready.Ready {
+		t.Fatalf("reconciliation did not converge after VM detail became visible: %#v", ready)
+	}
+}
+
+func TestDestroyRejectsMalformedCanonicalVMDetailBeforeMutation(t *testing.T) {
 	tests := map[string]func(*fakeAPI, string){
+		"UUID mismatch": func(api *fakeAPI, _ string) {
+			api.mutateGetVMResponse = func(vm *inspace.VM) { vm.UUID = "99999999-1111-4222-8333-bbbbbbbbbbbb" }
+		},
 		"name mismatch": func(api *fakeAPI, _ string) {
 			api.mutateGetVMResponse = func(vm *inspace.VM) { vm.Name = "foreign" }
 		},
@@ -285,6 +316,44 @@ func TestDestroyRejectsMismatchedOrMissingCanonicalVMDetailBeforeMutation(t *tes
 				t.Fatalf("detail uncertainty mutated infrastructure during destroy: %v", api.events[eventsBefore:])
 			}
 		})
+	}
+}
+
+func TestDestroyWaitsWithoutMutationUntilStaleVMListEntryDisappears(t *testing.T) {
+	api := newFakeAPI()
+	cluster := testCluster()
+	reconciler := testReconciler(api)
+	reconcileUntilReady(t, reconciler, cluster)
+	bastion := mustVM(t, api.vms, bastionName(ownerKey(cluster)))
+	api.getVMErrorByUUID = map[string]error{
+		bastion.UUID: &inspace.APIError{StatusCode: 404, Method: "GET", Path: "/vm", Message: "not found"},
+	}
+	eventsBefore := len(api.events)
+
+	result, err := reconciler.Destroy(context.Background(), cluster)
+	if err != nil {
+		t.Fatalf("stale list/detail race must wait without an error: %v", err)
+	}
+	if result.Done || len(result.Remaining) != 1 || result.Remaining[0] != "vm/"+bastion.Name || !strings.Contains(result.Message, "stale VM list entry") {
+		t.Fatalf("stale list/detail destroy result = %#v", result)
+	}
+	if len(api.events) != eventsBefore {
+		t.Fatalf("stale list/detail race mutated infrastructure during destroy: %v", api.events[eventsBefore:])
+	}
+
+	api.removeVMFromReadback(bastion.UUID)
+	var destroyed DestroyResult
+	for i := 0; i < 40; i++ {
+		destroyed, err = reconciler.Destroy(context.Background(), cluster)
+		if err != nil {
+			t.Fatalf("destroy after list convergence %d: %v", i, err)
+		}
+		if destroyed.Done {
+			break
+		}
+	}
+	if !destroyed.Done || len(api.vms) != 0 || len(api.floatingIPs) != 0 || len(api.firewalls) != 0 {
+		t.Fatalf("destroy did not converge after stale list row disappeared: result=%#v VMs=%#v FIPs=%#v firewalls=%#v", destroyed, api.vms, api.floatingIPs, api.firewalls)
 	}
 }
 
@@ -1376,6 +1445,43 @@ func (f *fakeAPI) DeleteVM(_ context.Context, _ string, uuid string) error {
 	}
 	return nil
 }
+
+// removeVMFromReadback simulates eventual convergence after the per-VM
+// endpoint has already reported absence while the location list was stale.
+// It deliberately records no controller mutation event.
+func (f *fakeAPI) removeVMFromReadback(uuid string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i := range f.vms {
+		if f.vms[i].UUID == uuid {
+			f.vms = append(f.vms[:i], f.vms[i+1:]...)
+			break
+		}
+	}
+	for i := range f.network.VMUUIDs {
+		if f.network.VMUUIDs[i] == uuid {
+			f.network.VMUUIDs = append(f.network.VMUUIDs[:i], f.network.VMUUIDs[i+1:]...)
+			break
+		}
+	}
+	for i := range f.firewalls {
+		kept := f.firewalls[i].ResourcesAssigned[:0]
+		for _, resource := range f.firewalls[i].ResourcesAssigned {
+			if resource.ResourceUUID != uuid {
+				kept = append(kept, resource)
+			}
+		}
+		f.firewalls[i].ResourcesAssigned = kept
+	}
+	for i := range f.floatingIPs {
+		if f.floatingIPs[i].AssignedTo == uuid {
+			f.floatingIPs[i].AssignedTo = ""
+			f.floatingIPs[i].AssignedToResourceType = ""
+			f.floatingIPs[i].AssignedToPrivateIP = ""
+		}
+	}
+}
+
 func (f *fakeAPI) ListFirewalls(context.Context, string) ([]inspace.Firewall, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
