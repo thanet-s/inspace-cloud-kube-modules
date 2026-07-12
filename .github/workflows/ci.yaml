@@ -138,6 +138,23 @@ jobs:
             docker run --rm "$image" --help >/dev/null 2>&1
           fi
 
+  container-images:
+    name: Container images
+    if: ${{ always() }}
+    needs: containers
+    runs-on: ubuntu-slim
+    steps:
+      - name: Require every enabled native image job
+        shell: bash
+        env:
+          CONTAINER_RESULT: ${{ needs.containers.result }}
+        run: |
+          set -euo pipefail
+          if [[ "$CONTAINER_RESULT" != "success" ]]; then
+            echo "one or more enabled native image jobs did not succeed" >&2
+            exit 1
+          fi
+
   helm:
     name: Helm
     runs-on: ubuntu-slim
