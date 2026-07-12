@@ -45,6 +45,8 @@ var (
 	errFirewallAssignmentNotVisible  = errors.New("intended worker firewall assignment is not visible")
 	errPersistedOwnershipIncomplete  = errors.New("persisted VM ownership record is incomplete")
 	vmUUIDPattern                    = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
+	karpenterOwnershipPrefixPattern  = regexp.MustCompile(`^\s*\{\s*"schema"\s*:\s*"karpenter\.inspace\.cloud/v1"(?:\s*[,}]|\s*$)`)
+	karpenterClusterPattern          = regexp.MustCompile(`"cluster"\s*:\s*"([^"]*)"`)
 	fixedClusterNetworks             = [...]struct {
 		description string
 		prefix      netip.Prefix
@@ -358,17 +360,19 @@ func (a *Adapter) readCanonicalCreateCandidate(ctx context.Context, request clou
 		requestCtx, requestCancel := context.WithTimeout(readbackCtx, a.networkAttachmentRequestTimeout)
 		vm, err := a.api.GetVM(requestCtx, request.Location, summary.UUID)
 		requestCancel()
+		var currentObservation error
 		if err != nil {
-			lastObservation = fmt.Errorf("getting canonical VM %s: %w", summary.UUID, err)
+			currentObservation = fmt.Errorf("getting canonical VM %s: %w", summary.UUID, err)
 		}
 		if readbackErr := readbackCtx.Err(); readbackErr != nil {
-			return nil, ownership{}, fmt.Errorf("canonical VM %s read-back stopped: %w", summary.UUID, errors.Join(lastObservation, readbackErr))
+			return nil, ownership{}, fmt.Errorf("canonical VM %s read-back stopped: %w", summary.UUID, errors.Join(lastObservation, currentObservation, readbackErr))
 		}
 		switch {
 		case err != nil:
 			if !sdk.IsNotFound(err) && !isRetryableReadback(readbackCtx, err) {
-				return nil, ownership{}, lastObservation
+				return nil, ownership{}, currentObservation
 			}
+			lastObservation = currentObservation
 		case vm == nil:
 			lastObservation = fmt.Errorf("%w: canonical VM %s detail response is empty: %w", cloudapi.ErrOwnershipMismatch, summary.UUID, errPersistedOwnershipIncomplete)
 		case vm.UUID != summary.UUID:
@@ -424,7 +428,7 @@ func (a *Adapter) ListVMs(ctx context.Context, location, clusterName string) ([]
 	if err != nil {
 		return nil, err
 	}
-	vms, err := a.canonicalListedVMDetails(ctx, location, listed)
+	vms, err := a.canonicalListedVMDetails(ctx, location, clusterName, listed)
 	if err != nil {
 		return nil, err
 	}
@@ -449,12 +453,14 @@ func (a *Adapter) ListVMs(ctx context.Context, location, clusterName string) ([]
 	return result, nil
 }
 
-func (a *Adapter) canonicalListedVMDetails(ctx context.Context, location string, listed []sdk.VM) ([]sdk.VM, error) {
+func (a *Adapter) canonicalListedVMDetails(ctx context.Context, location, clusterName string, listed []sdk.VM) ([]sdk.VM, error) {
 	if err := validateVMListSnapshot(listed); err != nil {
 		return nil, fmt.Errorf("validating VM list for canonical read audit: %w", err)
 	}
 	auditCtx, cancel := context.WithTimeout(ctx, a.protectionAuditTimeout)
 	defer cancel()
+	workerCtx, cancelWorkers := context.WithCancel(auditCtx)
+	defer cancelWorkers()
 	summaries := append([]sdk.VM(nil), listed...)
 	sort.Slice(summaries, func(i, j int) bool { return summaries[i].UUID < summaries[j].UUID })
 	details := make([]*sdk.VM, len(summaries))
@@ -469,39 +475,27 @@ func (a *Adapter) canonicalListedVMDetails(ctx context.Context, location string,
 		workers = len(summaries)
 	}
 	var reads sync.WaitGroup
+	var firstErr error
+	var firstErrOnce sync.Once
 	for range workers {
 		reads.Add(1)
 		go func() {
 			defer reads.Done()
 			for index := range jobs {
-				if auditCtx.Err() != nil {
-					errs[index] = auditCtx.Err()
-					continue
+				details[index], errs[index] = a.readCanonicalListedVM(workerCtx, location, clusterName, summaries[index])
+				if errs[index] != nil {
+					firstErrOnce.Do(func() {
+						firstErr = errs[index]
+						cancelWorkers()
+					})
 				}
-				vm, err := a.api.GetVM(auditCtx, location, summaries[index].UUID)
-				if sdk.IsNotFound(err) {
-					// The list row became stale after the snapshot. Canonical current
-					// state says the VM is absent, so omitting it is authoritative.
-					continue
-				}
-				if err != nil {
-					errs[index] = fmt.Errorf("reading canonical detail for listed VM %s: %w", summaries[index].UUID, err)
-					continue
-				}
-				if vm == nil {
-					errs[index] = fmt.Errorf("%w: canonical detail for listed VM %s is empty", cloudapi.ErrOwnershipMismatch, summaries[index].UUID)
-					continue
-				}
-				if vm.UUID != summaries[index].UUID ||
-					(summaries[index].Name != "" && vm.Name != "" && vm.Name != summaries[index].Name) {
-					errs[index] = fmt.Errorf("%w: canonical detail identity for listed VM %s/%q does not match its list row", cloudapi.ErrOwnershipMismatch, summaries[index].UUID, summaries[index].Name)
-					continue
-				}
-				details[index] = vm
 			}
 		}()
 	}
 	reads.Wait()
+	if firstErr != nil {
+		return nil, firstErr
+	}
 	result := make([]sdk.VM, 0, len(details))
 	for i := range details {
 		if errs[i] != nil {
@@ -512,6 +506,90 @@ func (a *Adapter) canonicalListedVMDetails(ctx context.Context, location string,
 		}
 	}
 	return result, nil
+}
+
+// readCanonicalListedVM lets an authoritative 404 remove a stale list row and
+// lets definitively unmanaged descriptions pass through for the caller to
+// ignore. Once either the list row or a detail response carries Karpenter
+// ownership evidence, however, an incomplete canonical record is uncertainty:
+// poll it within the shared ListVMs bound and fail closed if it never converges.
+func (a *Adapter) readCanonicalListedVM(ctx context.Context, location, clusterName string, summary sdk.VM) (*sdk.VM, error) {
+	listedRecord, listedKarpenter, listedRecordComplete := inspectOwnershipDescription(summary.Description)
+	ownershipEvidence := listedKarpenter && (listedRecord.Cluster == "" || listedRecord.Cluster == clusterName)
+	var lastObservation error
+	readbackDelay := a.networkAttachmentReadbackMinDelay
+	for {
+		if readbackErr := ctx.Err(); readbackErr != nil {
+			return nil, fmt.Errorf("canonical VM %s list read-back stopped: %w", summary.UUID, errors.Join(lastObservation, readbackErr))
+		}
+		requestCtx, requestCancel := context.WithTimeout(ctx, a.networkAttachmentRequestTimeout)
+		vm, err := a.api.GetVM(requestCtx, location, summary.UUID)
+		requestCancel()
+		var currentObservation error
+		if err != nil {
+			currentObservation = fmt.Errorf("reading canonical detail for listed VM %s: %w", summary.UUID, err)
+		}
+		if readbackErr := ctx.Err(); readbackErr != nil {
+			return nil, fmt.Errorf("canonical VM %s list read-back stopped: %w", summary.UUID, errors.Join(lastObservation, currentObservation, readbackErr))
+		}
+		if sdk.IsNotFound(err) {
+			// The list row became stale after the snapshot. Canonical current
+			// state says the VM is absent, so omitting it is authoritative.
+			return nil, nil
+		}
+		if err != nil {
+			if ownershipEvidence && isRetryableReadback(ctx, err) {
+				lastObservation = currentObservation
+				if err := waitForReadback(ctx, readbackDelay); err != nil {
+					return nil, fmt.Errorf("canonical VM %s Karpenter ownership did not converge before the list read-back deadline: %w", summary.UUID, errors.Join(lastObservation, err))
+				}
+				readbackDelay = nextReadbackDelay(readbackDelay, a.networkAttachmentReadbackMaxDelay)
+				continue
+			}
+			return nil, currentObservation
+		}
+		if vm == nil {
+			if ownershipEvidence {
+				lastObservation = fmt.Errorf("%w: canonical detail for listed VM %s is empty: %w", cloudapi.ErrOwnershipMismatch, summary.UUID, errPersistedOwnershipIncomplete)
+				if err := waitForReadback(ctx, readbackDelay); err != nil {
+					return nil, fmt.Errorf("canonical VM %s Karpenter ownership did not converge before the list read-back deadline: %w", summary.UUID, errors.Join(lastObservation, err))
+				}
+				readbackDelay = nextReadbackDelay(readbackDelay, a.networkAttachmentReadbackMaxDelay)
+				continue
+			}
+			return nil, fmt.Errorf("%w: canonical detail for listed VM %s is empty", cloudapi.ErrOwnershipMismatch, summary.UUID)
+		}
+		if vm.UUID != summary.UUID || (summary.Name != "" && vm.Name != "" && vm.Name != summary.Name) {
+			return nil, fmt.Errorf("%w: canonical detail identity for listed VM %s/%q does not match its list row", cloudapi.ErrOwnershipMismatch, summary.UUID, summary.Name)
+		}
+		record, canonicalKarpenter, canonicalRecordComplete := inspectOwnershipDescription(vm.Description)
+		if listedKarpenter && canonicalKarpenter && listedRecord.Cluster != "" && record.Cluster != "" && listedRecord.Cluster != record.Cluster {
+			return nil, fmt.Errorf("%w: canonical Karpenter cluster %q for listed VM %s differs from list cluster %q", cloudapi.ErrOwnershipMismatch, record.Cluster, summary.UUID, listedRecord.Cluster)
+		}
+		if listedRecordComplete && canonicalRecordComplete && listedRecord != record {
+			return nil, fmt.Errorf("%w: canonical Karpenter ownership for listed VM %s differs from its complete list record", cloudapi.ErrOwnershipMismatch, summary.UUID)
+		}
+		if canonicalRecordComplete {
+			return vm, nil
+		}
+		if canonicalKarpenter && record.Cluster != "" && record.Cluster != clusterName && !ownershipEvidence {
+			// An explicit record for another cluster is foreign to this query;
+			// its unrelated optional fields need not converge here.
+			return vm, nil
+		}
+		canonicalTargetsCluster := canonicalKarpenter && (record.Cluster == "" || record.Cluster == clusterName)
+		if !ownershipEvidence && !canonicalTargetsCluster {
+			// A non-Karpenter description is authoritative unmanaged inventory,
+			// not an account-wide reason to fail a cluster-scoped list.
+			return vm, nil
+		}
+		ownershipEvidence = true
+		lastObservation = fmt.Errorf("%w: canonical detail for listed VM %s lacks a complete Karpenter ownership record: %w", cloudapi.ErrOwnershipMismatch, summary.UUID, errPersistedOwnershipIncomplete)
+		if err := waitForReadback(ctx, readbackDelay); err != nil {
+			return nil, fmt.Errorf("canonical VM %s Karpenter ownership did not converge before the list read-back deadline: %w", summary.UUID, errors.Join(lastObservation, err))
+		}
+		readbackDelay = nextReadbackDelay(readbackDelay, a.networkAttachmentReadbackMaxDelay)
+	}
 }
 
 type ownedVM struct {
@@ -1101,7 +1179,7 @@ func (a *Adapter) ensureNetworkAttachment(ctx context.Context, location, network
 		requestCancel()
 		if readbackErr := readbackCtx.Err(); readbackErr != nil {
 			return netip.Prefix{}, fmt.Errorf(
-				"VM %s attachment to network %s read-back stopped: %w", vmUUID, networkUUID, readbackErr,
+				"VM %s attachment to network %s read-back stopped: %w", vmUUID, networkUUID, errors.Join(lastObservation, readbackErr),
 			)
 		}
 		if err != nil {
@@ -1163,7 +1241,7 @@ func (a *Adapter) ensureWorkerPrivateIPv4(ctx context.Context, request cloudapi.
 		vm, err := a.api.GetVM(requestCtx, request.Location, vmUUID)
 		requestCancel()
 		if readbackErr := readbackCtx.Err(); readbackErr != nil {
-			return nil, netip.Addr{}, ownershipProven, fmt.Errorf("VM %s private IPv4 read-back stopped: %w", vmUUID, readbackErr)
+			return nil, netip.Addr{}, ownershipProven, fmt.Errorf("VM %s private IPv4 read-back stopped: %w", vmUUID, errors.Join(lastObservation, readbackErr))
 		}
 		if err != nil {
 			lastObservation = fmt.Errorf("getting worker VM %s for private IPv4 read-back: %w", vmUUID, err)
@@ -1780,6 +1858,33 @@ func parseOwnership(description string) (ownership, bool) {
 		return ownership{}, false
 	}
 	return record, true
+}
+
+func inspectOwnershipDescription(description string) (record ownership, karpenter, complete bool) {
+	if json.Unmarshal([]byte(description), &record) == nil {
+		if record.Schema != ownershipSchema {
+			return ownership{}, false, false
+		}
+		return record, true, ownershipRecordComplete(record)
+	}
+	// Ownership JSON is encoded with schema first. An anchored prefix retains
+	// evidence from an eventually consistent truncated response without
+	// treating arbitrary user notes that mention the schema as managed state.
+	if !karpenterOwnershipPrefixPattern.MatchString(description) {
+		return ownership{}, false, false
+	}
+	if match := karpenterClusterPattern.FindStringSubmatch(description); len(match) == 2 {
+		record.Cluster = match[1]
+	}
+	return record, true, false
+}
+
+func ownershipRecordComplete(record ownership) bool {
+	return record.Schema == ownershipSchema && record.Cluster != "" && record.NodeClaim != "" && record.KeyHash != "" &&
+		record.HostClass != "" && record.InstanceType != "" && record.RootDiskGiB > 0 && record.SpecHash != "" &&
+		record.BootstrapHash != "" && record.FirewallUUID != "" && record.NetworkUUID != "" && record.ControlPlaneVIP != "" &&
+		record.PrivateLoadBalancerPoolStart != "" && record.PrivateLoadBalancerPoolStop != "" && record.OSName != "" &&
+		record.OSVersion != "" && record.BillingAccountID > 0 && record.FloatingIPName != "" && record.PublicIPv4 != ""
 }
 
 func hashKey(key string) string {

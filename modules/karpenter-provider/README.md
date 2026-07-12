@@ -74,9 +74,15 @@ recover ambiguous responses.
 VM list rows are only discovery and collision evidence: exact per-VM detail is
 the ownership authority, including when the list omits descriptions. `ListVMs`
 resolves detail with at most eight parallel reads, omits a row that became 404
-after the snapshot, and fails closed on any other read or list/detail identity
-uncertainty. One firewall list, one Floating-IP list, and one network read per
-unique VPC then detect a lost/disabled address, a second or public firewall,
+after the snapshot, retries an incomplete detail when either view contains
+Karpenter ownership evidence for the requested cluster (or cannot yet expose
+the cluster), and fails closed if that evidence does not converge within the
+read bound. Complete list and detail ownership records must agree exactly.
+Definitively unmanaged descriptions and explicit records for another cluster
+remain cluster-independent inventory and are ignored. Any other read or list/detail
+identity uncertainty also fails closed. One firewall list, one Floating-IP
+list, and one network read per unique VPC then detect a lost/disabled address,
+a second or public firewall,
 membership drift, or a private-IP/supervisor-or-Service-VIP collision without
 mutating resources.
 

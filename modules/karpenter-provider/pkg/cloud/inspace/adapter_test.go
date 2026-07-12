@@ -20,6 +20,8 @@ import (
 	cloudapi "github.com/thanet-s/inspace-cloud-kube-modules/modules/karpenter-provider/pkg/cloud"
 )
 
+const boundedReadbackTestTimeout = 200 * time.Millisecond
+
 func TestCreateIsReadBeforeCreateIdempotent(t *testing.T) {
 	api := &fakeAPI{pools: []sdk.HostPool{{UUID: "pool-1"}}}
 	passwordCalls := 0
@@ -171,7 +173,7 @@ func TestCreateCanonicalCandidateNotFoundOrNilFailsClosed(t *testing.T) {
 			api.omitVMListDescriptions = true
 			inject(api, created.UUID)
 			getCallsBefore := api.vmGetCalls
-			configureFastNetworkReadback(adapter, 40*time.Millisecond)
+			configureFastNetworkReadback(adapter, boundedReadbackTestTimeout)
 			if _, err := adapter.CreateVM(context.Background(), testRequest()); err == nil {
 				t.Fatal("CreateVM() accepted an uncertain canonical candidate")
 			}
@@ -272,9 +274,9 @@ func TestCreateWaitsForIncompletePersistedLaunchIdentity(t *testing.T) {
 func TestCreateBoundsIncompletePersistedLaunchIdentity(t *testing.T) {
 	api := &fakeAPI{mutateGetVMResponse: func(vm *sdk.VM) { vm.NetworkUUID = "" }}
 	adapter, _ := New(api)
-	configureFastNetworkReadback(adapter, 40*time.Millisecond)
+	configureFastNetworkReadback(adapter, boundedReadbackTestTimeout)
 	_, err := adapter.CreateVM(context.Background(), testRequest())
-	if !errors.Is(err, cloudapi.ErrOwnershipMismatch) || !strings.Contains(err.Error(), "did not expose complete persisted identity") {
+	if !errors.Is(err, cloudapi.ErrOwnershipMismatch) || !errors.Is(err, errPersistedOwnershipIncomplete) || !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("CreateVM() error = %v, want bounded incomplete launch identity failure", err)
 	}
 	if api.vmGetCalls < 2 || api.deleteVMCalls != 1 || len(api.vms) != 0 || len(api.floatingIPs) != 0 {
@@ -282,6 +284,46 @@ func TestCreateBoundsIncompletePersistedLaunchIdentity(t *testing.T) {
 	}
 	if api.firewallAssignCalls != 0 || api.floatingIPAssignCalls != 0 {
 		t.Fatalf("incomplete launch identity reached protection: firewall=%d floatingIP=%d", api.firewallAssignCalls, api.floatingIPAssignCalls)
+	}
+}
+
+func TestWorkerPrivateIPv4CancellationPreservesLastOwnershipObservation(t *testing.T) {
+	api := &fakeAPI{}
+	adapter, _ := New(api)
+	request := testRequest()
+	created, err := adapter.CreateVM(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected, managed := parseOwnership(api.vms[0].Description)
+	if !managed {
+		t.Fatal("created VM fixture lacks Karpenter ownership")
+	}
+	api.mutateGetVMResponse = func(vm *sdk.VM) { vm.Description = "" }
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	hookCalls := 0
+	api.getVMHook = func(string) {
+		hookCalls++
+		if hookCalls == 2 {
+			cancel()
+		}
+	}
+	configureFastNetworkReadback(adapter, time.Second)
+	_, _, ownershipProven, err := adapter.ensureWorkerPrivateIPv4(
+		ctx,
+		request,
+		created.UUID,
+		netip.MustParsePrefix("10.0.0.0/24"),
+		netip.MustParseAddr(request.ControlPlaneVIP),
+		inspacev1.PrivateLoadBalancerPool{Start: request.PrivateLoadBalancerPoolStart, Stop: request.PrivateLoadBalancerPoolStop},
+		expected,
+	)
+	if !errors.Is(err, cloudapi.ErrOwnershipMismatch) || !errors.Is(err, errPersistedOwnershipIncomplete) || !errors.Is(err, context.Canceled) {
+		t.Fatalf("ensureWorkerPrivateIPv4() error = %v, want prior ownership observation joined with cancellation", err)
+	}
+	if ownershipProven || hookCalls != 2 {
+		t.Fatalf("canceled read-back ownershipProven=%t GET hooks=%d, want false/2", ownershipProven, hookCalls)
 	}
 }
 
@@ -353,11 +395,14 @@ func TestCreateRejectsUnpersistedOwnershipBeforeProtection(t *testing.T) {
 			api := &fakeAPI{persistDescription: test.mutate}
 			adapter, _ := New(api)
 			if test.incomplete {
-				configureFastNetworkReadback(adapter, 40*time.Millisecond)
+				configureFastNetworkReadback(adapter, boundedReadbackTestTimeout)
 			}
 			_, err := adapter.CreateVM(context.Background(), testRequest())
 			if !errors.Is(err, cloudapi.ErrOwnershipMismatch) {
 				t.Fatalf("CreateVM() error = %v, want persisted ownership rejection", err)
+			}
+			if test.incomplete && (!errors.Is(err, errPersistedOwnershipIncomplete) || !errors.Is(err, context.DeadlineExceeded)) {
+				t.Fatalf("CreateVM() error = %v, want incomplete observation and read-back deadline", err)
 			}
 			if len(api.vms) != 0 || len(api.floatingIPs) != 0 || api.createCalls != 1 || api.deleteVMCalls != 1 {
 				t.Fatalf("ownership rejection leaked launched resources: VMs=%#v FIPs=%#v POSTs=%d GETs=%d deletes=%d", api.vms, api.floatingIPs, api.createCalls, api.vmGetCalls, api.deleteVMCalls)
@@ -413,7 +458,7 @@ func TestAmbiguousCreateInvalidListOwnershipNeverProtectsOrDeletesUnprovenVM(t *
 			}
 			adapter, _ := New(api)
 			if test.incomplete {
-				configureFastNetworkReadback(adapter, 40*time.Millisecond)
+				configureFastNetworkReadback(adapter, boundedReadbackTestTimeout)
 			}
 			if _, err := adapter.CreateVM(context.Background(), testRequest()); err == nil {
 				t.Fatal("CreateVM() unexpectedly trusted invalid ListVMs ownership")
@@ -481,7 +526,7 @@ func TestAmbiguousCreateCanonicalOwnershipUncertaintyNeverMutatesListMatchedVM(t
 			}
 			adapter, _ := New(api)
 			if test.incomplete {
-				configureFastNetworkReadback(adapter, 40*time.Millisecond)
+				configureFastNetworkReadback(adapter, boundedReadbackTestTimeout)
 			}
 			_, err := adapter.CreateVM(context.Background(), testRequest())
 			if !errors.Is(err, cloudapi.ErrOwnershipMismatch) {
@@ -516,7 +561,7 @@ func TestAmbiguousCreateDoesNotRollbackBeforeCanonicalOwnershipProof(t *testing.
 		network:             &sdk.Network{UUID: "network-1", Subnet: "10.0.0.0/24"},
 	}
 	adapter, _ := New(api)
-	configureFastNetworkReadback(adapter, 40*time.Millisecond)
+	configureFastNetworkReadback(adapter, boundedReadbackTestTimeout)
 	_, err := adapter.CreateVM(context.Background(), testRequest())
 	if err == nil || !strings.Contains(err.Error(), "attachment to network") {
 		t.Fatalf("CreateVM() error = %v, want pre-ownership network read-back failure", err)
@@ -1312,6 +1357,207 @@ func TestListVMsUsesCanonicalDetailsWhenListDescriptionsAreSparse(t *testing.T) 
 	}
 	if api.vmGetCalls-getCallsBefore != 1 {
 		t.Fatalf("ListVMs canonical detail GET delta=%d, want one", api.vmGetCalls-getCallsBefore)
+	}
+}
+
+func TestListVMsWaitsForCanonicalKarpenterOwnershipToConverge(t *testing.T) {
+	tests := map[string]func(string) string{
+		"empty": func(string) string { return "" },
+		"truncated": func(description string) string {
+			return description[:len(description)/2]
+		},
+		"valid JSON with missing field": func(description string) string {
+			var record ownership
+			if err := json.Unmarshal([]byte(description), &record); err != nil {
+				t.Fatalf("decode ownership fixture: %v", err)
+			}
+			record.NetworkUUID = ""
+			encoded, err := json.Marshal(record)
+			if err != nil {
+				t.Fatalf("encode ownership fixture: %v", err)
+			}
+			return string(encoded)
+		},
+	}
+	for name, makeIncomplete := range tests {
+		t.Run(name, func(t *testing.T) {
+			api := &fakeAPI{}
+			adapter, _ := New(api)
+			created, err := adapter.CreateVM(context.Background(), testRequest())
+			if err != nil {
+				t.Fatal(err)
+			}
+			incompleteDescription := makeIncomplete(api.vms[0].Description)
+			remainingIncompleteReads := 1
+			api.mutateGetVMResponse = func(vm *sdk.VM) {
+				if vm.UUID == created.UUID && remainingIncompleteReads > 0 {
+					remainingIncompleteReads--
+					vm.Description = incompleteDescription
+				}
+			}
+			getCallsBefore := api.vmGetCalls
+			listed, err := adapter.ListVMs(context.Background(), "bkk01", "cluster-a")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(listed) != 1 || listed[0].UUID != created.UUID {
+				t.Fatalf("ListVMs() = %#v, want worker after ownership convergence", listed)
+			}
+			if delta := api.vmGetCalls - getCallsBefore; delta != 2 {
+				t.Fatalf("ListVMs canonical detail GET delta=%d, want incomplete then complete", delta)
+			}
+		})
+	}
+}
+
+func TestListVMsRetriesTransientCanonicalReadUncertaintyForOwnedSummary(t *testing.T) {
+	tests := map[string]func(*fakeAPI, string){
+		"retryable GET": func(api *fakeAPI, uuid string) {
+			api.getVMErrorByUUID = map[string]error{uuid: &sdk.APIError{StatusCode: 503, Retryable: true}}
+			api.getVMHook = func(string) {
+				api.mu.Lock()
+				delete(api.getVMErrorByUUID, uuid)
+				api.mu.Unlock()
+			}
+		},
+		"nil detail": func(api *fakeAPI, uuid string) {
+			api.nilGetVMUUID = uuid
+			api.getVMHook = func(string) {
+				api.mu.Lock()
+				api.nilGetVMUUID = ""
+				api.mu.Unlock()
+			}
+		},
+	}
+	for name, inject := range tests {
+		t.Run(name, func(t *testing.T) {
+			api := &fakeAPI{}
+			adapter, _ := New(api)
+			created, err := adapter.CreateVM(context.Background(), testRequest())
+			if err != nil {
+				t.Fatal(err)
+			}
+			inject(api, created.UUID)
+			getCallsBefore := api.vmGetCalls
+			listed, err := adapter.ListVMs(context.Background(), "bkk01", "cluster-a")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(listed) != 1 || listed[0].UUID != created.UUID {
+				t.Fatalf("ListVMs() = %#v, want worker after transient canonical read uncertainty", listed)
+			}
+			if delta := api.vmGetCalls - getCallsBefore; delta != 2 {
+				t.Fatalf("ListVMs canonical detail GET delta=%d, want uncertain then complete", delta)
+			}
+		})
+	}
+}
+
+func TestListVMsBoundsIncompleteCanonicalKarpenterOwnership(t *testing.T) {
+	api := &fakeAPI{}
+	adapter, _ := New(api)
+	created, err := adapter.CreateVM(context.Background(), testRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	api.mutateGetVMResponse = func(vm *sdk.VM) {
+		if vm.UUID == created.UUID {
+			vm.Description = ""
+		}
+	}
+	configureFastNetworkReadback(adapter, boundedReadbackTestTimeout)
+	adapter.protectionAuditTimeout = boundedReadbackTestTimeout
+	getCallsBefore := api.vmGetCalls
+	operationsBefore := append([]string(nil), api.operations...)
+	_, err = adapter.ListVMs(context.Background(), "bkk01", "cluster-a")
+	if !errors.Is(err, cloudapi.ErrOwnershipMismatch) || !errors.Is(err, errPersistedOwnershipIncomplete) || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("ListVMs() error = %v, want bounded incomplete Karpenter ownership failure", err)
+	}
+	if delta := api.vmGetCalls - getCallsBefore; delta < 2 {
+		t.Fatalf("ListVMs canonical detail GET delta=%d, want bounded retries", delta)
+	}
+	if !reflect.DeepEqual(api.operations, operationsBefore) || api.deleteVMCalls != 0 {
+		t.Fatalf("read-only ownership convergence mutated cloud resources: before=%v after=%v deletes=%d", operationsBefore, api.operations, api.deleteVMCalls)
+	}
+}
+
+func TestListVMsIgnoresDefinitivelyForeignDescriptions(t *testing.T) {
+	api := &fakeAPI{}
+	adapter, _ := New(api)
+	created, err := adapter.CreateVM(context.Background(), testRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	api.vms = append(api.vms,
+		sdk.VM{UUID: "55555555-5555-4555-8555-555555555555", Name: "other-cluster-partial", Description: `{"schema":"karpenter.inspace.cloud/v1","cluster":"other-cluster"}`},
+		sdk.VM{UUID: "66666666-6666-4666-8666-666666666666", Name: "foreign-note", Description: "notes mention karpenter.inspace.cloud/v1 but this VM is manual"},
+		sdk.VM{UUID: "77777777-7777-4777-8777-777777777777", Name: "foreign-plain", Description: "managed manually"},
+		sdk.VM{UUID: "88888888-8888-4888-8888-888888888888", Name: "foreign-malformed", Description: "{not-json"},
+		sdk.VM{UUID: "99999999-9999-4999-8999-999999999999", Name: "foreign-json", Description: `{"schema":"foreign.example/v1"}`},
+	)
+	getCallsBefore := api.vmGetCalls
+	listed, err := adapter.ListVMs(context.Background(), "bkk01", "cluster-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(listed) != 1 || listed[0].UUID != created.UUID {
+		t.Fatalf("ListVMs() = %#v, want foreign descriptions ignored", listed)
+	}
+	if delta := api.vmGetCalls - getCallsBefore; delta != 6 {
+		t.Fatalf("ListVMs canonical detail GET delta=%d, want one read per row", delta)
+	}
+}
+
+func TestListVMsRejectsManagedListAndCanonicalOwnershipDisagreement(t *testing.T) {
+	tests := map[string]struct {
+		mutate func(*ownership)
+		want   string
+	}{
+		"cluster": {
+			mutate: func(record *ownership) { record.Cluster = "other-cluster" },
+			want:   "differs from list cluster",
+		},
+		"same-cluster field": {
+			mutate: func(record *ownership) { record.SpecHash = "other-spec" },
+			want:   "differs from its complete list record",
+		},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			api := &fakeAPI{}
+			adapter, _ := New(api)
+			created, err := adapter.CreateVM(context.Background(), testRequest())
+			if err != nil {
+				t.Fatal(err)
+			}
+			var canonicalRecord ownership
+			if err := json.Unmarshal([]byte(api.vms[0].Description), &canonicalRecord); err != nil {
+				t.Fatalf("decode ownership fixture: %v", err)
+			}
+			test.mutate(&canonicalRecord)
+			encoded, err := json.Marshal(canonicalRecord)
+			if err != nil {
+				t.Fatalf("encode ownership fixture: %v", err)
+			}
+			canonicalDescription := string(encoded)
+			api.mutateGetVMResponse = func(vm *sdk.VM) {
+				if vm.UUID != created.UUID {
+					return
+				}
+				vm.Description = canonicalDescription
+			}
+			getCallsBefore := api.vmGetCalls
+			_, err = adapter.ListVMs(context.Background(), "bkk01", "cluster-a")
+			if !errors.Is(err, cloudapi.ErrOwnershipMismatch) || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("ListVMs() error = %v, want managed list/detail ownership disagreement", err)
+			}
+			if delta := api.vmGetCalls - getCallsBefore; delta != 1 {
+				t.Fatalf("managed ownership conflict GET delta=%d, want immediate failure", delta)
+			}
+			if api.deleteVMCalls != 0 {
+				t.Fatalf("read-only ownership disagreement deleted a VM: %d", api.deleteVMCalls)
+			}
+		})
 	}
 }
 
