@@ -54,9 +54,15 @@ func TestClusterE2EHostEntrypointOnlyLaunchesDocker(t *testing.T) {
 		mustContain(t, "runner Dockerfile", dockerfile, expected)
 	}
 	for _, expected := range []string{
-		"run_ansible /opt/e2e/playbook.yml",
-		"run_ansible /opt/e2e/cleanup.yml",
-		`ansible-playbook "$@" --forks 10 &`,
+		"run_ansible /opt/e2e/init-cluster.yml",
+		"run_ansible /opt/e2e/test.yml",
+		"run_ansible /opt/e2e/destroy-cluster.yml",
+		`setsid ansible-playbook "$@" --forks 10 &`,
+		`kill -TERM -- "-$pid"`,
+		"ansible_starting=true",
+		"process group identity was not yet stable",
+		"phase-preserved",
+		"e2e_attach_require_initialized=false",
 		"trap 'cleanup_on_signal INT' INT",
 		"trap 'cleanup_on_signal TERM' TERM",
 	} {
@@ -66,7 +72,8 @@ func TestClusterE2EHostEntrypointOnlyLaunchesDocker(t *testing.T) {
 
 func TestClusterE2EProvisionsAndWaitsForThreeControlPlanesInParallel(t *testing.T) {
 	clusterTemplate := readE2E(t, "templates/cluster.yaml.j2")
-	playbook := readE2E(t, "playbook.yml")
+	initPlaybook := readE2E(t, "init-cluster.yml")
+	playbook := initPlaybook + "\n" + readE2E(t, "test.yml")
 	if err := validateNoJinjaControlDirectives(clusterTemplate); err != nil {
 		t.Fatal(err)
 	}
@@ -78,15 +85,15 @@ func TestClusterE2EProvisionsAndWaitsForThreeControlPlanesInParallel(t *testing.
 		"name: inspace-rke2-agent-token",
 		"podCIDR: 10.42.0.0/16",
 		"virtualIPv4:",
+		"hostPoolUUID: {{ lookup('env', 'INSPACE_AMD_HOST_POOL_UUID') }}",
 	} {
 		mustContain(t, "cluster template", clusterTemplate, expected)
 	}
+	if strings.Contains(strings.ToLower(clusterTemplate), "intel") {
+		t.Fatal("cluster template must use only the AMD EPYC host pool")
+	}
 	for _, expected := range []string{
-		"async: 2700",
-		"poll: 0",
-		"ansible.builtin.async_status:",
-		"until: e2e_bootstrap_wait.finished",
-		"retries: 270",
+		"Run the bootstrap reconciler synchronously to readiness",
 		"e2e_bootstrap_result.controlPlaneVMs | length == 3",
 		"e2e_bootstrap_result.controlPlaneVMs | unique | length == 3",
 		"e2e_bootstrap_result.maxParallelControlPlaneCreates | int == 3",
@@ -106,12 +113,12 @@ func TestClusterE2EProvisionsAndWaitsForThreeControlPlanesInParallel(t *testing.
 	} {
 		mustContain(t, "Ansible playbook", playbook, expected)
 	}
-	plays := parseAnsiblePlays(t, playbook)
+	plays := parseAnsiblePlays(t, initPlaybook)
 	provision := exactAnsiblePlay(t, plays, "Provision the RKE2 control plane through the product bootstrap controller")
 	if provision.Hosts != "localhost" {
 		t.Fatalf("provision play hosts=%q, want localhost", provision.Hosts)
 	}
-	launch := exactAnsibleTask(t, provision, "Launch the bootstrap reconciler asynchronously")
+	launch := exactAnsibleTask(t, provision, "Run the bootstrap reconciler synchronously to readiness")
 	launchCommand := requireTaskMapping(t, launch, "ansible.builtin.command")
 	requireMappingStringSequence(t, launchCommand, "argv", []string{
 		"inspace-cluster-controller",
@@ -130,16 +137,13 @@ func TestClusterE2EProvisionsAndWaitsForThreeControlPlanesInParallel(t *testing.
 		"15s",
 		"--output=json",
 	})
-	requireTaskNumber(t, launch, "async", 2700)
-	requireTaskNumber(t, launch, "poll", 0)
-	requireTaskScalar(t, launch, "register", "e2e_bootstrap_job")
-	wait := exactAnsibleTask(t, provision, "Wait robustly for the product reconciler to finish")
-	waitStatus := requireTaskMapping(t, wait, "ansible.builtin.async_status")
-	requireMappingString(t, waitStatus, "jid", "{{ e2e_bootstrap_job.ansible_job_id }}")
-	requireTaskScalar(t, wait, "register", "e2e_bootstrap_wait")
-	requireTaskScalar(t, wait, "until", "e2e_bootstrap_wait.finished")
-	requireTaskNumber(t, wait, "retries", 270)
-	requireTaskNumber(t, wait, "delay", 10)
+	requireTaskScalar(t, launch, "register", "e2e_bootstrap_wait")
+	if _, exists := launch["async"]; exists {
+		t.Fatal("bootstrap cloud mutation must not use detached Ansible async")
+	}
+	if _, exists := launch["poll"]; exists {
+		t.Fatal("bootstrap cloud mutation must not use detached Ansible polling")
+	}
 	parallelContract := exactAnsibleTask(t, provision, "Prove exact and parallel three-control-plane provisioning")
 	requireTaskAssertions(t, parallelContract,
 		"e2e_bootstrap_result.controlPlaneVMs | length == 3",
@@ -251,8 +255,7 @@ func TestClusterE2EProvisionsAndWaitsForThreeControlPlanesInParallel(t *testing.
 	requireTaskNumber(t, readyz, "delay", 10)
 	requireTaskScalar(t, readyz, "until", "e2e_local_readyz.rc == 0")
 	assertOrdered(t, playbook,
-		"Launch the bootstrap reconciler asynchronously",
-		"Wait robustly for the product reconciler to finish",
+		"Run the bootstrap reconciler synchronously to readiness",
 		"Prove exact and parallel three-control-plane provisioning",
 		"Add exactly three dynamic RKE2 control-plane hosts",
 		"Wait for all RKE2 servers independently and in parallel",
@@ -262,7 +265,7 @@ func TestClusterE2EProvisionsAndWaitsForThreeControlPlanesInParallel(t *testing.
 
 func TestClusterE2ERendersRKE2WorkerAndCiliumKubeProxyReplacement(t *testing.T) {
 	workerTemplate := readE2E(t, "templates/karpenter.yaml.j2")
-	playbook := readE2E(t, "playbook.yml")
+	playbook := readE2E(t, "init-cluster.yml") + "\n" + readE2E(t, "test.yml")
 	for _, expected := range []string{
 		"rke2:",
 		"version: v1.35.6+rke2r1",
@@ -311,7 +314,7 @@ func TestClusterE2ERendersRKE2WorkerAndCiliumKubeProxyReplacement(t *testing.T) 
 }
 
 func TestClusterE2EProvesWorkerCloudIdentityAndVPCAttachment(t *testing.T) {
-	playbook := readE2E(t, "playbook.yml")
+	playbook := readE2E(t, "init-cluster.yml") + "\n" + readE2E(t, "test.yml")
 	discovery := readE2E(t, "scripts/discover-worker.py")
 	for _, expected := range []string{
 		"Read the exact Karpenter worker identity",
@@ -354,13 +357,13 @@ func TestClusterE2EProvesWorkerCloudIdentityAndVPCAttachment(t *testing.T) {
 
 func TestClusterE2ECleanupIsBoundedFailClosedAndOrdered(t *testing.T) {
 	entrypoint := readE2E(t, "scripts/container-entrypoint.sh")
-	cleanup := readE2E(t, "cleanup.yml")
+	cleanup := readE2E(t, "destroy-cluster.yml")
 	for _, expected := range []string{
 		"suite_status=$?",
 		"cleanup_status=0",
 		"if [[ $INSPACE_E2E_KEEP_RESOURCES == true ]]",
-		"ansible-playbook /opt/e2e/cleanup.yml --forks 10",
-		"if (( cleanup_status != 0 ))",
+		"cleanup_current_run ||",
+		"(( cleanup_status == 0 && retention_status == 0 )) || exit 1",
 		`exit "$suite_status"`,
 	} {
 		mustContain(t, "container entrypoint", entrypoint, expected)
@@ -371,10 +374,7 @@ func TestClusterE2ECleanupIsBoundedFailClosedAndOrdered(t *testing.T) {
 		"delay: 10",
 		"until: e2e_cleanup_storage_quiesced.rc == 0",
 		"until: e2e_cleanup_worker_quiesced.rc == 0",
-		"async: 1800",
-		"poll: 0",
-		"ansible.builtin.async_status:",
-		"until: e2e_destroy_wait.finished",
+		"Destroy only bootstrap-controller-owned infrastructure synchronously",
 		"retries: 90",
 		"until: (e2e_final_audit.stdout | from_json).count == 0",
 	} {
@@ -390,8 +390,7 @@ func TestClusterE2ECleanupIsBoundedFailClosedAndOrdered(t *testing.T) {
 		"Wait until CCM CSI and Karpenter removed all non-control-plane cloud resources",
 		"Uninstall controllers only after their owners are quiescent",
 		"Remove E2E credentials after controller shutdown",
-		"Destroy only bootstrap-controller-owned infrastructure asynchronously",
-		"Wait robustly for bootstrap destroy convergence",
+		"Destroy only bootstrap-controller-owned infrastructure synchronously",
 		"Require the final deterministic cloud audit to converge to zero",
 	)
 }
@@ -534,13 +533,12 @@ func expectedHostLauncherDockerCalls(dir string, inspectFail bool) []string {
 			"--env INSPACE_E2E_VERSION=0.0.0-static",
 			"--env INSPACE_E2E_KEEP_RESOURCES=false",
 			"--env INSPACE_E2E_RUN_ID=",
-			"--env INSPACE_E2E_RECOVERY_ONLY=false",
 			"--env INSPACE_E2E_RECOVER_RETAINED=false",
 			"--mount type=bind,src=" + filepath.Join(dir, "workspace.env") + ",dst=/run/config/workspace.env,readonly",
 			"--mount type=bind,src=" + filepath.Join(dir, "id_rsa") + ",dst=/run/secrets/e2e_ssh_key,readonly",
 			"--mount type=bind,src=" + filepath.Join(dir, "id_rsa.pub") + ",dst=/run/secrets/e2e_ssh_key.pub,readonly",
 			"--mount type=volume,src=" + volume + ",dst=/state",
-			"inspace-cloud-rke2-e2e:local",
+			"inspace-cloud-rke2-e2e:local all",
 		}, " "),
 	)
 	return calls

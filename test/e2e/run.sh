@@ -20,6 +20,13 @@ ssh_public_key=${INSPACE_E2E_SSH_PUBLIC_KEY:-$HOME/.ssh/id_rsa.pub}
 state_volume=${INSPACE_E2E_STATE_VOLUME:-inspace-cloud-rke2-e2e-state}
 runner_image=${INSPACE_E2E_RUNNER_IMAGE:-inspace-cloud-rke2-e2e:local}
 runner_platform=${INSPACE_E2E_RUNNER_PLATFORM:-linux/amd64}
+phase=${1:-all}
+
+[[ $# -le 1 ]] || { echo "usage: test/e2e/run.sh [all|init|test|shell|destroy]" >&2; exit 2; }
+case "$phase" in
+  all | init | test | shell | destroy) ;;
+  *) echo "unsupported E2E phase: $phase" >&2; exit 2 ;;
+esac
 
 case "$runner_platform" in
   linux/amd64 | linux/arm64) ;;
@@ -62,16 +69,20 @@ docker build \
   --build-arg "CONTROLLER_IMAGE=ghcr.io/thanet-s/inspace-cloud-controller-manager:$INSPACE_E2E_VERSION" \
   --tag "$runner_image" \
   .
-docker run --rm \
+interactive_arg=
+if [[ $phase == shell ]]; then
+  interactive_arg=-it
+fi
+docker run --rm ${interactive_arg:+"$interactive_arg"} \
   --platform "$runner_platform" \
   --env "CONFIRM_INSPACE_CLUSTER_E2E=$CONFIRM_INSPACE_CLUSTER_E2E" \
   --env "INSPACE_E2E_VERSION=$INSPACE_E2E_VERSION" \
   --env "INSPACE_E2E_KEEP_RESOURCES=${INSPACE_E2E_KEEP_RESOURCES:-false}" \
   --env "INSPACE_E2E_RUN_ID=${INSPACE_E2E_RUN_ID:-}" \
-  --env "INSPACE_E2E_RECOVERY_ONLY=${INSPACE_E2E_RECOVERY_ONLY:-false}" \
   --env "INSPACE_E2E_RECOVER_RETAINED=${INSPACE_E2E_RECOVER_RETAINED:-false}" \
   --mount "type=bind,src=$env_file,dst=/run/config/workspace.env,readonly" \
   --mount "type=bind,src=$ssh_private_key,dst=/run/secrets/e2e_ssh_key,readonly" \
   --mount "type=bind,src=$ssh_public_key,dst=/run/secrets/e2e_ssh_key.pub,readonly" \
   --mount "type=volume,src=$state_volume,dst=/state" \
-  "$runner_image"
+  "$runner_image" \
+  "$phase"

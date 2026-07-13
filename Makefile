@@ -2,7 +2,7 @@ SHELL := /bin/sh
 
 MODULES := modules/client modules/cloud-provider modules/csi-driver modules/karpenter-provider
 
-.PHONY: all fmt test smoke vet helm-verify helm-package e2e-static release-notes-verify verify images status live-audit live-test cluster-e2e
+.PHONY: all fmt test smoke vet helm-verify helm-package e2e-static release-notes-verify verify images status live-audit live-test cluster-e2e cluster-e2e-init cluster-e2e-test cluster-e2e-shell cluster-e2e-destroy
 
 all: test
 
@@ -81,4 +81,16 @@ live-test:
 	@MAKE="$(MAKE)" ./scripts/live-suite.sh
 
 cluster-e2e:
-	@./test/e2e/run.sh
+	@./test/e2e/run.sh all
+
+cluster-e2e-init:
+	@./test/e2e/run.sh init
+
+cluster-e2e-test:
+	@./test/e2e/run.sh test
+
+cluster-e2e-shell:
+	@./test/e2e/run.sh shell
+
+cluster-e2e-destroy:
+	@./test/e2e/run.sh destroy

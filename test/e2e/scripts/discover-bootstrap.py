@@ -254,7 +254,7 @@ def main() -> None:
         or bastion.get("memory") != 2048
         or bastion.get("os_name") != "ubuntu"
         or str(bastion.get("os_version")) != "24.04"
-        or bastion.get("designated_pool_uuid") != os.environ["INSPACE_INTEL_HOST_POOL_UUID"]
+        or bastion.get("designated_pool_uuid") != os.environ["INSPACE_AMD_HOST_POOL_UUID"]
         or bastion.get("billing_account") != int(os.environ["INSPACE_BILLING_ACCOUNT_ID"])
         or re.fullmatch(
             rf"inspace-rke2-bastion/v3 owner={re.escape(owner)} spec=[0-9a-f]{{64}}",
@@ -296,7 +296,7 @@ def main() -> None:
             or vm.get("memory") != 4096
             or vm.get("os_name") != "ubuntu"
             or str(vm.get("os_version")) != "24.04"
-            or vm.get("designated_pool_uuid") != os.environ["INSPACE_INTEL_HOST_POOL_UUID"]
+            or vm.get("designated_pool_uuid") != os.environ["INSPACE_AMD_HOST_POOL_UUID"]
             or vm.get("billing_account") != int(os.environ["INSPACE_BILLING_ACCOUNT_ID"])
             or re.fullmatch(
                 rf"inspace-rke2-cp/v3 owner={re.escape(owner)} slot={slot} spec=[0-9a-f]{{64}}",

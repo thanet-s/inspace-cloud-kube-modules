@@ -344,7 +344,7 @@
       changed_when: true
       when: e2e_cleanup_state.kubernetesOwnersPossible | default(false) | bool
 
-    - name: Destroy only bootstrap-controller-owned infrastructure asynchronously
+    - name: Destroy only bootstrap-controller-owned infrastructure synchronously
       ansible.builtin.command:
         argv:
           - inspace-cluster-controller
@@ -362,18 +362,8 @@
         INSPACE_ALLOW_REMOTE_MUTATIONS: "true"
         INSPACE_API_URL: "{{ lookup('env', 'INSPACE_API_URL') }}"
         INSPACE_API_TOKEN: "{{ lookup('env', 'INSPACE_API_TOKEN') }}"
-      async: 1800
-      poll: 0
-      register: e2e_destroy_job
-      no_log: true
-
-    - name: Wait robustly for bootstrap destroy convergence
-      ansible.builtin.async_status:
-        jid: "{{ e2e_destroy_job.ansible_job_id }}"
       register: e2e_destroy_wait
-      retries: 180
-      delay: 10
-      until: e2e_destroy_wait.finished
+      changed_when: true
       no_log: true
 
     - name: Require the controller to report complete destruction

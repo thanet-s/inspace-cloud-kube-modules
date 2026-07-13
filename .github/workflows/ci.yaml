@@ -262,6 +262,7 @@ jobs:
             python3 /opt/e2e/verify-static.py
             for script in /opt/e2e/scripts/*.sh; do bash -n "$script"; done
             ansible-inventory --inventory /opt/e2e/inventory.yml --list >/dev/null
-            ansible-playbook --inventory /opt/e2e/inventory.yml /opt/e2e/playbook.yml --syntax-check
-            ansible-playbook --inventory /opt/e2e/inventory.yml /opt/e2e/cleanup.yml --syntax-check
+            ansible-playbook --inventory /opt/e2e/inventory.yml /opt/e2e/init-cluster.yml --syntax-check
+            ansible-playbook --inventory /opt/e2e/inventory.yml /opt/e2e/test.yml --syntax-check
+            ansible-playbook --inventory /opt/e2e/inventory.yml /opt/e2e/destroy-cluster.yml --syntax-check
           '
