@@ -322,7 +322,7 @@ def main() -> None:
     require("interactive_arg=-it" in host and "[[ $phase == shell ]]" in host,
             "only the tunneled debug shell phase must request an interactive container")
 
-    for tool in ("kubectl", "helm", "jq", "openssh-client", "curl", "skopeo"):
+    for tool in ("kubectl", "helm", "jq", "openssh-client", "autossh", "curl", "skopeo"):
         require(tool in dockerfile, f"runner image is missing {tool}")
     require('ENTRYPOINT ["/usr/bin/tini", "-g", "--"' in dockerfile,
             "runner must use one process-group-aware Tini")
@@ -1068,6 +1068,31 @@ def main() -> None:
             "all control-plane and worker SSH must use private IPs through the bastion")
     require("127.0.0.1:16443:$virtual_ip:6443" in tunnel and "StrictHostKeyChecking=yes" in tunnel,
             "Kubernetes API must use the pinned bastion local forward")
+    require("setsid autossh -M 0" in tunnel and "AUTOSSH_GATETIME=0" in tunnel and
+            "ServerAliveInterval=5" in tunnel and "ServerAliveCountMax=3" in tunnel,
+            "Kubernetes API tunnel must automatically reconnect through a bounded autossh supervisor")
+    require("api-tunnel.pid" in tunnel and "supervisor_identity" in tunnel and
+            "read_process_metadata" in tunnel and "expected_start_time" in tunnel and
+            "read_process_comm" in tunnel and "process_comm == autossh" in tunnel and
+            "process_comm == ssh" in tunnel and
+            "mapfile -d '' -t arguments" in tunnel and "arguments[0]##*/" in tunnel and
+            "tunnel_ready" in tunnel and 'ss -H -ltnp "sport = :16443"' in tunnel and
+            "tunnel_healthy" in tunnel and tunnel.count('supervisor_identity "$pid" "$expected_start_time"') >= 3 and
+            "orphaned_tunnel_group_identity" in tunnel and "ssh_child_identity" in tunnel and
+            "tunnel_arguments" in tunnel and "expected_arguments" in tunnel and
+            "inspace-e2e-api-tunnel-instance" in tunnel and "record_token" in tunnel and
+            "launch_cleanup_on_exit" in tunnel and "cleanup_failed_launch" in tunnel and
+            "child_pid=$BASHPID" in tunnel and "child_group != \"$child_pid\"" in tunnel and
+            "snapshot_verified_tunnel_members" in tunnel and "signal_verified_members" in tunnel and
+            "containing an unverified live member" in tunnel and
+            "unverified API tunnel process group" in tunnel and
+            'kill "-$signal" "${pids[index]}"' in tunnel,
+            "API tunnel stop must validate and terminate the complete supervisor process group")
+    require('kill -TERM -- "-$pid"' not in tunnel and 'kill -KILL -- "-$pid"' not in tunnel,
+            "API tunnel termination must not escalate through a reusable numeric process-group ID")
+    require("openssl rand -hex 16" in entrypoint and
+            "inspace-e2e-api-tunnel-instance" in entrypoint,
+            "each phased runner container must have a unique API tunnel process identity")
     require("worker must not have an additional or foreign-named floating IPv4" in worker_discovery and
             "worker must be attached to exactly the intended managed cloud firewall" in worker_discovery and
             'require_nonvirtual_flag(address.get("is_virtual")' in worker_discovery and
