@@ -182,7 +182,7 @@ func (a *Adapter) CreateVM(ctx context.Context, request cloudapi.CreateVMRequest
 		if err := validateExisting(*existing, request, actual, record); err != nil {
 			return nil, err
 		}
-		return a.completeOwnedVM(ctx, request, *existing, actual, record, networkPrefix, false)
+		return a.completeOwnedVM(ctx, request, *existing, actual, record, networkPrefix, false, true)
 	}
 	description, err := json.Marshal(record)
 	if err != nil {
@@ -254,8 +254,11 @@ func (a *Adapter) CreateVM(ctx context.Context, request cloudapi.CreateVMRequest
 		return nil, fmt.Errorf("creating InSpace VM returned no valid UUID; protective recovery remains uncertain")
 	}
 	// A create response may be sparse and is not durable ownership authority.
-	// Use only its UUID, then require the subsequent VM detail read to contain
-	// the complete, exact ownership record before making protection mutations.
+	// Use only its UUID, immediately attach the prevalidated firewall, then
+	// require the subsequent VM detail read to contain the complete, exact v3
+	// ownership record before ownership-sensitive mutations. The detail endpoint
+	// may omit its redundant top-level network field; exact VPC membership is
+	// proved separately before any FIP mutation.
 	persisted, floatingIP, ownershipProven, err := a.ensureProtection(ctx, request, created.UUID, record, networkPrefix, nil, true)
 	if err != nil {
 		unsafeAddressCollision := errors.Is(err, errWorkerSupervisorVIPCollision) || errors.Is(err, errWorkerServiceVIPPoolCollision)
@@ -283,7 +286,7 @@ func (a *Adapter) recoverAmbiguousResponseUUID(ctx context.Context, request clou
 	if protectionErr != nil {
 		return nil, a.cleanupProvenAutoLaunch(ctx, request, vmUUID, nil, errors.Join(errEarlyFirewallProtection, protectionErr))
 	}
-	return a.completeOwnedVM(ctx, request, *persisted, expected, expected, networkPrefix, true)
+	return a.completeOwnedVM(ctx, request, *persisted, expected, expected, networkPrefix, true, false)
 }
 
 func (a *Adapter) rejectActiveFloatingIPNameCollision(ctx context.Context, location, expectedName string) error {
@@ -335,9 +338,12 @@ func (a *Adapter) findCreate(ctx context.Context, request cloudapi.CreateVMReque
 			return nil, err
 		}
 		if protectionErr != nil {
+			if authorityErr := a.ensureReadDiscoveredCleanupNetworkAuthority(ctx, request, vm.UUID); authorityErr != nil {
+				return nil, fmt.Errorf("ambiguous VM %s firewall recovery failed but destructive cleanup is not authorized: %w", vm.UUID, errors.Join(errEarlyFirewallProtection, protectionErr, authorityErr))
+			}
 			return nil, a.cleanupProvenAutoLaunch(ctx, request, vm.UUID, nil, errors.Join(errEarlyFirewallProtection, protectionErr))
 		}
-		return a.completeOwnedVM(ctx, request, *vm, actual, expected, networkPrefix, true)
+		return a.completeOwnedVM(ctx, request, *vm, actual, expected, networkPrefix, true, true)
 	}
 	vm, actual, err := a.findOwnedVM(ctx, request)
 	if err != nil || vm == nil {
@@ -346,16 +352,21 @@ func (a *Adapter) findCreate(ctx context.Context, request cloudapi.CreateVMReque
 	if err := validateExisting(*vm, request, actual, expected); err != nil {
 		return nil, err
 	}
-	return a.completeOwnedVM(ctx, request, *vm, actual, expected, networkPrefix, rollbackNewLaunch)
+	return a.completeOwnedVM(ctx, request, *vm, actual, expected, networkPrefix, rollbackNewLaunch, true)
 }
 
-func (a *Adapter) completeOwnedVM(ctx context.Context, request cloudapi.CreateVMRequest, vm sdk.VM, actual, expected ownership, networkPrefix netip.Prefix, rollbackNewLaunch bool) (*cloudapi.VM, error) {
+func (a *Adapter) completeOwnedVM(ctx context.Context, request cloudapi.CreateVMRequest, vm sdk.VM, actual, expected ownership, networkPrefix netip.Prefix, rollbackNewLaunch, readDiscovered bool) (*cloudapi.VM, error) {
 	persisted, floatingIP, ownershipProven, err := a.ensureProtection(ctx, request, vm.UUID, expected, networkPrefix, &vm, false)
 	if err != nil {
 		unsafeAddressCollision := actual.ControlPlaneVIP != "" &&
 			(errors.Is(err, errWorkerSupervisorVIPCollision) || errors.Is(err, errWorkerServiceVIPPoolCollision))
 		unprotectedAfterAssignment := errors.Is(err, errEarlyFirewallProtection) && errors.Is(err, errFirewallAssignmentNotVisible)
 		if ownershipProven && (rollbackNewLaunch || unprotectedAfterAssignment) && (unsafeAddressCollision || errors.Is(err, errEarlyFirewallProtection)) {
+			if readDiscovered && errors.Is(err, errEarlyFirewallProtection) {
+				if authorityErr := a.ensureReadDiscoveredCleanupNetworkAuthority(ctx, request, vm.UUID); authorityErr != nil {
+					return nil, fmt.Errorf("owned VM %s firewall recovery failed but destructive cleanup is not authorized: %w", vm.UUID, errors.Join(err, authorityErr))
+				}
+			}
 			return nil, a.cleanupProvenAutoLaunch(ctx, request, vm.UUID, floatingIP, err)
 		}
 		if ownershipProven && rollbackNewLaunch && exactNamedFloatingIP(floatingIP, expected) {
@@ -365,6 +376,31 @@ func (a *Adapter) completeOwnedVM(ctx context.Context, request cloudapi.CreateVM
 	}
 	actual.PublicIPv4 = floatingIP.Address
 	return fromSDK(persisted, request.Location, actual), nil
+}
+
+// ensureReadDiscoveredCleanupNetworkAuthority requires stronger authority than
+// either an omitted or echoed top-level NetworkUUID. Canonical v3 ownership
+// proves intent, but a read-discovered UUID is not destructive authority by
+// itself. Before an early-firewall failure may PATCH/delete its FIP or delete
+// the VM, the specifically configured VPC must contain that UUID exactly once.
+// A UUID returned directly by the current CreateVM POST does not use this guard
+// because that response is the invocation's launch anchor.
+func (a *Adapter) ensureReadDiscoveredCleanupNetworkAuthority(ctx context.Context, request cloudapi.CreateVMRequest, vmUUID string) error {
+	vip, err := validateControlPlaneVIP(request.ControlPlaneVIP)
+	if err != nil {
+		return err
+	}
+	privateLoadBalancerPool := inspacev1.PrivateLoadBalancerPool{
+		Start: request.PrivateLoadBalancerPoolStart,
+		Stop:  request.PrivateLoadBalancerPoolStop,
+	}
+	if err := privateLoadBalancerPool.ValidateForSupervisor(vip); err != nil {
+		return fmt.Errorf("private load-balancer pool: %w", err)
+	}
+	if _, err := a.ensureNetworkAttachment(context.WithoutCancel(ctx), request.Location, request.NetworkUUID, vmUUID, vip, privateLoadBalancerPool); err != nil {
+		return fmt.Errorf("read-discovered VM %s lacks exact membership in configured network %s: %w", vmUUID, request.NetworkUUID, err)
+	}
+	return nil
 }
 
 func exactNamedFloatingIP(floatingIP *sdk.FloatingIP, record ownership) bool {
@@ -1443,19 +1479,12 @@ func validatePersistedVM(vm sdk.VM, vmUUID string, request cloudapi.CreateVMRequ
 // validatePersistedLaunchIdentity returns incomplete=true only when every
 // value the API supplied agrees with the create request but at least one
 // required field is still absent. Any present conflict fails immediately.
+// NetworkUUID does not contribute to incomplete because InSpace's canonical
+// VM detail response does not always echo it. Any present value must match.
+// The complete v3 description still records the exact requested network, and
+// GetNetwork membership is required separately before a worker can be adopted,
+// returned, or have its FIP named.
 func validatePersistedLaunchIdentity(vm sdk.VM, request cloudapi.CreateVMRequest) (incomplete bool, err error) {
-	return validatePersistedLaunchIdentityWithNetworkPolicy(vm, request, false)
-}
-
-// validateEstablishedPersistedLaunchIdentity accepts an omitted NetworkUUID
-// because the detail endpoint may not echo it for an established VM. A
-// present value must still match exactly; authoritative attachment is proven
-// separately through GetNetwork membership during the protection audit.
-func validateEstablishedPersistedLaunchIdentity(vm sdk.VM, request cloudapi.CreateVMRequest) (incomplete bool, err error) {
-	return validatePersistedLaunchIdentityWithNetworkPolicy(vm, request, true)
-}
-
-func validatePersistedLaunchIdentityWithNetworkPolicy(vm sdk.VM, request cloudapi.CreateVMRequest, allowMissingNetwork bool) (incomplete bool, err error) {
 	checkString := func(field, actual, expected string) error {
 		if actual == "" {
 			incomplete = true
@@ -1491,9 +1520,6 @@ func validatePersistedLaunchIdentityWithNetworkPolicy(vm sdk.VM, request cloudap
 		func() error { return checkString("designated pool UUID", vm.DesignatedPoolUUID, request.HostPoolUUID) },
 		func() error {
 			if vm.NetworkUUID == "" {
-				if !allowMissingNetwork {
-					incomplete = true
-				}
 				return nil
 			}
 			if vm.NetworkUUID != request.NetworkUUID {
@@ -1632,7 +1658,7 @@ func validateEstablishedLaunchIdentity(vm sdk.VM, record ownership) error {
 		MemoryGiB:        normalized.MemoryGiB,
 		RootDiskGiB:      normalized.RootDiskGiB,
 	}
-	incomplete, err := validateEstablishedPersistedLaunchIdentity(vm, expected)
+	incomplete, err := validatePersistedLaunchIdentity(vm, expected)
 	if err != nil {
 		return fmt.Errorf("%w: established VM launch identity differs from persisted ownership: %v", cloudapi.ErrOwnershipMismatch, err)
 	}
@@ -1725,10 +1751,12 @@ func fromSDK(vm *sdk.VM, location string, record ownership) *cloudapi.VM {
 
 func (a *Adapter) ensureProtection(ctx context.Context, request cloudapi.CreateVMRequest, vmUUID string, expected ownership, prevalidatedNetworkPrefix netip.Prefix, canonicalHint *sdk.VM, freshLaunch bool) (*sdk.VM, *sdk.FloatingIP, bool, error) {
 	// reserve=true exposes the VM publicly as soon as CreateVM commits. Prove
-	// the exact persisted launch identity before touching a VM discovered by
-	// reads. A fresh POST is different: its returned UUID is this invocation's
-	// launch anchor, so attach/read back the firewall immediately and only then
-	// wait for canonical v3 ownership. No VPC or FIP mutation may precede it.
+	// the complete v3 ownership description and every top-level launch field
+	// supplied by the API before touching a VM discovered by reads. A fresh POST
+	// is different: its returned UUID is this invocation's launch anchor, so
+	// attach/read back the firewall immediately and only then wait for canonical
+	// ownership. The redundant top-level NetworkUUID may be absent, but exact
+	// GetNetwork membership must converge before any FIP mutation or return.
 	var persisted *sdk.VM
 	var err error
 	if freshLaunch {
@@ -1995,6 +2023,10 @@ func (a *Adapter) ensureWorkerNetworkIdentity(ctx context.Context, request cloud
 	if err := privateLoadBalancerPool.ValidateForSupervisor(vip); err != nil {
 		return nil, netip.Prefix{}, false, err
 	}
+	// Do not infer attachment from the VM detail: its top-level NetworkUUID is
+	// legitimately absent in the canonical API response. Require exactly one
+	// membership row from the specifically configured network before allowing
+	// FIP discovery/rename, adoption, or a successful return.
 	networkPrefix, err := a.ensureNetworkAttachment(ctx, request.Location, request.NetworkUUID, vmUUID, vip, privateLoadBalancerPool)
 	if err != nil {
 		return nil, netip.Prefix{}, false, err
@@ -2079,7 +2111,7 @@ func (a *Adapter) ensureNetworkAttachment(ctx context.Context, location, network
 				return networkPrefix, nil
 			}
 			if membershipCount > 1 {
-				return netip.Prefix{}, fmt.Errorf("worker network %s contains VM %s %d times", networkUUID, vmUUID, membershipCount)
+				return netip.Prefix{}, fmt.Errorf("%w: worker network %s contains VM %s %d times", cloudapi.ErrOwnershipMismatch, networkUUID, vmUUID, membershipCount)
 			}
 			lastObservation = fmt.Errorf("VM %s attachment to network %s is not visible yet", vmUUID, networkUUID)
 		}

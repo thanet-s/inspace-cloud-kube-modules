@@ -217,6 +217,35 @@ func TestAmbiguousRecoveredLaunchFirewallFailureDeletesVMWithInvisibleAutoFIP(t 
 	if len(api.vms) != 0 || api.deleteVMCalls != 1 || len(api.floatingIPs) != 1 || api.floatingIPs[0].AssignedTo != "" {
 		t.Fatalf("recovered launch left a public VM or guessed at its invisible FIP: VMs=%#v FIPs=%#v deletes=%d", api.vms, api.floatingIPs, api.deleteVMCalls)
 	}
+	if api.networkGetCalls < 2 {
+		t.Fatalf("ambiguous list cleanup did not require exact post-POST network membership: reads=%d", api.networkGetCalls)
+	}
+}
+
+func TestAmbiguousReadDiscoveredFirewallFailureWithoutNetworkMembershipDoesNotMutateFIPOrVM(t *testing.T) {
+	api := &fakeAPI{
+		createErr:            errors.New("connection reset after request"),
+		commitOnCreateError:  true,
+		assignFirewallErrors: []error{errors.New("firewall assignment rejected")},
+		network:              &sdk.Network{UUID: "network-1", Subnet: "10.0.0.0/24"},
+	}
+	adapter, _ := New(api)
+	configureFastNetworkReadback(adapter, 60*time.Millisecond)
+	adapter.launchFloatingIPCleanupTimeout = 60 * time.Millisecond
+	adapter.launchCleanupTimeout = 250 * time.Millisecond
+	_, err := adapter.CreateVM(context.Background(), testRequest())
+	if !errors.Is(err, errEarlyFirewallProtection) || !strings.Contains(err.Error(), "lacks exact membership in configured network") {
+		t.Fatalf("CreateVM() error = %v, want firewall failure plus missing cleanup authority", err)
+	}
+	if len(api.vms) != 1 || api.vms[0].NetworkUUID != "" || len(api.floatingIPs) != 1 || api.floatingIPs[0].AssignedTo != api.vms[0].UUID || api.floatingIPs[0].Name != "" {
+		t.Fatalf("ambiguous read-discovered resources changed without network authority: VMs=%#v FIPs=%#v", api.vms, api.floatingIPs)
+	}
+	if api.networkGetCalls < 2 || api.firewallAssignCalls != 1 || api.floatingIPUpdateCalls != 0 || api.deleteVMCalls != 0 ||
+		countOperation(api.operations, "unassign-floating-ip") != 0 || countOperation(api.operations, "delete-floating-ip") != 0 ||
+		!reflect.DeepEqual(api.operations, []string{"assign-firewall"}) {
+		t.Fatalf("missing ambiguous-list membership reached destructive mutation: networkReads=%d firewall=%d FIPPATCHes=%d VMdeletes=%d operations=%v",
+			api.networkGetCalls, api.firewallAssignCalls, api.floatingIPUpdateCalls, api.deleteVMCalls, api.operations)
+	}
 }
 
 func TestControllerRestartDeletesCanonicallyOwnedVMWhenFirewallCannotBeRestored(t *testing.T) {
@@ -227,12 +256,16 @@ func TestControllerRestartDeletesCanonicallyOwnedVMWhenFirewallCannotBeRestored(
 	if err != nil {
 		t.Fatal(err)
 	}
+	if len(api.vms) != 1 || api.vms[0].NetworkUUID != "" {
+		t.Fatalf("restart fixture must use canonical VM detail with omitted top-level network UUID: %#v", api.vms)
+	}
 	api.firewalls[0].ResourcesAssigned = nil
 	api.floatingIPs[0].Name = ""
 	api.assignFirewallErrors = []error{errors.New("firewall assignment rejected")}
 	api.hideFloatingIPsThroughCall = 10_000
 	api.operations = nil
 	api.firewallAssignCalls = 0
+	networkReadsBeforeRestart := api.networkGetCalls
 	adapter.launchFloatingIPCleanupTimeout = 60 * time.Millisecond
 	adapter.launchCleanupTimeout = 250 * time.Millisecond
 	configureFastNetworkReadback(adapter, 60*time.Millisecond)
@@ -245,6 +278,46 @@ func TestControllerRestartDeletesCanonicallyOwnedVMWhenFirewallCannotBeRestored(
 	}
 	if !reflect.DeepEqual(api.operations, []string{"assign-firewall", "delete-vm"}) {
 		t.Fatalf("restart security cleanup operations=%v", api.operations)
+	}
+	if api.networkGetCalls-networkReadsBeforeRestart < 2 {
+		t.Fatalf("restart cleanup did not require exact current network membership after preflight: read delta=%d", api.networkGetCalls-networkReadsBeforeRestart)
+	}
+}
+
+func TestControllerRestartFirewallFailureWithoutNetworkMembershipDoesNotMutateFIPOrVM(t *testing.T) {
+	api := &fakeAPI{}
+	adapter, _ := New(api)
+	request := testRequest()
+	if _, err := adapter.CreateVM(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	if len(api.vms) != 1 || api.vms[0].NetworkUUID != "" {
+		t.Fatalf("restart fixture must omit the canonical top-level network UUID: %#v", api.vms)
+	}
+	api.firewalls[0].ResourcesAssigned = nil
+	api.floatingIPs[0].Name = ""
+	api.network = &sdk.Network{UUID: request.NetworkUUID, Subnet: "10.0.0.0/24"}
+	api.assignFirewallErrors = []error{errors.New("firewall assignment rejected")}
+	api.operations = nil
+	api.firewallAssignCalls = 0
+	api.floatingIPUpdateCalls = 0
+	api.deleteVMCalls = 0
+	api.networkGetCalls = 0
+	configureFastNetworkReadback(adapter, 60*time.Millisecond)
+	adapter.launchFloatingIPCleanupTimeout = 60 * time.Millisecond
+	adapter.launchCleanupTimeout = 250 * time.Millisecond
+	_, err := adapter.CreateVM(context.Background(), request)
+	if !errors.Is(err, errEarlyFirewallProtection) || !strings.Contains(err.Error(), "lacks exact membership in configured network") {
+		t.Fatalf("restart CreateVM() error = %v, want firewall failure plus missing cleanup authority", err)
+	}
+	if len(api.vms) != 1 || len(api.floatingIPs) != 1 || api.floatingIPs[0].AssignedTo != api.vms[0].UUID || api.floatingIPs[0].Name != "" || firewallHasVM(api.firewalls[0], api.vms[0].UUID) {
+		t.Fatalf("restart resources changed without exact network membership: VMs=%#v FIPs=%#v firewall=%#v", api.vms, api.floatingIPs, api.firewalls)
+	}
+	if api.networkGetCalls < 2 || api.firewallAssignCalls != 1 || api.floatingIPUpdateCalls != 0 || api.deleteVMCalls != 0 ||
+		countOperation(api.operations, "unassign-floating-ip") != 0 || countOperation(api.operations, "delete-floating-ip") != 0 ||
+		!reflect.DeepEqual(api.operations, []string{"assign-firewall"}) {
+		t.Fatalf("missing restart membership reached destructive mutation: networkReads=%d firewall=%d FIPPATCHes=%d VMdeletes=%d operations=%v",
+			api.networkGetCalls, api.firewallAssignCalls, api.floatingIPUpdateCalls, api.deleteVMCalls, api.operations)
 	}
 }
 
@@ -703,19 +776,42 @@ func TestCreateWaitsForIncompletePersistedLaunchIdentity(t *testing.T) {
 	}
 }
 
-func TestCreateBoundsIncompletePersistedLaunchIdentity(t *testing.T) {
+func TestCreateAllowsOmittedPersistedNetworkUUIDAfterExactMembership(t *testing.T) {
 	api := &fakeAPI{mutateGetVMResponse: func(vm *sdk.VM) { vm.NetworkUUID = "" }}
+	adapter, _ := New(api)
+	request := testRequest()
+	created, err := adapter.CreateVM(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created.UUID == "" || created.NetworkUUID != request.NetworkUUID || api.vmGetCalls != 1 {
+		t.Fatalf("CreateVM() result=%#v GETs=%d, want one canonical detail read with network from exact v3 ownership", created, api.vmGetCalls)
+	}
+	record, managed, complete, inspectErr := inspectOwnershipDescription(api.vms[0].Description, request.ClusterName)
+	if inspectErr != nil || !managed || !complete || record.Schema != ownershipSchema || record.NetworkUUID != request.NetworkUUID {
+		t.Fatalf("fresh VM lacks complete exact v3 ownership: record=%#v managed=%t complete=%t err=%v", record, managed, complete, inspectErr)
+	}
+	if api.networkGetCalls != 2 || api.networkGetCallsAtFirstFIPUpdate != 2 {
+		t.Fatalf("FIP PATCH ordering used network reads=%d at PATCH=%d, want preflight plus exact post-create membership before PATCH", api.networkGetCalls, api.networkGetCallsAtFirstFIPUpdate)
+	}
+	if api.createCalls != 1 || api.deleteVMCalls != 0 || api.firewallAssignCalls != 1 || api.floatingIPUpdateCalls != 1 || !reflect.DeepEqual(api.operations, []string{"assign-firewall", "update-floating-ip"}) {
+		t.Fatalf("omitted top-level network changed protected create lifecycle: POSTs=%d deletes=%d firewall=%d FIPPATCHes=%d operations=%v", api.createCalls, api.deleteVMCalls, api.firewallAssignCalls, api.floatingIPUpdateCalls, api.operations)
+	}
+}
+
+func TestCreateBoundsMissingRequiredPersistedLaunchIdentity(t *testing.T) {
+	api := &fakeAPI{mutateGetVMResponse: func(vm *sdk.VM) { vm.DesignatedPoolUUID = "" }}
 	adapter, _ := New(api)
 	configureFastNetworkReadback(adapter, boundedReadbackTestTimeout)
 	_, err := adapter.CreateVM(context.Background(), testRequest())
 	if !errors.Is(err, cloudapi.ErrOwnershipMismatch) || !errors.Is(err, errPersistedOwnershipIncomplete) || !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("CreateVM() error = %v, want bounded incomplete launch identity failure", err)
+		t.Fatalf("CreateVM() error = %v, want bounded missing required launch identity failure", err)
 	}
 	if api.vmGetCalls < 2 || api.deleteVMCalls != 1 || len(api.vms) != 0 || len(api.floatingIPs) != 0 {
-		t.Fatalf("bounded fresh launch identity failure was not rolled back: GETs=%d deletes=%d VMs=%#v FIPs=%#v", api.vmGetCalls, api.deleteVMCalls, api.vms, api.floatingIPs)
+		t.Fatalf("bounded required launch identity failure was not rolled back: GETs=%d deletes=%d VMs=%#v FIPs=%#v", api.vmGetCalls, api.deleteVMCalls, api.vms, api.floatingIPs)
 	}
-	if api.firewallAssignCalls != 1 || api.floatingIPAssignCalls != 0 || !slicesContain(api.operations, "unassign-firewall") {
-		t.Fatalf("incomplete launch identity was not protected before rollback: firewall=%d floatingIP=%d operations=%v", api.firewallAssignCalls, api.floatingIPAssignCalls, api.operations)
+	if api.networkGetCalls != 1 || api.firewallAssignCalls != 1 || api.floatingIPAssignCalls != 0 || !slicesContain(api.operations, "unassign-firewall") {
+		t.Fatalf("missing required launch identity reached VPC proof or skipped protected rollback: networkReads=%d firewall=%d floatingIP=%d operations=%v", api.networkGetCalls, api.firewallAssignCalls, api.floatingIPAssignCalls, api.operations)
 	}
 }
 
@@ -1546,28 +1642,49 @@ func TestCreateRejectsMalformedNetworkMembershipReadback(t *testing.T) {
 			if err == nil {
 				t.Fatal("expected malformed network read-back rejection")
 			}
-			if api.createCalls != 1 || len(api.vms) != 1 || len(api.floatingIPs) != 1 || api.floatingIPs[0].AssignedTo != api.vms[0].UUID {
+			if name == "duplicate membership" && (!errors.Is(err, cloudapi.ErrOwnershipMismatch) || api.networkGetCalls != 2 || errors.Is(err, context.DeadlineExceeded)) {
+				t.Fatalf("duplicate membership error=%v reads=%d, want immediate hard ownership failure on the post-create read", err, api.networkGetCalls)
+			}
+			if api.createCalls != 1 || api.deleteVMCalls != 0 || len(api.vms) != 1 || len(api.floatingIPs) != 1 || api.floatingIPs[0].AssignedTo != api.vms[0].UUID {
 				t.Fatalf("malformed read-back failed to preserve the unproven launch: POSTs=%d VMs=%#v FIPs=%#v", api.createCalls, api.vms, api.floatingIPs)
 			}
-			if api.firewallAssignCalls != 1 || api.floatingIPAssignCalls != 0 || !firewallHasVM(api.firewalls[0], api.vms[0].UUID) {
-				t.Fatalf("malformed VPC proof did not preserve early firewall protection: firewall=%d floatingIP=%d", api.firewallAssignCalls, api.floatingIPAssignCalls)
+			if api.firewallAssignCalls != 1 || api.floatingIPAssignCalls != 0 || api.floatingIPUpdateCalls != 0 || !reflect.DeepEqual(api.operations, []string{"assign-firewall"}) || !firewallHasVM(api.firewalls[0], api.vms[0].UUID) {
+				t.Fatalf("malformed VPC proof did not preserve early firewall protection without FIP mutation: firewall=%d floatingIP=%d FIPPATCHes=%d operations=%v", api.firewallAssignCalls, api.floatingIPAssignCalls, api.floatingIPUpdateCalls, api.operations)
 			}
 		})
 	}
 }
 
-func TestCreatePreservesVMWhenNetworkAttachmentNeverAppears(t *testing.T) {
-	api := &fakeAPI{network: &sdk.Network{UUID: "network-1", Subnet: "10.0.0.0/24"}}
+func TestCreateMissingNetworkMembershipPreservesProtectedLaunchForRestartAdoption(t *testing.T) {
+	api := &fakeAPI{
+		network:             &sdk.Network{UUID: "network-1", Subnet: "10.0.0.0/24"},
+		mutateGetVMResponse: func(vm *sdk.VM) { vm.NetworkUUID = "" },
+	}
 	adapter, _ := New(api)
 	configureFastNetworkReadback(adapter, 60*time.Millisecond)
-	if _, err := adapter.CreateVM(context.Background(), testRequest()); err == nil || !strings.Contains(err.Error(), "attachment to network") {
+	request := testRequest()
+	if _, err := adapter.CreateVM(context.Background(), request); err == nil || !strings.Contains(err.Error(), "attachment to network") || !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("CreateVM() error = %v, want missing network attachment", err)
 	}
 	if api.createCalls != 1 || len(api.vms) != 1 || len(api.floatingIPs) != 1 || api.floatingIPs[0].AssignedTo != api.vms[0].UUID || api.deleteVMCalls != 0 {
 		t.Fatalf("failed network attachment did not preserve the unproven launch: POSTs=%d VMs=%#v FIPs=%#v deletes=%d", api.createCalls, api.vms, api.floatingIPs, api.deleteVMCalls)
 	}
-	if api.firewallAssignCalls != 1 || api.floatingIPAssignCalls != 0 || !firewallHasVM(api.firewalls[0], api.vms[0].UUID) {
-		t.Fatalf("missing VPC attachment did not retain early firewall protection: firewall=%d floatingIP=%d", api.firewallAssignCalls, api.floatingIPAssignCalls)
+	if api.firewallAssignCalls != 1 || api.floatingIPAssignCalls != 0 || api.floatingIPUpdateCalls != 0 || !reflect.DeepEqual(api.operations, []string{"assign-firewall"}) || !firewallHasVM(api.firewalls[0], api.vms[0].UUID) {
+		t.Fatalf("missing VPC attachment did not retain firewall protection without FIP mutation: firewall=%d floatingIP=%d FIPPATCHes=%d operations=%v", api.firewallAssignCalls, api.floatingIPAssignCalls, api.floatingIPUpdateCalls, api.operations)
+	}
+	if _, err := adapter.CreateVM(context.Background(), request); err == nil || !strings.Contains(err.Error(), "attachment to network") {
+		t.Fatalf("restart CreateVM() error = %v, want bounded missing network attachment", err)
+	}
+	if api.createCalls != 1 || api.deleteVMCalls != 0 || api.firewallAssignCalls != 1 || api.floatingIPUpdateCalls != 0 || !reflect.DeepEqual(api.operations, []string{"assign-firewall"}) {
+		t.Fatalf("restart duplicated or mutated the unproven launch: POSTs=%d deletes=%d firewall=%d FIPPATCHes=%d operations=%v", api.createCalls, api.deleteVMCalls, api.firewallAssignCalls, api.floatingIPUpdateCalls, api.operations)
+	}
+	api.network.VMUUIDs = []string{api.vms[0].UUID}
+	adopted, err := adapter.CreateVM(context.Background(), request)
+	if err != nil {
+		t.Fatalf("restart did not adopt launch after exact membership appeared: %v", err)
+	}
+	if adopted.UUID != api.vms[0].UUID || adopted.NetworkUUID != request.NetworkUUID || api.createCalls != 1 || api.deleteVMCalls != 0 || api.firewallAssignCalls != 1 || api.floatingIPUpdateCalls != 1 || !reflect.DeepEqual(api.operations, []string{"assign-firewall", "update-floating-ip"}) {
+		t.Fatalf("restart adoption lifecycle=%#v POSTs=%d deletes=%d firewall=%d FIPPATCHes=%d operations=%v", adopted, api.createCalls, api.deleteVMCalls, api.firewallAssignCalls, api.floatingIPUpdateCalls, api.operations)
 	}
 }
 
@@ -1676,8 +1793,11 @@ func TestCreateRejectsNonEmptyMismatchedVMNetwork(t *testing.T) {
 	api := &fakeAPI{createdNetworkUUID: "other-network"}
 	adapter, _ := New(api)
 	configureFastNetworkReadback(adapter, boundedReadbackTestTimeout)
-	if _, err := adapter.CreateVM(context.Background(), testRequest()); err == nil || !strings.Contains(err.Error(), "instead of") {
+	if _, err := adapter.CreateVM(context.Background(), testRequest()); !errors.Is(err, cloudapi.ErrOwnershipMismatch) || !strings.Contains(err.Error(), "instead of") {
 		t.Fatalf("CreateVM() error = %v, want wrong-network rejection", err)
+	}
+	if api.networkGetCalls != 1 {
+		t.Fatalf("present VM network mismatch reached attachment read-back: reads=%d, want preflight only", api.networkGetCalls)
 	}
 	if len(api.vms) != 0 || len(api.floatingIPs) != 0 || api.deleteVMCalls != 1 {
 		t.Fatalf("wrong-network fresh response was not rolled back: VMs=%#v FIPs=%#v deletes=%d", api.vms, api.floatingIPs, api.deleteVMCalls)
@@ -4069,6 +4189,7 @@ type fakeAPI struct {
 	updateFloatingIPErrors          []error
 	updateFloatingIPCommitOnError   bool
 	updateFloatingIPKeepCount       int
+	networkGetCallsAtFirstFIPUpdate int
 	createFloatingIPHook            func(*sdk.FloatingIP)
 	autoFloatingIPHook              func(*sdk.FloatingIP)
 	floatingIPAssignCalls           int
@@ -4212,6 +4333,9 @@ func (f *fakeAPI) CreateFloatingIP(_ context.Context, _ string, request sdk.Crea
 }
 func (f *fakeAPI) UpdateFloatingIP(_ context.Context, _ string, address string, request sdk.UpdateFloatingIPRequest) (*sdk.FloatingIP, error) {
 	f.floatingIPUpdateCalls++
+	if f.floatingIPUpdateCalls == 1 {
+		f.networkGetCallsAtFirstFIPUpdate = f.networkGetCalls
+	}
 	f.operations = append(f.operations, "update-floating-ip")
 	var injectedErr error
 	if len(f.updateFloatingIPErrors) != 0 {
@@ -4372,7 +4496,9 @@ func (f *fakeAPI) CreateVM(_ context.Context, _ string, request sdk.CreateVMRequ
 	vm := sdk.VM{
 		UUID: "11111111-1111-4111-8111-111111111111", Name: request.Name, Description: request.Description,
 		Status: "provisioning", VCPU: request.VCPU, MemoryMiB: request.MemoryMiB, OSName: request.OSName,
-		OSVersion: request.OSVersion, DesignatedPoolUUID: request.DesignatedPoolUUID, NetworkUUID: request.NetworkUUID,
+		// The canonical InSpace VM response omits network_uuid. Tests that need
+		// a present response value opt in through createdNetworkUUID below.
+		OSVersion: request.OSVersion, DesignatedPoolUUID: request.DesignatedPoolUUID,
 		BillingAccountID: request.BillingAccountID,
 		Storage:          []sdk.VMStorage{{SizeGiB: request.DiskGiB, Primary: true}},
 	}
