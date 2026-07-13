@@ -339,6 +339,7 @@
         ansible_ssh_common_args: "-F {{ e2e_ssh_config }}"
         e2e_public_ip: "{{ e2e_state.bastionPublicIPv4 }}"
         e2e_private_ip: "{{ e2e_state.bastionPrivateIPv4 }}"
+        e2e_node_name: "{{ e2e_state.bastionName }}"
 
     - name: Add exactly three dynamic RKE2 control-plane hosts
       ansible.builtin.add_host:
@@ -412,6 +413,9 @@
     - name: Prove the bastion private address Ubuntu version and cloud-firewall-only state
       ansible.builtin.shell: |
         set -euo pipefail
+        test "$(hostname)" = "{{ e2e_node_name }}"
+        test "$(hostnamectl --static)" = "{{ e2e_node_name }}"
+        test "$(tr -d '\n' </etc/hostname)" = "{{ e2e_node_name }}"
         ip -4 -o addr show scope global | grep -F -- "{{ e2e_private_ip }}/"
         ! ip -4 -o addr show scope global | grep -F -- "{{ e2e_public_ip }}/"
         if command -v ufw >/dev/null 2>&1; then
@@ -1328,7 +1332,8 @@
         jq -e --arg nodeName "$node_name" '.status.nodeName == $nodeName' <<<"$nodeclaim"
         jq -cn --argjson node "$node" --argjson nodeclaim "$nodeclaim" '
           {name:$node.metadata.name,nodeClaimName:$nodeclaim.metadata.name,providerID:$node.spec.providerID,
-           internalIPs:[$node.status.addresses[]|select(.type=="InternalIP")|.address]}'
+           internalIPs:[$node.status.addresses[]|select(.type=="InternalIP")|.address],
+           externalIPs:[$node.status.addresses[]|select(.type=="ExternalIP")|.address]}'
       args:
         executable: /bin/bash
       register: e2e_worker_node_command

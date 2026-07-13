@@ -91,6 +91,44 @@ func TestDeleteMalformedProviderIDDoesNotReleaseFinalizer(t *testing.T) {
 	}
 }
 
+func TestDeleteThreadsDurableFloatingIPIdentityFromNodeClaimAnnotations(t *testing.T) {
+	nodeClass := providerNodeClass()
+	cloud := &recordingDeleteCloud{Cloud: cloudfake.New()}
+	provider, err := New(cloud, NewStaticResolver(nodeClass), providerOptions(nodeClass))
+	if err != nil {
+		t.Fatal(err)
+	}
+	vm, err := cloud.CreateVM(context.Background(), cloudapi.CreateVMRequest{
+		IdempotencyKey: "delete-identity", Name: "cluster-karp-general-abc", ClusterName: nodeClass.Spec.ClusterName,
+		NodeClaimName: "general-abc", Location: nodeClass.Spec.Location, BillingAccountID: 42,
+		OSName: "ubuntu", OSVersion: "24.04", InstanceType: "is-general-2c-4g", VCPU: 2, MemoryGiB: 4,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim := nodeClaimFromVM(vm)
+	if claim.Annotations[AnnotationBillingAccount] != "42" {
+		t.Fatalf("NodeClaim billing annotation = %q, want 42", claim.Annotations[AnnotationBillingAccount])
+	}
+	if err := provider.Delete(context.Background(), claim); err != nil {
+		t.Fatal(err)
+	}
+	want := cloudapi.DeleteVMIdentity{FloatingIPName: vm.FloatingIPName, PublicIPv4: vm.PublicIPv4, BillingAccountID: 42}
+	if cloud.lastDeleteIdentity != want {
+		t.Fatalf("DeleteVM identity = %#v, want %#v", cloud.lastDeleteIdentity, want)
+	}
+}
+
+type recordingDeleteCloud struct {
+	*cloudfake.Cloud
+	lastDeleteIdentity cloudapi.DeleteVMIdentity
+}
+
+func (c *recordingDeleteCloud) DeleteVM(ctx context.Context, location, uuid, clusterName, nodeClaimName string, identity cloudapi.DeleteVMIdentity) error {
+	c.lastDeleteIdentity = identity
+	return c.Cloud.DeleteVM(ctx, location, uuid, clusterName, nodeClaimName, identity)
+}
+
 func TestGetInstanceTypesUsesNodeClassHostPool(t *testing.T) {
 	ctx := context.Background()
 	nodeClass := providerNodeClass()

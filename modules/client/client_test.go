@@ -139,6 +139,34 @@ func TestMutationGuardBlocksBeforeTransport(t *testing.T) {
 	}
 }
 
+func TestUpdateFloatingIPValidatesRequestBeforeTransport(t *testing.T) {
+	client, err := inspace.NewClient(inspace.Options{
+		BaseURL:                   "https://api.example.invalid",
+		APIKey:                    "test-key",
+		HTTPClient:                &http.Client{Transport: &panicTransport{}},
+		DangerouslyAllowMutations: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name    string
+		address string
+		request inspace.UpdateFloatingIPRequest
+	}{
+		{name: "private address", address: "10.0.0.10", request: inspace.UpdateFloatingIPRequest{Name: "owned-ip", BillingAccountID: 42}},
+		{name: "missing name", address: "203.0.113.10", request: inspace.UpdateFloatingIPRequest{BillingAccountID: 42}},
+		{name: "missing billing account", address: "203.0.113.10", request: inspace.UpdateFloatingIPRequest{Name: "owned-ip"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := client.UpdateFloatingIP(context.Background(), "bkk01", test.address, test.request); err == nil {
+				t.Fatal("UpdateFloatingIP accepted invalid input")
+			}
+		})
+	}
+}
+
 func TestReadRequestsHaveBoundedContext(t *testing.T) {
 	var observedRemaining time.Duration
 	transport := roundTripFunc(func(req *http.Request) (*http.Response, error) {

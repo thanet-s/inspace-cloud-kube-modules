@@ -92,6 +92,16 @@ type VM struct {
 	RawState                     string
 }
 
+// DeleteVMIdentity is the NodeClaim-persisted identity of the worker's
+// provider-owned floating IP. It is required to clean an orphan after the VM
+// has already disappeared, because a deterministic name alone is not durable
+// authority to mutate an account resource.
+type DeleteVMIdentity struct {
+	FloatingIPName   string
+	PublicIPv4       string
+	BillingAccountID int64
+}
+
 func (v *VM) ImageID() string { return v.OSName + "@" + v.OSVersion }
 
 // Cloud is the complete location-aware cloud boundary used by the provider.
@@ -99,7 +109,7 @@ func (v *VM) ImageID() string { return v.OSName + "@" + v.OSVersion }
 // VMs that merely happen to share a name.
 type Cloud interface {
 	CreateVM(context.Context, CreateVMRequest) (*VM, error)
-	DeleteVM(ctx context.Context, location, uuid, clusterName, nodeClaimName string) error
+	DeleteVM(ctx context.Context, location, uuid, clusterName, nodeClaimName string, identity DeleteVMIdentity) error
 	GetVM(ctx context.Context, location, uuid, clusterName string) (*VM, error)
 	ListVMs(ctx context.Context, location, clusterName string) ([]*VM, error)
 }

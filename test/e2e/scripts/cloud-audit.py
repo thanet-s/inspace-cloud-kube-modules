@@ -73,6 +73,10 @@ def main() -> None:
     }
     if not control_plane_names:
         control_plane_names = {f"{args.cluster}-cp{slot}" for slot in range(3)}
+    bastion_vm_names = {
+        f"{args.cluster}-bastion",
+        f"rke2-{args.owner}-bastion",
+    }
     worker_vm_names = {
         str(item.get("name")) for item in state.get("workerVMs", [])
         if isinstance(item, dict) and item.get("name")
@@ -88,6 +92,7 @@ def main() -> None:
         {"uuid": vm.get("uuid"), "name": vm.get("name")}
         for vm in active_resources("user-resource/vm/list")
         if vm.get("name") in control_plane_names
+        or vm.get("name") in bastion_vm_names
         or vm.get("name") in worker_vm_names
         or str(vm.get("name", "")).startswith(control_prefixes)
         or str(vm.get("name", "")).startswith(worker_vm_prefix)

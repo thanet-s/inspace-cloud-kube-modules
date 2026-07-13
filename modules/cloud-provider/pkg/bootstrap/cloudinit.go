@@ -67,9 +67,11 @@ func RenderCloudInitJSON(input CloudInitInput) (string, error) {
 	if !nodeNamePattern.MatchString(input.NodeName) {
 		return "", errors.New("bootstrap: node name must be a lowercase DNS label of at most 63 characters")
 	}
-	externalAddress, err := netip.ParseAddr(input.NodeExternalIPv4)
-	if err != nil || !externalAddress.Is4() || !externalAddress.IsGlobalUnicast() || externalAddress.IsPrivate() {
-		return "", errors.New("bootstrap: node external IP must be the allocated public IPv4")
+	if input.NodeExternalIPv4 != "" {
+		externalAddress, err := netip.ParseAddr(input.NodeExternalIPv4)
+		if err != nil || !externalAddress.Is4() || !externalAddress.IsGlobalUnicast() || externalAddress.IsPrivate() {
+			return "", errors.New("bootstrap: node external IP must be empty or an allocated public IPv4")
+		}
 	}
 	if !rke2VersionPattern.MatchString(input.RKE2Version) {
 		return "", errors.New("bootstrap: RKE2 version must be an exact vX.Y.Z+rke2rN release")
@@ -135,11 +137,17 @@ func RenderCloudInitJSON(input CloudInitInput) (string, error) {
 	return string(data), nil
 }
 
-// RenderBastionCloudInitJSON disables any image-provided host firewall. All
-// packet policy is enforced by the separately owned InSpace bastion firewall.
-func RenderBastionCloudInitJSON() (string, error) {
+// RenderBastionCloudInitJSON sets the deterministic guest hostname and
+// disables any image-provided host firewall. All packet policy is enforced by
+// the separately owned InSpace bastion firewall.
+func RenderBastionCloudInitJSON(nodeName string) (string, error) {
+	if !nodeNamePattern.MatchString(nodeName) {
+		return "", errors.New("bootstrap: bastion node name must be a lowercase DNS label of at most 63 characters")
+	}
 	payload := struct {
-		WriteFiles []struct {
+		Hostname         string `json:"hostname"`
+		PreserveHostname bool   `json:"preserve_hostname"`
+		WriteFiles       []struct {
 			Path        string `json:"path"`
 			Content     string `json:"content"`
 			Permissions string `json:"permissions"`
@@ -148,6 +156,7 @@ func RenderBastionCloudInitJSON() (string, error) {
 		} `json:"write_files"`
 		RunCmd []string `json:"runcmd"`
 	}{
+		Hostname: nodeName, PreserveHostname: false,
 		WriteFiles: []struct {
 			Path        string `json:"path"`
 			Content     string `json:"content"`
@@ -172,7 +181,6 @@ func renderRKE2Config(input CloudInitInput) string {
 		"token: " + yamlString(input.RKE2Token),
 		"node-name: " + yamlString(input.NodeName),
 		"node-ip: __PRIVATE_IP__",
-		"node-external-ip: " + yamlString(input.NodeExternalIPv4),
 		"advertise-address: __PRIVATE_IP__",
 		"cluster-cidr: " + yamlString(input.PodCIDR),
 		"service-cidr: " + yamlString(input.ServiceCIDR),
@@ -184,6 +192,9 @@ func renderRKE2Config(input CloudInitInput) string {
 		"  - node-role.kubernetes.io/control-plane=true:NoSchedule",
 		"kubelet-arg:",
 		"  - cloud-provider=external",
+	}
+	if input.NodeExternalIPv4 != "" {
+		lines = append(lines, "node-external-ip: "+yamlString(input.NodeExternalIPv4))
 	}
 	if !input.Initialize {
 		lines = append(lines, "server: "+yamlString("https://"+input.ServerAddress+":9345"))

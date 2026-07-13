@@ -37,13 +37,26 @@ private VIP with that VIP as the TLS server name. The private registration VIP
 is used by the `inspace-rke2-agent-token` Secret and worker bootstrap. Because
 InSpace has no NAT service, all three control planes, the worker, and bastion
 still receive one FIP for egress, but node FIPs are never used as management
-endpoints. The worker proof binds Node/NodeClaim/provider ID to one exact VM,
+endpoints. VM creation uses `reserve=true`: InSpace creates one initially
+nameless FIP already assigned to the VM while the VM detail's `public_ipv4`
+remains empty. Each reconciler discovers that sole assignment by VM UUID,
+PATCHes the deterministic owner name and billing account, and requires exact
+authoritative readback before continuing. Karpenter persists ownership schema
+`karpenter.inspace.cloud/v3` with the deterministic FIP name but no copied
+`publicIPv4`; the FIP record is the address authority, and CCM must publish that
+same address as the worker Node's sole `ExternalIP`. The worker proof binds
+Node/NodeClaim/provider ID to one exact VM,
 authoritative VPC membership, private subnet containment, the configured AMD
 EPYC host pool, and its exact FIP. Control planes and the bastion stay on the
 configured Intel Scalable pool, while the Karpenter NodeClass deliberately
 exercises `amd-epyc` worker provisioning.
 The three control-plane cloud names, guest hostnames, and Kubernetes Node names
 are live-proven as `<clusterResourceName>-cp0`, `-cp1`, and `-cp2`.
+The bastion cloud name and guest hostname are live-proven as
+`<clusterResourceName>-bastion`; the owner-derived `rke2-<owner>-bastion-ip`
+floating IP and `rke2-<owner>-bastion` firewall remain separate ownership
+identities. Cluster resource names are limited to 55 characters so the
+longest fixed `-bastion` hostname remains a DNS label.
 The worker cloud name, API hostname when returned, guest hostname, and
 Kubernetes Node name are live-proven as
 `<clusterResourceName>-karp-general-<Karpenter random suffix>` while its
@@ -102,7 +115,9 @@ removal is ordered:
    `CiliumLoadBalancerIPPool/inspace-private` must report zero used IPs;
 4. NodePool, NodeClaims, worker Nodes, then NodeClass;
 5. CSI/CCM/Karpenter-owned disks, workers, floating IPs, and service NLB must
-   be absent before controller charts are removed;
+   be absent before controller charts are removed; Karpenter deletes its named
+   FIP before deleting the worker VM because VM deletion only leaves that FIP
+   active and unassigned;
 6. bootstrap-owned control-plane VMs/FIPs, bastion/FIP, and both managed cloud
    firewalls; and
 7. a deterministic final cloud audit must report exactly zero owned resources.

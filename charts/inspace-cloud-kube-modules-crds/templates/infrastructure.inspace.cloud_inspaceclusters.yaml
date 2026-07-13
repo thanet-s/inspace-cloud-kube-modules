@@ -30,8 +30,8 @@ spec:
           type: object
           required: [apiVersion, kind, metadata, spec]
           x-kubernetes-validations:
-            - rule: 'self.metadata.name.matches("^[a-z0-9](?:[a-z0-9-]{0,57}[a-z0-9])?$") || (oldSelf.hasValue() && self.metadata.name == oldSelf.value().metadata.name)'
-              message: metadata.name must be a lowercase DNS label of at most 59 characters so fixed control-plane hostnames fit within 63 characters
+            - rule: 'self.metadata.name.matches("^[a-z0-9](?:[a-z0-9-]{0,53}[a-z0-9])?$") || (oldSelf.hasValue() && self.metadata.name == oldSelf.value().metadata.name)'
+              message: metadata.name must be a lowercase DNS label of at most 55 characters so fixed bastion and control-plane hostnames fit within 63 characters
               optionalOldSelf: true
           properties:
             apiVersion:

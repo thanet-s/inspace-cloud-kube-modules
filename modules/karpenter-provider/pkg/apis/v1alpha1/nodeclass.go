@@ -59,9 +59,11 @@ type InSpaceNodeClassSpec struct {
 	// Cilium LB IPAM Services. It contains 16 to 256 addresses; worker NICs are
 	// forbidden from this range.
 	PrivateLoadBalancerPool PrivateLoadBalancerPool `json:"privateLoadBalancerPool"`
-	// ReservePublicIPv4 makes the provider own a separately named floating IPv4
-	// because InSpace has no managed NAT gateway. The VM create call itself
-	// reserves no implicit IP. The address is for egress only; RKE2 uses RFC1918.
+	// ReservePublicIPv4 makes VM creation reserve exactly one implicit floating
+	// IPv4 because InSpace has no managed NAT gateway. The provider discovers
+	// that exact VM assignment, PATCHes its deterministic name/account, and
+	// requires readback before success. The address is for egress only; RKE2
+	// uses RFC1918 and the external CCM publishes the Node ExternalIP.
 	ReservePublicIPv4 bool `json:"reservePublicIPv4"`
 	// FirewallUUID is a pre-created default-deny InSpace firewall assigned to
 	// every worker before the provider reports a successful launch. Readiness

@@ -44,6 +44,28 @@ func (c *Client) CreateFloatingIP(ctx context.Context, location string, input Cr
 	return &result, err
 }
 
+// UpdateFloatingIP changes the stable display name and billing-account
+// metadata for an existing address. InSpace auto-created VM addresses initially
+// have no useful name, so controllers use this PATCH before adopting them.
+func (c *Client) UpdateFloatingIP(ctx context.Context, location, address string, input UpdateFloatingIPRequest) (*FloatingIP, error) {
+	if err := validatePublicIPv4(address); err != nil {
+		return nil, err
+	}
+	if input.Name == "" {
+		return nil, errors.New("inspace: floating IP name is required")
+	}
+	if input.BillingAccountID < 1 {
+		return nil, errors.New("inspace: floating IP billing account ID is required")
+	}
+	path, err := c.locationPath(location, "network/ip_addresses/"+address)
+	if err != nil {
+		return nil, err
+	}
+	var result FloatingIP
+	err = c.doJSON(ctx, http.MethodPatch, path, nil, input, &result)
+	return &result, err
+}
+
 func (c *Client) AssignFloatingIP(ctx context.Context, location, address, resourceUUID, resourceType string) (*FloatingIP, error) {
 	if err := validatePublicIPv4(address); err != nil {
 		return nil, err

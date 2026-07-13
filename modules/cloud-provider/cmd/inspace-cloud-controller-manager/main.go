@@ -60,7 +60,7 @@ func initializeCloud(config *cloudconfig.CompletedConfig) cloud.Interface {
 	if err != nil {
 		klog.Fatalf("parse INSPACE_ALLOW_REMOTE_MUTATIONS: %v", err)
 	}
-	billingID, err := parseOptionalInt64("INSPACE_BILLING_ACCOUNT_ID")
+	billingID, err := parseRequiredPositiveInt64("INSPACE_BILLING_ACCOUNT_ID")
 	if err != nil {
 		klog.Fatal(err)
 	}
@@ -90,10 +90,10 @@ func initializeCloud(config *cloudconfig.CompletedConfig) cloud.Interface {
 	return provider
 }
 
-func parseOptionalInt64(name string) (int64, error) {
+func parseRequiredPositiveInt64(name string) (int64, error) {
 	value := strings.TrimSpace(os.Getenv(name))
 	if value == "" {
-		return 0, nil
+		return 0, fmt.Errorf("%s is required and must be a positive integer", name)
 	}
 	parsed, err := strconv.ParseInt(value, 10, 64)
 	if err != nil || parsed < 1 {

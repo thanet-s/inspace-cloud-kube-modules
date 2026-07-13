@@ -22,10 +22,10 @@ const (
 )
 
 var (
-	locationPattern        = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
-	controlPlaneNamePrefix = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,57}[a-z0-9])?$`)
-	uuidPattern            = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
-	rke2VersionPattern     = regexp.MustCompile(`^v[0-9]+\.[0-9]+\.[0-9]+\+rke2r[0-9]+$`)
+	locationPattern    = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
+	clusterNamePrefix  = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,53}[a-z0-9])?$`)
+	uuidPattern        = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
+	rke2VersionPattern = regexp.MustCompile(`^v[0-9]+\.[0-9]+\.[0-9]+\+rke2r[0-9]+$`)
 )
 
 type InSpaceCluster struct {
@@ -283,10 +283,10 @@ func ipv4Value(address netip.Addr) uint32 {
 
 func (c InSpaceCluster) Validate() []error {
 	var errs []error
-	if !controlPlaneNamePrefix.MatchString(c.Metadata.Name) {
+	if !clusterNamePrefix.MatchString(c.Metadata.Name) {
 		errs = append(errs, ValidationError{
 			Field:   "metadata.name",
-			Message: "must be a lowercase DNS label of at most 59 characters so fixed control-plane hostnames fit within 63 characters",
+			Message: "must be a lowercase DNS label of at most 55 characters so fixed bastion and control-plane hostnames fit within 63 characters",
 		})
 	}
 	if c.Spec.ControlPlane.Replicas == 0 {

@@ -22,15 +22,18 @@ func TestControlPlaneReplicaValidation(t *testing.T) {
 	}
 }
 
-func TestClusterNameFitsFixedControlPlaneHostname(t *testing.T) {
-	valid := []string{"a", "unit", strings.Repeat("a", 59)}
+func TestClusterNameFitsFixedNodeHostnames(t *testing.T) {
+	valid := []string{"a", "unit", strings.Repeat("a", 55)}
 	for _, name := range valid {
 		cluster := InSpaceCluster{Metadata: ObjectMeta{Name: name}, Spec: validSpec()}
 		if errs := cluster.Validate(); len(errs) != 0 {
 			t.Errorf("name %q: unexpected validation errors: %v", name, errs)
 		}
 	}
-	for _, name := range []string{"", "UPPER", "contains.dot", "-leading", "trailing-", strings.Repeat("a", 60)} {
+	if got := len(strings.Repeat("a", 55) + "-bastion"); got != 63 {
+		t.Fatalf("maximum cluster name produces bastion hostname length %d, want 63", got)
+	}
+	for _, name := range []string{"", "UPPER", "contains.dot", "-leading", "trailing-", strings.Repeat("a", 56)} {
 		cluster := InSpaceCluster{Metadata: ObjectMeta{Name: name}, Spec: validSpec()}
 		errs := cluster.Validate()
 		found := false
@@ -161,9 +164,9 @@ func TestControlPlaneCRDMatchesMachineValidationContract(t *testing.T) {
 	}
 	crd := string(data)
 	for _, required := range []string{
-		`self.metadata.name.matches("^[a-z0-9](?:[a-z0-9-]{0,57}[a-z0-9])?$") || (oldSelf.hasValue() && self.metadata.name == oldSelf.value().metadata.name)`,
+		`self.metadata.name.matches("^[a-z0-9](?:[a-z0-9-]{0,53}[a-z0-9])?$") || (oldSelf.hasValue() && self.metadata.name == oldSelf.value().metadata.name)`,
 		"optionalOldSelf: true",
-		"metadata.name must be a lowercase DNS label of at most 59 characters",
+		"metadata.name must be a lowercase DNS label of at most 55 characters",
 		"vcpu:\n                          type: integer\n                          format: int32\n                          minimum: 2\n                          maximum: 16",
 		"memoryMiB:\n                          type: integer\n                          format: int32\n                          minimum: 4096\n                          maximum: 65536",
 		"osName:\n                              type: string\n                              enum: [ubuntu]",

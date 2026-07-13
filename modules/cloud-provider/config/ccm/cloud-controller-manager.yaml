@@ -150,6 +150,7 @@ spec:
                 configMapKeyRef:
                   name: inspace-cloud-config
                   key: billingAccountID
+                  optional: false
             - name: INSPACE_CLUSTER_ID
               valueFrom:
                 configMapKeyRef:

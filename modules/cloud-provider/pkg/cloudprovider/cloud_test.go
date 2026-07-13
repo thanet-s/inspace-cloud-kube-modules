@@ -2,6 +2,7 @@ package cloudprovider
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -25,7 +26,10 @@ func TestInstancesV2MetadataUsesCanonicalProviderID(t *testing.T) {
 	api := &fakeAPI{vms: []inspace.VM{{
 		UUID: testVMUUID, Name: "worker-0", Hostname: "worker-0", Status: "running",
 		VCPU: 4, MemoryMiB: 8192, PrivateIPv4: "10.0.0.10",
-	}}, floatingIPs: []inspace.FloatingIP{{Address: "203.0.113.10", AssignedTo: testVMUUID, AssignedToResourceType: "virtual_machine"}}}
+	}}, floatingIPs: []inspace.FloatingIP{{
+		Address: "203.0.113.10", BillingAccountID: 42, Type: "public", Enabled: true,
+		AssignedTo: testVMUUID, AssignedToResourceType: "virtual_machine", AssignedToPrivateIP: "10.0.0.10",
+	}}}
 	provider := newTestProvider(t, api)
 	metadata, err := provider.InstanceMetadata(context.Background(), &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "worker-0"}})
 	if err != nil {
@@ -68,6 +72,15 @@ func TestInstancesV2MetadataPreservesKarpenterInstanceType(t *testing.T) {
 		t.Fatalf("v2 InstanceType = %q", metadata.InstanceType)
 	}
 
+	api.vms[0].Description = `{"schema":"karpenter.inspace.cloud/v3","instanceType":"is-general-4c-8g"}`
+	metadata, err = provider.InstanceMetadata(context.Background(), &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "worker-0"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if metadata.InstanceType != "is-general-4c-8g" {
+		t.Fatalf("v3 InstanceType = %q", metadata.InstanceType)
+	}
+
 	api.vms[0].Description = `{"schema":"karpenter.inspace.cloud/v2","instanceType":"invalid/value"}`
 	metadata, err = provider.InstanceMetadata(context.Background(), &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "worker-0"}})
 	if err != nil {
@@ -75,6 +88,81 @@ func TestInstancesV2MetadataPreservesKarpenterInstanceType(t *testing.T) {
 	}
 	if metadata.InstanceType != "inspace-4c-8192mib" {
 		t.Fatalf("invalid ownership instance type did not fall back: %q", metadata.InstanceType)
+	}
+}
+
+func TestExternalIPv4ForVMRequiresExactActiveAssignment(t *testing.T) {
+	vm := inspace.VM{UUID: testVMUUID, PrivateIPv4: "10.0.0.10", PublicIPv4: "198.51.100.90"}
+	valid := inspace.FloatingIP{
+		Address: "203.0.113.10", BillingAccountID: 42, Type: "public", Enabled: true,
+		AssignedTo: testVMUUID, AssignedToResourceType: "virtual_machine", AssignedToPrivateIP: vm.PrivateIPv4,
+	}
+
+	provider := newTestProvider(t, &fakeAPI{floatingIPs: []inspace.FloatingIP{valid}})
+	address, err := provider.externalIPv4ForVM(context.Background(), "bkk01", &vm)
+	if err != nil || address != valid.Address {
+		t.Fatalf("externalIPv4ForVM() = %q, %v", address, err)
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(*inspace.FloatingIP)
+	}{
+		{name: "wrong billing account", mutate: func(item *inspace.FloatingIP) { item.BillingAccountID++ }},
+		{name: "disabled", mutate: func(item *inspace.FloatingIP) { item.Enabled = false }},
+		{name: "deleted", mutate: func(item *inspace.FloatingIP) { item.IsDeleted = true }},
+		{name: "virtual", mutate: func(item *inspace.FloatingIP) { item.IsVirtual = true }},
+		{name: "wrong address type", mutate: func(item *inspace.FloatingIP) { item.Type = "private" }},
+		{name: "private address", mutate: func(item *inspace.FloatingIP) { item.Address = "10.0.0.20" }},
+		{name: "IPv6 address", mutate: func(item *inspace.FloatingIP) { item.Address = "2001:db8::10" }},
+		{name: "noncanonical address", mutate: func(item *inspace.FloatingIP) { item.Address = "203.0.113.010" }},
+		{name: "wrong VM", mutate: func(item *inspace.FloatingIP) { item.AssignedTo = testLBUUID }},
+		{name: "wrong resource type", mutate: func(item *inspace.FloatingIP) { item.AssignedToResourceType = "load_balancer" }},
+		{name: "missing private assignment", mutate: func(item *inspace.FloatingIP) { item.AssignedToPrivateIP = "" }},
+		{name: "wrong private assignment", mutate: func(item *inspace.FloatingIP) { item.AssignedToPrivateIP = "10.0.0.99" }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			item := valid
+			test.mutate(&item)
+			provider := newTestProvider(t, &fakeAPI{floatingIPs: []inspace.FloatingIP{item}})
+			if address, err := provider.externalIPv4ForVM(context.Background(), "bkk01", &vm); err == nil || address != "" {
+				t.Fatalf("externalIPv4ForVM() = %q, %v; want fail-closed error", address, err)
+			}
+		})
+	}
+}
+
+func TestExternalIPv4ForVMRejectsMultipleRowsAndDoesNotUseNICFallback(t *testing.T) {
+	vm := inspace.VM{UUID: testVMUUID, PrivateIPv4: "10.0.0.10", PublicIPv4: "198.51.100.90"}
+	valid := inspace.FloatingIP{
+		Address: "203.0.113.10", BillingAccountID: 42, Type: "public", Enabled: true,
+		AssignedTo: testVMUUID, AssignedToResourceType: "virtual_machine", AssignedToPrivateIP: vm.PrivateIPv4,
+	}
+
+	provider := newTestProvider(t, &fakeAPI{floatingIPs: []inspace.FloatingIP{valid, valid}})
+	if address, err := provider.externalIPv4ForVM(context.Background(), "bkk01", &vm); err == nil || address != "" {
+		t.Fatalf("multiple rows externalIPv4ForVM() = %q, %v; want fail-closed error", address, err)
+	}
+
+	provider = newTestProvider(t, &fakeAPI{})
+	if address, err := provider.externalIPv4ForVM(context.Background(), "bkk01", &vm); err != nil || address != "" {
+		t.Fatalf("NIC fallback externalIPv4ForVM() = %q, %v; want no published address", address, err)
+	}
+}
+
+func TestExternalIPv4ForVMAcceptsNullIsVirtualAsFalse(t *testing.T) {
+	var item inspace.FloatingIP
+	if err := json.Unmarshal([]byte(`{"address":"203.0.113.10","billing_account_id":42,"type":"public","enabled":true,"is_deleted":false,"is_virtual":null,"assigned_to":"`+testVMUUID+`","assigned_to_resource_type":"virtual_machine","assigned_to_private_ip":"10.0.0.10"}`), &item); err != nil {
+		t.Fatal(err)
+	}
+	if item.IsVirtual {
+		t.Fatal("null is_virtual decoded as true")
+	}
+	vm := inspace.VM{UUID: testVMUUID, PrivateIPv4: "10.0.0.10"}
+	provider := newTestProvider(t, &fakeAPI{floatingIPs: []inspace.FloatingIP{item}})
+	if address, err := provider.externalIPv4ForVM(context.Background(), "bkk01", &vm); err != nil || address != item.Address {
+		t.Fatalf("externalIPv4ForVM() = %q, %v", address, err)
 	}
 }
 
@@ -395,9 +483,6 @@ func TestExistingReservedAddressCollisionCleanupPrecedesUnrelatedValidation(t *t
 			nodes: []*corev1.Node{{Spec: corev1.NodeSpec{ProviderID: "foreign://node"}}},
 		},
 		{
-			name: "Ensure before missing billing config", billingID: 0, nodes: validNodes,
-		},
-		{
 			name: "Update before invalid Service", billingID: 42, withFIP: true, update: true, nodes: validNodes,
 			mutateService: func(service *corev1.Service) {
 				service.Spec.ExternalTrafficPolicy = corev1.ServiceExternalTrafficPolicyLocal
@@ -466,11 +551,25 @@ func TestProviderRequiresBoundedCanonicalPrivateLoadBalancerPool(t *testing.T) {
 	} {
 		_, err := New(&fakeAPI{}, Config{
 			Location: "bkk01", NetworkUUID: testNetworkUUID, ClusterID: "unit-test-cluster",
+			BillingAccountID:             42,
 			ControlPlaneVIP:              "10.0.0.10",
 			PrivateLoadBalancerPoolStart: pool[0], PrivateLoadBalancerPoolStop: pool[1],
 		})
 		if err == nil {
 			t.Fatalf("invalid private load-balancer pool %#v accepted", pool)
+		}
+	}
+}
+
+func TestProviderRequiresPositiveBillingAccountID(t *testing.T) {
+	for _, billingAccountID := range []int64{-1, 0} {
+		_, err := New(&fakeAPI{}, Config{
+			Location: "bkk01", NetworkUUID: testNetworkUUID, BillingAccountID: billingAccountID, ClusterID: "unit-test-cluster",
+			ControlPlaneVIP:              "10.0.0.10",
+			PrivateLoadBalancerPoolStart: "10.0.0.200", PrivateLoadBalancerPoolStop: "10.0.0.239",
+		})
+		if err == nil || !strings.Contains(err.Error(), "billing account ID") {
+			t.Fatalf("billing account ID %d was accepted: %v", billingAccountID, err)
 		}
 	}
 }
@@ -481,6 +580,7 @@ func TestProviderRequiresCanonicalControlPlaneVIPOutsidePrivateLoadBalancerPool(
 	} {
 		_, err := New(&fakeAPI{}, Config{
 			Location: "bkk01", NetworkUUID: testNetworkUUID, ClusterID: "unit-test-cluster",
+			BillingAccountID:             42,
 			ControlPlaneVIP:              controlPlaneVIP,
 			PrivateLoadBalancerPoolStart: "10.0.0.200", PrivateLoadBalancerPoolStop: "10.0.0.239",
 		})
