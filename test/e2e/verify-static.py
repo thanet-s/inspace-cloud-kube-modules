@@ -217,6 +217,62 @@ def verify_host_launcher_external_allow_list() -> None:
         )
 
 
+def verify_retention_state_parser(entrypoint: str) -> None:
+    """Exercise the exact parser used before unfinished-run recovery."""
+    function = re.search(r"(?ms)^read_retention_state\(\) \{\n.*?^\}\n", entrypoint)
+    require(function is not None, "entrypoint lacks a testable retention-state parser")
+    require(
+        entrypoint.count('retained=$(read_retention_state "$previous_dir/state.json") || {') == 1,
+        "unfinished-run recovery must use the tested retention-state parser exactly once",
+    )
+    require("jq -er '.retained // false'" not in entrypoint,
+            "unfinished-run recovery must not restore jq -e boolean parsing")
+    harness = "set -euo pipefail\n" + function.group(0) + '\nread_retention_state "$1"\n'
+
+    valid_cases = [
+        ({}, "false"),
+        ({"retained": False}, "false"),
+        ({"retained": True}, "true"),
+    ]
+    invalid_cases = [
+        "",
+        "{not-json",
+        "{}\n{}",
+        json.dumps([]),
+        json.dumps({"retained": None}),
+        json.dumps({"retained": "false"}),
+        json.dumps({"retained": 0}),
+        json.dumps({"retained": []}),
+        json.dumps({"retained": {}}),
+    ]
+
+    with tempfile.TemporaryDirectory(prefix="inspace-retention-static-") as temporary:
+        state = pathlib.Path(temporary) / "state.json"
+        for value, expected in valid_cases:
+            state.write_text(json.dumps(value), encoding="utf-8")
+            result = subprocess.run(
+                ["/bin/bash", "-c", harness, "retention-parser", str(state)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            require(result.returncode == 0,
+                    f"valid retention state {value!r} failed closed: {result.stderr}")
+            require(result.stdout.strip() == expected,
+                    f"valid retention state {value!r} produced {result.stdout!r}, want {expected!r}")
+
+        for contents in invalid_cases:
+            state.write_text(contents, encoding="utf-8")
+            result = subprocess.run(
+                ["/bin/bash", "-c", harness, "retention-parser", str(state)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            require(result.returncode != 0,
+                    f"malformed or non-boolean retention state was accepted: {contents!r}")
+
+
 def main() -> None:
     host = (ROOT / "run.sh").read_text(encoding="utf-8")
     dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
@@ -241,6 +297,7 @@ def main() -> None:
         if not line.lstrip().startswith("#")
     )
     verify_host_launcher_external_allow_list()
+    verify_retention_state_parser(entrypoint)
     require("docker build" in executable_host and "docker run" in executable_host, "host launcher must build and run Docker")
     require("runner_platform=${INSPACE_E2E_RUNNER_PLATFORM:-linux/amd64}" in executable_host,
             "E2E runner must default explicitly to linux/amd64")
