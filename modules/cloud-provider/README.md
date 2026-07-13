@@ -24,7 +24,13 @@ and the fixed three-server RKE2 bootstrap reconciler.
   `metadata.name` must be a lowercase DNS label of at most 55 characters.
 - A per-node RKE2 static Pod running kube-vip v1.2.1 by immutable multiarch
   digest. It advertises only the control-plane VIP with ARP and leader
-  election; Kubernetes Service handling is disabled.
+  election; Kubernetes Service handling is disabled. The Pod mounts the host
+  RKE2 kubeconfig `/etc/rancher/rke2/rke2.yaml` at kube-vip's standard
+  `/etc/kubernetes/admin.conf` path, maps `kubernetes` to `127.0.0.1`, and
+  does not set `k8s_config_file`. Its `vip_nodename` comes from the downward
+  API's `spec.nodeName`, so Lease ownership identifies an exact control-plane
+  node rather than a mirror-Pod name. The container capability set drops
+  `ALL` and adds exactly `NET_ADMIN` and `NET_RAW`.
 - Pinned RKE2 release tarball installation verified against the matching
   official `sha256sum-amd64.txt` release asset.
 - Pre-RKE2 Ubuntu preparation disables swap, rewrites stock archive endpoints to the Thailand archive
