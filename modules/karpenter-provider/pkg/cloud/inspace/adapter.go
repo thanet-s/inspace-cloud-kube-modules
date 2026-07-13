@@ -38,6 +38,8 @@ const (
 	defaultNetworkAttachmentReadbackMinInterval = 500 * time.Millisecond
 	defaultNetworkAttachmentReadbackMaxInterval = 5 * time.Second
 	defaultProtectionAuditTimeout               = 15 * time.Second
+	defaultLaunchCleanupTimeout                 = 30 * time.Second
+	defaultLaunchFloatingIPCleanupTimeout       = 10 * time.Second
 	canonicalVMReadConcurrency                  = 8
 )
 
@@ -47,6 +49,8 @@ var (
 	errFirewallAssignmentNotVisible  = errors.New("intended worker firewall assignment is not visible")
 	errPersistedOwnershipIncomplete  = errors.New("persisted VM ownership record is incomplete")
 	errVMAbsenceUncertain            = errors.New("VM absence could not be established")
+	errFloatingIPCleanupUncertain    = errors.New("floating IP cleanup did not converge")
+	errFirewallCleanupUncertain      = errors.New("firewall cleanup did not converge")
 	vmUUIDPattern                    = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
 	ownedInstanceTypePattern         = regexp.MustCompile(`^is-(compute|general|memory)-([0-9]+)c-([0-9]+)g$`)
 	karpenterOwnershipPrefixPattern  = regexp.MustCompile(`^\s*\{\s*"schema"\s*:\s*"karpenter\.inspace\.cloud/v1"(?:\s*[,}]|\s*$)`)
@@ -87,6 +91,8 @@ type Adapter struct {
 	networkAttachmentReadbackMinDelay time.Duration
 	networkAttachmentReadbackMaxDelay time.Duration
 	protectionAuditTimeout            time.Duration
+	launchCleanupTimeout              time.Duration
+	launchFloatingIPCleanupTimeout    time.Duration
 }
 
 func New(api API) (*Adapter, error) {
@@ -108,6 +114,8 @@ func newAdapter(api API, passwordGenerator func() (string, error)) (*Adapter, er
 		networkAttachmentReadbackMinDelay: defaultNetworkAttachmentReadbackMinInterval,
 		networkAttachmentReadbackMaxDelay: defaultNetworkAttachmentReadbackMaxInterval,
 		protectionAuditTimeout:            defaultProtectionAuditTimeout,
+		launchCleanupTimeout:              defaultLaunchCleanupTimeout,
+		launchFloatingIPCleanupTimeout:    defaultLaunchFloatingIPCleanupTimeout,
 	}, nil
 }
 
@@ -791,19 +799,28 @@ func (a *Adapter) DeleteVM(ctx context.Context, location, uuid, clusterName, nod
 	}
 	var record ownership
 	if !vmMissing {
-		var managed bool
-		record, managed = parseOwnership(vm.Description)
-		if !managed || record.Cluster != clusterName || record.NodeClaim != nodeClaimName {
+		var managed, complete bool
+		var ownershipErr error
+		record, managed, complete, ownershipErr = inspectOwnershipDescription(vm.Description)
+		if ownershipErr != nil {
+			return fmt.Errorf("authorizing deletion of VM %s: %w", uuid, ownershipErr)
+		}
+		if !managed || !complete || record.Cluster != clusterName || record.NodeClaim != nodeClaimName {
 			return fmt.Errorf("%w: VM %s is not managed for cluster %q and NodeClaim %q", cloudapi.ErrOwnershipMismatch, uuid, clusterName, nodeClaimName)
 		}
 	}
 
-	floatingIP, floatingErr := a.findFloatingIPByName(ctx, location, floatingIPName(clusterName, nodeClaimName), 0)
-	if floatingErr != nil && !errors.Is(floatingErr, cloudapi.ErrNotFound) {
-		return floatingErr
-	}
-	if floatingIP != nil && record.PublicIPv4 != "" && (floatingIP.Address != record.PublicIPv4 || floatingIP.Name != record.FloatingIPName) {
-		return fmt.Errorf("%w: floating IP ownership does not match VM %s", cloudapi.ErrOwnershipMismatch, uuid)
+	var floatingIP *sdk.FloatingIP
+	if vmMissing {
+		var floatingErr error
+		floatingIP, floatingErr = a.readOrphanFloatingIPForDelete(ctx, location, floatingIPName(clusterName, nodeClaimName), uuid)
+		if floatingErr != nil {
+			return floatingErr
+		}
+	} else {
+		floatingIP = &sdk.FloatingIP{
+			Name: record.FloatingIPName, Address: record.PublicIPv4, BillingAccountID: record.BillingAccountID,
+		}
 	}
 
 	var errs []error
@@ -811,37 +828,27 @@ func (a *Adapter) DeleteVM(ctx context.Context, location, uuid, clusterName, nod
 	if floatingIP != nil {
 		floatingCleanupErr = a.deleteOwnedFloatingIP(ctx, location, *floatingIP, uuid)
 	}
-	vmGone := vmMissing
-	if !vmMissing {
-		if err := a.api.DeleteVM(ctx, location, uuid); err != nil {
-			if sdk.IsNotFound(err) {
-				vmGone = true
-				vmMissing = true
-			} else {
-				// The cloud firewall deliberately remains attached whenever VM
-				// deletion fails, even if floating-IP cleanup also failed.
-				if floatingCleanupErr != nil {
-					errs = append(errs, floatingCleanupErr)
-				}
-				errs = append(errs, fmt.Errorf("deleting VM %s: %w", uuid, err))
-				return errors.Join(errs...)
-			}
-		} else {
-			vmGone = true
-		}
-	}
-	if vmGone && floatingCleanupErr != nil && floatingIP != nil {
-		// VM deletion may cause the API to release an assignment, so retry the
-		// owned IP cleanup once after the protected VM is gone.
-		floatingCleanupErr = a.deleteOwnedFloatingIP(ctx, location, *floatingIP, uuid)
-	}
 	if floatingCleanupErr != nil {
-		errs = append(errs, floatingCleanupErr)
+		// Dependent identity or convergence failures are a hard precondition:
+		// preserve the VM and firewall so the next reconciliation can retry from
+		// an owned, protected state.
+		return floatingCleanupErr
 	}
-	if vmGone {
-		if err := a.detachFirewallAfterVMDeletion(ctx, location, record.FirewallUUID, uuid); err != nil {
-			errs = append(errs, err)
+	if !vmMissing {
+		deleteErr := a.api.DeleteVM(ctx, location, uuid)
+		// A remote 2xx, 404, or error response only proves that the request was
+		// dispatched. Keep the firewall attached until canonical GET and list
+		// read-back independently agree that the VM is absent.
+		if absenceErr := a.waitForVMAbsence(ctx, location, uuid, "after delete"); absenceErr != nil {
+			if deleteErr != nil {
+				errs = append(errs, fmt.Errorf("deleting VM %s: %w", uuid, deleteErr))
+			}
+			errs = append(errs, absenceErr)
+			return errors.Join(errs...)
 		}
+	}
+	if err := a.detachFirewallAfterVMDeletion(ctx, location, record.FirewallUUID, uuid); err != nil {
+		errs = append(errs, err)
 	}
 	if len(errs) != 0 {
 		return errors.Join(errs...)
@@ -850,6 +857,83 @@ func (a *Adapter) DeleteVM(ctx context.Context, location, uuid, clusterName, nod
 		return cloudapi.ErrNotFound
 	}
 	return nil
+}
+
+// waitForVMAbsence is the post-mutation counterpart to readVMForDelete. It
+// never turns a DELETE response into state: two consecutive canonical 404s,
+// each corroborated by a valid location-wide list without the UUID, are
+// required before dependent firewall cleanup can begin.
+func (a *Adapter) waitForVMAbsence(ctx context.Context, location, uuid, phase string) error {
+	readbackCtx, cancel := context.WithTimeout(ctx, a.networkAttachmentReadbackTimeout)
+	defer cancel()
+	absenceConfirmations := 0
+	var lastObservation error
+	readbackDelay := a.networkAttachmentReadbackMinDelay
+	for {
+		if readbackErr := readbackCtx.Err(); readbackErr != nil {
+			return fmt.Errorf("VM %s absence %s stopped: %w", uuid, phase, errors.Join(errVMAbsenceUncertain, lastObservation, readbackErr))
+		}
+		requestCtx, requestCancel := context.WithTimeout(readbackCtx, a.networkAttachmentRequestTimeout)
+		vm, getErr := a.api.GetVM(requestCtx, location, uuid)
+		requestCancel()
+		if readbackErr := readbackCtx.Err(); readbackErr != nil {
+			return fmt.Errorf("VM %s absence %s stopped: %w", uuid, phase, errors.Join(errVMAbsenceUncertain, lastObservation, getErr, readbackErr))
+		}
+		switch {
+		case getErr == nil && vm == nil:
+			absenceConfirmations = 0
+			lastObservation = fmt.Errorf("%w: VM %s detail response is empty", errVMAbsenceUncertain, uuid)
+		case getErr == nil && vm.UUID != uuid:
+			return fmt.Errorf("%w: canonical VM detail UUID %q does not match delete target %q", cloudapi.ErrOwnershipMismatch, vm.UUID, uuid)
+		case getErr == nil:
+			absenceConfirmations = 0
+			lastObservation = fmt.Errorf("VM %s remains visible %s", uuid, phase)
+		case !sdk.IsNotFound(getErr):
+			absenceConfirmations = 0
+			lastObservation = fmt.Errorf("getting VM %s %s: %w", uuid, phase, getErr)
+			if !isRetryableReadback(readbackCtx, getErr) {
+				return lastObservation
+			}
+		default:
+			requestCtx, requestCancel := context.WithTimeout(readbackCtx, a.networkAttachmentRequestTimeout)
+			listed, listErr := a.api.ListVMs(requestCtx, location)
+			requestCancel()
+			if readbackErr := readbackCtx.Err(); readbackErr != nil {
+				return fmt.Errorf("VM %s absence %s stopped: %w", uuid, phase, errors.Join(errVMAbsenceUncertain, lastObservation, listErr, readbackErr))
+			}
+			if listErr != nil {
+				absenceConfirmations = 0
+				lastObservation = fmt.Errorf("listing VMs to confirm absence of %s %s: %w", uuid, phase, listErr)
+				if !isRetryableReadback(readbackCtx, listErr) {
+					return lastObservation
+				}
+			} else if err := validateVMListSnapshot(listed); err != nil {
+				return fmt.Errorf("validating VM list to confirm absence of %s %s: %w", uuid, phase, err)
+			} else {
+				listedPresent := false
+				for i := range listed {
+					if listed[i].UUID == uuid {
+						listedPresent = true
+						break
+					}
+				}
+				if listedPresent {
+					absenceConfirmations = 0
+					lastObservation = fmt.Errorf("%w: GetVM reports %s absent while ListVMs still contains it", cloudapi.ErrOwnershipMismatch, uuid)
+				} else {
+					absenceConfirmations++
+					lastObservation = fmt.Errorf("VM %s absence confirmation %d of 2 %s", uuid, absenceConfirmations, phase)
+					if absenceConfirmations == 2 {
+						return nil
+					}
+				}
+			}
+		}
+		if err := waitForReadback(readbackCtx, readbackDelay); err != nil {
+			return fmt.Errorf("VM %s absence did not converge %s: %w", uuid, phase, errors.Join(errVMAbsenceUncertain, lastObservation, err))
+		}
+		readbackDelay = nextReadbackDelay(readbackDelay, a.networkAttachmentReadbackMaxDelay)
+	}
 }
 
 // readVMForDelete never treats one eventually consistent 404 as permission to
@@ -1778,32 +1862,45 @@ func validateWorkerFloatingIPAssignmentsInList(addresses []sdk.FloatingIP, expec
 }
 
 func (a *Adapter) cleanupLaunch(ctx context.Context, location, firewallUUID, vmUUID string, floatingIP sdk.FloatingIP, cause error) error {
-	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), a.launchCleanupTimeout)
 	defer cancel()
 	var errs []error
-	floatingErr := a.deleteOwnedFloatingIP(cleanupCtx, location, floatingIP, vmUUID)
+	// Reserve most of the detached cleanup window for deletion of the
+	// ownership-proven unprotected VM. A persistently uncertain floating-IP
+	// readback must not consume the entire window before VM DELETE is sent.
+	floatingCtx, floatingCancel := context.WithTimeout(cleanupCtx, a.launchFloatingIPCleanupTimeout)
+	floatingErr := a.deleteOwnedFloatingIP(floatingCtx, location, floatingIP, vmUUID)
+	floatingCancel()
 	vmDeleteErr := a.api.DeleteVM(cleanupCtx, location, vmUUID)
-	if vmDeleteErr != nil && !sdk.IsNotFound(vmDeleteErr) {
+	if absenceErr := a.waitForVMAbsence(cleanupCtx, location, vmUUID, "after launch rollback"); absenceErr != nil {
 		if floatingErr != nil {
 			errs = append(errs, floatingErr)
 		}
-		errs = append(errs, fmt.Errorf("cleanup of unprotected VM %s failed; cloud firewall remains attached: %w", vmUUID, vmDeleteErr))
+		if vmDeleteErr != nil {
+			errs = append(errs, fmt.Errorf("deleting unprotected VM %s during launch rollback: %w", vmUUID, vmDeleteErr))
+		}
+		errs = append(errs, fmt.Errorf("cleanup of unprotected VM %s did not prove absence; cloud firewall remains attached: %w", vmUUID, absenceErr))
 		return errors.Join(append([]error{cause}, errs...)...)
 	}
+	// Once VM absence is canonical, retire every stale firewall assignment
+	// before spending the remaining detached cleanup budget on the recoverable,
+	// deterministically named floating IP.
+	if err := a.detachFirewallAfterVMDeletion(cleanupCtx, location, firewallUUID, vmUUID); err != nil {
+		errs = append(errs, err)
+	}
 	if floatingErr != nil {
+		// A VM deletion may release the assignment asynchronously. Retry the
+		// exact address only after canonical VM absence has been established.
 		floatingErr = a.deleteOwnedFloatingIP(cleanupCtx, location, floatingIP, vmUUID)
 	}
 	if floatingErr != nil {
 		errs = append(errs, floatingErr)
 	}
-	if err := a.detachFirewallAfterVMDeletion(cleanupCtx, location, firewallUUID, vmUUID); err != nil {
-		errs = append(errs, err)
-	}
 	return errors.Join(append([]error{cause}, errs...)...)
 }
 
 func (a *Adapter) cleanupUnassignedFloatingIP(ctx context.Context, location string, floatingIP sdk.FloatingIP) error {
-	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), defaultLaunchCleanupTimeout)
 	defer cancel()
 	return a.deleteOwnedFloatingIP(cleanupCtx, location, floatingIP, "")
 }
@@ -1811,46 +1908,227 @@ func (a *Adapter) cleanupUnassignedFloatingIP(ctx context.Context, location stri
 func (a *Adapter) detachFirewallAfterVMDeletion(ctx context.Context, location, _ string, vmUUID string) error {
 	// The caller invokes this only after VM absence is confirmed. Scan every
 	// firewall for the exact deleted VM UUID so rollback also cleans unexpected
-	// second-firewall assignments without ever detaching a live VM.
-	firewalls, err := a.api.ListFirewalls(ctx, location)
-	if err != nil {
-		return fmt.Errorf("listing firewalls for deleted VM cleanup: %w", err)
-	}
-	var errs []error
-	for _, firewall := range firewalls {
-		if !firewallHasVM(firewall, vmUUID) {
-			continue
+	// second-firewall assignments without ever detaching a live VM. A mutation
+	// response is not convergence: require repeated authoritative list absence.
+	readbackCtx, cancel := context.WithTimeout(ctx, a.networkAttachmentReadbackTimeout)
+	defer cancel()
+	absenceConfirmations := 0
+	var lastObservation, mutationErr error
+	readbackDelay := a.networkAttachmentReadbackMinDelay
+	for {
+		requestCtx, requestCancel := context.WithTimeout(readbackCtx, a.networkAttachmentRequestTimeout)
+		firewalls, err := a.api.ListFirewalls(requestCtx, location)
+		requestCancel()
+		if readbackErr := readbackCtx.Err(); readbackErr != nil {
+			return fmt.Errorf("firewall cleanup for deleted VM %s stopped: %w", vmUUID, errors.Join(errFirewallCleanupUncertain, lastObservation, mutationErr, readbackErr))
 		}
-		if err := a.api.UnassignFirewallFromVM(ctx, location, firewall.UUID, vmUUID); err != nil && !sdk.IsNotFound(err) {
-			errs = append(errs, fmt.Errorf("cleaning stale firewall %s assignment for deleted VM %s: %w", firewall.UUID, vmUUID, err))
+		if err != nil {
+			lastObservation = fmt.Errorf("listing firewalls for deleted VM cleanup: %w", err)
+			if !isRetryableReadback(readbackCtx, err) {
+				return lastObservation
+			}
+		} else {
+			assignments, validationErr := firewallAssignmentsForVM(firewalls, vmUUID)
+			if validationErr != nil {
+				return validationErr
+			}
+			if len(assignments) == 0 {
+				absenceConfirmations++
+				lastObservation = fmt.Errorf("firewall assignment absence confirmation %d of 2 for VM %s", absenceConfirmations, vmUUID)
+				if absenceConfirmations == 2 {
+					return nil
+				}
+			} else {
+				absenceConfirmations = 0
+				lastObservation = fmt.Errorf("VM %s remains assigned to firewalls %v", vmUUID, assignments)
+				for _, firewallUUID := range assignments {
+					requestCtx, requestCancel := context.WithTimeout(readbackCtx, a.networkAttachmentRequestTimeout)
+					err := a.api.UnassignFirewallFromVM(requestCtx, location, firewallUUID, vmUUID)
+					requestCancel()
+					if err != nil {
+						mutationErr = fmt.Errorf("unassigning firewall %s from deleted VM %s: %w", firewallUUID, vmUUID, err)
+						if !isRetryableCleanupMutation(err) {
+							return mutationErr
+						}
+					}
+				}
+			}
 		}
+		if err := waitForReadback(readbackCtx, readbackDelay); err != nil {
+			return fmt.Errorf("firewall assignments for deleted VM %s did not converge: %w", vmUUID, errors.Join(errFirewallCleanupUncertain, lastObservation, mutationErr, err))
+		}
+		readbackDelay = nextReadbackDelay(readbackDelay, a.networkAttachmentReadbackMaxDelay)
 	}
-	return errors.Join(errs...)
 }
 
 func (a *Adapter) deleteOwnedFloatingIP(ctx context.Context, location string, floatingIP sdk.FloatingIP, expectedVMUUID string) error {
-	current, err := a.findFloatingIPByNameRaw(ctx, location, floatingIP.Name, floatingIP.BillingAccountID)
-	if err != nil {
-		if errors.Is(err, cloudapi.ErrNotFound) {
-			return nil
+	if floatingIP.Name == "" || floatingIP.Address == "" || floatingIP.BillingAccountID <= 0 {
+		return fmt.Errorf("%w: incomplete floating IP ownership anchor", cloudapi.ErrOwnershipMismatch)
+	}
+	readbackCtx, cancel := context.WithTimeout(ctx, a.networkAttachmentReadbackTimeout)
+	defer cancel()
+	absenceConfirmations := 0
+	var lastObservation, mutationErr error
+	readbackDelay := a.networkAttachmentReadbackMinDelay
+	for {
+		requestCtx, requestCancel := context.WithTimeout(readbackCtx, a.networkAttachmentRequestTimeout)
+		addresses, err := a.api.ListFloatingIPs(requestCtx, location, nil)
+		requestCancel()
+		if readbackErr := readbackCtx.Err(); readbackErr != nil {
+			return fmt.Errorf("floating IP %s cleanup stopped: %w", floatingIP.Address, errors.Join(errFloatingIPCleanupUncertain, lastObservation, mutationErr, readbackErr))
 		}
-		return err
-	}
-	if current.Address != floatingIP.Address {
-		return fmt.Errorf("%w: refusing to delete changed floating IP %q", cloudapi.ErrOwnershipMismatch, floatingIP.Name)
-	}
-	if current.AssignedTo != "" {
-		if expectedVMUUID == "" || current.AssignedTo != expectedVMUUID || current.AssignedToResourceType != "virtual_machine" {
-			return fmt.Errorf("%w: refusing to unassign floating IP %s from %s", cloudapi.ErrOwnershipMismatch, current.Address, current.AssignedTo)
+		if err != nil {
+			lastObservation = fmt.Errorf("listing floating IPs for cleanup: %w", err)
+			if !isRetryableReadback(readbackCtx, err) {
+				return lastObservation
+			}
+		} else {
+			current, present, validationErr := exactFloatingIPForCleanup(addresses, floatingIP, expectedVMUUID)
+			if validationErr != nil {
+				return validationErr
+			}
+			if !present {
+				absenceConfirmations++
+				lastObservation = fmt.Errorf("floating IP %s absence confirmation %d of 2", floatingIP.Address, absenceConfirmations)
+				if absenceConfirmations == 2 {
+					return nil
+				}
+			} else {
+				absenceConfirmations = 0
+				switch {
+				case current.AssignedTo != "":
+					if expectedVMUUID == "" || current.AssignedTo != expectedVMUUID || current.AssignedToResourceType != "virtual_machine" {
+						return fmt.Errorf("%w: refusing to unassign floating IP %s from %s", cloudapi.ErrOwnershipMismatch, current.Address, current.AssignedTo)
+					}
+					lastObservation = fmt.Errorf("floating IP %s remains assigned to VM %s", current.Address, expectedVMUUID)
+					requestCtx, requestCancel := context.WithTimeout(readbackCtx, a.networkAttachmentRequestTimeout)
+					_, err := a.api.UnassignFloatingIP(requestCtx, location, current.Address)
+					requestCancel()
+					if err != nil {
+						mutationErr = fmt.Errorf("unassigning floating IP %s: %w", current.Address, err)
+						if !isRetryableCleanupMutation(err) {
+							return mutationErr
+						}
+					}
+				default:
+					lastObservation = fmt.Errorf("floating IP %s remains visible and unassigned", current.Address)
+					requestCtx, requestCancel := context.WithTimeout(readbackCtx, a.networkAttachmentRequestTimeout)
+					err := a.api.DeleteFloatingIP(requestCtx, location, current.Address)
+					requestCancel()
+					if err != nil {
+						mutationErr = fmt.Errorf("deleting floating IP %s: %w", current.Address, err)
+						if !isRetryableCleanupMutation(err) {
+							return mutationErr
+						}
+					}
+				}
+			}
 		}
-		if _, err := a.api.UnassignFloatingIP(ctx, location, current.Address); err != nil && !sdk.IsNotFound(err) {
-			return fmt.Errorf("unassigning floating IP %s: %w", current.Address, err)
+		if err := waitForReadback(readbackCtx, readbackDelay); err != nil {
+			return fmt.Errorf("floating IP %s cleanup did not converge: %w", floatingIP.Address, errors.Join(errFloatingIPCleanupUncertain, lastObservation, mutationErr, err))
+		}
+		readbackDelay = nextReadbackDelay(readbackDelay, a.networkAttachmentReadbackMaxDelay)
+	}
+}
+
+func exactFloatingIPForCleanup(addresses []sdk.FloatingIP, expected sdk.FloatingIP, expectedVMUUID string) (*sdk.FloatingIP, bool, error) {
+	var exact []sdk.FloatingIP
+	for i := range addresses {
+		address := addresses[i]
+		identityOverlap := address.Name == expected.Name || address.Address == expected.Address ||
+			(expectedVMUUID != "" && address.AssignedTo == expectedVMUUID)
+		if !identityOverlap {
+			continue
+		}
+		if address.Name != expected.Name || address.Address != expected.Address || address.BillingAccountID != expected.BillingAccountID {
+			return nil, false, fmt.Errorf("%w: floating IP ownership anchor %q/%s/account-%d changed", cloudapi.ErrOwnershipMismatch, expected.Name, expected.Address, expected.BillingAccountID)
+		}
+		exact = append(exact, address)
+	}
+	if len(exact) == 0 {
+		return nil, false, nil
+	}
+	if len(exact) != 1 {
+		return nil, false, fmt.Errorf("%w: floating IP ownership anchor %q/%s appears %d times", cloudapi.ErrOwnershipMismatch, expected.Name, expected.Address, len(exact))
+	}
+	return &exact[0], true, nil
+}
+
+func firewallAssignmentsForVM(firewalls []sdk.Firewall, vmUUID string) ([]string, error) {
+	seenFirewalls := make(map[string]bool, len(firewalls))
+	assignments := make([]string, 0, 1)
+	for i := range firewalls {
+		if firewalls[i].UUID == "" {
+			return nil, fmt.Errorf("%w: firewall list row %d has no UUID", cloudapi.ErrOwnershipMismatch, i)
+		}
+		if seenFirewalls[firewalls[i].UUID] {
+			return nil, fmt.Errorf("%w: firewall list contains duplicate UUID %s", cloudapi.ErrOwnershipMismatch, firewalls[i].UUID)
+		}
+		seenFirewalls[firewalls[i].UUID] = true
+		for _, resource := range firewalls[i].ResourcesAssigned {
+			if resource.ResourceUUID != vmUUID {
+				continue
+			}
+			if !strings.EqualFold(resource.ResourceType, "vm") {
+				return nil, fmt.Errorf("%w: resource UUID %s appears on firewall %s with type %q", cloudapi.ErrOwnershipMismatch, vmUUID, firewalls[i].UUID, resource.ResourceType)
+			}
+			assignments = append(assignments, firewalls[i].UUID)
 		}
 	}
-	if err := a.api.DeleteFloatingIP(ctx, location, current.Address); err != nil && !sdk.IsNotFound(err) {
-		return fmt.Errorf("deleting floating IP %s: %w", current.Address, err)
+	sort.Strings(assignments)
+	return assignments, nil
+}
+
+func (a *Adapter) readOrphanFloatingIPForDelete(ctx context.Context, location, name, vmUUID string) (*sdk.FloatingIP, error) {
+	readbackCtx, cancel := context.WithTimeout(ctx, a.networkAttachmentReadbackTimeout)
+	defer cancel()
+	absenceConfirmations := 0
+	var lastObservation error
+	readbackDelay := a.networkAttachmentReadbackMinDelay
+	for {
+		requestCtx, requestCancel := context.WithTimeout(readbackCtx, a.networkAttachmentRequestTimeout)
+		addresses, err := a.api.ListFloatingIPs(requestCtx, location, nil)
+		requestCancel()
+		if readbackErr := readbackCtx.Err(); readbackErr != nil {
+			return nil, fmt.Errorf("orphan floating IP discovery for missing VM %s stopped: %w", vmUUID, errors.Join(lastObservation, readbackErr))
+		}
+		if err != nil {
+			lastObservation = fmt.Errorf("listing floating IPs for missing VM %s: %w", vmUUID, err)
+			if !isRetryableReadback(readbackCtx, err) {
+				return nil, lastObservation
+			}
+		} else {
+			matches := make([]sdk.FloatingIP, 0, 1)
+			for i := range addresses {
+				if addresses[i].Name == name && !addresses[i].IsDeleted {
+					matches = append(matches, addresses[i])
+				}
+			}
+			switch len(matches) {
+			case 0:
+				absenceConfirmations++
+				lastObservation = fmt.Errorf("named floating IP absence confirmation %d of 2 for missing VM %s", absenceConfirmations, vmUUID)
+				if absenceConfirmations == 2 {
+					return nil, nil
+				}
+			case 1:
+				candidate := matches[0]
+				if candidate.BillingAccountID <= 0 || candidate.Address == "" || candidate.AssignedTo != vmUUID || candidate.AssignedToResourceType != "virtual_machine" {
+					return nil, fmt.Errorf("%w: named floating IP %q cannot be proven to belong to missing VM %s", cloudapi.ErrOwnershipMismatch, name, vmUUID)
+				}
+				if err := validateUsableFloatingIP(candidate); err != nil {
+					return nil, fmt.Errorf("%w: named floating IP %q for missing VM %s is unusable: %v", cloudapi.ErrOwnershipMismatch, name, vmUUID, err)
+				}
+				return &candidate, nil
+			default:
+				return nil, fmt.Errorf("%w: %d floating IPs share owned name %q", cloudapi.ErrOwnershipMismatch, len(matches), name)
+			}
+		}
+		if err := waitForReadback(readbackCtx, readbackDelay); err != nil {
+			return nil, fmt.Errorf("orphan floating IP discovery for missing VM %s did not converge: %w", vmUUID, errors.Join(lastObservation, err))
+		}
+		readbackDelay = nextReadbackDelay(readbackDelay, a.networkAttachmentReadbackMaxDelay)
 	}
-	return nil
 }
 
 func (a *Adapter) findFloatingIPByName(ctx context.Context, location, name string, billingAccountID int64) (*sdk.FloatingIP, error) {
@@ -2218,6 +2496,24 @@ func isRetryableReadback(ctx context.Context, err error) bool {
 	}
 	// A non-HTTP error from a GET is a transport or response-read failure. It is
 	// safe to retry within the bounded window because reads do not mutate state.
+	return true
+}
+
+func isRetryableCleanupMutation(err error) bool {
+	if errors.Is(err, sdk.ErrCrossOriginRedirect) || errors.Is(err, sdk.ErrMutationBlocked) {
+		return false
+	}
+	if sdk.IsNotFound(err) {
+		// A remote 404 may be stale or may describe an asynchronously applied
+		// prior mutation. Re-read exact state and retry only if it remains.
+		return true
+	}
+	var apiErr *sdk.APIError
+	if errors.As(err, &apiErr) {
+		return apiErr.Retryable || apiErr.StatusCode == http.StatusRequestTimeout
+	}
+	// Transport and response-read failures are ambiguous. Exact identity is
+	// revalidated before every bounded retry.
 	return true
 }
 
