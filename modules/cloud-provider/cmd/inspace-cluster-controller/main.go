@@ -22,6 +22,7 @@ import (
 	"sigs.k8s.io/yaml"
 
 	"github.com/thanet-s/inspace-cloud-kube-modules/modules/client"
+	buildversion "github.com/thanet-s/inspace-cloud-kube-modules/modules/client/version"
 	"github.com/thanet-s/inspace-cloud-kube-modules/modules/cloud-provider/api/v1alpha1"
 	"github.com/thanet-s/inspace-cloud-kube-modules/modules/cloud-provider/pkg/bootstrap"
 )
@@ -73,7 +74,7 @@ func run() error {
 	flag.BoolVar(&deleteOwned, "delete", false, "delete only this cluster's deterministically owned infrastructure, then exit")
 	flag.Parse()
 	if version {
-		fmt.Println("inspace-cluster-controller dev")
+		fmt.Printf("inspace-cluster-controller %s\n", buildversion.Version)
 		return nil
 	}
 	if configPath == "" {
@@ -120,7 +121,7 @@ func run() error {
 	baseURL := defaultValue(os.Getenv("INSPACE_API_URL"), "https://api.inspace.cloud")
 	api, err := inspace.NewClient(inspace.Options{
 		BaseURL: baseURL, APIKey: apiToken, DangerouslyAllowMutations: allowMutations,
-		UserAgent: "inspace-cluster-controller/dev",
+		UserAgent: buildversion.UserAgent("inspace-cluster-controller"),
 	})
 	if err != nil {
 		return err

@@ -23,15 +23,17 @@ jobs:
       prerelease: ${{ steps.semver.outputs.prerelease }}
       arm64_images: ${{ steps.platforms.outputs.arm64_images }}
     steps:
-      - name: Require a SemVer tag
+      - name: Require a SemVer tag without build metadata
         id: semver
         shell: bash
         env:
           TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          if [[ ! "$TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
-            echo "Tag must be valid SemVer prefixed with v; got $TAG" >&2
+          # Docker tags cannot preserve SemVer's '+' build-metadata separator,
+          # so accepting it would make image and chart versions disagree.
+          if [[ ! "$TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "Tag must be valid SemVer prefixed with v and without build metadata; got $TAG" >&2
             exit 1
           fi
           version="${TAG#v}"
@@ -171,6 +173,7 @@ jobs:
           context: ${{ matrix.context }}
           file: ${{ matrix.dockerfile }}
           platforms: linux/${{ matrix.arch }}
+          build-args: VERSION=${{ needs.validate.outputs.version }}
           labels: ${{ steps.meta.outputs.labels }}
           sbom: true
           provenance: false
@@ -467,6 +470,16 @@ jobs:
           set -euo pipefail
           owner="${GITHUB_REPOSITORY_OWNER,,}"
           mkdir -p dist
+          values_file=charts/inspace-cloud-kube-modules/values.yaml
+          if [[ "$(grep -Ec '^    tag: ""$' "$values_file")" -ne 3 ]]; then
+            echo "expected exactly three release-managed empty image tags" >&2
+            exit 1
+          fi
+          sed -i "s/^    tag: \"\"$/    tag: \"$VERSION\"/" "$values_file"
+          if [[ "$(grep -Fxc "    tag: \"$VERSION\"" "$values_file")" -ne 3 ]]; then
+            echo "failed to pin every controller image tag to $VERSION" >&2
+            exit 1
+          fi
           helm lint charts/inspace-cloud-kube-modules-crds
           helm lint charts/inspace-cloud-kube-modules \
             --values charts/inspace-cloud-kube-modules/ci/test-values.yaml
@@ -478,6 +491,11 @@ jobs:
             --version "$VERSION" \
             --app-version "$VERSION" \
             --destination dist
+          if [[ "$(helm show values "dist/inspace-cloud-kube-modules-$VERSION.tgz" | \
+            grep -Fxc "    tag: \"$VERSION\"")" -ne 3 ]]; then
+            echo "packaged chart does not pin every controller image tag to $VERSION" >&2
+            exit 1
+          fi
           charts=(
             "inspace-cloud-kube-modules-crds|dist/inspace-cloud-kube-modules-crds-$VERSION.tgz"
             "inspace-cloud-kube-modules|dist/inspace-cloud-kube-modules-$VERSION.tgz"

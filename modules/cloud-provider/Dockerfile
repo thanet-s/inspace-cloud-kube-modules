@@ -4,6 +4,7 @@ FROM --platform=$BUILDPLATFORM golang:1.26.5 AS build
 
 ARG TARGETOS
 ARG TARGETARCH
+ARG VERSION=0.0.0-dev
 
 WORKDIR /workspace
 COPY modules/client/go.mod ./client/
@@ -15,8 +16,12 @@ WORKDIR /workspace
 COPY modules/client/ ./client/
 COPY modules/cloud-provider/ ./cloud-provider/
 WORKDIR /workspace/cloud-provider
-RUN GOWORK=off CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags='-s -w' -o /out/inspace-cloud-controller-manager ./cmd/inspace-cloud-controller-manager && \
-    GOWORK=off CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags='-s -w' -o /out/inspace-cluster-controller ./cmd/inspace-cluster-controller
+RUN GOWORK=off CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath \
+      -ldflags="-s -w -X=github.com/thanet-s/inspace-cloud-kube-modules/modules/client/version.Version=${VERSION} -X=k8s.io/component-base/version.gitVersion=v${VERSION}" \
+      -o /out/inspace-cloud-controller-manager ./cmd/inspace-cloud-controller-manager && \
+    GOWORK=off CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath \
+      -ldflags="-s -w -X=github.com/thanet-s/inspace-cloud-kube-modules/modules/client/version.Version=${VERSION}" \
+      -o /out/inspace-cluster-controller ./cmd/inspace-cluster-controller
 
 FROM gcr.io/distroless/static-debian12:nonroot
 LABEL org.opencontainers.image.title="InSpace Cloud Controller Manager" \

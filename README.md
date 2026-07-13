@@ -13,8 +13,8 @@ for clusters built directly on InSpace virtual machines rather than a managed
 Kubernetes service.
 
 > [!NOTE]
-> The project is currently published as release candidates. Review the supported
-> scope and test a release in an isolated account before production use.
+> Review the supported scope and test the release in an isolated account before
+> production use.
 
 ## Highlights
 

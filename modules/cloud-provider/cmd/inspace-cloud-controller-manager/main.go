@@ -23,6 +23,7 @@ import (
 	"k8s.io/klog/v2"
 
 	"github.com/thanet-s/inspace-cloud-kube-modules/modules/client"
+	buildversion "github.com/thanet-s/inspace-cloud-kube-modules/modules/client/version"
 	inspaceprovider "github.com/thanet-s/inspace-cloud-kube-modules/modules/cloud-provider/pkg/cloudprovider"
 )
 
@@ -66,7 +67,7 @@ func initializeCloud(config *cloudconfig.CompletedConfig) cloud.Interface {
 	}
 	api, err := inspace.NewClient(inspace.Options{
 		BaseURL: baseURL, APIKey: apiKey, DangerouslyAllowMutations: allowMutations,
-		UserAgent: "inspace-cloud-controller-manager/dev",
+		UserAgent: buildversion.UserAgent("inspace-cloud-controller-manager"),
 	})
 	if err != nil {
 		klog.Fatalf("initialize InSpace client: %v", err)
