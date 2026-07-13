@@ -145,13 +145,17 @@ the private VPC through the dedicated bastion; workload traffic reaches private
 targets through the TCP service path. Direct public SSH and NodePort access are
 not part of the worker firewall contract.
 
-Worker network policy relies on the validated InSpace cloud firewall. Generated bootstrap does not install or enable UFW. One `set -eu` orchestrator runs every bootstrap stage in order, executes `additionalUserData`, then disables and verifies UFW before it can start RKE2. The RKE2 service also has an `ExecStartPre` verifier, so initial launch and later restarts fail unless `ufw status` is inactive and its unit is inactive and disabled (an absent unit is safe). It never flushes or rewrites iptables/nftables, which belong to Cilium and RKE2. The adapter replaces a single strict VPC-subnet placeholder with the exact API-reported prefix before VM creation. Bootstrap then requires exactly one guest address in that prefix and writes it as `node-ip`; it never chooses the default interface or mistakes the floating address for a NIC address. A separate strict placeholder is replaced with the one allocated floating IPv4 for `node-external-ip`; unresolved or duplicate placeholders fail launch. The external CCM remains authoritative and must publish the same API-reported addresses as `InternalIP` and `ExternalIP`. InSpace service targets use the private node address. Deletion removes the Floating IP first, deletes the VM, and only then removes every stale firewall attachment for that exact VM UUID.
+Worker network policy relies on the validated InSpace cloud firewall. Generated bootstrap does not install or enable UFW. One `set -eu` orchestrator runs every bootstrap stage in order, executes `additionalUserData`, reapplies the required node tuning, then disables and verifies UFW before it can start RKE2. The RKE2 service also has an `ExecStartPre` verifier, so initial launch and later restarts fail unless `ufw status` is inactive and its unit is inactive and disabled (an absent unit is safe). It never flushes or rewrites iptables/nftables, which belong to Cilium and RKE2. The adapter replaces a single strict VPC-subnet placeholder with the exact API-reported prefix before VM creation. Bootstrap then requires exactly one guest address in that prefix and writes it as `node-ip`; it never chooses the default interface or mistakes the floating address for a NIC address. A separate strict placeholder is replaced with the one allocated floating IPv4 for `node-external-ip`; unresolved or duplicate placeholders fail launch. The external CCM remains authoritative and must publish the same API-reported addresses as `InternalIP` and `ExternalIP`. InSpace service targets use the private node address. Deletion removes the Floating IP first, deletes the VM, and only then removes every stale firewall attachment for that exact VM UUID.
 
 ## RKE2 agent bootstrap
 
 `cloud_init` is sent as an API-compatible JSON object. On stock Ubuntu 24.04 it:
 
-- waits up to 60 attempts for `apt-get` to succeed after floating-IP egress exists, then installs `curl`, CA certificates, `gzip`, `iproute2`, and `tar`;
+- disables active swap and idempotently comments persistent swap entries in `/etc/fstab`;
+- changes stock Ubuntu archive endpoints to Thailand's regional mirror when they appear in either the deb822 or legacy source file;
+- waits within one hard ten-minute package-preparation budget for floating-IP egress, then updates and upgrades the image before installing `curl`, CA certificates, `gzip`, `iproute2`, `procps`, and `tar`;
+- persists and applies IPv4 forwarding plus the RKE2-recommended inotify instance/watch limits under `/etc/sysctl.d`;
+- persists a high `nofile` PAM limit and applies `NOFILE`, unlimited process/memory-lock, and unlimited task limits directly to `rke2-agent.service`;
 - downloads the exact RKE2 `rke2.linux-amd64.tar.gz` release and its `sha256sum-amd64.txt` asset with at most 60 attempts per asset;
 - verifies the tarball checksum and installed RKE2 version;
 - configures the agent to join the stable TCP/9345 supervisor endpoint;
@@ -216,7 +220,7 @@ INSPACE_ALLOW_REMOTE_MUTATIONS=true \
 make live-test
 ```
 
-It additionally requires `INSPACE_API_TOKEN`, `INSPACE_BILLING_ACCOUNT_ID`, `INSPACE_NETWORK_UUID`, `INSPACE_CONTROL_PLANE_VIP`, `INSPACE_PRIVATE_LOAD_BALANCER_POOL_START`, `INSPACE_PRIVATE_LOAD_BALANCER_POOL_STOP`, `INSPACE_FIREWALL_UUID`, and `INSPACE_INTEL_HOST_POOL_UUID`. The VPC, supervisor VIP, and Service range must satisfy the fixed pod/Service-CIDR constraints above. The supplied firewall must already satisfy the VPC/pod-CIDR TCP, UDP, and ICMP contract above with no public inbound rule; the live test performs a read-only preflight before creating resources. Normal `go test ./...` compiles this test but skips it before reading those values.
+It additionally requires `INSPACE_API_TOKEN`, `INSPACE_BILLING_ACCOUNT_ID`, `INSPACE_NETWORK_UUID`, `INSPACE_CONTROL_PLANE_VIP`, `INSPACE_PRIVATE_LOAD_BALANCER_POOL_START`, `INSPACE_PRIVATE_LOAD_BALANCER_POOL_STOP`, `INSPACE_FIREWALL_UUID`, and `INSPACE_AMD_HOST_POOL_UUID`. The live adapter lifecycle deliberately creates its worker on the `amd-epyc` class. The VPC, supervisor VIP, and Service range must satisfy the fixed pod/Service-CIDR constraints above. The supplied firewall must already satisfy the VPC/pod-CIDR TCP, UDP, and ICMP contract above with no public inbound rule; the live test performs a read-only preflight before creating resources. Normal `go test ./...` compiles this test but skips it before reading those values.
 
 That smaller test covers the InSpace API lifecycle only. The separate
 [full-cluster release acceptance test](../../test/e2e/README.md) deploys the

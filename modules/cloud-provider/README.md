@@ -23,6 +23,10 @@ and the fixed three-server RKE2 bootstrap reconciler.
   election; Kubernetes Service handling is disabled.
 - Pinned RKE2 release tarball installation verified against the matching
   official `sha256sum-amd64.txt` release asset.
+- Pre-RKE2 Ubuntu preparation disables swap, rewrites stock archive endpoints to the Thailand archive
+  mirror, updates and upgrades packages within a hard ten-minute budget, and
+  persists IPv4 forwarding, RKE2 inotify values, PAM `nofile`, and matching
+  `rke2-server.service` resource limits.
 - RKE2's packaged Cilium CNI in native-routing mode, with direct node routes,
   full kube-proxy replacement, LB-IPAM and L2 announcements. Cilium Node IPAM
   is explicitly disabled and is never used for Service addressing.

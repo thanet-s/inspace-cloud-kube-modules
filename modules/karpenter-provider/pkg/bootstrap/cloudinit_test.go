@@ -98,6 +98,20 @@ func TestRenderIncludesExactlyOneRegistrationTaint(t *testing.T) {
 		"systemctl disable --now ufw.service",
 		"systemctl start --no-block rke2-agent.service",
 		`[ "$attempt" -ge 180 ]`,
+		"swapoff -a",
+		"http://th.archive.ubuntu.com",
+		"apt-get -o DPkg::Lock::Timeout=30 upgrade -y",
+		"NEEDRESTART_MODE=a",
+		"package_deadline=$(( $(date +%s) + 600 ))",
+		"timeout --kill-after=30s",
+		"ca-certificates curl gzip iproute2 procps tar",
+		"net.ipv4.ip_forward = 1",
+		"fs.inotify.max_user_instances = 8192",
+		"fs.inotify.max_user_watches = 524288",
+		"LimitNOFILE=1048576",
+		"LimitNPROC=infinity",
+		"LimitMEMLOCK=infinity",
+		"TasksMax=infinity",
 		"waiting for floating-IP egress",
 		"attempt $attempt",
 		"--retry-all-errors",
@@ -109,8 +123,8 @@ func TestRenderIncludesExactlyOneRegistrationTaint(t *testing.T) {
 	if strings.Contains(strings.ToLower(rendered), "k3s") {
 		t.Fatalf("RKE2 bootstrap retained a K3s artifact:\n%s", rendered)
 	}
-	if SchemaVersion != "stock-ubuntu-rke2-v3" {
-		t.Fatalf("bootstrap schema = %q, want exact-VPC/firewall/startup drift version v3", SchemaVersion)
+	if SchemaVersion != "stock-ubuntu-rke2-v4" {
+		t.Fatalf("bootstrap schema = %q, want host-preparation/node-tuning drift version v4", SchemaVersion)
 	}
 }
 
@@ -135,8 +149,71 @@ func TestRenderedShellScriptsHaveValidSyntax(t *testing.T) {
 		}
 		checked++
 	}
-	if checked != 8 {
-		t.Fatalf("syntax-checked %d shell scripts, want eight; runcmd=%#v", checked, doc.RunCmd)
+	if checked != 10 {
+		t.Fatalf("syntax-checked %d shell scripts, want ten; runcmd=%#v", checked, doc.RunCmd)
+	}
+}
+
+func TestRenderedHostPreparationAndNodeTuningContracts(t *testing.T) {
+	data, err := RenderCloudInit(Config{
+		NodeName: "worker-1", Server: "https://10.0.0.10:9345", Token: "secret-token",
+		RKE2Version: "v1.35.6+rke2r1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc := mustDocument(t, data)
+
+	if got, want := writeFileContent(t, doc, "/etc/sysctl.d/90-inspace-kubernetes.conf"), "net.ipv4.ip_forward = 1\nfs.inotify.max_user_instances = 8192\nfs.inotify.max_user_watches = 524288\n"; got != want {
+		t.Fatalf("persistent Kubernetes sysctls differ\ngot:\n%swant:\n%s", got, want)
+	}
+	if got, want := writeFileContent(t, doc, "/etc/security/limits.d/90-inspace-kubernetes.conf"), "* soft nofile 1048576\n* hard nofile 1048576\nroot soft nofile 1048576\nroot hard nofile 1048576\n"; got != want {
+		t.Fatalf("persistent PAM nofile limits differ\ngot:\n%swant:\n%s", got, want)
+	}
+	if got, want := writeFileContent(t, doc, "/etc/systemd/system/rke2-agent.service.d/20-inspace-node-limits.conf"), "[Service]\nLimitNOFILE=1048576\nLimitNPROC=infinity\nLimitMEMLOCK=infinity\nTasksMax=infinity\n"; got != want {
+		t.Fatalf("RKE2 agent service limits differ\ngot:\n%swant:\n%s", got, want)
+	}
+
+	prepare := writeFileContent(t, doc, "/usr/local/sbin/inspace-prepare-kubernetes-node")
+	for _, want := range []string{
+		"swapoff -a",
+		`/^[[:space:]]*#/! { /[[:space:]]swap[[:space:]]/ s/^/#/; }`,
+		"/etc/apt/sources.list.d/ubuntu.sources",
+		"/etc/apt/sources.list",
+		`sed -E -i 's|https?://archive\.ubuntu\.com|http://th.archive.ubuntu.com|g' "$ubuntu_sources"`,
+		`[ -f "$ubuntu_sources" ] || continue`,
+	} {
+		if !strings.Contains(prepare, want) {
+			t.Errorf("host-preparation script is missing %q\n%s", want, prepare)
+		}
+	}
+	if strings.Contains(prepare, "apt-get") {
+		t.Fatalf("host preparation must finish before the separately retried package stage\n%s", prepare)
+	}
+
+	prerequisites := writeFileContent(t, doc, "/usr/local/sbin/inspace-install-prerequisites")
+	updateIndex := strings.Index(prerequisites, " update &&")
+	upgradeIndex := strings.Index(prerequisites, " upgrade -y &&")
+	installIndex := strings.Index(prerequisites, " install -y --no-install-recommends")
+	if updateIndex < 0 || upgradeIndex <= updateIndex || installIndex <= upgradeIndex {
+		t.Fatalf("apt update/upgrade/install order differs\n%s", prerequisites)
+	}
+	if !strings.Contains(prerequisites, "ca-certificates curl gzip iproute2 procps tar") {
+		t.Fatalf("prerequisites must install procps for persistent sysctl application\n%s", prerequisites)
+	}
+
+	apply := writeFileContent(t, doc, "/usr/local/sbin/inspace-apply-node-tuning")
+	for _, want := range []string{
+		"sysctl --system >/dev/null",
+		`[ "$(sysctl -n net.ipv4.ip_forward)" -eq 1 ]`,
+		`[ "$(sysctl -n fs.inotify.max_user_instances)" -ge 8192 ]`,
+		`[ "$(sysctl -n fs.inotify.max_user_watches)" -ge 524288 ]`,
+		`[ -z "$(swapon --show --noheadings)" ]`,
+		"/var/lib/inspace/kubernetes-node-prepared-v1",
+	} {
+		if !strings.Contains(apply, want) {
+			t.Errorf("node-tuning script is missing %q\n%s", want, apply)
+		}
 	}
 }
 
@@ -329,10 +406,15 @@ func TestBootstrapOrchestratorIsFailFastAndDisablesFirewallAfterAdditionalData(t
 		t.Fatalf("RKE2 service lacks host-firewall pre-start gate\n%s", dropIn)
 	}
 	additionalIndex := strings.Index(orchestrator, "cloud-init-per once inspace-additional-user-data")
+	prepareIndex := strings.Index(orchestrator, "/usr/local/sbin/inspace-prepare-kubernetes-node")
+	prerequisitesIndex := strings.Index(orchestrator, "/usr/local/sbin/inspace-install-prerequisites")
+	installIndex := strings.Index(orchestrator, "/usr/local/sbin/inspace-install-rke2")
+	detectIndex := strings.Index(orchestrator, "/usr/local/sbin/inspace-detect-private-ip")
+	tuningIndex := strings.Index(orchestrator, "/usr/local/sbin/inspace-apply-node-tuning")
 	disableIndex := strings.Index(orchestrator, "/usr/local/sbin/inspace-disable-host-firewall")
 	verifyIndex := strings.Index(orchestrator, "/usr/local/sbin/inspace-verify-host-firewall")
 	startIndex := strings.Index(orchestrator, "/usr/local/sbin/inspace-start-rke2-agent")
-	if additionalIndex < 0 || disableIndex <= additionalIndex || verifyIndex <= disableIndex || startIndex <= verifyIndex {
+	if prepareIndex < 0 || prerequisitesIndex <= prepareIndex || installIndex <= prerequisitesIndex || detectIndex <= installIndex || additionalIndex <= detectIndex || tuningIndex <= additionalIndex || disableIndex <= tuningIndex || verifyIndex <= disableIndex || startIndex <= verifyIndex {
 		t.Fatalf("unsafe orchestrator order\n%s", orchestrator)
 	}
 
@@ -345,7 +427,7 @@ if [ "$name" = "${FAIL_STEP:-}" ]; then exit 1; fi
 exit 0
 `
 	for _, name := range []string{
-		"inspace-install-prerequisites", "inspace-install-rke2", "inspace-detect-private-ip",
+		"inspace-prepare-kubernetes-node", "inspace-install-prerequisites", "inspace-install-rke2", "inspace-detect-private-ip", "inspace-apply-node-tuning",
 		"inspace-additional-user-data", "inspace-disable-host-firewall", "inspace-verify-host-firewall", "inspace-start-rke2-agent", "cloud-init-per",
 	} {
 		writeExecutable(t, filepath.Join(stubDir, name), stub)
@@ -374,13 +456,13 @@ exit 0
 	if strings.Contains(log, "inspace-start-rke2-agent") {
 		t.Fatalf("agent start ran after firewall verification failure\n%s", log)
 	}
-	wantBeforeFailure := "inspace-install-prerequisites\ninspace-install-rke2\ninspace-detect-private-ip\ncloud-init-per\ninspace-disable-host-firewall\ninspace-verify-host-firewall\n"
+	wantBeforeFailure := "inspace-prepare-kubernetes-node\ninspace-install-prerequisites\ninspace-install-rke2\ninspace-detect-private-ip\ncloud-init-per\ninspace-apply-node-tuning\ninspace-disable-host-firewall\ninspace-verify-host-firewall\n"
 	if log != wantBeforeFailure {
 		t.Fatalf("failure order differs\ngot:\n%swant:\n%s", log, wantBeforeFailure)
 	}
 
 	log, err = run("inspace-install-prerequisites")
-	if err == nil || log != "inspace-install-prerequisites\n" {
+	if err == nil || log != "inspace-prepare-kubernetes-node\ninspace-install-prerequisites\n" {
 		t.Fatalf("prerequisite failure did not stop orchestrator: err=%v log=%q", err, log)
 	}
 }

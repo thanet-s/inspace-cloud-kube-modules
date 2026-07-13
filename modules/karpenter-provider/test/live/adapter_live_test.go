@@ -67,8 +67,8 @@ func TestLiveAdapterCreateGetListDelete(t *testing.T) {
 		ControlPlaneVIP:              controlPlaneVIP,
 		PrivateLoadBalancerPoolStart: requireEnv("INSPACE_PRIVATE_LOAD_BALANCER_POOL_START"),
 		PrivateLoadBalancerPoolStop:  requireEnv("INSPACE_PRIVATE_LOAD_BALANCER_POOL_STOP"),
-		OSName:                       "ubuntu", OSVersion: "24.04", HostPoolUUID: requireEnv("INSPACE_INTEL_HOST_POOL_UUID"),
-		HostClass: "intel-scalable", InstanceType: "is-compute-2c-2g", VCPU: 2, MemoryGiB: 2, RootDiskGiB: 30,
+		OSName:                       "ubuntu", OSVersion: "24.04", HostPoolUUID: requireEnv("INSPACE_AMD_HOST_POOL_UUID"),
+		HostClass: "amd-epyc", InstanceType: "is-compute-2c-2g", VCPU: 2, MemoryGiB: 2, RootDiskGiB: 30,
 		PublicIPv4: true, CloudInitJSON: cloudInit, SpecHash: "inspace-e2e", BootstrapHash: "inspace-e2e",
 	}
 	if err := adapter.ValidateNodeClass(ctx, request.Location, request.NetworkUUID, request.ControlPlaneVIP, request.PrivateLoadBalancerPoolStart, request.PrivateLoadBalancerPoolStop, request.HostPoolUUID, request.FirewallUUID); err != nil {

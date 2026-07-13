@@ -16,6 +16,26 @@ var rke2VersionPattern = regexp.MustCompile(`^v[0-9]+\.[0-9]+\.[0-9]+\+rke2r[0-9
 
 const kubeVIPImage = "ghcr.io/kube-vip/kube-vip:v1.2.1@sha256:49b77655f9f109bedc5eb25723bb0e4c57d8513ba33cc69c31be3f243eb2386d"
 
+const kubernetesSysctlConfig = `# Managed by InSpace Kubernetes bootstrap.
+net.ipv4.ip_forward = 1
+fs.inotify.max_user_instances = 8192
+fs.inotify.max_user_watches = 524288
+`
+
+const kubernetesLimitsConfig = `# Managed by InSpace Kubernetes bootstrap.
+* soft nofile 1048576
+* hard nofile 1048576
+root soft nofile 1048576
+root hard nofile 1048576
+`
+
+const rke2ServerLimitsConfig = `[Service]
+LimitNOFILE=1048576
+LimitNPROC=infinity
+LimitMEMLOCK=infinity
+TasksMax=infinity
+`
+
 type CloudInitInput struct {
 	NodeName                     string
 	NodeExternalIPv4             string
@@ -96,6 +116,9 @@ func RenderCloudInitJSON(input CloudInitInput) (string, error) {
 	addFile("/var/lib/inspace/rke2-cilium-config", ciliumConfig, "0600")
 	addFile("/var/lib/inspace/rke2-cilium-private-load-balancer", ciliumLoadBalancerConfig, "0600")
 	addFile("/var/lib/inspace/rke2-kube-vip", kubeVIPConfig, "0600")
+	addFile("/etc/sysctl.d/90-inspace-kubernetes.conf", kubernetesSysctlConfig, "0644")
+	addFile("/etc/security/limits.d/90-inspace-kubernetes.conf", kubernetesLimitsConfig, "0644")
+	addFile("/etc/systemd/system/rke2-server.service.d/20-inspace-node-limits.conf", rke2ServerLimitsConfig, "0644")
 	payload.RunCmd = []string{"/usr/local/sbin/inspace-bootstrap-rke2"}
 	data, err := json.Marshal(payload)
 	if err != nil {
@@ -195,6 +218,8 @@ spec:
     autoDirectNodeRoutes: true
     kubeProxyReplacement: true
     enableIPv4Masquerade: true
+    bpf:
+      masquerade: true
     l2announcements:
       enabled: true
     defaultLBServiceIPAM: none
@@ -326,13 +351,39 @@ func renderInstallScript(input CloudInitInput) string {
 	return fmt.Sprintf(`#!/bin/sh
 set -eu
 
+swapoff -a
+if [ -f /etc/fstab ]; then
+  sed -Ei '/^[[:space:]]*#/! { /[[:space:]]swap[[:space:]]/ s/^/#/; }' /etc/fstab
+fi
+for ubuntu_sources in /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list; do
+  [ -f "$ubuntu_sources" ] || continue
+  sed -E -i 's|https?://archive\.ubuntu\.com|http://th.archive.ubuntu.com|g' "$ubuntu_sources"
+  if grep -E 'https?://archive\.ubuntu\.com' "$ubuntu_sources" >/dev/null; then exit 1; fi
+done
+
+package_deadline=$(( $(date +%%s) + 600 ))
+run_package_command() {
+  package_remaining=$(( package_deadline - $(date +%%s) ))
+  [ "$package_remaining" -gt 0 ] || return 124
+  timeout --kill-after=30s "${package_remaining}s" "$@"
+}
 attempt=0
-until apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 update && \
-      DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=30 install -y --no-install-recommends ca-certificates curl iproute2 tar; do
+until run_package_command apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 update && \
+	  run_package_command env NEEDRESTART_MODE=a DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=30 upgrade -y && \
+	  run_package_command env NEEDRESTART_MODE=a DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=30 install -y --no-install-recommends ca-certificates curl iproute2 procps tar; do
   attempt=$((attempt + 1))
-  if [ "$attempt" -ge 60 ]; then exit 1; fi
+  if [ "$attempt" -ge 60 ] || [ "$(date +%%s)" -ge "$package_deadline" ]; then exit 1; fi
   sleep 10
 done
+
+sysctl --system >/dev/null
+test "$(sysctl -n net.ipv4.ip_forward)" -eq 1
+test "$(sysctl -n fs.inotify.max_user_instances)" -ge 8192
+test "$(sysctl -n fs.inotify.max_user_watches)" -ge 524288
+test -z "$(swapon --show --noheadings)"
+install -d -m 0755 /var/lib/inspace
+: > /var/lib/inspace/kubernetes-node-prepared-v1
+chmod 0600 /var/lib/inspace/kubernetes-node-prepared-v1
 
 vpc_subnet='%s'
 virtual_ip='%s'

@@ -439,6 +439,7 @@
   hosts: rke2_control_plane
   gather_facts: false
   strategy: free
+  any_errors_fatal: true
   tasks:
     - name: Probe every private control-plane SSH port from the bastion in parallel
       ansible.builtin.command:
@@ -490,6 +491,171 @@
       become: true
       changed_when: false
 
+    - name: Detect completed product node preparation on every control plane
+      ansible.builtin.stat:
+        path: /var/lib/inspace/kubernetes-node-prepared-v1
+      register: e2e_node_preparation
+      become: true
+
+    - name: Disable active swap on every control plane in parallel
+      ansible.builtin.shell: |
+        set -euo pipefail
+        if swapon --noheadings | grep -q .; then
+          swapoff -a
+        fi
+      args:
+        executable: /bin/bash
+      become: true
+      changed_when: false
+      when: not e2e_node_preparation.stat.exists
+
+    - name: Disable persistent swap entries on every control plane in parallel
+      ansible.builtin.replace:
+        path: /etc/fstab
+        regexp: '^(?!\s*#)(.*\s+swap\s+.*)$'
+        replace: '#\1'
+      become: true
+      when: not e2e_node_preparation.stat.exists
+
+    - name: Detect Ubuntu archive source files on every control plane
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop:
+        - /etc/apt/sources.list.d/ubuntu.sources
+        - /etc/apt/sources.list
+      register: e2e_ubuntu_sources
+      become: true
+
+    - name: Select the Thailand Ubuntu archive mirror on every control plane in parallel
+      ansible.builtin.replace:
+        path: "{{ item }}"
+        regexp: 'https?://archive\.ubuntu\.com'
+        replace: 'http://th.archive.ubuntu.com'
+      loop: >-
+        {{ (e2e_ubuntu_sources.results | default([])) |
+           selectattr('stat.exists') | map(attribute='item') | list }}
+      become: true
+      when: not e2e_node_preparation.stat.exists
+
+    - name: Update and upgrade every control plane in parallel
+      ansible.builtin.apt:
+        update_cache: true
+        upgrade: 'yes'
+        lock_timeout: 300
+      environment:
+        DEBIAN_FRONTEND: noninteractive
+        NEEDRESTART_MODE: l
+      become: true
+      async: 600
+      poll: 10
+      when: not e2e_node_preparation.stat.exists
+
+    - name: Persist Kubernetes sysctls on repaired control planes
+      ansible.builtin.copy:
+        content: |
+          # Managed by InSpace Kubernetes bootstrap.
+          net.ipv4.ip_forward = 1
+          fs.inotify.max_user_instances = 8192
+          fs.inotify.max_user_watches = 524288
+        dest: /etc/sysctl.d/90-inspace-kubernetes.conf
+        owner: root
+        group: root
+        mode: "0644"
+      become: true
+      when: not e2e_node_preparation.stat.exists
+
+    - name: Persist Kubernetes PAM limits on repaired control planes
+      ansible.builtin.copy:
+        content: |
+          # Managed by InSpace Kubernetes bootstrap.
+          * soft nofile 1048576
+          * hard nofile 1048576
+          root soft nofile 1048576
+          root hard nofile 1048576
+        dest: /etc/security/limits.d/90-inspace-kubernetes.conf
+        owner: root
+        group: root
+        mode: "0644"
+      become: true
+      when: not e2e_node_preparation.stat.exists
+
+    - name: Create the repaired RKE2 server drop-in directory
+      ansible.builtin.file:
+        path: /etc/systemd/system/rke2-server.service.d
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+      become: true
+      when: not e2e_node_preparation.stat.exists
+
+    - name: Persist RKE2 server limits on repaired control planes
+      ansible.builtin.copy:
+        content: |
+          [Service]
+          LimitNOFILE=1048576
+          LimitNPROC=infinity
+          LimitMEMLOCK=infinity
+          TasksMax=infinity
+        dest: /etc/systemd/system/rke2-server.service.d/20-inspace-node-limits.conf
+        owner: root
+        group: root
+        mode: "0644"
+      become: true
+      when: not e2e_node_preparation.stat.exists
+
+    - name: Apply Kubernetes sysctls on repaired control planes
+      ansible.builtin.command: sysctl --system
+      become: true
+      when: not e2e_node_preparation.stat.exists
+
+    - name: Restart repaired RKE2 servers one at a time and prove local readiness
+      ansible.builtin.shell: |
+        set -euo pipefail
+        systemctl daemon-reload
+        old_pid=$(systemctl show rke2-server.service --property=MainPID --value)
+        test "$old_pid" -gt 0
+        systemctl restart --no-block rke2-server.service
+        restart_deadline=$(( $(date +%s) + 1200 ))
+        attempt=0
+        while true; do
+          new_pid=$(systemctl show rke2-server.service --property=MainPID --value)
+          if test "$new_pid" -gt 0 && test "$new_pid" != "$old_pid" && \
+             systemctl is-active --quiet rke2-server.service && \
+             timeout 10s /var/lib/rancher/rke2/bin/kubectl \
+               --kubeconfig /etc/rancher/rke2/rke2.yaml get --raw='/readyz?verbose' | \
+               grep -F '[+]etcd ok'; then
+            break
+          fi
+          attempt=$((attempt + 1))
+          if systemctl is-failed --quiet rke2-server.service || [ "$attempt" -ge 180 ] || [ "$(date +%s)" -ge "$restart_deadline" ]; then exit 1; fi
+          sleep 5
+        done
+        test -z "$(swapon --noheadings)"
+        if awk '$0 !~ /^[[:space:]]*#/ && NF >= 3 && $3 == "swap" { found=1 } END { exit found ? 0 : 1 }' /etc/fstab; then exit 1; fi
+        test "$(sysctl -n net.ipv4.ip_forward)" -eq 1
+        test "$(sysctl -n fs.inotify.max_user_instances)" -ge 8192
+        test "$(sysctl -n fs.inotify.max_user_watches)" -ge 524288
+        test "$(systemctl show rke2-server.service --property=LimitNOFILE --value)" = 1048576
+        test "$(systemctl show rke2-server.service --property=LimitNPROC --value)" = infinity
+        test "$(systemctl show rke2-server.service --property=LimitMEMLOCK --value)" = infinity
+        test "$(systemctl show rke2-server.service --property=TasksMax --value)" = infinity
+      args:
+        executable: /bin/bash
+      become: true
+      throttle: 1
+      when: not e2e_node_preparation.stat.exists
+
+    - name: Persist completed repaired node preparation
+      ansible.builtin.file:
+        path: /var/lib/inspace/kubernetes-node-prepared-v1
+        state: touch
+        owner: root
+        group: root
+        mode: "0600"
+      become: true
+      when: not e2e_node_preparation.stat.exists
+
     - name: Wait for every rke2-server service in parallel
       ansible.builtin.command: systemctl is-active rke2-server
       become: true
@@ -523,6 +689,23 @@
         ip -4 -o addr show scope global | grep -F -- "{{ e2e_private_ip }}/"
         ! ip -4 -o addr show scope global | grep -F -- "{{ e2e_public_ip }}/"
         ! pgrep -x kube-proxy
+        test -f /var/lib/inspace/kubernetes-node-prepared-v1
+        test -z "$(swapon --noheadings)"
+        if awk '$0 !~ /^[[:space:]]*#/ && NF >= 3 && $3 == "swap" { found=1 } END { exit found ? 0 : 1 }' /etc/fstab; then exit 1; fi
+        for ubuntu_sources in /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list; do
+          test ! -f "$ubuntu_sources" || ! grep -E 'https?://archive\.ubuntu\.com' "$ubuntu_sources"
+        done
+        grep -Fqx 'net.ipv4.ip_forward = 1' /etc/sysctl.d/90-inspace-kubernetes.conf
+        grep -Fqx 'fs.inotify.max_user_instances = 8192' /etc/sysctl.d/90-inspace-kubernetes.conf
+        grep -Fqx 'fs.inotify.max_user_watches = 524288' /etc/sysctl.d/90-inspace-kubernetes.conf
+        test "$(sysctl -n net.ipv4.ip_forward)" -eq 1
+        test "$(sysctl -n fs.inotify.max_user_instances)" -ge 8192
+        test "$(sysctl -n fs.inotify.max_user_watches)" -ge 524288
+        grep -Fqx 'root hard nofile 1048576' /etc/security/limits.d/90-inspace-kubernetes.conf
+        test "$(systemctl show rke2-server.service --property=LimitNOFILE --value)" = 1048576
+        test "$(systemctl show rke2-server.service --property=LimitNPROC --value)" = infinity
+        test "$(systemctl show rke2-server.service --property=LimitMEMLOCK --value)" = infinity
+        test "$(systemctl show rke2-server.service --property=TasksMax --value)" = infinity
         if command -v ufw >/dev/null 2>&1; then
           ufw_status=$(ufw status)
           ! grep -Eiq '^Status:[[:space:]]+active' <<<"$ufw_status"
@@ -672,6 +855,8 @@
           .data["ipv4-native-routing-cidr"] == "10.42.0.0/16" and
           .data["auto-direct-node-routes"] == "true" and
           .data["kube-proxy-replacement"] == "true" and
+          .data["enable-ipv4-masquerade"] == "true" and
+          .data["enable-bpf-masquerade"] == "true" and
           .data["enable-l2-announcements"] == "true" and
           .data["default-lb-service-ipam"] == "none"'
         values=$(kubectl -n kube-system get helmchartconfig rke2-cilium -o jsonpath='{.spec.valuesContent}')
@@ -691,6 +876,8 @@
         start, stop = map(ipaddress.ip_address, sys.argv[1:])
         addresses = int(stop) - int(start) + 1
         qps = max(10, math.ceil(addresses / 5))
+        assert values["enableIPv4Masquerade"] is True
+        assert values["bpf"]["masquerade"] is True
         assert values["l2announcements"]["enabled"] is True
         assert values["defaultLBServiceIPAM"] == "none"
         assert values["nodeIPAM"]["enabled"] is False
@@ -719,6 +906,7 @@
         cilium_status=$(kubectl -n kube-system exec daemonset/cilium -- cilium-dbg status --verbose)
         grep -E 'KubeProxyReplacement:[[:space:]]+True' <<<"$cilium_status"
         grep -E '(Routing:.*Native|Direct Routing)' <<<"$cilium_status"
+        grep -E 'Masquerading:[[:space:]]+BPF' <<<"$cilium_status"
       args:
         executable: /bin/bash
       register: e2e_cilium_private_lb_ready
@@ -1091,6 +1279,10 @@
         set -euo pipefail
         kubectl apply -f "{{ e2e_state_dir }}/karpenter.yaml"
         kubectl wait --for=condition=Ready "inspacenodeclass/{{ e2e_nodeclass_name }}" --timeout=10m
+        kubectl get "inspacenodeclass/{{ e2e_nodeclass_name }}" -o json | jq -e \
+          --arg pool "$INSPACE_AMD_HOST_POOL_UUID" '
+          .spec.hostPoolSelector.class == "amd-epyc" and
+          .status.hostPoolUUID == $pool'
       args:
         executable: /bin/bash
       changed_when: true
@@ -1228,6 +1420,23 @@
         ip -4 -o addr show scope global | grep -F -- "{{ e2e_private_ip }}/"
         ! ip -4 -o addr show scope global | grep -F -- "{{ e2e_public_ip }}/"
         ! pgrep -x kube-proxy
+        test -f /var/lib/inspace/kubernetes-node-prepared-v1
+        test -z "$(swapon --noheadings)"
+        if awk '$0 !~ /^[[:space:]]*#/ && NF >= 3 && $3 == "swap" { found=1 } END { exit found ? 0 : 1 }' /etc/fstab; then exit 1; fi
+        for ubuntu_sources in /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list; do
+          test ! -f "$ubuntu_sources" || ! grep -E 'https?://archive\.ubuntu\.com' "$ubuntu_sources"
+        done
+        grep -Fqx 'net.ipv4.ip_forward = 1' /etc/sysctl.d/90-inspace-kubernetes.conf
+        grep -Fqx 'fs.inotify.max_user_instances = 8192' /etc/sysctl.d/90-inspace-kubernetes.conf
+        grep -Fqx 'fs.inotify.max_user_watches = 524288' /etc/sysctl.d/90-inspace-kubernetes.conf
+        test "$(sysctl -n net.ipv4.ip_forward)" -eq 1
+        test "$(sysctl -n fs.inotify.max_user_instances)" -ge 8192
+        test "$(sysctl -n fs.inotify.max_user_watches)" -ge 524288
+        grep -Fqx 'root hard nofile 1048576' /etc/security/limits.d/90-inspace-kubernetes.conf
+        test "$(systemctl show rke2-agent.service --property=LimitNOFILE --value)" = 1048576
+        test "$(systemctl show rke2-agent.service --property=LimitNPROC --value)" = infinity
+        test "$(systemctl show rke2-agent.service --property=LimitMEMLOCK --value)" = infinity
+        test "$(systemctl show rke2-agent.service --property=TasksMax --value)" = infinity
         if command -v ufw >/dev/null 2>&1; then
           ufw_status=$(ufw status)
           ! grep -Eiq '^Status:[[:space:]]+active' <<<"$ufw_status"
@@ -1275,6 +1484,8 @@
           .data["ipv4-native-routing-cidr"] == "10.42.0.0/16" and
           .data["auto-direct-node-routes"] == "true" and
           .data["kube-proxy-replacement"] == "true" and
+          .data["enable-ipv4-masquerade"] == "true" and
+          .data["enable-bpf-masquerade"] == "true" and
           .data["enable-l2-announcements"] == "true" and
           .data["default-lb-service-ipam"] == "none"'
         kubectl get ciliumloadbalancerippool inspace-private
@@ -1291,7 +1502,10 @@
           status=$(timeout --kill-after=5s 60s kubectl -n kube-system exec "$pod" -- cilium-dbg status --verbose)
           grep -E 'KubeProxyReplacement:[[:space:]]+True' <<<"$status"
           grep -E '(Routing:.*Native|Direct Routing)' <<<"$status"
+          grep -E '^[[:space:]]*Masquerading:[[:space:]]+BPF([[:space:]]+\(ip-masq-agent\))?[[:space:]]+\[[^][]+\][[:space:]]+10\.42\.0\.0/16([[:space:]]|$)' <<<"$status"
           config=$(timeout --kill-after=5s 60s kubectl -n kube-system exec "$pod" -- cilium-dbg config --all)
+          grep -E '^EnableBPFMasquerade[[:space:]]*:[[:space:]]*true$' <<<"$config"
+          grep -E '^EnableIPv4Masquerade[[:space:]]*:[[:space:]]*true$' <<<"$config"
           grep -E 'EnableL2Announcements[[:space:]]*:[[:space:]]*true' <<<"$config"
           printf 'verified cilium datapath on %s via %s\n' "$node" "$pod"
         done < <(jq -r '.items[] | [.metadata.name,.spec.nodeName] | @tsv' <<<"$cilium")

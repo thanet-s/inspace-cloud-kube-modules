@@ -101,6 +101,8 @@ func TestClusterE2EProvisionsAndWaitsForThreeControlPlanesInParallel(t *testing.
 		"ansible.builtin.wait_for_connection:",
 		"until: e2e_rke2_service.rc == 0 and e2e_rke2_service.stdout == 'active'",
 		"until: e2e_local_readyz.rc == 0",
+		`EnableBPFMasquerade[[:space:]]*:[[:space:]]*true`,
+		`EnableIPv4Masquerade[[:space:]]*:[[:space:]]*true`,
 	} {
 		mustContain(t, "Ansible playbook", playbook, expected)
 	}
@@ -180,6 +182,62 @@ func TestClusterE2EProvisionsAndWaitsForThreeControlPlanesInParallel(t *testing.
 	requireParallelTask(t, cloudInit)
 	requireTaskModule(t, cloudInit, "ansible.builtin.raw")
 	mustContain(t, "control-plane cloud-init wait", taskString(t, cloudInit, "ansible.builtin.raw"), "timeout --kill-after=5s 1800s")
+	prepared := exactAnsibleTask(t, controlPlaneWait, "Detect completed product node preparation on every control plane")
+	requireParallelTask(t, prepared)
+	preparedConfig := requireTaskMapping(t, prepared, "ansible.builtin.stat")
+	requireMappingString(t, preparedConfig, "path", "/var/lib/inspace/kubernetes-node-prepared-v1")
+	disableSwap := exactAnsibleTask(t, controlPlaneWait, "Disable active swap on every control plane in parallel")
+	requireParallelTask(t, disableSwap)
+	requireTaskModule(t, disableSwap, "ansible.builtin.shell")
+	mustContain(t, "control-plane swap disable", taskString(t, disableSwap, "ansible.builtin.shell"), "swapoff -a")
+	persistSwap := exactAnsibleTask(t, controlPlaneWait, "Disable persistent swap entries on every control plane in parallel")
+	requireParallelTask(t, persistSwap)
+	persistSwapConfig := requireTaskMapping(t, persistSwap, "ansible.builtin.replace")
+	requireMappingString(t, persistSwapConfig, "regexp", `^(?!\s*#)(.*\s+swap\s+.*)$`)
+	mirror := exactAnsibleTask(t, controlPlaneWait, "Select the Thailand Ubuntu archive mirror on every control plane in parallel")
+	requireParallelTask(t, mirror)
+	mirrorConfig := requireTaskMapping(t, mirror, "ansible.builtin.replace")
+	requireMappingString(t, mirrorConfig, "regexp", `https?://archive\.ubuntu\.com`)
+	requireMappingString(t, mirrorConfig, "replace", "http://th.archive.ubuntu.com")
+	upgrade := exactAnsibleTask(t, controlPlaneWait, "Update and upgrade every control plane in parallel")
+	requireParallelTask(t, upgrade)
+	upgradeConfig := requireTaskMapping(t, upgrade, "ansible.builtin.apt")
+	requireMappingNumber(t, upgradeConfig, "lock_timeout", 300)
+	if updateCache, ok := upgradeConfig["update_cache"].(bool); !ok || !updateCache {
+		t.Fatalf("Ansible upgrade update_cache=%#v, want true", upgradeConfig["update_cache"])
+	}
+	requireMappingString(t, upgradeConfig, "upgrade", "yes")
+	requireTaskNumber(t, upgrade, "async", 600)
+	requireTaskNumber(t, upgrade, "poll", 10)
+	sysctls := exactAnsibleTask(t, controlPlaneWait, "Persist Kubernetes sysctls on repaired control planes")
+	requireParallelTask(t, sysctls)
+	sysctlCopy := requireTaskMapping(t, sysctls, "ansible.builtin.copy")
+	requireMappingString(t, sysctlCopy, "dest", "/etc/sysctl.d/90-inspace-kubernetes.conf")
+	limits := exactAnsibleTask(t, controlPlaneWait, "Persist Kubernetes PAM limits on repaired control planes")
+	requireParallelTask(t, limits)
+	limitsCopy := requireTaskMapping(t, limits, "ansible.builtin.copy")
+	requireMappingString(t, limitsCopy, "dest", "/etc/security/limits.d/90-inspace-kubernetes.conf")
+	dropInDirectory := exactAnsibleTask(t, controlPlaneWait, "Create the repaired RKE2 server drop-in directory")
+	requireParallelTask(t, dropInDirectory)
+	dropInDirectoryConfig := requireTaskMapping(t, dropInDirectory, "ansible.builtin.file")
+	requireMappingString(t, dropInDirectoryConfig, "path", "/etc/systemd/system/rke2-server.service.d")
+	requireMappingString(t, dropInDirectoryConfig, "state", "directory")
+	serviceLimits := exactAnsibleTask(t, controlPlaneWait, "Persist RKE2 server limits on repaired control planes")
+	requireParallelTask(t, serviceLimits)
+	serviceLimitsCopy := requireTaskMapping(t, serviceLimits, "ansible.builtin.copy")
+	requireMappingString(t, serviceLimitsCopy, "dest", "/etc/systemd/system/rke2-server.service.d/20-inspace-node-limits.conf")
+	restartRepaired := exactAnsibleTask(t, controlPlaneWait, "Restart repaired RKE2 servers one at a time and prove local readiness")
+	requireTaskModule(t, restartRepaired, "ansible.builtin.shell")
+	requireTaskNumber(t, restartRepaired, "throttle", 1)
+	restartScript := taskString(t, restartRepaired, "ansible.builtin.shell")
+	for _, expected := range []string{"old_pid=$(systemctl show rke2-server.service --property=MainPID --value)", `test "$new_pid" != "$old_pid"`, "systemctl restart --no-block rke2-server.service", "restart_deadline=$(( $(date +%s) + 1200 ))", "timeout 10s", "[+]etcd ok", "sysctl -n net.ipv4.ip_forward", "LimitNOFILE"} {
+		mustContain(t, "rolling repaired-server restart", restartScript, expected)
+	}
+	persistRepaired := exactAnsibleTask(t, controlPlaneWait, "Persist completed repaired node preparation")
+	requireParallelTask(t, persistRepaired)
+	persistRepairedConfig := requireTaskMapping(t, persistRepaired, "ansible.builtin.file")
+	requireMappingString(t, persistRepairedConfig, "path", "/var/lib/inspace/kubernetes-node-prepared-v1")
+	requireMappingString(t, persistRepairedConfig, "state", "touch")
 	service := exactAnsibleTask(t, controlPlaneWait, "Wait for every rke2-server service in parallel")
 	requireParallelTask(t, service)
 	requireTaskModule(t, service, "ansible.builtin.command")
@@ -210,6 +268,7 @@ func TestClusterE2ERendersRKE2WorkerAndCiliumKubeProxyReplacement(t *testing.T) 
 		"version: v1.35.6+rke2r1",
 		"server: {{ e2e_bootstrap_result.privateRegistrationEndpoint }}",
 		"name: inspace-rke2-agent-token",
+		"class: amd-epyc",
 		"sshUsername: {{ e2e_ssh_user }}",
 		"sshPublicKey: {{ e2e_ssh_public_key | to_json }}",
 	} {
@@ -230,10 +289,22 @@ func TestClusterE2ERendersRKE2WorkerAndCiliumKubeProxyReplacement(t *testing.T) 
 		`.data["routing-mode"] == "native"`,
 		`.data["ipv4-native-routing-cidr"] == "10.42.0.0/16"`,
 		`.data["kube-proxy-replacement"] == "true"`,
+		`.data["enable-ipv4-masquerade"] == "true"`,
+		`.data["enable-bpf-masquerade"] == "true"`,
+		`values["bpf"]["masquerade"] is True`,
+		`.spec.hostPoolSelector.class == "amd-epyc"`,
+		`.status.hostPoolUUID == $pool`,
+		`INSPACE_AMD_HOST_POOL_UUID`,
 		`all(.items[]; .metadata.name != "kube-proxy")`,
 		`all(.items[]; (.metadata.name | startswith("kube-proxy-")) | not)`,
 		"KubeProxyReplacement:[[:space:]]+True",
 		"(Routing:.*Native|Direct Routing)",
+		"Masquerading:[[:space:]]+BPF",
+		"EnableBPFMasquerade",
+		"EnableIPv4Masquerade",
+		"/etc/sysctl.d/90-inspace-kubernetes.conf",
+		"/etc/security/limits.d/90-inspace-kubernetes.conf",
+		"LimitMEMLOCK",
 	} {
 		mustContain(t, "Ansible playbook", playbook, expected)
 	}
@@ -252,6 +323,8 @@ func TestClusterE2EProvesWorkerCloudIdentityAndVPCAttachment(t *testing.T) {
 	}
 	for _, expected := range []string{
 		`if len(matches) != 1:`,
+		`canonical_worker_vm_detail(vms, node.get("name"), nodepool)`,
+		`VM_UUID_PATTERN.fullmatch(vm_uuid)`,
 		`node.get("providerID") != f"inspace://{location}/{vm_uuid}"`,
 		`if not isinstance(internal_ips, list) or len(internal_ips) != 1:`,
 		`network_uuid = os.environ["INSPACE_NETWORK_UUID"]`,
@@ -260,6 +333,9 @@ func TestClusterE2EProvesWorkerCloudIdentityAndVPCAttachment(t *testing.T) {
 		`subnet = ipaddress.ip_network(network["subnet"], strict=False)`,
 		`if internal_ip not in subnet:`,
 		`if len(addresses) != 1:`,
+		`amd_pool_uuid = os.environ["INSPACE_AMD_HOST_POOL_UUID"]`,
+		`record.get("hostClass") != "amd-epyc"`,
+		`vm.get("designated_pool_uuid") != amd_pool_uuid`,
 		`"publicIPv4": str(public_ip)`,
 	} {
 		mustContain(t, "worker discovery", discovery, expected)

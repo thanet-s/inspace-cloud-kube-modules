@@ -1402,8 +1402,8 @@ func testCluster() *v1alpha1.InSpaceCluster {
 func assertControlPlaneCloudInit(t *testing.T, raw string, initialize bool) {
 	t.Helper()
 	files := decodeWriteFiles(t, raw)
-	if len(files) != 5 {
-		t.Fatalf("write_files=%d, want 5", len(files))
+	if len(files) != 8 {
+		t.Fatalf("write_files=%d, want 8", len(files))
 	}
 	script := files["/usr/local/sbin/inspace-bootstrap-rke2"]
 	command := exec.Command("sh", "-n")
@@ -1416,9 +1416,36 @@ func assertControlPlaneCloudInit(t *testing.T, raw string, initialize bool) {
 		"systemctl enable rke2-server.service", "systemctl start --no-block rke2-server.service", `"$attempt" -ge 180`,
 		"--max-time 300 --retry 3 --retry-all-errors", "/var/lib/rancher/rke2/agent/pod-manifests/kube-vip.yaml",
 		"/var/lib/rancher/rke2/server/manifests/inspace-private-load-balancer.yaml",
+		"swapoff -a", `sed -Ei '/^[[:space:]]*#/!`, "/etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list", "http://th.archive.ubuntu.com",
+		"NEEDRESTART_MODE=a DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=30 upgrade -y", "ca-certificates curl iproute2 procps tar",
+		"package_deadline=$(( $(date +%s) + 600 ))", "timeout --kill-after=30s",
+		"sysctl --system", "sysctl -n net.ipv4.ip_forward", "sysctl -n fs.inotify.max_user_instances", "sysctl -n fs.inotify.max_user_watches",
+		"swapon --show --noheadings", "/var/lib/inspace/kubernetes-node-prepared-v1",
 	} {
 		if !strings.Contains(script, required) {
 			t.Errorf("bootstrap script lacks %q", required)
+		}
+	}
+	if got := files["/etc/sysctl.d/90-inspace-kubernetes.conf"]; got != kubernetesSysctlConfig {
+		t.Errorf("sysctl config mismatch:\n%s", got)
+	}
+	if got := files["/etc/security/limits.d/90-inspace-kubernetes.conf"]; got != kubernetesLimitsConfig {
+		t.Errorf("PAM limits config mismatch:\n%s", got)
+	}
+	if got := files["/etc/systemd/system/rke2-server.service.d/20-inspace-node-limits.conf"]; got != rke2ServerLimitsConfig {
+		t.Errorf("rke2-server limits mismatch:\n%s", got)
+	}
+	for before, after := range map[string]string{
+		"swapoff -a":                                   "apt-get -o Acquire::Retries=3",
+		"http://th.archive.ubuntu.com":                 "apt-get -o Acquire::Retries=3",
+		"apt-get -o Acquire::Retries=3":                "apt-get -o DPkg::Lock::Timeout=30 upgrade -y",
+		"apt-get -o DPkg::Lock::Timeout=30 upgrade -y": "install -y --no-install-recommends",
+		"install -y --no-install-recommends":           "sysctl --system",
+		"sysctl --system":                              "systemctl daemon-reload",
+		"systemctl daemon-reload":                      "systemctl start --no-block rke2-server.service",
+	} {
+		if beforeIndex, afterIndex := strings.Index(script, before), strings.Index(script, after); beforeIndex < 0 || afterIndex <= beforeIndex {
+			t.Errorf("bootstrap order %q -> %q is not enforced", before, after)
 		}
 	}
 	for _, forbidden := range []string{"iptables -F", "iptables --flush", "nft flush", "ufw --force enable", "ufw allow ", "find_private_ip"} {
@@ -1473,12 +1500,16 @@ func assertControlPlaneCloudInit(t *testing.T, raw string, initialize bool) {
 		AutoDirectNodeRoutes  bool   `json:"autoDirectNodeRoutes"`
 		KubeProxyReplacement  bool   `json:"kubeProxyReplacement"`
 		EnableIPv4Masquerade  bool   `json:"enableIPv4Masquerade"`
+		BPF                   struct {
+			Masquerade bool `json:"masquerade"`
+		} `json:"bpf"`
 	}
 	if err := yaml.Unmarshal([]byte(helmChartConfig.Spec.ValuesContent), &ciliumValues); err != nil {
 		t.Fatalf("parse generated RKE2 Cilium values: %v", err)
 	}
 	if ciliumValues.RoutingMode != "native" || ciliumValues.IPv4NativeRoutingCIDR != "10.42.0.0/16" ||
-		!ciliumValues.AutoDirectNodeRoutes || !ciliumValues.KubeProxyReplacement || !ciliumValues.EnableIPv4Masquerade {
+		!ciliumValues.AutoDirectNodeRoutes || !ciliumValues.KubeProxyReplacement || !ciliumValues.EnableIPv4Masquerade ||
+		!ciliumValues.BPF.Masquerade {
 		t.Fatalf("generated Cilium native-routing contract=%#v", ciliumValues)
 	}
 	for _, required := range []string{"l2announcements:\n      enabled: true", "defaultLBServiceIPAM: none", "nodeIPAM:\n      enabled: false", "k8sClientRateLimit:\n      qps: 10\n      burst: 20"} {

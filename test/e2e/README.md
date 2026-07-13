@@ -38,7 +38,10 @@ is used by the `inspace-rke2-agent-token` Secret and worker bootstrap. Because
 InSpace has no NAT service, all three control planes, the worker, and bastion
 still receive one FIP for egress, but node FIPs are never used as management
 endpoints. The worker proof binds Node/NodeClaim/provider ID to one exact VM,
-authoritative VPC membership, private subnet containment, and its exact FIP.
+authoritative VPC membership, private subnet containment, the configured AMD
+EPYC host pool, and its exact FIP. Control planes and the bastion stay on the
+configured Intel Scalable pool, while the Karpenter NodeClass deliberately
+exercises `amd-epyc` worker provisioning.
 Managed InSpace cloud firewalls are the only host firewalls; guest UFW must be
 inactive and disabled or masked on the control planes, worker, and bastion.
 
@@ -148,7 +151,9 @@ Required `.env` values are `INSPACE_API_URL`, `INSPACE_API_TOKEN`,
 `INSPACE_LOCATION`, `INSPACE_BILLING_ACCOUNT_ID`, `INSPACE_NETWORK_UUID`,
 `INSPACE_CONTROL_PLANE_VIP`, `INSPACE_PRIVATE_LOAD_BALANCER_POOL_START`,
 `INSPACE_PRIVATE_LOAD_BALANCER_POOL_STOP`, and
-`INSPACE_INTEL_HOST_POOL_UUID`. The control-plane VIP must be one unused
+`INSPACE_INTEL_HOST_POOL_UUID`, and `INSPACE_AMD_HOST_POOL_UUID`. The Intel
+pool is used by the fixed control planes and bastion; the AMD EPYC pool is
+used by the Karpenter worker. The control-plane VIP must be one unused
 RFC1918 address inside that VPC subnet. The inclusive private Service range
 must contain 16-256 addresses, be excluded from InSpace VM and NLB allocation
 before the run, and not contain that VIP; the current InSpace API cannot

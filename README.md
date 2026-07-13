@@ -31,10 +31,13 @@ The bootstrap-owned bastion is fixed to Ubuntu 24.04, 1 vCPU, 2 GiB RAM, and a
 30 GiB root disk.
 
 RKE2 uses its bundled Cilium chart in native-routing mode. Cilium installs
-direct routes for the pod CIDR on the shared VPC, performs IPv4 masquerading
+direct routes for the pod CIDR on the shared VPC, performs eBPF IPv4 masquerading
 for internet egress, and fully replaces kube-proxy with eBPF service handling.
 The fixed control-plane contract requires stock Ubuntu 24.04 with at least
 2 vCPU and 4 GiB RAM, matching the tested RKE2/Cilium platform floor.
+Control planes and elastic workers disable swap, rewrite stock Ubuntu archive
+endpoints to the Thailand mirror when present, and apply persistent Kubernetes
+sysctl and RKE2 systemd limits before their RKE2 service starts.
 Node firewalls are validated fail-closed for TCP, UDP, and ICMP coverage from
 both the VPC subnet and native-routing pod CIDR, with matching outbound access.
 A private kube-vip address inside the VPC is advertised by the control-plane

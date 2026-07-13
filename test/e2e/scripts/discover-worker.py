@@ -6,8 +6,10 @@ import ipaddress
 import json
 import os
 import pathlib
+import re
 import ssl
 import tempfile
+import urllib.parse
 import urllib.request
 
 
@@ -28,6 +30,33 @@ def description(vm):
         return result if isinstance(result, dict) else {}
     except (TypeError, json.JSONDecodeError):
         return {}
+
+
+VM_UUID_PATTERN = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+
+
+def canonical_worker_vm_detail(listed_vms, node_name: str, nodepool: str, getter=api_get):
+    """Resolve one exact sparse list row to its authoritative VM detail."""
+    if not isinstance(node_name, str) or not node_name.startswith(nodepool + "-"):
+        raise SystemExit("Ready Karpenter Node name is outside the expected NodePool identity")
+    matches = []
+    for summary in listed_vms:
+        if not isinstance(summary, dict):
+            raise SystemExit("worker VM list contained a non-object record")
+        if summary.get("name") == node_name:
+            matches.append(summary)
+    if len(matches) != 1:
+        raise SystemExit("expected one exact cloud VM list identity for the Ready Karpenter Node")
+    vm_uuid = matches[0].get("uuid")
+    if not isinstance(vm_uuid, str) or not VM_UUID_PATTERN.fullmatch(vm_uuid):
+        raise SystemExit("worker VM list identity lacks a valid UUID")
+    query = urllib.parse.urlencode({"uuid": vm_uuid})
+    detail = getter(f"user-resource/vm?{query}")
+    if not isinstance(detail, dict) or detail.get("uuid") != vm_uuid or detail.get("name") != node_name:
+        raise SystemExit("authoritative worker VM detail does not match the list UUID and Node name")
+    return detail
 
 
 def atomic_write(path: pathlib.Path, value) -> None:
@@ -59,19 +88,19 @@ def main() -> None:
     location = os.environ["INSPACE_LOCATION"]
 
     vms = api_get("user-resource/vm/list")
-    matches = [
-        vm for vm in vms
-        if vm.get("name") == node.get("name")
-        and str(vm.get("name", "")).startswith(nodepool + "-")
-        and description(vm).get("cluster") == cluster
-        and description(vm).get("nodeClaim") == node.get("name")
-        and description(vm).get("floatingIPName")
-    ]
-    if len(matches) != 1:
-        raise SystemExit("expected one exact cloud VM for the Ready Karpenter Node")
-    vm = matches[0]
-    vm_uuid = vm.get("uuid")
+    vm = canonical_worker_vm_detail(vms, node.get("name"), nodepool)
+    vm_uuid = vm["uuid"]
     record = description(vm)
+    amd_pool_uuid = os.environ["INSPACE_AMD_HOST_POOL_UUID"]
+    if (
+        record.get("cluster") != cluster
+        or record.get("nodeClaim") != node.get("name")
+        or not record.get("floatingIPName")
+        or record.get("hostClass") != "amd-epyc"
+        or record.get("hostPoolUUID") != amd_pool_uuid
+        or vm.get("designated_pool_uuid") != amd_pool_uuid
+    ):
+        raise SystemExit("worker must use the exact configured AMD EPYC host pool and persisted ownership")
     if node.get("providerID") != f"inspace://{location}/{vm_uuid}":
         raise SystemExit("Node providerID does not bind to the discovered VM UUID")
 
