@@ -73,16 +73,23 @@ func (c *Controller) Reconcile(ctx context.Context, nodeClass *inspacev1.InSpace
 		readinessErr = err
 		requeue = true
 	} else {
-		hostPoolUUID, _ := nodeClass.Spec.HostPoolSelector.UUID()
 		controlPlaneVIP, _ := nodeClass.Spec.RKE2.ServerVIP()
-		if err := c.validator.ValidateNodeClass(ctx, nodeClass.Spec.Location, nodeClass.Spec.NetworkUUID, controlPlaneVIP.String(), nodeClass.Spec.PrivateLoadBalancerPool.Start, nodeClass.Spec.PrivateLoadBalancerPool.Stop, hostPoolUUID, nodeClass.Spec.FirewallUUID); err != nil {
-			readinessErr = err
-			requeue = true
+		for _, hostClass := range inspacev1.SupportedHostClasses() {
+			hostPoolUUID, ok := inspacev1.HostPoolUUIDForClass(hostClass)
+			if !ok {
+				readinessErr = fmt.Errorf("provider has no host-pool UUID mapping for class %q", hostClass)
+				break
+			}
+			if err := c.validator.ValidateNodeClass(ctx, nodeClass.Spec.Location, nodeClass.Spec.NetworkUUID, controlPlaneVIP.String(), nodeClass.Spec.PrivateLoadBalancerPool.Start, nodeClass.Spec.PrivateLoadBalancerPool.Stop, hostPoolUUID, nodeClass.Spec.FirewallUUID); err != nil {
+				readinessErr = fmt.Errorf("validating %s host pool %s: %w", hostClass, hostPoolUUID, err)
+				requeue = true
+				break
+			}
 		}
 	}
 
 	if readinessErr != nil {
-		nodeClass.Status.HostPoolUUID = ""
+		nodeClass.Status.HostPoolUUIDs = nil
 		nodeClass.Status.FirewallUUID = ""
 		nodeClass.Status.ObservedImageID = ""
 		nodeClass.Status.ObservedSpecHash = ""
@@ -90,14 +97,17 @@ func (c *Controller) Reconcile(ctx context.Context, nodeClass *inspacev1.InSpace
 		nodeClass.Status.ObservedBillingAccountID = 0
 		nodeClass.StatusConditions().SetFalse(status.ConditionReady, "NodeClassNotReady", readinessErr.Error())
 	} else {
-		hostPoolUUID, _ := nodeClass.Spec.HostPoolSelector.UUID()
-		nodeClass.Status.HostPoolUUID = hostPoolUUID
+		nodeClass.Status.HostPoolUUIDs = make([]string, 0, len(inspacev1.SupportedHostClasses()))
+		for _, hostClass := range inspacev1.SupportedHostClasses() {
+			hostPoolUUID, _ := inspacev1.HostPoolUUIDForClass(hostClass)
+			nodeClass.Status.HostPoolUUIDs = append(nodeClass.Status.HostPoolUUIDs, hostPoolUUID)
+		}
 		nodeClass.Status.FirewallUUID = nodeClass.Spec.FirewallUUID
 		nodeClass.Status.ObservedImageID = nodeClass.Spec.ImageSelector.ID()
 		nodeClass.Status.ObservedSpecHash = provider.NodeClassHash(nodeClass)
 		nodeClass.Status.ObservedGeneration = nodeClass.Generation
 		nodeClass.Status.ObservedBillingAccountID = nodeClass.Spec.BillingAccountID
-		nodeClass.StatusConditions().SetTrueWithReason(status.ConditionReady, "NodeClassReady", "Private RKE2 supervisor VIP and Service pool, InSpace VPC, Cilium native-routing firewall, host pool, and RKE2 token are ready")
+		nodeClass.StatusConditions().SetTrueWithReason(status.ConditionReady, "NodeClassReady", "Private RKE2 supervisor VIP and Service pool, InSpace VPC, Cilium native-routing firewall, Intel and AMD host pools, and RKE2 token are ready")
 	}
 
 	if !equality.Semantic.DeepEqual(stored.Status, nodeClass.Status) {

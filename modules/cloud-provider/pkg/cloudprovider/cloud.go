@@ -12,11 +12,20 @@ import (
 	"net"
 	"net/netip"
 	"sort"
+	"strconv"
 	"strings"
+	"sync"
 
 	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	utilvalidation "k8s.io/apimachinery/pkg/util/validation"
+	"k8s.io/client-go/informers"
+	"k8s.io/client-go/kubernetes"
+	discoverylisters "k8s.io/client-go/listers/discovery/v1"
+	"k8s.io/client-go/tools/cache"
 	cloud "k8s.io/cloud-provider"
+	"k8s.io/klog/v2"
 
 	"github.com/thanet-s/inspace-cloud-kube-modules/modules/client"
 	"github.com/thanet-s/inspace-cloud-kube-modules/modules/cloud-provider/api/v1alpha1"
@@ -26,10 +35,14 @@ import (
 const (
 	ProviderName = "inspace"
 
-	AnnotationPublicLoadBalancer = "service.beta.kubernetes.io/inspace-load-balancer-public"
-	LabelLoadBalancerScope       = "inspace.cloud/load-balancer-scope"
-	LoadBalancerScopePublic      = "public"
-	LoadBalancerScopePrivate     = "private"
+	AnnotationPublicLoadBalancer    = "service.beta.kubernetes.io/inspace-load-balancer-public"
+	annotationLoadBalancerReconcile = "inspace.cloud/load-balancer-reconcile"
+	LabelLoadBalancerScope          = "inspace.cloud/load-balancer-scope"
+	LoadBalancerScopePublic         = "public"
+	LoadBalancerScopePrivate        = "private"
+
+	clusterAutoscalerDeletionTaint = "ToBeDeletedByClusterAutoscaler"
+	karpenterDisruptionTaint       = "karpenter.sh/disrupted"
 )
 
 // API is the exact SDK surface used by the CCM and permits loopback-only
@@ -68,6 +81,11 @@ type Provider struct {
 	controlPlaneVIP              netip.Addr
 	privateLoadBalancerPoolStart netip.Addr
 	privateLoadBalancerPoolStop  netip.Addr
+	loadBalancerMu               sync.Mutex
+	stopCh                       <-chan struct{}
+	kubeClient                   kubernetes.Interface
+	endpointSliceLister          discoverylisters.EndpointSliceLister
+	endpointSlicesSynced         cache.InformerSynced
 }
 
 func New(api API, config Config) (*Provider, error) {
@@ -160,15 +178,46 @@ func cloudIPv4Value(address netip.Addr) uint32 {
 	return uint32(bytes[0])<<24 | uint32(bytes[1])<<16 | uint32(bytes[2])<<8 | uint32(bytes[3])
 }
 
-func (p *Provider) Initialize(cloud.ControllerClientBuilder, <-chan struct{}) {}
-func (p *Provider) ProviderName() string                                      { return ProviderName }
-func (p *Provider) HasClusterID() bool                                        { return p.config.ClusterID != "" }
-func (p *Provider) Instances() (cloud.Instances, bool)                        { return nil, false }
-func (p *Provider) InstancesV2() (cloud.InstancesV2, bool)                    { return p, true }
-func (p *Provider) LoadBalancer() (cloud.LoadBalancer, bool)                  { return p, true }
-func (p *Provider) Zones() (cloud.Zones, bool)                                { return nil, false }
-func (p *Provider) Clusters() (cloud.Clusters, bool)                          { return nil, false }
-func (p *Provider) Routes() (cloud.Routes, bool)                              { return nil, false }
+func (p *Provider) Initialize(clientBuilder cloud.ControllerClientBuilder, stopCh <-chan struct{}) {
+	if clientBuilder == nil {
+		panic("cloudprovider: controller client builder is required")
+	}
+	client, err := clientBuilder.Client("inspace-load-balancer-target-controller")
+	if err != nil {
+		panic(fmt.Sprintf("cloudprovider: initialize Kubernetes client: %v", err))
+	}
+	if client == nil {
+		panic("cloudprovider: controller client builder returned a nil Kubernetes client")
+	}
+	p.kubeClient = client
+	p.stopCh = stopCh
+}
+
+// SetInformers wires the provider-specific target reconciler into the same
+// leader-elected informer factory as the standard cloud-controller-manager.
+// The standard Service controller intentionally does not react to Node Ready
+// transitions or EndpointSlice changes, both of which affect InSpace targets.
+func (p *Provider) SetInformers(factory informers.SharedInformerFactory) {
+	if p.stopCh == nil || p.kubeClient == nil {
+		panic("cloudprovider: Initialize must be called before SetInformers")
+	}
+	controller, err := newLoadBalancerTargetController(p, factory)
+	if err != nil {
+		panic(fmt.Sprintf("cloudprovider: initialize load-balancer target controller: %v", err))
+	}
+	p.endpointSliceLister = controller.endpointSlices
+	p.endpointSlicesSynced = controller.endpointSlicesSynced
+	go controller.Run(p.stopCh)
+}
+
+func (p *Provider) ProviderName() string                     { return ProviderName }
+func (p *Provider) HasClusterID() bool                       { return p.config.ClusterID != "" }
+func (p *Provider) Instances() (cloud.Instances, bool)       { return nil, false }
+func (p *Provider) InstancesV2() (cloud.InstancesV2, bool)   { return p, true }
+func (p *Provider) LoadBalancer() (cloud.LoadBalancer, bool) { return p, true }
+func (p *Provider) Zones() (cloud.Zones, bool)               { return nil, false }
+func (p *Provider) Clusters() (cloud.Clusters, bool)         { return nil, false }
+func (p *Provider) Routes() (cloud.Routes, bool)             { return nil, false }
 
 func (p *Provider) InstanceExists(ctx context.Context, node *corev1.Node) (bool, error) {
 	_, err := p.resolveVM(ctx, node)
@@ -384,6 +433,9 @@ func (p *Provider) GetLoadBalancerNameForService(service *corev1.Service) string
 }
 
 func (p *Provider) EnsureLoadBalancer(ctx context.Context, _ string, service *corev1.Service, nodes []*corev1.Node) (*corev1.LoadBalancerStatus, error) {
+	p.loadBalancerMu.Lock()
+	defer p.loadBalancerMu.Unlock()
+
 	lb, err := p.findOwnedLoadBalancer(ctx, service)
 	if err != nil {
 		return nil, err
@@ -419,7 +471,7 @@ func (p *Provider) EnsureLoadBalancer(ctx context.Context, _ string, service *co
 	if p.config.BillingAccountID < 1 {
 		return nil, errors.New("cloudprovider: public load balancer requires INSPACE_BILLING_ACCOUNT_ID")
 	}
-	targets, err := targetUUIDs(nodes, p.config.Location)
+	targets, err := p.targetUUIDs(service, nodes)
 	if err != nil {
 		return nil, err
 	}
@@ -463,6 +515,12 @@ func (p *Provider) EnsureLoadBalancer(ctx context.Context, _ string, service *co
 }
 
 func (p *Provider) UpdateLoadBalancer(ctx context.Context, _ string, service *corev1.Service, nodes []*corev1.Node) error {
+	p.loadBalancerMu.Lock()
+	defer p.loadBalancerMu.Unlock()
+	return p.updateLoadBalancer(ctx, service, nodes, false)
+}
+
+func (p *Provider) updateLoadBalancer(ctx context.Context, service *corev1.Service, nodes []*corev1.Node, allowMissing bool) error {
 	lb, err := p.findOwnedLoadBalancer(ctx, service)
 	if err != nil {
 		return err
@@ -485,6 +543,12 @@ func (p *Provider) UpdateLoadBalancer(ctx context.Context, _ string, service *co
 		return err
 	}
 	if lb == nil {
+		if allowMissing {
+			// The provider-specific target controller can observe a Service or
+			// EndpointSlice before the standard Service controller creates the
+			// NLB. EnsureLoadBalancer will use the same target resolver.
+			return nil
+		}
 		return errors.New("cloudprovider: managed public load balancer does not exist")
 	}
 	if err := p.validatePublicLoadBalancerAddress(ctx, service, lb); err != nil {
@@ -493,7 +557,7 @@ func (p *Provider) UpdateLoadBalancer(ctx context.Context, _ string, service *co
 	if err := validateService(service); err != nil {
 		return err
 	}
-	targets, err := targetUUIDs(nodes, p.config.Location)
+	targets, err := p.targetUUIDs(service, nodes)
 	if err != nil {
 		return err
 	}
@@ -504,7 +568,16 @@ func (p *Provider) UpdateLoadBalancer(ctx context.Context, _ string, service *co
 	return err
 }
 
+func (p *Provider) reconcileLoadBalancerTargets(ctx context.Context, service *corev1.Service, nodes []*corev1.Node) error {
+	p.loadBalancerMu.Lock()
+	defer p.loadBalancerMu.Unlock()
+	return p.updateLoadBalancer(ctx, service, nodes, true)
+}
+
 func (p *Provider) EnsureLoadBalancerDeleted(ctx context.Context, _ string, service *corev1.Service) error {
+	p.loadBalancerMu.Lock()
+	defer p.loadBalancerMu.Unlock()
+
 	lb, err := p.findOwnedLoadBalancer(ctx, service)
 	if err != nil {
 		return err
@@ -820,9 +893,6 @@ func validateService(service *corev1.Service) error {
 	if len(service.Spec.LoadBalancerSourceRanges) != 0 {
 		return errors.New("cloudprovider: loadBalancerSourceRanges is unsupported; InSpace NLB exposes TCP forwarding only")
 	}
-	if service.Spec.ExternalTrafficPolicy == corev1.ServiceExternalTrafficPolicyLocal {
-		return errors.New("cloudprovider: externalTrafficPolicy=Local is unsupported because InSpace NLB has no Kubernetes endpoint health filtering")
-	}
 	explicitPublic, err := explicitPublicRequested(service)
 	if err != nil {
 		return err
@@ -853,18 +923,49 @@ func serviceRules(service *corev1.Service) []inspace.LoadBalancerRule {
 	return rules
 }
 
-func targetUUIDs(nodes []*corev1.Node, location string) ([]string, error) {
+func (p *Provider) targetUUIDs(service *corev1.Service, nodes []*corev1.Node) ([]string, error) {
+	var localNodes map[string]struct{}
+	if service.Spec.ExternalTrafficPolicy == corev1.ServiceExternalTrafficPolicyLocal {
+		if p.endpointSliceLister == nil || p.endpointSlicesSynced == nil || !p.endpointSlicesSynced() {
+			return nil, errors.New("cloudprovider: externalTrafficPolicy=Local requires a synchronized EndpointSlice informer")
+		}
+		selector := labels.SelectorFromSet(labels.Set{discoveryv1.LabelServiceName: service.Name})
+		slices, err := p.endpointSliceLister.EndpointSlices(service.Namespace).List(selector)
+		if err != nil {
+			return nil, fmt.Errorf("cloudprovider: list EndpointSlices for Service %s/%s: %w", service.Namespace, service.Name, err)
+		}
+		localNodes = make(map[string]struct{})
+		for _, slice := range slices {
+			for nodeName := range readyEndpointNodes(slice) {
+				localNodes[nodeName] = struct{}{}
+			}
+		}
+	}
+
 	set := make(map[string]struct{}, len(nodes))
 	for _, node := range nodes {
-		if node == nil || node.Spec.ProviderID == "" {
-			return nil, errors.New("cloudprovider: every load balancer node needs an InSpace provider ID")
+		if !loadBalancerNodeEligible(node) {
+			continue
+		}
+		if localNodes != nil {
+			if _, exists := localNodes[node.Name]; !exists {
+				continue
+			}
+		}
+		if node.Spec.ProviderID == "" {
+			// A newly registered cloud node can become Ready immediately before
+			// cloud-node-controller writes its provider ID. It is not a safe NLB
+			// target until that stable identity exists.
+			continue
 		}
 		id, err := providerid.Parse(node.Spec.ProviderID)
 		if err != nil {
-			return nil, err
+			klog.ErrorS(err, "skipping load-balancer node with malformed provider ID", "node", node.Name, "providerID", node.Spec.ProviderID)
+			continue
 		}
-		if id.Location != location {
-			return nil, fmt.Errorf("cloudprovider: node %q is in location %q, load balancer is in %q", node.Name, id.Location, location)
+		if id.Location != p.config.Location {
+			klog.ErrorS(nil, "skipping load-balancer node outside the configured location", "node", node.Name, "nodeLocation", id.Location, "loadBalancerLocation", p.config.Location)
+			continue
 		}
 		set[id.UUID] = struct{}{}
 	}
@@ -874,6 +975,32 @@ func targetUUIDs(nodes []*corev1.Node, location string) ([]string, error) {
 	}
 	sort.Strings(result)
 	return result, nil
+}
+
+func loadBalancerNodeEligible(node *corev1.Node) bool {
+	if node == nil || !node.DeletionTimestamp.IsZero() || nodeExcludedFromLoadBalancers(node) {
+		return false
+	}
+	for _, taint := range node.Spec.Taints {
+		if taint.Key == clusterAutoscalerDeletionTaint || taint.Key == karpenterDisruptionTaint {
+			return false
+		}
+	}
+	for _, condition := range node.Status.Conditions {
+		if condition.Type == corev1.NodeReady {
+			return condition.Status == corev1.ConditionTrue
+		}
+	}
+	return false
+}
+
+func nodeExcludedFromLoadBalancers(node *corev1.Node) bool {
+	value, exists := node.Labels[corev1.LabelNodeExcludeBalancers]
+	if !exists {
+		return false
+	}
+	excluded, err := strconv.ParseBool(value)
+	return err != nil || excluded
 }
 
 func explicitPublicRequested(service *corev1.Service) (bool, error) {
@@ -921,6 +1048,7 @@ func statusForLoadBalancer(lb *inspace.LoadBalancer, publicAddress string) (*cor
 
 var (
 	_ cloud.Interface    = (*Provider)(nil)
+	_ cloud.InformerUser = (*Provider)(nil)
 	_ cloud.InstancesV2  = (*Provider)(nil)
 	_ cloud.LoadBalancer = (*Provider)(nil)
 )

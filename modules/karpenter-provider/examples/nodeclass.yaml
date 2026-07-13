@@ -1,7 +1,7 @@
 apiVersion: karpenter.inspace.cloud/v1alpha1
 kind: InSpaceNodeClass
 metadata:
-  name: ubuntu-workers-intel
+  name: ubuntu-workers
 spec:
   clusterName: example-rke2
   billingAccountID: 12345
@@ -25,8 +25,9 @@ spec:
   imageSelector:
     osName: ubuntu
     osVersion: "24.04"
-  hostPoolSelector:
-    class: intel-scalable
+  # Hardware class is selected by each NodePool with
+  # inspace.cloud/host-class, so this NodeClass can serve Intel, AMD, or mixed
+  # pools without duplicating network and bootstrap configuration.
   rootDiskGiB: 40
   # Optional controlled SSH access through the private-VPC bastion. Configure
   # both fields together and keep private key material outside Kubernetes and

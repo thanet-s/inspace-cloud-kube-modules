@@ -1579,7 +1579,7 @@ func normalizeOwnershipLaunchIdentity(record ownership) (normalized ownership, p
 	if record.HostClass == "" || record.InstanceType == "" {
 		return normalized, true, nil
 	}
-	derivedHostPoolUUID, knownHostClass := (inspacev1.HostPoolSelector{Class: record.HostClass}).UUID()
+	derivedHostPoolUUID, knownHostClass := inspacev1.HostPoolUUIDForClass(record.HostClass)
 	if !knownHostClass {
 		return ownership{}, false, fmt.Errorf("unsupported recorded host class %q", record.HostClass)
 	}

@@ -58,9 +58,6 @@ func (n *InSpaceNodeClass) Validate() field.ErrorList {
 	if n.Spec.ImageSelector.OSVersion != OSVersionUbuntu {
 		errs = append(errs, field.NotSupported(p.Child("imageSelector", "osVersion"), n.Spec.ImageSelector.OSVersion, []string{OSVersionUbuntu}))
 	}
-	if _, ok := n.Spec.HostPoolSelector.UUID(); !ok {
-		errs = append(errs, field.NotSupported(p.Child("hostPoolSelector", "class"), n.Spec.HostPoolSelector.Class, []string{HostClassIntelScalable, HostClassAMDEPYC}))
-	}
 	if n.Spec.RootDiskGiB < 30 || n.Spec.RootDiskGiB > 2000 {
 		errs = append(errs, field.Invalid(p.Child("rootDiskGiB"), n.Spec.RootDiskGiB, "must be between 30 and 2000 GiB"))
 	}

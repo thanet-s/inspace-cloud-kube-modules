@@ -52,6 +52,9 @@ The control-plane VM names, guest hostnames, and Kubernetes Node names are
 exactly `<InSpaceCluster metadata.name>-cp0`, `-cp1`, and `-cp2`. The bastion is
 exactly `<InSpaceCluster metadata.name>-bastion`. Cluster names are limited to
 55 characters so every generated hostname remains a DNS label.
+Bootstrap FIPs use the same cluster prefix (`-bastion-ip`, `-cp0-ip` through
+`-cp2-ip`). Firewall names also begin with the cluster name and retain the
+namespace/name owner hash as their final ownership component.
 
 Elastic worker VM names, guest hostnames, and Kubernetes Node names are
 `<cluster>-karp-<NodePool>-<random>`. The provider derives the NodePool and
@@ -60,7 +63,10 @@ identity remains the cloud ownership and deletion key.
 
 Control planes and workers disable swap, rewrite stock Ubuntu archive endpoints
 to the Thailand mirror when present, and apply persistent Kubernetes sysctls,
-PAM limits, and RKE2 systemd limits before starting RKE2. Node firewalls are
+PAM limits, and RKE2 systemd limits before starting RKE2. After the deliberate
+one-time package update and upgrade, control planes, workers, and the bastion
+disable APT periodic updates and mask the unattended-upgrade units; OS patching
+is an explicit operator action. Node firewalls are
 validated fail-closed for all-port TCP, UDP, and ICMP coverage from both the VPC
 subnet and native-routing pod CIDR, with matching outbound access.
 
@@ -104,6 +110,11 @@ class and cannot race the generic external CCM. Cilium Node IPAM is disabled;
 `loadBalancerClass: io.cilium/node` is unsupported. Public exposure remains an
 explicit, paid, TCP-only InSpace NLB path documented in the
 [public Service example](charts/inspace-cloud-kube-modules/examples/service-public-nlb.yaml).
+Public NLB Services use `externalTrafficPolicy: Local`; CCM watches
+EndpointSlices and keeps targets limited to eligible Ready nodes with a Ready,
+non-terminating local endpoint. InSpace does not probe the allocated
+`healthCheckNodePort`, so node and endpoint events—not an NLB health check—drive
+target convergence.
 
 Operators must reserve an inclusive 16-256-address RFC1918 range for Cilium LB
 IPAM and exclude it from InSpace VM and NLB allocation. The InSpace API has no

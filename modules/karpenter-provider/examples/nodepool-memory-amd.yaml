@@ -11,7 +11,7 @@ spec:
       nodeClassRef:
         group: karpenter.inspace.cloud
         kind: InSpaceNodeClass
-        name: ubuntu-workers-amd
+        name: ubuntu-workers
       requirements:
         - key: inspace.cloud/instance-family
           operator: In

@@ -2,16 +2,19 @@ package catalog
 
 import (
 	"fmt"
+	"strconv"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+	"sigs.k8s.io/karpenter/pkg/cloudprovider"
+	"sigs.k8s.io/karpenter/pkg/scheduling"
 
 	inspacev1 "github.com/thanet-s/inspace-cloud-kube-modules/modules/karpenter-provider/pkg/apis/v1alpha1"
 )
 
 func TestCatalogHasAll24BoundedVariants(t *testing.T) {
-	types, err := New(Options{Location: inspacev1.LocationBangkok, HostClass: inspacev1.HostClassIntelScalable, RootDiskGiB: 40})
+	types, err := New(Options{Location: inspacev1.LocationBangkok, RootDiskGiB: 40})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -44,6 +47,34 @@ func TestCatalogHasAll24BoundedVariants(t *testing.T) {
 		if instanceType.Requirements.Get(karpv1.CapacityTypeLabelKey).Any() != karpv1.CapacityTypeOnDemand {
 			t.Fatalf("%s is not on-demand", instanceType.Name)
 		}
+		if got := instanceType.Requirements.Get(LabelInstanceCPU).Any(); got != strconv.Itoa(cores) {
+			t.Fatalf("%s instance-cpu=%q, want %d", instanceType.Name, got, cores)
+		}
+		if got := instanceType.Requirements.Get(LabelInstanceMemory).Any(); got != strconv.Itoa(memoryGiB*1024) {
+			t.Fatalf("%s instance-memory=%q MiB, want %d", instanceType.Name, got, memoryGiB*1024)
+		}
+		if len(instanceType.Offerings) != 2 {
+			t.Fatalf("%s has %d host-class offerings, want 2", instanceType.Name, len(instanceType.Offerings))
+		}
+		hostClasses := map[string]bool{}
+		hostPrices := map[string]float64{}
+		for _, offering := range instanceType.Offerings {
+			hostClass := offering.Requirements.Get(LabelHostClass).Any()
+			hostClasses[hostClass] = true
+			hostPrices[hostClass] = offering.Price
+			if want := hourlyComputePriceTHB(cores, memoryGiB); offering.Price != want {
+				t.Fatalf("%s %s hourly price=%v THB, want %v THB", instanceType.Name, hostClass, offering.Price, want)
+			}
+		}
+		for _, hostClass := range inspacev1.SupportedHostClasses() {
+			if !hostClasses[hostClass] {
+				t.Fatalf("%s is missing %s offering", instanceType.Name, hostClass)
+			}
+		}
+		if hostPrices[inspacev1.HostClassIntelScalable] != hostPrices[inspacev1.HostClassAMDEPYC] {
+			t.Fatalf("%s host-class prices differ: Intel=%v AMD=%v", instanceType.Name,
+				hostPrices[inspacev1.HostClassIntelScalable], hostPrices[inspacev1.HostClassAMDEPYC])
+		}
 		if got := instanceType.Allocatable()[corev1.ResourceEphemeralStorage]; got.Cmp(instanceType.Capacity[corev1.ResourceEphemeralStorage]) >= 0 {
 			t.Fatalf("%s does not reserve root-disk space for Ubuntu/RKE2", instanceType.Name)
 		}
@@ -59,14 +90,91 @@ func TestCatalogHasAll24BoundedVariants(t *testing.T) {
 	}
 }
 
-func TestCatalogSelectsHostClass(t *testing.T) {
-	types, err := New(Options{HostClass: inspacev1.HostClassAMDEPYC})
+func TestInSpaceComputePriceFormula(t *testing.T) {
+	tests := []struct {
+		name            string
+		cores           int
+		memoryGiB       int
+		monthlyPriceTHB float64
+	}{
+		{name: "1 CPU 2 GiB RAM", cores: 1, memoryGiB: 2, monthlyPriceTHB: 120},
+		{name: "2 CPU 4 GiB RAM", cores: 2, memoryGiB: 4, monthlyPriceTHB: 240},
+		{name: "2 CPU 8 GiB RAM", cores: 2, memoryGiB: 8, monthlyPriceTHB: 360},
+		{name: "6 CPU 8 GiB RAM", cores: 6, memoryGiB: 8, monthlyPriceTHB: 600},
+		{name: "10 CPU 26 GiB RAM", cores: 10, memoryGiB: 26, monthlyPriceTHB: 1380},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := monthlyComputePriceTHB(test.cores, test.memoryGiB); got != test.monthlyPriceTHB {
+				t.Fatalf("monthly price=%v THB, want %v THB", got, test.monthlyPriceTHB)
+			}
+			if got, want := hourlyComputePriceTHB(test.cores, test.memoryGiB), test.monthlyPriceTHB/billingHoursPerMonth; got != want {
+				t.Fatalf("hourly price=%v THB, want %v THB", got, want)
+			}
+		})
+	}
+}
+
+func TestCatalogPriceIgnoresNodeClassRootDisk(t *testing.T) {
+	smallDisk, err := New(Options{RootDiskGiB: 30})
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, instanceType := range types {
-		if actual := instanceType.Requirements.Get(LabelHostClass).Any(); actual != inspacev1.HostClassAMDEPYC {
-			t.Fatalf("%s has host class %q", instanceType.Name, actual)
+	largeDisk, err := New(Options{RootDiskGiB: 2000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index := range smallDisk {
+		if smallDisk[index].Name != largeDisk[index].Name {
+			t.Fatalf("catalog order differs at %d: %s != %s", index, smallDisk[index].Name, largeDisk[index].Name)
 		}
+		for offeringIndex := range smallDisk[index].Offerings {
+			if smallDisk[index].Offerings[offeringIndex].Price != largeDisk[index].Offerings[offeringIndex].Price {
+				t.Fatalf("%s price changed with root disk: %v != %v", smallDisk[index].Name,
+					smallDisk[index].Offerings[offeringIndex].Price, largeDisk[index].Offerings[offeringIndex].Price)
+			}
+		}
+	}
+}
+
+func TestNumericRequirementsSupportExclusiveAndInclusiveBounds(t *testing.T) {
+	types, err := New(Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var target *cloudprovider.InstanceType
+	for _, instanceType := range types {
+		if instanceType.Name == "is-general-4c-8g" {
+			target = instanceType
+			break
+		}
+	}
+	if target == nil {
+		t.Fatal("catalog is missing is-general-4c-8g")
+	}
+
+	tests := []struct {
+		name     string
+		key      string
+		operator corev1.NodeSelectorOperator
+		value    string
+		want     bool
+	}{
+		{name: "cpu greater than", key: LabelInstanceCPU, operator: corev1.NodeSelectorOpGt, value: "2", want: true},
+		{name: "cpu less than", key: LabelInstanceCPU, operator: corev1.NodeSelectorOpLt, value: "4", want: false},
+		{name: "cpu greater than or equal", key: LabelInstanceCPU, operator: karpv1.NodeSelectorOpGte, value: "4", want: true},
+		{name: "cpu less than or equal", key: LabelInstanceCPU, operator: karpv1.NodeSelectorOpLte, value: "4", want: true},
+		{name: "memory greater than", key: LabelInstanceMemory, operator: corev1.NodeSelectorOpGt, value: "4096", want: true},
+		{name: "memory less than", key: LabelInstanceMemory, operator: corev1.NodeSelectorOpLt, value: "8192", want: false},
+		{name: "memory greater than or equal", key: LabelInstanceMemory, operator: karpv1.NodeSelectorOpGte, value: "8192", want: true},
+		{name: "memory less than or equal", key: LabelInstanceMemory, operator: karpv1.NodeSelectorOpLte, value: "8192", want: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			requirements := scheduling.NewRequirements(scheduling.NewRequirement(test.key, test.operator, test.value))
+			if got := requirements.IsCompatible(target.Requirements, scheduling.AllowUndefinedWellKnownLabels); got != test.want {
+				t.Fatalf("compatibility=%t, want %t for %s %s %s", got, test.want, test.key, test.operator, test.value)
+			}
+		})
 	}
 }

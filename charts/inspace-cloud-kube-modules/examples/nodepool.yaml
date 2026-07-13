@@ -11,11 +11,21 @@ spec:
       nodeClassRef:
         group: karpenter.inspace.cloud
         kind: InSpaceNodeClass
-        name: ubuntu-workers-intel
+        name: ubuntu-workers
       requirements:
         - key: inspace.cloud/instance-family
           operator: In
           values: [general]
+        - key: inspace.cloud/host-class
+          operator: In
+          values: [intel-scalable, amd-epyc]
+        # Numeric capacity labels use CPU cores and memory MiB.
+        - key: inspace.cloud/instance-cpu
+          operator: Gte
+          values: ["4"]
+        - key: inspace.cloud/instance-memory
+          operator: Gte
+          values: ["8192"]
         - key: karpenter.sh/capacity-type
           operator: In
           values: [on-demand]

@@ -50,7 +50,7 @@ metadata:
     service.beta.kubernetes.io/inspace-load-balancer-public: "true"
 spec:
   type: LoadBalancer
-  externalTrafficPolicy: Cluster
+  externalTrafficPolicy: Local
   selector: {app: inspace-e2e-web}
   ports:
     - name: http

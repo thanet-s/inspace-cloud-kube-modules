@@ -288,10 +288,10 @@
         (e2e_cleanup_owner_audit.stdout | from_json).disks | length == 0 and
         (e2e_cleanup_owner_audit.stdout | from_json).vms | length == 4 and
         ((e2e_cleanup_owner_audit.stdout | from_json).vms |
-          rejectattr('name', 'match', '^(' + e2e_cleanup_state.clusterResourceName + '-cp[0-2]|' + e2e_cleanup_state.clusterResourceName + '-bastion|rke2-' + e2e_cleanup_state.owner + '-bastion)$') |
+          rejectattr('name', 'match', '^(' + e2e_cleanup_state.clusterResourceName + '-cp[0-2]|' + e2e_cleanup_state.clusterResourceName + '-bastion|rke2-' + e2e_cleanup_state.owner + '-(cp-[0-2]|bastion))$') |
           list | length) == 0 and
         ((e2e_cleanup_owner_audit.stdout | from_json).floatingIPs |
-          rejectattr('name', 'match', '^rke2-' + e2e_cleanup_state.owner + '-(cp-[0-2]|bastion)-ip$') |
+          rejectattr('name', 'match', '^(' + e2e_cleanup_state.clusterResourceName + '-(cp[0-2]|bastion)-ip|rke2-' + e2e_cleanup_state.owner + '-(cp-[0-2]|bastion)-ip)$') |
           list | length) == 0 and
         (e2e_cleanup_owner_audit.stdout | from_json).floatingIPs | length == 4 and
         (e2e_cleanup_owner_audit.stdout | from_json).firewalls | length == 2 and

@@ -5,14 +5,20 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/awslabs/operatorpkg/status"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
+	"sigs.k8s.io/karpenter/pkg/scheduling"
 
 	inspacev1 "github.com/thanet-s/inspace-cloud-kube-modules/modules/karpenter-provider/pkg/apis/v1alpha1"
+	"github.com/thanet-s/inspace-cloud-kube-modules/modules/karpenter-provider/pkg/catalog"
 	cloudapi "github.com/thanet-s/inspace-cloud-kube-modules/modules/karpenter-provider/pkg/cloud"
 	cloudfake "github.com/thanet-s/inspace-cloud-kube-modules/modules/karpenter-provider/pkg/cloud/fake"
+	"github.com/thanet-s/inspace-cloud-kube-modules/modules/karpenter-provider/pkg/providerid"
 )
 
 func TestWorkerNodeNameUsesClusterAndKarpenterNodeClaimSuffix(t *testing.T) {
@@ -129,7 +135,7 @@ func (c *recordingDeleteCloud) DeleteVM(ctx context.Context, location, uuid, clu
 	return c.Cloud.DeleteVM(ctx, location, uuid, clusterName, nodeClaimName, identity)
 }
 
-func TestGetInstanceTypesUsesNodeClassHostPool(t *testing.T) {
+func TestGetInstanceTypesAdvertisesBothHostClassesAndNumericCapacity(t *testing.T) {
 	ctx := context.Background()
 	nodeClass := providerNodeClass()
 	resolver := NewStaticResolver(nodeClass)
@@ -147,6 +153,182 @@ func TestGetInstanceTypesUsesNodeClassHostPool(t *testing.T) {
 	if len(instanceTypes) != 24 {
 		t.Fatalf("expected 24 instance types, got %d", len(instanceTypes))
 	}
+	for _, instanceType := range instanceTypes {
+		if len(instanceType.Offerings) != 2 {
+			t.Fatalf("%s offerings=%d, want Intel and AMD", instanceType.Name, len(instanceType.Offerings))
+		}
+		if instanceType.Requirements.Get(catalog.LabelInstanceCPU) == nil || instanceType.Requirements.Get(catalog.LabelInstanceMemory) == nil {
+			t.Fatalf("%s lacks numeric CPU/memory requirements", instanceType.Name)
+		}
+	}
+}
+
+func TestSelectInstanceTypeSupportsNumericBoundsAndHostClassOffering(t *testing.T) {
+	instanceTypes, err := catalog.New(catalog.Options{Location: inspacev1.LocationBangkok, RootDiskGiB: 100})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name         string
+		requirements []karpv1.NodeSelectorRequirementWithMinValues
+		wantType     string
+	}{
+		{
+			name: "exclusive CPU bounds",
+			requirements: []karpv1.NodeSelectorRequirementWithMinValues{
+				{Key: catalog.LabelFamily, Operator: corev1.NodeSelectorOpIn, Values: []string{"general"}},
+				{Key: catalog.LabelInstanceCPU, Operator: corev1.NodeSelectorOpGt, Values: []string{"2"}},
+				{Key: catalog.LabelInstanceCPU, Operator: corev1.NodeSelectorOpLt, Values: []string{"6"}},
+				{Key: catalog.LabelHostClass, Operator: corev1.NodeSelectorOpIn, Values: []string{inspacev1.HostClassAMDEPYC}},
+			},
+			wantType: "is-general-4c-8g",
+		},
+		{
+			name: "inclusive memory bounds",
+			requirements: []karpv1.NodeSelectorRequirementWithMinValues{
+				{Key: catalog.LabelFamily, Operator: corev1.NodeSelectorOpIn, Values: []string{"general"}},
+				{Key: catalog.LabelInstanceMemory, Operator: karpv1.NodeSelectorOpGte, Values: []string{"8192"}},
+				{Key: catalog.LabelInstanceMemory, Operator: karpv1.NodeSelectorOpLte, Values: []string{"8192"}},
+				{Key: catalog.LabelHostClass, Operator: corev1.NodeSelectorOpIn, Values: []string{inspacev1.HostClassAMDEPYC}},
+			},
+			wantType: "is-general-4c-8g",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			claim := &karpv1.NodeClaim{Spec: karpv1.NodeClaimSpec{Requirements: test.requirements}}
+			instanceType, offering, err := selectInstanceType(claim, instanceTypes)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if instanceType.Name != test.wantType {
+				t.Fatalf("selected %s, want %s", instanceType.Name, test.wantType)
+			}
+			hostClass, hostPoolUUID, err := hostPoolForOffering(offering)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if hostClass != inspacev1.HostClassAMDEPYC || hostPoolUUID != inspacev1.AMDEPYCHostPoolUUID {
+				t.Fatalf("selected host class/pool=%s/%s", hostClass, hostPoolUUID)
+			}
+		})
+	}
+}
+
+func TestSelectInstanceTypeAllowsMixedHostClassesInOneNodePool(t *testing.T) {
+	instanceTypes, err := catalog.New(catalog.Options{Location: inspacev1.LocationBangkok, RootDiskGiB: 100})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim := &karpv1.NodeClaim{Spec: karpv1.NodeClaimSpec{Requirements: []karpv1.NodeSelectorRequirementWithMinValues{
+		{Key: catalog.LabelFamily, Operator: corev1.NodeSelectorOpIn, Values: []string{"general"}},
+		{Key: catalog.LabelInstanceCPU, Operator: karpv1.NodeSelectorOpGte, Values: []string{"4"}},
+		{Key: catalog.LabelHostClass, Operator: corev1.NodeSelectorOpIn, Values: []string{inspacev1.HostClassIntelScalable, inspacev1.HostClassAMDEPYC}},
+	}}}
+	instanceType, offering, err := selectInstanceType(claim, instanceTypes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if instanceType.Name != "is-general-4c-8g" {
+		t.Fatalf("selected %s, want is-general-4c-8g", instanceType.Name)
+	}
+	hostClass, hostPoolUUID, err := hostPoolForOffering(offering)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantHostPoolUUID, supported := inspacev1.HostPoolUUIDForClass(hostClass)
+	if !supported || hostPoolUUID != wantHostPoolUUID {
+		t.Fatalf("mixed pool selected inconsistent host class/pool=%s/%s", hostClass, hostPoolUUID)
+	}
+}
+
+func TestHostPoolForOfferingRejectsAmbiguousOrUnknownIdentity(t *testing.T) {
+	tests := map[string]*cloudprovider.Offering{
+		"nil":     nil,
+		"missing": {Requirements: scheduling.NewRequirements()},
+		"ambiguous": {Requirements: scheduling.NewRequirements(
+			scheduling.NewRequirement(catalog.LabelHostClass, corev1.NodeSelectorOpIn, inspacev1.HostClassIntelScalable, inspacev1.HostClassAMDEPYC),
+		)},
+		"unknown": {Requirements: scheduling.NewRequirements(
+			scheduling.NewRequirement(catalog.LabelHostClass, corev1.NodeSelectorOpIn, "future-host"),
+		)},
+	}
+	for name, offering := range tests {
+		t.Run(name, func(t *testing.T) {
+			if hostClass, hostPoolUUID, err := hostPoolForOffering(offering); err == nil {
+				t.Fatalf("resolved unsafe offering to %s/%s", hostClass, hostPoolUUID)
+			}
+		})
+	}
+}
+
+func TestCreateAndReadbackPreserveOfferingAndNumericIdentity(t *testing.T) {
+	ctx := context.Background()
+	nodeClass := readyProviderNodeClass()
+	resolver := NewStaticResolver(nodeClass)
+	resolver.SetToken(inspacev1.RKE2AgentTokenSecretName, inspacev1.RKE2AgentTokenSecretKey, "agent-token")
+	cloud := cloudfake.New()
+	provider, err := New(cloud, resolver, providerOptions(nodeClass))
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim := &karpv1.NodeClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: "general-ab12c", UID: types.UID("claim-uid"), Labels: map[string]string{karpv1.NodePoolLabelKey: "general"}},
+		Spec: karpv1.NodeClaimSpec{
+			NodeClassRef: &karpv1.NodeClassReference{Group: inspacev1.Group, Kind: inspacev1.Kind, Name: nodeClass.Name},
+			Requirements: []karpv1.NodeSelectorRequirementWithMinValues{
+				{Key: catalog.LabelFamily, Operator: corev1.NodeSelectorOpIn, Values: []string{"general"}},
+				{Key: catalog.LabelHostClass, Operator: corev1.NodeSelectorOpIn, Values: []string{inspacev1.HostClassAMDEPYC}},
+				{Key: catalog.LabelInstanceCPU, Operator: karpv1.NodeSelectorOpGte, Values: []string{"4"}},
+				{Key: catalog.LabelInstanceMemory, Operator: karpv1.NodeSelectorOpGte, Values: []string{"8192"}},
+			},
+			Resources: karpv1.ResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("3")}},
+		},
+	}
+	created, err := provider.Create(ctx, claim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := providerid.Parse(created.Status.ProviderID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, ok := cloud.Request(id.VMUUID)
+	if !ok {
+		t.Fatal("cloud did not record launch request")
+	}
+	if request.HostClass != inspacev1.HostClassAMDEPYC || request.HostPoolUUID != inspacev1.AMDEPYCHostPoolUUID || request.InstanceType != "is-general-4c-8g" {
+		t.Fatalf("launch identity=%s/%s/%s", request.HostClass, request.HostPoolUUID, request.InstanceType)
+	}
+	assertCapacityLabels := func(t *testing.T, labels map[string]string) {
+		t.Helper()
+		want := map[string]string{
+			catalog.LabelHostClass:      inspacev1.HostClassAMDEPYC,
+			catalog.LabelInstanceCPU:    "4",
+			catalog.LabelInstanceMemory: "8192",
+			catalog.LabelFamily:         "general",
+			catalog.LabelLocation:       inspacev1.LocationBangkok,
+		}
+		for key, value := range want {
+			if labels[key] != value {
+				t.Fatalf("label %s=%q, want %q", key, labels[key], value)
+			}
+		}
+	}
+	assertCapacityLabels(t, created.Labels)
+	read, err := provider.Get(ctx, created.Status.ProviderID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertCapacityLabels(t, read.Labels)
+	listed, err := provider.List(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(listed) != 1 {
+		t.Fatalf("List() returned %d NodeClaims", len(listed))
+	}
+	assertCapacityLabels(t, listed[0].Labels)
 }
 
 func TestGetInstanceTypesRejectsNodeClassServicePoolDifferentFromController(t *testing.T) {
@@ -287,7 +469,6 @@ func providerNodeClass() *inspacev1.InSpaceNodeClass {
 			ReservePublicIPv4:       true,
 			FirewallUUID:            "22222222-2222-4222-8222-222222222222",
 			ImageSelector:           inspacev1.ImageSelector{OSName: inspacev1.OSNameUbuntu, OSVersion: inspacev1.OSVersionUbuntu},
-			HostPoolSelector:        inspacev1.HostPoolSelector{Class: inspacev1.HostClassAMDEPYC},
 			RootDiskGiB:             40,
 			RKE2: inspacev1.RKE2Config{
 				Version:        "v1.35.6+rke2r1",
@@ -296,6 +477,15 @@ func providerNodeClass() *inspacev1.InSpaceNodeClass {
 			},
 		},
 	}
+}
+
+func readyProviderNodeClass() *inspacev1.InSpaceNodeClass {
+	nodeClass := providerNodeClass()
+	nodeClass.Generation = 1
+	nodeClass.Status.ObservedGeneration = nodeClass.Generation
+	nodeClass.Status.ObservedSpecHash = NodeClassHash(nodeClass)
+	nodeClass.StatusConditions().SetTrueWithReason(status.ConditionReady, "NodeClassReady", "ready for provider test")
+	return nodeClass
 }
 
 func providerOptions(nodeClass *inspacev1.InSpaceNodeClass) Options {

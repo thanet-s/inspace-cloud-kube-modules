@@ -39,6 +39,15 @@ LimitMEMLOCK=infinity
 TasksMax=infinity
 `
 
+const automaticAPTUpdatesDisabledConfig = `// Managed by InSpace cluster bootstrap.
+APT::Periodic::Enable "0";
+APT::Periodic::Update-Package-Lists "0";
+APT::Periodic::Download-Upgradeable-Packages "0";
+APT::Periodic::Unattended-Upgrade "0";
+APT::Periodic::AutocleanInterval "0";
+Unattended-Upgrade::Automatic-Reboot "false";
+`
+
 type CloudInitInput struct {
 	NodeName                     string
 	NodeExternalIPv4             string
@@ -129,6 +138,7 @@ func RenderCloudInitJSON(input CloudInitInput) (string, error) {
 	addFile("/etc/sysctl.d/90-inspace-kubernetes.conf", kubernetesSysctlConfig, "0644")
 	addFile("/etc/security/limits.d/90-inspace-kubernetes.conf", kubernetesLimitsConfig, "0644")
 	addFile("/etc/systemd/system/rke2-server.service.d/20-inspace-node-limits.conf", rke2ServerLimitsConfig, "0644")
+	addFile("/var/lib/inspace/apt-periodic-disabled", automaticAPTUpdatesDisabledConfig, "0644")
 	payload.RunCmd = []string{"/usr/local/sbin/inspace-bootstrap-rke2"}
 	data, err := json.Marshal(payload)
 	if err != nil {
@@ -137,9 +147,10 @@ func RenderCloudInitJSON(input CloudInitInput) (string, error) {
 	return string(data), nil
 }
 
-// RenderBastionCloudInitJSON sets the deterministic guest hostname and
-// disables any image-provided host firewall. All packet policy is enforced by
-// the separately owned InSpace bastion firewall.
+// RenderBastionCloudInitJSON sets the deterministic guest hostname, performs
+// one bounded package upgrade, disables automatic APT updates, and disables
+// any image-provided host firewall. All packet policy is enforced by the
+// separately owned InSpace bastion firewall.
 func RenderBastionCloudInitJSON(nodeName string) (string, error) {
 	if !nodeNamePattern.MatchString(nodeName) {
 		return "", errors.New("bootstrap: bastion node name must be a lowercase DNS label of at most 63 characters")
@@ -163,11 +174,17 @@ func RenderBastionCloudInitJSON(nodeName string) (string, error) {
 			Permissions string `json:"permissions"`
 			Encoding    string `json:"encoding"`
 			Owner       string `json:"owner"`
-		}{{
-			Path: "/usr/local/sbin/inspace-disable-ufw", Content: base64.StdEncoding.EncodeToString([]byte(renderDisableUFWScript())),
-			Permissions: "0700", Encoding: "b64", Owner: "root:root",
-		}},
-		RunCmd: []string{"/usr/local/sbin/inspace-disable-ufw"},
+		}{
+			{
+				Path: "/usr/local/sbin/inspace-bootstrap-bastion", Content: base64.StdEncoding.EncodeToString([]byte(renderBastionBootstrapScript())),
+				Permissions: "0700", Encoding: "b64", Owner: "root:root",
+			},
+			{
+				Path: "/var/lib/inspace/apt-periodic-disabled", Content: base64.StdEncoding.EncodeToString([]byte(automaticAPTUpdatesDisabledConfig)),
+				Permissions: "0644", Encoding: "b64", Owner: "root:root",
+			},
+		},
+		RunCmd: []string{"/usr/local/sbin/inspace-bootstrap-bastion"},
 	}
 	data, err := json.Marshal(payload)
 	if err != nil {
@@ -372,6 +389,48 @@ fi
 `
 }
 
+func renderDisableAutomaticAPTUpdatesCommands() string {
+	return `install -D -m 0644 /var/lib/inspace/apt-periodic-disabled /etc/apt/apt.conf.d/99-inspace-disable-periodic
+cmp -s /var/lib/inspace/apt-periodic-disabled /etc/apt/apt.conf.d/99-inspace-disable-periodic
+for apt_unit in apt-daily.service apt-daily-upgrade.service apt-daily.timer apt-daily-upgrade.timer unattended-upgrades.service; do
+  systemctl mask --now "$apt_unit" >/dev/null
+done
+for apt_unit in apt-daily.service apt-daily-upgrade.service apt-daily.timer apt-daily-upgrade.timer unattended-upgrades.service; do
+  if systemctl is-active --quiet "$apt_unit"; then exit 1; fi
+  apt_unit_state="$(systemctl is-enabled "$apt_unit" 2>/dev/null || true)"
+  test "$apt_unit_state" = masked
+done
+`
+}
+
+func renderBastionBootstrapScript() string {
+	return `#!/bin/sh
+set -eu
+
+for ubuntu_sources in /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list; do
+  [ -f "$ubuntu_sources" ] || continue
+  sed -E -i 's|https?://archive\.ubuntu\.com|http://th.archive.ubuntu.com|g' "$ubuntu_sources"
+  if grep -E 'https?://archive\.ubuntu\.com' "$ubuntu_sources" >/dev/null; then exit 1; fi
+done
+
+package_deadline=$(( $(date +%s) + 600 ))
+run_package_command() {
+  package_remaining=$(( package_deadline - $(date +%s) ))
+  [ "$package_remaining" -gt 0 ] || return 124
+  timeout --kill-after=30s "${package_remaining}s" "$@"
+}
+attempt=0
+until run_package_command apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 update && \
+      run_package_command env NEEDRESTART_MODE=a DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=30 upgrade -y; do
+  attempt=$((attempt + 1))
+  if [ "$attempt" -ge 60 ] || [ "$(date +%s)" -ge "$package_deadline" ]; then exit 1; fi
+  sleep 10
+done
+
+` + renderDisableAutomaticAPTUpdatesCommands() + `
+` + strings.TrimSpace(strings.TrimPrefix(renderDisableUFWScript(), "#!/bin/sh\nset -eu\n")) + "\n"
+}
+
 func renderInstallScript(input CloudInitInput) string {
 	releaseBase := "https://github.com/rancher/rke2/releases/download/" + url.PathEscape(input.RKE2Version)
 	return fmt.Sprintf(`#!/bin/sh
@@ -401,6 +460,8 @@ until run_package_command apt-get -o Acquire::Retries=3 -o Acquire::http::Timeou
   if [ "$attempt" -ge 60 ] || [ "$(date +%%s)" -ge "$package_deadline" ]; then exit 1; fi
   sleep 10
 done
+
+%s
 
 sysctl --system >/dev/null
 test "$(sysctl -n net.ipv4.ip_forward)" -eq 1
@@ -461,7 +522,7 @@ until systemctl is-active --quiet rke2-server.service && [ -s /etc/rancher/rke2/
   if systemctl is-failed --quiet rke2-server.service || [ "$attempt" -ge 180 ]; then exit 1; fi
   sleep 5
 done
-`, input.PrivateSubnet, input.VirtualIPv4, strings.TrimSpace(strings.TrimPrefix(renderDisableUFWScript(), "#!/bin/sh\nset -eu\n")), input.RKE2Version, releaseBase)
+`, strings.TrimSpace(renderDisableAutomaticAPTUpdatesCommands()), input.PrivateSubnet, input.VirtualIPv4, strings.TrimSpace(strings.TrimPrefix(renderDisableUFWScript(), "#!/bin/sh\nset -eu\n")), input.RKE2Version, releaseBase)
 }
 
 func sortedUniquePorts(ports []int) []int {

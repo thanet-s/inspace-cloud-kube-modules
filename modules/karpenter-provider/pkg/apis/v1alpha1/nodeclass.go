@@ -25,7 +25,6 @@ const (
 // +kubebuilder:resource:path=inspacenodeclasses,scope=Cluster,categories=karpenter
 // +kubebuilder:subresource:status
 // +kubebuilder:printcolumn:name="Location",type=string,JSONPath=`.spec.location`
-// +kubebuilder:printcolumn:name="Host Class",type=string,JSONPath=`.spec.hostPoolSelector.class`
 // +kubebuilder:printcolumn:name="Ready",type=string,JSONPath=`.status.conditions[?(@.type=="Ready")].status`
 type InSpaceNodeClass struct {
 	metav1.TypeMeta   `json:",inline"`
@@ -74,8 +73,6 @@ type InSpaceNodeClassSpec struct {
 	// ImageSelector selects a stock operating-system image supported by the VM
 	// create API. The first release supports Ubuntu 24.04 only.
 	ImageSelector ImageSelector `json:"imageSelector"`
-	// HostPoolSelector resolves one of the two supported hardware classes.
-	HostPoolSelector HostPoolSelector `json:"hostPoolSelector"`
 	// RootDiskGiB is ephemeral node storage. Persistent data belongs on CSI volumes.
 	RootDiskGiB int32 `json:"rootDiskGiB"`
 	// RKE2 configures agents to join the fixed supervisor endpoint.
@@ -97,13 +94,11 @@ func (i ImageSelector) ID() string {
 	return i.OSName + "@" + i.OSVersion
 }
 
-type HostPoolSelector struct {
-	// Class selects the Standard Intel Scalable or High Performance AMD EPYC pool.
-	Class string `json:"class"`
-}
-
-func (h HostPoolSelector) UUID() (string, bool) {
-	switch h.Class {
+// HostPoolUUIDForClass resolves the provider's frozen hardware-class identity.
+// Hardware selection belongs to NodePool requirements; NodeClass deliberately
+// contains no host-class selector so one NodeClass can serve mixed-class pools.
+func HostPoolUUIDForClass(class string) (string, bool) {
+	switch class {
 	case HostClassIntelScalable:
 		return IntelScalableHostPoolUUID, true
 	case HostClassAMDEPYC:
@@ -111,6 +106,12 @@ func (h HostPoolSelector) UUID() (string, bool) {
 	default:
 		return "", false
 	}
+}
+
+// SupportedHostClasses returns a stable copy in deterministic scheduling and
+// readiness-validation order.
+func SupportedHostClasses() []string {
+	return []string{HostClassIntelScalable, HostClassAMDEPYC}
 }
 
 type RKE2Config struct {
@@ -134,13 +135,14 @@ type SecretKeySelector struct {
 }
 
 type InSpaceNodeClassStatus struct {
-	Conditions               []status.Condition `json:"conditions,omitempty"`
-	HostPoolUUID             string             `json:"hostPoolUUID,omitempty"`
-	FirewallUUID             string             `json:"firewallUUID,omitempty"`
-	ObservedImageID          string             `json:"observedImageID,omitempty"`
-	ObservedSpecHash         string             `json:"observedSpecHash,omitempty"`
-	ObservedGeneration       int64              `json:"observedGeneration,omitempty"`
-	ObservedBillingAccountID int64              `json:"observedBillingAccountID,omitempty"`
+	Conditions []status.Condition `json:"conditions,omitempty"`
+	// +listType=set
+	HostPoolUUIDs            []string `json:"hostPoolUUIDs,omitempty"`
+	FirewallUUID             string   `json:"firewallUUID,omitempty"`
+	ObservedImageID          string   `json:"observedImageID,omitempty"`
+	ObservedSpecHash         string   `json:"observedSpecHash,omitempty"`
+	ObservedGeneration       int64    `json:"observedGeneration,omitempty"`
+	ObservedBillingAccountID int64    `json:"observedBillingAccountID,omitempty"`
 }
 
 func (n *InSpaceNodeClass) StatusConditions(opts ...status.ForOption) status.ConditionSet {

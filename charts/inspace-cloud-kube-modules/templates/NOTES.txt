@@ -27,6 +27,9 @@ Cilium Node IPAM and loadBalancerClass io.cilium/node are unsupported. Public
 InSpace NLBs are an explicit paid TCP-only path: leave loadBalancerClass unset,
 set inspace.cloud/load-balancer-scope=public, and set annotation
 service.beta.kubernetes.io/inspace-load-balancer-public=true.
+Public NLB Services may use externalTrafficPolicy=Local; CCM limits targets to
+Ready nodes with Ready, non-terminating local EndpointSlice endpoints. Private
+Cilium L2 Services must remain externalTrafficPolicy=Cluster.
 
 L2 Announcements is beta. Confirm this VPC accepts ARP and gratuitous ARP for
 the reserved VIPs before production use. See the private and public Service
@@ -69,6 +72,14 @@ contract there as well (the chart will not copy credential data):
 
 Check the controllers:
   kubectl get pods -A -l app.kubernetes.io/part-of=inspace-cloud-kube-modules
+
+IMPORTANT upgrade migration:
+  Before upgrading a selector-based installation, add an explicit
+  inspace.cloud/host-class requirement (intel-scalable, amd-epyc, or both) to
+  every NodePool and verify it was stored while the old CRD/controller are
+  still running. The new CRD prunes InSpaceNodeClass.spec.hostPoolSelector;
+  skipping this step makes both equal-priced classes eligible and no longer
+  guarantees AMD. Fresh installations can skip this migration.
 
 CRDs are released separately and must be upgraded before this chart:
   helm upgrade --install inspace-cloud-kube-modules-crds \

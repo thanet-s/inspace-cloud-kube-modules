@@ -649,6 +649,8 @@ def main() -> None:
         "Disable persistent swap entries on every control plane in parallel",
         "Select the Thailand Ubuntu archive mirror on every control plane in parallel",
         "Update and upgrade every control plane in parallel",
+        "/etc/apt/apt.conf.d/99-inspace-disable-periodic",
+        'APT::Periodic::Unattended-Upgrade "0";',
         "/etc/sysctl.d/90-inspace-kubernetes.conf",
         "/etc/security/limits.d/90-inspace-kubernetes.conf",
         "LimitMEMLOCK",
@@ -656,6 +658,7 @@ def main() -> None:
         require(marker in playbook, f"playbook is missing contract marker: {marker}")
 
     require("version: v1.35.6+rke2r1" in cluster, "control plane must pin supported RKE2")
+    require("rootDiskGiB: 60" in cluster, "E2E control planes must use 60 GiB root disks")
     require("rke2-ingress-nginx" in cluster, "unused RKE2 ingress must be disabled")
     require("virtualIPv4:" in cluster and "public:" not in cluster and "host:" not in cluster,
             "cluster endpoint must be only the configured private VIP")
@@ -664,12 +667,21 @@ def main() -> None:
     require("rke2:" in nodeclass and "privateRegistrationEndpoint" in nodeclass,
             "NodeClass must use the private RKE2 registration endpoint")
     require("inspace-rke2-agent-token" in nodeclass, "NodeClass must use the RKE2 token secret")
-    require("class: amd-epyc" in nodeclass and "class: intel-scalable" not in nodeclass,
-            "E2E NodeClass must select AMD EPYC workers")
-    require('.spec.hostPoolSelector.class == "amd-epyc"' in playbook and
-            ".status.hostPoolUUID == $pool" in playbook and
+    require("rootDiskGiB: 100" in nodeclass, "E2E Karpenter workers must use 100 GiB root disks")
+    require("hostPoolSelector" not in nodeclass and
+            "key: inspace.cloud/host-class" in nodeclass and
+            "values: [amd-epyc]" in nodeclass and
+            "intel-scalable" not in nodeclass,
+            "E2E NodePool must exclusively select AMD EPYC workers")
+    require('(.spec | has("hostPoolSelector") | not)' in playbook and
+            ".status.hostPoolUUIDs | sort" in playbook and
+            '.key == "inspace.cloud/host-class"' in playbook and
             "INSPACE_AMD_HOST_POOL_UUID" in playbook,
-            "live NodeClass readiness must prove the exact AMD EPYC pool")
+            "live NodeClass and NodePool checks must prove the multi-class catalog and AMD selection")
+    require(playbook.count('.metadata.labels["inspace.cloud/host-class"] == "amd-epyc"') >= 2 and
+            playbook.count('.metadata.labels["inspace.cloud/instance-cpu"] == "2"') >= 2 and
+            playbook.count('.metadata.labels["inspace.cloud/instance-memory"] == "4096"') >= 2,
+            "live worker checks must prove resolved host-class and numeric capacity labels")
     private_services = [
         manifest_document(workload, "Service", "inspace-e2e-private-a"),
         manifest_document(workload, "Service", "inspace-e2e-private-b"),
@@ -700,6 +712,8 @@ def main() -> None:
             "public Service must use the exact InSpace scope and opt-in annotation")
     require("loadBalancerClass:" not in public_service,
             "public InSpace NLB Service must leave loadBalancerClass unset for generic CCM")
+    require("externalTrafficPolicy: Local" in public_service,
+            "public InSpace NLB Service must preserve source IP and use endpoint-local targets")
     require(re.search(r"(?m)^\s+protocol: TCP$", public_service) is not None,
             "public InSpace NLB Service must be TCP-only")
 
@@ -777,17 +791,34 @@ def main() -> None:
             require(False, f"service cloud verifier accepted invalid is_virtual={contradictory_nonvirtual!r}")
     require("private_address == control_plane_vip" in service_cloud,
             "public Service proof must reject a control-plane VIP collision")
-    require("targets must be exactly three control planes and one worker" in service_cloud and
+    require("target must be exactly the ready local-endpoint worker" in service_cloud and
+            "targets must be empty without an eligible ready local endpoint" in service_cloud and
             "exactly one TCP 80-to-30080 forwarding rule" in service_cloud,
             "public Service proof must bind the exact NLB forwarding and VM target contracts")
+    require("node.kubernetes.io/exclude-from-external-load-balancers=true" in playbook and
+            "Require the public NLB to remove the excluded local-endpoint node" in playbook and
+            "Require zero public NLB targets without a ready local endpoint" in playbook and
+            playbook.count("--targets") >= 4,
+            "live public NLB acceptance must prove Node and EndpointSlice target removal/restoration")
     require(playbook.count("/opt/e2e/scripts/verify-service-cloud.py") >= 2 and
             "service.beta.kubernetes.io/inspace-load-balancer-public" in playbook,
             "playbook must audit cloud ownership before and after removing public opt-in")
+    require("Remove only the public scope label while keeping the annotation and Service type" in playbook and
+            "Restore only the public scope label to recreate the NLB" in playbook and
+            "inspace.cloud/load-balancer-scope-" in playbook,
+            "live public lifecycle must prove label-only cleanup and recreation")
     require(playbook.count("systemctl is-enabled ufw.service") == 3 and
             playbook.count("systemctl is-active --quiet ufw.service") == 3 and
             playbook.count("systemctl show ufw.service --property=LoadState --value") == 3 and
             playbook.count("not-found) ;;") == 3,
             "control planes, worker, and bastion must prove guest UFW is disabled and inactive")
+    require("Disable automatic APT update units on repaired control planes" in playbook and
+            playbook.count("for apt_unit in apt-daily.service") == 5 and
+            playbook.count('APT::Periodic::Enable "0";') == 4 and
+            playbook.count('APT::Periodic::Update-Package-Lists "0";') == 4 and
+            playbook.count('APT::Periodic::Unattended-Upgrade "0";') == 4 and
+            playbook.count('systemctl is-enabled "$apt_unit"') == 4,
+            "control planes (including repair), worker, and bastion must prove automatic APT updates are masked")
     digest = "sha256:49b77655f9f109bedc5eb25723bb0e4c57d8513ba33cc69c31be3f243eb2386d"
     require(playbook.count(digest) >= 2, "kube-vip tag and live pods must use the audited digest")
     require("expected one exact egress FIP for each control plane and bastion" in bootstrap_discovery and
@@ -798,7 +829,7 @@ def main() -> None:
             "enabled non-virtual InSpace type=public FIP" in bootstrap_discovery and
             'assigned_to_resource_type") != "virtual_machine"' in bootstrap_discovery and
             "private-VIP bootstrap must not create or adopt a control-plane load balancer" in bootstrap_discovery and
-            "2-vCPU / 4-GiB / 30-GiB control-plane shape" in bootstrap_discovery and
+            "2-vCPU / 4-GiB / 60-GiB control-plane shape" in bootstrap_discovery and
             "1-vCPU / 2-GiB / 30-GiB / configured-pool shape" in bootstrap_discovery and
             "bootstrap FIPs must have the exact configured billing-account identity" in bootstrap_discovery and
             "VM public_ipv4 must remain empty for an auto-reserved FIP" in bootstrap_discovery and
@@ -823,8 +854,9 @@ def main() -> None:
             "dynamic bastion inventory must use the discovered exact VM name")
     for naming_contract in (
         're.compile(r"[a-z0-9](?:[a-z0-9-]{0,53}[a-z0-9])?")',
-        'return f"{cluster_resource_name}-bastion", owner_name, owner_name + "-ip"',
-        'bastion_name, bastion_owner_name, bastion_fip_name = bastion_resource_names(',
+        'f"{cluster_resource_name}-bastion-{owner}"',
+        'f"{cluster_resource_name}-bastion-ip"',
+        'bastion_name, bastion_firewall_name, bastion_fip_name = bastion_resource_names(',
         'rf"inspace-rke2-bastion/v3 owner={re.escape(owner)} spec=[0-9a-f]{{64}}"',
         'validate_optional_vm_hostname(bastion, bastion_name, "bastion")',
         '"bastionName": bastion_name',
@@ -833,8 +865,9 @@ def main() -> None:
         require(naming_contract in bootstrap_discovery,
                 f"bootstrap bastion naming contract is missing: {naming_contract}")
     require('expected_fip_names = set(expected_cp_fip_names) | {bastion_fip_name}' in bootstrap_discovery and
-            '== bastion_owner_name' in bootstrap_discovery,
-            "bastion VM naming must remain distinct from owner-derived FIP and firewall naming")
+            'expected_cp_fip_names = [f"{cluster_resource_name}-cp{slot}-ip"' in bootstrap_discovery and
+            'node_firewall_name = f"{cluster_resource_name}-nodes-{owner}"' in bootstrap_discovery,
+            "bootstrap FIP and firewall names must use the cluster prefix")
 
     bootstrap_discovery_module = load_script_module(
         "e2e_discover_bootstrap_static", ROOT / "scripts/discover-bootstrap.py"
@@ -851,12 +884,12 @@ def main() -> None:
     require(
         bastion_names == (
             "inspace-e2e-unit-bastion",
-            "rke2-owner-bastion",
-            "rke2-owner-bastion-ip",
+            "inspace-e2e-unit-bastion-owner",
+            "inspace-e2e-unit-bastion-ip",
         )
         and bastion_names[0] != bastion_names[1]
         and bastion_names[0] != bastion_names[2],
-        "bastion VM name must be distinct from owner-derived firewall and FIP names",
+        "bastion VM name must be distinct from cluster-prefixed firewall and FIP names",
     )
     for vm_detail in ({}, {"hostname": None}, {"hostname": ""}, {"hostname": bastion_names[0]}):
         bootstrap_discovery_module.validate_optional_vm_hostname(
@@ -870,7 +903,7 @@ def main() -> None:
         require("contradictory hostname" in str(error),
                 "bootstrap discovery returned the wrong hostname contradiction diagnostic")
     else:
-        require(False, "bootstrap discovery accepted the owner-derived firewall name as the bastion hostname")
+        require(False, "bootstrap discovery accepted the firewall name as the bastion hostname")
     require(
         bootstrap_discovery.count(
             'validate_optional_vm_hostname(bastion, bastion_name, "bastion")'
@@ -1035,6 +1068,10 @@ def main() -> None:
             "hostClass": "amd-epyc",
         }),
         "designated_pool_uuid": "6976fdc8-4492-465b-bd16-9ad5f6b00b03",
+        "storage": [
+            {"uuid": "root-disk", "primary": True, "size": 100},
+            {"uuid": "data-disk", "primary": False, "size": 20},
+        ],
     }
     worker_detail_queries = []
 
@@ -1049,6 +1086,26 @@ def main() -> None:
     require(canonical_worker is worker_detail and
             worker_detail_queries == ["user-resource/vm?uuid=12345678-1234-4abc-8def-1234567890ab"],
             "worker discovery did not resolve a sparse list identity through exact VM detail")
+    worker_discovery_module.validate_worker_root_disk(worker_detail)
+    invalid_worker_storage = (
+        {},
+        {"storage": None},
+        {"storage": ["not-a-disk"]},
+        {"storage": [{"primary": False, "size": 100}]},
+        {"storage": [{"primary": True, "size": 99}]},
+        {"storage": [
+            {"primary": True, "size": 100},
+            {"primary": True, "size": 100},
+        ]},
+    )
+    for invalid_vm in invalid_worker_storage:
+        try:
+            worker_discovery_module.validate_worker_root_disk(invalid_vm)
+        except SystemExit as error:
+            require("worker VM" in str(error),
+                    "worker root-disk validation returned the wrong diagnostic")
+        else:
+            require(False, f"worker discovery accepted invalid root storage {invalid_vm!r}")
 
     def mismatched_worker_getter(_path: str):
         return {**worker_detail, "name": "foreign-worker"}
@@ -1100,6 +1157,8 @@ def main() -> None:
             "worker InternalIP collides with the private control-plane VIP" in worker_discovery and
             'os.environ["INSPACE_AMD_HOST_POOL_UUID"]' in worker_discovery and
             "canonical_worker_vm_detail(" in worker_discovery and
+            "validate_worker_root_disk(vm)" in worker_discovery and
+            "exactly one 100-GiB primary root disk" in worker_discovery and
             'record.get("schema") != "karpenter.inspace.cloud/v3"' in worker_discovery and
             'record.get("nodeClaim") != node.get("nodeClaimName")' in worker_discovery and
             'record.get("vmName") != node.get("name")' in worker_discovery and
@@ -1141,6 +1200,11 @@ def main() -> None:
             'worker_fip_prefix = f"karpenter-{args.nodepool}-"' in cloud_audit and
             'state.get("workerVMs", [])' in cloud_audit,
             "cleanup audit must retain new worker VM/FIP naming even with sparse list descriptions")
+    require('f"{args.cluster}-nodes-{args.owner}"' in cloud_audit and
+            'f"{args.cluster}-bastion-{args.owner}"' in cloud_audit and
+            'f"{args.cluster}-bastion-ip"' in cloud_audit and
+            'f"{args.cluster}-cp{slot}-ip"' in cloud_audit,
+            "cleanup audit must retain cluster-prefixed bootstrap firewall/FIP naming")
     require('f"{args.cluster}-bastion"' in cloud_audit and
             'f"rke2-{args.owner}-bastion"' in cloud_audit and
             "or vm.get(\"name\") in bastion_vm_names" in cloud_audit,
@@ -1195,8 +1259,8 @@ def main() -> None:
             "cleanup must fail closed when ownership is uncertain")
     require("e2e_cleanup_state.clusterResourceName + '-cp[0-2]|'" in cleanup and
             "e2e_cleanup_state.clusterResourceName + '-bastion|rke2-'" in cleanup and
-            "e2e_cleanup_state.owner + '-bastion)$'" in cleanup,
-            "controller uninstall must permit only control planes and current or safe-prior bastion names")
+            "e2e_cleanup_state.owner + '-(cp-[0-2]|bastion))$'" in cleanup,
+            "controller uninstall must permit only current or fully legacy bootstrap VM names")
     print("E2E static contract verified (no live resources touched)")
 
 

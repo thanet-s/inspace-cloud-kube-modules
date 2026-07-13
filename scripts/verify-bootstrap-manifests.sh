@@ -7,6 +7,9 @@ values=$chart/ci/test-values.yaml
 standalone_ccm=$workspace/modules/cloud-provider/config/ccm/cloud-controller-manager.yaml
 standalone_csi=$workspace/modules/csi-driver/deploy/kubernetes/controller.yaml
 standalone_karpenter=$workspace/modules/karpenter-provider/config/controller/controller.yaml
+root_readme=$workspace/README.md
+chart_readme=$chart/README.md
+chart_notes=$chart/templates/NOTES.txt
 tmpdir=$(mktemp -d)
 trap 'rm -rf "$tmpdir"' EXIT INT TERM
 
@@ -141,3 +144,10 @@ require_toleration "$standalone_csi"
 require_toleration "$standalone_karpenter"
 grep -F '            - name: INSPACE_NETWORK_UUID' "$standalone_karpenter" >/dev/null
 grep -F '            - name: INSPACE_CONTROL_PLANE_VIP' "$standalone_karpenter" >/dev/null
+
+for upgrade_document in "$root_readme" "$chart_readme" "$chart_notes"; do
+  grep -F 'inspace.cloud/host-class' "$upgrade_document" >/dev/null
+  grep -F 'spec.hostPoolSelector' "$upgrade_document" >/dev/null
+  grep -F 'equal-priced' "$upgrade_document" >/dev/null
+  grep -F 'guarantees AMD' "$upgrade_document" >/dev/null
+done

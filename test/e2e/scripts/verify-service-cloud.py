@@ -34,6 +34,12 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--state", required=True)
     parser.add_argument("--public", choices=("present", "absent"), required=True)
+    parser.add_argument(
+        "--targets",
+        choices=("ready", "empty"),
+        default="ready",
+        help="expected public NLB local-endpoint target state",
+    )
     args = parser.parse_args()
 
     state = json.loads(pathlib.Path(args.state).read_text(encoding="utf-8"))
@@ -65,30 +71,26 @@ def main() -> None:
     floating_ip = public_fips[0]
     if load_balancer.get("network_uuid") != os.environ["INSPACE_NETWORK_UUID"]:
         raise SystemExit("public Service NLB is outside the configured VPC")
-    control_plane_targets = state.get("controlPlaneVMs", [])
     worker_records = state.get("workerVMs", [])
     if (
-        not isinstance(control_plane_targets, list)
-        or len(control_plane_targets) != 3
-        or any(not isinstance(value, str) or not value for value in control_plane_targets)
-        or not isinstance(worker_records, list)
+        not isinstance(worker_records, list)
         or len(worker_records) != 1
         or not isinstance(worker_records[0], dict)
         or not isinstance(worker_records[0].get("uuid"), str)
         or not worker_records[0]["uuid"]
     ):
-        raise SystemExit("workload journal lacks exactly three control-plane and one worker target UUIDs")
-    expected_targets = set(control_plane_targets) | {worker_records[0]["uuid"]}
-    if len(expected_targets) != 4:
-        raise SystemExit("public Service target journal contains duplicate VM UUIDs")
+        raise SystemExit("workload journal lacks the exact Karpenter worker target UUID")
+    expected_targets = {worker_records[0]["uuid"]} if args.targets == "ready" else set()
     targets = load_balancer.get("targets")
     if (
         not isinstance(targets, list)
-        or len(targets) != 4
+        or len(targets) != len(expected_targets)
         or any(not isinstance(target, dict) or target.get("target_type") != "vm" for target in targets)
         or {target.get("target_uuid") for target in targets} != expected_targets
     ):
-        raise SystemExit("public Service NLB targets must be exactly three control planes and one worker")
+        if args.targets == "ready":
+            raise SystemExit("public Service NLB target must be exactly the ready local-endpoint worker")
+        raise SystemExit("public Service NLB targets must be empty without an eligible ready local endpoint")
     forwarding_rules = load_balancer.get("forwarding_rules")
     if (
         not isinstance(forwarding_rules, list)

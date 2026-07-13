@@ -74,6 +74,12 @@ Public exposure remains an explicit, paid, TCP-only InSpace NLB. A public
 Service deliberately leaves `loadBalancerClass` unset for Kubernetes' generic
 cloud service controller and sets both the public scope label and
 `service.beta.kubernetes.io/inspace-load-balancer-public: "true"` annotation.
+Public Services may use `externalTrafficPolicy: Local`; the CCM watches
+EndpointSlices and makes the NLB target set exactly the Ready, non-terminating
+local endpoint nodes that are themselves Ready and eligible for load balancing.
+The resulting `healthCheckNodePort` is not probed by InSpace because its NLB API
+has no health-check contract; endpoint and node informer events drive target
+convergence instead. Private Cilium L2 Services must remain `Cluster`.
 See [`service-private-l2.yaml`](examples/service-private-l2.yaml) and
 [`service-public-nlb.yaml`](examples/service-public-nlb.yaml).
 
@@ -102,6 +108,16 @@ namespaces, so the same existing cloud API Secret contract must then also be
 provisioned in that namespace. The chart never copies secret data.
 
 ## Install
+
+> [!IMPORTANT]
+> Before upgrading an existing selector-based installation, update every
+> NodePool—while the old CRD/controller are still installed—with an explicit
+> `inspace.cloud/host-class` requirement (`intel-scalable`, `amd-epyc`, or both)
+> and verify that Kubernetes stored it. Only then upgrade the CRD followed by
+> this chart. The new CRD removes and prunes
+> `InSpaceNodeClass.spec.hostPoolSelector`; without the NodePool requirement, a
+> formerly AMD-only pool exposes both equal-priced offerings and no longer
+> guarantees AMD. Fresh installations can skip this migration.
 
 ```sh
 export VERSION=0.1.0

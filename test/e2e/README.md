@@ -55,16 +55,25 @@ authoritative readback before continuing. Karpenter persists ownership schema
 same address as the worker Node's sole `ExternalIP`. The worker proof binds
 Node/NodeClaim/provider ID to one exact VM,
 authoritative VPC membership, private subnet containment, the configured AMD
-EPYC host pool, and its exact FIP. The control planes, bastion, and Karpenter
-worker all use that exact AMD EPYC pool; the NodeClass selects it through the
-`amd-epyc` host class.
+EPYC host pool, exactly one 100 GiB primary root disk, and its exact FIP. The
+control planes, bastion, and Karpenter worker all use that exact AMD EPYC pool;
+the worker NodePool selects it with an
+`inspace.cloud/host-class In [amd-epyc]` requirement. The reusable NodeClass
+validates both supported class-to-pool mappings, while the live Node and
+NodeClaim must advertise `instance-cpu=2`, `instance-memory=4096` MiB, and the
+resolved AMD host class.
 The three control-plane cloud names, guest hostnames, and Kubernetes Node names
 are live-proven as `<clusterResourceName>-cp0`, `-cp1`, and `-cp2`.
+Each E2E control plane uses a 60 GiB root disk, and the E2E Karpenter NodeClass
+uses a 100 GiB worker root disk.
 The bastion cloud name and guest hostname are live-proven as
-`<clusterResourceName>-bastion`; the owner-derived `rke2-<owner>-bastion-ip`
-floating IP and `rke2-<owner>-bastion` firewall remain separate ownership
-identities. Cluster resource names are limited to 55 characters so the
-longest fixed `-bastion` hostname remains a DNS label.
+`<clusterResourceName>-bastion`. Bootstrap FIPs are
+`<clusterResourceName>-bastion-ip` and `<clusterResourceName>-cp0-ip` through
+`-cp2-ip`; firewalls are `<clusterResourceName>-bastion-<owner>` and
+`<clusterResourceName>-nodes-<owner>`. The owner suffix keeps firewall identity
+fail-closed even when InSpace omits descriptions from readback. Cluster
+resource names are limited to 55 characters so the longest fixed `-bastion`
+hostname remains a DNS label.
 The worker cloud name, API hostname when returned, guest hostname, and
 Kubernetes Node name are live-proven as
 `<clusterResourceName>-karp-general-<Karpenter random suffix>` while its
@@ -90,12 +99,20 @@ accepts ARP for VIPs not assigned to a VM NIC. `externalTrafficPolicy: Local`
 is deliberately unsupported because it is incompatible with this L2 mode.
 
 One separate class-unset Service opts into the explicit paid, TCP-only InSpace
-NLB using the public scope label and annotation. The suite proves the two
-private Services own zero InSpace NLBs/FIPs, while the public Service owns
-exactly one of each. It then removes the public opt-in, waits for that NLB/FIP
-to be deleted and its status cleared, and verifies the transition left no
-public cloud resource behind. UDP is not tested on the public path because the
-InSpace NLB supports TCP only.
+NLB using the public scope label and annotation with
+`externalTrafficPolicy: Local`. Its target set must be exactly the Ready worker
+that hosts the Ready local endpoint—never the three control-plane nodes. The
+suite proves Node-event reconciliation by applying the standard external-LB
+exclusion label and observing an empty target set, then removes every serving
+replica and again requires zero targets before restoring the replica and exact
+worker target. It also proves the two private Services own zero InSpace
+NLBs/FIPs, while the public Service owns exactly one of each. It then removes
+only the public scope label (leaving the annotation and Service type intact),
+waits for that NLB/FIP to be deleted and its status cleared, and restores only
+the label to prove label-driven recreation. This directly exercises CCM's
+provider-intent trigger for changes the generic Service controller otherwise
+does not observe. UDP is not tested on the public path because the InSpace NLB
+supports TCP only.
 
 ## Safety and cleanup
 

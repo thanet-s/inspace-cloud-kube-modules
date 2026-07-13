@@ -26,6 +26,9 @@ func TestManifestWiresReservedPrivateAddressEnvironment(t *testing.T) {
 		"name: INSPACE_BILLING_ACCOUNT_ID",
 		"key: billingAccountID",
 		"optional: false",
+		"apiGroups: [\"discovery.k8s.io\"]",
+		"resources: [\"endpointslices\"]",
+		"verbs: [\"get\", \"list\", \"watch\"]",
 	} {
 		if !strings.Contains(manifest, required) {
 			t.Errorf("CCM manifest lacks %q", required)
