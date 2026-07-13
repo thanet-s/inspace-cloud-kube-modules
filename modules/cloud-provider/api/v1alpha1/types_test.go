@@ -22,6 +22,27 @@ func TestControlPlaneReplicaValidation(t *testing.T) {
 	}
 }
 
+func TestClusterNameFitsFixedControlPlaneHostname(t *testing.T) {
+	valid := []string{"a", "unit", strings.Repeat("a", 59)}
+	for _, name := range valid {
+		cluster := InSpaceCluster{Metadata: ObjectMeta{Name: name}, Spec: validSpec()}
+		if errs := cluster.Validate(); len(errs) != 0 {
+			t.Errorf("name %q: unexpected validation errors: %v", name, errs)
+		}
+	}
+	for _, name := range []string{"", "UPPER", "contains.dot", "-leading", "trailing-", strings.Repeat("a", 60)} {
+		cluster := InSpaceCluster{Metadata: ObjectMeta{Name: name}, Spec: validSpec()}
+		errs := cluster.Validate()
+		found := false
+		for _, err := range errs {
+			found = found || strings.HasPrefix(err.Error(), "metadata.name:")
+		}
+		if !found {
+			t.Errorf("name %q: validation errors %v do not identify metadata.name", name, errs)
+		}
+	}
+}
+
 func TestRKE2VersionValidationRequiresExactRelease(t *testing.T) {
 	for _, version := range []string{"v1.35.6+rke2r1", "v1.35.6+rke2r12"} {
 		spec := validSpec()
@@ -140,6 +161,9 @@ func TestControlPlaneCRDMatchesMachineValidationContract(t *testing.T) {
 	}
 	crd := string(data)
 	for _, required := range []string{
+		`self.metadata.name.matches("^[a-z0-9](?:[a-z0-9-]{0,57}[a-z0-9])?$") || (oldSelf.hasValue() && self.metadata.name == oldSelf.value().metadata.name)`,
+		"optionalOldSelf: true",
+		"metadata.name must be a lowercase DNS label of at most 59 characters",
 		"vcpu:\n                          type: integer\n                          format: int32\n                          minimum: 2\n                          maximum: 16",
 		"memoryMiB:\n                          type: integer\n                          format: int32\n                          minimum: 4096\n                          maximum: 65536",
 		"osName:\n                              type: string\n                              enum: [ubuntu]",

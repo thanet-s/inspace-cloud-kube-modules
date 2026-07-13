@@ -83,7 +83,7 @@ the cluster), and fails closed if that evidence does not converge within the
 read bound. Complete list and detail ownership records must agree exactly.
 Definitively unmanaged descriptions and explicit records for another cluster
 remain cluster-independent inventory and are ignored. A schema in the reserved
-`karpenter.inspace.cloud/` namespace must be the supported exact version; an
+`karpenter.inspace.cloud/` namespace must be a deliberately supported version; an
 unknown version fails closed instead of silently hiding a managed VM. Any other
 read or list/detail identity uncertainty also fails closed. One firewall list,
 one Floating-IP list, and one network read per unique VPC then detect a
@@ -91,15 +91,16 @@ lost/disabled address, a second or public firewall,
 membership drift, or a private-IP/supervisor-or-Service-VIP collision without
 mutating resources.
 
-New v1 ownership records persist the exact host-pool UUID, vCPU count, and
+New v2 ownership records persist the cloud VM/node name separately from the
+NodeClaim ownership identity, plus the exact host-pool UUID, vCPU count, and
 memory size used at launch. Established reads compare canonical VM name,
 capacity, image, host pool, VPC, billing account, and exactly one primary root
-disk against that record before reporting a worker healthy. The v1 schema was
-not bumped: older complete v1 records that lack those additive fields remain
-compatible by deriving capacity from the frozen 24-variant instance name and
-the pool UUID from the frozen host-class mapping. Partial or contradictory
-exact fields fail closed; operators should recycle any legacy worker whose v1
-identity cannot be derived.
+disk against that record before reporting a worker healthy. Older complete v1
+records remain compatible: their VM/node name is the NodeClaim name, capacity
+is derived from the frozen 24-variant instance name, and the pool UUID is
+derived from the frozen host-class mapping. Partial or contradictory exact
+fields fail closed; operators should recycle any legacy worker whose identity
+cannot be derived.
 
 `spec.networkUUID` and the literal VIP in `spec.rke2.server` must exactly match
 the controller-wide `INSPACE_NETWORK_UUID` and `INSPACE_CONTROL_PLANE_VIP`.
@@ -151,6 +152,8 @@ Worker network policy relies on the validated InSpace cloud firewall. Generated 
 
 `cloud_init` is sent as an API-compatible JSON object. On stock Ubuntu 24.04 it:
 
+- sets `/etc/hostname`, the active guest hostname, and RKE2 `node-name` to the
+  same validated worker name;
 - disables active swap and idempotently comments persistent swap entries in `/etc/fstab`;
 - changes stock Ubuntu archive endpoints to Thailand's regional mirror when they appear in either the deb822 or legacy source file;
 - waits within one hard ten-minute package-preparation budget for floating-IP egress, then updates and upgrades the image before installing `curl`, CA certificates, `gzip`, `iproute2`, `procps`, and `tar`;
@@ -175,6 +178,15 @@ supported OpenSSH `authorized_keys` public-key line. Private keys are never
 accepted or sent.
 
 The RKE2 token is read from `spec.rke2.tokenSecretRef`. Because the NodeClass is cluster-scoped, the reference cannot choose an arbitrary namespace: it is fixed to Secret `inspace-rke2-agent-token`, key `token`, in `INSPACE_SECRET_NAMESPACE` (default `karpenter`). The resolver uses an uncached, resource-name-scoped GET and cannot select the separate `inspace-api` cloud credential Secret.
+
+Worker cloud VM names, guest hostnames, and Kubernetes Node names are exactly
+`<clusterName>-karp-<NodeClaim name>`. Karpenter generates the NodeClaim name as
+`<NodePool name>-<random suffix>`, yielding the operator-facing form
+`<clusterName>-karp-<NodePool name>-<random suffix>`. The provider requires that
+prefix relationship and a combined DNS-1123 hostname no longer than 63
+characters before any cloud mutation. NodeClaim ownership and deletion remain
+bound to the original NodeClaim name; Node registration binds through the
+canonical `inspace://<location>/<vm-uuid>` provider ID.
 
 ## Run the controller
 

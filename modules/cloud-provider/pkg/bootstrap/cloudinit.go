@@ -12,7 +12,10 @@ import (
 	"strings"
 )
 
-var rke2VersionPattern = regexp.MustCompile(`^v[0-9]+\.[0-9]+\.[0-9]+\+rke2r[0-9]+$`)
+var (
+	rke2VersionPattern = regexp.MustCompile(`^v[0-9]+\.[0-9]+\.[0-9]+\+rke2r[0-9]+$`)
+	nodeNamePattern    = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
+)
 
 const kubeVIPImage = "ghcr.io/kube-vip/kube-vip:v1.2.1@sha256:49b77655f9f109bedc5eb25723bb0e4c57d8513ba33cc69c31be3f243eb2386d"
 
@@ -61,6 +64,9 @@ func RenderCloudInitJSON(input CloudInitInput) (string, error) {
 		input.PrivateLoadBalancerPoolStart == "" || input.PrivateLoadBalancerPoolStop == "" {
 		return "", errors.New("bootstrap: node name, token, private subnet, virtual IPv4, pod CIDR, service CIDR, and private load-balancer pool are required")
 	}
+	if !nodeNamePattern.MatchString(input.NodeName) {
+		return "", errors.New("bootstrap: node name must be a lowercase DNS label of at most 63 characters")
+	}
 	externalAddress, err := netip.ParseAddr(input.NodeExternalIPv4)
 	if err != nil || !externalAddress.Is4() || !externalAddress.IsGlobalUnicast() || externalAddress.IsPrivate() {
 		return "", errors.New("bootstrap: node external IP must be the allocated public IPv4")
@@ -90,7 +96,9 @@ func RenderCloudInitJSON(input CloudInitInput) (string, error) {
 	kubeVIPConfig := renderKubeVIPStaticPod(input.VirtualIPv4)
 	script := renderInstallScript(input)
 	payload := struct {
-		WriteFiles []struct {
+		Hostname         string `json:"hostname"`
+		PreserveHostname bool   `json:"preserve_hostname"`
+		WriteFiles       []struct {
 			Path        string `json:"path"`
 			Content     string `json:"content"`
 			Permissions string `json:"permissions"`
@@ -98,7 +106,7 @@ func RenderCloudInitJSON(input CloudInitInput) (string, error) {
 			Owner       string `json:"owner"`
 		} `json:"write_files"`
 		RunCmd []string `json:"runcmd"`
-	}{}
+	}{Hostname: input.NodeName, PreserveHostname: false}
 	addFile := func(path, content, permissions string) {
 		payload.WriteFiles = append(payload.WriteFiles, struct {
 			Path        string `json:"path"`

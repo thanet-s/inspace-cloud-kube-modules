@@ -12,13 +12,14 @@ import (
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
+	k8svalidation "k8s.io/apimachinery/pkg/util/validation"
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 )
 
 // SchemaVersion must be bumped whenever generated bootstrap semantics change.
 // It is included in the provider drift hash so existing nodes are replaced.
 const (
-	SchemaVersion           = "stock-ubuntu-rke2-v4"
+	SchemaVersion           = "stock-ubuntu-rke2-v5"
 	ExternalIPv4Placeholder = "__INSPACE_FLOATING_IPV4__"
 	VPCSubnetPlaceholder    = "__INSPACE_VPC_SUBNET__"
 	NativeRoutingPodCIDR    = "10.42.0.0/16"
@@ -38,8 +39,10 @@ type Config struct {
 }
 
 type document struct {
-	WriteFiles []writeFile `json:"write_files"`
-	RunCmd     []string    `json:"runcmd"`
+	Hostname         string      `json:"hostname,omitempty"`
+	PreserveHostname bool        `json:"preserve_hostname"`
+	WriteFiles       []writeFile `json:"write_files"`
+	RunCmd           []string    `json:"runcmd"`
 }
 
 type writeFile struct {
@@ -56,6 +59,9 @@ type writeFile struct {
 func RenderCloudInit(config Config) (string, error) {
 	if config.NodeName == "" || config.Server == "" || config.Token == "" || config.RKE2Version == "" {
 		return "", fmt.Errorf("node name, server, token, and RKE2 version are required")
+	}
+	if messages := k8svalidation.IsDNS1123Label(config.NodeName); len(messages) != 0 {
+		return "", fmt.Errorf("node name must be a DNS-1123 hostname label: %s", strings.Join(messages, "; "))
 	}
 	if !exactRKE2VersionPattern.MatchString(config.RKE2Version) {
 		return "", fmt.Errorf("RKE2 version must be an exact vX.Y.Z+rke2rN release")
@@ -117,8 +123,11 @@ fs.inotify.max_user_watches = 524288
 root soft nofile 1048576
 root hard nofile 1048576
 `
-	prepareHost := `#!/bin/sh
+	prepareHost := fmt.Sprintf(`#!/bin/sh
 set -eu
+expected_hostname=%s
+hostnamectl set-hostname --static "$expected_hostname"
+[ "$(hostnamectl --static)" = "$expected_hostname" ]
 swapoff -a
 if [ -f /etc/fstab ]; then
   sed -Ei '/^[[:space:]]*#/! { /[[:space:]]swap[[:space:]]/ s/^/#/; }' /etc/fstab
@@ -128,7 +137,7 @@ for ubuntu_sources in /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.li
   sed -E -i 's|https?://archive\.ubuntu\.com|http://th.archive.ubuntu.com|g' "$ubuntu_sources"
   if grep -E 'https?://archive\.ubuntu\.com' "$ubuntu_sources" >/dev/null; then exit 1; fi
 done
-`
+`, shellQuote(config.NodeName))
 	applyNodeTuning := `#!/bin/sh
 set -eu
 sysctl --system >/dev/null
@@ -286,7 +295,10 @@ tar -xzf "$tmpdir/rke2.linux-amd64.tar.gz" -C /usr/local
 `, shellQuote(config.RKE2Version), shellQuote(releaseBase), shellQuote(releaseBase))
 
 	doc := document{
+		Hostname:         config.NodeName,
+		PreserveHostname: false,
 		WriteFiles: []writeFile{
+			encodedWriteFile("/etc/hostname", "0644", config.NodeName+"\n"),
 			encodedWriteFile("/etc/rancher/rke2/config.yaml", "0600", rke2.String()),
 			encodedWriteFile("/etc/systemd/system/rke2-agent.service.d/10-inspace-private-ip.conf", "0644", serviceDropIn),
 			encodedWriteFile("/etc/systemd/system/rke2-agent.service.d/20-inspace-node-limits.conf", "0644", nodeLimitsDropIn),

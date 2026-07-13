@@ -42,6 +42,12 @@ authoritative VPC membership, private subnet containment, the configured AMD
 EPYC host pool, and its exact FIP. Control planes and the bastion stay on the
 configured Intel Scalable pool, while the Karpenter NodeClass deliberately
 exercises `amd-epyc` worker provisioning.
+The three control-plane cloud names, guest hostnames, and Kubernetes Node names
+are live-proven as `<clusterResourceName>-cp0`, `-cp1`, and `-cp2`.
+The worker cloud name, API hostname when returned, guest hostname, and
+Kubernetes Node name are live-proven as
+`<clusterResourceName>-karp-general-<Karpenter random suffix>` while its
+separate `general-<random suffix>` NodeClaim remains the ownership identity.
 Managed InSpace cloud firewalls are the only host firewalls; guest UFW must be
 inactive and disabled or masked on the control planes, worker, and bastion.
 

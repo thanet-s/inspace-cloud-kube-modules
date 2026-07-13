@@ -45,8 +45,10 @@ func TestLiveAdapterCreateGetListDelete(t *testing.T) {
 	}
 
 	suffix := fmt.Sprintf("%x", time.Now().UnixNano())
-	name := "inspace-e2e-karp-" + suffix
 	clusterName := "inspace-e2e-" + suffix
+	nodeClaimName := "general-" + suffix
+	name := clusterName + "-karp-" + nodeClaimName
+	floatingIPPrefix := "karpenter-" + nodeClaimName
 	controlPlaneVIP := requireEnv("INSPACE_CONTROL_PLANE_VIP")
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
 	defer cancel()
@@ -61,7 +63,7 @@ func TestLiveAdapterCreateGetListDelete(t *testing.T) {
 		t.Fatalf("INSPACE_BILLING_ACCOUNT_ID must be a positive integer")
 	}
 	request := cloudapi.CreateVMRequest{
-		IdempotencyKey: name, Name: name, ClusterName: clusterName, NodeClaimName: name,
+		IdempotencyKey: nodeClaimName, Name: name, ClusterName: clusterName, NodeClaimName: nodeClaimName,
 		BillingAccountID: billingAccountID,
 		Location:         "bkk01", NetworkUUID: requireEnv("INSPACE_NETWORK_UUID"), FirewallUUID: requireEnv("INSPACE_FIREWALL_UUID"),
 		ControlPlaneVIP:              controlPlaneVIP,
@@ -82,7 +84,7 @@ func TestLiveAdapterCreateGetListDelete(t *testing.T) {
 		var cleanupErrors []error
 		if vms, listErr := adapter.ListVMs(cleanupCtx, request.Location, clusterName); listErr == nil {
 			for _, vm := range vms {
-				if err := adapter.DeleteVM(cleanupCtx, request.Location, vm.UUID, clusterName, name); err != nil && !errors.Is(err, cloudapi.ErrNotFound) {
+				if err := adapter.DeleteVM(cleanupCtx, request.Location, vm.UUID, clusterName, nodeClaimName); err != nil && !errors.Is(err, cloudapi.ErrNotFound) {
 					cleanupErrors = append(cleanupErrors, fmt.Errorf("adapter cleanup VM %s: %w", vm.UUID, err))
 				}
 			}
@@ -100,7 +102,7 @@ func TestLiveAdapterCreateGetListDelete(t *testing.T) {
 		}
 		if addresses, listErr := client.ListFloatingIPs(cleanupCtx, request.Location, &sdk.FloatingIPFilters{BillingAccountID: billingAccountID}); listErr == nil {
 			for _, address := range addresses {
-				if strings.HasPrefix(address.Name, name) {
+				if strings.HasPrefix(address.Name, floatingIPPrefix) {
 					if address.AssignedTo != "" {
 						if _, err := client.UnassignFloatingIP(cleanupCtx, request.Location, address.Address); err != nil && !sdk.IsNotFound(err) {
 							cleanupErrors = append(cleanupErrors, fmt.Errorf("unassign cleanup floating IP %s: %w", address.Address, err))
@@ -124,7 +126,7 @@ func TestLiveAdapterCreateGetListDelete(t *testing.T) {
 				vmLeft = vmLeft || vm.Name == name
 			}
 			for _, address := range addresses {
-				ipLeft = ipLeft || strings.HasPrefix(address.Name, name)
+				ipLeft = ipLeft || strings.HasPrefix(address.Name, floatingIPPrefix)
 			}
 			if vmErr == nil && ipErr == nil && !vmLeft && !ipLeft {
 				auditErr = nil
@@ -163,7 +165,7 @@ func TestLiveAdapterCreateGetListDelete(t *testing.T) {
 	if err != nil || len(listed) != 1 || listed[0].UUID != created.UUID {
 		t.Fatalf("ListVMs = %#v, %v", listed, err)
 	}
-	if err := adapter.DeleteVM(ctx, request.Location, created.UUID, clusterName, name); err != nil {
+	if err := adapter.DeleteVM(ctx, request.Location, created.UUID, clusterName, nodeClaimName); err != nil {
 		t.Fatal(err)
 	}
 }

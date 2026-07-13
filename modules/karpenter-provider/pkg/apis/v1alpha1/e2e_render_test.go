@@ -316,6 +316,8 @@ func TestClusterE2EProvesWorkerCloudIdentityAndVPCAttachment(t *testing.T) {
 	for _, expected := range []string{
 		"Read the exact Karpenter worker identity",
 		"Persist exact worker cloud ownership and VPC proof",
+		`.status.nodeName == $nodeName`,
+		`test "$(hostname)" = "{{ e2e_node_name }}"`,
 		"/opt/e2e/scripts/discover-worker.py",
 		"Add the dynamically created RKE2 worker for parallel-safe validation",
 	} {
@@ -323,7 +325,12 @@ func TestClusterE2EProvesWorkerCloudIdentityAndVPCAttachment(t *testing.T) {
 	}
 	for _, expected := range []string{
 		`if len(matches) != 1:`,
-		`canonical_worker_vm_detail(vms, node.get("name"), nodepool)`,
+		`canonical_worker_vm_detail(`,
+		`node.get("name"), node.get("nodeClaimName"), cluster, nodepool`,
+		`record.get("schema") != "karpenter.inspace.cloud/v2"`,
+		`record.get("nodeClaim") != node.get("nodeClaimName")`,
+		`record.get("vmName") != node.get("name")`,
+		`vm.get("hostname") != node.get("name")`,
 		`VM_UUID_PATTERN.fullmatch(vm_uuid)`,
 		`node.get("providerID") != f"inspace://{location}/{vm_uuid}"`,
 		`if not isinstance(internal_ips, list) or len(internal_ips) != 1:`,

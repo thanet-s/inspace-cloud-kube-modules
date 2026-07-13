@@ -37,10 +37,20 @@ VM_UUID_PATTERN = re.compile(
 )
 
 
-def canonical_worker_vm_detail(listed_vms, node_name: str, nodepool: str, getter=api_get):
+def canonical_worker_vm_detail(
+    listed_vms, node_name: str, nodeclaim_name: str, cluster: str, nodepool: str, getter=api_get
+):
     """Resolve one exact sparse list row to its authoritative VM detail."""
-    if not isinstance(node_name, str) or not node_name.startswith(nodepool + "-"):
-        raise SystemExit("Ready Karpenter Node name is outside the expected NodePool identity")
+    nodeclaim_prefix = nodepool + "-"
+    if (
+        not isinstance(nodeclaim_name, str)
+        or not nodeclaim_name.startswith(nodeclaim_prefix)
+        or len(nodeclaim_name) == len(nodeclaim_prefix)
+        or node_name != f"{cluster}-karp-{nodeclaim_name}"
+        or not re.fullmatch(r"[a-z0-9](?:[-a-z0-9]*[a-z0-9])?", node_name or "")
+        or len(node_name) > 63
+    ):
+        raise SystemExit("Ready Karpenter Node and NodeClaim do not satisfy the cluster-karp-nodepool-random identity")
     matches = []
     for summary in listed_vms:
         if not isinstance(summary, dict):
@@ -88,19 +98,25 @@ def main() -> None:
     location = os.environ["INSPACE_LOCATION"]
 
     vms = api_get("user-resource/vm/list")
-    vm = canonical_worker_vm_detail(vms, node.get("name"), nodepool)
+    vm = canonical_worker_vm_detail(
+        vms, node.get("name"), node.get("nodeClaimName"), cluster, nodepool
+    )
     vm_uuid = vm["uuid"]
     record = description(vm)
     amd_pool_uuid = os.environ["INSPACE_AMD_HOST_POOL_UUID"]
     if (
-        record.get("cluster") != cluster
-        or record.get("nodeClaim") != node.get("name")
+        record.get("schema") != "karpenter.inspace.cloud/v2"
+        or record.get("cluster") != cluster
+        or record.get("nodeClaim") != node.get("nodeClaimName")
+        or record.get("vmName") != node.get("name")
         or not record.get("floatingIPName")
         or record.get("hostClass") != "amd-epyc"
         or record.get("hostPoolUUID") != amd_pool_uuid
         or vm.get("designated_pool_uuid") != amd_pool_uuid
     ):
         raise SystemExit("worker must use the exact configured AMD EPYC host pool and persisted ownership")
+    if vm.get("hostname") and vm.get("hostname") != node.get("name"):
+        raise SystemExit("authoritative worker VM hostname differs from the Kubernetes Node name")
     if node.get("providerID") != f"inspace://{location}/{vm_uuid}":
         raise SystemExit("Node providerID does not bind to the discovered VM UUID")
 
@@ -195,6 +211,7 @@ def main() -> None:
     worker = {
         "uuid": vm_uuid,
         "name": vm["name"],
+        "nodeClaimName": node["nodeClaimName"],
         "fip": fip_name,
         "publicIPv4": str(public_ip),
         "internalIPv4": str(internal_ip),

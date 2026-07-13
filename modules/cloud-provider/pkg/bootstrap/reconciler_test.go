@@ -75,11 +75,15 @@ func TestReconcileBuildsBastionThenExactlyThreeControlPlaneVMs(t *testing.T) {
 	}
 	privateLoadBalancerManifest := ""
 	for slot := 0; slot < ControlPlaneReplicas; slot++ {
-		request := mustVMRequest(t, api.vmCreates, controlPlaneName(owner, slot))
+		expectedName := fmt.Sprintf("unit-cp%d", slot)
+		if got := controlPlaneName(cluster.Metadata.Name, slot); got != expectedName {
+			t.Fatalf("control-plane slot %d name=%q, want %q", slot, got, expectedName)
+		}
+		request := mustVMRequest(t, api.vmCreates, expectedName)
 		if request.ReservePublicIP == nil || *request.ReservePublicIP {
 			t.Errorf("control-plane slot %d requested an implicit public IP", slot)
 		}
-		assertControlPlaneCloudInit(t, request.CloudInit, slot == 0)
+		assertControlPlaneCloudInit(t, request.CloudInit, request.Name, slot == 0)
 		manifest := decodeWriteFiles(t, request.CloudInit)["/var/lib/inspace/rke2-cilium-private-load-balancer"]
 		if slot == 0 {
 			privateLoadBalancerManifest = manifest
@@ -454,10 +458,9 @@ func TestParallelControlPlaneErrorsAreSlotOrderedAndKeepSuccesses(t *testing.T) 
 	cluster := testCluster()
 	reconciler := testReconciler(api)
 	prepareBastion(t, reconciler, cluster)
-	owner := ownerKey(cluster)
 	api.failVMCreateNames = map[string]error{
-		controlPlaneName(owner, 2): errors.New("slot two"),
-		controlPlaneName(owner, 0): errors.New("slot zero"),
+		controlPlaneName(cluster.Metadata.Name, 2): errors.New("slot two"),
+		controlPlaneName(cluster.Metadata.Name, 0): errors.New("slot zero"),
 	}
 	result, err := reconciler.Reconcile(context.Background(), cluster, "unit-test-secret-token")
 	if err == nil || strings.Index(err.Error(), "slot 0") > strings.Index(err.Error(), "slot 2") {
@@ -505,9 +508,8 @@ func TestReconcileRequiresExactBastionAccessBeforeMutation(t *testing.T) {
 func TestReconcileRefusesAutomaticSlotZeroReplacement(t *testing.T) {
 	api := newFakeAPI()
 	cluster := testCluster()
-	owner := ownerKey(cluster)
 	api.vms = append(api.vms, inspace.VM{
-		UUID: "99999999-1111-4222-8333-bbbbbbbbbbbb", Name: controlPlaneName(owner, 1), PrivateIPv4: "10.20.30.21",
+		UUID: "99999999-1111-4222-8333-bbbbbbbbbbbb", Name: controlPlaneName(cluster.Metadata.Name, 1), PrivateIPv4: "10.20.30.21",
 	})
 	if _, err := testReconciler(api).Reconcile(context.Background(), cluster, "unit-test-secret-token"); err == nil || !strings.Contains(err.Error(), "slot 0 is absent") {
 		t.Fatalf("expected split-brain refusal, got %v", err)
@@ -536,6 +538,60 @@ func TestReconcileRejectsLoadBalancerVIPCollisionBeforeMutation(t *testing.T) {
 	}
 }
 
+func TestReconcileFailsClosedOnLegacyOwnerNamedControlPlanes(t *testing.T) {
+	api := newFakeAPI()
+	cluster := testCluster()
+	owner := ownerKey(cluster)
+	api.vms = append(api.vms, inspace.VM{
+		UUID:        "99999999-1111-4222-8333-bbbbbbbbbbbb",
+		Name:        fmt.Sprintf("rke2-%s-cp-0", owner),
+		Hostname:    fmt.Sprintf("rke2-%s-cp-0", owner),
+		Description: fmt.Sprintf("inspace-rke2-cp/v2 owner=%s slot=0 spec=%s", owner, strings.Repeat("a", 64)),
+	})
+	_, err := testReconciler(api).Reconcile(context.Background(), cluster, "unit-test-secret-token")
+	if err == nil || !strings.Contains(err.Error(), "unexpected VM") {
+		t.Fatalf("expected explicit legacy-topology refusal, got %v", err)
+	}
+	if len(api.vmCreates) != 0 || len(api.vmDeletes) != 0 || len(api.floatingIPs) != 0 || len(api.firewallCreates) != 0 {
+		t.Fatalf("legacy topology caused mutations: creates=%#v deletes=%#v FIPs=%#v firewalls=%#v", api.vmCreates, api.vmDeletes, api.floatingIPs, api.firewallCreates)
+	}
+}
+
+func TestReconcileCanonicalControlPlaneHostnameAllowsOmissionButRejectsMismatch(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		hostname  string
+		wantError bool
+	}{
+		{name: "API omission", hostname: ""},
+		{name: "API mismatch", hostname: "foreign", wantError: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			api := newFakeAPI()
+			cluster := testCluster()
+			reconciler := testReconciler(api)
+			reconcileUntilReady(t, reconciler, cluster)
+			cpName := controlPlaneName(cluster.Metadata.Name, 1)
+			api.mutateGetVMResponse = func(vm *inspace.VM) {
+				if vm.Name == cpName {
+					vm.Hostname = test.hostname
+				}
+			}
+			eventsBefore := len(api.events)
+			_, err := reconciler.Reconcile(context.Background(), cluster, "unit-test-secret-token")
+			if test.wantError && (err == nil || !strings.Contains(err.Error(), "authoritative hostname")) {
+				t.Fatalf("expected hostname mismatch refusal, got %v", err)
+			}
+			if !test.wantError && err != nil {
+				t.Fatalf("omitted API hostname must be tolerated: %v", err)
+			}
+			if len(api.events) != eventsBefore {
+				t.Fatalf("hostname readback caused mutation: %v", api.events[eventsBefore:])
+			}
+		})
+	}
+}
+
 func TestReverseFirewallAuditRejectsForeignAttachment(t *testing.T) {
 	for _, operation := range []string{"reconcile", "destroy"} {
 		t.Run(operation, func(t *testing.T) {
@@ -543,8 +599,7 @@ func TestReverseFirewallAuditRejectsForeignAttachment(t *testing.T) {
 			cluster := testCluster()
 			reconciler := testReconciler(api)
 			reconcileUntilReady(t, reconciler, cluster)
-			owner := ownerKey(cluster)
-			ownedVM := mustVM(t, api.vms, controlPlaneName(owner, 0))
+			ownedVM := mustVM(t, api.vms, controlPlaneName(cluster.Metadata.Name, 0))
 			api.firewalls = append(api.firewalls, inspace.Firewall{
 				UUID: "66666666-1111-4222-8333-444444444444", DisplayName: "foreign",
 				ResourcesAssigned: []inspace.FirewallResource{{ResourceType: "vm", ResourceUUID: ownedVM.UUID}},
@@ -790,8 +845,7 @@ func TestDHCPVIPCollisionRollsBackNewVM(t *testing.T) {
 		cluster := testCluster()
 		reconciler := testReconciler(api)
 		prepareBastion(t, reconciler, cluster)
-		owner := ownerKey(cluster)
-		api.privateIPByName = map[string]string{controlPlaneName(owner, 1): cluster.Spec.Endpoint.VirtualIPv4}
+		api.privateIPByName = map[string]string{controlPlaneName(cluster.Metadata.Name, 1): cluster.Spec.Endpoint.VirtualIPv4}
 		if _, err := reconciler.Reconcile(context.Background(), cluster, "token"); err == nil {
 			t.Fatal("expected control-plane VIP collision")
 		}
@@ -820,8 +874,7 @@ func TestDHCPPrivateLoadBalancerPoolCollisionRollsBackNewVM(t *testing.T) {
 		cluster := testCluster()
 		reconciler := testReconciler(api)
 		prepareBastion(t, reconciler, cluster)
-		owner := ownerKey(cluster)
-		api.privateIPByName = map[string]string{controlPlaneName(owner, 1): "10.20.30.201"}
+		api.privateIPByName = map[string]string{controlPlaneName(cluster.Metadata.Name, 1): "10.20.30.201"}
 		if _, err := reconciler.Reconcile(context.Background(), cluster, "token"); err == nil {
 			t.Fatal("expected control-plane private load-balancer pool collision")
 		}
@@ -895,6 +948,168 @@ func TestDestroyRemovesOnlyOwnedResourcesInSafeOrder(t *testing.T) {
 	}
 	if lastFIPDelete < 0 || firstVMDelete <= lastFIPDelete || firstFirewallDelete <= firstVMDelete {
 		t.Fatalf("unsafe destroy order: %v", api.events)
+	}
+}
+
+func TestDestroyDoesNotUseClusterDerivedControlPlaneNameAsDeletionAuthority(t *testing.T) {
+	api := newFakeAPI()
+	cluster := testCluster()
+	reconciler := testReconciler(api)
+	reconcileUntilReady(t, reconciler, cluster)
+	cp := mustVM(t, api.vms, controlPlaneName(cluster.Metadata.Name, 1))
+	cp.Description = fmt.Sprintf(
+		"inspace-rke2-cp/v2 owner=%s slot=1 spec=%s",
+		strings.Repeat("f", 16), strings.Repeat("a", 64),
+	)
+	mutationsBefore := len(api.vmDeletes) + len(api.floatingIPDeletes) + len(api.firewallDeletes)
+	_, err := reconciler.Destroy(context.Background(), cluster)
+	if err == nil || !strings.Contains(err.Error(), "expected ownership record") {
+		t.Fatalf("expected owner-record refusal for same-name control plane, got %v", err)
+	}
+	if got := len(api.vmDeletes) + len(api.floatingIPDeletes) + len(api.firewallDeletes); got != mutationsBefore {
+		t.Fatal("same-name foreign-owner collision became deletion authority")
+	}
+}
+
+func TestDestroyConvergesForExactLegacyControlPlaneTopology(t *testing.T) {
+	api := newFakeAPI()
+	cluster := testCluster()
+	reconciler := testReconciler(api)
+	reconcileUntilReady(t, reconciler, cluster)
+	convertControlPlanesToLegacy(t, api, cluster)
+
+	var result DestroyResult
+	for attempt := 0; attempt < 40; attempt++ {
+		var err error
+		result, err = reconciler.Destroy(context.Background(), cluster)
+		if err != nil {
+			t.Fatalf("legacy destroy %d: %v", attempt, err)
+		}
+		if result.Done {
+			break
+		}
+	}
+	if !result.Done || len(api.vms) != 0 || len(api.floatingIPs) != 0 || len(api.firewalls) != 0 {
+		t.Fatalf("legacy destroy did not converge: result=%#v VMs=%#v FIPs=%#v firewalls=%#v", result, api.vms, api.floatingIPs, api.firewalls)
+	}
+}
+
+func TestDestroyRejectsLegacyAuthorityDriftBeforeMutation(t *testing.T) {
+	tests := map[string]struct {
+		mutate func(*testing.T, *fakeAPI, *v1alpha1.InSpaceCluster)
+		want   string
+	}{
+		"ownership record": {
+			mutate: func(t *testing.T, api *fakeAPI, cluster *v1alpha1.InSpaceCluster) {
+				legacy := mustVM(t, api.vms, legacyControlPlaneName(ownerKey(cluster), 1))
+				legacy.Description = fmt.Sprintf(
+					"inspace-rke2-cp/v2 owner=%s slot=2 spec=%s",
+					ownerKey(cluster), strings.Repeat("a", 64),
+				)
+			},
+			want: "expected ownership record",
+		},
+		"floating IP billing": {
+			mutate: func(_ *testing.T, api *fakeAPI, cluster *v1alpha1.InSpaceCluster) {
+				owner := ownerKey(cluster)
+				for i := range api.floatingIPs {
+					if api.floatingIPs[i].Name == nodeFloatingIPName(owner, 1) {
+						api.floatingIPs[i].BillingAccountID++
+					}
+				}
+			},
+			want: "billing-account ownership",
+		},
+		"node firewall assignment": {
+			mutate: func(t *testing.T, api *fakeAPI, cluster *v1alpha1.InSpaceCluster) {
+				firewall := mustFirewall(t, api.firewalls, firewallName(ownerKey(cluster)))
+				firewall.ResourcesAssigned = append(firewall.ResourcesAssigned, inspace.FirewallResource{
+					ResourceType: "vm", ResourceUUID: "99999999-1111-4222-8333-bbbbbbbbbbbb",
+				})
+			},
+			want: "node firewall assignment drift",
+		},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			api := newFakeAPI()
+			cluster := testCluster()
+			reconciler := testReconciler(api)
+			reconcileUntilReady(t, reconciler, cluster)
+			convertControlPlanesToLegacy(t, api, cluster)
+			test.mutate(t, api, cluster)
+			mutationsBefore := len(api.vmDeletes) + len(api.floatingIPDeletes) + len(api.firewallDeletes)
+			_, err := reconciler.Destroy(context.Background(), cluster)
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("expected legacy %s refusal, got %v", name, err)
+			}
+			if got := len(api.vmDeletes) + len(api.floatingIPDeletes) + len(api.firewallDeletes); got != mutationsBefore {
+				t.Fatalf("legacy %s drift caused a teardown mutation", name)
+			}
+		})
+	}
+}
+
+func TestDestroyRejectsMixedCurrentAndLegacyControlPlaneTopology(t *testing.T) {
+	api := newFakeAPI()
+	cluster := testCluster()
+	reconciler := testReconciler(api)
+	reconcileUntilReady(t, reconciler, cluster)
+	owner := ownerKey(cluster)
+	current := mustVM(t, api.vms, controlPlaneName(cluster.Metadata.Name, 0))
+	current.Name = legacyControlPlaneName(owner, 0)
+	current.Hostname = current.Name
+	mutationsBefore := len(api.vmDeletes) + len(api.floatingIPDeletes) + len(api.firewallDeletes)
+	_, err := reconciler.Destroy(context.Background(), cluster)
+	if err == nil || !strings.Contains(err.Error(), "mixed current and legacy") {
+		t.Fatalf("expected mixed-topology refusal, got %v", err)
+	}
+	if got := len(api.vmDeletes) + len(api.floatingIPDeletes) + len(api.firewallDeletes); got != mutationsBefore {
+		t.Fatal("mixed topology caused a teardown mutation")
+	}
+}
+
+func TestDestroyDoesNotApplyCurrentHostnameLengthConstraint(t *testing.T) {
+	api := newFakeAPI()
+	cluster := testCluster()
+	reconciler := testReconciler(api)
+	reconcileUntilReady(t, reconciler, cluster)
+	oldOwner := ownerKey(cluster)
+	oldClusterName := cluster.Metadata.Name
+	cluster.Metadata.Name = strings.Repeat("a", 60)
+	newOwner := ownerKey(cluster)
+	for slot := 0; slot < ControlPlaneReplicas; slot++ {
+		vm := mustVM(t, api.vms, controlPlaneName(oldClusterName, slot))
+		vm.Name = legacyControlPlaneName(newOwner, slot)
+		vm.Hostname = vm.Name
+		vm.Description = strings.Replace(vm.Description, "owner="+oldOwner, "owner="+newOwner, 1)
+	}
+	bastion := mustVM(t, api.vms, bastionName(oldOwner))
+	bastion.Name = bastionName(newOwner)
+	bastion.Hostname = bastion.Name
+	bastion.Description = strings.Replace(bastion.Description, "owner="+oldOwner, "owner="+newOwner, 1)
+	for i := range api.floatingIPs {
+		api.floatingIPs[i].Name = strings.Replace(api.floatingIPs[i].Name, "rke2-"+oldOwner+"-", "rke2-"+newOwner+"-", 1)
+	}
+	for i := range api.firewalls {
+		api.firewalls[i].Name = strings.Replace(api.firewalls[i].Name, oldOwner, newOwner, 1)
+		api.firewalls[i].DisplayName = strings.Replace(api.firewalls[i].DisplayName, oldOwner, newOwner, 1)
+		api.firewalls[i].Description = strings.Replace(api.firewalls[i].Description, oldOwner, newOwner, 1)
+	}
+
+	var result DestroyResult
+	for attempt := 0; attempt < 40; attempt++ {
+		var err error
+		result, err = reconciler.Destroy(context.Background(), cluster)
+		if err != nil {
+			t.Fatalf("long-name legacy destroy %d: %v", attempt, err)
+		}
+		if result.Done {
+			break
+		}
+	}
+	if !result.Done || len(api.vms) != 0 || len(api.floatingIPs) != 0 || len(api.firewalls) != 0 {
+		t.Fatalf("long legacy cluster name blocked teardown: result=%#v VMs=%#v FIPs=%#v firewalls=%#v", result, api.vms, api.floatingIPs, api.firewalls)
 	}
 }
 
@@ -1211,7 +1426,21 @@ func TestRenderControlPlaneCloudInitUsesVIPStaticPodAndBoundedBoot(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	assertControlPlaneCloudInit(t, raw, false)
+	assertControlPlaneCloudInit(t, raw, "cp-1", false)
+}
+
+func TestRenderControlPlaneCloudInitRejectsInvalidGuestHostname(t *testing.T) {
+	for _, nodeName := range []string{"UPPER", "contains.dot", strings.Repeat("a", 64)} {
+		_, err := RenderCloudInitJSON(CloudInitInput{
+			NodeName: nodeName, NodeExternalIPv4: "203.0.113.11", PrivateSubnet: "10.20.30.0/24", VirtualIPv4: "10.20.30.10",
+			RKE2Version: "v1.35.6+rke2r1", RKE2Token: "token", ServerAddress: "10.20.30.10",
+			PodCIDR: "10.42.0.0/16", ServiceCIDR: "10.43.0.0/16",
+			PrivateLoadBalancerPoolStart: "10.20.30.200", PrivateLoadBalancerPoolStop: "10.20.30.239",
+		})
+		if err == nil || !strings.Contains(err.Error(), "lowercase DNS label") {
+			t.Errorf("node name %q: expected DNS-label error, got %v", nodeName, err)
+		}
+	}
 }
 
 func TestVirtualIPv4HostValidation(t *testing.T) {
@@ -1370,6 +1599,16 @@ func prepareBastion(t *testing.T, reconciler *Reconciler, cluster *v1alpha1.InSp
 	t.Fatal("bastion never became protected")
 }
 
+func convertControlPlanesToLegacy(t *testing.T, api *fakeAPI, cluster *v1alpha1.InSpaceCluster) {
+	t.Helper()
+	owner := ownerKey(cluster)
+	for slot := 0; slot < ControlPlaneReplicas; slot++ {
+		vm := mustVM(t, api.vms, controlPlaneName(cluster.Metadata.Name, slot))
+		vm.Name = legacyControlPlaneName(owner, slot)
+		vm.Hostname = vm.Name
+	}
+}
+
 func testReconciler(api *fakeAPI) *Reconciler {
 	return &Reconciler{
 		API: api, SSHUsername: "inspacee2e", SSHPublicKey: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest unit@test",
@@ -1399,8 +1638,17 @@ func testCluster() *v1alpha1.InSpaceCluster {
 	}
 }
 
-func assertControlPlaneCloudInit(t *testing.T, raw string, initialize bool) {
+func assertControlPlaneCloudInit(t *testing.T, raw, expectedNodeName string, initialize bool) {
 	t.Helper()
+	var identity struct {
+		Hostname string `json:"hostname"`
+	}
+	if err := json.Unmarshal([]byte(raw), &identity); err != nil {
+		t.Fatal(err)
+	}
+	if identity.Hostname != expectedNodeName || !strings.Contains(raw, `"preserve_hostname":false`) {
+		t.Errorf("cloud-init guest identity hostname=%q, want %q with preserve_hostname=false", identity.Hostname, expectedNodeName)
+	}
 	files := decodeWriteFiles(t, raw)
 	if len(files) != 8 {
 		t.Fatalf("write_files=%d, want 8", len(files))
@@ -1454,6 +1702,9 @@ func assertControlPlaneCloudInit(t *testing.T, raw string, initialize bool) {
 		}
 	}
 	config := files["/var/lib/inspace/rke2-config"]
+	if !strings.Contains(config, `node-name: "`+expectedNodeName+`"`+"\n") {
+		t.Errorf("RKE2 config node-name does not equal guest hostname %q:\n%s", expectedNodeName, config)
+	}
 	for _, required := range []string{"node-ip: __PRIVATE_IP__", "advertise-address: __PRIVATE_IP__", "node-external-ip:", "disable-kube-proxy: true", `"10.20.30.10"`} {
 		if !strings.Contains(config, required) {
 			t.Errorf("RKE2 config lacks %q", required)
@@ -1724,7 +1975,7 @@ func (f *fakeAPI) CreateVM(ctx context.Context, _ string, request inspace.Create
 		}
 	}
 	vm := inspace.VM{
-		UUID: fmt.Sprintf("%08d-1111-4222-8333-bbbbbbbbbbbb", index), Name: request.Name, Description: request.Description,
+		UUID: fmt.Sprintf("%08d-1111-4222-8333-bbbbbbbbbbbb", index), Name: request.Name, Hostname: request.Name, Description: request.Description,
 		Status: "running", VCPU: request.VCPU, MemoryMiB: request.MemoryMiB, OSName: request.OSName, OSVersion: request.OSVersion,
 		PrivateIPv4: fmt.Sprintf("10.20.30.%d", 20+index), NetworkUUID: request.NetworkUUID, BillingAccountID: request.BillingAccountID,
 		DesignatedPoolUUID: request.DesignatedPoolUUID,

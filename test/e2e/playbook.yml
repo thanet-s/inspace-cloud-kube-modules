@@ -8,7 +8,7 @@
     e2e_cluster_resource_name: "inspace-e2e-{{ lookup('env', 'E2E_RUN_ID') }}"
     e2e_cluster_name: "inspace-e2e-{{ lookup('env', 'E2E_RUN_ID') }}"
     e2e_nodeclass_name: "inspace-e2e-workers-{{ lookup('env', 'E2E_RUN_ID') }}"
-    e2e_nodepool_name: "inspace-e2e-{{ lookup('env', 'E2E_RUN_ID') }}"
+    e2e_nodepool_name: "general"
     e2e_cluster_file: "{{ lookup('env', 'E2E_STATE_DIR') }}/cluster.yaml"
     e2e_state_file: "{{ lookup('env', 'E2E_STATE_DIR') }}/state.json"
     e2e_token_file: "{{ lookup('env', 'E2E_STATE_DIR') }}/rke2-token"
@@ -347,6 +347,7 @@
         ansible_host: "rke2-cp-{{ '%02d' | format(e2e_cp_index + 1) }}"
         ansible_user: "{{ e2e_ssh_user }}"
         ansible_ssh_common_args: "-F {{ e2e_ssh_config }}"
+        e2e_node_name: "{{ item.name }}"
         e2e_vm_uuid: "{{ item.uuid }}"
         e2e_private_ip: "{{ item.privateIPv4 }}"
         e2e_public_ip: "{{ item.publicIPv4 }}"
@@ -683,6 +684,9 @@
     - name: Verify pinned RKE2 and Ubuntu versions on every control plane
       ansible.builtin.shell: |
         set -euo pipefail
+        test "$(hostname)" = "{{ e2e_node_name }}"
+        test "$(hostnamectl --static)" = "{{ e2e_node_name }}"
+        test "$(cat /etc/hostname)" = "{{ e2e_node_name }}"
         /usr/local/bin/rke2 --version | grep -F 'v1.35.6+rke2r1'
         grep -F 'ghcr.io/kube-vip/kube-vip:v1.2.1@sha256:49b77655f9f109bedc5eb25723bb0e4c57d8513ba33cc69c31be3f243eb2386d' \
           /var/lib/rancher/rke2/agent/pod-manifests/kube-vip.yaml
@@ -744,7 +748,7 @@
     e2e_kubeconfig: "{{ lookup('env', 'E2E_STATE_DIR') }}/kubeconfig.yaml"
     e2e_cluster_name: "inspace-e2e-{{ lookup('env', 'E2E_RUN_ID') }}"
     e2e_nodeclass_name: "inspace-e2e-workers-{{ lookup('env', 'E2E_RUN_ID') }}"
-    e2e_nodepool_name: "inspace-e2e-{{ lookup('env', 'E2E_RUN_ID') }}"
+    e2e_nodepool_name: "general"
     e2e_marker: "inspace-e2e-{{ lookup('env', 'E2E_RUN_ID') }}"
     e2e_ssh_user: "{{ lookup('env', 'INSPACE_E2E_SSH_USERNAME') | default('inspacee2e', true) }}"
     e2e_ssh_public_key: "{{ lookup('file', lookup('env', 'E2E_PUBLIC_KEY')) | trim }}"
@@ -839,9 +843,13 @@
       ansible.builtin.shell: |
         set -euo pipefail
         kubectl wait --for=condition=Ready node --all --timeout=10m
-        kubectl get nodes -o json | jq -e '
+        nodes=$(kubectl get nodes -o json)
+        jq -e '
           .items | length == 3 and
-          all(.[]; any(.status.conditions[]; .type == "Ready" and .status == "True"))'
+          all(.[]; any(.status.conditions[]; .type == "Ready" and .status == "True"))' <<<"$nodes"
+        expected_names=$(jq -c '[.controlPlanes[].name] | sort' "{{ e2e_state_file }}")
+        actual_names=$(jq -c '[.items[].metadata.name] | sort' <<<"$nodes")
+        test "$actual_names" = "$expected_names"
       args:
         executable: /bin/bash
       changed_when: false
@@ -1309,9 +1317,18 @@
     - name: Read the exact Karpenter worker identity
       ansible.builtin.shell: |
         set -euo pipefail
-        kubectl get nodes -l "karpenter.sh/nodepool={{ e2e_nodepool_name }}" -o json | jq -cer '
-          if (.items | length) == 1 then .items[0] else error("expected exactly one worker") end |
-          {name:.metadata.name,providerID:.spec.providerID,internalIPs:[.status.addresses[]|select(.type=="InternalIP")|.address]}'
+        node=$(kubectl get nodes -l "karpenter.sh/nodepool={{ e2e_nodepool_name }}" -o json | jq -cer '
+          if (.items | length) == 1 then .items[0] else error("expected exactly one worker") end')
+        provider_id=$(jq -er '.spec.providerID | select(length > 0)' <<<"$node")
+        nodeclaim=$(kubectl get nodeclaims -l "karpenter.sh/nodepool={{ e2e_nodepool_name }}" -o json | jq -cer \
+          --arg providerID "$provider_id" '
+          [.items[] | select(.status.providerID == $providerID)] |
+          if length == 1 then .[0] else error("expected one NodeClaim bound through the worker provider ID") end')
+        node_name=$(jq -er '.metadata.name' <<<"$node")
+        jq -e --arg nodeName "$node_name" '.status.nodeName == $nodeName' <<<"$nodeclaim"
+        jq -cn --argjson node "$node" --argjson nodeclaim "$nodeclaim" '
+          {name:$node.metadata.name,nodeClaimName:$nodeclaim.metadata.name,providerID:$node.spec.providerID,
+           internalIPs:[$node.status.addresses[]|select(.type=="InternalIP")|.address]}'
       args:
         executable: /bin/bash
       register: e2e_worker_node_command
@@ -1352,6 +1369,8 @@
         ansible_ssh_common_args: "-F {{ e2e_state_dir }}/ssh-config"
         e2e_private_ip: "{{ e2e_worker_cloud.internalIPv4 }}"
         e2e_public_ip: "{{ e2e_worker_cloud.publicIPv4 }}"
+        e2e_node_name: "{{ e2e_worker_cloud.name }}"
+        e2e_nodeclaim_name: "{{ e2e_worker_cloud.nodeClaimName }}"
         e2e_known_hosts: "{{ e2e_state_dir }}/known-hosts-worker"
 
 - name: Verify the dynamically provisioned RKE2 worker
@@ -1417,6 +1436,10 @@
         systemctl is-active --quiet rke2-agent
         /usr/local/bin/rke2 --version | grep -F 'v1.35.6+rke2r1'
         grep -F -- 'server: "{{ e2e_private_registration_endpoint }}"' /etc/rancher/rke2/config.yaml
+        grep -Fqx -- 'node-name: "{{ e2e_node_name }}"' /etc/rancher/rke2/config.yaml
+        test "$(hostname)" = "{{ e2e_node_name }}"
+        test "$(hostnamectl --static)" = "{{ e2e_node_name }}"
+        test "$(cat /etc/hostname)" = "{{ e2e_node_name }}"
         ip -4 -o addr show scope global | grep -F -- "{{ e2e_private_ip }}/"
         ! ip -4 -o addr show scope global | grep -F -- "{{ e2e_public_ip }}/"
         ! pgrep -x kube-proxy
@@ -1470,7 +1493,7 @@
     e2e_state_dir: "{{ lookup('env', 'E2E_STATE_DIR') }}"
     e2e_state_file: "{{ lookup('env', 'E2E_STATE_DIR') }}/state.json"
     e2e_kubeconfig: "{{ lookup('env', 'E2E_STATE_DIR') }}/kubeconfig.yaml"
-    e2e_nodepool_name: "inspace-e2e-{{ lookup('env', 'E2E_RUN_ID') }}"
+    e2e_nodepool_name: "general"
     e2e_marker: "inspace-e2e-{{ lookup('env', 'E2E_RUN_ID') }}"
   environment:
     KUBECONFIG: "{{ e2e_kubeconfig }}"

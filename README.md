@@ -35,6 +35,11 @@ direct routes for the pod CIDR on the shared VPC, performs eBPF IPv4 masqueradin
 for internet egress, and fully replaces kube-proxy with eBPF service handling.
 The fixed control-plane contract requires stock Ubuntu 24.04 with at least
 2 vCPU and 4 GiB RAM, matching the tested RKE2/Cilium platform floor.
+Its three VM names, guest hostnames, and Kubernetes Node names are exactly
+`<InSpaceCluster metadata.name>-cp0`, `-cp1`, and `-cp2`.
+Elastic worker VM names, guest hostnames, and Kubernetes Node names are exactly
+`<clusterName>-karp-<NodePool name>-<Karpenter random suffix>`; the separate
+NodeClaim identity remains the cloud ownership/deletion key.
 Control planes and elastic workers disable swap, rewrite stock Ubuntu archive
 endpoints to the Thailand mirror when present, and apply persistent Kubernetes
 sysctl and RKE2 systemd limits before their RKE2 service starts.

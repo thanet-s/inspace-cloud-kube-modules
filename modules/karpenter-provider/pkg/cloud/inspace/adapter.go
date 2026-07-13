@@ -22,6 +22,7 @@ import (
 	"time"
 
 	sdk "github.com/thanet-s/inspace-cloud-kube-modules/modules/client"
+	k8svalidation "k8s.io/apimachinery/pkg/util/validation"
 
 	inspacev1 "github.com/thanet-s/inspace-cloud-kube-modules/modules/karpenter-provider/pkg/apis/v1alpha1"
 	"github.com/thanet-s/inspace-cloud-kube-modules/modules/karpenter-provider/pkg/bootstrap"
@@ -30,7 +31,8 @@ import (
 
 const (
 	ownershipSchemaNamespace                    = "karpenter.inspace.cloud/"
-	ownershipSchema                             = ownershipSchemaNamespace + "v1"
+	ownershipSchema                             = ownershipSchemaNamespace + "v2"
+	legacyOwnershipSchema                       = ownershipSchemaNamespace + "v1"
 	defaultUsername                             = "user"
 	passwordByteSize                            = 21
 	defaultNetworkAttachmentReadbackTimeout     = 60 * time.Second
@@ -53,7 +55,7 @@ var (
 	errFirewallCleanupUncertain      = errors.New("firewall cleanup did not converge")
 	vmUUIDPattern                    = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
 	ownedInstanceTypePattern         = regexp.MustCompile(`^is-(compute|general|memory)-([0-9]+)c-([0-9]+)g$`)
-	karpenterOwnershipPrefixPattern  = regexp.MustCompile(`^\s*\{\s*"schema"\s*:\s*"karpenter\.inspace\.cloud/v1"(?:\s*[,}]|\s*$)`)
+	karpenterOwnershipPrefixPattern  = regexp.MustCompile(`^\s*\{\s*"schema"\s*:\s*"(karpenter\.inspace\.cloud/[^"\s]+)"(?:\s*[,}]|\s*$)`)
 	karpenterClusterPattern          = regexp.MustCompile(`"cluster"\s*:\s*"([^"]*)"`)
 	fixedClusterNetworks             = [...]struct {
 		description string
@@ -123,6 +125,7 @@ type ownership struct {
 	Schema                       string `json:"schema"`
 	Cluster                      string `json:"cluster"`
 	NodeClaim                    string `json:"nodeClaim"`
+	VMName                       string `json:"vmName,omitempty"`
 	KeyHash                      string `json:"keyHash"`
 	HostClass                    string `json:"hostClass"`
 	InstanceType                 string `json:"instanceType"`
@@ -146,7 +149,7 @@ type ownership struct {
 
 func newOwnership(request cloudapi.CreateVMRequest, floatingIP sdk.FloatingIP) ownership {
 	return ownership{
-		Schema: ownershipSchema, Cluster: request.ClusterName, NodeClaim: request.NodeClaimName,
+		Schema: ownershipSchema, Cluster: request.ClusterName, NodeClaim: request.NodeClaimName, VMName: request.Name,
 		KeyHash: hashKey(request.IdempotencyKey), HostClass: request.HostClass, InstanceType: request.InstanceType,
 		HostPoolUUID: request.HostPoolUUID, VCPU: request.VCPU, MemoryGiB: request.MemoryGiB,
 		RootDiskGiB: request.RootDiskGiB, SpecHash: request.SpecHash, BootstrapHash: request.BootstrapHash,
@@ -1089,8 +1092,6 @@ func validateCreateRequest(r cloudapi.CreateVMRequest) error {
 		return fmt.Errorf("idempotency key is required")
 	case r.Name == "" || r.ClusterName == "" || r.NodeClaimName == "":
 		return fmt.Errorf("VM name, cluster name, and NodeClaim name are required")
-	case r.Name != r.NodeClaimName:
-		return fmt.Errorf("VM name must exactly match NodeClaim name")
 	case r.BillingAccountID <= 0:
 		return fmt.Errorf("billing account ID must be positive")
 	case r.Location == "" || r.NetworkUUID == "" || r.HostPoolUUID == "" || r.FirewallUUID == "":
@@ -1105,6 +1106,9 @@ func validateCreateRequest(r cloudapi.CreateVMRequest) error {
 		return fmt.Errorf("public IPv4 allocation is required because InSpace has no managed NAT")
 	case r.CloudInitJSON == "":
 		return fmt.Errorf("cloud-init JSON is required")
+	}
+	if err := validateV2WorkerName(r.ClusterName, r.NodeClaimName, r.Name); err != nil {
+		return err
 	}
 	if _, err := validateControlPlaneVIP(r.ControlPlaneVIP); err != nil {
 		return err
@@ -1172,6 +1176,7 @@ func validateExisting(vm sdk.VM, request cloudapi.CreateVMRequest, actual, expec
 	normalizedExpected, expectedPartial, expectedErr := normalizeOwnershipLaunchIdentity(expected)
 	if actualErr != nil || expectedErr != nil || actualPartial || expectedPartial || normalizedActual != normalizedExpected ||
 		vm.Name != request.Name || vm.VCPU != request.VCPU || vm.MemoryMiB != request.MemoryGiB*1024 ||
+		(vm.Hostname != "" && vm.Hostname != request.Name) ||
 		(vm.OSName != "" && vm.OSName != request.OSName) || (vm.OSVersion != "" && vm.OSVersion != request.OSVersion) ||
 		(vm.DesignatedPoolUUID != "" && vm.DesignatedPoolUUID != request.HostPoolUUID) ||
 		(vm.NetworkUUID != "" && vm.NetworkUUID != request.NetworkUUID) {
@@ -1251,6 +1256,12 @@ func validatePersistedLaunchIdentityWithNetworkPolicy(vm sdk.VM, request cloudap
 	}
 	for _, check := range []func() error{
 		func() error { return checkString("name", vm.Name, request.Name) },
+		func() error {
+			if vm.Hostname != "" && vm.Hostname != request.Name {
+				return fmt.Errorf("hostname %q does not match %q", vm.Hostname, request.Name)
+			}
+			return nil
+		},
 		func() error { return checkPositive("vCPU", vm.VCPU, request.VCPU) },
 		func() error { return checkPositive("memory MiB", vm.MemoryMiB, request.MemoryGiB*1024) },
 		func() error { return checkString("OS name", vm.OSName, request.OSName) },
@@ -1301,6 +1312,22 @@ func validatePersistedLaunchIdentityWithNetworkPolicy(vm sdk.VM, request cloudap
 
 func normalizeOwnershipLaunchIdentity(record ownership) (normalized ownership, partial bool, err error) {
 	normalized = record
+	// v1 records used the NodeClaim name for the VM, guest hostname, and RKE2
+	// Node name. Normalize that deliberate compatibility contract to v2 before
+	// comparing ownership; a v2 record may never omit its separate VM name.
+	if normalized.Schema == legacyOwnershipSchema {
+		if normalized.VMName != "" && normalized.VMName != normalized.NodeClaim {
+			return ownership{}, false, fmt.Errorf("legacy v1 VM name %q contradicts NodeClaim identity %q", normalized.VMName, normalized.NodeClaim)
+		}
+		normalized.VMName = normalized.NodeClaim
+	} else if normalized.Schema == ownershipSchema {
+		if normalized.Cluster == "" || normalized.NodeClaim == "" || normalized.VMName == "" {
+			return normalized, true, nil
+		}
+		if err := validateV2WorkerName(normalized.Cluster, normalized.NodeClaim, normalized.VMName); err != nil {
+			return ownership{}, false, fmt.Errorf("invalid v2 worker identity: %v", err)
+		}
+	}
 	if record.HostClass == "" || record.InstanceType == "" {
 		return normalized, true, nil
 	}
@@ -1344,6 +1371,23 @@ func normalizeOwnershipLaunchIdentity(record ownership) (normalized ownership, p
 	return normalized, partial, nil
 }
 
+func validateV2WorkerName(clusterName, nodeClaimName, vmName string) error {
+	if messages := k8svalidation.IsDNS1123Label(clusterName); len(messages) != 0 {
+		return fmt.Errorf("cluster name %q must be a DNS-1123 hostname label: %s", clusterName, strings.Join(messages, "; "))
+	}
+	if messages := k8svalidation.IsDNS1123Label(nodeClaimName); len(messages) != 0 {
+		return fmt.Errorf("NodeClaim name %q must be a DNS-1123 hostname label: %s", nodeClaimName, strings.Join(messages, "; "))
+	}
+	expected := clusterName + "-karp-" + nodeClaimName
+	if vmName != expected {
+		return fmt.Errorf("VM name %q must exactly equal cluster-derived worker name %q", vmName, expected)
+	}
+	if messages := k8svalidation.IsDNS1123Label(vmName); len(messages) != 0 {
+		return fmt.Errorf("derived VM name %q must be a DNS-1123 hostname label: %s", vmName, strings.Join(messages, "; "))
+	}
+	return nil
+}
+
 func validateEstablishedLaunchIdentity(vm sdk.VM, record ownership) error {
 	normalized, partial, err := normalizeOwnershipLaunchIdentity(record)
 	if err != nil {
@@ -1353,7 +1397,7 @@ func validateEstablishedLaunchIdentity(vm sdk.VM, record ownership) error {
 		return fmt.Errorf("%w: established ownership lacks complete exact launch identity: %w", cloudapi.ErrOwnershipMismatch, errPersistedOwnershipIncomplete)
 	}
 	expected := cloudapi.CreateVMRequest{
-		Name:             normalized.NodeClaim,
+		Name:             normalized.VMName,
 		BillingAccountID: normalized.BillingAccountID,
 		NetworkUUID:      normalized.NetworkUUID,
 		OSName:           normalized.OSName,
@@ -1381,6 +1425,7 @@ func ownershipMatchesExpectedWherePresent(actual, expected ownership) bool {
 	return fieldMatchesOrIsMissing(actual.Schema, expected.Schema) &&
 		fieldMatchesOrIsMissing(actual.Cluster, expected.Cluster) &&
 		fieldMatchesOrIsMissing(actual.NodeClaim, expected.NodeClaim) &&
+		fieldMatchesOrIsMissing(actual.VMName, expected.VMName) &&
 		fieldMatchesOrIsMissing(actual.KeyHash, expected.KeyHash) &&
 		fieldMatchesOrIsMissing(actual.HostClass, expected.HostClass) &&
 		fieldMatchesOrIsMissing(actual.InstanceType, expected.InstanceType) &&
@@ -2414,7 +2459,7 @@ func isRFC1918Prefix(prefix netip.Prefix) bool {
 
 func parseOwnership(description string) (ownership, bool) {
 	var record ownership
-	if json.Unmarshal([]byte(description), &record) != nil || record.Schema != ownershipSchema || record.Cluster == "" ||
+	if json.Unmarshal([]byte(description), &record) != nil || (record.Schema != ownershipSchema && record.Schema != legacyOwnershipSchema) || record.Cluster == "" ||
 		record.NodeClaim == "" || record.KeyHash == "" || record.FloatingIPName == "" || record.PublicIPv4 == "" {
 		return ownership{}, false
 	}
@@ -2431,17 +2476,17 @@ func inspectOwnershipDescription(description, targetCluster string) (record owne
 		if json.Unmarshal(envelope.Schema, &schema) != nil {
 			return ownership{}, false, false, nil
 		}
-		if strings.HasPrefix(schema, ownershipSchemaNamespace) && schema != ownershipSchema {
+		if strings.HasPrefix(schema, ownershipSchemaNamespace) && schema != ownershipSchema && schema != legacyOwnershipSchema {
 			return ownership{}, false, false, fmt.Errorf("%w: unsupported Karpenter ownership schema %q", cloudapi.ErrOwnershipMismatch, schema)
 		}
-		if schema != ownershipSchema {
+		if schema != ownershipSchema && schema != legacyOwnershipSchema {
 			return ownership{}, false, false, nil
 		}
 		if json.Unmarshal([]byte(description), &record) != nil {
 			// The minimal schema envelope is authoritative even when another
 			// v1 field has an incompatible JSON type. Preserve any independently
 			// decodable cluster evidence and keep the record fail-closed.
-			record.Schema = ownershipSchema
+			record.Schema = schema
 			_ = json.Unmarshal(envelope.Cluster, &record.Cluster)
 			return record, true, false, nil
 		}
@@ -2464,8 +2509,13 @@ func inspectOwnershipDescription(description, targetCluster string) (record owne
 	// Ownership JSON is encoded with schema first. An anchored prefix retains
 	// evidence from an eventually consistent truncated response without
 	// treating arbitrary user notes that mention the schema as managed state.
-	if !karpenterOwnershipPrefixPattern.MatchString(description) {
+	prefix := karpenterOwnershipPrefixPattern.FindStringSubmatch(description)
+	if len(prefix) != 2 {
 		return ownership{}, false, false, nil
+	}
+	record.Schema = prefix[1]
+	if record.Schema != ownershipSchema && record.Schema != legacyOwnershipSchema {
+		return ownership{}, false, false, fmt.Errorf("%w: unsupported Karpenter ownership schema %q", cloudapi.ErrOwnershipMismatch, record.Schema)
 	}
 	if match := karpenterClusterPattern.FindStringSubmatch(description); len(match) == 2 {
 		record.Cluster = match[1]
@@ -2474,7 +2524,8 @@ func inspectOwnershipDescription(description, targetCluster string) (record owne
 }
 
 func ownershipRecordStructurallyComplete(record ownership) bool {
-	return record.Schema == ownershipSchema && record.Cluster != "" && record.NodeClaim != "" && record.KeyHash != "" &&
+	validSchemaAndName := (record.Schema == ownershipSchema && record.VMName != "") || record.Schema == legacyOwnershipSchema
+	return validSchemaAndName && record.Cluster != "" && record.NodeClaim != "" && record.KeyHash != "" &&
 		record.HostClass != "" && record.InstanceType != "" && record.RootDiskGiB > 0 && record.SpecHash != "" &&
 		record.BootstrapHash != "" && record.FirewallUUID != "" && record.NetworkUUID != "" && record.ControlPlaneVIP != "" &&
 		record.PrivateLoadBalancerPoolStart != "" && record.PrivateLoadBalancerPoolStop != "" && record.OSName != "" &&

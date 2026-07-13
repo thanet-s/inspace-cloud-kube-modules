@@ -67,11 +67,30 @@ def main() -> None:
     disk_uuid = state.get("diskUUID", "")
     disk_name = state.get("pvcDiskName", "")
     control_prefixes = (f"rke2-{args.owner}-", f"k3s-{args.owner}-")
+    control_plane_names = {
+        str(item.get("name")) for item in state.get("controlPlanes", [])
+        if isinstance(item, dict) and item.get("name")
+    }
+    if not control_plane_names:
+        control_plane_names = {f"{args.cluster}-cp{slot}" for slot in range(3)}
+    worker_vm_names = {
+        str(item.get("name")) for item in state.get("workerVMs", [])
+        if isinstance(item, dict) and item.get("name")
+    }
+    worker_fip_names = {
+        str(item.get("fip")) for item in state.get("workerVMs", [])
+        if isinstance(item, dict) and item.get("fip")
+    }
+    worker_vm_prefix = f"{args.cluster}-karp-{args.nodepool}-"
+    worker_fip_prefix = f"karpenter-{args.nodepool}-"
 
     vms = [
         {"uuid": vm.get("uuid"), "name": vm.get("name")}
         for vm in active_resources("user-resource/vm/list")
-        if str(vm.get("name", "")).startswith(control_prefixes)
+        if vm.get("name") in control_plane_names
+        or vm.get("name") in worker_vm_names
+        or str(vm.get("name", "")).startswith(control_prefixes)
+        or str(vm.get("name", "")).startswith(worker_vm_prefix)
         or str(vm.get("name", "")).startswith(args.nodepool + "-")
         or parse_description(vm.get("description")).get("cluster") == args.cluster
     ]
@@ -88,6 +107,8 @@ def main() -> None:
         {"address": ip.get("address"), "name": ip.get("name"), "assigned_to": ip.get("assigned_to")}
         for ip in active_resources("network/ip_addresses")
         if str(ip.get("name", "")).startswith(control_prefixes)
+        or ip.get("name") in worker_fip_names
+        or str(ip.get("name", "")).startswith(worker_fip_prefix)
         or str(ip.get("name", "")).startswith(args.nodepool + "-")
         or ip.get("name") in service_ips
     ]

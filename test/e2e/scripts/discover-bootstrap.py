@@ -194,9 +194,18 @@ def main() -> None:
         for vm in vms
     ):
         raise SystemExit("operator-reserved private Service VIP range collides with a VPC VM")
-    expected_cp_names = [f"rke2-{owner}-cp-{index}" for index in range(3)]
+    cluster_resource_name = state["clusterResourceName"]
+    if not isinstance(cluster_resource_name, str) or re.fullmatch(
+        r"[a-z0-9](?:[a-z0-9-]{0,57}[a-z0-9])?", cluster_resource_name
+    ) is None:
+        raise SystemExit("cluster resource name cannot form fixed DNS-label control-plane hostnames")
+    expected_cp_names = [f"{cluster_resource_name}-cp{index}" for index in range(3)]
     bastion_name = f"rke2-{owner}-bastion"
-    listed_owned_vms = [vm for vm in vms if str(vm.get("name", "")).startswith(f"rke2-{owner}-")]
+    listed_owned_vms = [
+        vm for vm in vms
+        if vm.get("name") in expected_cp_names
+        or str(vm.get("name", "")).startswith(f"rke2-{owner}-")
+    ]
     if len(listed_owned_vms) != 4 or {vm.get("name") for vm in listed_owned_vms} != {*expected_cp_names, bastion_name}:
         raise SystemExit("expected exactly three control planes and one deterministic bastion")
     vm_by_name = canonical_owned_vm_details(listed_owned_vms)
@@ -228,7 +237,8 @@ def main() -> None:
         raise SystemExit("bastion must be exact Ubuntu 24.04 / 1-vCPU / 2-GiB / 30-GiB / configured-pool shape")
 
     addresses = [item for item in api_get("network/ip_addresses") if not item.get("is_deleted", False)]
-    expected_fip_names = {name + "-ip" for name in expected_cp_names} | {bastion_name + "-ip"}
+    expected_cp_fip_names = [f"rke2-{owner}-cp-{slot}-ip" for slot in range(3)]
+    expected_fip_names = set(expected_cp_fip_names) | {bastion_name + "-ip"}
     owned_fips = [item for item in addresses if str(item.get("name", "")).startswith(f"rke2-{owner}-")]
     if len(owned_fips) != 4 or {item.get("name") for item in owned_fips} != expected_fip_names:
         raise SystemExit("expected one exact egress FIP for each control plane and bastion")
@@ -245,7 +255,7 @@ def main() -> None:
     public_addresses = set()
     for slot, name in enumerate(expected_cp_names):
         vm = vm_by_name[name]
-        fip = fip_by_name[name + "-ip"]
+        fip = fip_by_name[expected_cp_fip_names[slot]]
         root_disks = [disk for disk in vm.get("storage", []) if disk.get("primary")]
         if (
             vm.get("vcpu") != 2
@@ -255,6 +265,7 @@ def main() -> None:
             or vm.get("designated_pool_uuid") != os.environ["INSPACE_INTEL_HOST_POOL_UUID"]
             or vm.get("network_uuid") != network_uuid
             or vm.get("billing_account") != int(os.environ["INSPACE_BILLING_ACCOUNT_ID"])
+            or vm.get("hostname") not in (None, "", name)
             or re.fullmatch(
                 rf"inspace-rke2-cp/v2 owner={re.escape(owner)} slot={slot} spec=[0-9a-f]{{64}}",
                 str(vm.get("description", "")),

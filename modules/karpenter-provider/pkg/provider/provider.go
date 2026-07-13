@@ -8,11 +8,13 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 
 	"github.com/awslabs/operatorpkg/status"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	k8svalidation "k8s.io/apimachinery/pkg/util/validation"
 
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
@@ -32,8 +34,9 @@ const (
 	AnnotationVMState       = "karpenter.inspace.cloud/vm-state"
 	AnnotationPublicIPv4    = "karpenter.inspace.cloud/public-ipv4"
 	AnnotationFloatingIP    = "karpenter.inspace.cloud/floating-ip-name"
+	AnnotationNodeName      = "karpenter.inspace.cloud/node-name"
 	DriftReasonNodeClass    = cloudprovider.DriftReason("NodeClassDrifted")
-	ProviderSchemaVersion   = "inspace-provider-v1"
+	ProviderSchemaVersion   = "inspace-provider-v2"
 )
 
 var _ cloudprovider.CloudProvider = (*CloudProvider)(nil)
@@ -60,6 +63,9 @@ func New(cloud cloudapi.Cloud, resolver NodeClassResolver, opts Options) (*Cloud
 	if opts.ClusterName == "" || opts.DefaultNodeClassName == "" || opts.NetworkUUID == "" || opts.ControlPlaneVIP == "" {
 		return nil, fmt.Errorf("cluster name, default NodeClass name, network UUID, and control-plane VIP are required")
 	}
+	if messages := k8svalidation.IsDNS1123Label(opts.ClusterName); len(messages) != 0 {
+		return nil, fmt.Errorf("cluster name %q must be a DNS-1123 hostname label: %s", opts.ClusterName, strings.Join(messages, "; "))
+	}
 	if err := inspacev1.ValidateNetworkUUID(opts.NetworkUUID); err != nil {
 		return nil, fmt.Errorf("controller network UUID: %w", err)
 	}
@@ -78,6 +84,10 @@ func New(cloud cloudapi.Cloud, resolver NodeClassResolver, opts Options) (*Cloud
 }
 
 func (p *CloudProvider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim) (*karpv1.NodeClaim, error) {
+	workerName, err := workerNodeName(p.opts.ClusterName, nodeClaim)
+	if err != nil {
+		return nil, fmt.Errorf("deriving worker node name: %w", err)
+	}
 	nodeClass, err := p.resolveNodeClass(ctx, nodeClaim.Spec.NodeClassRef)
 	if err != nil {
 		return nil, cloudprovider.NewNodeClassNotReadyError(err)
@@ -109,7 +119,7 @@ func (p *CloudProvider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim)
 		return nil, cloudprovider.NewNodeClassNotReadyError(err)
 	}
 	userData, err := bootstrap.RenderCloudInit(bootstrap.Config{
-		NodeName:         nodeClaim.Name,
+		NodeName:         workerName,
 		Server:           nodeClass.Spec.RKE2.Server,
 		Token:            token,
 		RKE2Version:      nodeClass.Spec.RKE2.Version,
@@ -128,7 +138,7 @@ func (p *CloudProvider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim)
 	memoryGiB := int(instanceType.Capacity.Memory().Value() / (1024 * 1024 * 1024))
 	request := cloudapi.CreateVMRequest{
 		IdempotencyKey:               idempotencyKey,
-		Name:                         nodeClaim.Name,
+		Name:                         workerName,
 		ClusterName:                  p.opts.ClusterName,
 		BillingAccountID:             nodeClass.Spec.BillingAccountID,
 		NodeClaimName:                nodeClaim.Name,
@@ -167,6 +177,7 @@ func (p *CloudProvider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim)
 	created.Annotations[AnnotationVMState] = string(vm.State)
 	created.Annotations[AnnotationPublicIPv4] = vm.PublicIPv4
 	created.Annotations[AnnotationFloatingIP] = vm.FloatingIPName
+	created.Annotations[AnnotationNodeName] = vm.Name
 	created.Status = karpv1.NodeClaimStatus{
 		ProviderID:  providerid.New(vm.Location, vm.UUID),
 		ImageID:     vm.ImageID(),
@@ -398,6 +409,7 @@ func nodeClaimFromVM(vm *cloudapi.VM) *karpv1.NodeClaim {
 				AnnotationVMState:       string(vm.State),
 				AnnotationPublicIPv4:    vm.PublicIPv4,
 				AnnotationFloatingIP:    vm.FloatingIPName,
+				AnnotationNodeName:      vm.Name,
 			},
 		},
 		Status: karpv1.NodeClaimStatus{
@@ -407,6 +419,38 @@ func nodeClaimFromVM(vm *cloudapi.VM) *karpv1.NodeClaim {
 			Allocatable: allocatable,
 		},
 	}
+}
+
+// workerNodeName returns the stable guest hostname, RKE2 node name, and cloud
+// VM name for one NodeClaim. The NodeClaim remains the ownership identity and
+// is deliberately not inferred back from this display name. Karpenter binds
+// the registered Node to the NodeClaim through the exact provider ID.
+func workerNodeName(clusterName string, nodeClaim *karpv1.NodeClaim) (string, error) {
+	if nodeClaim == nil {
+		return "", fmt.Errorf("NodeClaim is required")
+	}
+	nodePoolName := nodeClaim.Labels[karpv1.NodePoolLabelKey]
+	if nodePoolName == "" {
+		return "", fmt.Errorf("NodeClaim %q lacks required label %q", nodeClaim.Name, karpv1.NodePoolLabelKey)
+	}
+	if messages := k8svalidation.IsDNS1123Label(clusterName); len(messages) != 0 {
+		return "", fmt.Errorf("cluster name %q is not a DNS-1123 hostname label: %s", clusterName, strings.Join(messages, "; "))
+	}
+	if messages := k8svalidation.IsDNS1123Label(nodePoolName); len(messages) != 0 {
+		return "", fmt.Errorf("NodePool name %q is not a DNS-1123 hostname label: %s", nodePoolName, strings.Join(messages, "; "))
+	}
+	if messages := k8svalidation.IsDNS1123Label(nodeClaim.Name); len(messages) != 0 {
+		return "", fmt.Errorf("NodeClaim name %q is not a DNS-1123 hostname label: %s", nodeClaim.Name, strings.Join(messages, "; "))
+	}
+	nodePoolPrefix := nodePoolName + "-"
+	if !strings.HasPrefix(nodeClaim.Name, nodePoolPrefix) || len(nodeClaim.Name) == len(nodePoolPrefix) {
+		return "", fmt.Errorf("NodeClaim name %q must use the NodePool-generated prefix %q followed by a nonempty random suffix", nodeClaim.Name, nodePoolPrefix)
+	}
+	name := clusterName + "-karp-" + nodeClaim.Name
+	if messages := k8svalidation.IsDNS1123Label(name); len(messages) != 0 {
+		return "", fmt.Errorf("derived worker name %q is not a DNS-1123 hostname label: %s", name, strings.Join(messages, "; "))
+	}
+	return name, nil
 }
 
 func resourcesForVM(vm *cloudapi.VM) (corev1.ResourceList, corev1.ResourceList) {

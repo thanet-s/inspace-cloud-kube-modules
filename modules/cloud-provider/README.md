@@ -18,6 +18,9 @@ and the fixed three-server RKE2 bootstrap reconciler.
   (1 vCPU/2048 MiB/30 GiB), then creates exactly three Ubuntu 24.04 RKE2
   servers in one bounded parallel batch. The API and RKE2 registration use a
   caller-selected private VPC VIP; bootstrap creates no control-plane NLB.
+- Fixed control-plane VM, guest-hostname, and Kubernetes Node identities are
+  `<metadata.name>-cp0`, `<metadata.name>-cp1`, and `<metadata.name>-cp2`.
+  `metadata.name` must be a lowercase DNS label of at most 59 characters.
 - A per-node RKE2 static Pod running kube-vip v1.2.1 by immutable multiarch
   digest. It advertises only the control-plane VIP with ARP and leader
   election; Kubernetes Service handling is disabled.
@@ -115,10 +118,21 @@ Control-plane FIPs have no public ingress; API and RKE2 registration use only
 the private VIP. The real InSpace subnet is checked against the RKE2 pod and
 service CIDRs before any mutation.
 
-Use `--once` to perform exactly one reconciliation step. Ownership names are
-derived from the resource namespace/name, so an uncertain API response is
-resolved by listing and adopting the exact deterministic name on the next
-loop, not by blindly repeating the POST.
+Use `--once` to perform exactly one reconciliation step. Control-plane display
+names derive from `metadata.name`; deletion authority remains the versioned
+owner/spec record whose owner hash derives from the resource namespace/name.
+This makes a same-name VM from another namespace a fail-closed collision, not
+an adoption candidate. An uncertain API response is resolved by listing and
+validating the exact deterministic name and owner/spec record on the next loop,
+not by blindly repeating the POST.
+
+Reconciliation never migrates the legacy `rke2-<owner>-cp-<slot>` display-name
+topology. It fails before mutation when those VMs are present. Teardown remains
+available for an exclusively legacy topology, including clusters whose older
+resource name exceeds the current 59-character create limit, but only after
+canonical VM detail, exact `cp/v2` owner/slot/spec records, deterministic FIPs,
+and firewall policy/assignments all validate. A mixed legacy/current topology
+is rejected.
 
 Owned teardown is deterministic and fail-closed. Before its first mutation it
 validates every deterministic VM/FIP name, assignment, billing account,

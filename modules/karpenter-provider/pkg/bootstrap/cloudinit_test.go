@@ -38,6 +38,9 @@ func TestRenderIncludesExactlyOneRegistrationTaint(t *testing.T) {
 	if _, ok := parsed["packages"]; ok {
 		t.Fatal("cloud-init packages module must not race floating-IP assignment")
 	}
+	if parsed["hostname"] != "worker-1" || parsed["preserve_hostname"] != false {
+		t.Fatalf("cloud-init guest hostname contract = %#v", parsed)
+	}
 	doc, contents := decodedDocument(t, data)
 	decoded := strings.Join(contents, "\n")
 	rendered := decoded + "\n" + strings.Join(doc.RunCmd, "\n")
@@ -99,6 +102,9 @@ func TestRenderIncludesExactlyOneRegistrationTaint(t *testing.T) {
 		"systemctl start --no-block rke2-agent.service",
 		`[ "$attempt" -ge 180 ]`,
 		"swapoff -a",
+		"hostnamectl set-hostname --static",
+		`expected_hostname='worker-1'`,
+		"/etc/hostname",
 		"http://th.archive.ubuntu.com",
 		"apt-get -o DPkg::Lock::Timeout=30 upgrade -y",
 		"NEEDRESTART_MODE=a",
@@ -123,7 +129,7 @@ func TestRenderIncludesExactlyOneRegistrationTaint(t *testing.T) {
 	if strings.Contains(strings.ToLower(rendered), "k3s") {
 		t.Fatalf("RKE2 bootstrap retained a K3s artifact:\n%s", rendered)
 	}
-	if SchemaVersion != "stock-ubuntu-rke2-v4" {
+	if SchemaVersion != "stock-ubuntu-rke2-v5" {
 		t.Fatalf("bootstrap schema = %q, want host-preparation/node-tuning drift version v4", SchemaVersion)
 	}
 }
@@ -586,6 +592,8 @@ func TestRenderRequiresExactRKE2ReleaseAndSupervisorEndpoint(t *testing.T) {
 		RKE2Version: "v1.35.6+rke2r1",
 	}
 	for name, mutate := range map[string]func(*Config){
+		"invalid hostname":   func(config *Config) { config.NodeName = "Invalid_Worker" },
+		"hostname too long":  func(config *Config) { config.NodeName = strings.Repeat("a", 64) },
 		"legacy K3s release": func(config *Config) { config.RKE2Version = "v1.35.6+k3s1" },
 		"release channel":    func(config *Config) { config.RKE2Version = "stable" },
 		"Kubernetes API":     func(config *Config) { config.Server = "https://api.test.example:6443" },

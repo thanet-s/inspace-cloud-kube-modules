@@ -646,6 +646,8 @@ def main() -> None:
     require(playbook.count(digest) >= 2, "kube-vip tag and live pods must use the audited digest")
     require("expected one exact egress FIP for each control plane and bastion" in bootstrap_discovery and
             "vm_by_name = canonical_owned_vm_details(listed_owned_vms)" in bootstrap_discovery and
+            'expected_cp_names = [f"{cluster_resource_name}-cp{index}"' in bootstrap_discovery and
+            'vm.get("hostname") not in (None, "", name)' in bootstrap_discovery and
             "user-resource/vm?" in bootstrap_discovery and
             "enabled non-virtual InSpace type=public FIP" in bootstrap_discovery and
             'assigned_to_resource_type") != "virtual_machine"' in bootstrap_discovery and
@@ -655,12 +657,16 @@ def main() -> None:
             "node firewall must be assigned to exactly the three control-plane VMs" in bootstrap_discovery and
             "bastion public ingress must be only management /32 TCP/22" in bootstrap_discovery,
             "bootstrap discovery must prove exact VM FIPs, zero control NLBs, and firewall isolation")
+    require('test "$(hostname)" = "{{ e2e_node_name }}"' in playbook and
+            "[.controlPlanes[].name] | sort" in playbook and
+            "[.items[].metadata.name] | sort" in playbook,
+            "live E2E must bind cloud, guest-hostname, and Kubernetes control-plane identities")
 
     bootstrap_discovery_module = load_script_module(
         "e2e_discover_bootstrap_static", ROOT / "scripts/discover-bootstrap.py"
     )
     sparse_owned_vms = [
-        {"uuid": "11111111-2222-4333-8444-555555555555", "name": "rke2-owner-cp-0"},
+        {"uuid": "11111111-2222-4333-8444-555555555555", "name": "inspace-e2e-unit-cp0"},
         {"uuid": "66666666-7777-4888-8999-aaaaaaaaaaaa", "name": "rke2-owner-bastion"},
     ]
     canonical_vm_records = {
@@ -719,13 +725,17 @@ def main() -> None:
     worker_discovery_module = load_script_module(
         "e2e_discover_worker_static", ROOT / "scripts/discover-worker.py"
     )
-    worker_name = "inspace-e2e-run-claim-abc123"
+    worker_name = "inspace-e2e-run-karp-general-abc123"
+    worker_nodeclaim_name = "general-abc123"
     worker_summary = {"uuid": "12345678-1234-4abc-8def-1234567890ab", "name": worker_name}
     worker_detail = {
         **worker_summary,
+        "hostname": worker_name,
         "description": json.dumps({
+            "schema": "karpenter.inspace.cloud/v2",
             "cluster": "inspace-e2e-run",
-            "nodeClaim": worker_name,
+            "nodeClaim": worker_nodeclaim_name,
+            "vmName": worker_name,
             "floatingIPName": "worker-fip",
             "hostClass": "amd-epyc",
         }),
@@ -738,7 +748,8 @@ def main() -> None:
         return worker_detail
 
     canonical_worker = worker_discovery_module.canonical_worker_vm_detail(
-        [worker_summary], worker_name, "inspace-e2e-run", worker_detail_getter
+        [worker_summary], worker_name, worker_nodeclaim_name,
+        "inspace-e2e-run", "general", worker_detail_getter
     )
     require(canonical_worker is worker_detail and
             worker_detail_queries == ["user-resource/vm?uuid=12345678-1234-4abc-8def-1234567890ab"],
@@ -749,7 +760,8 @@ def main() -> None:
 
     try:
         worker_discovery_module.canonical_worker_vm_detail(
-            [worker_summary], worker_name, "inspace-e2e-run", mismatched_worker_getter
+            [worker_summary], worker_name, worker_nodeclaim_name,
+            "inspace-e2e-run", "general", mismatched_worker_getter
         )
     except SystemExit as error:
         require("does not match the list UUID and Node name" in str(error),
@@ -767,7 +779,12 @@ def main() -> None:
             "managed node firewall must protect exactly three control planes and the worker" in worker_discovery and
             "worker InternalIP collides with the private control-plane VIP" in worker_discovery and
             'os.environ["INSPACE_AMD_HOST_POOL_UUID"]' in worker_discovery and
-            "canonical_worker_vm_detail(vms" in worker_discovery and
+            "canonical_worker_vm_detail(" in worker_discovery and
+            'record.get("schema") != "karpenter.inspace.cloud/v2"' in worker_discovery and
+            'record.get("nodeClaim") != node.get("nodeClaimName")' in worker_discovery and
+            'record.get("vmName") != node.get("name")' in worker_discovery and
+            ".status.nodeName == $nodeName" in playbook and
+            'test "$(hostname)" = "{{ e2e_node_name }}"' in playbook and
             'record.get("hostClass") != "amd-epyc"' in worker_discovery and
             'vm.get("designated_pool_uuid") != amd_pool_uuid' in worker_discovery,
             "worker proof must bind exactly one egress FIP, exclude reserved VIPs, and bind the managed cloud firewall")
@@ -794,6 +811,10 @@ def main() -> None:
             'item.get("is_deleted") is True' in cloud_audit and
             cloud_audit.count("active_resources(") == 6,
             "deterministic cleanup audit must ignore only explicitly deleted cloud rows")
+    require('worker_vm_prefix = f"{args.cluster}-karp-{args.nodepool}-"' in cloud_audit and
+            'worker_fip_prefix = f"karpenter-{args.nodepool}-"' in cloud_audit and
+            'state.get("workerVMs", [])' in cloud_audit,
+            "cleanup audit must retain new worker VM/FIP naming even with sparse list descriptions")
     cloud_audit_module = load_script_module("e2e_cloud_audit_static", ROOT / "scripts/cloud-audit.py")
     require(cloud_audit_module.parse_description('{"cluster":"expected"}') == {"cluster": "expected"},
             "cloud audit must parse structured VM ownership descriptions")
@@ -835,7 +856,8 @@ def main() -> None:
             "recovery must restore its private API tunnel before probing Kubernetes")
     require(re.search(r"preserving\s+cloud infrastructure is the fail-closed outcome", cleanup) is not None,
             "cleanup must fail closed when ownership is uncertain")
-    require("^rke2-' + e2e_cleanup_state.owner + '-(cp-[0-2]|bastion)$" in cleanup,
+    require("e2e_cleanup_state.clusterResourceName + '-cp[0-2]|rke2-'" in cleanup and
+            "e2e_cleanup_state.owner + '-bastion)$'" in cleanup,
             "controller uninstall must permit only the three control planes and exact bastion")
     print("E2E static contract verified (no live resources touched)")
 

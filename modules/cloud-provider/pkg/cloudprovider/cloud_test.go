@@ -59,7 +59,16 @@ func TestInstancesV2MetadataPreservesKarpenterInstanceType(t *testing.T) {
 		t.Fatalf("InstanceType = %q", metadata.InstanceType)
 	}
 
-	api.vms[0].Description = `{"schema":"karpenter.inspace.cloud/v1","instanceType":"invalid/value"}`
+	api.vms[0].Description = `{"schema":"karpenter.inspace.cloud/v2","instanceType":"is-general-4c-8g"}`
+	metadata, err = provider.InstanceMetadata(context.Background(), &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "worker-0"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if metadata.InstanceType != "is-general-4c-8g" {
+		t.Fatalf("v2 InstanceType = %q", metadata.InstanceType)
+	}
+
+	api.vms[0].Description = `{"schema":"karpenter.inspace.cloud/v2","instanceType":"invalid/value"}`
 	metadata, err = provider.InstanceMetadata(context.Background(), &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "worker-0"}})
 	if err != nil {
 		t.Fatal(err)

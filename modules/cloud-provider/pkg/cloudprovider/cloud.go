@@ -240,7 +240,8 @@ func instanceTypeForVM(vm *inspace.VM) string {
 		Schema       string `json:"schema"`
 		InstanceType string `json:"instanceType"`
 	}
-	if json.Unmarshal([]byte(vm.Description), &record) != nil || record.Schema != "karpenter.inspace.cloud/v1" {
+	if json.Unmarshal([]byte(vm.Description), &record) != nil ||
+		(record.Schema != "karpenter.inspace.cloud/v1" && record.Schema != "karpenter.inspace.cloud/v2") {
 		return fallback
 	}
 	if record.InstanceType == "" || len(utilvalidation.IsValidLabelValue(record.InstanceType)) != 0 {

@@ -88,16 +88,43 @@ func TestCreateIsReadBeforeCreateIdempotent(t *testing.T) {
 	}
 }
 
-func TestCreateRequiresVMNameToMatchNodeClaimBeforeMutation(t *testing.T) {
+func TestCreateAllowsVMNameDistinctFromNodeClaimIdentity(t *testing.T) {
+	request := testRequest()
+	if err := validateCreateRequest(request); err != nil {
+		t.Fatalf("validateCreateRequest() rejected separate VM and NodeClaim identities: %v", err)
+	}
+	record := newOwnership(request, sdk.FloatingIP{
+		Name: floatingIPName(request.ClusterName, request.NodeClaimName), Address: "203.0.113.10",
+		BillingAccountID: request.BillingAccountID,
+	})
+	if record.VMName != request.Name || record.NodeClaim != request.NodeClaimName {
+		t.Fatalf("ownership identities were not persisted separately: %#v", record)
+	}
+}
+
+func TestCreateRejectsInvalidV2VMNameRelationBeforeMutation(t *testing.T) {
 	api := &fakeAPI{}
 	adapter, _ := New(api)
 	request := testRequest()
 	request.Name = "different-vm-name"
-	if _, err := adapter.CreateVM(context.Background(), request); err == nil || !strings.Contains(err.Error(), "must exactly match NodeClaim") {
-		t.Fatalf("CreateVM() error = %v, want VM/NodeClaim name contract", err)
+	if _, err := adapter.CreateVM(context.Background(), request); err == nil || !strings.Contains(err.Error(), "must exactly equal cluster-derived worker name") {
+		t.Fatalf("CreateVM() error = %v, want exact v2 VM-name relation", err)
 	}
 	if api.createCalls != 0 || api.floatingIPCreateCalls != 0 || len(api.operations) != 0 {
-		t.Fatalf("invalid VM/NodeClaim name reached mutation: VMPOSTs=%d FIPPOSTs=%d operations=%v", api.createCalls, api.floatingIPCreateCalls, api.operations)
+		t.Fatalf("invalid VM hostname reached mutation: VMPOSTs=%d FIPPOSTs=%d operations=%v", api.createCalls, api.floatingIPCreateCalls, api.operations)
+	}
+}
+
+func TestV2WorkerNameRequiresDNSLabelClusterAndNodeClaim(t *testing.T) {
+	for name, values := range map[string][3]string{
+		"cluster":   {"invalid.cluster", "nodeclaim-a", "invalid.cluster-karp-nodeclaim-a"},
+		"NodeClaim": {"cluster-a", "invalid.nodeclaim", "cluster-a-karp-invalid.nodeclaim"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := validateV2WorkerName(values[0], values[1], values[2]); err == nil || !strings.Contains(err.Error(), "DNS-1123 hostname label") {
+				t.Fatalf("validateV2WorkerName() error = %v, want DNS-label rejection", err)
+			}
+		})
 	}
 }
 
@@ -150,8 +177,8 @@ func TestCreateRejectsInvalidOrDuplicateListCandidateAuthorityBeforeMutation(t *
 			{UUID: "11111111-1111-4111-8111-111111111111", Name: "foreign-b"},
 		},
 		"duplicate deterministic name": {
-			{UUID: "11111111-1111-4111-8111-111111111111", Name: "nodeclaim-a"},
-			{UUID: "22222222-2222-4222-8222-222222222222", Name: "nodeclaim-a"},
+			{UUID: "11111111-1111-4111-8111-111111111111", Name: "cluster-a-karp-nodeclaim-a"},
+			{UUID: "22222222-2222-4222-8222-222222222222", Name: "cluster-a-karp-nodeclaim-a"},
 		},
 	}
 	for name, vms := range tests {
@@ -251,6 +278,45 @@ func TestCreateWaitsForIncompletePersistedOwnership(t *testing.T) {
 	}
 }
 
+func TestCreateWaitsForSparseV2WorkerIdentityFields(t *testing.T) {
+	remainingIncompleteReads := 2
+	api := &fakeAPI{
+		sparseCreateResponse: true,
+		mutateGetVMResponse: func(vm *sdk.VM) {
+			if remainingIncompleteReads == 0 {
+				return
+			}
+			var partial ownership
+			if err := json.Unmarshal([]byte(vm.Description), &partial); err != nil {
+				t.Fatalf("decode ownership fixture: %v", err)
+			}
+			if remainingIncompleteReads == 2 {
+				partial.Cluster = ""
+			} else {
+				partial.NodeClaim = ""
+			}
+			remainingIncompleteReads--
+			encoded, err := json.Marshal(partial)
+			if err != nil {
+				t.Fatalf("encode partial ownership fixture: %v", err)
+			}
+			vm.Description = string(encoded)
+		},
+	}
+	adapter, _ := New(api)
+	configureFastNetworkReadback(adapter, 200*time.Millisecond)
+	created, err := adapter.CreateVM(context.Background(), testRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created.UUID != "11111111-1111-4111-8111-111111111111" || api.vmGetCalls != 3 {
+		t.Fatalf("CreateVM() result=%#v GETs=%d, want sparse v2 identity convergence on the third detail read", created, api.vmGetCalls)
+	}
+	if api.deleteVMCalls != 0 || api.firewallAssignCalls != 1 || api.floatingIPAssignCalls != 1 {
+		t.Fatalf("sparse v2 identity convergence caused rollback or skipped protection: deletes=%d firewall=%d floatingIP=%d", api.deleteVMCalls, api.firewallAssignCalls, api.floatingIPAssignCalls)
+	}
+}
+
 func TestCreateWaitsForIncompletePersistedLaunchIdentity(t *testing.T) {
 	remainingIncompleteReads := 2
 	api := &fakeAPI{
@@ -276,7 +342,7 @@ func TestCreateWaitsForIncompletePersistedLaunchIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if created.Name != "nodeclaim-a" || created.VCPU != 2 || created.MemoryGiB != 4 || api.vmGetCalls != 3 {
+	if created.Name != "cluster-a-karp-nodeclaim-a" || created.VCPU != 2 || created.MemoryGiB != 4 || api.vmGetCalls != 3 {
 		t.Fatalf("CreateVM() result=%#v GETs=%d, want complete launch identity on the third detail read", created, api.vmGetCalls)
 	}
 	if api.deleteVMCalls != 0 || api.firewallAssignCalls != 1 || api.floatingIPAssignCalls != 1 {
@@ -1692,11 +1758,11 @@ func TestListVMsRejectsUnsupportedReservedOwnershipSchema(t *testing.T) {
 	t.Run("list summary", func(t *testing.T) {
 		api := &fakeAPI{vms: []sdk.VM{{
 			UUID: "77777777-7777-4777-8777-777777777777", Name: "future-owned",
-			Description: `{"schema":"karpenter.inspace.cloud/v2","cluster":"cluster-a"}`,
+			Description: `{"schema":"karpenter.inspace.cloud/v3","cluster":"cluster-a"}`,
 		}}}
 		adapter, _ := New(api)
 		_, err := adapter.ListVMs(context.Background(), "bkk01", "cluster-a")
-		if !errors.Is(err, cloudapi.ErrOwnershipMismatch) || !strings.Contains(err.Error(), `unsupported Karpenter ownership schema "karpenter.inspace.cloud/v2"`) {
+		if !errors.Is(err, cloudapi.ErrOwnershipMismatch) || !strings.Contains(err.Error(), `unsupported Karpenter ownership schema "karpenter.inspace.cloud/v3"`) {
 			t.Fatalf("ListVMs() error = %v, want unsupported reserved list schema rejection", err)
 		}
 		if api.vmGetCalls != 0 || len(api.operations) != 0 {
@@ -1707,11 +1773,11 @@ func TestListVMsRejectsUnsupportedReservedOwnershipSchema(t *testing.T) {
 	t.Run("foreign cluster", func(t *testing.T) {
 		api := &fakeAPI{vms: []sdk.VM{{
 			UUID: "77777777-7777-4777-8777-777777777777", Name: "future-owned",
-			Description: `{"schema":"karpenter.inspace.cloud/v2","cluster":"other-cluster"}`,
+			Description: `{"schema":"karpenter.inspace.cloud/v3","cluster":"other-cluster"}`,
 		}}}
 		adapter, _ := New(api)
 		_, err := adapter.ListVMs(context.Background(), "bkk01", "cluster-a")
-		if !errors.Is(err, cloudapi.ErrOwnershipMismatch) || !strings.Contains(err.Error(), `unsupported Karpenter ownership schema "karpenter.inspace.cloud/v2"`) {
+		if !errors.Is(err, cloudapi.ErrOwnershipMismatch) || !strings.Contains(err.Error(), `unsupported Karpenter ownership schema "karpenter.inspace.cloud/v3"`) {
 			t.Fatalf("ListVMs() error = %v, want global unsupported reserved schema rejection", err)
 		}
 		if api.vmGetCalls != 0 || len(api.operations) != 0 {
@@ -1728,13 +1794,13 @@ func TestListVMsRejectsUnsupportedReservedOwnershipSchema(t *testing.T) {
 		}
 		api.mutateGetVMResponse = func(vm *sdk.VM) {
 			if vm.UUID == created.UUID {
-				vm.Description = strings.Replace(vm.Description, ownershipSchema, ownershipSchemaNamespace+"v2", 1)
+				vm.Description = strings.Replace(vm.Description, ownershipSchema, ownershipSchemaNamespace+"v3", 1)
 			}
 		}
 		getCallsBefore := api.vmGetCalls
 		operationsBefore := append([]string(nil), api.operations...)
 		_, err = adapter.ListVMs(context.Background(), "bkk01", "cluster-a")
-		if !errors.Is(err, cloudapi.ErrOwnershipMismatch) || !strings.Contains(err.Error(), `unsupported Karpenter ownership schema "karpenter.inspace.cloud/v2"`) {
+		if !errors.Is(err, cloudapi.ErrOwnershipMismatch) || !strings.Contains(err.Error(), `unsupported Karpenter ownership schema "karpenter.inspace.cloud/v3"`) {
 			t.Fatalf("ListVMs() error = %v, want unsupported reserved canonical schema rejection", err)
 		}
 		if delta := api.vmGetCalls - getCallsBefore; delta != 1 {
@@ -1748,7 +1814,7 @@ func TestListVMsRejectsUnsupportedReservedOwnershipSchema(t *testing.T) {
 
 func TestInspectOwnershipDescriptionClassifiesSchemaBeforeTypedRecordFields(t *testing.T) {
 	for name, description := range map[string]string{
-		"unsupported schema before incompatible cluster": `{"schema":"karpenter.inspace.cloud/v2","cluster":123}`,
+		"unsupported schema before incompatible cluster": `{"schema":"karpenter.inspace.cloud/v3","cluster":123}`,
 		"unsupported schema after incompatible fields":   `{"cluster":[],"nodeClaim":{},"schema":"karpenter.inspace.cloud/future"}`,
 		"unsupported foreign-cluster record":             `{"schema":"karpenter.inspace.cloud/v99","cluster":"other-cluster","rootDiskGiB":"large"}`,
 	} {
@@ -1769,7 +1835,7 @@ func TestInspectOwnershipDescriptionClassifiesSchemaBeforeTypedRecordFields(t *t
 
 	t.Run("valid v1 with incompatible field stays managed and incomplete", func(t *testing.T) {
 		record, managed, complete, err := inspectOwnershipDescription(`{"schema":"karpenter.inspace.cloud/v1","cluster":"cluster-a","nodeClaim":[]}`, "cluster-a")
-		if err != nil || !managed || complete || record.Schema != ownershipSchema || record.Cluster != "cluster-a" {
+		if err != nil || !managed || complete || record.Schema != legacyOwnershipSchema || record.Cluster != "cluster-a" {
 			t.Fatalf("inspectOwnershipDescription() = %#v, %t, %t, %v; want sticky incomplete v1 target evidence", record, managed, complete, err)
 		}
 	})
@@ -1780,6 +1846,15 @@ func TestInspectOwnershipDescriptionClassifiesSchemaBeforeTypedRecordFields(t *t
 			t.Fatalf("inspectOwnershipDescription() = %#v, %t, %t, %v; want sticky truncated v1 target evidence", record, managed, complete, err)
 		}
 	})
+
+	for _, cluster := range []string{"cluster-a", "other-cluster"} {
+		t.Run("truncated reserved future schema rejects "+cluster, func(t *testing.T) {
+			_, managed, complete, err := inspectOwnershipDescription(`{"schema":"karpenter.inspace.cloud/v3","cluster":"`+cluster+`"`, "cluster-a")
+			if !errors.Is(err, cloudapi.ErrOwnershipMismatch) || !strings.Contains(err.Error(), `unsupported Karpenter ownership schema "karpenter.inspace.cloud/v3"`) || managed || complete {
+				t.Fatalf("inspectOwnershipDescription() managed=%t complete=%t err=%v; want global truncated reserved-schema rejection", managed, complete, err)
+			}
+		})
+	}
 }
 
 func TestListVMsRejectsManagedListAndCanonicalOwnershipDisagreement(t *testing.T) {
@@ -1952,6 +2027,7 @@ func TestListVMsRejectsForeignCanonicalReadErrorOrIdentityMismatch(t *testing.T)
 func TestEstablishedWorkerReadsFailClosedOnLaunchIdentityDrift(t *testing.T) {
 	tests := map[string]func(*sdk.VM){
 		"name":            func(vm *sdk.VM) { vm.Name = "other-nodeclaim" },
+		"hostname":        func(vm *sdk.VM) { vm.Hostname = "other-nodeclaim" },
 		"vCPU":            func(vm *sdk.VM) { vm.VCPU++ },
 		"memory":          func(vm *sdk.VM) { vm.MemoryMiB += 1024 },
 		"OS name":         func(vm *sdk.VM) { vm.OSName = "debian" },
@@ -2314,12 +2390,15 @@ func TestEstablishedWorkerReadsSupportDerivableLegacyV1LaunchIdentity(t *testing
 	record.HostPoolUUID = ""
 	record.VCPU = 0
 	record.MemoryGiB = 0
+	record.Schema = legacyOwnershipSchema
+	record.VMName = ""
 	legacyDescription, err := json.Marshal(record)
 	if err != nil {
 		t.Fatal(err)
 	}
 	api.vms[0].Description = string(legacyDescription)
-	if strings.Contains(api.vms[0].Description, `"hostPoolUUID"`) || strings.Contains(api.vms[0].Description, `"vCPU"`) || strings.Contains(api.vms[0].Description, `"memoryGiB"`) {
+	api.vms[0].Name = "nodeclaim-a"
+	if strings.Contains(api.vms[0].Description, `"hostPoolUUID"`) || strings.Contains(api.vms[0].Description, `"vCPU"`) || strings.Contains(api.vms[0].Description, `"memoryGiB"`) || strings.Contains(api.vms[0].Description, `"vmName"`) {
 		t.Fatalf("legacy v1 fixture retained new exact identity fields: %s", api.vms[0].Description)
 	}
 	got, err := adapter.GetVM(context.Background(), "bkk01", created.UUID, "cluster-a")
@@ -2330,13 +2409,43 @@ func TestEstablishedWorkerReadsSupportDerivableLegacyV1LaunchIdentity(t *testing
 	if err != nil || len(listed) != 1 || listed[0].UUID != created.UUID {
 		t.Fatalf("ListVMs() = %#v, %v, want derivable legacy v1 worker", listed, err)
 	}
-	operationsBefore := append([]string(nil), api.operations...)
-	adopted, err := adapter.CreateVM(context.Background(), testRequest())
-	if err != nil || adopted.UUID != created.UUID || api.createCalls != 1 {
-		t.Fatalf("CreateVM() legacy adoption = %#v, %v, POSTs=%d; want existing worker", adopted, err, api.createCalls)
+}
+
+func TestLegacyV1OwnershipRejectsContradictoryAdditiveVMName(t *testing.T) {
+	record := newOwnership(testRequest(), sdk.FloatingIP{
+		Name: floatingIPName("cluster-a", "nodeclaim-a"), Address: "203.0.113.10", BillingAccountID: testRequest().BillingAccountID,
+	})
+	record.Schema = legacyOwnershipSchema
+	record.VMName = "different-worker-name"
+	if _, partial, err := normalizeOwnershipLaunchIdentity(record); err == nil || partial || !strings.Contains(err.Error(), "contradicts NodeClaim identity") {
+		t.Fatalf("normalizeOwnershipLaunchIdentity() partial=%t err=%v, want contradictory legacy VM-name rejection", partial, err)
 	}
-	if !reflect.DeepEqual(api.operations, operationsBefore) {
-		t.Fatalf("legacy v1 adoption mutated cloud state: before=%v after=%v", operationsBefore, api.operations)
+}
+
+func TestEstablishedV2OwnershipRejectsSelfConsistentArbitraryVMName(t *testing.T) {
+	api := &fakeAPI{}
+	adapter, _ := New(api)
+	created, err := adapter.CreateVM(context.Background(), testRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var record ownership
+	if err := json.Unmarshal([]byte(api.vms[0].Description), &record); err != nil {
+		t.Fatal(err)
+	}
+	record.VMName = "arbitrary-worker"
+	api.vms[0].Name = record.VMName
+	description, err := json.Marshal(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	api.vms[0].Description = string(description)
+	api.operations = nil
+	if _, err := adapter.GetVM(context.Background(), "bkk01", created.UUID, "cluster-a"); !errors.Is(err, cloudapi.ErrOwnershipMismatch) || !strings.Contains(err.Error(), "invalid v2 worker identity") {
+		t.Fatalf("GetVM() error = %v, want exact cluster-derived v2 worker identity rejection", err)
+	}
+	if len(api.operations) != 0 || api.deleteVMCalls != 0 {
+		t.Fatalf("invalid established v2 identity mutated cloud state: operations=%v deletes=%d", api.operations, api.deleteVMCalls)
 	}
 }
 
@@ -2427,7 +2536,7 @@ func TestPartialExactIdentityExtensionRejectsPresentConflictsImmediately(t *test
 }
 
 func TestGetVMRequiresCompleteEstablishedOwnershipRecord(t *testing.T) {
-	for _, field := range []string{"spec hash", "bootstrap hash"} {
+	for _, field := range []string{"VM name", "spec hash", "bootstrap hash"} {
 		t.Run(field, func(t *testing.T) {
 			api := &fakeAPI{}
 			adapter, _ := New(api)
@@ -2441,7 +2550,9 @@ func TestGetVMRequiresCompleteEstablishedOwnershipRecord(t *testing.T) {
 			if err := json.Unmarshal([]byte(api.vms[0].Description), &record); err != nil {
 				t.Fatal(err)
 			}
-			if field == "spec hash" {
+			if field == "VM name" {
+				record.VMName = ""
+			} else if field == "spec hash" {
 				record.SpecHash = ""
 			} else {
 				record.BootstrapHash = ""
@@ -3331,7 +3442,7 @@ func TestCreateRejectsExactVPCOnlyFirewallBeforeMutation(t *testing.T) {
 
 func testRequest() cloudapi.CreateVMRequest {
 	return cloudapi.CreateVMRequest{
-		IdempotencyKey: "uid-a", Name: "nodeclaim-a", ClusterName: "cluster-a", NodeClaimName: "nodeclaim-a",
+		IdempotencyKey: "uid-a", Name: "cluster-a-karp-nodeclaim-a", ClusterName: "cluster-a", NodeClaimName: "nodeclaim-a",
 		BillingAccountID: 1,
 		Location:         "bkk01", NetworkUUID: "network-1", OSName: "ubuntu", OSVersion: "24.04",
 		ControlPlaneVIP:              "10.0.0.10",
