@@ -2,7 +2,7 @@ SHELL := /bin/sh
 
 MODULES := modules/client modules/cloud-provider modules/csi-driver modules/karpenter-provider
 
-.PHONY: all fmt test smoke vet helm-verify helm-package e2e-static verify images status live-audit live-test cluster-e2e
+.PHONY: all fmt test smoke vet helm-verify helm-package e2e-static release-notes-verify verify images status live-audit live-test cluster-e2e
 
 all: test
 
@@ -61,7 +61,10 @@ e2e-static:
 		bash -n "$$script"; \
 	done
 
-verify: test smoke vet helm-verify e2e-static
+release-notes-verify:
+	@./scripts/test-filter-release-notes.sh
+
+verify: test smoke vet helm-verify e2e-static release-notes-verify
 
 images:
 	docker build --platform=linux/amd64 -f modules/cloud-provider/Dockerfile -t inspace-cloud-controller-manager:dev .
