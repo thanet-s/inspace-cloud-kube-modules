@@ -80,9 +80,39 @@ def require_yaml_key(block: str, indent: int, key: str, value: str) -> None:
     require(re.search(pattern, block) is not None, f"YAML block lacks exact {key}: {value}")
 
 
+def yaml_scalar_sequence(block: str, indent: int, key: str) -> list[str]:
+    """Read one exact-format scalar sequence from a bounded YAML block."""
+    lines = block.splitlines()
+    marker = " " * indent + f"{key}:"
+    starts = [index for index, line in enumerate(lines) if line == marker]
+    require(len(starts) == 1, f"YAML sequence {key!r} matched {len(starts)} times")
+    values: list[str] = []
+    item_prefix = " " * (indent + 2) + "- "
+    for line in lines[starts[0] + 1:]:
+        if not line.strip():
+            continue
+        current_indent = len(line) - len(line.lstrip(" "))
+        if current_indent <= indent:
+            break
+        require(line.startswith(item_prefix), f"YAML sequence {key!r} contains a non-scalar item: {line}")
+        values.append(line[len(item_prefix):])
+    require(values, f"YAML sequence {key!r} is empty")
+    return values
+
+
+def require_unrestricted_parallel_task(block: str) -> None:
+    """Reject task-level controls that would serialize a free-strategy wait."""
+    for key in ("run_once", "throttle"):
+        require(
+            re.search(rf"(?m)^ {{6}}{key}:", block) is None,
+            f"parallel task must not set {key}",
+        )
+
+
 def verify_host_launcher_external_allow_list() -> None:
-    """Execute the valid launcher path with Docker as the only PATH command."""
-    with tempfile.TemporaryDirectory(prefix="inspace-e2e-static-") as temporary:
+    """Execute both volume branches with Docker as the only PATH command."""
+    for inspect_fails in (False, True):
+      with tempfile.TemporaryDirectory(prefix="inspace-e2e-static-") as temporary:
         root = pathlib.Path(temporary)
         bin_dir = root / "bin"
         bin_dir.mkdir(mode=0o700)
@@ -90,7 +120,12 @@ def verify_host_launcher_external_allow_list() -> None:
         unknown_log = root / "unknown.log"
         docker = bin_dir / "docker"
         docker.write_text(
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$E2E_DOCKER_LOG\"\n",
+            "#!/bin/sh\n"
+            "printf '%s\\n' \"$*\" >> \"$E2E_DOCKER_LOG\"\n"
+            "if [ \"${E2E_DOCKER_INSPECT_FAIL:-false}\" = true ] && "
+            "[ \"$1\" = volume ] && [ \"$2\" = inspect ]; then\n"
+            "  exit 1\n"
+            "fi\n",
             encoding="utf-8",
         )
         docker.chmod(0o700)
@@ -115,6 +150,7 @@ def verify_host_launcher_external_allow_list() -> None:
             "BASH_ENV": str(bash_env),
             "E2E_DOCKER_LOG": str(docker_log),
             "E2E_UNKNOWN_COMMAND_LOG": str(unknown_log),
+            "E2E_DOCKER_INSPECT_FAIL": str(inspect_fails).lower(),
             "INSPACE_E2E_ENV_FILE": str(root / "workspace.env"),
             "INSPACE_E2E_SSH_PRIVATE_KEY": str(root / "id_rsa"),
             "INSPACE_E2E_SSH_PUBLIC_KEY": str(root / "id_rsa.pub"),
@@ -137,23 +173,46 @@ def verify_host_launcher_external_allow_list() -> None:
             if match is not None:
                 traced_commands.append(match.group(1))
         require(traced_commands, "host launcher produced no Bash execution trace")
-        allowed_builtins = {"set", "[[", "case", "cd", "pwd", "command", "docker"}
+        allowed_builtins = {"set", "[[", "case", "cd", "pwd", "docker"}
         for command_line in traced_commands:
             command_word = command_line.split(maxsplit=1)[0]
             assignment = re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", command_line)
             require(
-                assignment is not None or command_word in allowed_builtins,
+                command_word != "command" or command_line == "command -v docker",
+                f"host launcher command builtin is restricted to exact command -v docker: {command_line}",
+            )
+            require(
+                assignment is not None or command_line == "command -v docker" or command_word in allowed_builtins,
                 f"host launcher executed a command outside the Docker/builtin allow-list: {command_line}",
             )
         unknown = unknown_log.read_text(encoding="utf-8").strip() if unknown_log.exists() else ""
         require(not unknown, f"host launcher attempted non-Docker external commands: {unknown}")
         calls = docker_log.read_text(encoding="utf-8").splitlines()
+        expected_calls = ["volume inspect static-contract-state"]
+        if inspect_fails:
+            expected_calls.append("volume create static-contract-state")
+        expected_calls.extend([
+            "build --platform linux/amd64 --file test/e2e/Dockerfile --target published-live "
+            "--build-arg CONTROLLER_IMAGE=ghcr.io/thanet-s/inspace-cloud-controller-manager:0.0.0-static "
+            "--tag inspace-cloud-rke2-e2e:local .",
+            " ".join((
+                "run --rm --platform linux/amd64",
+                "--env CONFIRM_INSPACE_CLUSTER_E2E=static-contract-account",
+                "--env INSPACE_E2E_VERSION=0.0.0-static",
+                "--env INSPACE_E2E_KEEP_RESOURCES=false",
+                "--env INSPACE_E2E_RUN_ID=",
+                "--env INSPACE_E2E_RECOVERY_ONLY=false",
+                "--env INSPACE_E2E_RECOVER_RETAINED=false",
+                f"--mount type=bind,src={root / 'workspace.env'},dst=/run/config/workspace.env,readonly",
+                f"--mount type=bind,src={root / 'id_rsa'},dst=/run/secrets/e2e_ssh_key,readonly",
+                f"--mount type=bind,src={root / 'id_rsa.pub'},dst=/run/secrets/e2e_ssh_key.pub,readonly",
+                "--mount type=volume,src=static-contract-state,dst=/state",
+                "inspace-cloud-rke2-e2e:local",
+            )),
+        ])
         require(
-            len(calls) == 3
-            and calls[0].startswith("volume inspect ")
-            and calls[1].startswith("build ")
-            and calls[2].startswith("run "),
-            f"unexpected host Docker call sequence: {calls!r}",
+            calls == expected_calls,
+            f"unexpected host Docker call sequence: got {calls!r}, want {expected_calls!r}",
         )
 
 
@@ -255,6 +314,10 @@ def main() -> None:
     require(re.search(r"^task_timeout\s*=\s*(?:2[1-9][0-9]{2}|[3-9][0-9]{3,})$", ansible_cfg, re.MULTILINE) is not None,
             "every Ansible action must have a hard timeout of at least 2100 seconds")
 
+    # Exact-path scanning is only authoritative when template control flow cannot
+    # hide the replicas field at render time. Value expressions remain allowed.
+    require("{%" not in cluster and "{#" not in cluster,
+            "cluster template must not contain Jinja control flow or template comments")
     require(yaml_mapping_scalar(cluster, "spec", "controlPlane", "replicas") == "3",
             "cluster template spec.controlPlane.replicas must be exactly 3")
     provision_play = named_yaml_sequence_item(
@@ -264,13 +327,38 @@ def main() -> None:
     launch_task = named_yaml_sequence_item(provision_play, "Launch the bootstrap reconciler asynchronously", 4)
     require("\n      ansible.builtin.command:" in launch_task,
             "bootstrap launch task must use ansible.builtin.command")
+    require(
+        yaml_scalar_sequence(launch_task, 8, "argv") == [
+            "inspace-cluster-controller",
+            "--cluster-config",
+            '"{{ e2e_cluster_file }}"',
+            "--ssh-public-key-file",
+            '"{{ lookup(\'env\', \'E2E_PUBLIC_KEY\') }}"',
+            "--ssh-username",
+            '"{{ e2e_ssh_user }}"',
+            "--management-cidr",
+            '"{{ e2e_management_cidr }}"',
+            "--management-tcp-ports",
+            '"22"',
+            "--until-ready",
+            "--interval",
+            "15s",
+            "--output=json",
+        ],
+        "bootstrap launch argv must be the canonical until-ready controller invocation",
+    )
     require_yaml_key(launch_task, 6, "async", "2700")
     require_yaml_key(launch_task, 6, "poll", "0")
+    require_yaml_key(launch_task, 6, "register", "e2e_bootstrap_job")
     bootstrap_wait_task = named_yaml_sequence_item(
         provision_play, "Wait robustly for the product reconciler to finish", 4
     )
     require("\n      ansible.builtin.async_status:" in bootstrap_wait_task,
             "bootstrap wait task must use ansible.builtin.async_status")
+    require_yaml_key(
+        bootstrap_wait_task, 8, "jid", '"{{ e2e_bootstrap_job.ansible_job_id }}"'
+    )
+    require_yaml_key(bootstrap_wait_task, 6, "register", "e2e_bootstrap_wait")
     require_yaml_key(bootstrap_wait_task, 6, "until", "e2e_bootstrap_wait.finished")
     require_yaml_key(bootstrap_wait_task, 6, "retries", "270")
     require_yaml_key(bootstrap_wait_task, 6, "delay", "10")
@@ -302,17 +390,21 @@ def main() -> None:
     )
     require_yaml_key(control_plane_wait_play, 2, "hosts", "rke2_control_plane")
     require_yaml_key(control_plane_wait_play, 2, "strategy", "free")
+    require(re.search(r"(?m)^  serial:", control_plane_wait_play) is None,
+            "parallel control-plane wait play must not set serial")
     private_ssh_probe = named_yaml_sequence_item(
         control_plane_wait_play, "Probe every private control-plane SSH port from the bastion in parallel", 4
     )
     require("\n      ansible.builtin.command:" in private_ssh_probe,
             "private control-plane SSH probe must be a command task")
+    require_unrestricted_parallel_task(private_ssh_probe)
     require_yaml_key(private_ssh_probe, 6, "retries", "120")
     require_yaml_key(private_ssh_probe, 6, "delay", "5")
     require_yaml_key(private_ssh_probe, 6, "until", "e2e_private_ssh_probe.rc == 0")
     host_key_wait = named_yaml_sequence_item(
         control_plane_wait_play, "Scan each private control-plane host key from the bastion", 4
     )
+    require_unrestricted_parallel_task(host_key_wait)
     require_yaml_key(host_key_wait, 6, "retries", "20")
     require_yaml_key(host_key_wait, 6, "delay", "5")
     require_yaml_key(
@@ -321,6 +413,7 @@ def main() -> None:
     connection_wait = named_yaml_sequence_item(
         control_plane_wait_play, "Wait for authenticated SSH on every control plane in parallel", 4
     )
+    require_unrestricted_parallel_task(connection_wait)
     require("\n      ansible.builtin.wait_for_connection:" in connection_wait,
             "control-plane authenticated SSH wait must use wait_for_connection")
     require_yaml_key(connection_wait, 8, "connect_timeout", "10")
@@ -329,12 +422,14 @@ def main() -> None:
     cloud_init_wait = named_yaml_sequence_item(
         control_plane_wait_play, "Wait for cloud-init completion on every control plane in parallel", 4
     )
+    require_unrestricted_parallel_task(cloud_init_wait)
     require("\n      ansible.builtin.raw: >-" in cloud_init_wait and
             "timeout --kill-after=5s 1800s sh -c" in cloud_init_wait,
             "control-plane cloud-init wait must be bounded inside the free-strategy play")
     rke2_wait = named_yaml_sequence_item(
         control_plane_wait_play, "Wait for every rke2-server service in parallel", 4
     )
+    require_unrestricted_parallel_task(rke2_wait)
     require_yaml_key(rke2_wait, 6, "retries", "180")
     require_yaml_key(rke2_wait, 6, "delay", "10")
     require_yaml_key(
@@ -343,6 +438,7 @@ def main() -> None:
     readyz_wait = named_yaml_sequence_item(
         control_plane_wait_play, "Wait for embedded etcd and the local API on every server in parallel", 4
     )
+    require_unrestricted_parallel_task(readyz_wait)
     require_yaml_key(readyz_wait, 6, "retries", "120")
     require_yaml_key(readyz_wait, 6, "delay", "10")
     require_yaml_key(readyz_wait, 6, "until", "e2e_local_readyz.rc == 0")

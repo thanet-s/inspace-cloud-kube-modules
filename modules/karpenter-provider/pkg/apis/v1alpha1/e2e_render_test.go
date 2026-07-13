@@ -1,6 +1,7 @@
 package v1alpha1
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -66,6 +67,9 @@ func TestClusterE2EHostEntrypointOnlyLaunchesDocker(t *testing.T) {
 func TestClusterE2EProvisionsAndWaitsForThreeControlPlanesInParallel(t *testing.T) {
 	clusterTemplate := readE2E(t, "templates/cluster.yaml.j2")
 	playbook := readE2E(t, "playbook.yml")
+	if err := validateNoJinjaControlDirectives(clusterTemplate); err != nil {
+		t.Fatal(err)
+	}
 	if got := yamlMappingScalar(t, clusterTemplate, "spec", "controlPlane", "replicas"); got != "3" {
 		t.Fatalf("cluster template spec.controlPlane.replicas=%q, want exactly 3", got)
 	}
@@ -106,11 +110,31 @@ func TestClusterE2EProvisionsAndWaitsForThreeControlPlanesInParallel(t *testing.
 		t.Fatalf("provision play hosts=%q, want localhost", provision.Hosts)
 	}
 	launch := exactAnsibleTask(t, provision, "Launch the bootstrap reconciler asynchronously")
-	requireTaskModule(t, launch, "ansible.builtin.command")
+	launchCommand := requireTaskMapping(t, launch, "ansible.builtin.command")
+	requireMappingStringSequence(t, launchCommand, "argv", []string{
+		"inspace-cluster-controller",
+		"--cluster-config",
+		"{{ e2e_cluster_file }}",
+		"--ssh-public-key-file",
+		"{{ lookup('env', 'E2E_PUBLIC_KEY') }}",
+		"--ssh-username",
+		"{{ e2e_ssh_user }}",
+		"--management-cidr",
+		"{{ e2e_management_cidr }}",
+		"--management-tcp-ports",
+		"22",
+		"--until-ready",
+		"--interval",
+		"15s",
+		"--output=json",
+	})
 	requireTaskNumber(t, launch, "async", 2700)
 	requireTaskNumber(t, launch, "poll", 0)
+	requireTaskScalar(t, launch, "register", "e2e_bootstrap_job")
 	wait := exactAnsibleTask(t, provision, "Wait robustly for the product reconciler to finish")
-	requireTaskModule(t, wait, "ansible.builtin.async_status")
+	waitStatus := requireTaskMapping(t, wait, "ansible.builtin.async_status")
+	requireMappingString(t, waitStatus, "jid", "{{ e2e_bootstrap_job.ansible_job_id }}")
+	requireTaskScalar(t, wait, "register", "e2e_bootstrap_wait")
 	requireTaskScalar(t, wait, "until", "e2e_bootstrap_wait.finished")
 	requireTaskNumber(t, wait, "retries", 270)
 	requireTaskNumber(t, wait, "delay", 10)
@@ -133,30 +157,37 @@ func TestClusterE2EProvisionsAndWaitsForThreeControlPlanesInParallel(t *testing.
 	if controlPlaneWait.Hosts != "rke2_control_plane" || controlPlaneWait.Strategy != "free" {
 		t.Fatalf("control-plane wait play hosts/strategy=%q/%q, want rke2_control_plane/free", controlPlaneWait.Hosts, controlPlaneWait.Strategy)
 	}
+	requireUnserializedParallelPlay(t, controlPlaneWait)
 	probe := exactAnsibleTask(t, controlPlaneWait, "Probe every private control-plane SSH port from the bastion in parallel")
+	requireParallelTask(t, probe)
 	requireTaskModule(t, probe, "ansible.builtin.command")
 	requireTaskNumber(t, probe, "retries", 120)
 	requireTaskNumber(t, probe, "delay", 5)
 	requireTaskScalar(t, probe, "until", "e2e_private_ssh_probe.rc == 0")
 	hostKey := exactAnsibleTask(t, controlPlaneWait, "Scan each private control-plane host key from the bastion")
+	requireParallelTask(t, hostKey)
 	requireTaskModule(t, hostKey, "ansible.builtin.command")
 	requireTaskNumber(t, hostKey, "retries", 20)
 	requireTaskNumber(t, hostKey, "delay", 5)
 	requireTaskScalar(t, hostKey, "until", "e2e_host_keyscan.rc == 0 and e2e_host_keyscan.stdout | length > 0")
 	connection := exactAnsibleTask(t, controlPlaneWait, "Wait for authenticated SSH on every control plane in parallel")
+	requireParallelTask(t, connection)
 	connectionConfig := requireTaskMapping(t, connection, "ansible.builtin.wait_for_connection")
 	requireMappingNumber(t, connectionConfig, "connect_timeout", 10)
 	requireMappingNumber(t, connectionConfig, "sleep", 5)
 	requireMappingNumber(t, connectionConfig, "timeout", 1200)
 	cloudInit := exactAnsibleTask(t, controlPlaneWait, "Wait for cloud-init completion on every control plane in parallel")
+	requireParallelTask(t, cloudInit)
 	requireTaskModule(t, cloudInit, "ansible.builtin.raw")
 	mustContain(t, "control-plane cloud-init wait", taskString(t, cloudInit, "ansible.builtin.raw"), "timeout --kill-after=5s 1800s")
 	service := exactAnsibleTask(t, controlPlaneWait, "Wait for every rke2-server service in parallel")
+	requireParallelTask(t, service)
 	requireTaskModule(t, service, "ansible.builtin.command")
 	requireTaskNumber(t, service, "retries", 180)
 	requireTaskNumber(t, service, "delay", 10)
 	requireTaskScalar(t, service, "until", "e2e_rke2_service.rc == 0 and e2e_rke2_service.stdout == 'active'")
 	readyz := exactAnsibleTask(t, controlPlaneWait, "Wait for embedded etcd and the local API on every server in parallel")
+	requireParallelTask(t, readyz)
 	requireTaskModule(t, readyz, "ansible.builtin.shell")
 	requireTaskNumber(t, readyz, "retries", 120)
 	requireTaskNumber(t, readyz, "delay", 10)
@@ -280,82 +311,106 @@ func TestClusterE2ECleanupIsBoundedFailClosedAndOrdered(t *testing.T) {
 }
 
 type ansiblePlay struct {
-	Name     string           `json:"name"`
-	Hosts    string           `json:"hosts"`
-	Strategy string           `json:"strategy"`
-	Tasks    []map[string]any `json:"tasks"`
+	Name      string           `json:"name"`
+	Hosts     string           `json:"hosts"`
+	Strategy  string           `json:"strategy"`
+	Tasks     []map[string]any `json:"tasks"`
+	HasSerial bool             `json:"-"`
 }
 
 func assertHostLauncherExternalCommandAllowList(t *testing.T, runPath string) {
 	t.Helper()
-	dir := t.TempDir()
-	binDir := filepath.Join(dir, "bin")
-	if err := os.Mkdir(binDir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	dockerLog := filepath.Join(dir, "docker.log")
-	unknownLog := filepath.Join(dir, "unknown.log")
-	dockerPath := filepath.Join(binDir, "docker")
-	if err := os.WriteFile(dockerPath, []byte("#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$E2E_DOCKER_LOG\"\n"), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	bashEnv := filepath.Join(dir, "bash-env")
-	if err := os.WriteFile(bashEnv, []byte("command_not_found_handle() { printf '%s\\n' \"$1\" >> \"$E2E_UNKNOWN_COMMAND_LOG\"; return 127; }\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	for name, contents := range map[string]string{
-		"workspace.env": "INSPACE_API_TOKEN=not-a-real-token\n",
-		"id_rsa":        "not-a-real-private-key\n",
-		"id_rsa.pub":    "ssh-ed25519 not-a-real-public-key\n",
+	for _, scenario := range []struct {
+		name        string
+		inspectFail bool
+	}{
+		{name: "existing volume"},
+		{name: "missing volume is created", inspectFail: true},
 	} {
-		if err := os.WriteFile(filepath.Join(dir, name), []byte(contents), 0o600); err != nil {
-			t.Fatal(err)
-		}
-	}
-	absoluteRunPath, err := filepath.Abs(runPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	command := exec.Command("/bin/bash", "-x", absoluteRunPath)
-	command.Env = []string{
-		"PATH=" + binDir,
-		"HOME=" + dir,
-		"BASH_ENV=" + bashEnv,
-		"E2E_DOCKER_LOG=" + dockerLog,
-		"E2E_UNKNOWN_COMMAND_LOG=" + unknownLog,
-		"INSPACE_E2E_ENV_FILE=" + filepath.Join(dir, "workspace.env"),
-		"INSPACE_E2E_SSH_PRIVATE_KEY=" + filepath.Join(dir, "id_rsa"),
-		"INSPACE_E2E_SSH_PUBLIC_KEY=" + filepath.Join(dir, "id_rsa.pub"),
-		"INSPACE_E2E_STATE_VOLUME=static-contract-state",
-		"CONFIRM_INSPACE_CLUSTER_E2E=static-contract-account",
-		"INSPACE_E2E_VERSION=0.0.0-static",
-	}
-	output, err := command.CombinedOutput()
-	if err != nil {
-		t.Fatalf("host launcher failed with a Docker-only PATH: %v\n%s", err, output)
-	}
-	assertHostLauncherTraceAllowList(t, string(output))
-	if unknown, err := os.ReadFile(unknownLog); err == nil && len(strings.TrimSpace(string(unknown))) != 0 {
-		t.Fatalf("host launcher attempted non-Docker external commands: %s", unknown)
-	} else if err != nil && !os.IsNotExist(err) {
-		t.Fatal(err)
-	}
-	logBytes, err := os.ReadFile(dockerLog)
-	if err != nil {
-		t.Fatal(err)
-	}
-	calls := strings.Split(strings.TrimSpace(string(logBytes)), "\n")
-	if len(calls) != 3 || !strings.HasPrefix(calls[0], "volume inspect ") || !strings.HasPrefix(calls[1], "build ") || !strings.HasPrefix(calls[2], "run ") {
-		t.Fatalf("host launcher Docker call sequence=%q, want volume inspect, build, run", calls)
+		t.Run(scenario.name, func(t *testing.T) {
+			dir := t.TempDir()
+			binDir := filepath.Join(dir, "bin")
+			if err := os.Mkdir(binDir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			dockerLog := filepath.Join(dir, "docker.log")
+			unknownLog := filepath.Join(dir, "unknown.log")
+			dockerPath := filepath.Join(binDir, "docker")
+			if err := os.WriteFile(dockerPath, []byte(`#!/bin/sh
+printf '%s\n' "$*" >> "$E2E_DOCKER_LOG"
+if [ "${E2E_DOCKER_INSPECT_FAIL:-false}" = true ] && [ "$1" = volume ] && [ "$2" = inspect ]; then
+  exit 1
+fi
+`), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			bashEnv := filepath.Join(dir, "bash-env")
+			if err := os.WriteFile(bashEnv, []byte("command_not_found_handle() { printf '%s\\n' \"$1\" >> \"$E2E_UNKNOWN_COMMAND_LOG\"; return 127; }\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			for name, contents := range map[string]string{
+				"workspace.env": "INSPACE_API_TOKEN=not-a-real-token\n",
+				"id_rsa":        "not-a-real-private-key\n",
+				"id_rsa.pub":    "ssh-ed25519 not-a-real-public-key\n",
+			} {
+				if err := os.WriteFile(filepath.Join(dir, name), []byte(contents), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			absoluteRunPath, err := filepath.Abs(runPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			command := exec.Command("/bin/bash", "-x", absoluteRunPath)
+			command.Env = []string{
+				"PATH=" + binDir,
+				"HOME=" + dir,
+				"BASH_ENV=" + bashEnv,
+				"E2E_DOCKER_LOG=" + dockerLog,
+				"E2E_UNKNOWN_COMMAND_LOG=" + unknownLog,
+				fmt.Sprintf("E2E_DOCKER_INSPECT_FAIL=%t", scenario.inspectFail),
+				"INSPACE_E2E_ENV_FILE=" + filepath.Join(dir, "workspace.env"),
+				"INSPACE_E2E_SSH_PRIVATE_KEY=" + filepath.Join(dir, "id_rsa"),
+				"INSPACE_E2E_SSH_PUBLIC_KEY=" + filepath.Join(dir, "id_rsa.pub"),
+				"INSPACE_E2E_STATE_VOLUME=static-contract-state",
+				"CONFIRM_INSPACE_CLUSTER_E2E=static-contract-account",
+				"INSPACE_E2E_VERSION=0.0.0-static",
+			}
+			output, err := command.CombinedOutput()
+			if err != nil {
+				t.Fatalf("host launcher failed with a Docker-only PATH: %v\n%s", err, output)
+			}
+			assertHostLauncherTraceAllowList(t, string(output))
+			if unknown, err := os.ReadFile(unknownLog); err == nil && len(strings.TrimSpace(string(unknown))) != 0 {
+				t.Fatalf("host launcher attempted non-Docker external commands: %s", unknown)
+			} else if err != nil && !os.IsNotExist(err) {
+				t.Fatal(err)
+			}
+			logBytes, err := os.ReadFile(dockerLog)
+			if err != nil {
+				t.Fatal(err)
+			}
+			calls := strings.Split(strings.TrimSpace(string(logBytes)), "\n")
+			want := expectedHostLauncherDockerCalls(dir, scenario.inspectFail)
+			if !equalStrings(calls, want) {
+				t.Fatalf("host launcher Docker calls:\n got: %q\nwant: %q", calls, want)
+			}
+		})
 	}
 }
 
 func assertHostLauncherTraceAllowList(t *testing.T, trace string) {
 	t.Helper()
+	if err := validateHostLauncherTraceAllowList(trace); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func validateHostLauncherTraceAllowList(trace string) error {
 	traceLine := regexp.MustCompile(`^\++ (.*)$`)
 	assignment := regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*=.*$`)
 	allowed := map[string]bool{
-		"set": true, "[[": true, "case": true, "cd": true, "pwd": true, "command": true, "docker": true,
+		"set": true, "[[": true, "case": true, "cd": true, "pwd": true, "docker": true,
 	}
 	traced := 0
 	for _, line := range strings.Split(trace, "\n") {
@@ -366,12 +421,101 @@ func assertHostLauncherTraceAllowList(t *testing.T, trace string) {
 		traced++
 		commandLine := match[1]
 		commandWord := strings.Fields(commandLine)[0]
-		if !assignment.MatchString(commandLine) && !allowed[commandWord] {
-			t.Fatalf("host launcher executed a command outside the Docker/builtin allow-list: %s", commandLine)
+		if commandWord == "command" && commandLine != "command -v docker" {
+			return fmt.Errorf("host launcher command builtin is restricted to exact command -v docker: %s", commandLine)
+		}
+		if !assignment.MatchString(commandLine) && commandLine != "command -v docker" && !allowed[commandWord] {
+			return fmt.Errorf("host launcher executed a command outside the Docker/builtin allow-list: %s", commandLine)
 		}
 	}
 	if traced == 0 {
-		t.Fatal("host launcher produced no Bash execution trace")
+		return fmt.Errorf("host launcher produced no Bash execution trace")
+	}
+	return nil
+}
+
+func expectedHostLauncherDockerCalls(dir string, inspectFail bool) []string {
+	volume := "static-contract-state"
+	calls := []string{"volume inspect " + volume}
+	if inspectFail {
+		calls = append(calls, "volume create "+volume)
+	}
+	calls = append(calls,
+		"build --platform linux/amd64 --file test/e2e/Dockerfile --target published-live --build-arg CONTROLLER_IMAGE=ghcr.io/thanet-s/inspace-cloud-controller-manager:0.0.0-static --tag inspace-cloud-rke2-e2e:local .",
+		strings.Join([]string{
+			"run --rm --platform linux/amd64",
+			"--env CONFIRM_INSPACE_CLUSTER_E2E=static-contract-account",
+			"--env INSPACE_E2E_VERSION=0.0.0-static",
+			"--env INSPACE_E2E_KEEP_RESOURCES=false",
+			"--env INSPACE_E2E_RUN_ID=",
+			"--env INSPACE_E2E_RECOVERY_ONLY=false",
+			"--env INSPACE_E2E_RECOVER_RETAINED=false",
+			"--mount type=bind,src=" + filepath.Join(dir, "workspace.env") + ",dst=/run/config/workspace.env,readonly",
+			"--mount type=bind,src=" + filepath.Join(dir, "id_rsa") + ",dst=/run/secrets/e2e_ssh_key,readonly",
+			"--mount type=bind,src=" + filepath.Join(dir, "id_rsa.pub") + ",dst=/run/secrets/e2e_ssh_key.pub,readonly",
+			"--mount type=volume,src=" + volume + ",dst=/state",
+			"inspace-cloud-rke2-e2e:local",
+		}, " "),
+	)
+	return calls
+}
+
+func validateNoJinjaControlDirectives(document string) error {
+	for _, delimiter := range []string{"{%", "{#"} {
+		if strings.Contains(document, delimiter) {
+			return fmt.Errorf("cluster template must not contain Jinja control flow or template comments (%s)", delimiter)
+		}
+	}
+	return nil
+}
+
+func TestHostLauncherTraceAllowListRejectsCommandBuiltinBypasses(t *testing.T) {
+	valid := "+ command -v docker\n+ docker volume inspect static-contract-state\n"
+	if err := validateHostLauncherTraceAllowList(valid); err != nil {
+		t.Fatalf("valid trace rejected: %v", err)
+	}
+	for _, trace := range []string{
+		"+ command -p docker\n",
+		"+ command -p -v docker\n",
+		"+ command /usr/bin/curl https://example.invalid\n",
+		"+ /usr/bin/docker version\n",
+	} {
+		if err := validateHostLauncherTraceAllowList(trace); err == nil {
+			t.Fatalf("bypass trace accepted: %q", trace)
+		}
+	}
+}
+
+func TestClusterTemplateRejectsHiddenReplicaControlFlow(t *testing.T) {
+	for _, document := range []string{
+		"{% if false %}\nspec:\n  controlPlane:\n    replicas: 3\n{% endif %}\n",
+		"{# spec:\n  controlPlane:\n    replicas: 3 #}\n",
+	} {
+		if err := validateNoJinjaControlDirectives(document); err == nil {
+			t.Fatalf("template control-flow bypass accepted: %q", document)
+		}
+	}
+	if err := validateNoJinjaControlDirectives("spec:\n  controlPlane:\n    replicas: 3\n    name: {{ e2e_name }}\n"); err != nil {
+		t.Fatalf("ordinary Jinja value expression rejected: %v", err)
+	}
+}
+
+func TestParallelAnsibleGuardsRejectSerializationControls(t *testing.T) {
+	plays := parseAnsiblePlays(t, `
+- name: parallel
+  hosts: all
+  strategy: free
+  serial: 1
+  tasks: []
+`)
+	if err := validateUnserializedParallelPlay(plays[0]); err == nil {
+		t.Fatal("serial was accepted on a parallel play")
+	}
+	for _, key := range []string{"run_once", "throttle"} {
+		task := map[string]any{"name": "parallel wait", key: 1}
+		if err := validateParallelTask(task); err == nil {
+			t.Fatalf("%s was accepted on a parallel wait task", key)
+		}
 	}
 }
 
@@ -443,6 +587,16 @@ func parseAnsiblePlays(t *testing.T, playbook string) []ansiblePlay {
 	if err := yaml.Unmarshal([]byte(playbook), &plays); err != nil {
 		t.Fatalf("parse Ansible playbook YAML: %v", err)
 	}
+	var rawPlays []map[string]any
+	if err := yaml.Unmarshal([]byte(playbook), &rawPlays); err != nil {
+		t.Fatalf("parse raw Ansible playbook YAML: %v", err)
+	}
+	if len(rawPlays) != len(plays) {
+		t.Fatalf("typed/raw Ansible play counts differ: %d/%d", len(plays), len(rawPlays))
+	}
+	for index := range plays {
+		_, plays[index].HasSerial = rawPlays[index]["serial"]
+	}
 	if len(plays) == 0 {
 		t.Fatal("Ansible playbook contains no plays")
 	}
@@ -495,6 +649,74 @@ func requireTaskMapping(t *testing.T, task map[string]any, key string) map[strin
 		t.Fatalf("Ansible task %q field %q has type %T, want mapping", task["name"], key, value)
 	}
 	return mapping
+}
+
+func requireParallelTask(t *testing.T, task map[string]any) {
+	t.Helper()
+	if err := validateParallelTask(task); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func validateParallelTask(task map[string]any) error {
+	for _, forbidden := range []string{"run_once", "throttle"} {
+		if _, exists := task[forbidden]; exists {
+			return fmt.Errorf("parallel Ansible task %q must not set %s", task["name"], forbidden)
+		}
+	}
+	return nil
+}
+
+func requireUnserializedParallelPlay(t *testing.T, play ansiblePlay) {
+	t.Helper()
+	if err := validateUnserializedParallelPlay(play); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func validateUnserializedParallelPlay(play ansiblePlay) error {
+	if play.HasSerial {
+		return fmt.Errorf("parallel Ansible play %q must not set serial", play.Name)
+	}
+	return nil
+}
+
+func requireMappingString(t *testing.T, mapping map[string]any, key, expected string) {
+	t.Helper()
+	value, exists := mapping[key]
+	if !exists {
+		t.Fatalf("mapping lacks string field %q", key)
+	}
+	actual, ok := value.(string)
+	if !ok {
+		t.Fatalf("mapping field %q has type %T, want string", key, value)
+	}
+	if actual != expected {
+		t.Fatalf("mapping field %q=%q, want %q", key, actual, expected)
+	}
+}
+
+func requireMappingStringSequence(t *testing.T, mapping map[string]any, key string, expected []string) {
+	t.Helper()
+	raw, exists := mapping[key]
+	if !exists {
+		t.Fatalf("mapping lacks sequence field %q", key)
+	}
+	values, ok := raw.([]any)
+	if !ok {
+		t.Fatalf("mapping field %q has type %T, want sequence", key, raw)
+	}
+	actual := make([]string, 0, len(values))
+	for index, value := range values {
+		text, ok := value.(string)
+		if !ok {
+			t.Fatalf("mapping field %q item %d has type %T, want string", key, index, value)
+		}
+		actual = append(actual, text)
+	}
+	if !equalStrings(actual, expected) {
+		t.Fatalf("mapping field %q=%q, want %q", key, actual, expected)
+	}
 }
 
 func requireTaskNumber(t *testing.T, task map[string]any, key string, expected int) {
