@@ -523,8 +523,10 @@
               cilium-l2announce-default-inspace-e2e-private-a -o json)
             jq -er --arg old "{{ e2e_l2_original_holder.stdout }}" '
               (.spec.holderIdentity // "") as $holder |
-              if (($holder | length) > 0 and $holder != $old and
-                  (.spec.leaseTransitions // 0) >= 1)
+              # Cilium may replace the Lease during L2 failover, which resets
+              # the optional leaseTransitions counter. The new holder plus the
+              # following NIC-MAC and VIP reachability checks prove migration.
+              if (($holder | length) > 0 and $holder != $old)
               then $holder else error("lease has not migrated") end' <<<"$lease"
           args:
             executable: /bin/bash
