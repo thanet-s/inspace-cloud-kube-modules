@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/thanet-s/inspace-cloud-kube-modules/modules/client"
 	"github.com/thanet-s/inspace-cloud-kube-modules/modules/cloud-provider/api/v1alpha1"
+	corev1 "k8s.io/api/core/v1"
 	"sigs.k8s.io/yaml"
 )
 
@@ -2668,11 +2670,12 @@ func assertControlPlaneCloudInit(t *testing.T, raw, expectedNodeName string, ini
 		t.Error("join does not use private VIP registration endpoint")
 	}
 	staticPod := files["/var/lib/inspace/rke2-kube-vip"]
-	for _, required := range []string{kubeVIPImage, "vip_interface", "__PRIVATE_IFACE__", "vip_arp", "cp_enable", "svc_enable", `value: "false"`, "vip_leaderelection", "inspace-control-plane-vip", "k8s_config_file", "hostNetwork: true", "type: File", "app.kubernetes.io/component: control-plane-vip"} {
+	for _, required := range []string{kubeVIPImage, "vip_interface", "__PRIVATE_IFACE__", "vip_arp", "cp_enable", "svc_enable", `value: "false"`, "vip_leaderelection", "inspace-control-plane-vip", "hostNetwork: true", "type: File", "app.kubernetes.io/component: control-plane-vip"} {
 		if !strings.Contains(staticPod, required) {
 			t.Errorf("kube-vip static Pod lacks %q", required)
 		}
 	}
+	assertKubeVIPStaticPodContract(t, staticPod)
 	if strings.Contains(staticPod, "DaemonSet") || strings.Contains(staticPod, "servicesElection") {
 		t.Errorf("kube-vip manifest enables an obsolete deployment/service path: %s", staticPod)
 	}
@@ -2721,6 +2724,70 @@ func assertControlPlaneCloudInit(t *testing.T, raw, expectedNodeName string, ini
 	}
 	if strings.Contains(privateLoadBalancer, "interfaces:") || strings.Contains(privateLoadBalancer, "CiliumNodeConfig") || strings.Contains(ciliumConfig, "nodeIPAM:\n      enabled: true") {
 		t.Errorf("Cilium private load-balancer contract enabled a forbidden interface or Node IPAM path: %s\n%s", privateLoadBalancer, ciliumConfig)
+	}
+}
+
+func assertKubeVIPStaticPodContract(t *testing.T, manifest string) {
+	t.Helper()
+
+	var pod corev1.Pod
+	if err := yaml.Unmarshal([]byte(manifest), &pod); err != nil {
+		t.Fatalf("parse generated kube-vip static Pod: %v", err)
+	}
+	if pod.APIVersion != "v1" || pod.Kind != "Pod" || pod.Namespace != "kube-system" {
+		t.Fatalf("generated kube-vip object identity=%s/%s namespace=%q", pod.APIVersion, pod.Kind, pod.Namespace)
+	}
+	if !pod.Spec.HostNetwork {
+		t.Fatal("generated kube-vip Pod must use the host network")
+	}
+	if len(pod.Spec.HostAliases) != 1 || pod.Spec.HostAliases[0].IP != "127.0.0.1" ||
+		len(pod.Spec.HostAliases[0].Hostnames) != 1 || pod.Spec.HostAliases[0].Hostnames[0] != "kubernetes" {
+		t.Fatalf("generated kube-vip kubernetes host alias=%#v, want kubernetes -> 127.0.0.1", pod.Spec.HostAliases)
+	}
+	if len(pod.Spec.Containers) != 1 {
+		t.Fatalf("generated kube-vip containers=%d, want 1", len(pod.Spec.Containers))
+	}
+	container := pod.Spec.Containers[0]
+	if container.Name != "kube-vip" {
+		t.Fatalf("generated kube-vip container name=%q", container.Name)
+	}
+	vipNodeNameEnvs := make([]corev1.EnvVar, 0, 1)
+	for _, env := range container.Env {
+		if env.Name == "k8s_config_file" {
+			t.Fatalf("generated kube-vip Pod sets ignored k8s_config_file environment variable to %q", env.Value)
+		}
+		if env.Name == "vip_nodename" {
+			vipNodeNameEnvs = append(vipNodeNameEnvs, env)
+		}
+	}
+	wantVIPNodeNameEnv := corev1.EnvVar{
+		Name: "vip_nodename",
+		ValueFrom: &corev1.EnvVarSource{
+			FieldRef: &corev1.ObjectFieldSelector{FieldPath: "spec.nodeName"},
+		},
+	}
+	if len(vipNodeNameEnvs) != 1 || !reflect.DeepEqual(vipNodeNameEnvs[0], wantVIPNodeNameEnv) {
+		t.Fatalf("generated kube-vip vip_nodename env=%#v, want exactly %#v", vipNodeNameEnvs, wantVIPNodeNameEnv)
+	}
+	wantCapabilities := &corev1.Capabilities{
+		Add:  []corev1.Capability{"NET_ADMIN", "NET_RAW"},
+		Drop: []corev1.Capability{"ALL"},
+	}
+	var gotCapabilities *corev1.Capabilities
+	if container.SecurityContext != nil {
+		gotCapabilities = container.SecurityContext.Capabilities
+	}
+	if !reflect.DeepEqual(gotCapabilities, wantCapabilities) {
+		t.Fatalf("generated kube-vip capabilities=%#v, want exactly %#v", gotCapabilities, wantCapabilities)
+	}
+	if len(container.VolumeMounts) != 1 || container.VolumeMounts[0].Name != "kubeconfig" ||
+		container.VolumeMounts[0].MountPath != "/etc/kubernetes/admin.conf" || !container.VolumeMounts[0].ReadOnly {
+		t.Fatalf("generated kube-vip kubeconfig mount=%#v, want read-only /etc/kubernetes/admin.conf", container.VolumeMounts)
+	}
+	if len(pod.Spec.Volumes) != 1 || pod.Spec.Volumes[0].Name != "kubeconfig" || pod.Spec.Volumes[0].HostPath == nil ||
+		pod.Spec.Volumes[0].HostPath.Path != "/etc/rancher/rke2/rke2.yaml" || pod.Spec.Volumes[0].HostPath.Type == nil ||
+		*pod.Spec.Volumes[0].HostPath.Type != corev1.HostPathFile {
+		t.Fatalf("generated kube-vip kubeconfig host volume=%#v, want RKE2 kubeconfig File", pod.Spec.Volumes)
 	}
 }
 

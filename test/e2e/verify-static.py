@@ -556,6 +556,23 @@ def main() -> None:
     require_yaml_key(readyz_wait, 6, "retries", "120")
     require_yaml_key(readyz_wait, 6, "delay", "10")
     require_yaml_key(readyz_wait, 6, "until", "e2e_local_readyz.rc == 0")
+    control_plane_contract = named_yaml_sequence_item(
+        control_plane_wait_play, "Verify pinned RKE2 and Ubuntu versions on every control plane", 4
+    )
+    for marker in (
+        "kube_vip_manifest=/var/lib/rancher/rke2/agent/pod-manifests/kube-vip.yaml",
+        "grep -Fc '    - ip: \"127.0.0.1\"'",
+        "grep -Fc '        - \"kubernetes\"'",
+        "grep -Fc '        - name: vip_nodename'",
+        "grep -Fc '              fieldPath: spec.nodeName'",
+        "grep -Fc '          drop: [\"ALL\"]'",
+        "grep -Fc '          add: [\"NET_ADMIN\", \"NET_RAW\"]'",
+        "grep -Fc '          mountPath: /etc/kubernetes/admin.conf'",
+        "grep -Fc '        path: /etc/rancher/rke2/rke2.yaml'",
+        "! grep -Fq 'k8s_config_file' \"$kube_vip_manifest\"",
+    ):
+        require(marker in control_plane_contract,
+                f"per-node kube-vip manifest proof is missing: {marker}")
 
     for marker in (
         "maxParallelControlPlaneCreates | int == 3",
@@ -665,9 +682,31 @@ def main() -> None:
             "CSI replacement proof must read data created after initialization")
     require("ready-api-monitor" in playbook and "Wait for the continuity monitor first successful API probe" in playbook,
             "kube-vip failover must wait for a successful monitor probe before disruption")
-    require(playbook.count("kube-vip Lease holder does not resolve to exactly one pod") == 3 and
-            playbook.count(".metadata.name == $holder or .spec.nodeName == $holder") == 3,
-            "kube-vip ownership must correlate Lease identity through its exact pod and node")
+    require(playbook.count("kube-vip Lease holder does not resolve to exactly one control-plane pod by node name") == 3 and
+            playbook.count("select(.spec.nodeName == $holder)]") == 3 and
+            playbook.count("then .[0].spec.nodeName else error") == 3 and
+            ".metadata.name == $holder" not in playbook,
+            "kube-vip ownership must correlate its node-name Lease identity to exactly one control-plane pod")
+    kube_vip_ready = named_yaml_sequence_item(
+        playbook, "Prove three pinned kube-vip mirror pods and one elected lease holder", 4
+    )
+    for marker in (
+        '.ip == "127.0.0.1"',
+        'any(.hostnames[]?; . == "kubernetes")',
+        '.hostPath.path == "/etc/rancher/rke2/rke2.yaml"',
+        '.hostPath.type == "File"',
+        '.mountPath == "/etc/kubernetes/admin.conf"',
+        '.readOnly == true',
+        '(.securityContext.capabilities.drop // []) | sort) == ["ALL"]',
+        '(.securityContext.capabilities.add // []) | sort) == ["NET_ADMIN", "NET_RAW"]',
+    ):
+        require(marker in kube_vip_ready,
+                f"live kube-vip mirror-Pod proof is missing: {marker}")
+    require('([.env[]? | select(.name == "k8s_config_file")] | length) == 0' in kube_vip_ready,
+            "live kube-vip proof must reject the ineffective k8s_config_file override")
+    require('select(.name == "vip_nodename" and' in kube_vip_ready and
+            '.valueFrom.fieldRef.fieldPath == "spec.nodeName")] | length) == 1' in kube_vip_ready,
+            "live kube-vip proof must require exactly one downward-API node-name identity")
     for lease in (
         "cilium-l2announce-default-inspace-e2e-private-a",
         "cilium-l2announce-default-inspace-e2e-private-b",

@@ -692,8 +692,18 @@
         test "$(hostnamectl --static)" = "{{ e2e_node_name }}"
         test "$(cat /etc/hostname)" = "{{ e2e_node_name }}"
         /usr/local/bin/rke2 --version | grep -F 'v1.35.6+rke2r1'
+        kube_vip_manifest=/var/lib/rancher/rke2/agent/pod-manifests/kube-vip.yaml
         grep -F 'ghcr.io/kube-vip/kube-vip:v1.2.1@sha256:49b77655f9f109bedc5eb25723bb0e4c57d8513ba33cc69c31be3f243eb2386d' \
-          /var/lib/rancher/rke2/agent/pod-manifests/kube-vip.yaml
+          "$kube_vip_manifest"
+        test "$(grep -Fc '    - ip: "127.0.0.1"' "$kube_vip_manifest")" -eq 1
+        test "$(grep -Fc '        - "kubernetes"' "$kube_vip_manifest")" -eq 1
+        test "$(grep -Fc '        - name: vip_nodename' "$kube_vip_manifest")" -eq 1
+        test "$(grep -Fc '              fieldPath: spec.nodeName' "$kube_vip_manifest")" -eq 1
+        test "$(grep -Fc '          drop: ["ALL"]' "$kube_vip_manifest")" -eq 1
+        test "$(grep -Fc '          add: ["NET_ADMIN", "NET_RAW"]' "$kube_vip_manifest")" -eq 1
+        test "$(grep -Fc '          mountPath: /etc/kubernetes/admin.conf' "$kube_vip_manifest")" -eq 1
+        test "$(grep -Fc '        path: /etc/rancher/rke2/rke2.yaml' "$kube_vip_manifest")" -eq 1
+        ! grep -Fq 'k8s_config_file' "$kube_vip_manifest"
         ip -4 -o addr show scope global | grep -F -- "{{ e2e_private_ip }}/"
         ! ip -4 -o addr show scope global | grep -F -- "{{ e2e_public_ip }}/"
         ! pgrep -x kube-proxy
@@ -937,9 +947,26 @@
           ([.[].spec.nodeName] | unique | length) == 3 and
           all(.[];
             .status.phase == "Running" and
+            ([.spec.hostAliases[]? |
+              select(.ip == "127.0.0.1" and
+                any(.hostnames[]?; . == "kubernetes"))] | length) == 1 and
+            ([.spec.volumes[]? |
+              select(.name == "kubeconfig" and
+                .hostPath.path == "/etc/rancher/rke2/rke2.yaml" and
+                .hostPath.type == "File")] | length) == 1 and
             any(.spec.containers[];
               .name == "kube-vip" and
-              .image == "ghcr.io/kube-vip/kube-vip:v1.2.1@sha256:49b77655f9f109bedc5eb25723bb0e4c57d8513ba33cc69c31be3f243eb2386d"))' <<<"$pods"
+              .image == "ghcr.io/kube-vip/kube-vip:v1.2.1@sha256:49b77655f9f109bedc5eb25723bb0e4c57d8513ba33cc69c31be3f243eb2386d" and
+              ([.env[]? | select(.name == "k8s_config_file")] | length) == 0 and
+              ([.env[]? |
+                select(.name == "vip_nodename" and
+                  .valueFrom.fieldRef.fieldPath == "spec.nodeName")] | length) == 1 and
+              (((.securityContext.capabilities.drop // []) | sort) == ["ALL"]) and
+              (((.securityContext.capabilities.add // []) | sort) == ["NET_ADMIN", "NET_RAW"]) and
+              ([.volumeMounts[]? |
+                select(.name == "kubeconfig" and
+                  .mountPath == "/etc/kubernetes/admin.conf" and
+                  .readOnly == true)] | length) == 1))' <<<"$pods"
         kubectl -n kube-system get lease inspace-control-plane-vip -o json | jq -e '
           (.spec.holderIdentity // "") | length > 0'
       args:
@@ -974,9 +1001,8 @@
               -l 'app.kubernetes.io/name=kube-vip,app.kubernetes.io/component=control-plane-vip' -o json)
             holder_node=$(jq -er --arg holder "$holder" '
               [.items[] |
-                select(.metadata.name == $holder or .spec.nodeName == $holder) |
-                .spec.nodeName] | unique |
-              if length == 1 then .[0] else error("kube-vip Lease holder does not resolve to exactly one pod") end' \
+                select(.spec.nodeName == $holder)] |
+              if length == 1 then .[0].spec.nodeName else error("kube-vip Lease holder does not resolve to exactly one control-plane pod by node name") end' \
               <<<"$pods")
             test "$holder_node" = "$owner_node"
             head -n 1 <<<"$owners"
@@ -1063,9 +1089,8 @@
               -l 'app.kubernetes.io/name=kube-vip,app.kubernetes.io/component=control-plane-vip' -o json)
             holder_node=$(jq -er --arg holder "$holder" '
               [.items[] |
-                select(.metadata.name == $holder or .spec.nodeName == $holder) |
-                .spec.nodeName] | unique |
-              if length == 1 then .[0] else error("kube-vip Lease holder does not resolve to exactly one pod") end' \
+                select(.spec.nodeName == $holder)] |
+              if length == 1 then .[0].spec.nodeName else error("kube-vip Lease holder does not resolve to exactly one control-plane pod by node name") end' \
               <<<"$pods")
             test "$holder_node" = "$owner_node"
             test "$holder" != "{{ e2e_kube_vip_holder_before.stdout | trim }}"
@@ -1124,9 +1149,8 @@
               -l 'app.kubernetes.io/name=kube-vip,app.kubernetes.io/component=control-plane-vip' -o json)
             holder_node=$(jq -er --arg holder "$holder" '
               [.items[] |
-                select(.metadata.name == $holder or .spec.nodeName == $holder) |
-                .spec.nodeName] | unique |
-              if length == 1 then .[0] else error("kube-vip Lease holder does not resolve to exactly one pod") end' \
+                select(.spec.nodeName == $holder)] |
+              if length == 1 then .[0].spec.nodeName else error("kube-vip Lease holder does not resolve to exactly one control-plane pod by node name") end' \
               <<<"$pods")
             test "$holder_node" = "$owner_node"
           args:

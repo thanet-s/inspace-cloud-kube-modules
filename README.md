@@ -56,6 +56,13 @@ A private kube-vip address inside the VPC is advertised by the control-plane
 nodes with ARP leader election. It is the stable RKE2 API endpoint on TCP/6443
 and registration endpoint on TCP/9345; bootstrap does not create a
 control-plane NLB or public API endpoint.
+The static Pod mounts the host's `/etc/rancher/rke2/rke2.yaml` at kube-vip's
+expected in-container path, `/etc/kubernetes/admin.conf`, and maps the
+`kubernetes` hostname to `127.0.0.1`. It does not rely on a
+`k8s_config_file` environment override. The downward API supplies
+`vip_nodename` from `spec.nodeName`, making the kube-vip Lease holder the exact
+control-plane node name. Its container drops every Linux capability before
+adding only `NET_ADMIN` and `NET_RAW` for VIP address and ARP management.
 
 Private workload `Service` load balancers use Cilium LoadBalancer IPAM and L2
 Announcements by default. LB IPAM assigns a unique private VIP to each Service,

@@ -26,9 +26,17 @@ disabled.
 The API and registration listeners share the configured private kube-vip
 address on TCP/6443 and TCP/9345. No bootstrap NLB or API endpoint FIP exists.
 The suite pins kube-vip `v1.2.1` by digest, requires one static mirror pod per
-control plane, one Lease holder, and exactly one VIP owner. It then removes the
-leader's static manifest temporarily, proves ownership moves to a different
-control plane without interrupting the API, and restores all three pods.
+control plane, one Lease holder, and exactly one VIP owner. Each generated
+manifest and live mirror Pod must mount the host RKE2 kubeconfig
+`/etc/rancher/rke2/rke2.yaml` at `/etc/kubernetes/admin.conf`, map
+`kubernetes` to `127.0.0.1`, omit `k8s_config_file`, and derive
+`vip_nodename` from the downward API's `spec.nodeName`. Lease-holder checks
+must resolve that exact node name to one control-plane mirror Pod; a Pod-name
+fallback is not accepted. Both the generated manifest and live Pod must drop
+`ALL` Linux capabilities and add exactly `NET_ADMIN` and `NET_RAW`. The suite
+then removes the leader's static manifest temporarily, proves ownership moves
+to a different control plane without interrupting the API, and restores all
+three pods.
 
 One controller-owned bastion is the sole inbound SSH endpoint. Control planes
 and the Karpenter worker are reached only at private IPs through pinned SSH

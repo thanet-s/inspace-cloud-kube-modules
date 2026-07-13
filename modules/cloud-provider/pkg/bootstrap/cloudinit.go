@@ -300,6 +300,10 @@ metadata:
     app.kubernetes.io/component: control-plane-vip
 spec:
   hostNetwork: true
+  hostAliases:
+    - ip: "127.0.0.1"
+      hostnames:
+        - "kubernetes"
   priorityClassName: system-node-critical
   containers:
     - name: kube-vip
@@ -317,6 +321,10 @@ spec:
           value: "true"
         - name: cp_namespace
           value: "kube-system"
+        - name: vip_nodename
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
         - name: svc_enable
           value: "false"
         - name: vip_leaderelection
@@ -327,14 +335,13 @@ spec:
           value: %s
         - name: port
           value: "6443"
-        - name: k8s_config_file
-          value: "/etc/rancher/rke2/rke2.yaml"
       securityContext:
         capabilities:
+          drop: ["ALL"]
           add: ["NET_ADMIN", "NET_RAW"]
       volumeMounts:
         - name: kubeconfig
-          mountPath: /etc/rancher/rke2/rke2.yaml
+          mountPath: /etc/kubernetes/admin.conf
           readOnly: true
   volumes:
     - name: kubeconfig
