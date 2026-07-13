@@ -116,8 +116,8 @@ provisioned in that namespace. The chart never copies secret data.
 > and verify that Kubernetes stored it. Only then upgrade the CRD followed by
 > this chart. The new CRD removes and prunes
 > `InSpaceNodeClass.spec.hostPoolSelector`; without the NodePool requirement, a
-> formerly AMD-only pool exposes both offerings and can select the
-> lower-weight Intel offering. Fresh installations can skip this migration.
+> formerly AMD-only pool exposes both equal-priced offerings and no longer
+> guarantees AMD. Fresh installations can skip this migration.
 
 ```sh
 export VERSION=0.1.0

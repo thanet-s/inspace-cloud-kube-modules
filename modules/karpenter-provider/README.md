@@ -26,7 +26,8 @@ and `inspace.cloud/instance-memory` (MiB) labels. NodePool requirements can use
 single-class or mixed-class NodePool. The selected offering is persisted in
 the VM ownership record and returned on launched and rehydrated NodeClaims.
 When a NodePool omits the host-class requirement, both offerings are eligible
-and the provider chooses the lowest scheduling weight.
+and the provider uses a deterministic tie-break between their equal scheduling
+weights. Specify the requirement whenever hardware identity matters.
 NodeClass readiness validates both frozen class-to-pool UUID mappings and
 reports them as `status.hostPoolUUIDs`.
 
@@ -36,10 +37,14 @@ reports them as `status.hostPoolUUIDs`.
 > change to be stored. Then update the CRD and controller. The removed
 > `spec.hostPoolSelector` field is pruned by the API server; a former AMD
 > NodeClass whose NodePool has no host-class requirement would otherwise make
-> both offerings eligible and select the lower-weight Intel offering. Use
+> both equal-priced offerings eligible and no longer guarantee AMD. Use
 > `values: [intel-scalable, amd-epyc]` when both classes are intentional.
 
-Catalog prices are deterministic scheduling weights, not actual InSpace prices. A pricing source is still required before enabling cost-based consolidation decisions in production.
+Catalog offering prices follow the current InSpace custom-VM calculator:
+`monthly THB = CPU cores × 60 + RAM GiB × 30 + root-disk GiB × 1`, converted
+to hourly THB with 730 billing hours per month. Intel and AMD offerings for the
+same VM shape have the same price. Revalidate these frozen rates against
+InSpace before using cost-based consolidation decisions in production.
 
 `spec.rke2` is the required bootstrap contract; the legacy `spec.k3s` field is
 not accepted. The RKE2 bootstrap schema has a distinct drift hash, including

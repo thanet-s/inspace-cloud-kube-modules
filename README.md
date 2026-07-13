@@ -67,7 +67,7 @@ The detailed networking, ownership, and cleanup invariants are documented in the
 > `inspace.cloud/host-class` requirement to every NodePool and verify it was
 > stored while the old CRD/controller are still running. Then upgrade the CRD
 > and workload chart. The new CRD prunes the removed selector; skipping this
-> step can change a formerly AMD-only pool to the lower-weight Intel offering.
+> step makes both equal-priced classes eligible and no longer guarantees AMD.
 > Fresh installations do not need this migration.
 
 ```sh

@@ -148,6 +148,6 @@ grep -F '            - name: INSPACE_CONTROL_PLANE_VIP' "$standalone_karpenter" 
 for upgrade_document in "$root_readme" "$chart_readme" "$chart_notes"; do
   grep -F 'inspace.cloud/host-class' "$upgrade_document" >/dev/null
   grep -F 'spec.hostPoolSelector' "$upgrade_document" >/dev/null
-  grep -F 'lower-weight' "$upgrade_document" >/dev/null
-  grep -F 'Intel offering' "$upgrade_document" >/dev/null
+  grep -F 'equal-priced' "$upgrade_document" >/dev/null
+  grep -F 'guarantees AMD' "$upgrade_document" >/dev/null
 done

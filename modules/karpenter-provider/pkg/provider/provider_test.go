@@ -236,8 +236,9 @@ func TestSelectInstanceTypeAllowsMixedHostClassesInOneNodePool(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if hostClass != inspacev1.HostClassIntelScalable || hostPoolUUID != inspacev1.IntelScalableHostPoolUUID {
-		t.Fatalf("mixed pool selected host class/pool=%s/%s, want lowest-weight Intel offering", hostClass, hostPoolUUID)
+	wantHostPoolUUID, supported := inspacev1.HostPoolUUIDForClass(hostClass)
+	if !supported || hostPoolUUID != wantHostPoolUUID {
+		t.Fatalf("mixed pool selected inconsistent host class/pool=%s/%s", hostClass, hostPoolUUID)
 	}
 }
 

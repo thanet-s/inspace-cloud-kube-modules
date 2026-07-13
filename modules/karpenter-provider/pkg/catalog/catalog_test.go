@@ -57,13 +57,23 @@ func TestCatalogHasAll24BoundedVariants(t *testing.T) {
 			t.Fatalf("%s has %d host-class offerings, want 2", instanceType.Name, len(instanceType.Offerings))
 		}
 		hostClasses := map[string]bool{}
+		hostPrices := map[string]float64{}
 		for _, offering := range instanceType.Offerings {
-			hostClasses[offering.Requirements.Get(LabelHostClass).Any()] = true
+			hostClass := offering.Requirements.Get(LabelHostClass).Any()
+			hostClasses[hostClass] = true
+			hostPrices[hostClass] = offering.Price
+			if want := hourlyPriceTHB(cores, memoryGiB, 40); offering.Price != want {
+				t.Fatalf("%s %s hourly price=%v THB, want %v THB", instanceType.Name, hostClass, offering.Price, want)
+			}
 		}
 		for _, hostClass := range inspacev1.SupportedHostClasses() {
 			if !hostClasses[hostClass] {
 				t.Fatalf("%s is missing %s offering", instanceType.Name, hostClass)
 			}
+		}
+		if hostPrices[inspacev1.HostClassIntelScalable] != hostPrices[inspacev1.HostClassAMDEPYC] {
+			t.Fatalf("%s host-class prices differ: Intel=%v AMD=%v", instanceType.Name,
+				hostPrices[inspacev1.HostClassIntelScalable], hostPrices[inspacev1.HostClassAMDEPYC])
 		}
 		if got := instanceType.Allocatable()[corev1.ResourceEphemeralStorage]; got.Cmp(instanceType.Capacity[corev1.ResourceEphemeralStorage]) >= 0 {
 			t.Fatalf("%s does not reserve root-disk space for Ubuntu/RKE2", instanceType.Name)
@@ -77,6 +87,34 @@ func TestCatalogHasAll24BoundedVariants(t *testing.T) {
 				t.Errorf("catalog is missing %s", name)
 			}
 		}
+	}
+}
+
+func TestInSpaceCalculatorPriceFormula(t *testing.T) {
+	tests := []struct {
+		name            string
+		cores           int
+		memoryGiB       int
+		diskGiB         int32
+		monthlyPriceTHB float64
+	}{
+		{name: "1 CPU 2 GiB RAM 30 GiB disk", cores: 1, memoryGiB: 2, diskGiB: 30, monthlyPriceTHB: 150},
+		{name: "2 CPU 4 GiB RAM 60 GiB disk", cores: 2, memoryGiB: 4, diskGiB: 60, monthlyPriceTHB: 300},
+		{name: "4 CPU 8 GiB RAM 120 GiB disk", cores: 4, memoryGiB: 8, diskGiB: 120, monthlyPriceTHB: 600},
+		{name: "8 CPU 16 GiB RAM 240 GiB disk", cores: 8, memoryGiB: 16, diskGiB: 240, monthlyPriceTHB: 1200},
+		{name: "2 CPU 8 GiB RAM 60 GiB disk", cores: 2, memoryGiB: 8, diskGiB: 60, monthlyPriceTHB: 420},
+		{name: "6 CPU 8 GiB RAM 60 GiB disk", cores: 6, memoryGiB: 8, diskGiB: 60, monthlyPriceTHB: 660},
+		{name: "10 CPU 26 GiB RAM 60 GiB disk", cores: 10, memoryGiB: 26, diskGiB: 60, monthlyPriceTHB: 1440},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := monthlyPriceTHB(test.cores, test.memoryGiB, test.diskGiB); got != test.monthlyPriceTHB {
+				t.Fatalf("monthly price=%v THB, want %v THB", got, test.monthlyPriceTHB)
+			}
+			if got, want := hourlyPriceTHB(test.cores, test.memoryGiB, test.diskGiB), test.monthlyPriceTHB/billingHoursPerMonth; got != want {
+				t.Fatalf("hourly price=%v THB, want %v THB", got, want)
+			}
+		})
 	}
 }
 

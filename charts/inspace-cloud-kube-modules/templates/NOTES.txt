@@ -78,8 +78,8 @@ IMPORTANT upgrade migration:
   inspace.cloud/host-class requirement (intel-scalable, amd-epyc, or both) to
   every NodePool and verify it was stored while the old CRD/controller are
   still running. The new CRD prunes InSpaceNodeClass.spec.hostPoolSelector;
-  skipping this step can change a formerly AMD-only pool to the lower-weight
-  Intel offering. Fresh installations can skip this migration.
+  skipping this step makes both equal-priced classes eligible and no longer
+  guarantees AMD. Fresh installations can skip this migration.
 
 CRDs are released separately and must be upgraded before this chart:
   helm upgrade --install inspace-cloud-kube-modules-crds \

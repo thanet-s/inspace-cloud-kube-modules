@@ -22,6 +22,11 @@ const (
 	LabelLocation       = "inspace.cloud/location"
 	RegionThailand      = "thailand"
 	DefaultDiskGiB      = int32(40)
+
+	monthlyCPUPriceTHB       = 60.0
+	monthlyMemoryGiBPriceTHB = 30.0
+	monthlyDiskGiBPriceTHB   = 1.0
+	billingHoursPerMonth     = 730.0
 )
 
 type Family struct {
@@ -100,7 +105,7 @@ func newInstanceType(opts Options, family string, cores, memoryGiB int) *cloudpr
 	for _, hostClass := range inspacev1.SupportedHostClasses() {
 		offerings = append(offerings, &cloudprovider.Offering{
 			Available: true,
-			Price:     relativePrice(cores, memoryGiB, hostClass),
+			Price:     hourlyPriceTHB(cores, memoryGiB, opts.RootDiskGiB),
 			Requirements: scheduling.NewRequirements(
 				scheduling.NewRequirement(corev1.LabelTopologyZone, corev1.NodeSelectorOpIn, opts.Location),
 				scheduling.NewRequirement(karpv1.CapacityTypeLabelKey, corev1.NodeSelectorOpIn, karpv1.CapacityTypeOnDemand),
@@ -131,10 +136,12 @@ func newInstanceType(opts Options, family string, cores, memoryGiB int) *cloudpr
 	}
 }
 
-func relativePrice(cores, memoryGiB int, hostClass string) float64 {
-	price := float64(cores) + float64(memoryGiB)/4
-	if hostClass == inspacev1.HostClassAMDEPYC {
-		price *= 1.1
-	}
-	return price
+func monthlyPriceTHB(cores, memoryGiB int, diskGiB int32) float64 {
+	return float64(cores)*monthlyCPUPriceTHB +
+		float64(memoryGiB)*monthlyMemoryGiBPriceTHB +
+		float64(diskGiB)*monthlyDiskGiBPriceTHB
+}
+
+func hourlyPriceTHB(cores, memoryGiB int, diskGiB int32) float64 {
+	return monthlyPriceTHB(cores, memoryGiB, diskGiB) / billingHoursPerMonth
 }
