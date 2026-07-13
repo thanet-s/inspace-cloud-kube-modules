@@ -1521,6 +1521,92 @@ func TestListVMsIgnoresDefinitivelyForeignDescriptions(t *testing.T) {
 	}
 }
 
+func TestListVMsIgnoresExplicitForeignV1RecordsBeforeLaunchSemantics(t *testing.T) {
+	api := &fakeAPI{}
+	adapter, _ := New(api)
+	created, err := adapter.CreateVM(context.Background(), testRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var base ownership
+	if err := json.Unmarshal([]byte(api.vms[0].Description), &base); err != nil {
+		t.Fatal(err)
+	}
+	base.Cluster = "other-cluster"
+	tests := []struct {
+		uuid   string
+		mutate func(*ownership)
+	}{
+		{uuid: "55555555-5555-4555-8555-555555555555", mutate: func(record *ownership) { record.HostClass = "future-host" }},
+		{uuid: "66666666-6666-4666-8666-666666666666", mutate: func(record *ownership) { record.InstanceType = "future-shape" }},
+		{uuid: "77777777-7777-4777-8777-777777777777", mutate: func(record *ownership) { record.HostPoolUUID = "future-pool" }},
+		{uuid: "88888888-8888-4888-8888-888888888888", mutate: func(record *ownership) { record.VCPU++ }},
+		{uuid: "99999999-9999-4999-8999-999999999999", mutate: func(record *ownership) { record.MemoryGiB++ }},
+	}
+	for _, test := range tests {
+		record := base
+		test.mutate(&record)
+		description, err := json.Marshal(record)
+		if err != nil {
+			t.Fatal(err)
+		}
+		api.vms = append(api.vms, sdk.VM{UUID: test.uuid, Name: "foreign-worker", Description: string(description)})
+	}
+	getCallsBefore := api.vmGetCalls
+	listed, err := adapter.ListVMs(context.Background(), "bkk01", "cluster-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(listed) != 1 || listed[0].UUID != created.UUID {
+		t.Fatalf("ListVMs() = %#v, want only target-cluster worker", listed)
+	}
+	if delta := api.vmGetCalls - getCallsBefore; delta != len(tests)+1 {
+		t.Fatalf("ListVMs canonical GET delta=%d, want one read per row", delta)
+	}
+}
+
+func TestListVMsKeepsAmbiguousTargetOwnershipSticky(t *testing.T) {
+	api := &fakeAPI{}
+	adapter, _ := New(api)
+	configureFastNetworkReadback(adapter, 40*time.Millisecond)
+	adapter.protectionAuditTimeout = 40 * time.Millisecond
+	if _, err := adapter.CreateVM(context.Background(), testRequest()); err != nil {
+		t.Fatal(err)
+	}
+	var foreign ownership
+	if err := json.Unmarshal([]byte(api.vms[0].Description), &foreign); err != nil {
+		t.Fatal(err)
+	}
+	foreign.Cluster = "other-cluster"
+	foreign.HostClass = "future-host"
+	foreignDescription, err := json.Marshal(foreign)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foreignUUID := "99999999-9999-4999-8999-999999999999"
+	api.vms = append(api.vms, sdk.VM{
+		UUID: foreignUUID, Name: "ambiguous-worker",
+		Description: `{"schema":"karpenter.inspace.cloud/v1","cluster":""}`,
+	})
+	api.mutateGetVMResponse = func(vm *sdk.VM) {
+		if vm.UUID == foreignUUID {
+			vm.Description = string(foreignDescription)
+		}
+	}
+	api.operations = nil
+	getCallsBefore := api.vmGetCalls
+	_, err = adapter.ListVMs(context.Background(), "bkk01", "cluster-a")
+	if !errors.Is(err, cloudapi.ErrOwnershipMismatch) || !errors.Is(err, errPersistedOwnershipIncomplete) || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("ListVMs() error = %v, want sticky target ownership uncertainty", err)
+	}
+	if delta := api.vmGetCalls - getCallsBefore; delta < 3 {
+		t.Fatalf("ListVMs ambiguous target GET delta=%d, want bounded retries", delta)
+	}
+	if api.deleteVMCalls != 0 || len(api.operations) != 0 {
+		t.Fatalf("ambiguous target audit mutated cloud state: deletes=%d operations=%v", api.deleteVMCalls, api.operations)
+	}
+}
+
 func TestListVMsRejectsUnsupportedReservedOwnershipSchema(t *testing.T) {
 	t.Run("list summary", func(t *testing.T) {
 		api := &fakeAPI{vms: []sdk.VM{{
@@ -1534,6 +1620,21 @@ func TestListVMsRejectsUnsupportedReservedOwnershipSchema(t *testing.T) {
 		}
 		if api.vmGetCalls != 0 || len(api.operations) != 0 {
 			t.Fatalf("unsupported list schema reached canonical read or mutation: GETs=%d operations=%v", api.vmGetCalls, api.operations)
+		}
+	})
+
+	t.Run("foreign cluster", func(t *testing.T) {
+		api := &fakeAPI{vms: []sdk.VM{{
+			UUID: "77777777-7777-4777-8777-777777777777", Name: "future-owned",
+			Description: `{"schema":"karpenter.inspace.cloud/v2","cluster":"other-cluster"}`,
+		}}}
+		adapter, _ := New(api)
+		_, err := adapter.ListVMs(context.Background(), "bkk01", "cluster-a")
+		if !errors.Is(err, cloudapi.ErrOwnershipMismatch) || !strings.Contains(err.Error(), `unsupported Karpenter ownership schema "karpenter.inspace.cloud/v2"`) {
+			t.Fatalf("ListVMs() error = %v, want global unsupported reserved schema rejection", err)
+		}
+		if api.vmGetCalls != 0 || len(api.operations) != 0 {
+			t.Fatalf("unsupported foreign schema reached canonical read or mutation: GETs=%d operations=%v", api.vmGetCalls, api.operations)
 		}
 	})
 
@@ -1733,16 +1834,15 @@ func TestListVMsRejectsForeignCanonicalReadErrorOrIdentityMismatch(t *testing.T)
 
 func TestEstablishedWorkerReadsFailClosedOnLaunchIdentityDrift(t *testing.T) {
 	tests := map[string]func(*sdk.VM){
-		"name":              func(vm *sdk.VM) { vm.Name = "other-nodeclaim" },
-		"vCPU":              func(vm *sdk.VM) { vm.VCPU++ },
-		"memory":            func(vm *sdk.VM) { vm.MemoryMiB += 1024 },
-		"OS name":           func(vm *sdk.VM) { vm.OSName = "debian" },
-		"OS version":        func(vm *sdk.VM) { vm.OSVersion = "22.04" },
-		"host pool":         func(vm *sdk.VM) { vm.DesignatedPoolUUID = "other-pool" },
-		"network":           func(vm *sdk.VM) { vm.NetworkUUID = "other-network" },
-		"billing account":   func(vm *sdk.VM) { vm.BillingAccountID++ },
-		"root disk size":    func(vm *sdk.VM) { vm.Storage[0].SizeGiB++ },
-		"missing root disk": func(vm *sdk.VM) { vm.Storage = nil },
+		"name":            func(vm *sdk.VM) { vm.Name = "other-nodeclaim" },
+		"vCPU":            func(vm *sdk.VM) { vm.VCPU++ },
+		"memory":          func(vm *sdk.VM) { vm.MemoryMiB += 1024 },
+		"OS name":         func(vm *sdk.VM) { vm.OSName = "debian" },
+		"OS version":      func(vm *sdk.VM) { vm.OSVersion = "22.04" },
+		"host pool":       func(vm *sdk.VM) { vm.DesignatedPoolUUID = "other-pool" },
+		"network":         func(vm *sdk.VM) { vm.NetworkUUID = "other-network" },
+		"billing account": func(vm *sdk.VM) { vm.BillingAccountID++ },
+		"root disk size":  func(vm *sdk.VM) { vm.Storage[0].SizeGiB++ },
 		"second root disk": func(vm *sdk.VM) {
 			vm.Storage = append(vm.Storage, sdk.VMStorage{SizeGiB: vm.Storage[0].SizeGiB, Primary: true})
 		},
@@ -1757,14 +1857,141 @@ func TestEstablishedWorkerReadsFailClosedOnLaunchIdentityDrift(t *testing.T) {
 			}
 			mutate(&api.vms[0])
 			api.operations = nil
+			getCallsBefore := api.vmGetCalls
 			if _, err := adapter.GetVM(context.Background(), "bkk01", created.UUID, "cluster-a"); !errors.Is(err, cloudapi.ErrOwnershipMismatch) || !strings.Contains(err.Error(), "launch identity drift") {
 				t.Fatalf("GetVM() error = %v, want established launch identity drift", err)
 			}
+			if delta := api.vmGetCalls - getCallsBefore; delta != 1 {
+				t.Fatalf("GetVM conflict GET delta=%d, want immediate failure", delta)
+			}
+			getCallsBefore = api.vmGetCalls
 			if _, err := adapter.ListVMs(context.Background(), "bkk01", "cluster-a"); !errors.Is(err, cloudapi.ErrOwnershipMismatch) || !strings.Contains(err.Error(), "launch identity drift") {
 				t.Fatalf("ListVMs() error = %v, want established launch identity drift", err)
 			}
+			if delta := api.vmGetCalls - getCallsBefore; delta != 1 {
+				t.Fatalf("ListVMs conflict GET delta=%d, want immediate failure", delta)
+			}
 			if api.deleteVMCalls != 0 || len(api.operations) != 0 {
 				t.Fatalf("read-only launch drift audit mutated cloud state: deletes=%d operations=%v", api.deleteVMCalls, api.operations)
+			}
+		})
+	}
+}
+
+func TestEstablishedWorkerReadsAllowOmittedNetworkUUIDWithExactNetworkMembership(t *testing.T) {
+	api := &fakeAPI{}
+	adapter, _ := New(api)
+	created, err := adapter.CreateVM(context.Background(), testRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	api.mutateGetVMResponse = func(vm *sdk.VM) {
+		if vm.UUID == created.UUID {
+			vm.NetworkUUID = ""
+		}
+	}
+	getCallsBefore := api.vmGetCalls
+	if got, err := adapter.GetVM(context.Background(), "bkk01", created.UUID, "cluster-a"); err != nil || got.UUID != created.UUID {
+		t.Fatalf("GetVM() = %#v, %v, want established worker with network proven by membership", got, err)
+	}
+	if delta := api.vmGetCalls - getCallsBefore; delta != 1 {
+		t.Fatalf("GetVM network-omission GET delta=%d, want no convergence retry", delta)
+	}
+	getCallsBefore = api.vmGetCalls
+	if got, err := adapter.ListVMs(context.Background(), "bkk01", "cluster-a"); err != nil || len(got) != 1 || got[0].UUID != created.UUID {
+		t.Fatalf("ListVMs() = %#v, %v, want established worker with network proven by membership", got, err)
+	}
+	if delta := api.vmGetCalls - getCallsBefore; delta != 1 {
+		t.Fatalf("ListVMs network-omission GET delta=%d, want no convergence retry", delta)
+	}
+	api.network = &sdk.Network{UUID: "network-1", Subnet: "10.0.0.0/24"}
+	api.operations = nil
+	if _, err := adapter.GetVM(context.Background(), "bkk01", created.UUID, "cluster-a"); err == nil || !strings.Contains(err.Error(), "network contains VM UUID 0 times") {
+		t.Fatalf("GetVM() error = %v, want exact GetNetwork membership rejection", err)
+	}
+	if api.deleteVMCalls != 0 || len(api.operations) != 0 {
+		t.Fatalf("missing network membership audit mutated cloud state: deletes=%d operations=%v", api.deleteVMCalls, api.operations)
+	}
+}
+
+func TestEstablishedWorkerReadsWaitForMissingLaunchFieldsToConverge(t *testing.T) {
+	tests := map[string]func(*sdk.VM){
+		"name":            func(vm *sdk.VM) { vm.Name = "" },
+		"vCPU":            func(vm *sdk.VM) { vm.VCPU = 0 },
+		"memory":          func(vm *sdk.VM) { vm.MemoryMiB = 0 },
+		"OS name":         func(vm *sdk.VM) { vm.OSName = "" },
+		"OS version":      func(vm *sdk.VM) { vm.OSVersion = "" },
+		"host pool":       func(vm *sdk.VM) { vm.DesignatedPoolUUID = "" },
+		"billing account": func(vm *sdk.VM) { vm.BillingAccountID = 0 },
+		"root disk":       func(vm *sdk.VM) { vm.Storage = nil },
+	}
+	for name, omit := range tests {
+		t.Run(name, func(t *testing.T) {
+			api := &fakeAPI{}
+			adapter, _ := New(api)
+			configureFastNetworkReadback(adapter, boundedReadbackTestTimeout)
+			adapter.protectionAuditTimeout = boundedReadbackTestTimeout
+			created, err := adapter.CreateVM(context.Background(), testRequest())
+			if err != nil {
+				t.Fatal(err)
+			}
+			remainingSparseReads := 1
+			api.mutateGetVMResponse = func(vm *sdk.VM) {
+				if vm.UUID == created.UUID && remainingSparseReads > 0 {
+					remainingSparseReads--
+					omit(vm)
+				}
+			}
+			api.operations = nil
+			getCallsBefore := api.vmGetCalls
+			if got, err := adapter.GetVM(context.Background(), "bkk01", created.UUID, "cluster-a"); err != nil || got.UUID != created.UUID {
+				t.Fatalf("GetVM() = %#v, %v, want convergence", got, err)
+			}
+			if delta := api.vmGetCalls - getCallsBefore; delta != 2 {
+				t.Fatalf("GetVM sparse launch GET delta=%d, want sparse then complete", delta)
+			}
+			remainingSparseReads = 1
+			getCallsBefore = api.vmGetCalls
+			if got, err := adapter.ListVMs(context.Background(), "bkk01", "cluster-a"); err != nil || len(got) != 1 || got[0].UUID != created.UUID {
+				t.Fatalf("ListVMs() = %#v, %v, want convergence", got, err)
+			}
+			if delta := api.vmGetCalls - getCallsBefore; delta != 2 {
+				t.Fatalf("ListVMs sparse launch GET delta=%d, want sparse then complete", delta)
+			}
+			if api.deleteVMCalls != 0 || len(api.operations) != 0 {
+				t.Fatalf("read convergence mutated cloud state: deletes=%d operations=%v", api.deleteVMCalls, api.operations)
+			}
+		})
+	}
+}
+
+func TestEstablishedWorkerReadsBoundPermanentlyMissingLaunchFields(t *testing.T) {
+	for _, operation := range []string{"get", "list"} {
+		t.Run(operation, func(t *testing.T) {
+			api := &fakeAPI{}
+			adapter, _ := New(api)
+			configureFastNetworkReadback(adapter, 40*time.Millisecond)
+			adapter.protectionAuditTimeout = 40 * time.Millisecond
+			created, err := adapter.CreateVM(context.Background(), testRequest())
+			if err != nil {
+				t.Fatal(err)
+			}
+			api.mutateGetVMResponse = func(vm *sdk.VM) { vm.OSVersion = "" }
+			api.operations = nil
+			getCallsBefore := api.vmGetCalls
+			if operation == "get" {
+				_, err = adapter.GetVM(context.Background(), "bkk01", created.UUID, "cluster-a")
+			} else {
+				_, err = adapter.ListVMs(context.Background(), "bkk01", "cluster-a")
+			}
+			if !errors.Is(err, cloudapi.ErrOwnershipMismatch) || !errors.Is(err, errPersistedOwnershipIncomplete) || !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("%s error = %v, want bounded incomplete launch identity", operation, err)
+			}
+			if delta := api.vmGetCalls - getCallsBefore; delta < 2 {
+				t.Fatalf("%s sparse launch GET delta=%d, want bounded retries", operation, delta)
+			}
+			if api.deleteVMCalls != 0 || len(api.operations) != 0 {
+				t.Fatalf("bounded read convergence mutated cloud state: deletes=%d operations=%v", api.deleteVMCalls, api.operations)
 			}
 		})
 	}
@@ -1810,11 +2037,99 @@ func TestEstablishedWorkerReadsSupportDerivableLegacyV1LaunchIdentity(t *testing
 	}
 }
 
+func TestEstablishedWorkerReadsTreatEveryPartialExactIdentityExtensionAsIncomplete(t *testing.T) {
+	tests := map[string]func(*ownership){
+		"host pool only":       func(record *ownership) { record.VCPU, record.MemoryGiB = 0, 0 },
+		"vCPU only":            func(record *ownership) { record.HostPoolUUID, record.MemoryGiB = "", 0 },
+		"memory only":          func(record *ownership) { record.HostPoolUUID, record.VCPU = "", 0 },
+		"host pool and vCPU":   func(record *ownership) { record.MemoryGiB = 0 },
+		"host pool and memory": func(record *ownership) { record.VCPU = 0 },
+		"vCPU and memory":      func(record *ownership) { record.HostPoolUUID = "" },
+	}
+	for name, makePartial := range tests {
+		t.Run(name, func(t *testing.T) {
+			api := &fakeAPI{}
+			adapter, _ := New(api)
+			configureFastNetworkReadback(adapter, boundedReadbackTestTimeout)
+			adapter.protectionAuditTimeout = boundedReadbackTestTimeout
+			created, err := adapter.CreateVM(context.Background(), testRequest())
+			if err != nil {
+				t.Fatal(err)
+			}
+			var partial ownership
+			if err := json.Unmarshal([]byte(api.vms[0].Description), &partial); err != nil {
+				t.Fatal(err)
+			}
+			makePartial(&partial)
+			partialDescription, err := json.Marshal(partial)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, _, complete, err := inspectOwnershipDescription(string(partialDescription), "cluster-a"); err != nil || complete {
+				t.Fatalf("partial extension inspect complete=%t, err=%v; want incomplete", complete, err)
+			}
+			remainingPartialReads := 1
+			api.mutateGetVMResponse = func(vm *sdk.VM) {
+				if vm.UUID == created.UUID && remainingPartialReads > 0 {
+					remainingPartialReads--
+					vm.Description = string(partialDescription)
+				}
+			}
+			api.operations = nil
+			getCallsBefore := api.vmGetCalls
+			if got, err := adapter.GetVM(context.Background(), "bkk01", created.UUID, "cluster-a"); err != nil || got.UUID != created.UUID {
+				t.Fatalf("GetVM() = %#v, %v, want extension convergence", got, err)
+			}
+			if delta := api.vmGetCalls - getCallsBefore; delta != 2 {
+				t.Fatalf("GetVM partial extension GET delta=%d, want partial then complete", delta)
+			}
+			remainingPartialReads = 1
+			getCallsBefore = api.vmGetCalls
+			if got, err := adapter.ListVMs(context.Background(), "bkk01", "cluster-a"); err != nil || len(got) != 1 || got[0].UUID != created.UUID {
+				t.Fatalf("ListVMs() = %#v, %v, want extension convergence", got, err)
+			}
+			if delta := api.vmGetCalls - getCallsBefore; delta != 2 {
+				t.Fatalf("ListVMs partial extension GET delta=%d, want partial then complete", delta)
+			}
+			if api.deleteVMCalls != 0 || len(api.operations) != 0 {
+				t.Fatalf("partial extension convergence mutated cloud state: deletes=%d operations=%v", api.deleteVMCalls, api.operations)
+			}
+		})
+	}
+}
+
+func TestPartialExactIdentityExtensionRejectsPresentConflictsImmediately(t *testing.T) {
+	tests := map[string]func(*ownership){
+		"host pool": func(record *ownership) {
+			record.HostPoolUUID, record.VCPU, record.MemoryGiB = "other-pool", 0, 0
+		},
+		"vCPU": func(record *ownership) {
+			record.HostPoolUUID, record.VCPU, record.MemoryGiB = "", 4, 0
+		},
+		"memory": func(record *ownership) {
+			record.HostPoolUUID, record.VCPU, record.MemoryGiB = "", 0, 8
+		},
+	}
+	for name, conflict := range tests {
+		t.Run(name, func(t *testing.T) {
+			record := newOwnership(testRequest(), sdk.FloatingIP{
+				Name: floatingIPName("cluster-a", "nodeclaim-a"), Address: "203.0.113.10", BillingAccountID: testRequest().BillingAccountID,
+			})
+			conflict(&record)
+			if _, partial, err := normalizeOwnershipLaunchIdentity(record); err == nil || partial {
+				t.Fatalf("normalizeOwnershipLaunchIdentity() partial=%t, err=%v; want immediate conflict", partial, err)
+			}
+		})
+	}
+}
+
 func TestGetVMRequiresCompleteEstablishedOwnershipRecord(t *testing.T) {
 	for _, field := range []string{"spec hash", "bootstrap hash"} {
 		t.Run(field, func(t *testing.T) {
 			api := &fakeAPI{}
 			adapter, _ := New(api)
+			configureFastNetworkReadback(adapter, 40*time.Millisecond)
+			adapter.protectionAuditTimeout = 40 * time.Millisecond
 			created, err := adapter.CreateVM(context.Background(), testRequest())
 			if err != nil {
 				t.Fatal(err)

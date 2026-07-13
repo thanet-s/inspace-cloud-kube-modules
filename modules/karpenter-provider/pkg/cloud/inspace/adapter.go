@@ -414,33 +414,65 @@ func (a *Adapter) readCanonicalCreateCandidate(ctx context.Context, request clou
 }
 
 func (a *Adapter) GetVM(ctx context.Context, location, uuid, clusterName string) (*cloudapi.VM, error) {
-	vm, err := a.api.GetVM(ctx, location, uuid)
+	vm, record, err := a.readEstablishedVM(ctx, location, uuid, clusterName)
 	if err != nil {
-		if sdk.IsNotFound(err) {
-			return nil, cloudapi.ErrNotFound
-		}
 		return nil, err
-	}
-	if vm == nil || vm.UUID != uuid {
-		return nil, fmt.Errorf("%w: canonical VM %s returned invalid detail identity", cloudapi.ErrOwnershipMismatch, uuid)
-	}
-	record, managed, complete, err := inspectOwnershipDescription(vm.Description)
-	if err != nil {
-		return nil, fmt.Errorf("canonical VM %s ownership: %w", uuid, err)
-	}
-	if !managed || record.Cluster != clusterName {
-		return nil, fmt.Errorf("%w: VM %s is not managed for cluster %q", cloudapi.ErrOwnershipMismatch, uuid, clusterName)
-	}
-	if !complete {
-		return nil, fmt.Errorf("%w: established worker VM %s lacks complete persisted ownership: %w", cloudapi.ErrOwnershipMismatch, uuid, errPersistedOwnershipIncomplete)
-	}
-	if err := validateEstablishedLaunchIdentity(*vm, record); err != nil {
-		return nil, fmt.Errorf("established worker VM %s launch identity drift: %w", uuid, err)
 	}
 	if err := a.auditEstablishedVMProtections(ctx, location, []ownedVM{{vm: *vm, record: record}}); err != nil {
 		return nil, err
 	}
 	return fromSDK(vm, location, record), nil
+}
+
+// readEstablishedVM gives eventually consistent detail fields a bounded
+// chance to converge. Missing ownership or launch fields are uncertainty;
+// every supplied conflict remains an immediate, fail-closed error.
+func (a *Adapter) readEstablishedVM(ctx context.Context, location, uuid, clusterName string) (*sdk.VM, ownership, error) {
+	readbackCtx, cancel := context.WithTimeout(ctx, a.protectionAuditTimeout)
+	defer cancel()
+	var lastObservation error
+	readbackDelay := a.networkAttachmentReadbackMinDelay
+	for {
+		if readbackErr := readbackCtx.Err(); readbackErr != nil {
+			return nil, ownership{}, fmt.Errorf("canonical VM %s established read-back stopped: %w", uuid, errors.Join(lastObservation, readbackErr))
+		}
+		requestCtx, requestCancel := context.WithTimeout(readbackCtx, a.networkAttachmentRequestTimeout)
+		vm, err := a.api.GetVM(requestCtx, location, uuid)
+		requestCancel()
+		if err != nil {
+			if sdk.IsNotFound(err) {
+				return nil, ownership{}, cloudapi.ErrNotFound
+			}
+			return nil, ownership{}, err
+		}
+		if vm == nil || vm.UUID != uuid {
+			return nil, ownership{}, fmt.Errorf("%w: canonical VM %s returned invalid detail identity", cloudapi.ErrOwnershipMismatch, uuid)
+		}
+		record, managed, complete, err := inspectOwnershipDescription(vm.Description, clusterName)
+		if err != nil {
+			return nil, ownership{}, fmt.Errorf("canonical VM %s ownership: %w", uuid, err)
+		}
+		if !managed || record.Cluster != clusterName {
+			return nil, ownership{}, fmt.Errorf("%w: VM %s is not managed for cluster %q", cloudapi.ErrOwnershipMismatch, uuid, clusterName)
+		}
+		switch {
+		case !complete:
+			lastObservation = fmt.Errorf("%w: established worker VM %s lacks complete persisted ownership: %w", cloudapi.ErrOwnershipMismatch, uuid, errPersistedOwnershipIncomplete)
+		default:
+			validationErr := validateEstablishedLaunchIdentity(*vm, record)
+			if validationErr == nil {
+				return vm, record, nil
+			}
+			if !errors.Is(validationErr, errPersistedOwnershipIncomplete) {
+				return nil, ownership{}, fmt.Errorf("established worker VM %s launch identity drift: %w", uuid, validationErr)
+			}
+			lastObservation = fmt.Errorf("established worker VM %s launch identity has not converged: %w", uuid, validationErr)
+		}
+		if err := waitForReadback(readbackCtx, readbackDelay); err != nil {
+			return nil, ownership{}, fmt.Errorf("canonical VM %s established identity did not converge before the read-back deadline: %w", uuid, errors.Join(lastObservation, err))
+		}
+		readbackDelay = nextReadbackDelay(readbackDelay, a.networkAttachmentReadbackMaxDelay)
+	}
 }
 
 func (a *Adapter) ListVMs(ctx context.Context, location, clusterName string) ([]*cloudapi.VM, error) {
@@ -454,7 +486,7 @@ func (a *Adapter) ListVMs(ctx context.Context, location, clusterName string) ([]
 	}
 	owned := make([]ownedVM, 0, len(vms))
 	for i := range vms {
-		record, managed, complete, err := inspectOwnershipDescription(vms[i].Description)
+		record, managed, complete, err := inspectOwnershipDescription(vms[i].Description, clusterName)
 		if err != nil {
 			return nil, fmt.Errorf("canonical VM %s ownership: %w", vms[i].UUID, err)
 		}
@@ -540,7 +572,7 @@ func (a *Adapter) canonicalListedVMDetails(ctx context.Context, location, cluste
 // ownership evidence, however, an incomplete canonical record is uncertainty:
 // poll it within the shared ListVMs bound and fail closed if it never converges.
 func (a *Adapter) readCanonicalListedVM(ctx context.Context, location, clusterName string, summary sdk.VM) (*sdk.VM, error) {
-	listedRecord, listedKarpenter, listedRecordComplete, err := inspectOwnershipDescription(summary.Description)
+	listedRecord, listedKarpenter, listedRecordComplete, err := inspectOwnershipDescription(summary.Description, clusterName)
 	if err != nil {
 		return nil, fmt.Errorf("listed VM %s ownership: %w", summary.UUID, err)
 	}
@@ -591,7 +623,7 @@ func (a *Adapter) readCanonicalListedVM(ctx context.Context, location, clusterNa
 		if vm.UUID != summary.UUID || (summary.Name != "" && vm.Name != "" && vm.Name != summary.Name) {
 			return nil, fmt.Errorf("%w: canonical detail identity for listed VM %s/%q does not match its list row", cloudapi.ErrOwnershipMismatch, summary.UUID, summary.Name)
 		}
-		record, canonicalKarpenter, canonicalRecordComplete, err := inspectOwnershipDescription(vm.Description)
+		record, canonicalKarpenter, canonicalRecordComplete, err := inspectOwnershipDescription(vm.Description, clusterName)
 		if err != nil {
 			return nil, fmt.Errorf("canonical VM %s ownership: %w", summary.UUID, err)
 		}
@@ -601,13 +633,26 @@ func (a *Adapter) readCanonicalListedVM(ctx context.Context, location, clusterNa
 		if listedRecordComplete && canonicalRecordComplete && listedRecord != record {
 			return nil, fmt.Errorf("%w: canonical Karpenter ownership for listed VM %s differs from its complete list record", cloudapi.ErrOwnershipMismatch, summary.UUID)
 		}
-		if canonicalRecordComplete {
-			return vm, nil
-		}
 		if canonicalKarpenter && record.Cluster != "" && record.Cluster != clusterName && !ownershipEvidence {
 			// An explicit record for another cluster is foreign to this query;
 			// its unrelated optional fields need not converge here.
 			return vm, nil
+		}
+		if canonicalRecordComplete && record.Cluster == clusterName {
+			validationErr := validateEstablishedLaunchIdentity(*vm, record)
+			if validationErr == nil {
+				return vm, nil
+			}
+			if !errors.Is(validationErr, errPersistedOwnershipIncomplete) {
+				return nil, fmt.Errorf("established worker VM %s launch identity drift: %w", summary.UUID, validationErr)
+			}
+			ownershipEvidence = true
+			lastObservation = fmt.Errorf("established worker VM %s launch identity has not converged: %w", summary.UUID, validationErr)
+			if err := waitForReadback(ctx, readbackDelay); err != nil {
+				return nil, fmt.Errorf("canonical VM %s established identity did not converge before the list read-back deadline: %w", summary.UUID, errors.Join(lastObservation, err))
+			}
+			readbackDelay = nextReadbackDelay(readbackDelay, a.networkAttachmentReadbackMaxDelay)
+			continue
 		}
 		canonicalTargetsCluster := canonicalKarpenter && (record.Cluster == "" || record.Cluster == clusterName)
 		if !ownershipEvidence && !canonicalTargetsCluster {
@@ -1075,6 +1120,18 @@ func validatePersistedVM(vm sdk.VM, vmUUID string, request cloudapi.CreateVMRequ
 // value the API supplied agrees with the create request but at least one
 // required field is still absent. Any present conflict fails immediately.
 func validatePersistedLaunchIdentity(vm sdk.VM, request cloudapi.CreateVMRequest) (incomplete bool, err error) {
+	return validatePersistedLaunchIdentityWithNetworkPolicy(vm, request, false)
+}
+
+// validateEstablishedPersistedLaunchIdentity accepts an omitted NetworkUUID
+// because the detail endpoint may not echo it for an established VM. A
+// present value must still match exactly; authoritative attachment is proven
+// separately through GetNetwork membership during the protection audit.
+func validateEstablishedPersistedLaunchIdentity(vm sdk.VM, request cloudapi.CreateVMRequest) (incomplete bool, err error) {
+	return validatePersistedLaunchIdentityWithNetworkPolicy(vm, request, true)
+}
+
+func validatePersistedLaunchIdentityWithNetworkPolicy(vm sdk.VM, request cloudapi.CreateVMRequest, allowMissingNetwork bool) (incomplete bool, err error) {
 	checkString := func(field, actual, expected string) error {
 		if actual == "" {
 			incomplete = true
@@ -1104,7 +1161,9 @@ func validatePersistedLaunchIdentity(vm sdk.VM, request cloudapi.CreateVMRequest
 		func() error { return checkString("designated pool UUID", vm.DesignatedPoolUUID, request.HostPoolUUID) },
 		func() error {
 			if vm.NetworkUUID == "" {
-				incomplete = true
+				if !allowMissingNetwork {
+					incomplete = true
+				}
 				return nil
 			}
 			if vm.NetworkUUID != request.NetworkUUID {
@@ -1152,9 +1211,7 @@ func normalizeOwnershipLaunchIdentity(record ownership) (normalized ownership, p
 	if !knownHostClass {
 		return ownership{}, false, fmt.Errorf("unsupported recorded host class %q", record.HostClass)
 	}
-	if record.HostPoolUUID == "" {
-		normalized.HostPoolUUID = derivedHostPoolUUID
-	} else if record.HostPoolUUID != derivedHostPoolUUID {
+	if record.HostPoolUUID != "" && record.HostPoolUUID != derivedHostPoolUUID {
 		return ownership{}, false, fmt.Errorf("recorded host pool %q does not match host class %q", record.HostPoolUUID, record.HostClass)
 	}
 	matches := ownedInstanceTypePattern.FindStringSubmatch(record.InstanceType)
@@ -1167,18 +1224,24 @@ func normalizeOwnershipLaunchIdentity(record ownership) (normalized ownership, p
 	if vCPUErr != nil || memoryErr != nil || derivedVCPU < 2 || derivedVCPU > 16 || derivedVCPU%2 != 0 || derivedMemoryGiB != derivedVCPU*memoryPerVCPU {
 		return ownership{}, false, fmt.Errorf("recorded instance type %q has invalid capacity", record.InstanceType)
 	}
-	if record.VCPU == 0 && record.MemoryGiB == 0 {
-		normalized.VCPU = derivedVCPU
-		normalized.MemoryGiB = derivedMemoryGiB
-		return normalized, false, nil
-	}
 	if record.VCPU < 0 || record.MemoryGiB < 0 {
 		return ownership{}, false, fmt.Errorf("recorded exact capacity must be positive")
 	}
 	if (record.VCPU != 0 && record.VCPU != derivedVCPU) || (record.MemoryGiB != 0 && record.MemoryGiB != derivedMemoryGiB) {
 		return ownership{}, false, fmt.Errorf("recorded exact capacity %d vCPU/%d GiB differs from instance type %q", record.VCPU, record.MemoryGiB, record.InstanceType)
 	}
-	partial = record.VCPU == 0 || record.MemoryGiB == 0
+	extensionFields := 0
+	if record.HostPoolUUID != "" {
+		extensionFields++
+	}
+	if record.VCPU != 0 {
+		extensionFields++
+	}
+	if record.MemoryGiB != 0 {
+		extensionFields++
+	}
+	partial = extensionFields != 0 && extensionFields != 3
+	normalized.HostPoolUUID = derivedHostPoolUUID
 	normalized.VCPU = derivedVCPU
 	normalized.MemoryGiB = derivedMemoryGiB
 	return normalized, partial, nil
@@ -1203,12 +1266,12 @@ func validateEstablishedLaunchIdentity(vm sdk.VM, record ownership) error {
 		MemoryGiB:        normalized.MemoryGiB,
 		RootDiskGiB:      normalized.RootDiskGiB,
 	}
-	incomplete, err := validatePersistedLaunchIdentity(vm, expected)
+	incomplete, err := validateEstablishedPersistedLaunchIdentity(vm, expected)
 	if err != nil {
 		return fmt.Errorf("%w: established VM launch identity differs from persisted ownership: %v", cloudapi.ErrOwnershipMismatch, err)
 	}
 	if incomplete {
-		return fmt.Errorf("%w: established VM lacks complete launch identity", cloudapi.ErrOwnershipMismatch)
+		return fmt.Errorf("%w: established VM lacks complete launch identity: %w", cloudapi.ErrOwnershipMismatch, errPersistedOwnershipIncomplete)
 	}
 	return nil
 }
@@ -2062,7 +2125,7 @@ func parseOwnership(description string) (ownership, bool) {
 	return record, true
 }
 
-func inspectOwnershipDescription(description string) (record ownership, karpenter, complete bool, err error) {
+func inspectOwnershipDescription(description, targetCluster string) (record ownership, karpenter, complete bool, err error) {
 	if json.Unmarshal([]byte(description), &record) == nil {
 		if strings.HasPrefix(record.Schema, ownershipSchemaNamespace) && record.Schema != ownershipSchema {
 			return ownership{}, false, false, fmt.Errorf("%w: unsupported Karpenter ownership schema %q", cloudapi.ErrOwnershipMismatch, record.Schema)
@@ -2072,6 +2135,13 @@ func inspectOwnershipDescription(description string) (record ownership, karpente
 		}
 		if !ownershipRecordStructurallyComplete(record) {
 			return record, true, false, nil
+		}
+		// A complete, explicit record for another cluster is foreign inventory.
+		// Route it before interpreting target-cluster host/capacity extensions:
+		// another provider revision's semantics must not break this scoped list.
+		// Reserved future schemas remain rejected above for every cluster.
+		if record.Cluster != targetCluster {
+			return record, true, true, nil
 		}
 		normalized, partial, err := normalizeOwnershipLaunchIdentity(record)
 		if err != nil {
