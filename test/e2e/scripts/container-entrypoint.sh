@@ -107,6 +107,23 @@ final_audit_is_zero() {
   [[ -f $directory/final-audit.json ]] && jq -e '.count == 0' "$directory/final-audit.json" >/dev/null 2>&1
 }
 
+read_retention_state() {
+  local state=$1
+  jq -rs '
+    if length != 1 then
+      error("retention state must contain exactly one JSON value")
+    elif (.[0] | type) != "object" then
+      error("retention state must be an object")
+    elif (.[0] | has("retained") | not) then
+      "false"
+    elif (.[0].retained | type) == "boolean" then
+      (.[0].retained | tostring)
+    else
+      error("retained must be a boolean")
+    end
+  ' "$state"
+}
+
 terminate_active_ansible() {
   local pid=${active_ansible_pid:-}
   [[ -n $pid ]] || return 0
@@ -181,7 +198,7 @@ if [[ -n $previous_run ]]; then
   if [[ -f $previous_dir/retained ]]; then
     retained=true
   elif [[ -f $previous_dir/state.json ]]; then
-    retained=$(jq -er '.retained // false' "$previous_dir/state.json") || {
+    retained=$(read_retention_state "$previous_dir/state.json") || {
       echo "unfinished run has an unreadable retention state; preserving it" >&2
       exit 1
     }
