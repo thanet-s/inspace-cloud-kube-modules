@@ -178,6 +178,7 @@ func TestControlPlaneCRDMatchesMachineValidationContract(t *testing.T) {
 		"privateLoadBalancerPool must not overlap podCIDR or serviceCIDR",
 		"privateLoadBalancerPool is immutable",
 		"control-plane virtualIPv4 must not overlap podCIDR or serviceCIDR",
+		"disable:\n                      type: array\n                      x-kubernetes-list-type: set\n                      items:",
 		"component != \"rke2-cilium\"",
 	} {
 		if !strings.Contains(crd, required) {

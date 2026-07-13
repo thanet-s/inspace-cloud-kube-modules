@@ -124,7 +124,7 @@ spec:
                           minLength: 1
                     disable:
                       type: array
-                      uniqueItems: true
+                      x-kubernetes-list-type: set
                       items:
                         type: string
                       x-kubernetes-validations:
