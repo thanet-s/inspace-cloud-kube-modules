@@ -17,7 +17,7 @@ import (
 
 const (
 	DefaultPluginName          = "csi.inspace.cloud"
-	DefaultPluginVersion       = "0.1.0"
+	DefaultPluginVersion       = "dev"
 	DefaultVolumeSize    int64 = 10 * 1024 * 1024 * 1024
 	TopologyLocationKey        = "topology.inspace.cloud/location"
 )

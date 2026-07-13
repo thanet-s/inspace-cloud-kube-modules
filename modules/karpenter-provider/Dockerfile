@@ -4,6 +4,7 @@ FROM --platform=$BUILDPLATFORM golang:1.26.5-bookworm AS build
 
 ARG TARGETOS
 ARG TARGETARCH
+ARG VERSION=0.0.0-dev
 
 WORKDIR /src
 COPY modules/client/go.mod ./client/
@@ -15,7 +16,9 @@ WORKDIR /src
 COPY modules/client ./client
 COPY modules/karpenter-provider ./karpenter-provider
 WORKDIR /src/karpenter-provider
-RUN GOWORK=off CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags="-s -w" -o /out/karpenter-provider-inspace ./cmd/controller
+RUN GOWORK=off CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath \
+      -ldflags="-s -w -X=github.com/thanet-s/inspace-cloud-kube-modules/modules/client/version.Version=${VERSION} -X=sigs.k8s.io/karpenter/pkg/operator.Version=${VERSION}" \
+      -o /out/karpenter-provider-inspace ./cmd/controller
 
 FROM gcr.io/distroless/static-debian12:nonroot
 LABEL org.opencontainers.image.title="Karpenter Provider for InSpace Cloud" \

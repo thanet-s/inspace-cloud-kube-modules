@@ -1,7 +1,8 @@
 # Release process
 
-Releases are automated from annotated SemVer tags. The repository uses a
-single version for the three controller images and both Helm charts.
+Releases are automated from annotated SemVer tags without `+build` metadata,
+which Docker tags cannot preserve. The repository uses a single version for
+the three controller images and both Helm charts.
 
 1. Merge through `main` only after CI passes Go formatting, tests, vet,
    command builds, `govulncheck`, container builds, CRD integrity, Helm lint,

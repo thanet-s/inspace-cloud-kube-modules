@@ -113,6 +113,7 @@ jobs:
           context: .
           file: ${{ matrix.dockerfile }}
           platforms: linux/${{ matrix.arch }}
+          build-args: VERSION=0.0.0-ci
           push: false
           load: true
           tags: local/${{ matrix.image }}:ci
@@ -126,6 +127,8 @@ jobs:
           image='local/${{ matrix.image }}:ci'
           test "$(docker image inspect --format '{{.Architecture}}' "$image")" = "${{ matrix.arch }}"
           if [[ '${{ matrix.image }}' == karpenter-provider-inspace ]]; then
+            test "$(docker run --rm "$image" --version)" = \
+              'karpenter-provider-inspace 0.0.0-ci'
             set +e
             output="$(docker run --rm "$image" --help 2>&1)"
             rc=$?
@@ -134,7 +137,14 @@ jobs:
             grep -F \
               'INSPACE_API_TOKEN, INSPACE_CLUSTER_NAME, INSPACE_DEFAULT_NODECLASS, INSPACE_NETWORK_UUID, and INSPACE_CONTROL_PLANE_VIP are required' \
               <<<"$output" >/dev/null
+          elif [[ '${{ matrix.image }}' == inspace-cloud-controller-manager ]]; then
+            test "$(docker run --rm --entrypoint /usr/local/bin/inspace-cluster-controller "$image" --version)" = \
+              'inspace-cluster-controller 0.0.0-ci'
+            test "$(docker run --rm "$image" --version)" = 'Kubernetes v0.0.0-ci'
+            docker run --rm "$image" --help >/dev/null 2>&1
           else
+            test "$(docker run --rm "$image" --version)" = \
+              'inspace-csi-driver 0.0.0-ci'
             docker run --rm "$image" --help >/dev/null 2>&1
           fi
 

@@ -12,6 +12,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/operator"
 
 	sdk "github.com/thanet-s/inspace-cloud-kube-modules/modules/client"
+	buildversion "github.com/thanet-s/inspace-cloud-kube-modules/modules/client/version"
 	inspacev1 "github.com/thanet-s/inspace-cloud-kube-modules/modules/karpenter-provider/pkg/apis/v1alpha1"
 	inspacecloud "github.com/thanet-s/inspace-cloud-kube-modules/modules/karpenter-provider/pkg/cloud/inspace"
 	nodeclasscontroller "github.com/thanet-s/inspace-cloud-kube-modules/modules/karpenter-provider/pkg/controllers/nodeclass"
@@ -34,6 +35,10 @@ type settings struct {
 }
 
 func main() {
+	if len(os.Args) == 2 && os.Args[1] == "--version" {
+		fmt.Printf("karpenter-provider-inspace %s\n", operator.Version)
+		return
+	}
 	if err := run(); err != nil {
 		fmt.Fprintf(os.Stderr, "karpenter-provider-inspace: %v\n", err)
 		os.Exit(1)
@@ -53,7 +58,7 @@ func run() error {
 	apiClient, err := sdk.NewClient(sdk.Options{
 		BaseURL:                   cfg.apiBaseURL,
 		APIKey:                    cfg.apiToken,
-		UserAgent:                 "karpenter-provider-inspace/dev",
+		UserAgent:                 buildversion.UserAgent("karpenter-provider-inspace"),
 		DangerouslyAllowMutations: cfg.allowRemoteMutation,
 	})
 	if err != nil {

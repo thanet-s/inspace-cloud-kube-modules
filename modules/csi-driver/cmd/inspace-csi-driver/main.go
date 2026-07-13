@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
@@ -11,6 +12,7 @@ import (
 	"syscall"
 
 	sdk "github.com/thanet-s/inspace-cloud-kube-modules/modules/client"
+	buildversion "github.com/thanet-s/inspace-cloud-kube-modules/modules/client/version"
 	"github.com/thanet-s/inspace-cloud-kube-modules/modules/csi-driver/pkg/cloud"
 	cloudfake "github.com/thanet-s/inspace-cloud-kube-modules/modules/csi-driver/pkg/cloud/fake"
 	cloudinspace "github.com/thanet-s/inspace-cloud-kube-modules/modules/csi-driver/pkg/cloud/inspace"
@@ -28,7 +30,12 @@ func main() {
 	apiBaseURL := flag.String("api-base-url", envOr("INSPACE_API_BASE_URL", "https://api.inspace.cloud"), "InSpace API base URL")
 	billingAccountID := flag.Int64("billing-account-id", envInt64("INSPACE_BILLING_ACCOUNT_ID"), "InSpace billing account ID (required for global tokens)")
 	developmentFake := flag.Bool("development-fake", false, "use in-memory adapters; NEVER use for real workloads")
+	showVersion := flag.Bool("version", false, "print version")
 	flag.Parse()
+	if *showVersion {
+		fmt.Printf("inspace-csi-driver %s\n", buildversion.Version)
+		return
+	}
 
 	driverMode := driver.Mode(strings.ToLower(strings.TrimSpace(*mode)))
 	var provider cloud.Interface
@@ -51,7 +58,7 @@ func main() {
 				log.Fatal("controller mode requires INSPACE_ALLOW_REMOTE_MUTATIONS=true")
 			}
 			client, err := sdk.NewClient(sdk.Options{
-				BaseURL: *apiBaseURL, APIKey: token, UserAgent: "inspace-csi-driver/0.1.0",
+				BaseURL: *apiBaseURL, APIKey: token, UserAgent: buildversion.UserAgent("inspace-csi-driver"),
 				DangerouslyAllowMutations: true,
 			})
 			if err != nil {
@@ -82,7 +89,9 @@ func main() {
 			log.Fatalf("unsupported mode %q", *mode)
 		}
 	}
-	d, err := driver.New(driver.Config{Mode: driverMode, Location: *location, NodeID: *nodeID}, provider, mounter)
+	d, err := driver.New(driver.Config{
+		Mode: driverMode, PluginVersion: buildversion.Version, Location: *location, NodeID: *nodeID,
+	}, provider, mounter)
 	if err != nil {
 		log.Fatalf("configure driver: %v", err)
 	}

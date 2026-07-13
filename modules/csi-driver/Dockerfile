@@ -4,6 +4,7 @@ FROM --platform=$BUILDPLATFORM golang:1.26.5-bookworm AS build
 
 ARG TARGETOS
 ARG TARGETARCH
+ARG VERSION=0.0.0-dev
 
 WORKDIR /workspace
 COPY modules/client/go.mod ./client/
@@ -15,7 +16,9 @@ WORKDIR /workspace
 COPY modules/client/ ./client/
 COPY modules/csi-driver/ ./csi-driver/
 WORKDIR /workspace/csi-driver
-RUN GOWORK=off CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags='-s -w' -o /out/inspace-csi-driver ./cmd/inspace-csi-driver
+RUN GOWORK=off CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath \
+      -ldflags="-s -w -X=github.com/thanet-s/inspace-cloud-kube-modules/modules/client/version.Version=${VERSION}" \
+      -o /out/inspace-csi-driver ./cmd/inspace-csi-driver
 
 FROM debian:bookworm-slim
 

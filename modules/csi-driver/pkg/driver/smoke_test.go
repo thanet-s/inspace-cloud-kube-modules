@@ -31,7 +31,9 @@ func newSmokeHarness(t *testing.T) *smokeHarness {
 	t.Helper()
 	provider := cloudfake.New()
 	mounter := hostfake.New()
-	d, err := New(Config{Location: "bkk01", NodeID: "inspace://bkk01/node-1"}, provider, mounter)
+	d, err := New(Config{
+		Location: "bkk01", NodeID: "inspace://bkk01/node-1", PluginVersion: "0.2.0-test",
+	}, provider, mounter)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -87,6 +89,9 @@ func TestCSIRWOLifecycleSmoke(t *testing.T) {
 	}
 	if info.GetName() != DefaultPluginName {
 		t.Fatalf("plugin name = %q", info.GetName())
+	}
+	if info.GetVendorVersion() != "0.2.0-test" {
+		t.Fatalf("plugin version = %q", info.GetVendorVersion())
 	}
 
 	created, err := h.controller.CreateVolume(ctx, &csi.CreateVolumeRequest{
