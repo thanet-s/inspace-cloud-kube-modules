@@ -170,7 +170,7 @@ func TestEnsureLoadBalancerCreatesTCPRulesAndOwnedName(t *testing.T) {
 	api := &fakeAPI{}
 	provider := newTestProvider(t, api)
 	service := testService()
-	nodes := []*corev1.Node{{Spec: corev1.NodeSpec{ProviderID: "inspace://bkk01/" + testVMUUID}}}
+	nodes := []*corev1.Node{readyNode("worker-0", "inspace://bkk01/"+testVMUUID)}
 	status, err := provider.EnsureLoadBalancer(context.Background(), "ignored", service, nodes)
 	if err != nil {
 		t.Fatal(err)
@@ -204,13 +204,13 @@ func TestLoadBalancerRejectsNonTCPBeforeMutation(t *testing.T) {
 	}
 }
 
-func TestLoadBalancerRejectsCrossLocationNode(t *testing.T) {
+func TestLoadBalancerSkipsCrossLocationNode(t *testing.T) {
 	api := &fakeAPI{}
 	provider := newTestProvider(t, api)
-	_, err := provider.EnsureLoadBalancer(context.Background(), "ignored", testService(), []*corev1.Node{{
-		Spec: corev1.NodeSpec{ProviderID: "inspace://jkt01/" + testVMUUID},
-	}})
-	if err == nil || len(api.creates) != 0 {
+	_, err := provider.EnsureLoadBalancer(context.Background(), "ignored", testService(), []*corev1.Node{
+		readyNode("worker-0", "inspace://jkt01/"+testVMUUID),
+	})
+	if err != nil || len(api.creates) != 1 || len(api.creates[0].Targets) != 0 {
 		t.Fatalf("EnsureLoadBalancer() error = %v, create calls = %d", err, len(api.creates))
 	}
 }
@@ -404,7 +404,7 @@ func TestMarkerRemovalNeverLeaksOwnedResourcesOrReturnsImplementedElsewhereEarly
 	api := &fakeAPI{}
 	provider := newTestProvider(t, api)
 	service := testService()
-	nodes := []*corev1.Node{{Spec: corev1.NodeSpec{ProviderID: "inspace://bkk01/" + testVMUUID}}}
+	nodes := []*corev1.Node{readyNode("worker-0", "inspace://bkk01/"+testVMUUID)}
 	if _, err := provider.EnsureLoadBalancer(context.Background(), "ignored", service, nodes); err != nil {
 		t.Fatal(err)
 	}
@@ -628,25 +628,14 @@ func TestFloatingIPCleanupRejectsUnexpectedAssignment(t *testing.T) {
 	}
 }
 
-func TestLoadBalancerRejectsMalformedPublicAnnotationAndLocalTrafficPolicy(t *testing.T) {
-	for name, mutate := range map[string]func(*corev1.Service){
-		"malformed annotation": func(service *corev1.Service) {
-			service.Annotations = map[string]string{AnnotationPublicLoadBalancer: "yes"}
-		},
-		"local policy": func(service *corev1.Service) {
-			service.Spec.ExternalTrafficPolicy = corev1.ServiceExternalTrafficPolicyLocal
-		},
-	} {
-		t.Run(name, func(t *testing.T) {
-			api := &fakeAPI{}
-			provider := newTestProvider(t, api)
-			service := testService()
-			mutate(service)
-			_, err := provider.EnsureLoadBalancer(context.Background(), "ignored", service, nil)
-			if err == nil || len(api.creates) != 0 {
-				t.Fatalf("EnsureLoadBalancer() error = %v, creates = %d", err, len(api.creates))
-			}
-		})
+func TestLoadBalancerRejectsMalformedPublicAnnotation(t *testing.T) {
+	api := &fakeAPI{}
+	provider := newTestProvider(t, api)
+	service := testService()
+	service.Annotations = map[string]string{AnnotationPublicLoadBalancer: "yes"}
+	_, err := provider.EnsureLoadBalancer(context.Background(), "ignored", service, nil)
+	if err == nil || len(api.creates) != 0 {
+		t.Fatalf("EnsureLoadBalancer() error = %v, creates = %d", err, len(api.creates))
 	}
 }
 
@@ -660,7 +649,7 @@ func TestEnsureLoadBalancerReconcilesTargetsAndRules(t *testing.T) {
 		Targets:         []inspace.LoadBalancerTarget{{TargetUUID: "99999999-1111-4222-8333-444444444444", TargetType: "vm"}},
 		ForwardingRules: []inspace.LoadBalancerRule{{UUID: "77777777-1111-4222-8333-444444444444", Protocol: "TCP", SourcePort: 443, TargetPort: 30001}},
 	}}
-	nodes := []*corev1.Node{{Spec: corev1.NodeSpec{ProviderID: "inspace://bkk01/" + testVMUUID}}}
+	nodes := []*corev1.Node{readyNode("worker-0", "inspace://bkk01/"+testVMUUID)}
 	if _, err := provider.EnsureLoadBalancer(context.Background(), "ignored", service, nodes); err != nil {
 		t.Fatal(err)
 	}
@@ -778,6 +767,16 @@ func testService() *corev1.Service {
 			Annotations: map[string]string{AnnotationPublicLoadBalancer: "true"},
 		},
 		Spec: corev1.ServiceSpec{Ports: []corev1.ServicePort{{Protocol: corev1.ProtocolTCP, Port: 443, NodePort: 30443}}},
+	}
+}
+
+func readyNode(name, providerID string) *corev1.Node {
+	return &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: name},
+		Spec:       corev1.NodeSpec{ProviderID: providerID},
+		Status: corev1.NodeStatus{Conditions: []corev1.NodeCondition{{
+			Type: corev1.NodeReady, Status: corev1.ConditionTrue,
+		}}},
 	}
 }
 

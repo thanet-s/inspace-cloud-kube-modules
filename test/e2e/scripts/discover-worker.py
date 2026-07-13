@@ -89,6 +89,18 @@ def canonical_worker_vm_detail(
     return detail
 
 
+def validate_worker_root_disk(vm: object) -> None:
+    """Require the authoritative NodeClass root-disk contract."""
+    if not isinstance(vm, dict):
+        raise SystemExit("authoritative worker VM detail must be an object")
+    storage = vm.get("storage")
+    if not isinstance(storage, list) or any(not isinstance(disk, dict) for disk in storage):
+        raise SystemExit("worker VM storage must be an authoritative disk array")
+    root_disks = [disk for disk in storage if disk.get("primary") is True]
+    if len(root_disks) != 1 or root_disks[0].get("size") != 100:
+        raise SystemExit("worker VM must have exactly one 100-GiB primary root disk")
+
+
 def atomic_write(path: pathlib.Path, value) -> None:
     fd, temporary = tempfile.mkstemp(prefix=path.name + ".", dir=path.parent)
     try:
@@ -121,6 +133,7 @@ def main() -> None:
     vm = canonical_worker_vm_detail(
         vms, node.get("name"), node.get("nodeClaimName"), cluster, nodepool
     )
+    validate_worker_root_disk(vm)
     vm_uuid = vm["uuid"]
     record = description(vm)
     amd_pool_uuid = os.environ["INSPACE_AMD_HOST_POOL_UUID"]

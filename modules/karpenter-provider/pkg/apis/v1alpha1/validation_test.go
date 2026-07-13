@@ -15,23 +15,25 @@ func TestValidate(t *testing.T) {
 
 	nodeClass.Spec.Location = "hkg01"
 	nodeClass.Spec.RootDiskGiB = 20
-	nodeClass.Spec.HostPoolSelector.Class = "unknown"
 	nodeClass.Spec.RKE2.Server = "http://cluster.example:9345/path"
-	if errs := nodeClass.Validate(); len(errs) != 4 {
-		t.Fatalf("expected four independent errors, got %d: %v", len(errs), errs)
+	if errs := nodeClass.Validate(); len(errs) != 3 {
+		t.Fatalf("expected three independent errors, got %d: %v", len(errs), errs)
 	}
 }
 
-func TestHostPoolSelectorUUID(t *testing.T) {
+func TestHostPoolUUIDForClass(t *testing.T) {
 	tests := map[string]string{
 		HostClassIntelScalable: IntelScalableHostPoolUUID,
 		HostClassAMDEPYC:       AMDEPYCHostPoolUUID,
 	}
 	for class, expected := range tests {
-		actual, ok := (HostPoolSelector{Class: class}).UUID()
+		actual, ok := HostPoolUUIDForClass(class)
 		if !ok || actual != expected {
 			t.Fatalf("class %q resolved to %q, %t; expected %q", class, actual, ok, expected)
 		}
+	}
+	if actual, ok := HostPoolUUIDForClass("future"); ok || actual != "" {
+		t.Fatalf("unknown class resolved to %q, %t", actual, ok)
 	}
 }
 
@@ -150,7 +152,6 @@ func validNodeClass() *InSpaceNodeClass {
 		FirewallUUID:            "22222222-2222-4222-8222-222222222222",
 		ImageSelector:           ImageSelector{OSName: OSNameUbuntu, OSVersion: OSVersionUbuntu},
 		RootDiskGiB:             40,
-		HostPoolSelector:        HostPoolSelector{Class: HostClassIntelScalable},
 		RKE2: RKE2Config{
 			Version:        "v1.35.6+rke2r1",
 			Server:         "https://10.0.0.10:9345",

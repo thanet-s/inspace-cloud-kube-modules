@@ -67,6 +67,10 @@ def main() -> None:
     disk_uuid = state.get("diskUUID", "")
     disk_name = state.get("pvcDiskName", "")
     control_prefixes = (f"rke2-{args.owner}-", f"k3s-{args.owner}-")
+    bootstrap_fip_names = {
+        f"{args.cluster}-bastion-ip",
+        *(f"{args.cluster}-cp{slot}-ip" for slot in range(3)),
+    }
     control_plane_names = {
         str(item.get("name")) for item in state.get("controlPlanes", [])
         if isinstance(item, dict) and item.get("name")
@@ -103,6 +107,8 @@ def main() -> None:
         {"uuid": fw.get("uuid"), "name": fw.get("display_name", fw.get("name"))}
         for fw in active_resources("network/firewalls")
         if fw.get("display_name", fw.get("name")) in {
+            f"{args.cluster}-nodes-{args.owner}",
+            f"{args.cluster}-bastion-{args.owner}",
             f"rke2-{args.owner}-nodes",
             f"rke2-{args.owner}-bastion",
             f"k3s-{args.owner}-nodes",
@@ -111,7 +117,8 @@ def main() -> None:
     floating_ips = [
         {"address": ip.get("address"), "name": ip.get("name"), "assigned_to": ip.get("assigned_to")}
         for ip in active_resources("network/ip_addresses")
-        if str(ip.get("name", "")).startswith(control_prefixes)
+        if ip.get("name") in bootstrap_fip_names
+        or str(ip.get("name", "")).startswith(control_prefixes)
         or ip.get("name") in worker_fip_names
         or str(ip.get("name", "")).startswith(worker_fip_prefix)
         or str(ip.get("name", "")).startswith(args.nodepool + "-")

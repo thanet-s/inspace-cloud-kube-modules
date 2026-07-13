@@ -33,10 +33,14 @@ and the fixed three-server RKE2 bootstrap reconciler.
   `ALL` and adds exactly `NET_ADMIN` and `NET_RAW`.
 - Pinned RKE2 release tarball installation verified against the matching
   official `sha256sum-amd64.txt` release asset.
-- Pre-RKE2 Ubuntu preparation disables swap, rewrites stock archive endpoints to the Thailand archive
-  mirror, updates and upgrades packages within a hard ten-minute budget, and
-  persists IPv4 forwarding, RKE2 inotify values, PAM `nofile`, and matching
-  `rke2-server.service` resource limits.
+- Pre-RKE2 Ubuntu preparation disables swap, rewrites stock archive endpoints
+  to the Thailand archive mirror, updates and upgrades packages within a hard
+  ten-minute budget, then disables APT periodic updates and masks every
+  `apt-daily*` unit plus `unattended-upgrades.service`. It also persists IPv4
+  forwarding, RKE2 inotify values, PAM `nofile`, and matching
+  `rke2-server.service` resource limits. Bastion cloud-init performs the same
+  bounded one-time package update/upgrade and automatic-update shutdown before
+  proving UFW inactive.
 - RKE2's packaged Cilium CNI in native-routing mode, with direct node routes,
   full kube-proxy replacement, LB-IPAM and L2 announcements. Cilium Node IPAM
   is explicitly disabled and is never used for Service addressing.
@@ -50,7 +54,7 @@ The controller first attaches its already-created managed firewall and proves
 the exact policy and VM assignment by authoritative readback before returning
 from the create pass. On later passes it discovers the exact FIP assignment,
 validates its account and private-address binding, patches its deterministic
-owner-derived name, and requires authoritative readback before adoption. The
+cluster-prefixed name, and requires authoritative readback before adoption. The
 guest NIC still has only its private RFC1918 address. RKE2 `node-ip` and
 `advertise-address` are explicitly derived from the real VPC address, so the
 VIP cannot become Kubernetes `InternalIP`; production cloud-init omits
@@ -143,19 +147,25 @@ an adoption candidate. An uncertain API response is resolved by listing and
 validating the exact deterministic name and owner/spec record on the next loop,
 not by blindly repeating the POST.
 
-Reconciliation never migrates the legacy `rke2-<owner>-cp-<slot>` or
-`rke2-<owner>-bastion` display-name topology. It fails before mutation when
-those VMs are present. Teardown remains available for the released RC4/RC5
-topology (current control-plane names plus the owner-derived bastion) and the
-fully owner-derived older topology, including clusters whose older resource
-name exceeds the current 55-character create limit. Canonical VM detail,
-versioned owner/slot/spec records, deterministic FIPs, and firewall
-policy/assignments must all validate. Dual-bastion and mixed control-plane
-topologies are rejected.
+New bootstrap FIPs are `<metadata.name>-bastion-ip` and
+`<metadata.name>-cp0-ip` through `-cp2-ip`. The two firewall display names are
+`<metadata.name>-bastion-<owner>` and `<metadata.name>-nodes-<owner>`; keeping
+the namespace/name owner hash in firewall names preserves ownership even
+though InSpace omits firewall descriptions from readback.
+
+Reconciliation never migrates the legacy `rke2-<owner>-*` VM, FIP, or firewall
+topology. It fails before mutation when those resources are present. Teardown
+remains available for the released legacy topologies, including clusters whose
+older resource name exceeds the current 55-character create limit. Teardown
+selects exactly one coherent cluster-prefixed or legacy FIP/firewall naming
+scheme and rejects any mix. Canonical VM detail, versioned owner/slot/spec
+records, deterministic FIPs, and firewall policy/assignments must all validate.
+Dual-bastion and mixed control-plane topologies are rejected.
 
 Owned teardown is deterministic and fail-closed. Before its first mutation it
 validates every deterministic VM/FIP name, assignment, billing account,
-owner-derived firewall name, exact firewall policy, and firewall assignment.
+cluster-prefixed owner-qualified firewall name, exact firewall policy, and
+firewall assignment.
 Sparse VM list entries are canonicalized through the per-VM detail endpoint
 before adoption or deletion.
 InSpace accepts firewall descriptions on create but omits them from readback,
@@ -248,8 +258,19 @@ metadata:
     service.beta.kubernetes.io/inspace-load-balancer-public: "true"
 spec:
   type: LoadBalancer
-  externalTrafficPolicy: Cluster
+  externalTrafficPolicy: Local
 ```
+
+For `Local`, the CCM watches EndpointSlices and targets exactly the eligible
+`Ready=True` nodes that host a Ready, non-terminating local endpoint for that
+Service. EndpointSlice changes cover Pod scheduling, readiness, and
+termination; Node add/delete, provider-ID, exclusion, disruption, and Ready
+condition changes also trigger target reconciliation. InSpace does not probe
+the Kubernetes `healthCheckNodePort`, so this is control-plane-driven health
+filtering rather than an independent NLB data-plane health check. Public
+Services may still use `Cluster`; unhealthy, deleting, excluded, or disrupting
+nodes are filtered there as well. Private Cilium L2 Services must remain
+`externalTrafficPolicy: Cluster`.
 
 If either public marker is removed, CCM deletes every deterministically owned
 FIP/NLB before handing the Service to another implementation. Discovery and
@@ -310,5 +331,5 @@ and requires an exact zero-owned-resource cloud audit after teardown.
 - The InSpace firewall's unmatched-traffic/default-deny semantics still need a
   live conformance test before treating the managed policy as production
   isolation. The controller nevertheless validates the exact node and bastion
-  policies, owner-derived names, billing account, and assignments before every
+  policies, deterministic names, billing account, and assignments before every
   mutation; any non-empty description is also checked for drift.

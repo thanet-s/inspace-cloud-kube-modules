@@ -9,6 +9,9 @@ metadata:
     service.beta.kubernetes.io/inspace-load-balancer-public: "true"
 spec:
   type: LoadBalancer
+  # The InSpace CCM watches EndpointSlices and targets only nodes with a local,
+  # Ready, non-terminating endpoint for this Service.
+  externalTrafficPolicy: Local
   # Deliberately omit loadBalancerClass: the generic external CCM handles only
   # classless Services. InSpace public NLB forwarding is TCP-only.
   selector:

@@ -143,9 +143,20 @@
           .items[] |
           select(.metadata.labels["inspace.cloud/l2-announcement-disabled"] != null) |
           .metadata.name')
+        while IFS= read -r node; do
+          test -z "$node" || kubectl label node "$node" node.kubernetes.io/exclude-from-external-load-balancers-
+        done < <(kubectl get nodes -o json | jq -r '
+          .items[] |
+          select(.metadata.labels["node.kubernetes.io/exclude-from-external-load-balancers"] != null) |
+          .metadata.name')
         if kubectl -n default get service inspace-e2e-web >/dev/null 2>&1; then
+          kubectl -n default label service inspace-e2e-web \
+            inspace.cloud/load-balancer-scope=public --overwrite
           kubectl -n default annotate service inspace-e2e-web \
             service.beta.kubernetes.io/inspace-load-balancer-public=true --overwrite
+        fi
+        if kubectl -n default get deployment inspace-e2e-web >/dev/null 2>&1; then
+          kubectl -n default scale deployment/inspace-e2e-web --replicas=1
         fi
       args:
         executable: /bin/bash
@@ -671,7 +682,8 @@
           .metadata.labels["inspace.cloud/load-balancer-scope"] == "public" and
           .metadata.annotations["service.beta.kubernetes.io/inspace-load-balancer-public"] == "true" and
           (.spec.loadBalancerClass == null) and
-          .spec.externalTrafficPolicy == "Cluster" and
+          .spec.externalTrafficPolicy == "Local" and
+          (.spec.healthCheckNodePort | type) == "number" and
           all(.status.conditions[]?; (.type | startswith("cilium.io/")) | not)'
         kubectl get services --all-namespaces -o json | jq -e '
           all(.items[]; .spec.loadBalancerClass != "io.cilium/node")'
@@ -680,6 +692,75 @@
       args:
         executable: /bin/bash
       changed_when: false
+
+    - name: Exercise public NLB removal for a node excluded from external load balancers
+      block:
+        - name: Resolve the exact public workload node
+          ansible.builtin.shell: |
+            set -euo pipefail
+            kubectl -n default get pod -l app=inspace-e2e-web -o json | jq -er '
+              [.items[] | select(.status.phase == "Running") | .spec.nodeName] |
+              unique | if length == 1 then .[0] else error("expected one public workload node") end'
+          args:
+            executable: /bin/bash
+          register: e2e_public_worker
+          changed_when: false
+
+        - name: Exclude the public workload node from external load balancers
+          ansible.builtin.command:
+            argv:
+              - kubectl
+              - label
+              - node
+              - "{{ e2e_public_worker.stdout }}"
+              - node.kubernetes.io/exclude-from-external-load-balancers=true
+              - --overwrite
+          changed_when: true
+
+        - name: Require the public NLB to remove the excluded local-endpoint node
+          ansible.builtin.command:
+            argv:
+              - /opt/e2e/scripts/verify-service-cloud.py
+              - --state
+              - "{{ e2e_state_file }}"
+              - --public
+              - present
+              - --targets
+              - empty
+          register: e2e_excluded_public_target
+          changed_when: false
+          retries: 120
+          delay: 1
+          until: e2e_excluded_public_target.rc == 0
+          no_log: true
+      always:
+        - name: Restore the public workload node to load-balancer eligibility
+          ansible.builtin.command:
+            argv:
+              - kubectl
+              - label
+              - node
+              - "{{ e2e_public_worker.stdout }}"
+              - node.kubernetes.io/exclude-from-external-load-balancers-
+          changed_when: true
+          when: e2e_public_worker is defined and (e2e_public_worker.stdout | default('')) | length > 0
+
+    - name: Require the public NLB to restore the eligible local-endpoint node
+      ansible.builtin.command:
+        argv:
+          - /opt/e2e/scripts/verify-service-cloud.py
+          - --state
+          - "{{ e2e_state_file }}"
+          - --public
+          - present
+          - --targets
+          - ready
+      register: e2e_restored_public_target
+      changed_when: false
+      retries: 120
+      delay: 1
+      until: e2e_restored_public_target.rc == 0
+      no_log: true
 
     - name: Require the expected marker through the TCP-only InSpace NLB
       ansible.builtin.uri:
@@ -692,16 +773,16 @@
       delay: 5
       until: e2e_marker_response.status == 200 and e2e_marker_response.content | trim == e2e_marker
 
-    - name: Remove public intent while keeping the Service type LoadBalancer
+    - name: Remove only the public scope label while keeping the annotation and Service type
       ansible.builtin.command:
         argv:
           - kubectl
           - -n
           - default
-          - annotate
+          - label
           - service
           - inspace-e2e-web
-          - service.beta.kubernetes.io/inspace-load-balancer-public-
+          - inspace.cloud/load-balancer-scope-
       changed_when: true
 
     - name: Require public status and exact owned NLB FIP cleanup
@@ -720,16 +801,16 @@
       until: e2e_public_transition_cleanup.rc == 0
       no_log: true
 
-    - name: Restore explicit public NLB intent
+    - name: Restore only the public scope label to recreate the NLB
       ansible.builtin.command:
         argv:
           - kubectl
           - -n
           - default
-          - annotate
+          - label
           - service
           - inspace-e2e-web
-          - service.beta.kubernetes.io/inspace-load-balancer-public=true
+          - inspace.cloud/load-balancer-scope=public
           - --overwrite
       changed_when: true
 
@@ -772,7 +853,7 @@
       delay: 5
       until: e2e_restored_public_marker.status == 200 and e2e_restored_public_marker.content | trim == e2e_marker
 
-    - name: Delete the serving pod to prove RWO persistence
+    - name: Scale away the serving replica to prove RWO persistence and local target removal
       ansible.builtin.shell: |
         set -euo pipefail
         old=$(kubectl -n default get pod -l app=inspace-e2e-web -o jsonpath='{.items[0].metadata.name}')
@@ -784,7 +865,33 @@
         test "$(kubectl -n default exec "$old" -c nginx -- \
           cat /usr/share/nginx/html/e2e-persistence-sentinel)" = "$sentinel"
         printf '%s' "$old" >"{{ e2e_state_dir }}/old-pod"
-        kubectl -n default delete pod "$old" --wait=true --timeout=5m
+        kubectl -n default scale deployment/inspace-e2e-web --replicas=0
+        kubectl -n default wait --for=delete "pod/$old" --timeout=5m
+      args:
+        executable: /bin/bash
+      changed_when: true
+
+    - name: Require zero public NLB targets without a ready local endpoint
+      ansible.builtin.command:
+        argv:
+          - /opt/e2e/scripts/verify-service-cloud.py
+          - --state
+          - "{{ e2e_state_file }}"
+          - --public
+          - present
+          - --targets
+          - empty
+      register: e2e_empty_public_targets
+      changed_when: false
+      retries: 120
+      delay: 1
+      until: e2e_empty_public_targets.rc == 0
+      no_log: true
+
+    - name: Restore the serving replica
+      ansible.builtin.shell: |
+        set -euo pipefail
+        kubectl -n default scale deployment/inspace-e2e-web --replicas=1
         kubectl -n default rollout status deployment/inspace-e2e-web --timeout=10m
       args:
         executable: /bin/bash
@@ -804,6 +911,23 @@
       args:
         executable: /bin/bash
       changed_when: false
+
+    - name: Require the public NLB to restore exactly the ready local-endpoint worker
+      ansible.builtin.command:
+        argv:
+          - /opt/e2e/scripts/verify-service-cloud.py
+          - --state
+          - "{{ e2e_state_file }}"
+          - --public
+          - present
+          - --targets
+          - ready
+      register: e2e_replacement_public_targets
+      changed_when: false
+      retries: 120
+      delay: 1
+      until: e2e_replacement_public_targets.rc == 0
+      no_log: true
 
     - name: Recheck the public TCP NLB after pod replacement
       ansible.builtin.uri:

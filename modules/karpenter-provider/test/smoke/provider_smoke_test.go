@@ -43,6 +43,9 @@ func TestFakeProvisioningLifecycleMakesNoNetworkCalls(t *testing.T) {
 			NodeClassRef: &karpv1.NodeClassReference{Group: inspacev1.Group, Kind: inspacev1.Kind, Name: nodeClass.Name},
 			Requirements: []karpv1.NodeSelectorRequirementWithMinValues{
 				{Key: catalog.LabelFamily, Operator: corev1.NodeSelectorOpIn, Values: []string{"general"}},
+				{Key: catalog.LabelHostClass, Operator: corev1.NodeSelectorOpIn, Values: []string{inspacev1.HostClassAMDEPYC}},
+				{Key: catalog.LabelInstanceCPU, Operator: corev1.NodeSelectorOpGt, Values: []string{"2"}},
+				{Key: catalog.LabelInstanceMemory, Operator: karpv1.NodeSelectorOpGte, Values: []string{"8192"}},
 				{Key: karpv1.CapacityTypeLabelKey, Operator: corev1.NodeSelectorOpIn, Values: []string{karpv1.CapacityTypeOnDemand}},
 			},
 			Resources: karpv1.ResourceRequirements{Requests: corev1.ResourceList{
@@ -59,6 +62,7 @@ func TestFakeProvisioningLifecycleMakesNoNetworkCalls(t *testing.T) {
 	if created.Labels[corev1.LabelInstanceTypeStable] != "is-general-4c-8g" {
 		t.Fatalf("unexpected selection %q", created.Labels[corev1.LabelInstanceTypeStable])
 	}
+	assertOfferingLabels(t, created.Labels)
 	const expectedNodeName = "smoke-cluster-karp-general-abc123"
 	if created.Name != nodeClaim.Name || created.Annotations[provider.AnnotationNodeName] != expectedNodeName {
 		t.Fatalf("NodeClaim identity or worker node annotation changed: name=%q annotations=%#v", created.Name, created.Annotations)
@@ -78,10 +82,12 @@ func TestFakeProvisioningLifecycleMakesNoNetworkCalls(t *testing.T) {
 	if got.Status.ProviderID != created.Status.ProviderID {
 		t.Fatalf("providerID mismatch: %s != %s", got.Status.ProviderID, created.Status.ProviderID)
 	}
+	assertOfferingLabels(t, got.Labels)
 	listed, err := cloudProvider.List(ctx)
 	if err != nil || len(listed) != 1 || listed[0].Status.ProviderID != created.Status.ProviderID {
 		t.Fatalf("unexpected list result %#v, %v", listed, err)
 	}
+	assertOfferingLabels(t, listed[0].Labels)
 
 	id := strings.TrimPrefix(created.Status.ProviderID, "inspace://bkk01/")
 	request, ok := cloud.Request(id)
@@ -100,8 +106,8 @@ func TestFakeProvisioningLifecycleMakesNoNetworkCalls(t *testing.T) {
 	if request.PrivateLoadBalancerPoolStart != nodeClass.Spec.PrivateLoadBalancerPool.Start || request.PrivateLoadBalancerPoolStop != nodeClass.Spec.PrivateLoadBalancerPool.Stop {
 		t.Fatalf("private Service pool was not propagated: %s-%s", request.PrivateLoadBalancerPoolStart, request.PrivateLoadBalancerPoolStop)
 	}
-	if request.HostPoolUUID != inspacev1.AMDEPYCHostPoolUUID {
-		t.Fatalf("unexpected host pool UUID %q", request.HostPoolUUID)
+	if request.HostClass != inspacev1.HostClassAMDEPYC || request.HostPoolUUID != inspacev1.AMDEPYCHostPoolUUID {
+		t.Fatalf("unexpected host class/pool %q/%q", request.HostClass, request.HostPoolUUID)
 	}
 	if request.SSHUsername != nodeClass.Spec.SSHUsername || request.SSHPublicKey != nodeClass.Spec.SSHPublicKey {
 		t.Fatalf("worker SSH access was not propagated through the provider request")
@@ -119,6 +125,15 @@ func TestFakeProvisioningLifecycleMakesNoNetworkCalls(t *testing.T) {
 	}
 	if !strings.Contains(decodedBootstrap, `node-name: "`+expectedNodeName+`"`) || !strings.Contains(decodedBootstrap, "hostnamectl set-hostname --static") {
 		t.Fatalf("guest hostname and RKE2 node-name are not identical\n%s", decodedBootstrap)
+	}
+	for _, expected := range []string{
+		catalog.LabelHostClass + "=" + inspacev1.HostClassAMDEPYC,
+		catalog.LabelInstanceCPU + "=4",
+		catalog.LabelInstanceMemory + "=8192",
+	} {
+		if !strings.Contains(decodedBootstrap, expected) {
+			t.Fatalf("RKE2 node identity is missing %q\n%s", expected, decodedBootstrap)
+		}
 	}
 	if strings.Count(decodedBootstrap, "karpenter.sh/unregistered:NoExecute") != 1 {
 		t.Fatalf("bootstrap must contain exactly one registration taint\n%s", request.CloudInitJSON)
@@ -152,6 +167,22 @@ func TestFakeProvisioningLifecycleMakesNoNetworkCalls(t *testing.T) {
 	}
 }
 
+func assertOfferingLabels(t *testing.T, labels map[string]string) {
+	t.Helper()
+	want := map[string]string{
+		catalog.LabelFamily:         "general",
+		catalog.LabelHostClass:      inspacev1.HostClassAMDEPYC,
+		catalog.LabelInstanceCPU:    "4",
+		catalog.LabelInstanceMemory: "8192",
+		catalog.LabelLocation:       inspacev1.LocationBangkok,
+	}
+	for key, value := range want {
+		if labels[key] != value {
+			t.Fatalf("label %s=%q, want %q", key, labels[key], value)
+		}
+	}
+}
+
 func decodedCloudInitFiles(t *testing.T, data string) string {
 	t.Helper()
 	var doc struct {
@@ -180,7 +211,7 @@ func decodedCloudInitFiles(t *testing.T, data string) string {
 
 func smokeNodeClass() *inspacev1.InSpaceNodeClass {
 	nodeClass := &inspacev1.InSpaceNodeClass{
-		ObjectMeta: metav1.ObjectMeta{Name: "smoke-amd"},
+		ObjectMeta: metav1.ObjectMeta{Name: "smoke-workers"},
 		Spec: inspacev1.InSpaceNodeClassSpec{
 			ClusterName:             "smoke-cluster",
 			BillingAccountID:        1,
@@ -190,7 +221,6 @@ func smokeNodeClass() *inspacev1.InSpaceNodeClass {
 			ReservePublicIPv4:       true,
 			FirewallUUID:            "22222222-2222-4222-8222-222222222222",
 			ImageSelector:           inspacev1.ImageSelector{OSName: inspacev1.OSNameUbuntu, OSVersion: inspacev1.OSVersionUbuntu},
-			HostPoolSelector:        inspacev1.HostPoolSelector{Class: inspacev1.HostClassAMDEPYC},
 			RootDiskGiB:             40,
 			SSHUsername:             "inspacee2e",
 			SSHPublicKey:            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINdamAGCsQq31Uv+08lkBzoO4XLz2qYjJa8CGmj3B1Ea smoke@example",
@@ -203,6 +233,6 @@ func smokeNodeClass() *inspacev1.InSpaceNodeClass {
 	}
 	nodeClass.Status.ObservedGeneration = nodeClass.Generation
 	nodeClass.Status.ObservedSpecHash = provider.NodeClassHash(nodeClass)
-	nodeClass.StatusConditions().SetTrueWithReason("Ready", "NodeClassReady", "Private RKE2 supervisor VIP and Service pool, InSpace VPC, Cilium native-routing firewall, host pool, and RKE2 token are ready")
+	nodeClass.StatusConditions().SetTrueWithReason("Ready", "NodeClassReady", "ready for smoke test")
 	return nodeClass
 }

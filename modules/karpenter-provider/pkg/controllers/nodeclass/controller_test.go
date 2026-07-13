@@ -2,6 +2,8 @@ package nodeclass
 
 import (
 	"context"
+	"fmt"
+	"slices"
 	"strings"
 	"testing"
 
@@ -21,17 +23,23 @@ type recordingValidator struct {
 	controlPlaneVIP string
 	poolStart       string
 	poolStop        string
+	hostPoolUUIDs   []string
+	failHostPool    string
 }
 
-func (v *recordingValidator) ValidateNodeClass(_ context.Context, _, _, controlPlaneVIP, poolStart, poolStop, _, _ string) error {
+func (v *recordingValidator) ValidateNodeClass(_ context.Context, _, _, controlPlaneVIP, poolStart, poolStop, hostPoolUUID, _ string) error {
 	v.calls++
 	v.controlPlaneVIP = controlPlaneVIP
 	v.poolStart = poolStart
 	v.poolStop = poolStop
+	v.hostPoolUUIDs = append(v.hostPoolUUIDs, hostPoolUUID)
+	if hostPoolUUID == v.failHostPool {
+		return fmt.Errorf("host pool %s is unavailable", hostPoolUUID)
+	}
 	return nil
 }
 
-func TestReconcileMarksReadyAfterSecretAndHostPoolValidation(t *testing.T) {
+func TestReconcileMarksReadyAfterSecretAndBothHostPoolValidations(t *testing.T) {
 	scheme := runtime.NewScheme()
 	if err := corev1.AddToScheme(scheme); err != nil {
 		t.Fatal(err)
@@ -63,12 +71,56 @@ func TestReconcileMarksReadyAfterSecretAndHostPoolValidation(t *testing.T) {
 	if !got.StatusConditions(status.WithObservedOnly()).IsTrue(status.ConditionReady) || got.Status.ObservedImageID != "ubuntu@24.04" || got.Status.ObservedSpecHash == "" {
 		t.Fatalf("unexpected status %#v", got.Status)
 	}
+	wantHostPoolUUIDs := []string{inspacev1.IntelScalableHostPoolUUID, inspacev1.AMDEPYCHostPoolUUID}
+	if !slices.Equal(got.Status.HostPoolUUIDs, wantHostPoolUUIDs) {
+		t.Fatalf("status hostPoolUUIDs=%v, want %v", got.Status.HostPoolUUIDs, wantHostPoolUUIDs)
+	}
 	ready := got.StatusConditions(status.WithObservedOnly()).Get(status.ConditionReady)
-	if ready == nil || ready.Message != "Private RKE2 supervisor VIP and Service pool, InSpace VPC, Cilium native-routing firewall, host pool, and RKE2 token are ready" {
+	if ready == nil || ready.Message != "Private RKE2 supervisor VIP and Service pool, InSpace VPC, Cilium native-routing firewall, Intel and AMD host pools, and RKE2 token are ready" {
 		t.Fatalf("Ready condition does not describe validated native-routing infrastructure: %#v", ready)
 	}
-	if validator.calls != 1 || validator.controlPlaneVIP != "10.0.0.10" || validator.poolStart != "10.0.0.200" || validator.poolStop != "10.0.0.219" {
+	if validator.calls != 2 || validator.controlPlaneVIP != "10.0.0.10" || validator.poolStart != "10.0.0.200" || validator.poolStop != "10.0.0.219" || !slices.Equal(validator.hostPoolUUIDs, wantHostPoolUUIDs) {
 		t.Fatalf("cloud validation calls=%d supervisorVIP=%q pool=%s-%s", validator.calls, validator.controlPlaneVIP, validator.poolStart, validator.poolStop)
+	}
+}
+
+func TestReconcileFailsClosedWhenEitherMappedHostPoolIsUnavailable(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := inspacev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	nodeClass := readyNodeClass()
+	kubeClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(nodeClass).WithObjects(nodeClass).Build()
+	resolver := provider.NewStaticResolver(nodeClass)
+	resolver.SetToken(inspacev1.RKE2AgentTokenSecretName, inspacev1.RKE2AgentTokenSecretKey, "agent-token")
+	validator := &recordingValidator{failHostPool: inspacev1.AMDEPYCHostPoolUUID}
+	controller, err := NewController(
+		kubeClient, resolver, validator, "test-cluster", nodeClass.Spec.NetworkUUID, "10.0.0.10", nodeClass.Spec.PrivateLoadBalancerPool,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := controller.ReconcileByName(context.Background(), nodeClass.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.RequeueAfter != retryAfter {
+		t.Fatalf("requeueAfter=%s, want %s", result.RequeueAfter, retryAfter)
+	}
+	var got inspacev1.InSpaceNodeClass
+	if err := kubeClient.Get(context.Background(), clientKey(nodeClass.Name), &got); err != nil {
+		t.Fatal(err)
+	}
+	ready := got.StatusConditions(status.WithObservedOnly()).Get(status.ConditionReady)
+	if ready == nil || ready.Status != metav1.ConditionFalse || !strings.Contains(ready.Message, "validating amd-epyc host pool "+inspacev1.AMDEPYCHostPoolUUID) {
+		t.Fatalf("Ready condition=%#v, want exact AMD mapping failure", ready)
+	}
+	if len(got.Status.HostPoolUUIDs) != 0 || got.Status.ObservedSpecHash != "" {
+		t.Fatalf("failed readiness retained authoritative status: %#v", got.Status)
+	}
+	wantCalls := []string{inspacev1.IntelScalableHostPoolUUID, inspacev1.AMDEPYCHostPoolUUID}
+	if !slices.Equal(validator.hostPoolUUIDs, wantCalls) {
+		t.Fatalf("validated host pools=%v, want exact mapped sequence %v", validator.hostPoolUUIDs, wantCalls)
 	}
 }
 
@@ -163,8 +215,8 @@ func readyNodeClass() *inspacev1.InSpaceNodeClass {
 		ReservePublicIPv4:       true,
 		FirewallUUID:            "22222222-2222-4222-8222-222222222222",
 		ImageSelector:           inspacev1.ImageSelector{OSName: inspacev1.OSNameUbuntu, OSVersion: inspacev1.OSVersionUbuntu},
-		HostPoolSelector:        inspacev1.HostPoolSelector{Class: inspacev1.HostClassIntelScalable}, RootDiskGiB: 40,
-		RKE2: inspacev1.RKE2Config{Version: "v1.35.6+rke2r1", Server: "https://10.0.0.10:9345", TokenSecretRef: inspacev1.SecretKeySelector{Name: inspacev1.RKE2AgentTokenSecretName, Key: inspacev1.RKE2AgentTokenSecretKey}},
+		RootDiskGiB:             40,
+		RKE2:                    inspacev1.RKE2Config{Version: "v1.35.6+rke2r1", Server: "https://10.0.0.10:9345", TokenSecretRef: inspacev1.SecretKeySelector{Name: inspacev1.RKE2AgentTokenSecretName, Key: inspacev1.RKE2AgentTokenSecretKey}},
 	}}
 }
 

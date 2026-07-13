@@ -40,6 +40,7 @@ func TestReconcileBuildsBastionThenExactlyThreeControlPlaneVMs(t *testing.T) {
 		t.Fatalf("bastion shape = %#v", api.vmCreates[0])
 	}
 	owner := ownerKey(cluster)
+	resourceNames := currentBootstrapResourceNames(cluster.Metadata.Name, owner)
 	if !strings.HasPrefix(api.vmCreates[0].Description, "inspace-rke2-bastion/v3 owner="+owner+" spec=") {
 		t.Fatalf("bastion ownership description = %q", api.vmCreates[0].Description)
 	}
@@ -73,8 +74,8 @@ func TestReconcileBuildsBastionThenExactlyThreeControlPlaneVMs(t *testing.T) {
 	if len(api.firewalls) != 2 || len(api.floatingIPs) != 4 {
 		t.Fatalf("firewalls=%#v floatingIPs=%#v", api.firewalls, api.floatingIPs)
 	}
-	nodeFirewall := mustFirewall(t, api.firewalls, firewallName(owner))
-	bastionFirewall := mustFirewall(t, api.firewalls, bastionFirewallName(owner))
+	nodeFirewall := mustFirewall(t, api.firewalls, resourceNames.NodeFirewall)
+	bastionFirewall := mustFirewall(t, api.firewalls, resourceNames.BastionFirewall)
 	if err := validateFirewallPolicy(nodeFirewall, api.network.Subnet, cluster.Spec.Network.PodCIDR, "", nil); err != nil {
 		t.Fatal(err)
 	}
@@ -97,8 +98,8 @@ func TestReconcileBuildsBastionThenExactlyThreeControlPlaneVMs(t *testing.T) {
 	if bastion.Hostname != wantBastionName {
 		t.Fatalf("bastion authoritative hostname=%q", bastion.Hostname)
 	}
-	if mustFirewall(t, api.firewalls, bastionFirewallName(owner)).EffectiveName() != "rke2-"+owner+"-bastion" || api.floatingIPs[0].Name != bastionFloatingIPName(owner) {
-		t.Fatalf("owner-derived bastion firewall/FIP changed: firewalls=%#v floatingIPs=%#v", api.firewalls, api.floatingIPs)
+	if mustFirewall(t, api.firewalls, resourceNames.BastionFirewall).EffectiveName() != resourceNames.BastionFirewall || api.floatingIPs[0].Name != resourceNames.BastionFloatingIP {
+		t.Fatalf("cluster-prefixed bastion firewall/FIP changed: firewalls=%#v floatingIPs=%#v", api.firewalls, api.floatingIPs)
 	}
 	privateLoadBalancerManifest := ""
 	for slot := 0; slot < ControlPlaneReplicas; slot++ {
@@ -134,6 +135,65 @@ func TestReconcileBuildsBastionThenExactlyThreeControlPlaneVMs(t *testing.T) {
 	}
 	if result.MaxParallelControlPlaneCreates != ControlPlaneReplicas {
 		t.Fatalf("parallel bound=%d", result.MaxParallelControlPlaneCreates)
+	}
+}
+
+func TestBootstrapResourceNamesUseClusterPrefixAndOwnerQualifiedFirewalls(t *testing.T) {
+	cluster := testCluster()
+	owner := ownerKey(cluster)
+	names := currentBootstrapResourceNames(cluster.Metadata.Name, owner)
+	if names.NodeFirewall != "unit-nodes-"+owner || names.BastionFirewall != "unit-bastion-"+owner ||
+		names.BastionFloatingIP != "unit-bastion-ip" || names.ControlPlaneFIP != [ControlPlaneReplicas]string{"unit-cp0-ip", "unit-cp1-ip", "unit-cp2-ip"} {
+		t.Fatalf("cluster-prefixed bootstrap names = %#v", names)
+	}
+	otherNamespace := testCluster()
+	otherNamespace.Metadata.Namespace = "other"
+	otherNames := currentBootstrapResourceNames(otherNamespace.Metadata.Name, ownerKey(otherNamespace))
+	if otherNames.NodeFirewall == names.NodeFirewall || otherNames.BastionFirewall == names.BastionFirewall {
+		t.Fatalf("same cluster name in another namespace reused firewall identity: first=%#v second=%#v", names, otherNames)
+	}
+	if otherNames.BastionFloatingIP != names.BastionFloatingIP || otherNames.ControlPlaneFIP != names.ControlPlaneFIP {
+		t.Fatalf("VM-bound FIP names should mirror the cluster/VM names: first=%#v second=%#v", names, otherNames)
+	}
+}
+
+func TestReconcileRejectsLegacyBootstrapResourceNamesBeforeMutation(t *testing.T) {
+	for _, resource := range []string{"floating IP", "firewall"} {
+		t.Run(resource, func(t *testing.T) {
+			api := newFakeAPI()
+			cluster := testCluster()
+			legacy := legacyBootstrapResourceNames(ownerKey(cluster))
+			if resource == "floating IP" {
+				api.floatingIPs = append(api.floatingIPs, inspace.FloatingIP{Name: legacy.ControlPlaneFIP[0]})
+			} else {
+				api.firewalls = append(api.firewalls, inspace.Firewall{DisplayName: legacy.NodeFirewall})
+			}
+			eventsBefore := len(api.events)
+			_, err := testReconciler(api).Reconcile(context.Background(), cluster, "unit-test-secret-token")
+			if err == nil || !strings.Contains(err.Error(), "legacy owner-prefixed") {
+				t.Fatalf("legacy %s topology was accepted: %v", resource, err)
+			}
+			if len(api.events) != eventsBefore {
+				t.Fatalf("legacy %s topology caused mutation: %v", resource, api.events[eventsBefore:])
+			}
+		})
+	}
+}
+
+func TestDestroyRejectsMixedCurrentAndLegacyBootstrapResourceNamesBeforeMutation(t *testing.T) {
+	api := newFakeAPI()
+	cluster := testCluster()
+	reconciler := testReconciler(api)
+	reconcileUntilReady(t, reconciler, cluster)
+	legacy := legacyBootstrapResourceNames(ownerKey(cluster))
+	api.firewalls = append(api.firewalls, inspace.Firewall{DisplayName: legacy.NodeFirewall})
+	eventsBefore := len(api.events)
+	_, err := reconciler.Destroy(context.Background(), cluster)
+	if err == nil || !strings.Contains(err.Error(), "mixed cluster-prefixed and legacy owner-prefixed") {
+		t.Fatalf("mixed bootstrap resource topology was accepted: %v", err)
+	}
+	if len(api.events) != eventsBefore {
+		t.Fatalf("mixed bootstrap resource topology caused mutation: %v", api.events[eventsBefore:])
 	}
 }
 
@@ -222,12 +282,13 @@ func TestReconcileAcceptsSparseFirewallCreateResponsesAfterAuthoritativeReadback
 		}
 	}
 	owner := ownerKey(cluster)
+	resourceNames := currentBootstrapResourceNames(cluster.Metadata.Name, owner)
 	readback, err := api.ListFirewalls(context.Background(), cluster.Spec.Location)
 	if err != nil {
 		t.Fatal(err)
 	}
-	nodeFirewall := mustFirewall(t, readback, firewallName(owner))
-	bastionFirewall := mustFirewall(t, readback, bastionFirewallName(owner))
+	nodeFirewall := mustFirewall(t, readback, resourceNames.NodeFirewall)
+	bastionFirewall := mustFirewall(t, readback, resourceNames.BastionFirewall)
 	if len(nodeFirewall.Rules) != 6 || len(nodeFirewall.ResourcesAssigned) != ControlPlaneReplicas ||
 		len(bastionFirewall.Rules) != 4 || len(bastionFirewall.ResourcesAssigned) != 1 {
 		t.Fatalf("authoritative firewall readback was not fully validated: node=%#v bastion=%#v", nodeFirewall, bastionFirewall)
@@ -511,12 +572,13 @@ func TestReconcileStartsAllThreeControlPlaneCreatesBehindOneBarrier(t *testing.T
 		if len(api.firewalls) != 2 {
 			t.Fatalf("control-plane firewall was not created before VM launch: %#v", api.firewalls)
 		}
-		nodeFirewall := mustFirewall(t, api.firewalls, firewallName(ownerKey(cluster)))
+		resourceNames := currentBootstrapResourceNames(cluster.Metadata.Name, ownerKey(cluster))
+		nodeFirewall := mustFirewall(t, api.firewalls, resourceNames.NodeFirewall)
 		if len(nodeFirewall.ResourcesAssigned) != ControlPlaneReplicas {
 			t.Fatalf("control-plane create returned before every VM was firewalled: %#v", nodeFirewall.ResourcesAssigned)
 		}
 		for _, floatingIP := range api.floatingIPs {
-			if floatingIP.Name != bastionFloatingIPName(ownerKey(cluster)) && (floatingIP.Name != "" || floatingIP.AssignedTo == "") {
+			if floatingIP.Name != resourceNames.BastionFloatingIP && (floatingIP.Name != "" || floatingIP.AssignedTo == "") {
 				t.Fatalf("control-plane create did not retain its nameless assigned auto FIP: %#v", floatingIP)
 			}
 		}
@@ -598,7 +660,8 @@ func TestControlPlaneFirewallFailureRollsBackEveryNewPublicVM(t *testing.T) {
 	if api.vms[0].Name != currentBastionName(cluster.Metadata.Name) || len(api.floatingIPs) != 1 || api.floatingIPs[0].AssignedTo != api.vms[0].UUID {
 		t.Fatalf("control-plane rollback touched the protected bastion or leaked auto FIPs: VMs=%#v FIPs=%#v", api.vms, api.floatingIPs)
 	}
-	nodeFirewall := mustFirewall(t, api.firewalls, firewallName(ownerKey(cluster)))
+	resourceNames := currentBootstrapResourceNames(cluster.Metadata.Name, ownerKey(cluster))
+	nodeFirewall := mustFirewall(t, api.firewalls, resourceNames.NodeFirewall)
 	if len(nodeFirewall.ResourcesAssigned) != 0 {
 		t.Fatalf("failed control-plane firewall assignments appeared committed: %#v", nodeFirewall.ResourcesAssigned)
 	}
@@ -749,7 +812,8 @@ func TestResidualFloatingIPBlocksVMPost(t *testing.T) {
 	t.Run("bastion initial snapshot", func(t *testing.T) {
 		api := newFakeAPI()
 		cluster := testCluster()
-		api.floatingIPs = append(api.floatingIPs, ownedResidual(bastionFloatingIPName(ownerKey(cluster))))
+		resourceNames := currentBootstrapResourceNames(cluster.Metadata.Name, ownerKey(cluster))
+		api.floatingIPs = append(api.floatingIPs, ownedResidual(resourceNames.BastionFloatingIP))
 		if _, err := testReconciler(api).Reconcile(context.Background(), cluster, "unit-test-secret-token"); err == nil || !strings.Contains(err.Error(), "residual floating IP") {
 			t.Fatalf("active bastion residual was accepted: %v", err)
 		}
@@ -760,7 +824,8 @@ func TestResidualFloatingIPBlocksVMPost(t *testing.T) {
 	t.Run("bastion immediate pre-POST relist", func(t *testing.T) {
 		api := newFakeAPI()
 		cluster := testCluster()
-		residual := ownedResidual(bastionFloatingIPName(ownerKey(cluster)))
+		resourceNames := currentBootstrapResourceNames(cluster.Metadata.Name, ownerKey(cluster))
+		residual := ownedResidual(resourceNames.BastionFloatingIP)
 		api.floatingIPAfterFirewallCreate = &residual
 		if _, err := testReconciler(api).Reconcile(context.Background(), cluster, "unit-test-secret-token"); err == nil || !strings.Contains(err.Error(), "active residual floating IP") {
 			t.Fatalf("TOCTOU bastion residual was accepted: %v", err)
@@ -774,7 +839,8 @@ func TestResidualFloatingIPBlocksVMPost(t *testing.T) {
 		cluster := testCluster()
 		reconciler := testReconciler(api)
 		prepareBastion(t, reconciler, cluster)
-		api.floatingIPs = append(api.floatingIPs, ownedResidual(nodeFloatingIPName(ownerKey(cluster), 1)))
+		resourceNames := currentBootstrapResourceNames(cluster.Metadata.Name, ownerKey(cluster))
+		api.floatingIPs = append(api.floatingIPs, ownedResidual(resourceNames.ControlPlaneFIP[1]))
 		eventsBefore := len(api.events)
 		if _, err := reconciler.Reconcile(context.Background(), cluster, "unit-test-secret-token"); err == nil || !strings.Contains(err.Error(), "residual floating IP") {
 			t.Fatalf("active control-plane residual was accepted: %v", err)
@@ -788,7 +854,8 @@ func TestResidualFloatingIPBlocksVMPost(t *testing.T) {
 		cluster := testCluster()
 		reconciler := testReconciler(api)
 		prepareBastion(t, reconciler, cluster)
-		residual := ownedResidual(nodeFloatingIPName(ownerKey(cluster), 2))
+		resourceNames := currentBootstrapResourceNames(cluster.Metadata.Name, ownerKey(cluster))
+		residual := ownedResidual(resourceNames.ControlPlaneFIP[2])
 		api.floatingIPAfterFirewallCreate = &residual
 		if _, err := reconciler.Reconcile(context.Background(), cluster, "unit-test-secret-token"); err == nil || !strings.Contains(err.Error(), "active residual floating IP") {
 			t.Fatalf("TOCTOU control-plane residual was accepted: %v", err)
@@ -800,7 +867,8 @@ func TestResidualFloatingIPBlocksVMPost(t *testing.T) {
 	t.Run("deleted tombstone does not block", func(t *testing.T) {
 		api := newFakeAPI()
 		cluster := testCluster()
-		tombstone := ownedResidual(bastionFloatingIPName(ownerKey(cluster)))
+		resourceNames := currentBootstrapResourceNames(cluster.Metadata.Name, ownerKey(cluster))
+		tombstone := ownedResidual(resourceNames.BastionFloatingIP)
 		tombstone.IsDeleted = true
 		api.floatingIPs = append(api.floatingIPs, tombstone)
 		if _, err := testReconciler(api).Reconcile(context.Background(), cluster, "unit-test-secret-token"); err != nil {
@@ -1174,7 +1242,8 @@ func TestFloatingIPPatchResponseAndAmbiguousReadback(t *testing.T) {
 			if !commits && err == nil {
 				t.Fatal("non-committed PATCH ambiguity was accepted")
 			}
-			if commits && api.floatingIPs[0].Name != bastionFloatingIPName(ownerKey(cluster)) {
+			resourceNames := currentBootstrapResourceNames(cluster.Metadata.Name, ownerKey(cluster))
+			if commits && api.floatingIPs[0].Name != resourceNames.BastionFloatingIP {
 				t.Fatalf("committed PATCH name was not retained: %#v", api.floatingIPs[0])
 			}
 		})
@@ -1262,7 +1331,8 @@ func TestFloatingIPInventoryRejectsAmbiguousOrForeignAssignmentBeforeMutation(t 
 			api.floatingIPs[0].Name = "foreign-ip"
 		},
 		"owned name assigned to foreign VM": func(api *fakeAPI) {
-			api.floatingIPs[0].Name = bastionFloatingIPName(ownerKey(testCluster()))
+			cluster := testCluster()
+			api.floatingIPs[0].Name = currentBootstrapResourceNames(cluster.Metadata.Name, ownerKey(cluster)).BastionFloatingIP
 			api.floatingIPs[0].AssignedTo = "99999999-1111-4222-8333-bbbbbbbbbbbb"
 			api.floatingIPs[0].AssignedToPrivateIP = "10.20.30.99"
 		},
@@ -1501,7 +1571,7 @@ func TestDestroyNamesAutoFloatingIPBeforeUnassignAcrossRestarts(t *testing.T) {
 	if err != nil || !strings.Contains(first.Message, "named ") {
 		t.Fatalf("first destroy pass did not name the auto FIP: result=%#v error=%v", first, err)
 	}
-	wantName := bastionFloatingIPName(ownerKey(cluster))
+	wantName := currentBootstrapResourceNames(cluster.Metadata.Name, ownerKey(cluster)).BastionFloatingIP
 	if len(api.floatingIPs) != 1 || api.floatingIPs[0].Name != wantName || api.floatingIPs[0].AssignedTo == "" {
 		t.Fatalf("first destroy pass did not retain a named assigned FIP: %#v", api.floatingIPs)
 	}
@@ -1551,7 +1621,8 @@ func TestDestroyAutoFloatingIPPatchAmbiguityNeverUnassignsNameless(t *testing.T)
 			if len(api.floatingIPs) != 1 || api.floatingIPs[0].AssignedTo == "" {
 				t.Fatalf("PATCH ambiguity unassigned or lost the auto FIP: %#v", api.floatingIPs)
 			}
-			if commits != (api.floatingIPs[0].Name == bastionFloatingIPName(ownerKey(cluster))) {
+			wantName := currentBootstrapResourceNames(cluster.Metadata.Name, ownerKey(cluster)).BastionFloatingIP
+			if commits != (api.floatingIPs[0].Name == wantName) {
 				t.Fatalf("PATCH commits=%t left unexpected name %q", commits, api.floatingIPs[0].Name)
 			}
 			for _, event := range api.events {
@@ -1618,7 +1689,7 @@ func TestCloudVMDeletionUnassignsButDoesNotDeleteNamedFloatingIP(t *testing.T) {
 		t.Fatal(err)
 	}
 	vm := api.vms[0]
-	wantName := bastionFloatingIPName(ownerKey(cluster))
+	wantName := currentBootstrapResourceNames(cluster.Metadata.Name, ownerKey(cluster)).BastionFloatingIP
 	if api.floatingIPs[0].Name != wantName {
 		t.Fatalf("floating IP was not renamed before VM deletion: %#v", api.floatingIPs[0])
 	}
@@ -1900,8 +1971,9 @@ func TestDestroyRejectsLegacyAuthorityDriftBeforeMutation(t *testing.T) {
 		"floating IP billing": {
 			mutate: func(_ *testing.T, api *fakeAPI, cluster *v1alpha1.InSpaceCluster) {
 				owner := ownerKey(cluster)
+				resourceNames := legacyBootstrapResourceNames(owner)
 				for i := range api.floatingIPs {
-					if api.floatingIPs[i].Name == nodeFloatingIPName(owner, 1) {
+					if api.floatingIPs[i].Name == resourceNames.ControlPlaneFIP[1] {
 						api.floatingIPs[i].BillingAccountID++
 					}
 				}
@@ -1910,7 +1982,8 @@ func TestDestroyRejectsLegacyAuthorityDriftBeforeMutation(t *testing.T) {
 		},
 		"node firewall assignment": {
 			mutate: func(t *testing.T, api *fakeAPI, cluster *v1alpha1.InSpaceCluster) {
-				firewall := mustFirewall(t, api.firewalls, firewallName(ownerKey(cluster)))
+				resourceNames := legacyBootstrapResourceNames(ownerKey(cluster))
+				firewall := mustFirewall(t, api.firewalls, resourceNames.NodeFirewall)
 				firewall.ResourcesAssigned = append(firewall.ResourcesAssigned, inspace.FirewallResource{
 					ResourceType: "vm", ResourceUUID: "99999999-1111-4222-8333-bbbbbbbbbbbb",
 				})
@@ -1978,12 +2051,23 @@ func TestDestroyDoesNotApplyCurrentHostnameLengthConstraint(t *testing.T) {
 	bastion.Name = legacyBastionName(newOwner)
 	bastion.Hostname = bastion.Name
 	bastion.Description = fmt.Sprintf("inspace-rke2-bastion/v1 owner=%s spec=%s", newOwner, bastionHash)
+	oldResourceNames := currentBootstrapResourceNames(oldClusterName, oldOwner)
+	newResourceNames := legacyBootstrapResourceNames(newOwner)
+	floatingIPNames := map[string]string{oldResourceNames.BastionFloatingIP: newResourceNames.BastionFloatingIP}
+	for slot := 0; slot < ControlPlaneReplicas; slot++ {
+		floatingIPNames[oldResourceNames.ControlPlaneFIP[slot]] = newResourceNames.ControlPlaneFIP[slot]
+	}
 	for i := range api.floatingIPs {
-		api.floatingIPs[i].Name = strings.Replace(api.floatingIPs[i].Name, "rke2-"+oldOwner+"-", "rke2-"+newOwner+"-", 1)
+		api.floatingIPs[i].Name = floatingIPNames[api.floatingIPs[i].Name]
+	}
+	firewallNames := map[string]string{
+		oldResourceNames.NodeFirewall:    newResourceNames.NodeFirewall,
+		oldResourceNames.BastionFirewall: newResourceNames.BastionFirewall,
 	}
 	for i := range api.firewalls {
-		api.firewalls[i].Name = strings.Replace(api.firewalls[i].Name, oldOwner, newOwner, 1)
-		api.firewalls[i].DisplayName = strings.Replace(api.firewalls[i].DisplayName, oldOwner, newOwner, 1)
+		name := firewallNames[api.firewalls[i].EffectiveName()]
+		api.firewalls[i].Name = name
+		api.firewalls[i].DisplayName = name
 		api.firewalls[i].Description = strings.Replace(api.firewalls[i].Description, oldOwner, newOwner, 1)
 	}
 
@@ -2190,7 +2274,8 @@ func TestDestroyPendingDeletionNeverAllowsForeignFirewallAssignment(t *testing.T
 	reconcileUntilReady(t, reconciler, cluster)
 	destroyUntilFirstVMDelete(t, reconciler, api, cluster)
 
-	nodeFirewall := mustFirewall(t, api.firewalls, firewallName(ownerKey(cluster)))
+	resourceNames := currentBootstrapResourceNames(cluster.Metadata.Name, ownerKey(cluster))
+	nodeFirewall := mustFirewall(t, api.firewalls, resourceNames.NodeFirewall)
 	nodeFirewall.ResourcesAssigned = append(nodeFirewall.ResourcesAssigned, inspace.FirewallResource{
 		ResourceType: "vm", ResourceUUID: "99999999-1111-4222-8333-bbbbbbbbbbbb",
 	})
@@ -2262,31 +2347,34 @@ func destroyUntilFirstVMDelete(t *testing.T, reconciler *Reconciler, api *fakeAP
 func TestDestroyRejectsAssignmentAndPolicyDriftBeforeMutation(t *testing.T) {
 	for _, mutate := range []func(*fakeAPI, *v1alpha1.InSpaceCluster){
 		func(api *fakeAPI, cluster *v1alpha1.InSpaceCluster) {
-			owner := ownerKey(cluster)
+			resourceNames := currentBootstrapResourceNames(cluster.Metadata.Name, ownerKey(cluster))
 			for i := range api.floatingIPs {
-				if api.floatingIPs[i].Name == bastionFloatingIPName(owner) {
+				if api.floatingIPs[i].Name == resourceNames.BastionFloatingIP {
 					api.floatingIPs[i].Enabled = false
 				}
 			}
 		},
 		func(api *fakeAPI, cluster *v1alpha1.InSpaceCluster) {
-			owner := ownerKey(cluster)
+			resourceNames := currentBootstrapResourceNames(cluster.Metadata.Name, ownerKey(cluster))
 			for i := range api.floatingIPs {
-				if api.floatingIPs[i].Name == bastionFloatingIPName(owner) {
+				if api.floatingIPs[i].Name == resourceNames.BastionFloatingIP {
 					api.floatingIPs[i].AssignedTo = "99999999-1111-4222-8333-bbbbbbbbbbbb"
 				}
 			}
 		},
 		func(api *fakeAPI, cluster *v1alpha1.InSpaceCluster) {
-			fw := mustFirewall(t, api.firewalls, bastionFirewallName(ownerKey(cluster)))
+			resourceNames := currentBootstrapResourceNames(cluster.Metadata.Name, ownerKey(cluster))
+			fw := mustFirewall(t, api.firewalls, resourceNames.BastionFirewall)
 			fw.Rules[0].EndpointSpec = []string{"0.0.0.0/0"}
 		},
 		func(api *fakeAPI, cluster *v1alpha1.InSpaceCluster) {
-			fw := mustFirewall(t, api.firewalls, firewallName(ownerKey(cluster)))
+			resourceNames := currentBootstrapResourceNames(cluster.Metadata.Name, ownerKey(cluster))
+			fw := mustFirewall(t, api.firewalls, resourceNames.NodeFirewall)
 			fw.Description = "not-owned"
 		},
 		func(api *fakeAPI, cluster *v1alpha1.InSpaceCluster) {
-			fw := mustFirewall(t, api.firewalls, firewallName(ownerKey(cluster)))
+			resourceNames := currentBootstrapResourceNames(cluster.Metadata.Name, ownerKey(cluster))
+			fw := mustFirewall(t, api.firewalls, resourceNames.NodeFirewall)
 			fw.Rules = append(fw.Rules, fw.Rules[0])
 		},
 	} {
@@ -2480,6 +2568,7 @@ func destroyUntilDone(t *testing.T, reconciler *Reconciler, cluster *v1alpha1.In
 func prepareBastion(t *testing.T, reconciler *Reconciler, cluster *v1alpha1.InSpaceCluster) {
 	t.Helper()
 	owner := ownerKey(cluster)
+	resourceNames := currentBootstrapResourceNames(cluster.Metadata.Name, owner)
 	for i := 0; i < 10; i++ {
 		if _, err := reconciler.Reconcile(context.Background(), cluster, "unit-test-secret-token"); err != nil {
 			t.Fatal(err)
@@ -2498,7 +2587,7 @@ func prepareBastion(t *testing.T, reconciler *Reconciler, cluster *v1alpha1.InSp
 		var firewall *inspace.Firewall
 		for index := range reconciler.API.(*fakeAPI).firewalls {
 			candidate := &reconciler.API.(*fakeAPI).firewalls[index]
-			if candidate.EffectiveName() == bastionFirewallName(owner) {
+			if candidate.EffectiveName() == resourceNames.BastionFirewall {
 				firewall = candidate
 				break
 			}
@@ -2540,11 +2629,37 @@ func convertControlPlaneOwnershipToV2(t *testing.T, api *fakeAPI, cluster *v1alp
 func convertBastionToLegacy(t *testing.T, api *fakeAPI, cluster *v1alpha1.InSpaceCluster) {
 	t.Helper()
 	owner := ownerKey(cluster)
+	convertBootstrapResourceNamesToLegacy(t, api, cluster)
 	bastion := mustVM(t, api.vms, currentBastionName(cluster.Metadata.Name))
 	bastionHash := bastion.Description[strings.LastIndex(bastion.Description, "=")+1:]
 	bastion.Name = legacyBastionName(owner)
 	bastion.Hostname = bastion.Name
 	bastion.Description = fmt.Sprintf("inspace-rke2-bastion/v1 owner=%s spec=%s", owner, bastionHash)
+}
+
+func convertBootstrapResourceNamesToLegacy(t *testing.T, api *fakeAPI, cluster *v1alpha1.InSpaceCluster) {
+	t.Helper()
+	current := currentBootstrapResourceNames(cluster.Metadata.Name, ownerKey(cluster))
+	legacy := legacyBootstrapResourceNames(ownerKey(cluster))
+	floatingIPNames := map[string]string{current.BastionFloatingIP: legacy.BastionFloatingIP}
+	for slot := 0; slot < ControlPlaneReplicas; slot++ {
+		floatingIPNames[current.ControlPlaneFIP[slot]] = legacy.ControlPlaneFIP[slot]
+	}
+	for i := range api.floatingIPs {
+		if name, ok := floatingIPNames[api.floatingIPs[i].Name]; ok {
+			api.floatingIPs[i].Name = name
+		}
+	}
+	firewallNames := map[string]string{
+		current.NodeFirewall:    legacy.NodeFirewall,
+		current.BastionFirewall: legacy.BastionFirewall,
+	}
+	for i := range api.firewalls {
+		if name, ok := firewallNames[api.firewalls[i].EffectiveName()]; ok {
+			api.firewalls[i].Name = name
+			api.firewalls[i].DisplayName = name
+		}
+	}
 }
 
 func testReconciler(api *fakeAPI) *Reconciler {
@@ -2592,8 +2707,8 @@ func assertControlPlaneCloudInit(t *testing.T, raw, expectedNodeName string, ini
 		t.Errorf("cloud-init guest identity hostname=%q, want %q with preserve_hostname=false", identity.Hostname, expectedNodeName)
 	}
 	files := decodeWriteFiles(t, raw)
-	if len(files) != 8 {
-		t.Fatalf("write_files=%d, want 8", len(files))
+	if len(files) != 9 {
+		t.Fatalf("write_files=%d, want 9", len(files))
 	}
 	script := files["/usr/local/sbin/inspace-bootstrap-rke2"]
 	command := exec.Command("sh", "-n")
@@ -2625,12 +2740,14 @@ func assertControlPlaneCloudInit(t *testing.T, raw, expectedNodeName string, ini
 	if got := files["/etc/systemd/system/rke2-server.service.d/20-inspace-node-limits.conf"]; got != rke2ServerLimitsConfig {
 		t.Errorf("rke2-server limits mismatch:\n%s", got)
 	}
+	assertAutomaticAPTUpdatesDisabled(t, files, script)
 	for before, after := range map[string]string{
 		"swapoff -a":                                   "apt-get -o Acquire::Retries=3",
 		"http://th.archive.ubuntu.com":                 "apt-get -o Acquire::Retries=3",
 		"apt-get -o Acquire::Retries=3":                "apt-get -o DPkg::Lock::Timeout=30 upgrade -y",
 		"apt-get -o DPkg::Lock::Timeout=30 upgrade -y": "install -y --no-install-recommends",
-		"install -y --no-install-recommends":           "sysctl --system",
+		"install -y --no-install-recommends":           "/etc/apt/apt.conf.d/99-inspace-disable-periodic",
+		"test \"$apt_unit_state\" = masked":            "sysctl --system",
 		"sysctl --system":                              "systemctl daemon-reload",
 		"systemctl daemon-reload":                      "systemctl start --no-block rke2-server.service",
 	} {
@@ -2794,8 +2911,9 @@ func assertKubeVIPStaticPodContract(t *testing.T, manifest string) {
 func assertBastionCloudInit(t *testing.T, raw, expectedHostname string) {
 	t.Helper()
 	var payload struct {
-		Hostname         string `json:"hostname"`
-		PreserveHostname bool   `json:"preserve_hostname"`
+		Hostname         string   `json:"hostname"`
+		PreserveHostname bool     `json:"preserve_hostname"`
+		RunCmd           []string `json:"runcmd"`
 	}
 	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
 		t.Fatal(err)
@@ -2803,8 +2921,29 @@ func assertBastionCloudInit(t *testing.T, raw, expectedHostname string) {
 	if payload.Hostname != expectedHostname || payload.PreserveHostname {
 		t.Fatalf("bastion cloud-init hostname contract=%#v, want hostname %q and preserve_hostname=false", payload, expectedHostname)
 	}
+	if !reflect.DeepEqual(payload.RunCmd, []string{"/usr/local/sbin/inspace-bootstrap-bastion"}) {
+		t.Fatalf("bastion cloud-init runcmd=%#v", payload.RunCmd)
+	}
 	files := decodeWriteFiles(t, raw)
-	script := files["/usr/local/sbin/inspace-disable-ufw"]
+	if len(files) != 2 {
+		t.Fatalf("bastion write_files=%d, want 2", len(files))
+	}
+	script := files["/usr/local/sbin/inspace-bootstrap-bastion"]
+	command := exec.Command("sh", "-n")
+	command.Stdin = strings.NewReader(script)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("invalid bastion bootstrap shell: %v: %s", err, output)
+	}
+	for _, required := range []string{
+		"/etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list", "http://th.archive.ubuntu.com",
+		"apt-get -o Acquire::Retries=3", "NEEDRESTART_MODE=a DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=30 upgrade -y",
+		"package_deadline=$(( $(date +%s) + 600 ))", "timeout --kill-after=30s",
+	} {
+		if !strings.Contains(script, required) {
+			t.Errorf("bastion bootstrap script lacks %q", required)
+		}
+	}
+	assertAutomaticAPTUpdatesDisabled(t, files, script)
 	for _, required := range []string{"ufw --force disable", "systemctl list-unit-files --type=service", "systemctl disable --now ufw.service", "disabled|masked", "ufw status", "systemctl is-active", "systemctl is-enabled"} {
 		if !strings.Contains(script, required) {
 			t.Errorf("bastion UFW script lacks %q", required)
@@ -2812,6 +2951,43 @@ func assertBastionCloudInit(t *testing.T, raw, expectedHostname string) {
 	}
 	if strings.Contains(script, "ufw --force disable || true") || strings.Contains(script, "systemctl disable --now ufw.service >/dev/null 2>&1 || true") || strings.Contains(script, "iptables") || strings.Contains(script, "nft ") {
 		t.Errorf("bastion UFW disable is not fail-closed: %s", script)
+	}
+	for before, after := range map[string]string{
+		"http://th.archive.ubuntu.com":                 "apt-get -o Acquire::Retries=3",
+		"apt-get -o Acquire::Retries=3":                "apt-get -o DPkg::Lock::Timeout=30 upgrade -y",
+		"apt-get -o DPkg::Lock::Timeout=30 upgrade -y": "/etc/apt/apt.conf.d/99-inspace-disable-periodic",
+		"test \"$apt_unit_state\" = masked":            "ufw --force disable",
+	} {
+		if beforeIndex, afterIndex := strings.Index(script, before), strings.Index(script, after); beforeIndex < 0 || afterIndex <= beforeIndex {
+			t.Errorf("bastion bootstrap order %q -> %q is not enforced", before, after)
+		}
+	}
+}
+
+func assertAutomaticAPTUpdatesDisabled(t *testing.T, files map[string]string, script string) {
+	t.Helper()
+	if got := files["/var/lib/inspace/apt-periodic-disabled"]; got != automaticAPTUpdatesDisabledConfig {
+		t.Errorf("automatic APT update config mismatch:\n%s", got)
+	}
+	for _, required := range []string{
+		"install -D -m 0644 /var/lib/inspace/apt-periodic-disabled /etc/apt/apt.conf.d/99-inspace-disable-periodic",
+		"cmp -s /var/lib/inspace/apt-periodic-disabled /etc/apt/apt.conf.d/99-inspace-disable-periodic",
+		"systemctl mask --now \"$apt_unit\"", "systemctl is-active --quiet \"$apt_unit\"",
+		"systemctl is-enabled \"$apt_unit\"", "test \"$apt_unit_state\" = masked",
+		"apt-daily.service", "apt-daily-upgrade.service", "apt-daily.timer", "apt-daily-upgrade.timer", "unattended-upgrades.service",
+	} {
+		if !strings.Contains(script, required) {
+			t.Errorf("automatic APT update shutdown lacks %q", required)
+		}
+	}
+	for before, after := range map[string]string{
+		"apt-get -o DPkg::Lock::Timeout=30 upgrade -y": "/etc/apt/apt.conf.d/99-inspace-disable-periodic",
+		"systemctl mask --now \"$apt_unit\"":           "systemctl is-active --quiet \"$apt_unit\"",
+		"systemctl is-active --quiet \"$apt_unit\"":    "systemctl is-enabled \"$apt_unit\"",
+	} {
+		if beforeIndex, afterIndex := strings.Index(script, before), strings.Index(script, after); beforeIndex < 0 || afterIndex <= beforeIndex {
+			t.Errorf("automatic APT update shutdown order %q -> %q is not enforced", before, after)
+		}
 	}
 }
 

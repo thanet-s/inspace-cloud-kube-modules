@@ -14,7 +14,7 @@ spec:
     machine:
       vcpu: 2
       memoryMiB: 4096
-      rootDiskGiB: 30
+      rootDiskGiB: 60
       hostPoolUUID: {{ lookup('env', 'INSPACE_AMD_HOST_POOL_UUID') }}
       image:
         osName: {{ lookup('env', 'INSPACE_OS_NAME') | default('ubuntu', true) }}

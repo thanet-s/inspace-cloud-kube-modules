@@ -16,6 +16,29 @@ This repository implements the InSpace provider for Karpenter `v1.14.0` and RKE2
 
 Variant names describe raw VM capacity, for example `is-compute-4c-4g`, `is-general-6c-12g`, and `is-memory-16c-64g`. Allocatable disk reserves 8 GiB for Ubuntu/RKE2 plus a 4 GiB eviction threshold.
 
+Every catalog shape advertises numeric `inspace.cloud/instance-cpu` (cores)
+and `inspace.cloud/instance-memory` (MiB) labels. NodePool requirements can use
+`Gt`, `Lt`, `Gte`, and `Lte`, for example `instance-cpu Gt ["2"]` or
+`instance-memory Gte ["8192"]`. Each shape has separate `intel-scalable` and
+`amd-epyc` offerings. Hardware class is selected only with the NodePool
+`inspace.cloud/host-class` requirement; it is intentionally absent from
+`InSpaceNodeClass`, so the same infrastructure/bootstrap policy can serve a
+single-class or mixed-class NodePool. The selected offering is persisted in
+the VM ownership record and returned on launched and rehydrated NodeClaims.
+When a NodePool omits the host-class requirement, both offerings are eligible
+and the provider chooses the lowest scheduling weight.
+NodeClass readiness validates both frozen class-to-pool UUID mappings and
+reports them as `status.hostPoolUUIDs`.
+
+> [!IMPORTANT]
+> Before upgrading an existing installation to this schema, add an explicit
+> `inspace.cloud/host-class` requirement to every NodePool and wait for that
+> change to be stored. Then update the CRD and controller. The removed
+> `spec.hostPoolSelector` field is pruned by the API server; a former AMD
+> NodeClass whose NodePool has no host-class requirement would otherwise make
+> both offerings eligible and select the lower-weight Intel offering. Use
+> `values: [intel-scalable, amd-epyc]` when both classes are intentional.
+
 Catalog prices are deterministic scheduling weights, not actual InSpace prices. A pricing source is still required before enabling cost-based consolidation decisions in production.
 
 `spec.rke2` is the required bootstrap contract; the legacy `spec.k3s` field is
@@ -193,7 +216,8 @@ Worker network policy relies on the validated InSpace cloud firewall. Generated 
   same validated worker name;
 - disables active swap and idempotently comments persistent swap entries in `/etc/fstab`;
 - changes stock Ubuntu archive endpoints to Thailand's regional mirror when they appear in either the deb822 or legacy source file;
-- waits within one hard ten-minute package-preparation budget for floating-IP egress, then updates and upgrades the image before installing `curl`, CA certificates, `gzip`, `iproute2`, `procps`, and `tar`;
+- waits within one hard ten-minute package-preparation budget for floating-IP egress, then intentionally updates and upgrades the image before installing `curl`, CA certificates, `gzip`, `iproute2`, `procps`, and `tar`;
+- after that one bootstrap package stage, persists `APT::Periodic` disablement and masks/stops `apt-daily`, `apt-daily-upgrade`, and `unattended-upgrades` systemd units so a Karpenter worker never starts an automatic package update later; this policy is reasserted after `additionalUserData`;
 - persists and applies IPv4 forwarding plus the RKE2-recommended inotify instance/watch limits under `/etc/sysctl.d`;
 - persists a high `nofile` PAM limit and applies `NOFILE`, unlimited process/memory-lock, and unlimited task limits directly to `rke2-agent.service`;
 - downloads the exact RKE2 `rke2.linux-amd64.tar.gz` release and its `sha256sum-amd64.txt` asset with at most 60 attempts per asset;

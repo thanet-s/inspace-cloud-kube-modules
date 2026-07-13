@@ -19,7 +19,7 @@ import (
 // SchemaVersion must be bumped whenever generated bootstrap semantics change.
 // It is included in the provider drift hash so existing nodes are replaced.
 const (
-	SchemaVersion         = "stock-ubuntu-rke2-v6"
+	SchemaVersion         = "stock-ubuntu-rke2-v7"
 	VPCSubnetPlaceholder  = "__INSPACE_VPC_SUBNET__"
 	NativeRoutingPodCIDR  = "10.42.0.0/16"
 	KubernetesServiceCIDR = "10.43.0.0/16"
@@ -120,6 +120,12 @@ fs.inotify.max_user_watches = 524288
 * hard nofile 1048576
 root soft nofile 1048576
 root hard nofile 1048576
+`
+	disablePeriodicAPTConfig := `APT::Periodic::Enable "0";
+APT::Periodic::Update-Package-Lists "0";
+APT::Periodic::Download-Upgradeable-Packages "0";
+APT::Periodic::AutocleanInterval "0";
+APT::Periodic::Unattended-Upgrade "0";
 `
 	prepareHost := fmt.Sprintf(`#!/bin/sh
 set -eu
@@ -253,6 +259,45 @@ done
 echo "package installation failed after $attempt attempts" >&2
 exit 1
 `
+	disableAutomaticAPTUpdates := `#!/bin/sh
+set -eu
+periodic_config="${INSPACE_APT_PERIODIC_CONFIG:-/etc/apt/apt.conf.d/99-inspace-disable-periodic}"
+periodic_tmp="$(mktemp)"
+trap 'rm -f "$periodic_tmp"' EXIT INT TERM
+cat > "$periodic_tmp" <<'INSPACE_APT_PERIODIC'
+APT::Periodic::Enable "0";
+APT::Periodic::Update-Package-Lists "0";
+APT::Periodic::Download-Upgradeable-Packages "0";
+APT::Periodic::AutocleanInterval "0";
+APT::Periodic::Unattended-Upgrade "0";
+INSPACE_APT_PERIODIC
+install -d -m 0755 "$(dirname "$periodic_config")"
+install -m 0644 "$periodic_tmp" "$periodic_config"
+for directive in \
+  'APT::Periodic::Enable "0";' \
+  'APT::Periodic::Update-Package-Lists "0";' \
+  'APT::Periodic::Download-Upgradeable-Packages "0";' \
+  'APT::Periodic::AutocleanInterval "0";' \
+  'APT::Periodic::Unattended-Upgrade "0";'; do
+  grep -Fqx "$directive" "$periodic_config"
+done
+if command -v systemctl >/dev/null 2>&1; then
+  for unit in apt-daily.timer apt-daily-upgrade.timer apt-daily.service apt-daily-upgrade.service unattended-upgrades.service; do
+    load_state="$(systemctl show "$unit" --property=LoadState --value 2>/dev/null || true)"
+    [ "$load_state" = "not-found" ] && continue
+    systemctl mask --now "$unit"
+    if systemctl is-active --quiet "$unit"; then
+      echo "$unit is still active" >&2
+      exit 1
+    fi
+    enabled_state="$(systemctl is-enabled "$unit" 2>/dev/null || true)"
+    [ "$enabled_state" = "masked" ] || {
+      echo "$unit is not masked (state: $enabled_state)" >&2
+      exit 1
+    }
+  done
+fi
+`
 
 	versionURL := url.PathEscape(config.RKE2Version)
 	releaseBase := "https://github.com/rancher/rke2/releases/download/" + versionURL
@@ -302,8 +347,10 @@ tar -xzf "$tmpdir/rke2.linux-amd64.tar.gz" -C /usr/local
 			encodedWriteFile("/etc/systemd/system/rke2-agent.service.d/20-inspace-node-limits.conf", "0644", nodeLimitsDropIn),
 			encodedWriteFile("/etc/sysctl.d/90-inspace-kubernetes.conf", "0644", sysctlConfig),
 			encodedWriteFile("/etc/security/limits.d/90-inspace-kubernetes.conf", "0644", securityLimits),
+			encodedWriteFile("/etc/apt/apt.conf.d/99-inspace-disable-periodic", "0644", disablePeriodicAPTConfig),
 			encodedWriteFile("/usr/local/sbin/inspace-prepare-kubernetes-node", "0700", prepareHost),
 			encodedWriteFile("/usr/local/sbin/inspace-install-prerequisites", "0700", prerequisites),
+			encodedWriteFile("/usr/local/sbin/inspace-disable-automatic-apt-updates", "0700", disableAutomaticAPTUpdates),
 			encodedWriteFile("/usr/local/sbin/inspace-install-rke2", "0700", install),
 			encodedWriteFile("/usr/local/sbin/inspace-apply-node-tuning", "0700", applyNodeTuning),
 			encodedWriteFile("/usr/local/sbin/inspace-detect-private-ip", "0700", privateIP),
@@ -317,6 +364,7 @@ tar -xzf "$tmpdir/rke2.linux-amd64.tar.gz" -C /usr/local
 set -eu
 /usr/local/sbin/inspace-prepare-kubernetes-node
 /usr/local/sbin/inspace-install-prerequisites
+/usr/local/sbin/inspace-disable-automatic-apt-updates
 /usr/local/sbin/inspace-install-rke2
 /usr/local/sbin/inspace-detect-private-ip
 `)
@@ -330,7 +378,8 @@ set -eu
 		// fail-fast orchestrator is manually replayed during troubleshooting.
 		orchestrator.WriteString("cloud-init-per once inspace-additional-user-data /bin/sh /usr/local/sbin/inspace-additional-user-data\n")
 	}
-	orchestrator.WriteString(`/usr/local/sbin/inspace-apply-node-tuning
+	orchestrator.WriteString(`/usr/local/sbin/inspace-disable-automatic-apt-updates
+/usr/local/sbin/inspace-apply-node-tuning
 /usr/local/sbin/inspace-disable-host-firewall
 /usr/local/sbin/inspace-verify-host-firewall
 /usr/local/sbin/inspace-start-rke2-agent

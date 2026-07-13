@@ -61,6 +61,15 @@ The detailed networking, ownership, and cleanup invariants are documented in the
    [Helm chart guide](charts/inspace-cloud-kube-modules/README.md#secret-contracts).
 4. Install the CRDs first, followed by the workload chart:
 
+> [!IMPORTANT]
+> For an existing installation that still uses
+> `InSpaceNodeClass.spec.hostPoolSelector`, first add an explicit
+> `inspace.cloud/host-class` requirement to every NodePool and verify it was
+> stored while the old CRD/controller are still running. Then upgrade the CRD
+> and workload chart. The new CRD prunes the removed selector; skipping this
+> step can change a formerly AMD-only pool to the lower-weight Intel offering.
+> Fresh installations do not need this migration.
+
 ```sh
 export VERSION='<release-version>'
 

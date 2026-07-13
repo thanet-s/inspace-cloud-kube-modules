@@ -22,9 +22,6 @@ spec:
         - name: Location
           type: string
           jsonPath: .spec.location
-        - name: Host Class
-          type: string
-          jsonPath: .spec.hostPoolSelector.class
         - name: Ready
           type: string
           jsonPath: '.status.conditions[?(@.type=="Ready")].status'
@@ -51,7 +48,6 @@ spec:
                 - reservePublicIPv4
                 - firewallUUID
                 - imageSelector
-                - hostPoolSelector
                 - rootDiskGiB
                 - rke2
               x-kubernetes-validations:
@@ -119,13 +115,6 @@ spec:
                     osVersion:
                       type: string
                       enum: ["24.04"]
-                hostPoolSelector:
-                  type: object
-                  required: [class]
-                  properties:
-                    class:
-                      type: string
-                      enum: [intel-scalable, amd-epyc]
                 rootDiskGiB:
                   type: integer
                   format: int32
@@ -181,8 +170,11 @@ spec:
             status:
               type: object
               properties:
-                hostPoolUUID:
-                  type: string
+                hostPoolUUIDs:
+                  type: array
+                  x-kubernetes-list-type: set
+                  items:
+                    type: string
                 firewallUUID:
                   type: string
                 observedImageID:

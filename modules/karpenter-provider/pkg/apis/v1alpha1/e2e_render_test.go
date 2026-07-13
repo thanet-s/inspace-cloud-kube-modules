@@ -271,7 +271,8 @@ func TestClusterE2ERendersRKE2WorkerAndCiliumKubeProxyReplacement(t *testing.T) 
 		"version: v1.35.6+rke2r1",
 		"server: {{ e2e_bootstrap_result.privateRegistrationEndpoint }}",
 		"name: inspace-rke2-agent-token",
-		"class: amd-epyc",
+		"key: inspace.cloud/host-class",
+		"values: [amd-epyc]",
 		"sshUsername: {{ e2e_ssh_user }}",
 		"sshPublicKey: {{ e2e_ssh_public_key | to_json }}",
 	} {
@@ -281,6 +282,9 @@ func TestClusterE2ERendersRKE2WorkerAndCiliumKubeProxyReplacement(t *testing.T) 
 		if strings.Contains(strings.ToLower(workerTemplate), forbidden) {
 			t.Fatalf("Karpenter E2E template retained forbidden host bootstrap artifact %q", forbidden)
 		}
+	}
+	if strings.Contains(workerTemplate, "hostPoolSelector") {
+		t.Fatal("Karpenter E2E template must select hardware class in NodePool, not NodeClass")
 	}
 	for _, expected := range []string{
 		"--management-cidr",
@@ -295,8 +299,11 @@ func TestClusterE2ERendersRKE2WorkerAndCiliumKubeProxyReplacement(t *testing.T) 
 		`.data["enable-ipv4-masquerade"] == "true"`,
 		`.data["enable-bpf-masquerade"] == "true"`,
 		`values["bpf"]["masquerade"] is True`,
-		`.spec.hostPoolSelector.class == "amd-epyc"`,
-		`.status.hostPoolUUID == $pool`,
+		`(.spec | has("hostPoolSelector") | not)`,
+		`.status.hostPoolUUIDs | sort`,
+		`.key == "inspace.cloud/host-class"`,
+		`.metadata.labels["inspace.cloud/instance-cpu"] == "2"`,
+		`.metadata.labels["inspace.cloud/instance-memory"] == "4096"`,
 		`INSPACE_AMD_HOST_POOL_UUID`,
 		`all(.items[]; .metadata.name != "kube-proxy")`,
 		`all(.items[]; (.metadata.name | startswith("kube-proxy-")) | not)`,

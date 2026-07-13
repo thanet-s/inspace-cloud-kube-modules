@@ -412,6 +412,13 @@
         test "$(tr -d '\n' </etc/hostname)" = "{{ e2e_node_name }}"
         ip -4 -o addr show scope global | grep -F -- "{{ e2e_private_ip }}/"
         ! ip -4 -o addr show scope global | grep -F -- "{{ e2e_public_ip }}/"
+        grep -Fqx 'APT::Periodic::Enable "0";' /etc/apt/apt.conf.d/99-inspace-disable-periodic
+        grep -Fqx 'APT::Periodic::Update-Package-Lists "0";' /etc/apt/apt.conf.d/99-inspace-disable-periodic
+        grep -Fqx 'APT::Periodic::Unattended-Upgrade "0";' /etc/apt/apt.conf.d/99-inspace-disable-periodic
+        for apt_unit in apt-daily.service apt-daily-upgrade.service apt-daily.timer apt-daily-upgrade.timer unattended-upgrades.service; do
+          ! systemctl is-active --quiet "$apt_unit"
+          test "$(systemctl is-enabled "$apt_unit" 2>/dev/null || true)" = masked
+        done
         if command -v ufw >/dev/null 2>&1; then
           ufw_status=$(ufw status)
           ! grep -Eiq '^Status:[[:space:]]+active' <<<"$ufw_status"
@@ -547,6 +554,38 @@
       become: true
       async: 600
       poll: 10
+      when: not e2e_node_preparation.stat.exists
+
+    - name: Persist disabled automatic APT updates on repaired control planes
+      ansible.builtin.copy:
+        content: |
+          // Managed by InSpace cluster bootstrap.
+          APT::Periodic::Enable "0";
+          APT::Periodic::Update-Package-Lists "0";
+          APT::Periodic::Download-Upgradeable-Packages "0";
+          APT::Periodic::Unattended-Upgrade "0";
+          APT::Periodic::AutocleanInterval "0";
+          Unattended-Upgrade::Automatic-Reboot "false";
+        dest: /etc/apt/apt.conf.d/99-inspace-disable-periodic
+        owner: root
+        group: root
+        mode: "0644"
+      become: true
+      when: not e2e_node_preparation.stat.exists
+
+    - name: Disable automatic APT update units on repaired control planes
+      ansible.builtin.shell: |
+        set -euo pipefail
+        for apt_unit in apt-daily.service apt-daily-upgrade.service apt-daily.timer apt-daily-upgrade.timer unattended-upgrades.service; do
+          systemctl mask --now "$apt_unit" >/dev/null
+        done
+        for apt_unit in apt-daily.service apt-daily-upgrade.service apt-daily.timer apt-daily-upgrade.timer unattended-upgrades.service; do
+          ! systemctl is-active --quiet "$apt_unit"
+          test "$(systemctl is-enabled "$apt_unit" 2>/dev/null || true)" = masked
+        done
+      args:
+        executable: /bin/bash
+      become: true
       when: not e2e_node_preparation.stat.exists
 
     - name: Persist Kubernetes sysctls on repaired control planes
@@ -706,6 +745,13 @@
         if awk '$0 !~ /^[[:space:]]*#/ && NF >= 3 && $3 == "swap" { found=1 } END { exit found ? 0 : 1 }' /etc/fstab; then exit 1; fi
         for ubuntu_sources in /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list; do
           test ! -f "$ubuntu_sources" || ! grep -E 'https?://archive\.ubuntu\.com' "$ubuntu_sources"
+        done
+        grep -Fqx 'APT::Periodic::Enable "0";' /etc/apt/apt.conf.d/99-inspace-disable-periodic
+        grep -Fqx 'APT::Periodic::Update-Package-Lists "0";' /etc/apt/apt.conf.d/99-inspace-disable-periodic
+        grep -Fqx 'APT::Periodic::Unattended-Upgrade "0";' /etc/apt/apt.conf.d/99-inspace-disable-periodic
+        for apt_unit in apt-daily.service apt-daily-upgrade.service apt-daily.timer apt-daily-upgrade.timer unattended-upgrades.service; do
+          ! systemctl is-active --quiet "$apt_unit"
+          test "$(systemctl is-enabled "$apt_unit" 2>/dev/null || true)" = masked
         done
         grep -Fqx 'net.ipv4.ip_forward = 1' /etc/sysctl.d/90-inspace-kubernetes.conf
         grep -Fqx 'fs.inotify.max_user_instances = 8192' /etc/sysctl.d/90-inspace-kubernetes.conf
@@ -1310,9 +1356,15 @@
         kubectl apply -f "{{ e2e_state_dir }}/karpenter.yaml"
         kubectl wait --for=condition=Ready "inspacenodeclass/{{ e2e_nodeclass_name }}" --timeout=10m
         kubectl get "inspacenodeclass/{{ e2e_nodeclass_name }}" -o json | jq -e \
-          --arg pool "$INSPACE_AMD_HOST_POOL_UUID" '
-          .spec.hostPoolSelector.class == "amd-epyc" and
-          .status.hostPoolUUID == $pool'
+          --arg amd "$INSPACE_AMD_HOST_POOL_UUID" \
+          --arg intel "aac7dd66-f390-4edd-80c0-dd7cae49bd99" '
+          (.spec | has("hostPoolSelector") | not) and
+          (.status.hostPoolUUIDs | sort) == ([$intel, $amd] | sort)'
+        kubectl get "nodepool/{{ e2e_nodepool_name }}" -o json | jq -e '
+          any(.spec.template.spec.requirements[];
+            .key == "inspace.cloud/host-class" and
+            .operator == "In" and
+            .values == ["amd-epyc"])'
       args:
         executable: /bin/bash
       changed_when: true
@@ -1348,6 +1400,14 @@
           if length == 1 then .[0] else error("expected one NodeClaim bound through the worker provider ID") end')
         node_name=$(jq -er '.metadata.name' <<<"$node")
         jq -e --arg nodeName "$node_name" '.status.nodeName == $nodeName' <<<"$nodeclaim" >/dev/null
+        jq -e '
+          .metadata.labels["inspace.cloud/host-class"] == "amd-epyc" and
+          .metadata.labels["inspace.cloud/instance-cpu"] == "2" and
+          .metadata.labels["inspace.cloud/instance-memory"] == "4096"' <<<"$node" >/dev/null
+        jq -e '
+          .metadata.labels["inspace.cloud/host-class"] == "amd-epyc" and
+          .metadata.labels["inspace.cloud/instance-cpu"] == "2" and
+          .metadata.labels["inspace.cloud/instance-memory"] == "4096"' <<<"$nodeclaim" >/dev/null
         jq -cn --argjson node "$node" --argjson nodeclaim "$nodeclaim" '
           {name:$node.metadata.name,nodeClaimName:$nodeclaim.metadata.name,providerID:$node.spec.providerID,
            internalIPs:[$node.status.addresses[]|select(.type=="InternalIP")|.address],
@@ -1471,6 +1531,13 @@
         if awk '$0 !~ /^[[:space:]]*#/ && NF >= 3 && $3 == "swap" { found=1 } END { exit found ? 0 : 1 }' /etc/fstab; then exit 1; fi
         for ubuntu_sources in /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list; do
           test ! -f "$ubuntu_sources" || ! grep -E 'https?://archive\.ubuntu\.com' "$ubuntu_sources"
+        done
+        grep -Fqx 'APT::Periodic::Enable "0";' /etc/apt/apt.conf.d/99-inspace-disable-periodic
+        grep -Fqx 'APT::Periodic::Update-Package-Lists "0";' /etc/apt/apt.conf.d/99-inspace-disable-periodic
+        grep -Fqx 'APT::Periodic::Unattended-Upgrade "0";' /etc/apt/apt.conf.d/99-inspace-disable-periodic
+        for apt_unit in apt-daily.service apt-daily-upgrade.service apt-daily.timer apt-daily-upgrade.timer unattended-upgrades.service; do
+          ! systemctl is-active --quiet "$apt_unit"
+          test "$(systemctl is-enabled "$apt_unit" 2>/dev/null || true)" = masked
         done
         grep -Fqx 'net.ipv4.ip_forward = 1' /etc/sysctl.d/90-inspace-kubernetes.conf
         grep -Fqx 'fs.inotify.max_user_instances = 8192' /etc/sysctl.d/90-inspace-kubernetes.conf

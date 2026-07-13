@@ -2,6 +2,7 @@ package catalog
 
 import (
 	"fmt"
+	"strconv"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -14,11 +15,13 @@ import (
 )
 
 const (
-	LabelFamily    = "inspace.cloud/instance-family"
-	LabelHostClass = "inspace.cloud/host-class"
-	LabelLocation  = "inspace.cloud/location"
-	RegionThailand = "thailand"
-	DefaultDiskGiB = int32(40)
+	LabelFamily         = "inspace.cloud/instance-family"
+	LabelHostClass      = "inspace.cloud/host-class"
+	LabelInstanceCPU    = "inspace.cloud/instance-cpu"
+	LabelInstanceMemory = "inspace.cloud/instance-memory"
+	LabelLocation       = "inspace.cloud/location"
+	RegionThailand      = "thailand"
+	DefaultDiskGiB      = int32(40)
 )
 
 type Family struct {
@@ -37,12 +40,11 @@ var (
 
 type Options struct {
 	Location    string
-	HostClass   string
 	RootDiskGiB int32
 }
 
 func init() {
-	karpv1.WellKnownLabels.Insert(LabelFamily, LabelHostClass, LabelLocation)
+	karpv1.WellKnownLabels.Insert(LabelFamily, LabelHostClass, LabelInstanceCPU, LabelInstanceMemory, LabelLocation)
 	karpv1.WellKnownLabelsForOfferings.Insert(LabelHostClass)
 }
 
@@ -54,12 +56,6 @@ func New(opts Options) ([]*cloudprovider.InstanceType, error) {
 	}
 	if opts.Location != inspacev1.LocationBangkok {
 		return nil, fmt.Errorf("unsupported location %q", opts.Location)
-	}
-	if opts.HostClass == "" {
-		opts.HostClass = inspacev1.HostClassIntelScalable
-	}
-	if opts.HostClass != inspacev1.HostClassIntelScalable && opts.HostClass != inspacev1.HostClassAMDEPYC {
-		return nil, fmt.Errorf("unsupported host class %q", opts.HostClass)
 	}
 	if opts.RootDiskGiB == 0 {
 		opts.RootDiskGiB = DefaultDiskGiB
@@ -94,22 +90,28 @@ func newInstanceType(opts Options, family string, cores, memoryGiB int) *cloudpr
 		scheduling.NewRequirement(corev1.LabelTopologyRegion, corev1.NodeSelectorOpIn, RegionThailand),
 		scheduling.NewRequirement(karpv1.CapacityTypeLabelKey, corev1.NodeSelectorOpIn, karpv1.CapacityTypeOnDemand),
 		scheduling.NewRequirement(LabelFamily, corev1.NodeSelectorOpIn, family),
-		scheduling.NewRequirement(LabelHostClass, corev1.NodeSelectorOpIn, opts.HostClass),
+		scheduling.NewRequirement(LabelInstanceCPU, corev1.NodeSelectorOpIn, strconv.Itoa(cores)),
+		// Instance memory follows Karpenter's established provider convention and
+		// is an integer MiB value, making Gt/Lt/Gte/Lte comparisons unambiguous.
+		scheduling.NewRequirement(LabelInstanceMemory, corev1.NodeSelectorOpIn, strconv.Itoa(memoryGiB*1024)),
 		scheduling.NewRequirement(LabelLocation, corev1.NodeSelectorOpIn, opts.Location),
 	)
-	offering := &cloudprovider.Offering{
-		Available: true,
-		Price:     relativePrice(cores, memoryGiB, opts.HostClass),
-		Requirements: scheduling.NewRequirements(
-			scheduling.NewRequirement(corev1.LabelTopologyZone, corev1.NodeSelectorOpIn, opts.Location),
-			scheduling.NewRequirement(karpv1.CapacityTypeLabelKey, corev1.NodeSelectorOpIn, karpv1.CapacityTypeOnDemand),
-			scheduling.NewRequirement(LabelHostClass, corev1.NodeSelectorOpIn, opts.HostClass),
-		),
+	offerings := make(cloudprovider.Offerings, 0, len(inspacev1.SupportedHostClasses()))
+	for _, hostClass := range inspacev1.SupportedHostClasses() {
+		offerings = append(offerings, &cloudprovider.Offering{
+			Available: true,
+			Price:     relativePrice(cores, memoryGiB, hostClass),
+			Requirements: scheduling.NewRequirements(
+				scheduling.NewRequirement(corev1.LabelTopologyZone, corev1.NodeSelectorOpIn, opts.Location),
+				scheduling.NewRequirement(karpv1.CapacityTypeLabelKey, corev1.NodeSelectorOpIn, karpv1.CapacityTypeOnDemand),
+				scheduling.NewRequirement(LabelHostClass, corev1.NodeSelectorOpIn, hostClass),
+			),
+		})
 	}
 	return &cloudprovider.InstanceType{
 		Name:         name,
 		Requirements: requirements,
-		Offerings:    cloudprovider.Offerings{offering},
+		Offerings:    offerings,
 		Capacity:     capacity,
 		Overhead: &cloudprovider.InstanceTypeOverhead{
 			KubeReserved: corev1.ResourceList{

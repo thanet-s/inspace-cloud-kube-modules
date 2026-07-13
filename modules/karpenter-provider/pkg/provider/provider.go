@@ -38,7 +38,7 @@ const (
 	AnnotationBillingAccount = "karpenter.inspace.cloud/billing-account-id"
 	AnnotationNodeName       = "karpenter.inspace.cloud/node-name"
 	DriftReasonNodeClass     = cloudprovider.DriftReason("NodeClassDrifted")
-	ProviderSchemaVersion    = "inspace-provider-v2"
+	ProviderSchemaVersion    = "inspace-provider-v3"
 )
 
 var _ cloudprovider.CloudProvider = (*CloudProvider)(nil)
@@ -115,6 +115,10 @@ func (p *CloudProvider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim)
 	if err != nil {
 		return nil, err
 	}
+	hostClass, hostPoolUUID, err := hostPoolForOffering(offering)
+	if err != nil {
+		return nil, fmt.Errorf("resolving selected host-class offering: %w", err)
+	}
 	labels := resolvedLabels(nodeClaim.Labels, instanceType, offering)
 	token, err := p.resolver.ResolveAgentToken(ctx, nodeClass)
 	if err != nil {
@@ -132,7 +136,6 @@ func (p *CloudProvider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim)
 	if err != nil {
 		return nil, fmt.Errorf("rendering worker bootstrap: %w", err)
 	}
-	hostPoolUUID, _ := nodeClass.Spec.HostPoolSelector.UUID()
 	idempotencyKey := string(nodeClaim.UID)
 	if idempotencyKey == "" {
 		idempotencyKey = nodeClaim.Name
@@ -153,7 +156,7 @@ func (p *CloudProvider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim)
 		OSName:                       nodeClass.Spec.ImageSelector.OSName,
 		OSVersion:                    nodeClass.Spec.ImageSelector.OSVersion,
 		HostPoolUUID:                 hostPoolUUID,
-		HostClass:                    nodeClass.Spec.HostPoolSelector.Class,
+		HostClass:                    hostClass,
 		InstanceType:                 instanceType.Name,
 		VCPU:                         int(instanceType.Capacity.Cpu().Value()),
 		MemoryGiB:                    memoryGiB,
@@ -362,7 +365,6 @@ func ensureNodeClassReady(nodeClass *inspacev1.InSpaceNodeClass) error {
 func instanceTypesFor(nodeClass *inspacev1.InSpaceNodeClass) ([]*cloudprovider.InstanceType, error) {
 	return catalog.New(catalog.Options{
 		Location:    nodeClass.Spec.Location,
-		HostClass:   nodeClass.Spec.HostPoolSelector.Class,
 		RootDiskGiB: nodeClass.Spec.RootDiskGiB,
 	})
 }
@@ -411,12 +413,38 @@ func resolvedLabels(existing map[string]string, instanceType *cloudprovider.Inst
 	return labels
 }
 
+func hostPoolForOffering(offering *cloudprovider.Offering) (string, string, error) {
+	if offering == nil {
+		return "", "", fmt.Errorf("offering is required")
+	}
+	requirement := offering.Requirements.Get(catalog.LabelHostClass)
+	if requirement == nil || requirement.Operator() != corev1.NodeSelectorOpIn || len(requirement.Values()) != 1 {
+		return "", "", fmt.Errorf("offering must contain exactly one %q value", catalog.LabelHostClass)
+	}
+	hostClass := requirement.Any()
+	hostPoolUUID, ok := inspacev1.HostPoolUUIDForClass(hostClass)
+	if !ok {
+		return "", "", fmt.Errorf("unsupported host class %q", hostClass)
+	}
+	return hostClass, hostPoolUUID, nil
+}
+
 func nodeClaimFromVM(vm *cloudapi.VM) *karpv1.NodeClaim {
 	capacity, allocatable := resourcesForVM(vm)
+	labels := map[string]string{
+		corev1.LabelInstanceTypeStable: vm.InstanceType,
+		catalog.LabelHostClass:         vm.HostClass,
+		catalog.LabelInstanceCPU:       strconv.Itoa(vm.VCPU),
+		catalog.LabelInstanceMemory:    strconv.Itoa(vm.MemoryGiB * 1024),
+		catalog.LabelLocation:          vm.Location,
+	}
+	if instanceType, offering := instanceTypeAndOfferingForVM(vm); instanceType != nil && offering != nil {
+		labels = resolvedLabels(labels, instanceType, offering)
+	}
 	return &karpv1.NodeClaim{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:   vm.NodeClaimName,
-			Labels: map[string]string{corev1.LabelInstanceTypeStable: vm.InstanceType, catalog.LabelHostClass: vm.HostClass},
+			Labels: labels,
 			Annotations: map[string]string{
 				AnnotationNodeClassHash:  vm.SpecHash,
 				AnnotationBootstrapHash:  vm.BootstrapHash,
@@ -469,13 +497,8 @@ func workerNodeName(clusterName string, nodeClaim *karpv1.NodeClaim) (string, er
 }
 
 func resourcesForVM(vm *cloudapi.VM) (corev1.ResourceList, corev1.ResourceList) {
-	instanceTypes, err := catalog.New(catalog.Options{Location: vm.Location, HostClass: vm.HostClass, RootDiskGiB: vm.RootDiskGiB})
-	if err == nil {
-		for _, instanceType := range instanceTypes {
-			if instanceType.Name == vm.InstanceType {
-				return copyResourceList(instanceType.Capacity), copyResourceList(instanceType.Allocatable())
-			}
-		}
+	if instanceType, _ := instanceTypeAndOfferingForVM(vm); instanceType != nil {
+		return copyResourceList(instanceType.Capacity), copyResourceList(instanceType.Allocatable())
 	}
 	// Keep Get/List useful for an older or unknown VM shape while never
 	// advertising more than the cloud record's raw resources.
@@ -486,6 +509,26 @@ func resourcesForVM(vm *cloudapi.VM) (corev1.ResourceList, corev1.ResourceList) 
 		corev1.ResourcePods:             resource.MustParse("110"),
 	}
 	return capacity, copyResourceList(capacity)
+}
+
+func instanceTypeAndOfferingForVM(vm *cloudapi.VM) (*cloudprovider.InstanceType, *cloudprovider.Offering) {
+	instanceTypes, err := catalog.New(catalog.Options{Location: vm.Location, RootDiskGiB: vm.RootDiskGiB})
+	if err != nil {
+		return nil, nil
+	}
+	for _, instanceType := range instanceTypes {
+		if instanceType.Name != vm.InstanceType || int(instanceType.Capacity.Cpu().Value()) != vm.VCPU ||
+			int(instanceType.Capacity.Memory().Value()/(1024*1024*1024)) != vm.MemoryGiB {
+			continue
+		}
+		for _, offering := range instanceType.Offerings {
+			hostClass, _, offeringErr := hostPoolForOffering(offering)
+			if offeringErr == nil && hostClass == vm.HostClass {
+				return instanceType, offering
+			}
+		}
+	}
+	return nil, nil
 }
 
 func NodeClassHash(nodeClass *inspacev1.InSpaceNodeClass) string {

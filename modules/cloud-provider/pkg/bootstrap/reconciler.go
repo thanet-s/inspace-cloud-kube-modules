@@ -102,6 +102,13 @@ type privateIPv4Range struct {
 	AddressCount uint64
 }
 
+type bootstrapResourceNames struct {
+	NodeFirewall      string
+	BastionFirewall   string
+	BastionFloatingIP string
+	ControlPlaneFIP   [ControlPlaneReplicas]string
+}
+
 type Result struct {
 	Ready                          bool          `json:"ready"`
 	RequeueAfter                   time.Duration `json:"requeueAfter"`
@@ -214,26 +221,30 @@ func (r *Reconciler) Reconcile(ctx context.Context, cluster *v1alpha1.InSpaceClu
 	if err != nil {
 		return Result{}, err
 	}
-	floatingByName, err := validateOwnedFloatingIPs(floatingIPSnapshot, cluster, owner, byName)
-	if err != nil {
-		return Result{}, err
-	}
 	firewalls, err := r.API.ListFirewalls(ctx, cluster.Spec.Location)
 	if err != nil {
 		return Result{}, err
 	}
-	nodeFirewall, err := uniqueFirewallByName(firewalls, firewallName(owner))
+	resourceNames := currentBootstrapResourceNames(cluster.Metadata.Name, owner)
+	if err := validateCurrentBootstrapResourceTopology(floatingIPSnapshot, firewalls, legacyBootstrapResourceNames(owner)); err != nil {
+		return Result{}, err
+	}
+	floatingByName, err := validateOwnedFloatingIPs(floatingIPSnapshot, cluster, resourceNames, byName)
 	if err != nil {
 		return Result{}, err
 	}
-	bastionFirewall, err := uniqueFirewallByName(firewalls, bastionFirewallName(owner))
+	nodeFirewall, err := uniqueFirewallByName(firewalls, resourceNames.NodeFirewall)
 	if err != nil {
 		return Result{}, err
 	}
-	if err := validateManagedNodeFirewall(nodeFirewall, cluster, network, owner); err != nil {
+	bastionFirewall, err := uniqueFirewallByName(firewalls, resourceNames.BastionFirewall)
+	if err != nil {
 		return Result{}, err
 	}
-	if err := validateManagedBastionFirewall(bastionFirewall, cluster, owner, r.ManagementCIDR); err != nil {
+	if err := validateManagedNodeFirewall(nodeFirewall, cluster, network, owner, resourceNames.NodeFirewall); err != nil {
+		return Result{}, err
+	}
+	if err := validateManagedBastionFirewall(bastionFirewall, cluster, owner, resourceNames.BastionFirewall, r.ManagementCIDR); err != nil {
 		return Result{}, err
 	}
 	if err := validateOwnedFirewallAssignments(nodeFirewall, controlPlaneUUIDSet(byName, currentControlPlaneNames(cluster.Metadata.Name))); err != nil {
@@ -248,12 +259,12 @@ func (r *Reconciler) Reconcile(ctx context.Context, cluster *v1alpha1.InSpaceClu
 	if err := r.validateExistingVMs(cluster, network, privatePool, owner, byName, rke2Token); err != nil {
 		return Result{}, err
 	}
-	if byName[bastionVMName] == nil && floatingByName[bastionFloatingIPName(owner)] != nil {
-		return Result{}, fmt.Errorf("bootstrap: refusing to create bastion VM while residual floating IP %q already exists", bastionFloatingIPName(owner))
+	if byName[bastionVMName] == nil && floatingByName[resourceNames.BastionFloatingIP] != nil {
+		return Result{}, fmt.Errorf("bootstrap: refusing to create bastion VM while residual floating IP %q already exists", resourceNames.BastionFloatingIP)
 	}
 	for slot := 0; slot < ControlPlaneReplicas; slot++ {
-		if byName[controlPlaneName(cluster.Metadata.Name, slot)] == nil && floatingByName[nodeFloatingIPName(owner, slot)] != nil {
-			return Result{}, fmt.Errorf("bootstrap: refusing to create control-plane slot %d while residual floating IP %q already exists", slot, nodeFloatingIPName(owner, slot))
+		if byName[controlPlaneName(cluster.Metadata.Name, slot)] == nil && floatingByName[resourceNames.ControlPlaneFIP[slot]] != nil {
+			return Result{}, fmt.Errorf("bootstrap: refusing to create control-plane slot %d while residual floating IP %q already exists", slot, resourceNames.ControlPlaneFIP[slot])
 		}
 	}
 
@@ -289,11 +300,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, cluster *v1alpha1.InSpaceClu
 		if err != nil {
 			return Result{}, err
 		}
-		if err := r.rejectResidualFloatingIPNames(ctx, cluster.Spec.Location, bastionFloatingIPName(owner)); err != nil {
+		if err := r.rejectResidualFloatingIPNames(ctx, cluster.Spec.Location, resourceNames.BastionFloatingIP); err != nil {
 			return Result{}, err
 		}
 		created, createErr := r.API.CreateVM(ctx, cluster.Spec.Location, bastionRequest)
-		secured, secureErr := r.secureCreatedVMResponse(ctx, cluster, bastionFirewall, created, bastionRequest, bastionFloatingIPName(owner), network.Subnet, cluster.Spec.Endpoint.VirtualIPv4, privatePool)
+		secured, secureErr := r.secureCreatedVMResponse(ctx, cluster, bastionFirewall, created, bastionRequest, resourceNames.BastionFloatingIP, network.Subnet, cluster.Spec.Endpoint.VirtualIPv4, privatePool)
 		if secureErr != nil || createErr != nil {
 			return Result{}, errors.Join(createErr, secureErr)
 		}
@@ -317,7 +328,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, cluster *v1alpha1.InSpaceClu
 	if err := validateVMPrivateIPv4(bastion, network.Subnet, cluster.Spec.Endpoint.VirtualIPv4, privatePool); err != nil {
 		return Result{}, err
 	}
-	bastionIP, ready, err := r.ensureOwnedAutoFloatingIP(ctx, cluster, bastionFloatingIPName(owner), bastion, floatingByName[bastionFloatingIPName(owner)])
+	bastionIP, ready, err := r.ensureOwnedAutoFloatingIP(ctx, cluster, resourceNames.BastionFloatingIP, bastion, floatingByName[resourceNames.BastionFloatingIP])
 	if err != nil {
 		return Result{}, err
 	}
@@ -356,7 +367,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, cluster *v1alpha1.InSpaceClu
 		missingFloatingIPNames := make([]string, 0, missing)
 		for slot := 0; slot < ControlPlaneReplicas; slot++ {
 			if controlled[slot] == nil {
-				missingFloatingIPNames = append(missingFloatingIPNames, nodeFloatingIPName(owner, slot))
+				missingFloatingIPNames = append(missingFloatingIPNames, resourceNames.ControlPlaneFIP[slot])
 			}
 		}
 		if err := r.rejectResidualFloatingIPNames(ctx, cluster.Spec.Location, missingFloatingIPNames...); err != nil {
@@ -371,12 +382,12 @@ func (r *Reconciler) Reconcile(ctx context.Context, cluster *v1alpha1.InSpaceClu
 		creates.Add(1)
 		go func(slot int) {
 			defer creates.Done()
-			if collisionErr := r.rejectResidualFloatingIPNames(ctx, cluster.Spec.Location, nodeFloatingIPName(owner, slot)); collisionErr != nil {
+			if collisionErr := r.rejectResidualFloatingIPNames(ctx, cluster.Spec.Location, resourceNames.ControlPlaneFIP[slot]); collisionErr != nil {
 				outcomes[slot].err = collisionErr
 				return
 			}
 			created, createErr := r.API.CreateVM(ctx, cluster.Spec.Location, desiredRequests[slot])
-			secured, secureErr := r.secureCreatedVMResponse(ctx, cluster, nodeFirewall, created, desiredRequests[slot], nodeFloatingIPName(owner, slot), network.Subnet, cluster.Spec.Endpoint.VirtualIPv4, privatePool)
+			secured, secureErr := r.secureCreatedVMResponse(ctx, cluster, nodeFirewall, created, desiredRequests[slot], resourceNames.ControlPlaneFIP[slot], network.Subnet, cluster.Spec.Endpoint.VirtualIPv4, privatePool)
 			if secureErr != nil || createErr != nil {
 				outcomes[slot].err = errors.Join(createErr, secureErr)
 				return
@@ -432,7 +443,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, cluster *v1alpha1.InSpaceClu
 		if err := validateVMPrivateIPv4(vm, network.Subnet, cluster.Spec.Endpoint.VirtualIPv4, privatePool); err != nil {
 			return Result{}, err
 		}
-		_, ready, err := r.ensureOwnedAutoFloatingIP(ctx, cluster, nodeFloatingIPName(owner, slot), vm, floatingByName[nodeFloatingIPName(owner, slot)])
+		_, ready, err := r.ensureOwnedAutoFloatingIP(ctx, cluster, resourceNames.ControlPlaneFIP[slot], vm, floatingByName[resourceNames.ControlPlaneFIP[slot]])
 		if err != nil {
 			return Result{}, err
 		}
@@ -504,15 +515,27 @@ func (r *Reconciler) Destroy(ctx context.Context, cluster *v1alpha1.InSpaceClust
 	if err != nil {
 		return result, err
 	}
-	floatingByName, err := validateOwnedFloatingIPsForControlPlanes(floatingIPSnapshot, cluster, owner, ownedVMs, bastionVMName, controlPlaneNames)
+	firewalls, err := r.API.ListFirewalls(ctx, cluster.Spec.Location)
 	if err != nil {
 		return result, err
 	}
-	bastionIPName := bastionFloatingIPName(owner)
+	resourceNames, err := selectDestroyBootstrapResourceNames(
+		floatingIPSnapshot, firewalls,
+		currentBootstrapResourceNames(cluster.Metadata.Name, owner),
+		legacyBootstrapResourceNames(owner),
+	)
+	if err != nil {
+		return result, err
+	}
+	floatingByName, err := validateOwnedFloatingIPsForControlPlanes(floatingIPSnapshot, cluster, resourceNames, ownedVMs, bastionVMName, controlPlaneNames)
+	if err != nil {
+		return result, err
+	}
+	bastionIPName := resourceNames.BastionFloatingIP
 	floatingNames := []string{bastionIPName}
 	floatingVMByName := map[string]*inspace.VM{bastionIPName: ownedVMs[bastionVMName]}
 	for slot := 0; slot < ControlPlaneReplicas; slot++ {
-		name := nodeFloatingIPName(owner, slot)
+		name := resourceNames.ControlPlaneFIP[slot]
 		floatingNames = append(floatingNames, name)
 		floatingVMByName[name] = ownedVMs[controlPlaneNames[slot]]
 	}
@@ -522,22 +545,18 @@ func (r *Reconciler) Destroy(ctx context.Context, cluster *v1alpha1.InSpaceClust
 			result.Remaining = append(result.Remaining, "floating-ip/"+name)
 		}
 	}
-	firewalls, err := r.API.ListFirewalls(ctx, cluster.Spec.Location)
+	nodeFirewall, err := uniqueFirewallByName(firewalls, resourceNames.NodeFirewall)
 	if err != nil {
 		return result, err
 	}
-	nodeFirewall, err := uniqueFirewallByName(firewalls, firewallName(owner))
+	bastionFirewall, err := uniqueFirewallByName(firewalls, resourceNames.BastionFirewall)
 	if err != nil {
 		return result, err
 	}
-	bastionFirewall, err := uniqueFirewallByName(firewalls, bastionFirewallName(owner))
-	if err != nil {
+	if err := validateManagedNodeFirewall(nodeFirewall, cluster, network, owner, resourceNames.NodeFirewall); err != nil {
 		return result, err
 	}
-	if err := validateManagedNodeFirewall(nodeFirewall, cluster, network, owner); err != nil {
-		return result, err
-	}
-	if err := validateManagedBastionFirewall(bastionFirewall, cluster, owner, r.ManagementCIDR); err != nil {
+	if err := validateManagedBastionFirewall(bastionFirewall, cluster, owner, resourceNames.BastionFirewall, r.ManagementCIDR); err != nil {
 		return result, err
 	}
 	pendingDeletions, err := r.activePendingVMDeletions(owner, cluster.Spec.Location, firewalls)
@@ -1204,8 +1223,9 @@ func (r *Reconciler) ensureManagedNodeFirewall(ctx context.Context, cluster *v1a
 	if found != nil {
 		return found, nil
 	}
+	expectedName := currentBootstrapResourceNames(cluster.Metadata.Name, owner).NodeFirewall
 	created, err := r.API.CreateFirewall(ctx, cluster.Spec.Location, inspace.CreateFirewallRequest{
-		DisplayName: firewallName(owner), Description: "Managed RKE2 node firewall for " + owner,
+		DisplayName: expectedName, Description: "Managed RKE2 node firewall for " + owner,
 		BillingAccountID: cluster.Spec.BillingAccountID,
 		Rules:            managedFirewallRules(network.Subnet, cluster.Spec.Network.PodCIDR, "", nil),
 	})
@@ -1213,7 +1233,7 @@ func (r *Reconciler) ensureManagedNodeFirewall(ctx context.Context, cluster *v1a
 		return nil, err
 	}
 	if err := validateCreatedFirewallResponse(
-		created, firewallName(owner), "Managed RKE2 node firewall for "+owner, cluster.Spec.BillingAccountID,
+		created, expectedName, "Managed RKE2 node firewall for "+owner, cluster.Spec.BillingAccountID,
 	); err != nil {
 		return nil, fmt.Errorf("bootstrap: create node firewall response: %w", err)
 	}
@@ -1221,11 +1241,11 @@ func (r *Reconciler) ensureManagedNodeFirewall(ctx context.Context, cluster *v1a
 	if err != nil {
 		return nil, err
 	}
-	readback, err := uniqueFirewallByName(items, firewallName(owner))
+	readback, err := uniqueFirewallByName(items, expectedName)
 	if err != nil || readback == nil || readback.UUID != created.UUID {
 		return nil, errors.Join(errors.New("bootstrap: node firewall creation readback mismatch"), err)
 	}
-	if err := validateManagedNodeFirewall(readback, cluster, network, owner); err != nil {
+	if err := validateManagedNodeFirewall(readback, cluster, network, owner, expectedName); err != nil {
 		return nil, err
 	}
 	return readback, nil
@@ -1235,8 +1255,9 @@ func (r *Reconciler) ensureManagedBastionFirewall(ctx context.Context, cluster *
 	if found != nil {
 		return found, nil
 	}
+	expectedName := currentBootstrapResourceNames(cluster.Metadata.Name, owner).BastionFirewall
 	created, err := r.API.CreateFirewall(ctx, cluster.Spec.Location, inspace.CreateFirewallRequest{
-		DisplayName: bastionFirewallName(owner), Description: "Managed RKE2 bastion firewall for " + owner,
+		DisplayName: expectedName, Description: "Managed RKE2 bastion firewall for " + owner,
 		BillingAccountID: cluster.Spec.BillingAccountID,
 		Rules:            managedBastionFirewallRules(r.ManagementCIDR),
 	})
@@ -1244,7 +1265,7 @@ func (r *Reconciler) ensureManagedBastionFirewall(ctx context.Context, cluster *
 		return nil, err
 	}
 	if err := validateCreatedFirewallResponse(
-		created, bastionFirewallName(owner), "Managed RKE2 bastion firewall for "+owner, cluster.Spec.BillingAccountID,
+		created, expectedName, "Managed RKE2 bastion firewall for "+owner, cluster.Spec.BillingAccountID,
 	); err != nil {
 		return nil, fmt.Errorf("bootstrap: create bastion firewall response: %w", err)
 	}
@@ -1252,11 +1273,11 @@ func (r *Reconciler) ensureManagedBastionFirewall(ctx context.Context, cluster *
 	if err != nil {
 		return nil, err
 	}
-	readback, err := uniqueFirewallByName(items, bastionFirewallName(owner))
+	readback, err := uniqueFirewallByName(items, expectedName)
 	if err != nil || readback == nil || readback.UUID != created.UUID {
 		return nil, errors.Join(errors.New("bootstrap: bastion firewall creation readback mismatch"), err)
 	}
-	if err := validateManagedBastionFirewall(readback, cluster, owner, r.ManagementCIDR); err != nil {
+	if err := validateManagedBastionFirewall(readback, cluster, owner, expectedName, r.ManagementCIDR); err != nil {
 		return nil, err
 	}
 	return readback, nil
@@ -1289,13 +1310,13 @@ func validateCreatedFirewallResponse(firewall *inspace.Firewall, expectedName, e
 	return nil
 }
 
-func validateManagedNodeFirewall(firewall *inspace.Firewall, cluster *v1alpha1.InSpaceCluster, network *inspace.Network, owner string) error {
+func validateManagedNodeFirewall(firewall *inspace.Firewall, cluster *v1alpha1.InSpaceCluster, network *inspace.Network, owner, expectedName string) error {
 	if firewall == nil {
 		return nil
 	}
 	expectedDescription := "Managed RKE2 node firewall for " + owner
-	if firewall.EffectiveName() != firewallName(owner) || firewall.BillingAccountID != cluster.Spec.BillingAccountID {
-		return errors.New("bootstrap: node firewall lacks the expected owner-derived name or billing-account identity")
+	if firewall.EffectiveName() != expectedName || firewall.BillingAccountID != cluster.Spec.BillingAccountID {
+		return errors.New("bootstrap: node firewall lacks the expected deterministic name or billing-account identity")
 	}
 	// InSpace accepts a description on create but currently omits it from both
 	// create and list responses. Treat a returned mismatch as drift, but never
@@ -1309,13 +1330,13 @@ func validateManagedNodeFirewall(firewall *inspace.Firewall, cluster *v1alpha1.I
 	return nil
 }
 
-func validateManagedBastionFirewall(firewall *inspace.Firewall, cluster *v1alpha1.InSpaceCluster, owner, managementCIDR string) error {
+func validateManagedBastionFirewall(firewall *inspace.Firewall, cluster *v1alpha1.InSpaceCluster, owner, expectedName, managementCIDR string) error {
 	if firewall == nil {
 		return nil
 	}
 	expectedDescription := "Managed RKE2 bastion firewall for " + owner
-	if firewall.EffectiveName() != bastionFirewallName(owner) || firewall.BillingAccountID != cluster.Spec.BillingAccountID {
-		return errors.New("bootstrap: bastion firewall lacks the expected owner-derived name or billing-account identity")
+	if firewall.EffectiveName() != expectedName || firewall.BillingAccountID != cluster.Spec.BillingAccountID {
+		return errors.New("bootstrap: bastion firewall lacks the expected deterministic name or billing-account identity")
 	}
 	if firewall.Description != "" && firewall.Description != expectedDescription {
 		return errors.New("bootstrap: bastion firewall has an unexpected description")
@@ -1584,8 +1605,8 @@ func (r *Reconciler) validateExistingVMs(cluster *v1alpha1.InSpaceCluster, netwo
 	return nil
 }
 
-func validateOwnedFloatingIPs(items []inspace.FloatingIP, cluster *v1alpha1.InSpaceCluster, owner string, ownedVMs map[string]*inspace.VM) (map[string]*inspace.FloatingIP, error) {
-	return validateOwnedFloatingIPsForControlPlanes(items, cluster, owner, ownedVMs, currentBastionName(cluster.Metadata.Name), currentControlPlaneNames(cluster.Metadata.Name))
+func validateOwnedFloatingIPs(items []inspace.FloatingIP, cluster *v1alpha1.InSpaceCluster, names bootstrapResourceNames, ownedVMs map[string]*inspace.VM) (map[string]*inspace.FloatingIP, error) {
+	return validateOwnedFloatingIPsForControlPlanes(items, cluster, names, ownedVMs, currentBastionName(cluster.Metadata.Name), currentControlPlaneNames(cluster.Metadata.Name))
 }
 
 func (r *Reconciler) rejectResidualFloatingIPNames(ctx context.Context, location string, names ...string) error {
@@ -1606,10 +1627,10 @@ func (r *Reconciler) rejectResidualFloatingIPNames(ctx context.Context, location
 	return nil
 }
 
-func validateOwnedFloatingIPsForControlPlanes(items []inspace.FloatingIP, cluster *v1alpha1.InSpaceCluster, owner string, ownedVMs map[string]*inspace.VM, bastionVMName string, controlPlaneNames [ControlPlaneReplicas]string) (map[string]*inspace.FloatingIP, error) {
-	expected := map[string]*inspace.VM{bastionFloatingIPName(owner): ownedVMs[bastionVMName]}
+func validateOwnedFloatingIPsForControlPlanes(items []inspace.FloatingIP, cluster *v1alpha1.InSpaceCluster, names bootstrapResourceNames, ownedVMs map[string]*inspace.VM, bastionVMName string, controlPlaneNames [ControlPlaneReplicas]string) (map[string]*inspace.FloatingIP, error) {
+	expected := map[string]*inspace.VM{names.BastionFloatingIP: ownedVMs[bastionVMName]}
 	for slot := 0; slot < ControlPlaneReplicas; slot++ {
-		expected[nodeFloatingIPName(owner, slot)] = ownedVMs[controlPlaneNames[slot]]
+		expected[names.ControlPlaneFIP[slot]] = ownedVMs[controlPlaneNames[slot]]
 	}
 	expectedByVMUUID := make(map[string]string, len(expected))
 	for name, vm := range expected {
@@ -2369,13 +2390,67 @@ func legacyControlPlaneNames(owner string) [ControlPlaneReplicas]string {
 }
 func currentBastionName(clusterName string) string { return clusterName + "-bastion" }
 func legacyBastionName(owner string) string        { return "rke2-" + owner + "-bastion" }
-func firewallName(owner string) string             { return "rke2-" + owner + "-nodes" }
-func bastionFirewallName(owner string) string      { return "rke2-" + owner + "-bastion" }
-func bastionFloatingIPName(owner string) string {
-	return "rke2-" + owner + "-bastion-ip"
+
+func currentBootstrapResourceNames(clusterName, owner string) bootstrapResourceNames {
+	names := bootstrapResourceNames{
+		NodeFirewall:      fmt.Sprintf("%s-nodes-%s", clusterName, owner),
+		BastionFirewall:   fmt.Sprintf("%s-bastion-%s", clusterName, owner),
+		BastionFloatingIP: clusterName + "-bastion-ip",
+	}
+	for slot := 0; slot < ControlPlaneReplicas; slot++ {
+		names.ControlPlaneFIP[slot] = fmt.Sprintf("%s-cp%d-ip", clusterName, slot)
+	}
+	return names
 }
-func nodeFloatingIPName(owner string, slot int) string {
-	return fmt.Sprintf("rke2-%s-cp-%d-ip", owner, slot)
+
+func legacyBootstrapResourceNames(owner string) bootstrapResourceNames {
+	names := bootstrapResourceNames{
+		NodeFirewall:      "rke2-" + owner + "-nodes",
+		BastionFirewall:   "rke2-" + owner + "-bastion",
+		BastionFloatingIP: "rke2-" + owner + "-bastion-ip",
+	}
+	for slot := 0; slot < ControlPlaneReplicas; slot++ {
+		names.ControlPlaneFIP[slot] = fmt.Sprintf("rke2-%s-cp-%d-ip", owner, slot)
+	}
+	return names
+}
+
+func bootstrapResourceTopologyPresent(floatingIPs []inspace.FloatingIP, firewalls []inspace.Firewall, names bootstrapResourceNames) bool {
+	floatingIPNames := map[string]bool{names.BastionFloatingIP: true}
+	for _, name := range names.ControlPlaneFIP {
+		floatingIPNames[name] = true
+	}
+	for i := range floatingIPs {
+		if !floatingIPs[i].IsDeleted && floatingIPNames[floatingIPs[i].Name] {
+			return true
+		}
+	}
+	for i := range firewalls {
+		name := firewalls[i].EffectiveName()
+		if name == names.NodeFirewall || name == names.BastionFirewall {
+			return true
+		}
+	}
+	return false
+}
+
+func validateCurrentBootstrapResourceTopology(floatingIPs []inspace.FloatingIP, firewalls []inspace.Firewall, legacy bootstrapResourceNames) error {
+	if bootstrapResourceTopologyPresent(floatingIPs, firewalls, legacy) {
+		return errors.New("bootstrap: legacy owner-prefixed firewall or floating-IP names require teardown before cluster-prefixed reconciliation")
+	}
+	return nil
+}
+
+func selectDestroyBootstrapResourceNames(floatingIPs []inspace.FloatingIP, firewalls []inspace.Firewall, current, legacy bootstrapResourceNames) (bootstrapResourceNames, error) {
+	hasCurrent := bootstrapResourceTopologyPresent(floatingIPs, firewalls, current)
+	hasLegacy := bootstrapResourceTopologyPresent(floatingIPs, firewalls, legacy)
+	if hasCurrent && hasLegacy {
+		return bootstrapResourceNames{}, errors.New("bootstrap: refusing mixed cluster-prefixed and legacy owner-prefixed firewall/floating-IP topology")
+	}
+	if hasLegacy {
+		return legacy, nil
+	}
+	return current, nil
 }
 
 func uniqueOwnedVMs(vms []inspace.VM, owner, clusterName string) (map[string]*inspace.VM, error) {

@@ -37,8 +37,11 @@ def require_cluster_resource_name(value: object) -> str:
 
 
 def bastion_resource_names(cluster_resource_name: str, owner: str) -> tuple[str, str, str]:
-    owner_name = f"rke2-{owner}-bastion"
-    return f"{cluster_resource_name}-bastion", owner_name, owner_name + "-ip"
+    return (
+        f"{cluster_resource_name}-bastion",
+        f"{cluster_resource_name}-bastion-{owner}",
+        f"{cluster_resource_name}-bastion-ip",
+    )
 
 
 def canonical_owned_vm_details(listed_vms, getter=api_get):
@@ -227,7 +230,7 @@ def main() -> None:
         raise SystemExit("operator-reserved private Service VIP range collides with a VPC VM")
     cluster_resource_name = require_cluster_resource_name(state["clusterResourceName"])
     expected_cp_names = [f"{cluster_resource_name}-cp{index}" for index in range(3)]
-    bastion_name, bastion_owner_name, bastion_fip_name = bastion_resource_names(
+    bastion_name, bastion_firewall_name, bastion_fip_name = bastion_resource_names(
         cluster_resource_name, owner
     )
     listed_owned_vms = [
@@ -267,9 +270,9 @@ def main() -> None:
 
     billing_account = int(os.environ["INSPACE_BILLING_ACCOUNT_ID"])
     addresses = [item for item in api_get("network/ip_addresses") if not item.get("is_deleted", False)]
-    expected_cp_fip_names = [f"rke2-{owner}-cp-{slot}-ip" for slot in range(3)]
+    expected_cp_fip_names = [f"{cluster_resource_name}-cp{slot}-ip" for slot in range(3)]
     expected_fip_names = set(expected_cp_fip_names) | {bastion_fip_name}
-    owned_fips = [item for item in addresses if str(item.get("name", "")).startswith(f"rke2-{owner}-")]
+    owned_fips = [item for item in addresses if item.get("name") in expected_fip_names]
     if len(owned_fips) != 4 or {item.get("name") for item in owned_fips} != expected_fip_names:
         raise SystemExit("expected one exact egress FIP for each control plane and bastion")
     if any(item.get("billing_account_id") != billing_account for item in owned_fips):
@@ -303,9 +306,9 @@ def main() -> None:
                 str(vm.get("description", "")),
             ) is None
             or len(root_disks) != 1
-            or root_disks[0].get("size") != 30
+            or root_disks[0].get("size") != 60
         ):
-            raise SystemExit(f"{name} must be exact Ubuntu 24.04 / 2-vCPU / 4-GiB / 30-GiB control-plane shape")
+            raise SystemExit(f"{name} must be exact Ubuntu 24.04 / 2-vCPU / 4-GiB / 60-GiB control-plane shape")
         if fip.get("assigned_to") != vm.get("uuid"):
             raise SystemExit(f"{name} FIP is not assigned to its exact VM")
         private_value = vm.get("private_ipv4") or fip.get("assigned_to_private_ip")
@@ -372,20 +375,20 @@ def main() -> None:
         raise SystemExit("private-VIP bootstrap must not create an API endpoint FIP")
 
     firewalls = [fw for fw in api_get("network/firewalls") if not fw.get("is_deleted", False)]
+    node_firewall_name = f"{cluster_resource_name}-nodes-{owner}"
+    expected_firewall_names = {node_firewall_name, bastion_firewall_name}
     owned_firewalls = [
         fw for fw in firewalls
-        if str(fw.get("display_name", fw.get("name", ""))).startswith(f"rke2-{owner}-")
+        if fw.get("display_name", fw.get("name")) in expected_firewall_names
     ]
-    if {fw.get("display_name", fw.get("name")) for fw in owned_firewalls} != {
-        f"rke2-{owner}-nodes", bastion_owner_name
-    } or len(owned_firewalls) != 2:
+    if {fw.get("display_name", fw.get("name")) for fw in owned_firewalls} != expected_firewall_names or len(owned_firewalls) != 2:
         raise SystemExit("expected exactly the managed node and bastion firewalls")
     node_firewall = one(
-        [fw for fw in firewalls if fw.get("display_name", fw.get("name")) == f"rke2-{owner}-nodes"],
+        [fw for fw in firewalls if fw.get("display_name", fw.get("name")) == node_firewall_name],
         "managed node firewall",
     )
     bastion_firewall = one(
-        [fw for fw in firewalls if fw.get("display_name", fw.get("name")) == bastion_owner_name],
+        [fw for fw in firewalls if fw.get("display_name", fw.get("name")) == bastion_firewall_name],
         "managed bastion firewall",
     )
     if node_firewall.get("uuid") != result.get("firewallUUID"):

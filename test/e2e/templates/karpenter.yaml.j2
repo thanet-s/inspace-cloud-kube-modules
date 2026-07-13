@@ -15,9 +15,7 @@ spec:
   imageSelector:
     osName: {{ lookup('env', 'INSPACE_OS_NAME') | default('ubuntu', true) }}
     osVersion: "{{ lookup('env', 'INSPACE_OS_VERSION') | default('24.04', true) }}"
-  hostPoolSelector:
-    class: amd-epyc
-  rootDiskGiB: 30
+  rootDiskGiB: 100
   rke2:
     version: v1.35.6+rke2r1
     server: {{ e2e_bootstrap_result.privateRegistrationEndpoint }}
@@ -45,6 +43,9 @@ spec:
         - key: inspace.cloud/instance-family
           operator: In
           values: [general]
+        - key: inspace.cloud/host-class
+          operator: In
+          values: [amd-epyc]
         - key: karpenter.sh/capacity-type
           operator: In
           values: [on-demand]

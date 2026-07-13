@@ -58,4 +58,7 @@ func (in *InSpaceNodeClassStatus) DeepCopyInto(out *InSpaceNodeClassStatus) {
 	if in.Conditions != nil {
 		out.Conditions = append([]status.Condition(nil), in.Conditions...)
 	}
+	if in.HostPoolUUIDs != nil {
+		out.HostPoolUUIDs = append([]string(nil), in.HostPoolUUIDs...)
+	}
 }

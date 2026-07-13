@@ -98,6 +98,9 @@ func TestRenderIncludesExactlyOneRegistrationTaint(t *testing.T) {
 		"/etc/hostname",
 		"http://th.archive.ubuntu.com",
 		"apt-get -o DPkg::Lock::Timeout=30 upgrade -y",
+		"/etc/apt/apt.conf.d/99-inspace-disable-periodic",
+		`APT::Periodic::Unattended-Upgrade "0";`,
+		"systemctl mask --now \"$unit\"",
 		"NEEDRESTART_MODE=a",
 		"package_deadline=$(( $(date +%s) + 600 ))",
 		"timeout --kill-after=30s",
@@ -120,8 +123,8 @@ func TestRenderIncludesExactlyOneRegistrationTaint(t *testing.T) {
 	if strings.Contains(strings.ToLower(rendered), "k3s") {
 		t.Fatalf("RKE2 bootstrap retained a K3s artifact:\n%s", rendered)
 	}
-	if SchemaVersion != "stock-ubuntu-rke2-v6" {
-		t.Fatalf("bootstrap schema = %q, want external-CCM address ownership version v6", SchemaVersion)
+	if SchemaVersion != "stock-ubuntu-rke2-v7" {
+		t.Fatalf("bootstrap schema = %q, want automatic-APT-disable version v7", SchemaVersion)
 	}
 }
 
@@ -146,8 +149,8 @@ func TestRenderedShellScriptsHaveValidSyntax(t *testing.T) {
 		}
 		checked++
 	}
-	if checked != 10 {
-		t.Fatalf("syntax-checked %d shell scripts, want ten; runcmd=%#v", checked, doc.RunCmd)
+	if checked != 11 {
+		t.Fatalf("syntax-checked %d shell scripts, want eleven; runcmd=%#v", checked, doc.RunCmd)
 	}
 }
 
@@ -211,6 +214,107 @@ func TestRenderedHostPreparationAndNodeTuningContracts(t *testing.T) {
 		if !strings.Contains(apply, want) {
 			t.Errorf("node-tuning script is missing %q\n%s", want, apply)
 		}
+	}
+}
+
+func TestRenderedBootstrapDisablesAutomaticAPTOnlyAfterInitialPackages(t *testing.T) {
+	data, err := RenderCloudInit(Config{
+		NodeName: "worker-1", Server: "https://10.0.0.10:9345", Token: "secret-token",
+		RKE2Version: "v1.35.6+rke2r1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc := mustDocument(t, data)
+	const wantPeriodicConfig = `APT::Periodic::Enable "0";
+APT::Periodic::Update-Package-Lists "0";
+APT::Periodic::Download-Upgradeable-Packages "0";
+APT::Periodic::AutocleanInterval "0";
+APT::Periodic::Unattended-Upgrade "0";
+`
+	if got := writeFileContent(t, doc, "/etc/apt/apt.conf.d/99-inspace-disable-periodic"); got != wantPeriodicConfig {
+		t.Fatalf("automatic APT policy differs\ngot:\n%swant:\n%s", got, wantPeriodicConfig)
+	}
+	disableAPT := writeFileContent(t, doc, "/usr/local/sbin/inspace-disable-automatic-apt-updates")
+	for _, unit := range []string{
+		"apt-daily.timer", "apt-daily-upgrade.timer", "apt-daily.service", "apt-daily-upgrade.service", "unattended-upgrades.service",
+	} {
+		if !strings.Contains(disableAPT, unit) {
+			t.Errorf("automatic APT disable script omits %s\n%s", unit, disableAPT)
+		}
+	}
+	for _, contract := range []string{
+		`install -m 0644 "$periodic_tmp" "$periodic_config"`,
+		`systemctl mask --now "$unit"`,
+		`systemctl is-active --quiet "$unit"`,
+		`systemctl is-enabled "$unit"`,
+		`[ "$enabled_state" = "masked" ]`,
+	} {
+		if !strings.Contains(disableAPT, contract) {
+			t.Errorf("automatic APT disable script omits %q\n%s", contract, disableAPT)
+		}
+	}
+
+	orchestrator := writeFileContent(t, doc, "/usr/local/sbin/inspace-bootstrap-rke2-agent")
+	packagesIndex := strings.Index(orchestrator, "/usr/local/sbin/inspace-install-prerequisites")
+	disableIndex := strings.Index(orchestrator, "/usr/local/sbin/inspace-disable-automatic-apt-updates")
+	rke2Index := strings.Index(orchestrator, "/usr/local/sbin/inspace-install-rke2")
+	if packagesIndex < 0 || disableIndex <= packagesIndex || rke2Index <= disableIndex {
+		t.Fatalf("automatic APT disable must follow the intentional update/upgrade/install and precede RKE2\n%s", orchestrator)
+	}
+	if strings.Count(orchestrator, "/usr/local/sbin/inspace-disable-automatic-apt-updates") != 2 || strings.LastIndex(orchestrator, "/usr/local/sbin/inspace-disable-automatic-apt-updates") <= rke2Index {
+		t.Fatalf("automatic APT policy must be reasserted after bootstrap extensions\n%s", orchestrator)
+	}
+
+	stubDir := t.TempDir()
+	commandLog := filepath.Join(stubDir, "apt-systemd.log")
+	writeExecutable(t, filepath.Join(stubDir, "systemctl"), `#!/bin/sh
+printf '%s\n' "$*" >> "$COMMAND_LOG"
+case "$1" in
+  show) printf 'loaded\n' ;;
+  mask) exit 0 ;;
+  is-active) exit 3 ;;
+  is-enabled) printf 'masked\n'; exit 1 ;;
+esac
+`)
+	periodicConfig := filepath.Join(stubDir, "99-inspace-disable-periodic")
+	if err := os.WriteFile(periodicConfig, []byte(wantPeriodicConfig), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command("sh")
+	command.Stdin = strings.NewReader(disableAPT)
+	command.Env = append(os.Environ(), "PATH="+stubDir+":"+os.Getenv("PATH"), "COMMAND_LOG="+commandLog, "INSPACE_APT_PERIODIC_CONFIG="+periodicConfig)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("automatic APT disable script failed with healthy stubs: %v\n%s", err, output)
+	}
+	log, err := os.ReadFile(commandLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Count(string(log), "mask --now "); got != 5 {
+		t.Fatalf("masked %d automatic APT units, want 5\n%s", got, log)
+	}
+	for _, unit := range []string{"apt-daily.timer", "apt-daily-upgrade.timer", "apt-daily.service", "apt-daily-upgrade.service", "unattended-upgrades.service"} {
+		for _, operation := range []string{"mask --now ", "is-active --quiet ", "is-enabled "} {
+			if !strings.Contains(string(log), operation+unit) {
+				t.Errorf("automatic APT unit verification omitted %s%s\n%s", operation, unit, log)
+			}
+		}
+	}
+
+	writeExecutable(t, filepath.Join(stubDir, "systemctl"), `#!/bin/sh
+case "$1" in
+  show) printf 'loaded\n' ;;
+  mask) exit 0 ;;
+  is-active) exit 0 ;;
+  is-enabled) printf 'masked\n'; exit 1 ;;
+esac
+`)
+	command = exec.Command("sh")
+	command.Stdin = strings.NewReader(disableAPT)
+	command.Env = append(os.Environ(), "PATH="+stubDir+":"+os.Getenv("PATH"), "COMMAND_LOG="+commandLog, "INSPACE_APT_PERIODIC_CONFIG="+periodicConfig)
+	if output, err := command.CombinedOutput(); err == nil {
+		t.Fatalf("automatic APT disable accepted an active unit\n%s", output)
 	}
 }
 
@@ -405,13 +509,15 @@ func TestBootstrapOrchestratorIsFailFastAndDisablesFirewallAfterAdditionalData(t
 	additionalIndex := strings.Index(orchestrator, "cloud-init-per once inspace-additional-user-data")
 	prepareIndex := strings.Index(orchestrator, "/usr/local/sbin/inspace-prepare-kubernetes-node")
 	prerequisitesIndex := strings.Index(orchestrator, "/usr/local/sbin/inspace-install-prerequisites")
+	disableAPTIndex := strings.Index(orchestrator, "/usr/local/sbin/inspace-disable-automatic-apt-updates")
+	reassertAPTIndex := strings.LastIndex(orchestrator, "/usr/local/sbin/inspace-disable-automatic-apt-updates")
 	installIndex := strings.Index(orchestrator, "/usr/local/sbin/inspace-install-rke2")
 	detectIndex := strings.Index(orchestrator, "/usr/local/sbin/inspace-detect-private-ip")
 	tuningIndex := strings.Index(orchestrator, "/usr/local/sbin/inspace-apply-node-tuning")
 	disableIndex := strings.Index(orchestrator, "/usr/local/sbin/inspace-disable-host-firewall")
 	verifyIndex := strings.Index(orchestrator, "/usr/local/sbin/inspace-verify-host-firewall")
 	startIndex := strings.Index(orchestrator, "/usr/local/sbin/inspace-start-rke2-agent")
-	if prepareIndex < 0 || prerequisitesIndex <= prepareIndex || installIndex <= prerequisitesIndex || detectIndex <= installIndex || additionalIndex <= detectIndex || tuningIndex <= additionalIndex || disableIndex <= tuningIndex || verifyIndex <= disableIndex || startIndex <= verifyIndex {
+	if prepareIndex < 0 || prerequisitesIndex <= prepareIndex || disableAPTIndex <= prerequisitesIndex || installIndex <= disableAPTIndex || detectIndex <= installIndex || additionalIndex <= detectIndex || reassertAPTIndex <= additionalIndex || tuningIndex <= reassertAPTIndex || disableIndex <= tuningIndex || verifyIndex <= disableIndex || startIndex <= verifyIndex || strings.Count(orchestrator, "/usr/local/sbin/inspace-disable-automatic-apt-updates") != 2 {
 		t.Fatalf("unsafe orchestrator order\n%s", orchestrator)
 	}
 
@@ -424,7 +530,7 @@ if [ "$name" = "${FAIL_STEP:-}" ]; then exit 1; fi
 exit 0
 `
 	for _, name := range []string{
-		"inspace-prepare-kubernetes-node", "inspace-install-prerequisites", "inspace-install-rke2", "inspace-detect-private-ip", "inspace-apply-node-tuning",
+		"inspace-prepare-kubernetes-node", "inspace-install-prerequisites", "inspace-disable-automatic-apt-updates", "inspace-install-rke2", "inspace-detect-private-ip", "inspace-apply-node-tuning",
 		"inspace-additional-user-data", "inspace-disable-host-firewall", "inspace-verify-host-firewall", "inspace-start-rke2-agent", "cloud-init-per",
 	} {
 		writeExecutable(t, filepath.Join(stubDir, name), stub)
@@ -453,7 +559,7 @@ exit 0
 	if strings.Contains(log, "inspace-start-rke2-agent") {
 		t.Fatalf("agent start ran after firewall verification failure\n%s", log)
 	}
-	wantBeforeFailure := "inspace-prepare-kubernetes-node\ninspace-install-prerequisites\ninspace-install-rke2\ninspace-detect-private-ip\ncloud-init-per\ninspace-apply-node-tuning\ninspace-disable-host-firewall\ninspace-verify-host-firewall\n"
+	wantBeforeFailure := "inspace-prepare-kubernetes-node\ninspace-install-prerequisites\ninspace-disable-automatic-apt-updates\ninspace-install-rke2\ninspace-detect-private-ip\ncloud-init-per\ninspace-disable-automatic-apt-updates\ninspace-apply-node-tuning\ninspace-disable-host-firewall\ninspace-verify-host-firewall\n"
 	if log != wantBeforeFailure {
 		t.Fatalf("failure order differs\ngot:\n%swant:\n%s", log, wantBeforeFailure)
 	}

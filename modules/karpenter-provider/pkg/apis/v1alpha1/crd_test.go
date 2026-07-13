@@ -32,6 +32,7 @@ func TestInSpaceNodeClassCRDMatchesContract(t *testing.T) {
 		"!self.startsWith('https://10.42.')",
 		"!self.startsWith('https://10.43.')",
 		"inspace-rke2-agent-token",
+		"hostPoolUUIDs:",
 	} {
 		if !strings.Contains(string(data), expected) {
 			t.Errorf("RKE2 CRD is missing %q", expected)
@@ -39,6 +40,9 @@ func TestInSpaceNodeClassCRDMatchesContract(t *testing.T) {
 	}
 	if strings.Contains(strings.ToLower(string(data)), "k3s") {
 		t.Fatal("RKE2 CRD retained a K3s schema field")
+	}
+	if strings.Contains(string(data), "hostPoolSelector") || strings.Contains(string(data), "hostPoolUUID:") {
+		t.Fatal("NodeClass CRD still locks one host class instead of reporting both validated pools")
 	}
 	chartData, err := os.ReadFile("../../../../../charts/inspace-cloud-kube-modules-crds/templates/karpenter.inspace.cloud_inspacenodeclasses.yaml")
 	if err != nil {

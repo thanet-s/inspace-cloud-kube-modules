@@ -16,7 +16,7 @@ global:
 
 karpenter:
   clusterName: example-rke2
-  defaultNodeClass: ubuntu-workers-intel
+  defaultNodeClass: ubuntu-workers
   # Prefer an externally managed Secret/inspace-rke2-agent-token.
   agentTokenSecret:
     create: false
