@@ -2076,8 +2076,8 @@ func TestGetVMBoundsPersistentTransientEstablishedCanonicalReads(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			api := &fakeAPI{}
 			adapter, _ := New(api)
-			configureFastNetworkReadback(adapter, 40*time.Millisecond)
-			adapter.protectionAuditTimeout = 40 * time.Millisecond
+			configureFastNetworkReadback(adapter, boundedReadbackTestTimeout)
+			adapter.protectionAuditTimeout = boundedReadbackTestTimeout
 			created, err := adapter.CreateVM(context.Background(), testRequest())
 			if err != nil {
 				t.Fatal(err)
@@ -2096,6 +2096,30 @@ func TestGetVMBoundsPersistentTransientEstablishedCanonicalReads(t *testing.T) {
 				t.Fatalf("bounded established read mutated cloud state: deletes=%d operations=%v", api.deleteVMCalls, api.operations)
 			}
 		})
+	}
+}
+
+func TestGetVMPreservesOuterDeadlineWhenCanonicalRequestBlocks(t *testing.T) {
+	api := &fakeAPI{}
+	adapter, _ := New(api)
+	created, err := adapter.CreateVM(context.Background(), testRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	api.blockGetVMUUID = created.UUID
+	adapter.protectionAuditTimeout = 30 * time.Millisecond
+	adapter.networkAttachmentRequestTimeout = 100 * time.Millisecond
+	api.operations = nil
+	getCallsBefore := api.vmGetCalls
+	_, err = adapter.GetVM(context.Background(), "bkk01", created.UUID, "cluster-a")
+	if !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "established read-back stopped") {
+		t.Fatalf("GetVM() error = %v, want bounded outer read-back deadline", err)
+	}
+	if delta := api.vmGetCalls - getCallsBefore; delta != 1 || !api.getVMContextCanceled {
+		t.Fatalf("blocking canonical GET delta/canceled=%d/%t, want one request stopped by its parent deadline", delta, api.getVMContextCanceled)
+	}
+	if api.deleteVMCalls != 0 || len(api.operations) != 0 {
+		t.Fatalf("blocking established read mutated cloud state: deletes=%d operations=%v", api.deleteVMCalls, api.operations)
 	}
 }
 
@@ -3392,6 +3416,8 @@ type fakeAPI struct {
 	omitVMListDescriptions          bool
 	getVMErrorByUUID                map[string]error
 	nilGetVMUUID                    string
+	blockGetVMUUID                  string
+	getVMContextCanceled            bool
 	getVMHook                       func(string)
 	createCalls                     int
 	floatingIPs                     []sdk.FloatingIP
@@ -3631,11 +3657,12 @@ func secureFirewall() sdk.Firewall {
 			{UUID: "out-icmp", Protocol: "icmp", Direction: "outbound", EndpointSpecType: "any"}},
 	}
 }
-func (f *fakeAPI) GetVM(_ context.Context, _, uuid string) (*sdk.VM, error) {
+func (f *fakeAPI) GetVM(ctx context.Context, _, uuid string) (*sdk.VM, error) {
 	f.mu.Lock()
 	f.vmGetCalls++
 	injected := f.getVMErrorByUUID[uuid]
 	returnNil := f.nilGetVMUUID == uuid
+	block := f.blockGetVMUUID == uuid
 	mutate := f.mutateGetVMResponse
 	hook := f.getVMHook
 	var found *sdk.VM
@@ -3652,6 +3679,13 @@ func (f *fakeAPI) GetVM(_ context.Context, _, uuid string) (*sdk.VM, error) {
 	f.mu.Unlock()
 	if hook != nil {
 		hook(uuid)
+	}
+	if block {
+		<-ctx.Done()
+		f.mu.Lock()
+		f.getVMContextCanceled = true
+		f.mu.Unlock()
+		return nil, ctx.Err()
 	}
 	if injected != nil {
 		return nil, injected

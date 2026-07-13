@@ -451,6 +451,10 @@ func (a *Adapter) readEstablishedVM(ctx context.Context, location, uuid, cluster
 			if sdk.IsNotFound(err) {
 				return nil, ownership{}, cloudapi.ErrNotFound
 			}
+			if readbackErr := readbackCtx.Err(); readbackErr != nil {
+				observation := fmt.Errorf("reading canonical detail for established VM %s: %w", uuid, err)
+				return nil, ownership{}, fmt.Errorf("canonical VM %s established read-back stopped: %w", uuid, errors.Join(lastObservation, observation, readbackErr))
+			}
 			if !isRetryableReadback(readbackCtx, err) {
 				return nil, ownership{}, err
 			}
