@@ -18,11 +18,18 @@ and the fixed three-server RKE2 bootstrap reconciler.
   (1 vCPU/2048 MiB/30 GiB), then creates exactly three Ubuntu 24.04 RKE2
   servers in one bounded parallel batch. The API and RKE2 registration use a
   caller-selected private VPC VIP; bootstrap creates no control-plane NLB.
+- Fixed control-plane VM, guest-hostname, and Kubernetes Node identities are
+  `<metadata.name>-cp0`, `<metadata.name>-cp1`, and `<metadata.name>-cp2`.
+  `metadata.name` must be a lowercase DNS label of at most 59 characters.
 - A per-node RKE2 static Pod running kube-vip v1.2.1 by immutable multiarch
   digest. It advertises only the control-plane VIP with ARP and leader
   election; Kubernetes Service handling is disabled.
 - Pinned RKE2 release tarball installation verified against the matching
   official `sha256sum-amd64.txt` release asset.
+- Pre-RKE2 Ubuntu preparation disables swap, rewrites stock archive endpoints to the Thailand archive
+  mirror, updates and upgrades packages within a hard ten-minute budget, and
+  persists IPv4 forwarding, RKE2 inotify values, PAM `nofile`, and matching
+  `rke2-server.service` resource limits.
 - RKE2's packaged Cilium CNI in native-routing mode, with direct node routes,
   full kube-proxy replacement, LB-IPAM and L2 announcements. Cilium Node IPAM
   is explicitly disabled and is never used for Service addressing.
@@ -111,16 +118,44 @@ Control-plane FIPs have no public ingress; API and RKE2 registration use only
 the private VIP. The real InSpace subnet is checked against the RKE2 pod and
 service CIDRs before any mutation.
 
-Use `--once` to perform exactly one reconciliation step. Ownership names are
-derived from the resource namespace/name, so an uncertain API response is
-resolved by listing and adopting the exact deterministic name on the next
-loop, not by blindly repeating the POST.
+Use `--once` to perform exactly one reconciliation step. Control-plane display
+names derive from `metadata.name`; deletion authority remains the versioned
+owner/spec record whose owner hash derives from the resource namespace/name.
+This makes a same-name VM from another namespace a fail-closed collision, not
+an adoption candidate. An uncertain API response is resolved by listing and
+validating the exact deterministic name and owner/spec record on the next loop,
+not by blindly repeating the POST.
+
+Reconciliation never migrates the legacy `rke2-<owner>-cp-<slot>` display-name
+topology. It fails before mutation when those VMs are present. Teardown remains
+available for an exclusively legacy topology, including clusters whose older
+resource name exceeds the current 59-character create limit, but only after
+canonical VM detail, exact `cp/v2` owner/slot/spec records, deterministic FIPs,
+and firewall policy/assignments all validate. A mixed legacy/current topology
+is rejected.
 
 Owned teardown is deterministic and fail-closed. Before its first mutation it
 validates every deterministic VM/FIP name, assignment, billing account,
-firewall ownership description, exact policy, and firewall assignment. It
-then removes all four owned FIPs, deletes the bastion and three control-plane
+owner-derived firewall name, exact firewall policy, and firewall assignment.
+Sparse VM list entries are canonicalized through the per-VM detail endpoint
+before adoption or deletion.
+InSpace accepts firewall descriptions on create but omits them from readback,
+so an absent description is tolerated while any returned mismatch is rejected.
+It then removes all four owned FIPs, deletes the bastion and three control-plane
 VMs, and deletes both managed firewalls only after assignments are absent:
+
+Before each owned VM deletion, the running controller records that exact VM
+UUID and its expected managed-firewall UUID. A successful or normalized
+not-found DELETE refreshes the record. Every other HTTP/API or transport failure
+keeps it because response retry metadata does not prove whether DELETE committed,
+and the controller marks that outcome explicitly retryable. It retains the
+record for five minutes after DELETE returns and removes it only when the
+explicit local pre-dispatch mutation guard rejects the request. This bounded
+transition tolerates delayed firewall-assignment cleanup without
+allowing an unknown UUID, another firewall, a duplicate assignment, or an
+expired record to become deletion authority. A process restart forgets the
+transition and therefore fails closed until the cloud assignment readback has
+cleared.
 
 ```sh
 go run ./cmd/inspace-cluster-controller \
@@ -254,5 +289,5 @@ and requires an exact zero-owned-resource cloud audit after teardown.
 - The InSpace firewall's unmatched-traffic/default-deny semantics still need a
   live conformance test before treating the managed policy as production
   isolation. The controller nevertheless validates the exact node and bastion
-  policies, ownership descriptions, billing account, and assignments before
-  every mutation.
+  policies, owner-derived names, billing account, and assignments before every
+  mutation; any non-empty description is also checked for drift.

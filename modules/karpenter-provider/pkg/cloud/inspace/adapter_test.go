@@ -5,10 +5,12 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/netip"
 	"reflect"
 	"regexp"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -18,8 +20,10 @@ import (
 	cloudapi "github.com/thanet-s/inspace-cloud-kube-modules/modules/karpenter-provider/pkg/cloud"
 )
 
+const boundedReadbackTestTimeout = 200 * time.Millisecond
+
 func TestCreateIsReadBeforeCreateIdempotent(t *testing.T) {
-	api := &fakeAPI{pools: []sdk.HostPool{{UUID: "pool-1"}}}
+	api := &fakeAPI{pools: []sdk.HostPool{{UUID: inspacev1.IntelScalableHostPoolUUID}}}
 	passwordCalls := 0
 	adapter, err := newAdapter(api, func() (string, error) {
 		passwordCalls++
@@ -84,6 +88,570 @@ func TestCreateIsReadBeforeCreateIdempotent(t *testing.T) {
 	}
 }
 
+func TestCreateAllowsVMNameDistinctFromNodeClaimIdentity(t *testing.T) {
+	request := testRequest()
+	if err := validateCreateRequest(request); err != nil {
+		t.Fatalf("validateCreateRequest() rejected separate VM and NodeClaim identities: %v", err)
+	}
+	record := newOwnership(request, sdk.FloatingIP{
+		Name: floatingIPName(request.ClusterName, request.NodeClaimName), Address: "203.0.113.10",
+		BillingAccountID: request.BillingAccountID,
+	})
+	if record.VMName != request.Name || record.NodeClaim != request.NodeClaimName {
+		t.Fatalf("ownership identities were not persisted separately: %#v", record)
+	}
+}
+
+func TestCreateRejectsInvalidV2VMNameRelationBeforeMutation(t *testing.T) {
+	api := &fakeAPI{}
+	adapter, _ := New(api)
+	request := testRequest()
+	request.Name = "different-vm-name"
+	if _, err := adapter.CreateVM(context.Background(), request); err == nil || !strings.Contains(err.Error(), "must exactly equal cluster-derived worker name") {
+		t.Fatalf("CreateVM() error = %v, want exact v2 VM-name relation", err)
+	}
+	if api.createCalls != 0 || api.floatingIPCreateCalls != 0 || len(api.operations) != 0 {
+		t.Fatalf("invalid VM hostname reached mutation: VMPOSTs=%d FIPPOSTs=%d operations=%v", api.createCalls, api.floatingIPCreateCalls, api.operations)
+	}
+}
+
+func TestV2WorkerNameRequiresDNSLabelClusterAndNodeClaim(t *testing.T) {
+	for name, values := range map[string][3]string{
+		"cluster":   {"invalid.cluster", "nodeclaim-a", "invalid.cluster-karp-nodeclaim-a"},
+		"NodeClaim": {"cluster-a", "invalid.nodeclaim", "cluster-a-karp-invalid.nodeclaim"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := validateV2WorkerName(values[0], values[1], values[2]); err == nil || !strings.Contains(err.Error(), "DNS-1123 hostname label") {
+				t.Fatalf("validateV2WorkerName() error = %v, want DNS-label rejection", err)
+			}
+		})
+	}
+}
+
+func TestCreateAdoptsExactNameFromSparseListAfterCanonicalDetail(t *testing.T) {
+	api := &fakeAPI{}
+	adapter, _ := New(api)
+	request := testRequest()
+	first, err := adapter.CreateVM(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	getCallsBefore := api.vmGetCalls
+	api.omitVMListDescriptions = true
+	second, err := adapter.CreateVM(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.UUID != first.UUID || api.createCalls != 1 || len(api.vms) != 1 || len(api.floatingIPs) != 1 {
+		t.Fatalf("sparse-list adoption result=%#v POSTs=%d VMs=%#v FIPs=%#v", second, api.createCalls, api.vms, api.floatingIPs)
+	}
+	if api.vmGetCalls-getCallsBefore < 2 {
+		t.Fatalf("sparse-list adoption did not use canonical detail before protection: GET delta=%d", api.vmGetCalls-getCallsBefore)
+	}
+}
+
+func TestAmbiguousCreateRecoversSparseListCandidateThroughCanonicalDetail(t *testing.T) {
+	api := &fakeAPI{
+		createErr:              errors.New("connection reset after request"),
+		commitOnCreateError:    true,
+		omitVMListDescriptions: true,
+	}
+	adapter, _ := New(api)
+	created, err := adapter.CreateVM(context.Background(), testRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created.UUID == "" || api.createCalls != 1 || len(api.vms) != 1 || len(api.floatingIPs) != 1 {
+		t.Fatalf("ambiguous sparse-list recovery result=%#v POSTs=%d VMs=%#v FIPs=%#v", created, api.createCalls, api.vms, api.floatingIPs)
+	}
+	if api.vmGetCalls < 2 || api.firewallAssignCalls != 1 || api.floatingIPAssignCalls != 1 {
+		t.Fatalf("ambiguous recovery lacked canonical proof/protection: GETs=%d firewall=%d floatingIP=%d", api.vmGetCalls, api.firewallAssignCalls, api.floatingIPAssignCalls)
+	}
+}
+
+func TestCreateRejectsInvalidOrDuplicateListCandidateAuthorityBeforeMutation(t *testing.T) {
+	tests := map[string][]sdk.VM{
+		"invalid UUID": {{UUID: "not-a-uuid", Name: "foreign"}},
+		"duplicate UUID": {
+			{UUID: "11111111-1111-4111-8111-111111111111", Name: "foreign-a"},
+			{UUID: "11111111-1111-4111-8111-111111111111", Name: "foreign-b"},
+		},
+		"duplicate deterministic name": {
+			{UUID: "11111111-1111-4111-8111-111111111111", Name: "cluster-a-karp-nodeclaim-a"},
+			{UUID: "22222222-2222-4222-8222-222222222222", Name: "cluster-a-karp-nodeclaim-a"},
+		},
+	}
+	for name, vms := range tests {
+		t.Run(name, func(t *testing.T) {
+			api := &fakeAPI{vms: vms}
+			adapter, _ := New(api)
+			if _, err := adapter.CreateVM(context.Background(), testRequest()); err == nil {
+				t.Fatal("CreateVM() accepted invalid or duplicate list candidate authority")
+			}
+			if api.floatingIPCreateCalls != 0 || api.createCalls != 0 || api.vmGetCalls != 0 || len(api.operations) != 0 {
+				t.Fatalf("list authority failure reached mutation/detail lookup: FIPPOSTs=%d VMPOSTs=%d GETs=%d operations=%v", api.floatingIPCreateCalls, api.createCalls, api.vmGetCalls, api.operations)
+			}
+		})
+	}
+}
+
+func TestCreateCanonicalCandidateNotFoundOrNilFailsClosed(t *testing.T) {
+	tests := map[string]func(*fakeAPI, string){
+		"not found": func(api *fakeAPI, uuid string) {
+			api.getVMErrorByUUID = map[string]error{uuid: &sdk.APIError{StatusCode: 404}}
+		},
+		"nil response": func(api *fakeAPI, uuid string) { api.nilGetVMUUID = uuid },
+	}
+	for name, inject := range tests {
+		t.Run(name, func(t *testing.T) {
+			api := &fakeAPI{}
+			adapter, _ := New(api)
+			created, err := adapter.CreateVM(context.Background(), testRequest())
+			if err != nil {
+				t.Fatal(err)
+			}
+			api.omitVMListDescriptions = true
+			inject(api, created.UUID)
+			getCallsBefore := api.vmGetCalls
+			configureFastNetworkReadback(adapter, boundedReadbackTestTimeout)
+			if _, err := adapter.CreateVM(context.Background(), testRequest()); err == nil {
+				t.Fatal("CreateVM() accepted an uncertain canonical candidate")
+			}
+			if api.vmGetCalls-getCallsBefore < 2 || api.createCalls != 1 || api.deleteVMCalls != 0 || len(api.vms) != 1 || len(api.floatingIPs) != 1 {
+				t.Fatalf("uncertain canonical candidate mutated resources: GET delta=%d POSTs=%d deletes=%d VMs=%#v FIPs=%#v", api.vmGetCalls-getCallsBefore, api.createCalls, api.deleteVMCalls, api.vms, api.floatingIPs)
+			}
+		})
+	}
+}
+
+func TestCreateSparseResponseUsesPersistedVMDetailAuthority(t *testing.T) {
+	api := &fakeAPI{sparseCreateResponse: true}
+	adapter, _ := New(api)
+	created, err := adapter.CreateVM(context.Background(), testRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created.UUID != "11111111-1111-4111-8111-111111111111" || created.PrivateIPv4 != "10.0.0.20" || created.SpecHash != "spec-a" {
+		t.Fatalf("CreateVM() did not return authoritative persisted details: %#v", created)
+	}
+	if api.vmGetCalls != 1 || api.firewallAssignCalls != 1 || api.floatingIPAssignCalls != 1 {
+		t.Fatalf("sparse create did not pass through persisted detail proof: GETs=%d firewall=%d floatingIP=%d", api.vmGetCalls, api.firewallAssignCalls, api.floatingIPAssignCalls)
+	}
+}
+
+func TestCreateWaitsForIncompletePersistedOwnership(t *testing.T) {
+	remainingIncompleteReads := 2
+	api := &fakeAPI{
+		sparseCreateResponse: true,
+		mutateGetVMResponse: func(vm *sdk.VM) {
+			switch remainingIncompleteReads {
+			case 2:
+				vm.Description = ""
+			case 1:
+				var partial ownership
+				if err := json.Unmarshal([]byte(vm.Description), &partial); err != nil {
+					t.Fatalf("decode ownership fixture: %v", err)
+				}
+				partial.SpecHash = ""
+				encoded, err := json.Marshal(partial)
+				if err != nil {
+					t.Fatalf("encode partial ownership fixture: %v", err)
+				}
+				vm.Description = string(encoded)
+			}
+			if remainingIncompleteReads > 0 {
+				remainingIncompleteReads--
+			}
+		},
+	}
+	adapter, _ := New(api)
+	configureFastNetworkReadback(adapter, 200*time.Millisecond)
+	created, err := adapter.CreateVM(context.Background(), testRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created.UUID != "11111111-1111-4111-8111-111111111111" || api.vmGetCalls != 3 {
+		t.Fatalf("CreateVM() result=%#v GETs=%d, want canonical ownership on the third detail read", created, api.vmGetCalls)
+	}
+	if api.deleteVMCalls != 0 || api.firewallAssignCalls != 1 || api.floatingIPAssignCalls != 1 {
+		t.Fatalf("eventual ownership read-back caused rollback or skipped protection: deletes=%d firewall=%d floatingIP=%d", api.deleteVMCalls, api.firewallAssignCalls, api.floatingIPAssignCalls)
+	}
+}
+
+func TestCreateWaitsForSparseV2WorkerIdentityFields(t *testing.T) {
+	remainingIncompleteReads := 2
+	api := &fakeAPI{
+		sparseCreateResponse: true,
+		mutateGetVMResponse: func(vm *sdk.VM) {
+			if remainingIncompleteReads == 0 {
+				return
+			}
+			var partial ownership
+			if err := json.Unmarshal([]byte(vm.Description), &partial); err != nil {
+				t.Fatalf("decode ownership fixture: %v", err)
+			}
+			if remainingIncompleteReads == 2 {
+				partial.Cluster = ""
+			} else {
+				partial.NodeClaim = ""
+			}
+			remainingIncompleteReads--
+			encoded, err := json.Marshal(partial)
+			if err != nil {
+				t.Fatalf("encode partial ownership fixture: %v", err)
+			}
+			vm.Description = string(encoded)
+		},
+	}
+	adapter, _ := New(api)
+	configureFastNetworkReadback(adapter, 200*time.Millisecond)
+	created, err := adapter.CreateVM(context.Background(), testRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created.UUID != "11111111-1111-4111-8111-111111111111" || api.vmGetCalls != 3 {
+		t.Fatalf("CreateVM() result=%#v GETs=%d, want sparse v2 identity convergence on the third detail read", created, api.vmGetCalls)
+	}
+	if api.deleteVMCalls != 0 || api.firewallAssignCalls != 1 || api.floatingIPAssignCalls != 1 {
+		t.Fatalf("sparse v2 identity convergence caused rollback or skipped protection: deletes=%d firewall=%d floatingIP=%d", api.deleteVMCalls, api.firewallAssignCalls, api.floatingIPAssignCalls)
+	}
+}
+
+func TestCreateWaitsForIncompletePersistedLaunchIdentity(t *testing.T) {
+	remainingIncompleteReads := 2
+	api := &fakeAPI{
+		mutateGetVMResponse: func(vm *sdk.VM) {
+			if remainingIncompleteReads == 0 {
+				return
+			}
+			remainingIncompleteReads--
+			vm.Name = ""
+			vm.VCPU = 0
+			vm.MemoryMiB = 0
+			vm.OSName = ""
+			vm.OSVersion = ""
+			vm.DesignatedPoolUUID = ""
+			vm.NetworkUUID = ""
+			vm.BillingAccountID = 0
+			vm.Storage = nil
+		},
+	}
+	adapter, _ := New(api)
+	configureFastNetworkReadback(adapter, 200*time.Millisecond)
+	created, err := adapter.CreateVM(context.Background(), testRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created.Name != "cluster-a-karp-nodeclaim-a" || created.VCPU != 2 || created.MemoryGiB != 4 || api.vmGetCalls != 3 {
+		t.Fatalf("CreateVM() result=%#v GETs=%d, want complete launch identity on the third detail read", created, api.vmGetCalls)
+	}
+	if api.deleteVMCalls != 0 || api.firewallAssignCalls != 1 || api.floatingIPAssignCalls != 1 {
+		t.Fatalf("eventual launch identity caused rollback or skipped protection: deletes=%d firewall=%d floatingIP=%d", api.deleteVMCalls, api.firewallAssignCalls, api.floatingIPAssignCalls)
+	}
+}
+
+func TestCreateBoundsIncompletePersistedLaunchIdentity(t *testing.T) {
+	api := &fakeAPI{mutateGetVMResponse: func(vm *sdk.VM) { vm.NetworkUUID = "" }}
+	adapter, _ := New(api)
+	configureFastNetworkReadback(adapter, boundedReadbackTestTimeout)
+	_, err := adapter.CreateVM(context.Background(), testRequest())
+	if !errors.Is(err, cloudapi.ErrOwnershipMismatch) || !errors.Is(err, errPersistedOwnershipIncomplete) || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("CreateVM() error = %v, want bounded incomplete launch identity failure", err)
+	}
+	if api.vmGetCalls < 2 || api.deleteVMCalls != 1 || len(api.vms) != 0 || len(api.floatingIPs) != 0 {
+		t.Fatalf("bounded launch identity cleanup: GETs=%d deletes=%d VMs=%#v FIPs=%#v", api.vmGetCalls, api.deleteVMCalls, api.vms, api.floatingIPs)
+	}
+	if api.firewallAssignCalls != 0 || api.floatingIPAssignCalls != 0 {
+		t.Fatalf("incomplete launch identity reached protection: firewall=%d floatingIP=%d", api.firewallAssignCalls, api.floatingIPAssignCalls)
+	}
+}
+
+func TestWorkerPrivateIPv4CancellationPreservesLastOwnershipObservation(t *testing.T) {
+	api := &fakeAPI{}
+	adapter, _ := New(api)
+	request := testRequest()
+	created, err := adapter.CreateVM(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected, managed := parseOwnership(api.vms[0].Description)
+	if !managed {
+		t.Fatal("created VM fixture lacks Karpenter ownership")
+	}
+	api.mutateGetVMResponse = func(vm *sdk.VM) { vm.Description = "" }
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	hookCalls := 0
+	api.getVMHook = func(string) {
+		hookCalls++
+		if hookCalls == 2 {
+			cancel()
+		}
+	}
+	configureFastNetworkReadback(adapter, time.Second)
+	_, _, ownershipProven, err := adapter.ensureWorkerPrivateIPv4(
+		ctx,
+		request,
+		created.UUID,
+		netip.MustParsePrefix("10.0.0.0/24"),
+		netip.MustParseAddr(request.ControlPlaneVIP),
+		inspacev1.PrivateLoadBalancerPool{Start: request.PrivateLoadBalancerPoolStart, Stop: request.PrivateLoadBalancerPoolStop},
+		expected,
+	)
+	if !errors.Is(err, cloudapi.ErrOwnershipMismatch) || !errors.Is(err, errPersistedOwnershipIncomplete) || !errors.Is(err, context.Canceled) {
+		t.Fatalf("ensureWorkerPrivateIPv4() error = %v, want prior ownership observation joined with cancellation", err)
+	}
+	if ownershipProven || hookCalls != 2 {
+		t.Fatalf("canceled read-back ownershipProven=%t GET hooks=%d, want false/2", ownershipProven, hookCalls)
+	}
+}
+
+func TestCreateRejectsPresentLaunchIdentityConflictImmediately(t *testing.T) {
+	tests := map[string]func(*sdk.VM){
+		"name": func(vm *sdk.VM) { vm.Name = "foreign" },
+		"name with incomplete ownership": func(vm *sdk.VM) {
+			vm.Description = ""
+			vm.Name = "foreign"
+		},
+		"vCPU":                 func(vm *sdk.VM) { vm.VCPU++ },
+		"memory":               func(vm *sdk.VM) { vm.MemoryMiB++ },
+		"OS name":              func(vm *sdk.VM) { vm.OSName = "debian" },
+		"OS version":           func(vm *sdk.VM) { vm.OSVersion = "22.04" },
+		"designated pool UUID": func(vm *sdk.VM) { vm.DesignatedPoolUUID = "foreign-pool" },
+		"network UUID":         func(vm *sdk.VM) { vm.NetworkUUID = "foreign-network" },
+		"billing account":      func(vm *sdk.VM) { vm.BillingAccountID++ },
+		"root disk size":       func(vm *sdk.VM) { vm.Storage[0].SizeGiB++ },
+		"multiple root disks": func(vm *sdk.VM) {
+			vm.Storage = append(vm.Storage, sdk.VMStorage{SizeGiB: int(testRequest().RootDiskGiB), Primary: true})
+		},
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			api := &fakeAPI{mutateGetVMResponse: mutate}
+			adapter, _ := New(api)
+			configureFastNetworkReadback(adapter, boundedReadbackTestTimeout)
+			_, err := adapter.CreateVM(context.Background(), testRequest())
+			if !errors.Is(err, cloudapi.ErrOwnershipMismatch) {
+				t.Fatalf("CreateVM() error = %v, want launch identity conflict", err)
+			}
+			if api.vmGetCalls != 3 || api.deleteVMCalls != 1 || len(api.vms) != 0 || len(api.floatingIPs) != 0 {
+				t.Fatalf("present conflict rollback did not prove VM absence: GETs=%d lists=%d deletes=%d VMs=%#v FIPs=%#v", api.vmGetCalls, api.vmListCalls, api.deleteVMCalls, api.vms, api.floatingIPs)
+			}
+			if api.firewallAssignCalls != 0 || api.floatingIPAssignCalls != 0 {
+				t.Fatalf("present conflict reached protection: firewall=%d floatingIP=%d", api.firewallAssignCalls, api.floatingIPAssignCalls)
+			}
+		})
+	}
+}
+
+func TestCreateRejectsUnpersistedOwnershipBeforeProtection(t *testing.T) {
+	tests := map[string]struct {
+		mutate     func(string) string
+		incomplete bool
+	}{
+		"missing": {
+			mutate: func(string) string { return "" }, incomplete: true,
+		},
+		"truncated": {
+			mutate: func(description string) string { return description[:len(description)/2] }, incomplete: true,
+		},
+		"mismatched": {
+			mutate: func(description string) string {
+				var record ownership
+				if err := json.Unmarshal([]byte(description), &record); err != nil {
+					t.Fatalf("decode ownership fixture: %v", err)
+				}
+				record.SpecHash = "foreign-spec"
+				encoded, err := json.Marshal(record)
+				if err != nil {
+					t.Fatalf("encode ownership fixture: %v", err)
+				}
+				return string(encoded)
+			},
+		},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			api := &fakeAPI{persistDescription: test.mutate}
+			adapter, _ := New(api)
+			configureFastNetworkReadback(adapter, boundedReadbackTestTimeout)
+			_, err := adapter.CreateVM(context.Background(), testRequest())
+			if !errors.Is(err, cloudapi.ErrOwnershipMismatch) {
+				t.Fatalf("CreateVM() error = %v, want persisted ownership rejection", err)
+			}
+			if test.incomplete && (!errors.Is(err, errPersistedOwnershipIncomplete) || !errors.Is(err, context.DeadlineExceeded)) {
+				t.Fatalf("CreateVM() error = %v, want incomplete observation and read-back deadline", err)
+			}
+			if len(api.vms) != 0 || len(api.floatingIPs) != 0 || api.createCalls != 1 || api.deleteVMCalls != 1 {
+				t.Fatalf("ownership rejection leaked launched resources: VMs=%#v FIPs=%#v POSTs=%d GETs=%d deletes=%d", api.vms, api.floatingIPs, api.createCalls, api.vmGetCalls, api.deleteVMCalls)
+			}
+			if test.incomplete && api.vmGetCalls < 2 {
+				t.Fatalf("incomplete ownership was not retried within the read-back bound: GETs=%d", api.vmGetCalls)
+			}
+			if !test.incomplete && api.vmGetCalls != 3 {
+				t.Fatalf("complete conflicting ownership rollback did not prove absence: GETs=%d", api.vmGetCalls)
+			}
+			if api.firewallAssignCalls != 0 || api.floatingIPAssignCalls != 0 {
+				t.Fatalf("ownership rejection reached protection mutation: firewall=%d floatingIP=%d", api.firewallAssignCalls, api.floatingIPAssignCalls)
+			}
+			if !reflect.DeepEqual(api.operations, []string{"delete-floating-ip", "delete-vm"}) {
+				t.Fatalf("unsafe ownership rollback operations: %v", api.operations)
+			}
+		})
+	}
+}
+
+func TestAmbiguousCreateInvalidListOwnershipNeverProtectsOrDeletesUnprovenVM(t *testing.T) {
+	tests := map[string]struct {
+		mutate     func(string) string
+		incomplete bool
+	}{
+		"missing": {
+			mutate: func(string) string { return "" }, incomplete: true,
+		},
+		"truncated": {
+			mutate: func(description string) string { return description[:len(description)/2] }, incomplete: true,
+		},
+		"mismatched identity": {
+			mutate: func(description string) string {
+				var record ownership
+				if err := json.Unmarshal([]byte(description), &record); err != nil {
+					t.Fatalf("decode ownership fixture: %v", err)
+				}
+				record.NodeClaim = "foreign-nodeclaim"
+				encoded, err := json.Marshal(record)
+				if err != nil {
+					t.Fatalf("encode ownership fixture: %v", err)
+				}
+				return string(encoded)
+			},
+		},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			api := &fakeAPI{
+				createErr:           errors.New("connection reset after request"),
+				commitOnCreateError: true,
+				persistDescription:  test.mutate,
+			}
+			adapter, _ := New(api)
+			if test.incomplete {
+				configureFastNetworkReadback(adapter, boundedReadbackTestTimeout)
+			}
+			if _, err := adapter.CreateVM(context.Background(), testRequest()); err == nil {
+				t.Fatal("CreateVM() unexpectedly trusted invalid ListVMs ownership")
+			}
+			if len(api.vms) != 1 || api.createCalls != 1 || api.deleteVMCalls != 0 {
+				t.Fatalf("ambiguous unproven VM was retried, trusted, or unsafely deleted: VMs=%#v POSTs=%d GETs=%d deletes=%d", api.vms, api.createCalls, api.vmGetCalls, api.deleteVMCalls)
+			}
+			if test.incomplete && api.vmGetCalls < 2 {
+				t.Fatalf("incomplete canonical ownership was not retried: GETs=%d", api.vmGetCalls)
+			}
+			if !test.incomplete && api.vmGetCalls != 1 {
+				t.Fatalf("complete canonical ownership conflict was retried: GETs=%d", api.vmGetCalls)
+			}
+			if len(api.floatingIPs) != 1 || api.floatingIPs[0].AssignedTo != "" {
+				t.Fatalf("ambiguous ownership anchor was changed: %#v", api.floatingIPs)
+			}
+			if api.firewallAssignCalls != 0 || api.floatingIPAssignCalls != 0 || len(api.operations) != 0 {
+				t.Fatalf("invalid ListVMs ownership reached a mutation: firewall=%d floatingIP=%d operations=%v", api.firewallAssignCalls, api.floatingIPAssignCalls, api.operations)
+			}
+		})
+	}
+}
+
+func TestAmbiguousCreateCanonicalOwnershipUncertaintyNeverMutatesListMatchedVM(t *testing.T) {
+	tests := map[string]struct {
+		mutate     func(*sdk.VM)
+		incomplete bool
+	}{
+		"missing description": {
+			mutate: func(vm *sdk.VM) { vm.Description = "" }, incomplete: true,
+		},
+		"truncated description": {
+			mutate: func(vm *sdk.VM) { vm.Description = vm.Description[:len(vm.Description)/2] }, incomplete: true,
+		},
+		"missing launch identity": {
+			mutate: func(vm *sdk.VM) { vm.DesignatedPoolUUID = "" }, incomplete: true,
+		},
+		"mismatched ownership": {
+			mutate: func(vm *sdk.VM) {
+				var record ownership
+				if err := json.Unmarshal([]byte(vm.Description), &record); err != nil {
+					t.Fatalf("decode ownership fixture: %v", err)
+				}
+				record.SpecHash = "foreign-spec"
+				encoded, err := json.Marshal(record)
+				if err != nil {
+					t.Fatalf("encode ownership fixture: %v", err)
+				}
+				vm.Description = string(encoded)
+			},
+		},
+		"mismatched UUID": {
+			mutate: func(vm *sdk.VM) { vm.UUID = "99999999-9999-4999-8999-999999999999" },
+		},
+		"mismatched name": {
+			mutate: func(vm *sdk.VM) { vm.Name = "foreign" },
+		},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			api := &fakeAPI{
+				createErr:           errors.New("connection reset after request"),
+				commitOnCreateError: true,
+				mutateGetVMResponse: test.mutate,
+			}
+			adapter, _ := New(api)
+			if test.incomplete {
+				configureFastNetworkReadback(adapter, boundedReadbackTestTimeout)
+			}
+			_, err := adapter.CreateVM(context.Background(), testRequest())
+			if !errors.Is(err, cloudapi.ErrOwnershipMismatch) {
+				t.Fatalf("CreateVM() error = %v, want canonical ownership rejection", err)
+			}
+			if len(api.vms) != 1 || api.createCalls != 1 || api.deleteVMCalls != 0 {
+				t.Fatalf("canonical disagreement retried or deleted list-matched VM: VMs=%#v POSTs=%d GETs=%d deletes=%d", api.vms, api.createCalls, api.vmGetCalls, api.deleteVMCalls)
+			}
+			if test.incomplete && api.vmGetCalls < 2 {
+				t.Fatalf("incomplete canonical ownership was not retried: GETs=%d", api.vmGetCalls)
+			}
+			if !test.incomplete && api.vmGetCalls != 1 {
+				t.Fatalf("complete canonical ownership conflict was retried: GETs=%d", api.vmGetCalls)
+			}
+			if record, managed := parseOwnership(api.vms[0].Description); !managed || record.SpecHash != "spec-a" {
+				t.Fatalf("ListVMs fixture did not retain exact ownership: %#v, managed=%t", record, managed)
+			}
+			if len(api.floatingIPs) != 1 || api.floatingIPs[0].AssignedTo != "" {
+				t.Fatalf("ambiguous ownership anchor was changed: %#v", api.floatingIPs)
+			}
+			if api.firewallAssignCalls != 0 || api.floatingIPAssignCalls != 0 || len(api.operations) != 0 {
+				t.Fatalf("canonical disagreement reached mutation: firewall=%d floatingIP=%d operations=%v", api.firewallAssignCalls, api.floatingIPAssignCalls, api.operations)
+			}
+		})
+	}
+}
+
+func TestAmbiguousCreateDoesNotRollbackBeforeCanonicalOwnershipProof(t *testing.T) {
+	api := &fakeAPI{
+		createErr:           errors.New("connection reset after request"),
+		commitOnCreateError: true,
+		network:             &sdk.Network{UUID: "network-1", Subnet: "10.0.0.0/24"},
+	}
+	adapter, _ := New(api)
+	configureFastNetworkReadback(adapter, boundedReadbackTestTimeout)
+	_, err := adapter.CreateVM(context.Background(), testRequest())
+	if err == nil || !strings.Contains(err.Error(), "attachment to network") {
+		t.Fatalf("CreateVM() error = %v, want pre-ownership network read-back failure", err)
+	}
+	if len(api.vms) != 1 || len(api.floatingIPs) != 1 || api.createCalls != 1 || api.vmGetCalls != 1 || api.deleteVMCalls != 0 {
+		t.Fatalf("pre-proof failure changed ambiguous resources: VMs=%#v FIPs=%#v POSTs=%d GETs=%d deletes=%d", api.vms, api.floatingIPs, api.createCalls, api.vmGetCalls, api.deleteVMCalls)
+	}
+	if api.firewallAssignCalls != 0 || api.floatingIPAssignCalls != 0 || len(api.operations) != 0 {
+		t.Fatalf("pre-proof failure reached mutation: firewall=%d floatingIP=%d operations=%v", api.firewallAssignCalls, api.floatingIPAssignCalls, api.operations)
+	}
+}
+
 func TestCreatePassesOptionalSSHAccess(t *testing.T) {
 	api := &fakeAPI{}
 	adapter, err := newAdapter(api, func() (string, error) { return validGeneratedTestPassword, nil })
@@ -114,6 +682,7 @@ func TestPasswordGenerationFailsClosedBeforeVMPost(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			configureFastNetworkReadback(adapter, boundedReadbackTestTimeout)
 			if _, err := adapter.CreateVM(context.Background(), testRequest()); err == nil {
 				t.Fatal("expected password generation failure")
 			}
@@ -254,6 +823,7 @@ func TestWorkerPrivateIPv4MustBeExactlyOneRFC1918AddressInsideVPC(t *testing.T) 
 func TestCreatedWorkerPrivateIPCollisionRollsBackOwnedResources(t *testing.T) {
 	api := &fakeAPI{createdPrivateIPv4: "10.0.0.10"}
 	adapter, _ := New(api)
+	configureFastNetworkReadback(adapter, boundedReadbackTestTimeout)
 	_, err := adapter.CreateVM(context.Background(), testRequest())
 	if err == nil || !strings.Contains(err.Error(), "collides with the private RKE2 supervisor VIP") {
 		t.Fatalf("CreateVM() error = %v, want supervisor VIP collision", err)
@@ -272,6 +842,7 @@ func TestCreatedWorkerPrivateIPCollisionRollsBackOwnedResources(t *testing.T) {
 func TestAmbiguousCommittedWorkerVIPCollisionRollsBackOwnedResources(t *testing.T) {
 	api := &fakeAPI{createdPrivateIPv4: "10.0.0.10", createErr: errors.New("connection reset after request"), commitOnCreateError: true}
 	adapter, _ := New(api)
+	configureFastNetworkReadback(adapter, boundedReadbackTestTimeout)
 	_, err := adapter.CreateVM(context.Background(), testRequest())
 	if err == nil || !strings.Contains(err.Error(), "collides with the private RKE2 supervisor VIP") {
 		t.Fatalf("CreateVM() error = %v, want supervisor VIP collision", err)
@@ -284,6 +855,7 @@ func TestAmbiguousCommittedWorkerVIPCollisionRollsBackOwnedResources(t *testing.
 func TestPositivelyOwnedExistingWorkerVIPCollisionRollsBack(t *testing.T) {
 	api := &fakeAPI{}
 	adapter, _ := New(api)
+	configureFastNetworkReadback(adapter, boundedReadbackTestTimeout)
 	request := testRequest()
 	if _, err := adapter.CreateVM(context.Background(), request); err != nil {
 		t.Fatal(err)
@@ -305,6 +877,7 @@ func TestPositivelyOwnedExistingWorkerVIPCollisionRollsBack(t *testing.T) {
 func TestCreatedWorkerServiceVIPPoolCollisionRollsBackOwnedResources(t *testing.T) {
 	api := &fakeAPI{createdPrivateIPv4: "10.0.0.200"}
 	adapter, _ := New(api)
+	configureFastNetworkReadback(adapter, boundedReadbackTestTimeout)
 	_, err := adapter.CreateVM(context.Background(), testRequest())
 	if !errors.Is(err, errWorkerServiceVIPPoolCollision) {
 		t.Fatalf("CreateVM() error = %v, want reserved Service VIP-pool collision", err)
@@ -323,6 +896,7 @@ func TestCreatedWorkerServiceVIPPoolCollisionRollsBackOwnedResources(t *testing.
 func TestAmbiguousCommittedWorkerServiceVIPPoolCollisionRollsBackOwnedResources(t *testing.T) {
 	api := &fakeAPI{createdPrivateIPv4: "10.0.0.219", createErr: errors.New("connection reset after request"), commitOnCreateError: true}
 	adapter, _ := New(api)
+	configureFastNetworkReadback(adapter, boundedReadbackTestTimeout)
 	_, err := adapter.CreateVM(context.Background(), testRequest())
 	if !errors.Is(err, errWorkerServiceVIPPoolCollision) {
 		t.Fatalf("CreateVM() error = %v, want reserved Service VIP-pool collision", err)
@@ -335,6 +909,7 @@ func TestAmbiguousCommittedWorkerServiceVIPPoolCollisionRollsBackOwnedResources(
 func TestPositivelyOwnedExistingWorkerServiceVIPPoolCollisionRollsBack(t *testing.T) {
 	api := &fakeAPI{}
 	adapter, _ := New(api)
+	configureFastNetworkReadback(adapter, boundedReadbackTestTimeout)
 	request := testRequest()
 	if _, err := adapter.CreateVM(context.Background(), request); err != nil {
 		t.Fatal(err)
@@ -361,7 +936,7 @@ func TestAmbiguousCommittedGenericOwnershipMismatchIsNotDeleted(t *testing.T) {
 	}
 	adapter, _ := New(api)
 	_, err := adapter.CreateVM(context.Background(), testRequest())
-	if err == nil || !strings.Contains(err.Error(), "launch parameters differ") {
+	if err == nil || !strings.Contains(err.Error(), "persisted launch identity differs") {
 		t.Fatalf("CreateVM() error = %v, want generic launch mismatch", err)
 	}
 	if len(api.vms) != 1 || len(api.floatingIPs) != 1 || api.deleteVMCalls != 0 || slicesContain(api.operations, "delete-vm") {
@@ -372,6 +947,7 @@ func TestAmbiguousCommittedGenericOwnershipMismatchIsNotDeleted(t *testing.T) {
 func TestOwnedVIPCollisionRollsBackBeforeUnusableFIPOrFirewallAssignment(t *testing.T) {
 	api := &fakeAPI{}
 	adapter, _ := New(api)
+	configureFastNetworkReadback(adapter, boundedReadbackTestTimeout)
 	request := testRequest()
 	if _, err := adapter.CreateVM(context.Background(), request); err != nil {
 		t.Fatal(err)
@@ -473,6 +1049,7 @@ func TestUnusableNewFloatingIPIsCleanedBeforeVMCreate(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			api := &fakeAPI{createFloatingIPHook: mutate}
 			adapter, _ := New(api)
+			configureFastNetworkReadback(adapter, boundedReadbackTestTimeout)
 			_, err := adapter.CreateVM(context.Background(), testRequest())
 			if err == nil || !strings.Contains(err.Error(), "created floating IP is unusable") {
 				t.Fatalf("CreateVM() error = %v, want unusable new floating-IP rejection", err)
@@ -492,6 +1069,7 @@ func TestCreatedWorkerUnexpectedFirewallRollsBackAfterVMDeletion(t *testing.T) {
 		attachCreatedVMToFirewallUUID: extra.UUID,
 	}
 	adapter, _ := New(api)
+	configureFastNetworkReadback(adapter, boundedReadbackTestTimeout)
 	_, err := adapter.CreateVM(context.Background(), testRequest())
 	if !errors.Is(err, cloudapi.ErrOwnershipMismatch) || !strings.Contains(err.Error(), "attached exactly once to intended firewall") {
 		t.Fatalf("CreateVM() error = %v, want unexpected-firewall rejection", err)
@@ -526,6 +1104,7 @@ func TestPostAssignmentSecondFirewallAuditRollsBackNewWorker(t *testing.T) {
 		secondFirewallOnAssignUUID: extra.UUID,
 	}
 	adapter, _ := New(api)
+	configureFastNetworkReadback(adapter, boundedReadbackTestTimeout)
 	_, err := adapter.CreateVM(context.Background(), testRequest())
 	if !errors.Is(err, cloudapi.ErrOwnershipMismatch) || !strings.Contains(err.Error(), "attached exactly once to intended firewall") {
 		t.Fatalf("CreateVM() error = %v, want post-assignment firewall audit rejection", err)
@@ -588,6 +1167,7 @@ func TestCreateRetriesTransientNetworkReadbackErrors(t *testing.T) {
 func TestCreateDoesNotRetryNonRetryableNetworkReadbackError(t *testing.T) {
 	api := &fakeAPI{networkErrors: map[int]error{2: &sdk.APIError{StatusCode: 403}}}
 	adapter, _ := New(api)
+	configureFastNetworkReadback(adapter, boundedReadbackTestTimeout)
 	started := time.Now()
 	_, err := adapter.CreateVM(context.Background(), testRequest())
 	if err == nil || !strings.Contains(err.Error(), "getting worker network") {
@@ -614,6 +1194,7 @@ func TestCreateRejectsMalformedNetworkMembershipReadback(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			adapter, _ := New(api)
+			configureFastNetworkReadback(adapter, boundedReadbackTestTimeout)
 			_, err := adapter.CreateVM(context.Background(), testRequest())
 			if err == nil {
 				t.Fatal("expected malformed network read-back rejection")
@@ -653,6 +1234,7 @@ func TestCreateCancellationStopsVPCWaitAndUsesDetachedCleanup(t *testing.T) {
 		}
 	}
 	adapter, _ := New(api)
+	configureFastNetworkReadback(adapter, boundedReadbackTestTimeout)
 	started := time.Now()
 	_, err := adapter.CreateVM(ctx, testRequest())
 	if !errors.Is(err, context.Canceled) {
@@ -672,6 +1254,7 @@ func TestCreateCancellationStopsVPCWaitAndUsesDetachedCleanup(t *testing.T) {
 func TestCreateCallerDeadlineFailsClosed(t *testing.T) {
 	api := &fakeAPI{network: &sdk.Network{UUID: "network-1", Subnet: "10.0.0.0/24"}}
 	adapter, _ := New(api)
+	configureFastNetworkReadback(adapter, boundedReadbackTestTimeout)
 	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
 	defer cancel()
 	_, err := adapter.CreateVM(ctx, testRequest())
@@ -706,6 +1289,7 @@ func TestCreatedWorkerRejectsServiceCIDROverlapAppearingDuringNetworkReadback(t 
 		}
 	}
 	adapter, _ := New(api)
+	configureFastNetworkReadback(adapter, boundedReadbackTestTimeout)
 	_, err := adapter.CreateVM(context.Background(), testRequest())
 	if err == nil || !strings.Contains(err.Error(), "must not overlap Kubernetes Service CIDR 10.43.0.0/16") {
 		t.Fatalf("CreateVM() error = %v, want Service-CIDR overlap during readback", err)
@@ -744,6 +1328,7 @@ func TestCreateRejectsImpossibleControlPlaneVIPBeforeMutation(t *testing.T) {
 func TestCreateRejectsNonEmptyMismatchedVMNetwork(t *testing.T) {
 	api := &fakeAPI{createdNetworkUUID: "other-network"}
 	adapter, _ := New(api)
+	configureFastNetworkReadback(adapter, boundedReadbackTestTimeout)
 	if _, err := adapter.CreateVM(context.Background(), testRequest()); err == nil || !strings.Contains(err.Error(), "instead of") {
 		t.Fatalf("CreateVM() error = %v, want wrong-network rejection", err)
 	}
@@ -764,7 +1349,7 @@ func TestCreateRefusesToAdoptOwnedVMFromAnotherNetwork(t *testing.T) {
 	api.floatingIPs = nil
 	api.operations = nil
 	api.vms[0].NetworkUUID = "other-network"
-	if _, err := adapter.CreateVM(context.Background(), testRequest()); err == nil || !strings.Contains(err.Error(), "launch parameters differ") {
+	if _, err := adapter.CreateVM(context.Background(), testRequest()); err == nil || !strings.Contains(err.Error(), "persisted launch identity differs") {
 		t.Fatalf("CreateVM() error = %v, want wrong-network adoption refusal", err)
 	}
 	if api.createCalls != 1 || len(api.vms) != 1 || api.floatingIPCreateCalls != 1 || len(api.operations) != 0 {
@@ -796,7 +1381,6 @@ func TestCreateDoesNotDestroyAdoptedVMWhenVPCAttachmentIsTemporarilyAbsent(t *te
 	if _, err := adapter.CreateVM(context.Background(), request); err != nil {
 		t.Fatal(err)
 	}
-	api.vms[0].NetworkUUID = ""
 	api.network = &sdk.Network{UUID: request.NetworkUUID, Subnet: "10.0.0.0/24"}
 	api.operations = nil
 	configureFastNetworkReadback(adapter, 60*time.Millisecond)
@@ -825,6 +1409,7 @@ func TestCreateNeverRetriesAmbiguousUncommittedPOST(t *testing.T) {
 func TestGetListDeleteAreOwnershipBound(t *testing.T) {
 	api := &fakeAPI{}
 	adapter, _ := New(api)
+	configureFastNetworkReadback(adapter, boundedReadbackTestTimeout)
 	created, err := adapter.CreateVM(context.Background(), testRequest())
 	if err != nil {
 		t.Fatal(err)
@@ -847,6 +1432,1145 @@ func TestGetListDeleteAreOwnershipBound(t *testing.T) {
 	wantOrder := []string{"unassign-floating-ip", "delete-floating-ip", "delete-vm", "unassign-firewall"}
 	if !reflect.DeepEqual(api.operations, wantOrder) {
 		t.Fatalf("unsafe deletion order %v, want %v", api.operations, wantOrder)
+	}
+}
+
+func TestListVMsUsesCanonicalDetailsWhenListDescriptionsAreSparse(t *testing.T) {
+	api := &fakeAPI{}
+	adapter, _ := New(api)
+	created, err := adapter.CreateVM(context.Background(), testRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	api.omitVMListDescriptions = true
+	getCallsBefore := api.vmGetCalls
+	listed, err := adapter.ListVMs(context.Background(), "bkk01", "cluster-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(listed) != 1 || listed[0].UUID != created.UUID || listed[0].SpecHash != "spec-a" {
+		t.Fatalf("ListVMs() = %#v, want one canonically owned worker", listed)
+	}
+	if api.vmGetCalls-getCallsBefore != 1 {
+		t.Fatalf("ListVMs canonical detail GET delta=%d, want one", api.vmGetCalls-getCallsBefore)
+	}
+}
+
+func TestListVMsWaitsForCanonicalKarpenterOwnershipToConverge(t *testing.T) {
+	tests := map[string]func(string) string{
+		"empty": func(string) string { return "" },
+		"truncated": func(description string) string {
+			return description[:len(description)/2]
+		},
+		"valid JSON with missing field": func(description string) string {
+			var record ownership
+			if err := json.Unmarshal([]byte(description), &record); err != nil {
+				t.Fatalf("decode ownership fixture: %v", err)
+			}
+			record.NetworkUUID = ""
+			encoded, err := json.Marshal(record)
+			if err != nil {
+				t.Fatalf("encode ownership fixture: %v", err)
+			}
+			return string(encoded)
+		},
+	}
+	for name, makeIncomplete := range tests {
+		t.Run(name, func(t *testing.T) {
+			api := &fakeAPI{}
+			adapter, _ := New(api)
+			created, err := adapter.CreateVM(context.Background(), testRequest())
+			if err != nil {
+				t.Fatal(err)
+			}
+			incompleteDescription := makeIncomplete(api.vms[0].Description)
+			remainingIncompleteReads := 1
+			api.mutateGetVMResponse = func(vm *sdk.VM) {
+				if vm.UUID == created.UUID && remainingIncompleteReads > 0 {
+					remainingIncompleteReads--
+					vm.Description = incompleteDescription
+				}
+			}
+			getCallsBefore := api.vmGetCalls
+			listed, err := adapter.ListVMs(context.Background(), "bkk01", "cluster-a")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(listed) != 1 || listed[0].UUID != created.UUID {
+				t.Fatalf("ListVMs() = %#v, want worker after ownership convergence", listed)
+			}
+			if delta := api.vmGetCalls - getCallsBefore; delta != 2 {
+				t.Fatalf("ListVMs canonical detail GET delta=%d, want incomplete then complete", delta)
+			}
+		})
+	}
+}
+
+func TestListVMsRetriesTransientCanonicalReadUncertaintyForOwnedSummary(t *testing.T) {
+	tests := map[string]func(*fakeAPI, string){
+		"retryable GET": func(api *fakeAPI, uuid string) {
+			api.getVMErrorByUUID = map[string]error{uuid: &sdk.APIError{StatusCode: 503, Retryable: true}}
+			api.getVMHook = func(string) {
+				api.mu.Lock()
+				delete(api.getVMErrorByUUID, uuid)
+				api.mu.Unlock()
+			}
+		},
+		"nil detail": func(api *fakeAPI, uuid string) {
+			api.nilGetVMUUID = uuid
+			api.getVMHook = func(string) {
+				api.mu.Lock()
+				api.nilGetVMUUID = ""
+				api.mu.Unlock()
+			}
+		},
+	}
+	for name, inject := range tests {
+		t.Run(name, func(t *testing.T) {
+			api := &fakeAPI{}
+			adapter, _ := New(api)
+			created, err := adapter.CreateVM(context.Background(), testRequest())
+			if err != nil {
+				t.Fatal(err)
+			}
+			inject(api, created.UUID)
+			getCallsBefore := api.vmGetCalls
+			listed, err := adapter.ListVMs(context.Background(), "bkk01", "cluster-a")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(listed) != 1 || listed[0].UUID != created.UUID {
+				t.Fatalf("ListVMs() = %#v, want worker after transient canonical read uncertainty", listed)
+			}
+			if delta := api.vmGetCalls - getCallsBefore; delta != 2 {
+				t.Fatalf("ListVMs canonical detail GET delta=%d, want uncertain then complete", delta)
+			}
+		})
+	}
+}
+
+func TestListVMsBoundsIncompleteCanonicalKarpenterOwnership(t *testing.T) {
+	api := &fakeAPI{}
+	adapter, _ := New(api)
+	created, err := adapter.CreateVM(context.Background(), testRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	api.mutateGetVMResponse = func(vm *sdk.VM) {
+		if vm.UUID == created.UUID {
+			vm.Description = ""
+		}
+	}
+	configureFastNetworkReadback(adapter, boundedReadbackTestTimeout)
+	adapter.protectionAuditTimeout = boundedReadbackTestTimeout
+	getCallsBefore := api.vmGetCalls
+	operationsBefore := append([]string(nil), api.operations...)
+	_, err = adapter.ListVMs(context.Background(), "bkk01", "cluster-a")
+	if !errors.Is(err, cloudapi.ErrOwnershipMismatch) || !errors.Is(err, errPersistedOwnershipIncomplete) || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("ListVMs() error = %v, want bounded incomplete Karpenter ownership failure", err)
+	}
+	if delta := api.vmGetCalls - getCallsBefore; delta < 2 {
+		t.Fatalf("ListVMs canonical detail GET delta=%d, want bounded retries", delta)
+	}
+	if !reflect.DeepEqual(api.operations, operationsBefore) || api.deleteVMCalls != 0 {
+		t.Fatalf("read-only ownership convergence mutated cloud resources: before=%v after=%v deletes=%d", operationsBefore, api.operations, api.deleteVMCalls)
+	}
+}
+
+func TestListVMsIgnoresDefinitivelyForeignDescriptions(t *testing.T) {
+	api := &fakeAPI{}
+	adapter, _ := New(api)
+	created, err := adapter.CreateVM(context.Background(), testRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	api.vms = append(api.vms,
+		sdk.VM{UUID: "55555555-5555-4555-8555-555555555555", Name: "other-cluster-partial", Description: `{"schema":"karpenter.inspace.cloud/v1","cluster":"other-cluster"}`},
+		sdk.VM{UUID: "66666666-6666-4666-8666-666666666666", Name: "foreign-note", Description: "notes mention karpenter.inspace.cloud/v1 but this VM is manual"},
+		sdk.VM{UUID: "77777777-7777-4777-8777-777777777777", Name: "foreign-plain", Description: "managed manually"},
+		sdk.VM{UUID: "88888888-8888-4888-8888-888888888888", Name: "foreign-malformed", Description: "{not-json"},
+		sdk.VM{UUID: "99999999-9999-4999-8999-999999999999", Name: "foreign-json", Description: `{"schema":"foreign.example/v1"}`},
+	)
+	getCallsBefore := api.vmGetCalls
+	listed, err := adapter.ListVMs(context.Background(), "bkk01", "cluster-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(listed) != 1 || listed[0].UUID != created.UUID {
+		t.Fatalf("ListVMs() = %#v, want foreign descriptions ignored", listed)
+	}
+	if delta := api.vmGetCalls - getCallsBefore; delta != 6 {
+		t.Fatalf("ListVMs canonical detail GET delta=%d, want one read per row", delta)
+	}
+}
+
+func TestListVMsIgnoresExplicitForeignV1RecordsBeforeLaunchSemantics(t *testing.T) {
+	api := &fakeAPI{}
+	adapter, _ := New(api)
+	created, err := adapter.CreateVM(context.Background(), testRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var base ownership
+	if err := json.Unmarshal([]byte(api.vms[0].Description), &base); err != nil {
+		t.Fatal(err)
+	}
+	base.Cluster = "other-cluster"
+	tests := []struct {
+		uuid   string
+		mutate func(*ownership)
+	}{
+		{uuid: "55555555-5555-4555-8555-555555555555", mutate: func(record *ownership) { record.HostClass = "future-host" }},
+		{uuid: "66666666-6666-4666-8666-666666666666", mutate: func(record *ownership) { record.InstanceType = "future-shape" }},
+		{uuid: "77777777-7777-4777-8777-777777777777", mutate: func(record *ownership) { record.HostPoolUUID = "future-pool" }},
+		{uuid: "88888888-8888-4888-8888-888888888888", mutate: func(record *ownership) { record.VCPU++ }},
+		{uuid: "99999999-9999-4999-8999-999999999999", mutate: func(record *ownership) { record.MemoryGiB++ }},
+	}
+	for _, test := range tests {
+		record := base
+		test.mutate(&record)
+		description, err := json.Marshal(record)
+		if err != nil {
+			t.Fatal(err)
+		}
+		api.vms = append(api.vms, sdk.VM{UUID: test.uuid, Name: "foreign-worker", Description: string(description)})
+	}
+	getCallsBefore := api.vmGetCalls
+	listed, err := adapter.ListVMs(context.Background(), "bkk01", "cluster-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(listed) != 1 || listed[0].UUID != created.UUID {
+		t.Fatalf("ListVMs() = %#v, want only target-cluster worker", listed)
+	}
+	if delta := api.vmGetCalls - getCallsBefore; delta != len(tests)+1 {
+		t.Fatalf("ListVMs canonical GET delta=%d, want one read per row", delta)
+	}
+}
+
+func TestListVMsIgnoresCanonicalDriftBetweenExplicitForeignV1Records(t *testing.T) {
+	tests := map[string]func(*ownership){
+		"ownership fields": func(record *ownership) {
+			record.SpecHash = "foreign-reconciled-spec"
+			record.HostPoolUUID = "foreign-future-pool"
+			record.VCPU++
+		},
+		"foreign cluster": func(record *ownership) {
+			record.Cluster = "another-foreign-cluster"
+		},
+	}
+	for name, mutateCanonical := range tests {
+		t.Run(name, func(t *testing.T) {
+			api := &fakeAPI{}
+			adapter, _ := New(api)
+			created, err := adapter.CreateVM(context.Background(), testRequest())
+			if err != nil {
+				t.Fatal(err)
+			}
+			foreignVM := api.vms[0]
+			foreignVM.UUID = "99999999-9999-4999-8999-999999999999"
+			foreignVM.Name = "foreign-worker"
+			var listedRecord ownership
+			if err := json.Unmarshal([]byte(foreignVM.Description), &listedRecord); err != nil {
+				t.Fatal(err)
+			}
+			listedRecord.Cluster = "foreign-cluster"
+			listedDescription, err := json.Marshal(listedRecord)
+			if err != nil {
+				t.Fatal(err)
+			}
+			foreignVM.Description = string(listedDescription)
+			api.vms = append(api.vms, foreignVM)
+
+			canonicalRecord := listedRecord
+			mutateCanonical(&canonicalRecord)
+			canonicalDescription, err := json.Marshal(canonicalRecord)
+			if err != nil {
+				t.Fatal(err)
+			}
+			api.mutateGetVMResponse = func(vm *sdk.VM) {
+				if vm.UUID == foreignVM.UUID {
+					vm.Description = string(canonicalDescription)
+				}
+			}
+			api.operations = nil
+			getCallsBefore := api.vmGetCalls
+			listed, err := adapter.ListVMs(context.Background(), "bkk01", "cluster-a")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(listed) != 1 || listed[0].UUID != created.UUID {
+				t.Fatalf("ListVMs() = %#v, want only target-cluster worker", listed)
+			}
+			if delta := api.vmGetCalls - getCallsBefore; delta != 2 {
+				t.Fatalf("ListVMs canonical GET delta=%d, want one read per row", delta)
+			}
+			if api.deleteVMCalls != 0 || len(api.operations) != 0 {
+				t.Fatalf("foreign inventory audit mutated cloud state: deletes=%d operations=%v", api.deleteVMCalls, api.operations)
+			}
+		})
+	}
+}
+
+func TestListVMsKeepsAmbiguousTargetOwnershipSticky(t *testing.T) {
+	api := &fakeAPI{}
+	adapter, _ := New(api)
+	configureFastNetworkReadback(adapter, 40*time.Millisecond)
+	adapter.protectionAuditTimeout = 40 * time.Millisecond
+	if _, err := adapter.CreateVM(context.Background(), testRequest()); err != nil {
+		t.Fatal(err)
+	}
+	var foreign ownership
+	if err := json.Unmarshal([]byte(api.vms[0].Description), &foreign); err != nil {
+		t.Fatal(err)
+	}
+	foreign.Cluster = "other-cluster"
+	foreign.HostClass = "future-host"
+	foreignDescription, err := json.Marshal(foreign)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foreignUUID := "99999999-9999-4999-8999-999999999999"
+	api.vms = append(api.vms, sdk.VM{
+		UUID: foreignUUID, Name: "ambiguous-worker",
+		Description: `{"schema":"karpenter.inspace.cloud/v1","cluster":""}`,
+	})
+	api.mutateGetVMResponse = func(vm *sdk.VM) {
+		if vm.UUID == foreignUUID {
+			vm.Description = string(foreignDescription)
+		}
+	}
+	api.operations = nil
+	getCallsBefore := api.vmGetCalls
+	_, err = adapter.ListVMs(context.Background(), "bkk01", "cluster-a")
+	if !errors.Is(err, cloudapi.ErrOwnershipMismatch) || !errors.Is(err, errPersistedOwnershipIncomplete) || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("ListVMs() error = %v, want sticky target ownership uncertainty", err)
+	}
+	if delta := api.vmGetCalls - getCallsBefore; delta < 3 {
+		t.Fatalf("ListVMs ambiguous target GET delta=%d, want bounded retries", delta)
+	}
+	if api.deleteVMCalls != 0 || len(api.operations) != 0 {
+		t.Fatalf("ambiguous target audit mutated cloud state: deletes=%d operations=%v", api.deleteVMCalls, api.operations)
+	}
+}
+
+func TestListVMsRejectsUnsupportedReservedOwnershipSchema(t *testing.T) {
+	t.Run("list summary", func(t *testing.T) {
+		api := &fakeAPI{vms: []sdk.VM{{
+			UUID: "77777777-7777-4777-8777-777777777777", Name: "future-owned",
+			Description: `{"schema":"karpenter.inspace.cloud/v3","cluster":"cluster-a"}`,
+		}}}
+		adapter, _ := New(api)
+		_, err := adapter.ListVMs(context.Background(), "bkk01", "cluster-a")
+		if !errors.Is(err, cloudapi.ErrOwnershipMismatch) || !strings.Contains(err.Error(), `unsupported Karpenter ownership schema "karpenter.inspace.cloud/v3"`) {
+			t.Fatalf("ListVMs() error = %v, want unsupported reserved list schema rejection", err)
+		}
+		if api.vmGetCalls != 0 || len(api.operations) != 0 {
+			t.Fatalf("unsupported list schema reached canonical read or mutation: GETs=%d operations=%v", api.vmGetCalls, api.operations)
+		}
+	})
+
+	t.Run("foreign cluster", func(t *testing.T) {
+		api := &fakeAPI{vms: []sdk.VM{{
+			UUID: "77777777-7777-4777-8777-777777777777", Name: "future-owned",
+			Description: `{"schema":"karpenter.inspace.cloud/v3","cluster":"other-cluster"}`,
+		}}}
+		adapter, _ := New(api)
+		_, err := adapter.ListVMs(context.Background(), "bkk01", "cluster-a")
+		if !errors.Is(err, cloudapi.ErrOwnershipMismatch) || !strings.Contains(err.Error(), `unsupported Karpenter ownership schema "karpenter.inspace.cloud/v3"`) {
+			t.Fatalf("ListVMs() error = %v, want global unsupported reserved schema rejection", err)
+		}
+		if api.vmGetCalls != 0 || len(api.operations) != 0 {
+			t.Fatalf("unsupported foreign schema reached canonical read or mutation: GETs=%d operations=%v", api.vmGetCalls, api.operations)
+		}
+	})
+
+	t.Run("canonical detail", func(t *testing.T) {
+		api := &fakeAPI{}
+		adapter, _ := New(api)
+		created, err := adapter.CreateVM(context.Background(), testRequest())
+		if err != nil {
+			t.Fatal(err)
+		}
+		api.mutateGetVMResponse = func(vm *sdk.VM) {
+			if vm.UUID == created.UUID {
+				vm.Description = strings.Replace(vm.Description, ownershipSchema, ownershipSchemaNamespace+"v3", 1)
+			}
+		}
+		getCallsBefore := api.vmGetCalls
+		operationsBefore := append([]string(nil), api.operations...)
+		_, err = adapter.ListVMs(context.Background(), "bkk01", "cluster-a")
+		if !errors.Is(err, cloudapi.ErrOwnershipMismatch) || !strings.Contains(err.Error(), `unsupported Karpenter ownership schema "karpenter.inspace.cloud/v3"`) {
+			t.Fatalf("ListVMs() error = %v, want unsupported reserved canonical schema rejection", err)
+		}
+		if delta := api.vmGetCalls - getCallsBefore; delta != 1 {
+			t.Fatalf("unsupported canonical schema GET delta=%d, want immediate rejection", delta)
+		}
+		if !reflect.DeepEqual(api.operations, operationsBefore) || api.deleteVMCalls != 0 {
+			t.Fatalf("unsupported canonical schema mutated resources: before=%v after=%v deletes=%d", operationsBefore, api.operations, api.deleteVMCalls)
+		}
+	})
+}
+
+func TestInspectOwnershipDescriptionClassifiesSchemaBeforeTypedRecordFields(t *testing.T) {
+	for name, description := range map[string]string{
+		"unsupported schema before incompatible cluster": `{"schema":"karpenter.inspace.cloud/v3","cluster":123}`,
+		"unsupported schema after incompatible fields":   `{"cluster":[],"nodeClaim":{},"schema":"karpenter.inspace.cloud/future"}`,
+		"unsupported foreign-cluster record":             `{"schema":"karpenter.inspace.cloud/v99","cluster":"other-cluster","rootDiskGiB":"large"}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, managed, complete, err := inspectOwnershipDescription(description, "cluster-a")
+			if !errors.Is(err, cloudapi.ErrOwnershipMismatch) || !strings.Contains(err.Error(), "unsupported Karpenter ownership schema") {
+				t.Fatalf("inspectOwnershipDescription() managed=%t complete=%t err=%v, want unsupported reserved schema rejection", managed, complete, err)
+			}
+		})
+	}
+
+	t.Run("foreign namespace remains unmanaged", func(t *testing.T) {
+		record, managed, complete, err := inspectOwnershipDescription(`{"schema":"foreign.example/v1","cluster":123,"nodeClaim":[]}`, "cluster-a")
+		if err != nil || managed || complete || record != (ownership{}) {
+			t.Fatalf("inspectOwnershipDescription() = %#v, %t, %t, %v; want unmanaged foreign schema", record, managed, complete, err)
+		}
+	})
+
+	t.Run("valid v1 with incompatible field stays managed and incomplete", func(t *testing.T) {
+		record, managed, complete, err := inspectOwnershipDescription(`{"schema":"karpenter.inspace.cloud/v1","cluster":"cluster-a","nodeClaim":[]}`, "cluster-a")
+		if err != nil || !managed || complete || record.Schema != legacyOwnershipSchema || record.Cluster != "cluster-a" {
+			t.Fatalf("inspectOwnershipDescription() = %#v, %t, %t, %v; want sticky incomplete v1 target evidence", record, managed, complete, err)
+		}
+	})
+
+	t.Run("truncated v1 target remains sticky", func(t *testing.T) {
+		record, managed, complete, err := inspectOwnershipDescription(`{"schema":"karpenter.inspace.cloud/v1","cluster":"cluster-a"`, "cluster-a")
+		if err != nil || !managed || complete || record.Cluster != "cluster-a" {
+			t.Fatalf("inspectOwnershipDescription() = %#v, %t, %t, %v; want sticky truncated v1 target evidence", record, managed, complete, err)
+		}
+	})
+
+	for _, cluster := range []string{"cluster-a", "other-cluster"} {
+		t.Run("truncated reserved future schema rejects "+cluster, func(t *testing.T) {
+			_, managed, complete, err := inspectOwnershipDescription(`{"schema":"karpenter.inspace.cloud/v3","cluster":"`+cluster+`"`, "cluster-a")
+			if !errors.Is(err, cloudapi.ErrOwnershipMismatch) || !strings.Contains(err.Error(), `unsupported Karpenter ownership schema "karpenter.inspace.cloud/v3"`) || managed || complete {
+				t.Fatalf("inspectOwnershipDescription() managed=%t complete=%t err=%v; want global truncated reserved-schema rejection", managed, complete, err)
+			}
+		})
+	}
+}
+
+func TestListVMsRejectsManagedListAndCanonicalOwnershipDisagreement(t *testing.T) {
+	tests := map[string]struct {
+		mutate func(*ownership)
+		want   string
+	}{
+		"cluster": {
+			mutate: func(record *ownership) { record.Cluster = "other-cluster" },
+			want:   "differs from list cluster",
+		},
+		"same-cluster field": {
+			mutate: func(record *ownership) { record.SpecHash = "other-spec" },
+			want:   "differs from its complete list record",
+		},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			api := &fakeAPI{}
+			adapter, _ := New(api)
+			created, err := adapter.CreateVM(context.Background(), testRequest())
+			if err != nil {
+				t.Fatal(err)
+			}
+			var canonicalRecord ownership
+			if err := json.Unmarshal([]byte(api.vms[0].Description), &canonicalRecord); err != nil {
+				t.Fatalf("decode ownership fixture: %v", err)
+			}
+			test.mutate(&canonicalRecord)
+			encoded, err := json.Marshal(canonicalRecord)
+			if err != nil {
+				t.Fatalf("encode ownership fixture: %v", err)
+			}
+			canonicalDescription := string(encoded)
+			api.mutateGetVMResponse = func(vm *sdk.VM) {
+				if vm.UUID != created.UUID {
+					return
+				}
+				vm.Description = canonicalDescription
+			}
+			getCallsBefore := api.vmGetCalls
+			_, err = adapter.ListVMs(context.Background(), "bkk01", "cluster-a")
+			if !errors.Is(err, cloudapi.ErrOwnershipMismatch) || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("ListVMs() error = %v, want managed list/detail ownership disagreement", err)
+			}
+			if delta := api.vmGetCalls - getCallsBefore; delta != 1 {
+				t.Fatalf("managed ownership conflict GET delta=%d, want immediate failure", delta)
+			}
+			if api.deleteVMCalls != 0 {
+				t.Fatalf("read-only ownership disagreement deleted a VM: %d", api.deleteVMCalls)
+			}
+		})
+	}
+}
+
+func TestListVMsCanonicalizesForeignInventoryInParallelWithoutNameCoupling(t *testing.T) {
+	api := &fakeAPI{}
+	adapter, _ := New(api)
+	created, err := adapter.CreateVM(context.Background(), testRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index := 0; index < 24; index++ {
+		name := "foreign-duplicate"
+		if index == 0 {
+			name = ""
+		}
+		api.vms = append(api.vms, sdk.VM{
+			UUID: fmt.Sprintf("%08d-2222-4333-8444-555555555555", index+100),
+			Name: name, Description: "foreign", Status: "running",
+		})
+	}
+	api.omitVMListDescriptions = true
+	var concurrencyMu sync.Mutex
+	activeReads, maxReads := 0, 0
+	api.getVMHook = func(string) {
+		concurrencyMu.Lock()
+		activeReads++
+		if activeReads > maxReads {
+			maxReads = activeReads
+		}
+		concurrencyMu.Unlock()
+		time.Sleep(5 * time.Millisecond)
+		concurrencyMu.Lock()
+		activeReads--
+		concurrencyMu.Unlock()
+	}
+	listed, err := adapter.ListVMs(context.Background(), "bkk01", "cluster-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(listed) != 1 || listed[0].UUID != created.UUID {
+		t.Fatalf("ListVMs() = %#v, want only the canonical owned worker", listed)
+	}
+	if maxReads < 2 || maxReads > canonicalVMReadConcurrency {
+		t.Fatalf("canonical detail concurrency=%d, want 2..%d", maxReads, canonicalVMReadConcurrency)
+	}
+}
+
+func TestListVMsSkipsStaleNotFoundRowButRejectsNilCanonicalDetail(t *testing.T) {
+	for name, nilResponse := range map[string]bool{"stale not found": false, "nil response": true} {
+		t.Run(name, func(t *testing.T) {
+			api := &fakeAPI{}
+			adapter, _ := New(api)
+			created, err := adapter.CreateVM(context.Background(), testRequest())
+			if err != nil {
+				t.Fatal(err)
+			}
+			foreignUUID := "99999999-9999-4999-8999-999999999999"
+			api.vms = append(api.vms, sdk.VM{UUID: foreignUUID, Name: "foreign"})
+			if nilResponse {
+				api.nilGetVMUUID = foreignUUID
+			} else {
+				api.getVMErrorByUUID = map[string]error{foreignUUID: &sdk.APIError{StatusCode: 404}}
+			}
+			listed, err := adapter.ListVMs(context.Background(), "bkk01", "cluster-a")
+			if nilResponse {
+				if !errors.Is(err, cloudapi.ErrOwnershipMismatch) {
+					t.Fatalf("ListVMs() error = %v, want nil-detail rejection", err)
+				}
+				return
+			}
+			if err != nil || len(listed) != 1 || listed[0].UUID != created.UUID {
+				t.Fatalf("ListVMs() = %#v, %v, want stale foreign row skipped", listed, err)
+			}
+		})
+	}
+}
+
+func TestListVMsRejectsForeignCanonicalReadErrorOrIdentityMismatch(t *testing.T) {
+	tests := map[string]func(*fakeAPI, string){
+		"non-not-found error": func(api *fakeAPI, uuid string) {
+			api.getVMErrorByUUID = map[string]error{uuid: &sdk.APIError{StatusCode: 503, Retryable: true}}
+		},
+		"UUID mismatch": func(api *fakeAPI, uuid string) {
+			api.mutateGetVMResponse = func(vm *sdk.VM) {
+				if vm.UUID == uuid {
+					vm.UUID = "88888888-8888-4888-8888-888888888888"
+				}
+			}
+		},
+		"name mismatch": func(api *fakeAPI, uuid string) {
+			api.mutateGetVMResponse = func(vm *sdk.VM) {
+				if vm.UUID == uuid {
+					vm.Name = "changed"
+				}
+			}
+		},
+	}
+	for name, inject := range tests {
+		t.Run(name, func(t *testing.T) {
+			api := &fakeAPI{}
+			adapter, _ := New(api)
+			if _, err := adapter.CreateVM(context.Background(), testRequest()); err != nil {
+				t.Fatal(err)
+			}
+			foreignUUID := "99999999-9999-4999-8999-999999999999"
+			api.vms = append(api.vms, sdk.VM{UUID: foreignUUID, Name: "foreign"})
+			inject(api, foreignUUID)
+			if _, err := adapter.ListVMs(context.Background(), "bkk01", "cluster-a"); err == nil {
+				t.Fatal("ListVMs() accepted uncertain canonical foreign detail")
+			}
+			if api.deleteVMCalls != 0 {
+				t.Fatalf("read-only canonical failure deleted a VM: %d", api.deleteVMCalls)
+			}
+		})
+	}
+}
+
+func TestEstablishedWorkerReadsFailClosedOnLaunchIdentityDrift(t *testing.T) {
+	tests := map[string]func(*sdk.VM){
+		"name":            func(vm *sdk.VM) { vm.Name = "other-nodeclaim" },
+		"hostname":        func(vm *sdk.VM) { vm.Hostname = "other-nodeclaim" },
+		"vCPU":            func(vm *sdk.VM) { vm.VCPU++ },
+		"memory":          func(vm *sdk.VM) { vm.MemoryMiB += 1024 },
+		"OS name":         func(vm *sdk.VM) { vm.OSName = "debian" },
+		"OS version":      func(vm *sdk.VM) { vm.OSVersion = "22.04" },
+		"host pool":       func(vm *sdk.VM) { vm.DesignatedPoolUUID = "other-pool" },
+		"network":         func(vm *sdk.VM) { vm.NetworkUUID = "other-network" },
+		"billing account": func(vm *sdk.VM) { vm.BillingAccountID++ },
+		"root disk size":  func(vm *sdk.VM) { vm.Storage[0].SizeGiB++ },
+		"second root disk": func(vm *sdk.VM) {
+			vm.Storage = append(vm.Storage, sdk.VMStorage{SizeGiB: vm.Storage[0].SizeGiB, Primary: true})
+		},
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			api := &fakeAPI{}
+			adapter, _ := New(api)
+			created, err := adapter.CreateVM(context.Background(), testRequest())
+			if err != nil {
+				t.Fatal(err)
+			}
+			mutate(&api.vms[0])
+			api.operations = nil
+			getCallsBefore := api.vmGetCalls
+			if _, err := adapter.GetVM(context.Background(), "bkk01", created.UUID, "cluster-a"); !errors.Is(err, cloudapi.ErrOwnershipMismatch) || !strings.Contains(err.Error(), "launch identity drift") {
+				t.Fatalf("GetVM() error = %v, want established launch identity drift", err)
+			}
+			if delta := api.vmGetCalls - getCallsBefore; delta != 1 {
+				t.Fatalf("GetVM conflict GET delta=%d, want immediate failure", delta)
+			}
+			getCallsBefore = api.vmGetCalls
+			if _, err := adapter.ListVMs(context.Background(), "bkk01", "cluster-a"); !errors.Is(err, cloudapi.ErrOwnershipMismatch) || !strings.Contains(err.Error(), "launch identity drift") {
+				t.Fatalf("ListVMs() error = %v, want established launch identity drift", err)
+			}
+			if delta := api.vmGetCalls - getCallsBefore; delta != 1 {
+				t.Fatalf("ListVMs conflict GET delta=%d, want immediate failure", delta)
+			}
+			if api.deleteVMCalls != 0 || len(api.operations) != 0 {
+				t.Fatalf("read-only launch drift audit mutated cloud state: deletes=%d operations=%v", api.deleteVMCalls, api.operations)
+			}
+		})
+	}
+}
+
+func TestGetVMRetriesTransientEstablishedCanonicalReads(t *testing.T) {
+	tests := map[string]func(*fakeAPI, string){
+		"retryable service unavailable": func(api *fakeAPI, uuid string) {
+			api.getVMErrorByUUID = map[string]error{uuid: &sdk.APIError{StatusCode: 503, Retryable: true}}
+			api.getVMHook = func(string) {
+				api.mu.Lock()
+				delete(api.getVMErrorByUUID, uuid)
+				api.mu.Unlock()
+			}
+		},
+		"HTTP request timeout": func(api *fakeAPI, uuid string) {
+			api.getVMErrorByUUID = map[string]error{uuid: &sdk.APIError{StatusCode: 408}}
+			api.getVMHook = func(string) {
+				api.mu.Lock()
+				delete(api.getVMErrorByUUID, uuid)
+				api.mu.Unlock()
+			}
+		},
+		"transport failure": func(api *fakeAPI, uuid string) {
+			api.getVMErrorByUUID = map[string]error{uuid: errors.New("connection reset while reading response")}
+			api.getVMHook = func(string) {
+				api.mu.Lock()
+				delete(api.getVMErrorByUUID, uuid)
+				api.mu.Unlock()
+			}
+		},
+		"request context timeout": func(api *fakeAPI, uuid string) {
+			api.getVMErrorByUUID = map[string]error{uuid: context.DeadlineExceeded}
+			api.getVMHook = func(string) {
+				api.mu.Lock()
+				delete(api.getVMErrorByUUID, uuid)
+				api.mu.Unlock()
+			}
+		},
+		"empty detail": func(api *fakeAPI, uuid string) {
+			api.nilGetVMUUID = uuid
+			api.getVMHook = func(string) {
+				api.mu.Lock()
+				api.nilGetVMUUID = ""
+				api.mu.Unlock()
+			}
+		},
+	}
+	for name, inject := range tests {
+		t.Run(name, func(t *testing.T) {
+			api := &fakeAPI{}
+			adapter, _ := New(api)
+			created, err := adapter.CreateVM(context.Background(), testRequest())
+			if err != nil {
+				t.Fatal(err)
+			}
+			inject(api, created.UUID)
+			api.operations = nil
+			getCallsBefore := api.vmGetCalls
+			got, err := adapter.GetVM(context.Background(), "bkk01", created.UUID, "cluster-a")
+			if err != nil || got.UUID != created.UUID {
+				t.Fatalf("GetVM() = %#v, %v, want worker after transient canonical read uncertainty", got, err)
+			}
+			if delta := api.vmGetCalls - getCallsBefore; delta != 2 {
+				t.Fatalf("GetVM canonical GET delta=%d, want uncertain then complete", delta)
+			}
+			if api.deleteVMCalls != 0 || len(api.operations) != 0 {
+				t.Fatalf("established read convergence mutated cloud state: deletes=%d operations=%v", api.deleteVMCalls, api.operations)
+			}
+		})
+	}
+}
+
+func TestGetVMBoundsPersistentTransientEstablishedCanonicalReads(t *testing.T) {
+	tests := map[string]func(*fakeAPI, string){
+		"retryable service unavailable": func(api *fakeAPI, uuid string) {
+			api.getVMErrorByUUID = map[string]error{uuid: &sdk.APIError{StatusCode: 503, Retryable: true}}
+		},
+		"empty detail": func(api *fakeAPI, uuid string) {
+			api.nilGetVMUUID = uuid
+		},
+	}
+	for name, inject := range tests {
+		t.Run(name, func(t *testing.T) {
+			api := &fakeAPI{}
+			adapter, _ := New(api)
+			configureFastNetworkReadback(adapter, boundedReadbackTestTimeout)
+			adapter.protectionAuditTimeout = boundedReadbackTestTimeout
+			created, err := adapter.CreateVM(context.Background(), testRequest())
+			if err != nil {
+				t.Fatal(err)
+			}
+			inject(api, created.UUID)
+			api.operations = nil
+			getCallsBefore := api.vmGetCalls
+			_, err = adapter.GetVM(context.Background(), "bkk01", created.UUID, "cluster-a")
+			if !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("GetVM() error = %v, want bounded read-back deadline", err)
+			}
+			if delta := api.vmGetCalls - getCallsBefore; delta < 2 {
+				t.Fatalf("GetVM canonical GET delta=%d, want bounded retries", delta)
+			}
+			if api.deleteVMCalls != 0 || len(api.operations) != 0 {
+				t.Fatalf("bounded established read mutated cloud state: deletes=%d operations=%v", api.deleteVMCalls, api.operations)
+			}
+		})
+	}
+}
+
+func TestGetVMPreservesOuterDeadlineWhenCanonicalRequestBlocks(t *testing.T) {
+	api := &fakeAPI{}
+	adapter, _ := New(api)
+	created, err := adapter.CreateVM(context.Background(), testRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	api.blockGetVMUUID = created.UUID
+	adapter.protectionAuditTimeout = 30 * time.Millisecond
+	adapter.networkAttachmentRequestTimeout = 100 * time.Millisecond
+	api.operations = nil
+	getCallsBefore := api.vmGetCalls
+	_, err = adapter.GetVM(context.Background(), "bkk01", created.UUID, "cluster-a")
+	if !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "established read-back stopped") {
+		t.Fatalf("GetVM() error = %v, want bounded outer read-back deadline", err)
+	}
+	if delta := api.vmGetCalls - getCallsBefore; delta != 1 || !api.getVMContextCanceled {
+		t.Fatalf("blocking canonical GET delta/canceled=%d/%t, want one request stopped by its parent deadline", delta, api.getVMContextCanceled)
+	}
+	if api.deleteVMCalls != 0 || len(api.operations) != 0 {
+		t.Fatalf("blocking established read mutated cloud state: deletes=%d operations=%v", api.deleteVMCalls, api.operations)
+	}
+}
+
+func TestGetVMRejectsDefinitiveEstablishedCanonicalReadFailuresImmediately(t *testing.T) {
+	tests := map[string]struct {
+		inject func(*fakeAPI, string)
+		check  func(error) bool
+	}{
+		"not found": {
+			inject: func(api *fakeAPI, uuid string) {
+				api.getVMErrorByUUID = map[string]error{uuid: &sdk.APIError{StatusCode: 404}}
+			},
+			check: func(err error) bool { return errors.Is(err, cloudapi.ErrNotFound) },
+		},
+		"permanent API error": {
+			inject: func(api *fakeAPI, uuid string) {
+				api.getVMErrorByUUID = map[string]error{uuid: &sdk.APIError{StatusCode: 400, Message: "invalid UUID"}}
+			},
+			check: func(err error) bool {
+				var apiErr *sdk.APIError
+				return errors.As(err, &apiErr) && apiErr.StatusCode == 400
+			},
+		},
+		"UUID conflict": {
+			inject: func(api *fakeAPI, uuid string) {
+				api.mutateGetVMResponse = func(vm *sdk.VM) {
+					if vm.UUID == uuid {
+						vm.UUID = "88888888-8888-4888-8888-888888888888"
+					}
+				}
+			},
+			check: func(err error) bool {
+				return errors.Is(err, cloudapi.ErrOwnershipMismatch) && strings.Contains(err.Error(), "detail UUID")
+			},
+		},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			api := &fakeAPI{}
+			adapter, _ := New(api)
+			created, err := adapter.CreateVM(context.Background(), testRequest())
+			if err != nil {
+				t.Fatal(err)
+			}
+			test.inject(api, created.UUID)
+			api.operations = nil
+			getCallsBefore := api.vmGetCalls
+			_, err = adapter.GetVM(context.Background(), "bkk01", created.UUID, "cluster-a")
+			if !test.check(err) {
+				t.Fatalf("GetVM() error = %v, want definitive immediate failure", err)
+			}
+			if delta := api.vmGetCalls - getCallsBefore; delta != 1 {
+				t.Fatalf("GetVM canonical GET delta=%d, want immediate failure", delta)
+			}
+			if api.deleteVMCalls != 0 || len(api.operations) != 0 {
+				t.Fatalf("definitive established read failure mutated cloud state: deletes=%d operations=%v", api.deleteVMCalls, api.operations)
+			}
+		})
+	}
+}
+
+func TestEstablishedWorkerReadsAllowOmittedNetworkUUIDWithExactNetworkMembership(t *testing.T) {
+	api := &fakeAPI{}
+	adapter, _ := New(api)
+	created, err := adapter.CreateVM(context.Background(), testRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	api.mutateGetVMResponse = func(vm *sdk.VM) {
+		if vm.UUID == created.UUID {
+			vm.NetworkUUID = ""
+		}
+	}
+	getCallsBefore := api.vmGetCalls
+	if got, err := adapter.GetVM(context.Background(), "bkk01", created.UUID, "cluster-a"); err != nil || got.UUID != created.UUID {
+		t.Fatalf("GetVM() = %#v, %v, want established worker with network proven by membership", got, err)
+	}
+	if delta := api.vmGetCalls - getCallsBefore; delta != 1 {
+		t.Fatalf("GetVM network-omission GET delta=%d, want no convergence retry", delta)
+	}
+	getCallsBefore = api.vmGetCalls
+	if got, err := adapter.ListVMs(context.Background(), "bkk01", "cluster-a"); err != nil || len(got) != 1 || got[0].UUID != created.UUID {
+		t.Fatalf("ListVMs() = %#v, %v, want established worker with network proven by membership", got, err)
+	}
+	if delta := api.vmGetCalls - getCallsBefore; delta != 1 {
+		t.Fatalf("ListVMs network-omission GET delta=%d, want no convergence retry", delta)
+	}
+	api.network = &sdk.Network{UUID: "network-1", Subnet: "10.0.0.0/24"}
+	api.operations = nil
+	if _, err := adapter.GetVM(context.Background(), "bkk01", created.UUID, "cluster-a"); err == nil || !strings.Contains(err.Error(), "network contains VM UUID 0 times") {
+		t.Fatalf("GetVM() error = %v, want exact GetNetwork membership rejection", err)
+	}
+	if api.deleteVMCalls != 0 || len(api.operations) != 0 {
+		t.Fatalf("missing network membership audit mutated cloud state: deletes=%d operations=%v", api.deleteVMCalls, api.operations)
+	}
+}
+
+func TestEstablishedWorkerReadsWaitForMissingLaunchFieldsToConverge(t *testing.T) {
+	tests := map[string]func(*sdk.VM){
+		"name":            func(vm *sdk.VM) { vm.Name = "" },
+		"vCPU":            func(vm *sdk.VM) { vm.VCPU = 0 },
+		"memory":          func(vm *sdk.VM) { vm.MemoryMiB = 0 },
+		"OS name":         func(vm *sdk.VM) { vm.OSName = "" },
+		"OS version":      func(vm *sdk.VM) { vm.OSVersion = "" },
+		"host pool":       func(vm *sdk.VM) { vm.DesignatedPoolUUID = "" },
+		"billing account": func(vm *sdk.VM) { vm.BillingAccountID = 0 },
+		"root disk":       func(vm *sdk.VM) { vm.Storage = nil },
+	}
+	for name, omit := range tests {
+		t.Run(name, func(t *testing.T) {
+			api := &fakeAPI{}
+			adapter, _ := New(api)
+			configureFastNetworkReadback(adapter, boundedReadbackTestTimeout)
+			adapter.protectionAuditTimeout = boundedReadbackTestTimeout
+			created, err := adapter.CreateVM(context.Background(), testRequest())
+			if err != nil {
+				t.Fatal(err)
+			}
+			remainingSparseReads := 1
+			api.mutateGetVMResponse = func(vm *sdk.VM) {
+				if vm.UUID == created.UUID && remainingSparseReads > 0 {
+					remainingSparseReads--
+					omit(vm)
+				}
+			}
+			api.operations = nil
+			getCallsBefore := api.vmGetCalls
+			if got, err := adapter.GetVM(context.Background(), "bkk01", created.UUID, "cluster-a"); err != nil || got.UUID != created.UUID {
+				t.Fatalf("GetVM() = %#v, %v, want convergence", got, err)
+			}
+			if delta := api.vmGetCalls - getCallsBefore; delta != 2 {
+				t.Fatalf("GetVM sparse launch GET delta=%d, want sparse then complete", delta)
+			}
+			remainingSparseReads = 1
+			getCallsBefore = api.vmGetCalls
+			if got, err := adapter.ListVMs(context.Background(), "bkk01", "cluster-a"); err != nil || len(got) != 1 || got[0].UUID != created.UUID {
+				t.Fatalf("ListVMs() = %#v, %v, want convergence", got, err)
+			}
+			if delta := api.vmGetCalls - getCallsBefore; delta != 2 {
+				t.Fatalf("ListVMs sparse launch GET delta=%d, want sparse then complete", delta)
+			}
+			if api.deleteVMCalls != 0 || len(api.operations) != 0 {
+				t.Fatalf("read convergence mutated cloud state: deletes=%d operations=%v", api.deleteVMCalls, api.operations)
+			}
+		})
+	}
+}
+
+func TestEstablishedWorkerReadsBoundPermanentlyMissingLaunchFields(t *testing.T) {
+	for _, operation := range []string{"get", "list"} {
+		t.Run(operation, func(t *testing.T) {
+			api := &fakeAPI{}
+			adapter, _ := New(api)
+			configureFastNetworkReadback(adapter, 40*time.Millisecond)
+			adapter.protectionAuditTimeout = 40 * time.Millisecond
+			created, err := adapter.CreateVM(context.Background(), testRequest())
+			if err != nil {
+				t.Fatal(err)
+			}
+			api.mutateGetVMResponse = func(vm *sdk.VM) { vm.OSVersion = "" }
+			api.operations = nil
+			getCallsBefore := api.vmGetCalls
+			if operation == "get" {
+				_, err = adapter.GetVM(context.Background(), "bkk01", created.UUID, "cluster-a")
+			} else {
+				_, err = adapter.ListVMs(context.Background(), "bkk01", "cluster-a")
+			}
+			if !errors.Is(err, cloudapi.ErrOwnershipMismatch) || !errors.Is(err, errPersistedOwnershipIncomplete) || !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("%s error = %v, want bounded incomplete launch identity", operation, err)
+			}
+			if delta := api.vmGetCalls - getCallsBefore; delta < 2 {
+				t.Fatalf("%s sparse launch GET delta=%d, want bounded retries", operation, delta)
+			}
+			if api.deleteVMCalls != 0 || len(api.operations) != 0 {
+				t.Fatalf("bounded read convergence mutated cloud state: deletes=%d operations=%v", api.deleteVMCalls, api.operations)
+			}
+		})
+	}
+}
+
+func TestEstablishedWorkerReadsSupportDerivableLegacyV1LaunchIdentity(t *testing.T) {
+	api := &fakeAPI{}
+	adapter, _ := New(api)
+	created, err := adapter.CreateVM(context.Background(), testRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var record ownership
+	if err := json.Unmarshal([]byte(api.vms[0].Description), &record); err != nil {
+		t.Fatal(err)
+	}
+	record.HostPoolUUID = ""
+	record.VCPU = 0
+	record.MemoryGiB = 0
+	record.Schema = legacyOwnershipSchema
+	record.VMName = ""
+	legacyDescription, err := json.Marshal(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	api.vms[0].Description = string(legacyDescription)
+	api.vms[0].Name = "nodeclaim-a"
+	if strings.Contains(api.vms[0].Description, `"hostPoolUUID"`) || strings.Contains(api.vms[0].Description, `"vCPU"`) || strings.Contains(api.vms[0].Description, `"memoryGiB"`) || strings.Contains(api.vms[0].Description, `"vmName"`) {
+		t.Fatalf("legacy v1 fixture retained new exact identity fields: %s", api.vms[0].Description)
+	}
+	got, err := adapter.GetVM(context.Background(), "bkk01", created.UUID, "cluster-a")
+	if err != nil || got.VCPU != 2 || got.MemoryGiB != 4 {
+		t.Fatalf("GetVM() = %#v, %v, want derivable legacy v1 worker", got, err)
+	}
+	listed, err := adapter.ListVMs(context.Background(), "bkk01", "cluster-a")
+	if err != nil || len(listed) != 1 || listed[0].UUID != created.UUID {
+		t.Fatalf("ListVMs() = %#v, %v, want derivable legacy v1 worker", listed, err)
+	}
+}
+
+func TestLegacyV1OwnershipRejectsContradictoryAdditiveVMName(t *testing.T) {
+	record := newOwnership(testRequest(), sdk.FloatingIP{
+		Name: floatingIPName("cluster-a", "nodeclaim-a"), Address: "203.0.113.10", BillingAccountID: testRequest().BillingAccountID,
+	})
+	record.Schema = legacyOwnershipSchema
+	record.VMName = "different-worker-name"
+	if _, partial, err := normalizeOwnershipLaunchIdentity(record); err == nil || partial || !strings.Contains(err.Error(), "contradicts NodeClaim identity") {
+		t.Fatalf("normalizeOwnershipLaunchIdentity() partial=%t err=%v, want contradictory legacy VM-name rejection", partial, err)
+	}
+}
+
+func TestEstablishedV2OwnershipRejectsSelfConsistentArbitraryVMName(t *testing.T) {
+	api := &fakeAPI{}
+	adapter, _ := New(api)
+	created, err := adapter.CreateVM(context.Background(), testRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var record ownership
+	if err := json.Unmarshal([]byte(api.vms[0].Description), &record); err != nil {
+		t.Fatal(err)
+	}
+	record.VMName = "arbitrary-worker"
+	api.vms[0].Name = record.VMName
+	description, err := json.Marshal(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	api.vms[0].Description = string(description)
+	api.operations = nil
+	if _, err := adapter.GetVM(context.Background(), "bkk01", created.UUID, "cluster-a"); !errors.Is(err, cloudapi.ErrOwnershipMismatch) || !strings.Contains(err.Error(), "invalid v2 worker identity") {
+		t.Fatalf("GetVM() error = %v, want exact cluster-derived v2 worker identity rejection", err)
+	}
+	if len(api.operations) != 0 || api.deleteVMCalls != 0 {
+		t.Fatalf("invalid established v2 identity mutated cloud state: operations=%v deletes=%d", api.operations, api.deleteVMCalls)
+	}
+}
+
+func TestEstablishedWorkerReadsTreatEveryPartialExactIdentityExtensionAsIncomplete(t *testing.T) {
+	tests := map[string]func(*ownership){
+		"host pool only":       func(record *ownership) { record.VCPU, record.MemoryGiB = 0, 0 },
+		"vCPU only":            func(record *ownership) { record.HostPoolUUID, record.MemoryGiB = "", 0 },
+		"memory only":          func(record *ownership) { record.HostPoolUUID, record.VCPU = "", 0 },
+		"host pool and vCPU":   func(record *ownership) { record.MemoryGiB = 0 },
+		"host pool and memory": func(record *ownership) { record.VCPU = 0 },
+		"vCPU and memory":      func(record *ownership) { record.HostPoolUUID = "" },
+	}
+	for name, makePartial := range tests {
+		t.Run(name, func(t *testing.T) {
+			api := &fakeAPI{}
+			adapter, _ := New(api)
+			configureFastNetworkReadback(adapter, boundedReadbackTestTimeout)
+			adapter.protectionAuditTimeout = boundedReadbackTestTimeout
+			created, err := adapter.CreateVM(context.Background(), testRequest())
+			if err != nil {
+				t.Fatal(err)
+			}
+			var partial ownership
+			if err := json.Unmarshal([]byte(api.vms[0].Description), &partial); err != nil {
+				t.Fatal(err)
+			}
+			makePartial(&partial)
+			partialDescription, err := json.Marshal(partial)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, _, complete, err := inspectOwnershipDescription(string(partialDescription), "cluster-a"); err != nil || complete {
+				t.Fatalf("partial extension inspect complete=%t, err=%v; want incomplete", complete, err)
+			}
+			remainingPartialReads := 1
+			api.mutateGetVMResponse = func(vm *sdk.VM) {
+				if vm.UUID == created.UUID && remainingPartialReads > 0 {
+					remainingPartialReads--
+					vm.Description = string(partialDescription)
+				}
+			}
+			api.operations = nil
+			getCallsBefore := api.vmGetCalls
+			if got, err := adapter.GetVM(context.Background(), "bkk01", created.UUID, "cluster-a"); err != nil || got.UUID != created.UUID {
+				t.Fatalf("GetVM() = %#v, %v, want extension convergence", got, err)
+			}
+			if delta := api.vmGetCalls - getCallsBefore; delta != 2 {
+				t.Fatalf("GetVM partial extension GET delta=%d, want partial then complete", delta)
+			}
+			remainingPartialReads = 1
+			getCallsBefore = api.vmGetCalls
+			if got, err := adapter.ListVMs(context.Background(), "bkk01", "cluster-a"); err != nil || len(got) != 1 || got[0].UUID != created.UUID {
+				t.Fatalf("ListVMs() = %#v, %v, want extension convergence", got, err)
+			}
+			if delta := api.vmGetCalls - getCallsBefore; delta != 2 {
+				t.Fatalf("ListVMs partial extension GET delta=%d, want partial then complete", delta)
+			}
+			if api.deleteVMCalls != 0 || len(api.operations) != 0 {
+				t.Fatalf("partial extension convergence mutated cloud state: deletes=%d operations=%v", api.deleteVMCalls, api.operations)
+			}
+		})
+	}
+}
+
+func TestPartialExactIdentityExtensionRejectsPresentConflictsImmediately(t *testing.T) {
+	tests := map[string]func(*ownership){
+		"host pool": func(record *ownership) {
+			record.HostPoolUUID, record.VCPU, record.MemoryGiB = "other-pool", 0, 0
+		},
+		"vCPU": func(record *ownership) {
+			record.HostPoolUUID, record.VCPU, record.MemoryGiB = "", 4, 0
+		},
+		"memory": func(record *ownership) {
+			record.HostPoolUUID, record.VCPU, record.MemoryGiB = "", 0, 8
+		},
+	}
+	for name, conflict := range tests {
+		t.Run(name, func(t *testing.T) {
+			record := newOwnership(testRequest(), sdk.FloatingIP{
+				Name: floatingIPName("cluster-a", "nodeclaim-a"), Address: "203.0.113.10", BillingAccountID: testRequest().BillingAccountID,
+			})
+			conflict(&record)
+			if _, partial, err := normalizeOwnershipLaunchIdentity(record); err == nil || partial {
+				t.Fatalf("normalizeOwnershipLaunchIdentity() partial=%t, err=%v; want immediate conflict", partial, err)
+			}
+		})
+	}
+}
+
+func TestGetVMRequiresCompleteEstablishedOwnershipRecord(t *testing.T) {
+	for _, field := range []string{"VM name", "spec hash", "bootstrap hash"} {
+		t.Run(field, func(t *testing.T) {
+			api := &fakeAPI{}
+			adapter, _ := New(api)
+			configureFastNetworkReadback(adapter, 40*time.Millisecond)
+			adapter.protectionAuditTimeout = 40 * time.Millisecond
+			created, err := adapter.CreateVM(context.Background(), testRequest())
+			if err != nil {
+				t.Fatal(err)
+			}
+			var record ownership
+			if err := json.Unmarshal([]byte(api.vms[0].Description), &record); err != nil {
+				t.Fatal(err)
+			}
+			if field == "VM name" {
+				record.VMName = ""
+			} else if field == "spec hash" {
+				record.SpecHash = ""
+			} else {
+				record.BootstrapHash = ""
+			}
+			encoded, err := json.Marshal(record)
+			if err != nil {
+				t.Fatal(err)
+			}
+			api.vms[0].Description = string(encoded)
+			api.operations = nil
+			_, err = adapter.GetVM(context.Background(), "bkk01", created.UUID, "cluster-a")
+			if !errors.Is(err, cloudapi.ErrOwnershipMismatch) || !errors.Is(err, errPersistedOwnershipIncomplete) {
+				t.Fatalf("GetVM() error = %v, want incomplete full ownership rejection", err)
+			}
+			if len(api.operations) != 0 || api.deleteVMCalls != 0 {
+				t.Fatalf("incomplete ownership read mutated cloud state: operations=%v deletes=%d", api.operations, api.deleteVMCalls)
+			}
+		})
 	}
 }
 
@@ -955,22 +2679,87 @@ func TestValidateNodeClassChecksHostPool(t *testing.T) {
 func TestDeleteCleansNamedFloatingIPWhenVMAlreadyMissing(t *testing.T) {
 	api := &fakeAPI{}
 	adapter, _ := New(api)
+	configureFastNetworkReadback(adapter, boundedReadbackTestTimeout)
 	created, err := adapter.CreateVM(context.Background(), testRequest())
 	if err != nil {
 		t.Fatal(err)
 	}
 	api.vms = nil // simulate out-of-band VM disappearance
+	api.operations = nil
+	getCallsBefore, listCallsBefore := api.vmGetCalls, api.vmListCalls
 	if err := adapter.DeleteVM(context.Background(), "bkk01", created.UUID, "cluster-a", "nodeclaim-a"); !errors.Is(err, cloudapi.ErrNotFound) {
 		t.Fatalf("DeleteVM error = %v", err)
 	}
 	if len(api.floatingIPs) != 0 {
 		t.Fatalf("orphan floating IP was not cleaned: %#v", api.floatingIPs)
 	}
+	if api.vmGetCalls-getCallsBefore != 2 || api.vmListCalls-listCallsBefore != 2 {
+		t.Fatalf("absence proof GET/List deltas=%d/%d, want two confirmations from both sources", api.vmGetCalls-getCallsBefore, api.vmListCalls-listCallsBefore)
+	}
+	wantOperations := []string{"unassign-floating-ip", "delete-floating-ip", "unassign-firewall"}
+	if !reflect.DeepEqual(api.operations, wantOperations) {
+		t.Fatalf("persistent absence cleanup operations=%v, want %v", api.operations, wantOperations)
+	}
+}
+
+func TestDeleteTransientNotFoundRecoversOwnedDetailBeforeNormalDelete(t *testing.T) {
+	api := &fakeAPI{}
+	adapter, _ := New(api)
+	configureFastNetworkReadback(adapter, boundedReadbackTestTimeout)
+	created, err := adapter.CreateVM(context.Background(), testRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	api.getVMErrorByUUID = map[string]error{created.UUID: &sdk.APIError{StatusCode: 404}}
+	api.getVMHook = func(string) {
+		api.mu.Lock()
+		delete(api.getVMErrorByUUID, created.UUID)
+		api.mu.Unlock()
+	}
+	api.operations = nil
+	getCallsBefore, listCallsBefore := api.vmGetCalls, api.vmListCalls
+	if err := adapter.DeleteVM(context.Background(), "bkk01", created.UUID, "cluster-a", "nodeclaim-a"); err != nil {
+		t.Fatal(err)
+	}
+	if api.vmGetCalls-getCallsBefore != 4 || api.vmListCalls-listCallsBefore != 3 {
+		t.Fatalf("transient 404 recovery plus post-delete proof GET/List deltas=%d/%d, want 4/3", api.vmGetCalls-getCallsBefore, api.vmListCalls-listCallsBefore)
+	}
+	wantOperations := []string{"unassign-floating-ip", "delete-floating-ip", "delete-vm", "unassign-firewall"}
+	if !reflect.DeepEqual(api.operations, wantOperations) {
+		t.Fatalf("transient 404 delete operations=%v, want normal delete %v", api.operations, wantOperations)
+	}
+	if len(api.vms) != 0 || len(api.floatingIPs) != 0 || firewallHasVM(api.firewalls[0], created.UUID) {
+		t.Fatalf("normal delete after transient 404 did not clean resources: VMs=%#v FIPs=%#v firewall=%#v", api.vms, api.floatingIPs, api.firewalls[0])
+	}
+}
+
+func TestDeletePersistentGetListDisagreementFailsWithoutMutation(t *testing.T) {
+	api := &fakeAPI{}
+	adapter, _ := New(api)
+	configureFastNetworkReadback(adapter, boundedReadbackTestTimeout)
+	created, err := adapter.CreateVM(context.Background(), testRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	api.getVMErrorByUUID = map[string]error{created.UUID: &sdk.APIError{StatusCode: 404}}
+	api.operations = nil
+	getCallsBefore, listCallsBefore := api.vmGetCalls, api.vmListCalls
+	err = adapter.DeleteVM(context.Background(), "bkk01", created.UUID, "cluster-a", "nodeclaim-a")
+	if !errors.Is(err, errVMAbsenceUncertain) || !errors.Is(err, cloudapi.ErrOwnershipMismatch) || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("DeleteVM() error = %v, want bounded Get/List absence uncertainty", err)
+	}
+	if api.vmGetCalls-getCallsBefore < 2 || api.vmListCalls-listCallsBefore < 2 {
+		t.Fatalf("uncertain absence GET/List deltas=%d/%d, want bounded repeated reads", api.vmGetCalls-getCallsBefore, api.vmListCalls-listCallsBefore)
+	}
+	if api.deleteVMCalls != 0 || len(api.operations) != 0 || len(api.vms) != 1 || len(api.floatingIPs) != 1 || !firewallHasVM(api.firewalls[0], created.UUID) {
+		t.Fatalf("uncertain absence mutated resources: deletes=%d operations=%v VMs=%#v FIPs=%#v firewall=%#v", api.deleteVMCalls, api.operations, api.vms, api.floatingIPs, api.firewalls[0])
+	}
 }
 
 func TestDeleteFailureLeavesFirewallAttached(t *testing.T) {
 	api := &fakeAPI{}
 	adapter, _ := New(api)
+	configureFastNetworkReadback(adapter, boundedReadbackTestTimeout)
 	created, err := adapter.CreateVM(context.Background(), testRequest())
 	if err != nil {
 		t.Fatal(err)
@@ -987,6 +2776,416 @@ func TestDeleteFailureLeavesFirewallAttached(t *testing.T) {
 	}
 	if !firewallHasVM(api.firewalls[0], created.UUID) {
 		t.Fatal("firewall assignment was removed from live VM")
+	}
+}
+
+func TestDeleteRequiresCompleteExactOwnershipWithoutCheckingLaunchDrift(t *testing.T) {
+	t.Run("incomplete ownership is rejected before mutation", func(t *testing.T) {
+		api := &fakeAPI{}
+		adapter, _ := New(api)
+		configureFastNetworkReadback(adapter, boundedReadbackTestTimeout)
+		created, err := adapter.CreateVM(context.Background(), testRequest())
+		if err != nil {
+			t.Fatal(err)
+		}
+		var record map[string]any
+		if err := json.Unmarshal([]byte(api.vms[0].Description), &record); err != nil {
+			t.Fatal(err)
+		}
+		delete(record, "firewallUUID")
+		description, err := json.Marshal(record)
+		if err != nil {
+			t.Fatal(err)
+		}
+		api.vms[0].Description = string(description)
+		api.operations = nil
+		err = adapter.DeleteVM(context.Background(), "bkk01", created.UUID, "cluster-a", "nodeclaim-a")
+		if !errors.Is(err, cloudapi.ErrOwnershipMismatch) {
+			t.Fatalf("DeleteVM() error = %v, want incomplete ownership rejection", err)
+		}
+		if api.deleteVMCalls != 0 || len(api.operations) != 0 || !firewallHasVM(api.firewalls[0], created.UUID) {
+			t.Fatalf("incomplete ownership reached mutation: deletes=%d operations=%v firewall=%#v", api.deleteVMCalls, api.operations, api.firewalls[0])
+		}
+	})
+
+	t.Run("owned live launch drift remains deletable", func(t *testing.T) {
+		api := &fakeAPI{}
+		adapter, _ := New(api)
+		configureFastNetworkReadback(adapter, boundedReadbackTestTimeout)
+		created, err := adapter.CreateVM(context.Background(), testRequest())
+		if err != nil {
+			t.Fatal(err)
+		}
+		api.vms[0].Name = "drifted-name"
+		api.vms[0].VCPU = 16
+		api.vms[0].MemoryMiB = 64 * 1024
+		api.operations = nil
+		if err := adapter.DeleteVM(context.Background(), "bkk01", created.UUID, "cluster-a", "nodeclaim-a"); err != nil {
+			t.Fatalf("DeleteVM() rejected ownership-proven launch drift: %v", err)
+		}
+		if len(api.vms) != 0 || len(api.floatingIPs) != 0 || firewallHasVM(api.firewalls[0], created.UUID) {
+			t.Fatalf("drifted owned VM was not fully deleted: VMs=%#v FIPs=%#v firewall=%#v", api.vms, api.floatingIPs, api.firewalls[0])
+		}
+	})
+}
+
+func TestDeleteFloatingIPIdentityFailureStopsBeforeVMMutation(t *testing.T) {
+	for name, mutate := range map[string]func(*sdk.FloatingIP){
+		"billing account": func(address *sdk.FloatingIP) { address.BillingAccountID++ },
+		"name":            func(address *sdk.FloatingIP) { address.Name = "foreign-name" },
+		"address":         func(address *sdk.FloatingIP) { address.Address = "203.0.113.99" },
+		"assignment":      func(address *sdk.FloatingIP) { address.AssignedTo = "22222222-2222-4222-8222-222222222222" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			api := &fakeAPI{}
+			adapter, _ := New(api)
+			configureFastNetworkReadback(adapter, boundedReadbackTestTimeout)
+			created, err := adapter.CreateVM(context.Background(), testRequest())
+			if err != nil {
+				t.Fatal(err)
+			}
+			mutate(&api.floatingIPs[0])
+			api.operations = nil
+			err = adapter.DeleteVM(context.Background(), "bkk01", created.UUID, "cluster-a", "nodeclaim-a")
+			if !errors.Is(err, cloudapi.ErrOwnershipMismatch) {
+				t.Fatalf("DeleteVM() error = %v, want floating IP ownership mismatch", err)
+			}
+			if api.deleteVMCalls != 0 || len(api.operations) != 0 || len(api.vms) != 1 || !firewallHasVM(api.firewalls[0], created.UUID) {
+				t.Fatalf("floating IP mismatch reached VM/firewall mutation: deletes=%d operations=%v VMs=%#v firewall=%#v", api.deleteVMCalls, api.operations, api.vms, api.firewalls[0])
+			}
+		})
+	}
+}
+
+func TestDeleteMissingVMRejectsNameOnlyFloatingIP(t *testing.T) {
+	api := &fakeAPI{}
+	adapter, _ := New(api)
+	configureFastNetworkReadback(adapter, boundedReadbackTestTimeout)
+	created, err := adapter.CreateVM(context.Background(), testRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	api.vms = nil
+	api.floatingIPs[0].AssignedTo = ""
+	api.floatingIPs[0].AssignedToResourceType = ""
+	api.floatingIPs[0].BillingAccountID = 999
+	api.operations = nil
+	err = adapter.DeleteVM(context.Background(), "bkk01", created.UUID, "cluster-a", "nodeclaim-a")
+	if !errors.Is(err, cloudapi.ErrOwnershipMismatch) {
+		t.Fatalf("DeleteVM() error = %v, want name-only orphan rejection", err)
+	}
+	if len(api.operations) != 0 || len(api.floatingIPs) != 1 || !firewallHasVM(api.firewalls[0], created.UUID) {
+		t.Fatalf("unproven orphan cleanup mutated resources: operations=%v FIPs=%#v firewall=%#v", api.operations, api.floatingIPs, api.firewalls[0])
+	}
+}
+
+func TestDeleteRetriesExactDependentMutationsUntilReadbackConverges(t *testing.T) {
+	api := &fakeAPI{
+		unassignFloatingIPErrors: []error{&sdk.APIError{StatusCode: 404}},
+		deleteFloatingIPErrors:   []error{&sdk.APIError{StatusCode: 404}},
+		unassignFirewallErrors:   []error{&sdk.APIError{StatusCode: 404}},
+	}
+	adapter, _ := New(api)
+	configureFastNetworkReadback(adapter, boundedReadbackTestTimeout)
+	created, err := adapter.CreateVM(context.Background(), testRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	api.operations = nil
+	if err := adapter.DeleteVM(context.Background(), "bkk01", created.UUID, "cluster-a", "nodeclaim-a"); err != nil {
+		t.Fatal(err)
+	}
+	if got := countOperation(api.operations, "unassign-floating-ip"); got != 2 {
+		t.Fatalf("floating IP unassign attempts=%d, want retry after stale 404; operations=%v", got, api.operations)
+	}
+	if got := countOperation(api.operations, "delete-floating-ip"); got != 2 {
+		t.Fatalf("floating IP delete attempts=%d, want retry after stale 404; operations=%v", got, api.operations)
+	}
+	if got := countOperation(api.operations, "unassign-firewall"); got != 2 {
+		t.Fatalf("firewall unassign attempts=%d, want retry after stale 404; operations=%v", got, api.operations)
+	}
+	if len(api.floatingIPs) != 0 || firewallHasVM(api.firewalls[0], created.UUID) {
+		t.Fatalf("dependent cleanup did not converge: FIPs=%#v firewall=%#v", api.floatingIPs, api.firewalls[0])
+	}
+}
+
+func TestDeleteFloatingIPUncertaintyStopsBeforeVMDeletion(t *testing.T) {
+	api := &fakeAPI{deleteFloatingIPKeepCount: 100}
+	adapter, _ := New(api)
+	configureFastNetworkReadback(adapter, boundedReadbackTestTimeout)
+	created, err := adapter.CreateVM(context.Background(), testRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	api.operations = nil
+	err = adapter.DeleteVM(context.Background(), "bkk01", created.UUID, "cluster-a", "nodeclaim-a")
+	if !errors.Is(err, errFloatingIPCleanupUncertain) || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("DeleteVM() error = %v, want bounded floating IP cleanup uncertainty", err)
+	}
+	if api.deleteVMCalls != 0 || slicesContain(api.operations, "delete-vm") || len(api.vms) != 1 || !firewallHasVM(api.firewalls[0], created.UUID) {
+		t.Fatalf("uncertain floating IP cleanup reached VM/firewall mutation: deletes=%d operations=%v VMs=%#v firewall=%#v", api.deleteVMCalls, api.operations, api.vms, api.firewalls[0])
+	}
+	if len(api.floatingIPs) != 1 {
+		t.Fatalf("persistent asynchronous floating IP unexpectedly disappeared: %#v", api.floatingIPs)
+	}
+}
+
+func TestDeleteFirewallUncertaintyCannotReturnSuccess(t *testing.T) {
+	unassignErrors := make([]error, 100)
+	for i := range unassignErrors {
+		unassignErrors[i] = &sdk.APIError{StatusCode: 404}
+	}
+	api := &fakeAPI{unassignFirewallErrors: unassignErrors}
+	adapter, _ := New(api)
+	configureFastNetworkReadback(adapter, boundedReadbackTestTimeout)
+	created, err := adapter.CreateVM(context.Background(), testRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	api.operations = nil
+	err = adapter.DeleteVM(context.Background(), "bkk01", created.UUID, "cluster-a", "nodeclaim-a")
+	if !errors.Is(err, errFirewallCleanupUncertain) || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("DeleteVM() error = %v, want bounded firewall cleanup uncertainty", err)
+	}
+	if api.deleteVMCalls != 1 || len(api.vms) != 0 || !firewallHasVM(api.firewalls[0], created.UUID) {
+		t.Fatalf("firewall uncertainty was reported as cleanup: deletes=%d VMs=%#v firewall=%#v operations=%v", api.deleteVMCalls, api.vms, api.firewalls[0], api.operations)
+	}
+}
+
+func TestDeleteDoesNotTreatOneStaleDependentOmissionAsSuccess(t *testing.T) {
+	api := &fakeAPI{}
+	adapter, _ := New(api)
+	configureFastNetworkReadback(adapter, boundedReadbackTestTimeout)
+	created, err := adapter.CreateVM(context.Background(), testRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	api.floatingIPListSnapshots = map[int][]sdk.FloatingIP{api.floatingIPListCalls + 1: nil}
+	api.firewallListSnapshots = map[int][]sdk.Firewall{api.firewallListCalls + 1: nil}
+	api.operations = nil
+	if err := adapter.DeleteVM(context.Background(), "bkk01", created.UUID, "cluster-a", "nodeclaim-a"); err != nil {
+		t.Fatal(err)
+	}
+	if !slicesContain(api.operations, "delete-floating-ip") || !slicesContain(api.operations, "unassign-firewall") {
+		t.Fatalf("single stale omission caused false cleanup success: operations=%v", api.operations)
+	}
+	if len(api.floatingIPs) != 0 || firewallHasVM(api.firewalls[0], created.UUID) {
+		t.Fatalf("resources remained after omission recovery: FIPs=%#v firewall=%#v", api.floatingIPs, api.firewalls[0])
+	}
+}
+
+func TestDeleteIgnoresDeletedFloatingIPTombstones(t *testing.T) {
+	t.Run("tombstone only is already absent", func(t *testing.T) {
+		api := &fakeAPI{}
+		adapter, _ := New(api)
+		configureFastNetworkReadback(adapter, boundedReadbackTestTimeout)
+		created, err := adapter.CreateVM(context.Background(), testRequest())
+		if err != nil {
+			t.Fatal(err)
+		}
+		api.floatingIPs[0].IsDeleted = true
+		api.operations = nil
+		if err := adapter.DeleteVM(context.Background(), "bkk01", created.UUID, "cluster-a", "nodeclaim-a"); err != nil {
+			t.Fatal(err)
+		}
+		if countOperation(api.operations, "unassign-floating-ip") != 0 || countOperation(api.operations, "delete-floating-ip") != 0 {
+			t.Fatalf("deleted tombstone was mutated: operations=%v", api.operations)
+		}
+		if len(api.floatingIPs) != 1 || !api.floatingIPs[0].IsDeleted || len(api.vms) != 0 || firewallHasVM(api.firewalls[0], created.UUID) {
+			t.Fatalf("tombstone-only delete did not converge safely: VMs=%#v FIPs=%#v firewall=%#v", api.vms, api.floatingIPs, api.firewalls[0])
+		}
+	})
+
+	for name, mutate := range map[string]func(*sdk.FloatingIP){
+		"exact stale tombstone": func(*sdk.FloatingIP) {},
+		"wrong identity tombstone": func(address *sdk.FloatingIP) {
+			address.Address = "203.0.113.99"
+			address.BillingAccountID++
+		},
+	} {
+		t.Run(name+" beside active exact row", func(t *testing.T) {
+			api := &fakeAPI{}
+			adapter, _ := New(api)
+			configureFastNetworkReadback(adapter, boundedReadbackTestTimeout)
+			created, err := adapter.CreateVM(context.Background(), testRequest())
+			if err != nil {
+				t.Fatal(err)
+			}
+			tombstone := api.floatingIPs[0]
+			tombstone.IsDeleted = true
+			mutate(&tombstone)
+			api.floatingIPs = append(api.floatingIPs, tombstone)
+			api.operations = nil
+			if err := adapter.DeleteVM(context.Background(), "bkk01", created.UUID, "cluster-a", "nodeclaim-a"); err != nil {
+				t.Fatal(err)
+			}
+			if countOperation(api.operations, "unassign-floating-ip") != 1 || countOperation(api.operations, "delete-floating-ip") != 1 {
+				t.Fatalf("active exact address was not cleaned exactly once: operations=%v", api.operations)
+			}
+			if len(api.floatingIPs) != 1 || !api.floatingIPs[0].IsDeleted || len(api.vms) != 0 || firewallHasVM(api.firewalls[0], created.UUID) {
+				t.Fatalf("active-row cleanup mishandled stale tombstone: VMs=%#v FIPs=%#v firewall=%#v", api.vms, api.floatingIPs, api.firewalls[0])
+			}
+		})
+	}
+}
+
+func TestDeleteVMRequestDeadlineStillRequiresCanonicalAbsence(t *testing.T) {
+	t.Run("blocked delete leaves live VM firewall attached", func(t *testing.T) {
+		api := &fakeAPI{}
+		adapter, _ := New(api)
+		configureFastNetworkReadback(adapter, 120*time.Millisecond)
+		adapter.networkAttachmentRequestTimeout = 20 * time.Millisecond
+		created, err := adapter.CreateVM(context.Background(), testRequest())
+		if err != nil {
+			t.Fatal(err)
+		}
+		api.blockDeleteVM = true
+		api.operations = nil
+		started := time.Now()
+		err = adapter.DeleteVM(context.Background(), "bkk01", created.UUID, "cluster-a", "nodeclaim-a")
+		if !errors.Is(err, context.DeadlineExceeded) || !errors.Is(err, errVMAbsenceUncertain) {
+			t.Fatalf("DeleteVM() error = %v, want request timeout plus absence uncertainty", err)
+		}
+		if elapsed := time.Since(started); elapsed >= time.Second {
+			t.Fatalf("blocked VM DELETE exceeded bounded request/readback windows: %s", elapsed)
+		}
+		if !api.deleteVMContextCanceled || api.deleteVMCalls != 1 || len(api.vms) != 1 || !firewallHasVM(api.firewalls[0], created.UUID) || slicesContain(api.operations, "unassign-firewall") {
+			t.Fatalf("blocked VM DELETE detached live protection: canceled=%t deletes=%d operations=%v VMs=%#v firewall=%#v", api.deleteVMContextCanceled, api.deleteVMCalls, api.operations, api.vms, api.firewalls[0])
+		}
+	})
+
+	t.Run("timeout response that committed converges by readback", func(t *testing.T) {
+		api := &fakeAPI{}
+		adapter, _ := New(api)
+		configureFastNetworkReadback(adapter, 120*time.Millisecond)
+		adapter.networkAttachmentRequestTimeout = 20 * time.Millisecond
+		created, err := adapter.CreateVM(context.Background(), testRequest())
+		if err != nil {
+			t.Fatal(err)
+		}
+		api.blockDeleteVM = true
+		api.deleteVMCommitOnContext = true
+		api.operations = nil
+		if err := adapter.DeleteVM(context.Background(), "bkk01", created.UUID, "cluster-a", "nodeclaim-a"); err != nil {
+			t.Fatalf("DeleteVM() rejected canonically converged timeout outcome: %v", err)
+		}
+		if !api.deleteVMContextCanceled || len(api.vms) != 0 || firewallHasVM(api.firewalls[0], created.UUID) || !slicesContain(api.operations, "unassign-firewall") {
+			t.Fatalf("committed timeout outcome did not converge: canceled=%t operations=%v VMs=%#v firewall=%#v", api.deleteVMContextCanceled, api.operations, api.vms, api.firewalls[0])
+		}
+	})
+}
+
+func TestDeleteWaitsForAsyncVMAbsenceBeforeFirewallCleanup(t *testing.T) {
+	api := &fakeAPI{deleteVMKeepCount: 1}
+	adapter, _ := New(api)
+	configureFastNetworkReadback(adapter, boundedReadbackTestTimeout)
+	created, err := adapter.CreateVM(context.Background(), testRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	getCallsBefore := api.vmGetCalls
+	api.getVMHook = func(uuid string) {
+		if uuid != created.UUID || api.deleteVMCalls == 0 || api.vmGetCalls < getCallsBefore+3 {
+			return
+		}
+		api.mu.Lock()
+		api.vms = nil
+		api.mu.Unlock()
+	}
+	api.operations = nil
+	if err := adapter.DeleteVM(context.Background(), "bkk01", created.UUID, "cluster-a", "nodeclaim-a"); err != nil {
+		t.Fatal(err)
+	}
+	if api.firewallDetachedWhileVMVisible {
+		t.Fatal("firewall detached before async VM deletion became canonically absent")
+	}
+	if api.vmGetCalls-getCallsBefore < 4 || firewallHasVM(api.firewalls[0], created.UUID) {
+		t.Fatalf("async deletion convergence was not observed: GET delta=%d firewall=%#v", api.vmGetCalls-getCallsBefore, api.firewalls[0])
+	}
+}
+
+func TestDeleteRemoteNotFoundWithoutAbsenceKeepsFirewallAttached(t *testing.T) {
+	api := &fakeAPI{deleteVMErr: &sdk.APIError{StatusCode: 404}}
+	adapter, _ := New(api)
+	configureFastNetworkReadback(adapter, boundedReadbackTestTimeout)
+	created, err := adapter.CreateVM(context.Background(), testRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	api.operations = nil
+	err = adapter.DeleteVM(context.Background(), "bkk01", created.UUID, "cluster-a", "nodeclaim-a")
+	if !errors.Is(err, errVMAbsenceUncertain) || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("DeleteVM() error = %v, want bounded post-404 absence uncertainty", err)
+	}
+	if slicesContain(api.operations, "unassign-firewall") || !firewallHasVM(api.firewalls[0], created.UUID) {
+		t.Fatalf("remote 404 detached firewall without absence proof: operations=%v firewall=%#v", api.operations, api.firewalls[0])
+	}
+}
+
+func TestCleanupLaunchKeepsFirewallUntilAsyncDeleteConverges(t *testing.T) {
+	api := &fakeAPI{}
+	adapter, _ := New(api)
+	configureFastNetworkReadback(adapter, boundedReadbackTestTimeout)
+	created, err := adapter.CreateVM(context.Background(), testRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	anchor := api.floatingIPs[0]
+	api.deleteVMKeepCount = 1
+	api.operations = nil
+	err = adapter.cleanupLaunch(context.Background(), "bkk01", testRequest().FirewallUUID, created.UUID, anchor, errors.New("launch failed"))
+	if !errors.Is(err, errVMAbsenceUncertain) {
+		t.Fatalf("cleanupLaunch() error = %v, want post-delete absence uncertainty", err)
+	}
+	if slicesContain(api.operations, "unassign-firewall") || !firewallHasVM(api.firewalls[0], created.UUID) {
+		t.Fatalf("launch cleanup detached firewall while VM remained: operations=%v firewall=%#v", api.operations, api.firewalls[0])
+	}
+}
+
+func TestCleanupLaunchFloatingIPUncertaintyStillRollsBackUnprotectedVM(t *testing.T) {
+	api := &fakeAPI{}
+	adapter, _ := New(api)
+	configureFastNetworkReadback(adapter, boundedReadbackTestTimeout)
+	created, err := adapter.CreateVM(context.Background(), testRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	anchor := api.floatingIPs[0]
+	api.floatingIPs[0].BillingAccountID++
+	api.operations = nil
+	err = adapter.cleanupLaunch(context.Background(), "bkk01", testRequest().FirewallUUID, created.UUID, anchor, errors.New("launch failed"))
+	if !errors.Is(err, cloudapi.ErrOwnershipMismatch) {
+		t.Fatalf("cleanupLaunch() error = %v, want floating IP ownership mismatch", err)
+	}
+	if api.deleteVMCalls != 1 || len(api.vms) != 0 || !slicesContain(api.operations, "delete-vm") || firewallHasVM(api.firewalls[0], created.UUID) {
+		t.Fatalf("launch cleanup left an unprotected VM after floating IP uncertainty: deletes=%d operations=%v VMs=%#v firewall=%#v", api.deleteVMCalls, api.operations, api.vms, api.firewalls[0])
+	}
+	if len(api.floatingIPs) != 1 {
+		t.Fatalf("launch cleanup deleted a changed floating IP: %#v", api.floatingIPs)
+	}
+}
+
+func TestCleanupLaunchPersistentFloatingIPConvergenceStillDeletesVM(t *testing.T) {
+	api := &fakeAPI{deleteFloatingIPKeepCount: 100}
+	adapter, _ := New(api)
+	configureFastNetworkReadback(adapter, 500*time.Millisecond)
+	adapter.launchCleanupTimeout = 250 * time.Millisecond
+	adapter.launchFloatingIPCleanupTimeout = 40 * time.Millisecond
+	created, err := adapter.CreateVM(context.Background(), testRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	anchor := api.floatingIPs[0]
+	api.operations = nil
+	err = adapter.cleanupLaunch(context.Background(), "bkk01", testRequest().FirewallUUID, created.UUID, anchor, errors.New("launch failed"))
+	if !errors.Is(err, errFloatingIPCleanupUncertain) {
+		t.Fatalf("cleanupLaunch() error = %v, want floating IP convergence uncertainty", err)
+	}
+	if api.deleteVMCalls != 1 || len(api.vms) != 0 || !slicesContain(api.operations, "delete-vm") || firewallHasVM(api.firewalls[0], created.UUID) {
+		t.Fatalf("persistent floating IP uncertainty leaked unprotected VM or stale firewall assignment: deletes=%d operations=%v VMs=%#v firewall=%#v", api.deleteVMCalls, api.operations, api.vms, api.firewalls[0])
+	}
+	if len(api.floatingIPs) != 1 {
+		t.Fatalf("uncertain floating IP unexpectedly disappeared: %#v", api.floatingIPs)
 	}
 }
 
@@ -1243,14 +3442,14 @@ func TestCreateRejectsExactVPCOnlyFirewallBeforeMutation(t *testing.T) {
 
 func testRequest() cloudapi.CreateVMRequest {
 	return cloudapi.CreateVMRequest{
-		IdempotencyKey: "uid-a", Name: "nodeclaim-a", ClusterName: "cluster-a", NodeClaimName: "nodeclaim-a",
+		IdempotencyKey: "uid-a", Name: "cluster-a-karp-nodeclaim-a", ClusterName: "cluster-a", NodeClaimName: "nodeclaim-a",
 		BillingAccountID: 1,
 		Location:         "bkk01", NetworkUUID: "network-1", OSName: "ubuntu", OSVersion: "24.04",
 		ControlPlaneVIP:              "10.0.0.10",
 		PrivateLoadBalancerPoolStart: "10.0.0.200",
 		PrivateLoadBalancerPoolStop:  "10.0.0.219",
 		FirewallUUID:                 "33333333-3333-4333-8333-333333333333",
-		HostPoolUUID:                 "pool-1", HostClass: "intel-scalable", InstanceType: "is-general-2c-4g",
+		HostPoolUUID:                 inspacev1.IntelScalableHostPoolUUID, HostClass: inspacev1.HostClassIntelScalable, InstanceType: "is-general-2c-4g",
 		VCPU: 2, MemoryGiB: 4, RootDiskGiB: 40, CloudInitJSON: `{"write_files":[{"path":"/etc/rancher/rke2/config.yaml","encoding":"b64","content":"bm9kZS1leHRlcm5hbC1pcDogX19JTlNQQUNFX0ZMT0FUSU5HX0lQVjRfXw=="},{"path":"/usr/local/sbin/inspace-detect-private-ip","encoding":"b64","content":"X19JTlNQQUNFX1ZQQ19TVUJORVRfXw=="}],"runcmd":[]}`,
 		PublicIPv4: true,
 		SpecHash:   "spec-a", BootstrapHash: "bootstrap-a",
@@ -1305,17 +3504,40 @@ func slicesContain(values []string, expected string) bool {
 	return false
 }
 
+func countOperation(values []string, expected string) int {
+	count := 0
+	for _, value := range values {
+		if value == expected {
+			count++
+		}
+	}
+	return count
+}
+
 type fakeAPI struct {
+	mu                              sync.Mutex
 	vms                             []sdk.VM
 	pools                           []sdk.HostPool
 	firewalls                       []sdk.Firewall
 	createErr                       error
 	commitOnCreateError             bool
+	sparseCreateResponse            bool
+	persistDescription              func(string) string
+	mutateGetVMResponse             func(*sdk.VM)
+	omitVMListDescriptions          bool
+	getVMErrorByUUID                map[string]error
+	nilGetVMUUID                    string
+	blockGetVMUUID                  string
+	getVMContextCanceled            bool
+	getVMHook                       func(string)
 	createCalls                     int
 	floatingIPs                     []sdk.FloatingIP
 	lastVMRequest                   sdk.CreateVMRequest
 	operations                      []string
 	deleteVMErr                     error
+	deleteVMKeepCount               int
+	blockDeleteVM                   bool
+	deleteVMCommitOnContext         bool
 	network                         *sdk.Network
 	networkGetCalls                 int
 	networkMembershipAfter          int
@@ -1325,9 +3547,17 @@ type fakeAPI struct {
 	secondFirewallOnAssignUUID      string
 	privateIPv4VisibleAfter         int
 	vmGetCalls                      int
+	vmListCalls                     int
 	firewallListCalls               int
 	blockFirewallList               bool
+	firewallListSnapshots           map[int][]sdk.Firewall
+	unassignFirewallErrors          []error
+	firewallDetachedWhileVMVisible  bool
 	floatingIPListCalls             int
+	floatingIPListSnapshots         map[int][]sdk.FloatingIP
+	unassignFloatingIPErrors        []error
+	deleteFloatingIPErrors          []error
+	deleteFloatingIPKeepCount       int
 	networkErrors                   map[int]error
 	networkNilOnCalls               map[int]bool
 	networkGetHook                  func(int)
@@ -1342,7 +3572,7 @@ type fakeAPI struct {
 
 func (f *fakeAPI) ListHostPools(context.Context, string) ([]sdk.HostPool, error) {
 	if f.pools == nil {
-		f.pools = []sdk.HostPool{{UUID: "pool-1"}}
+		f.pools = []sdk.HostPool{{UUID: inspacev1.IntelScalableHostPoolUUID}, {UUID: "pool-1"}}
 	}
 	return append([]sdk.HostPool(nil), f.pools...), nil
 }
@@ -1379,6 +3609,9 @@ func (f *fakeAPI) ListFirewalls(ctx context.Context, _ string) ([]sdk.Firewall, 
 	if f.firewalls == nil {
 		f.firewalls = []sdk.Firewall{secureFirewall()}
 	}
+	if snapshot, ok := f.firewallListSnapshots[f.firewallListCalls]; ok {
+		return append([]sdk.Firewall(nil), snapshot...), nil
+	}
 	return append([]sdk.Firewall(nil), f.firewalls...), nil
 }
 func (f *fakeAPI) AssignFirewallToVM(_ context.Context, _ string, firewallUUID, vmUUID string) error {
@@ -1403,6 +3636,18 @@ func (f *fakeAPI) AssignFirewallToVM(_ context.Context, _ string, firewallUUID, 
 }
 func (f *fakeAPI) UnassignFirewallFromVM(_ context.Context, _ string, firewallUUID, vmUUID string) error {
 	f.operations = append(f.operations, "unassign-firewall")
+	for i := range f.vms {
+		if f.vms[i].UUID == vmUUID {
+			f.firewallDetachedWhileVMVisible = true
+		}
+	}
+	if len(f.unassignFirewallErrors) != 0 {
+		err := f.unassignFirewallErrors[0]
+		f.unassignFirewallErrors = f.unassignFirewallErrors[1:]
+		if err != nil {
+			return err
+		}
+	}
 	if f.firewalls == nil {
 		return nil
 	}
@@ -1422,6 +3667,9 @@ func (f *fakeAPI) UnassignFirewallFromVM(_ context.Context, _ string, firewallUU
 }
 func (f *fakeAPI) ListFloatingIPs(_ context.Context, _ string, filters *sdk.FloatingIPFilters) ([]sdk.FloatingIP, error) {
 	f.floatingIPListCalls++
+	if snapshot, ok := f.floatingIPListSnapshots[f.floatingIPListCalls]; ok {
+		return append([]sdk.FloatingIP(nil), snapshot...), nil
+	}
 	var result []sdk.FloatingIP
 	for _, address := range f.floatingIPs {
 		if filters == nil || filters.BillingAccountID == 0 || address.BillingAccountID == filters.BillingAccountID {
@@ -1453,6 +3701,13 @@ func (f *fakeAPI) AssignFloatingIP(_ context.Context, _ string, address, uuid, r
 }
 func (f *fakeAPI) UnassignFloatingIP(_ context.Context, _ string, address string) (*sdk.FloatingIP, error) {
 	f.operations = append(f.operations, "unassign-floating-ip")
+	if len(f.unassignFloatingIPErrors) != 0 {
+		err := f.unassignFloatingIPErrors[0]
+		f.unassignFloatingIPErrors = f.unassignFloatingIPErrors[1:]
+		if err != nil {
+			return nil, err
+		}
+	}
 	for i := range f.floatingIPs {
 		if f.floatingIPs[i].Address == address {
 			f.floatingIPs[i].AssignedTo = ""
@@ -1468,6 +3723,17 @@ func (f *fakeAPI) DeleteFloatingIP(ctx context.Context, _ string, address string
 		f.deleteFloatingIPContextCanceled = true
 	}
 	f.operations = append(f.operations, "delete-floating-ip")
+	if len(f.deleteFloatingIPErrors) != 0 {
+		err := f.deleteFloatingIPErrors[0]
+		f.deleteFloatingIPErrors = f.deleteFloatingIPErrors[1:]
+		if err != nil {
+			return err
+		}
+	}
+	if f.deleteFloatingIPKeepCount > 0 {
+		f.deleteFloatingIPKeepCount--
+		return nil
+	}
 	for i := range f.floatingIPs {
 		if f.floatingIPs[i].Address == address {
 			f.floatingIPs = append(f.floatingIPs[:i], f.floatingIPs[i+1:]...)
@@ -1477,7 +3743,16 @@ func (f *fakeAPI) DeleteFloatingIP(ctx context.Context, _ string, address string
 	return &sdk.APIError{StatusCode: 404}
 }
 func (f *fakeAPI) ListVMs(context.Context, string) ([]sdk.VM, error) {
-	return append([]sdk.VM(nil), f.vms...), nil
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.vmListCalls++
+	items := append([]sdk.VM(nil), f.vms...)
+	if f.omitVMListDescriptions {
+		for i := range items {
+			items[i].Description = ""
+		}
+	}
+	return items, nil
 }
 
 func secureFirewall() sdk.Firewall {
@@ -1493,18 +3768,49 @@ func secureFirewall() sdk.Firewall {
 			{UUID: "out-icmp", Protocol: "icmp", Direction: "outbound", EndpointSpecType: "any"}},
 	}
 }
-func (f *fakeAPI) GetVM(_ context.Context, _, uuid string) (*sdk.VM, error) {
+func (f *fakeAPI) GetVM(ctx context.Context, _, uuid string) (*sdk.VM, error) {
+	f.mu.Lock()
 	f.vmGetCalls++
+	injected := f.getVMErrorByUUID[uuid]
+	returnNil := f.nilGetVMUUID == uuid
+	block := f.blockGetVMUUID == uuid
+	mutate := f.mutateGetVMResponse
+	hook := f.getVMHook
+	var found *sdk.VM
 	for i := range f.vms {
 		if f.vms[i].UUID == uuid {
 			copy := f.vms[i]
 			if f.vmGetCalls <= f.privateIPv4VisibleAfter {
 				copy.PrivateIPv4 = ""
 			}
-			return &copy, nil
+			found = &copy
+			break
 		}
 	}
-	return nil, &sdk.APIError{StatusCode: 404}
+	f.mu.Unlock()
+	if hook != nil {
+		hook(uuid)
+	}
+	if block {
+		<-ctx.Done()
+		f.mu.Lock()
+		f.getVMContextCanceled = true
+		f.mu.Unlock()
+		return nil, ctx.Err()
+	}
+	if injected != nil {
+		return nil, injected
+	}
+	if returnNil {
+		return nil, nil
+	}
+	if found == nil {
+		return nil, &sdk.APIError{StatusCode: 404}
+	}
+	if mutate != nil {
+		mutate(found)
+	}
+	return found, nil
 }
 func (f *fakeAPI) CreateVM(_ context.Context, _ string, request sdk.CreateVMRequest) (*sdk.VM, error) {
 	f.createCalls++
@@ -1513,7 +3819,8 @@ func (f *fakeAPI) CreateVM(_ context.Context, _ string, request sdk.CreateVMRequ
 		UUID: "11111111-1111-4111-8111-111111111111", Name: request.Name, Description: request.Description,
 		Status: "provisioning", VCPU: request.VCPU, MemoryMiB: request.MemoryMiB, OSName: request.OSName,
 		OSVersion: request.OSVersion, DesignatedPoolUUID: request.DesignatedPoolUUID, NetworkUUID: request.NetworkUUID,
-		Storage: []sdk.VMStorage{{SizeGiB: request.DiskGiB, Primary: true}},
+		BillingAccountID: request.BillingAccountID,
+		Storage:          []sdk.VMStorage{{SizeGiB: request.DiskGiB, Primary: true}},
 	}
 	vm.PrivateIPv4 = f.createdPrivateIPv4
 	if vm.PrivateIPv4 == "" {
@@ -1523,7 +3830,11 @@ func (f *fakeAPI) CreateVM(_ context.Context, _ string, request sdk.CreateVMRequ
 		vm.NetworkUUID = f.createdNetworkUUID
 	}
 	if f.createErr == nil || f.commitOnCreateError {
-		f.vms = append(f.vms, vm)
+		persisted := vm
+		if f.persistDescription != nil {
+			persisted.Description = f.persistDescription(persisted.Description)
+		}
+		f.vms = append(f.vms, persisted)
 		if f.attachCreatedVMToFirewallUUID != "" {
 			for i := range f.firewalls {
 				if f.firewalls[i].UUID == f.attachCreatedVMToFirewallUUID {
@@ -1535,16 +3846,36 @@ func (f *fakeAPI) CreateVM(_ context.Context, _ string, request sdk.CreateVMRequ
 	if f.createErr != nil {
 		return nil, f.createErr
 	}
+	if f.sparseCreateResponse {
+		return &sdk.VM{UUID: vm.UUID}, nil
+	}
 	return &vm, nil
 }
 func (f *fakeAPI) DeleteVM(ctx context.Context, _, uuid string) error {
 	f.deleteVMCalls++
+	f.operations = append(f.operations, "delete-vm")
+	if f.blockDeleteVM {
+		<-ctx.Done()
+		f.deleteVMContextCanceled = true
+		if f.deleteVMCommitOnContext {
+			for i := range f.vms {
+				if f.vms[i].UUID == uuid {
+					f.vms = append(f.vms[:i], f.vms[i+1:]...)
+					break
+				}
+			}
+		}
+		return ctx.Err()
+	}
 	if ctx.Err() != nil {
 		f.deleteVMContextCanceled = true
 	}
-	f.operations = append(f.operations, "delete-vm")
 	if f.deleteVMErr != nil {
 		return f.deleteVMErr
+	}
+	if f.deleteVMKeepCount > 0 {
+		f.deleteVMKeepCount--
+		return nil
 	}
 	for i := range f.vms {
 		if f.vms[i].UUID == uuid {

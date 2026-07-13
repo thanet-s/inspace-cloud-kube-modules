@@ -6,8 +6,10 @@ import ipaddress
 import json
 import os
 import pathlib
+import re
 import ssl
 import tempfile
+import urllib.parse
 import urllib.request
 
 
@@ -20,6 +22,33 @@ def api_get(path: str):
     )
     with urllib.request.urlopen(request, timeout=60, context=ssl.create_default_context()) as response:
         return json.load(response)
+
+
+VM_UUID_PATTERN = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+
+
+def canonical_owned_vm_details(listed_vms, getter=api_get):
+    """Replace sparse owned VM list rows with strict per-VM detail records."""
+    details_by_name = {}
+    for summary in listed_vms:
+        if not isinstance(summary, dict):
+            raise SystemExit("owned VM list contained a non-object record")
+        name = summary.get("name")
+        vm_uuid = summary.get("uuid")
+        if not isinstance(name, str) or not isinstance(vm_uuid, str) or not VM_UUID_PATTERN.fullmatch(vm_uuid):
+            raise SystemExit("owned VM list record lacks an exact name and valid UUID")
+        if name in details_by_name:
+            raise SystemExit(f"duplicate owned VM name {name!r} in list readback")
+        query = urllib.parse.urlencode({"uuid": vm_uuid})
+        detail = getter(f"user-resource/vm?{query}")
+        if not isinstance(detail, dict):
+            raise SystemExit(f"authoritative detail for VM {name!r} was not an object")
+        if detail.get("uuid") != vm_uuid or detail.get("name") != name:
+            raise SystemExit(f"authoritative detail identity for VM {name!r} does not match its list UUID/name")
+        details_by_name[name] = detail
+    return details_by_name
 
 
 def require_public_ipv4(value: object, label: str) -> str:
@@ -130,6 +159,8 @@ def main() -> None:
     network = api_get(f"network/network/{network_uuid}")
     if not isinstance(network, dict) or network.get("uuid") != network_uuid:
         raise SystemExit("configured VPC lookup was not authoritative")
+    network_members = list(network.get("vm_uuids", []))
+    network_member_ids = set(network_members)
     subnet = ipaddress.ip_network(network["subnet"], strict=False)
     if subnet.version != 4 or vip not in subnet or not vip.is_private:
         raise SystemExit("control-plane VIP must be private IPv4 inside the configured VPC")
@@ -157,14 +188,28 @@ def main() -> None:
     vms = api_get("user-resource/vm/list")
     if not isinstance(vms, list):
         raise SystemExit("VM list was not an array")
-    if any(vm.get("network_uuid") == network_uuid and in_private_service_pool(vm.get("private_ipv4")) for vm in vms):
+    if any(
+        (vm.get("network_uuid") == network_uuid or vm.get("uuid") in network_member_ids)
+        and in_private_service_pool(vm.get("private_ipv4"))
+        for vm in vms
+    ):
         raise SystemExit("operator-reserved private Service VIP range collides with a VPC VM")
-    expected_cp_names = [f"rke2-{owner}-cp-{index}" for index in range(3)]
+    cluster_resource_name = state["clusterResourceName"]
+    if not isinstance(cluster_resource_name, str) or re.fullmatch(
+        r"[a-z0-9](?:[a-z0-9-]{0,57}[a-z0-9])?", cluster_resource_name
+    ) is None:
+        raise SystemExit("cluster resource name cannot form fixed DNS-label control-plane hostnames")
+    expected_cp_names = [f"{cluster_resource_name}-cp{index}" for index in range(3)]
     bastion_name = f"rke2-{owner}-bastion"
-    owned_vms = [vm for vm in vms if str(vm.get("name", "")).startswith(f"rke2-{owner}-")]
-    if len(owned_vms) != 4 or {vm.get("name") for vm in owned_vms} != {*expected_cp_names, bastion_name}:
+    listed_owned_vms = [
+        vm for vm in vms
+        if vm.get("name") in expected_cp_names
+        or str(vm.get("name", "")).startswith(f"rke2-{owner}-")
+    ]
+    if len(listed_owned_vms) != 4 or {vm.get("name") for vm in listed_owned_vms} != {*expected_cp_names, bastion_name}:
         raise SystemExit("expected exactly three control planes and one deterministic bastion")
-    vm_by_name = {vm["name"]: vm for vm in owned_vms}
+    vm_by_name = canonical_owned_vm_details(listed_owned_vms)
+    owned_vms = list(vm_by_name.values())
     result_cp_ids = result.get("controlPlaneVMs")
     if not isinstance(result_cp_ids, list) or len(result_cp_ids) != 3 or len(set(result_cp_ids)) != 3:
         raise SystemExit("reconciler result did not contain three unique control-plane UUIDs")
@@ -182,13 +227,18 @@ def main() -> None:
         or bastion.get("designated_pool_uuid") != os.environ["INSPACE_INTEL_HOST_POOL_UUID"]
         or bastion.get("network_uuid") != network_uuid
         or bastion.get("billing_account") != int(os.environ["INSPACE_BILLING_ACCOUNT_ID"])
+        or re.fullmatch(
+            rf"inspace-rke2-bastion/v1 owner={re.escape(owner)} spec=[0-9a-f]{{64}}",
+            str(bastion.get("description", "")),
+        ) is None
         or len(root_disks) != 1
         or root_disks[0].get("size") != 30
     ):
         raise SystemExit("bastion must be exact Ubuntu 24.04 / 1-vCPU / 2-GiB / 30-GiB / configured-pool shape")
 
     addresses = [item for item in api_get("network/ip_addresses") if not item.get("is_deleted", False)]
-    expected_fip_names = {name + "-ip" for name in expected_cp_names} | {bastion_name + "-ip"}
+    expected_cp_fip_names = [f"rke2-{owner}-cp-{slot}-ip" for slot in range(3)]
+    expected_fip_names = set(expected_cp_fip_names) | {bastion_name + "-ip"}
     owned_fips = [item for item in addresses if str(item.get("name", "")).startswith(f"rke2-{owner}-")]
     if len(owned_fips) != 4 or {item.get("name") for item in owned_fips} != expected_fip_names:
         raise SystemExit("expected one exact egress FIP for each control plane and bastion")
@@ -203,9 +253,9 @@ def main() -> None:
     control_planes = []
     private_addresses = set()
     public_addresses = set()
-    for name in expected_cp_names:
+    for slot, name in enumerate(expected_cp_names):
         vm = vm_by_name[name]
-        fip = fip_by_name[name + "-ip"]
+        fip = fip_by_name[expected_cp_fip_names[slot]]
         root_disks = [disk for disk in vm.get("storage", []) if disk.get("primary")]
         if (
             vm.get("vcpu") != 2
@@ -215,6 +265,11 @@ def main() -> None:
             or vm.get("designated_pool_uuid") != os.environ["INSPACE_INTEL_HOST_POOL_UUID"]
             or vm.get("network_uuid") != network_uuid
             or vm.get("billing_account") != int(os.environ["INSPACE_BILLING_ACCOUNT_ID"])
+            or vm.get("hostname") not in (None, "", name)
+            or re.fullmatch(
+                rf"inspace-rke2-cp/v2 owner={re.escape(owner)} slot={slot} spec=[0-9a-f]{{64}}",
+                str(vm.get("description", "")),
+            ) is None
             or len(root_disks) != 1
             or root_disks[0].get("size") != 30
         ):
@@ -258,7 +313,6 @@ def main() -> None:
     if bastion_private in private_addresses or bastion_public in public_addresses or str(vip) == bastion_private:
         raise SystemExit("bastion, control planes, and VIP must use unique addresses")
 
-    network_members = list(network.get("vm_uuids", []))
     expected_vm_ids = bootstrap_vm_ids
     if any(network_members.count(vm_uuid) != 1 for vm_uuid in expected_vm_ids):
         raise SystemExit("all bootstrap VMs must be exact members of the configured VPC")
@@ -328,10 +382,20 @@ def main() -> None:
     if bastion_assigned_firewalls != [bastion_firewall.get("uuid")]:
         raise SystemExit("the bastion must be attached only to the managed bastion firewall")
     billing_account = int(os.environ["INSPACE_BILLING_ACCOUNT_ID"])
-    if node_firewall.get("billing_account_id") != billing_account or node_firewall.get("description") != f"Managed RKE2 node firewall for {owner}":
-        raise SystemExit("node firewall lacks the exact billing-account ownership record")
-    if bastion_firewall.get("billing_account_id") != billing_account or bastion_firewall.get("description") != f"Managed RKE2 bastion firewall for {owner}":
-        raise SystemExit("bastion firewall lacks the exact billing-account ownership record")
+    if node_firewall.get("billing_account_id") != billing_account:
+        raise SystemExit("node firewall lacks the exact billing-account identity")
+    if bastion_firewall.get("billing_account_id") != billing_account:
+        raise SystemExit("bastion firewall lacks the exact billing-account identity")
+    # InSpace accepts firewall descriptions on create but omits them from the
+    # authoritative create/list responses. A description is therefore only an
+    # optional drift signal; exact names, account, rules, and assignments are
+    # the ownership proof used above and below.
+    node_description = node_firewall.get("description")
+    if node_description not in (None, "", f"Managed RKE2 node firewall for {owner}"):
+        raise SystemExit("node firewall has an unexpected description")
+    bastion_description = bastion_firewall.get("description")
+    if bastion_description not in (None, "", f"Managed RKE2 bastion firewall for {owner}"):
+        raise SystemExit("bastion firewall has an unexpected description")
     validate_node_firewall(node_firewall, str(subnet), "10.42.0.0/16", set(result_cp_ids))
     validate_bastion_firewall(bastion_firewall, state["managementCIDR"], bastion["uuid"])
 

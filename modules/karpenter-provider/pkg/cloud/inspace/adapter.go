@@ -14,11 +14,15 @@ import (
 	"fmt"
 	"net/http"
 	"net/netip"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	sdk "github.com/thanet-s/inspace-cloud-kube-modules/modules/client"
+	k8svalidation "k8s.io/apimachinery/pkg/util/validation"
 
 	inspacev1 "github.com/thanet-s/inspace-cloud-kube-modules/modules/karpenter-provider/pkg/apis/v1alpha1"
 	"github.com/thanet-s/inspace-cloud-kube-modules/modules/karpenter-provider/pkg/bootstrap"
@@ -26,7 +30,9 @@ import (
 )
 
 const (
-	ownershipSchema                             = "karpenter.inspace.cloud/v1"
+	ownershipSchemaNamespace                    = "karpenter.inspace.cloud/"
+	ownershipSchema                             = ownershipSchemaNamespace + "v2"
+	legacyOwnershipSchema                       = ownershipSchemaNamespace + "v1"
 	defaultUsername                             = "user"
 	passwordByteSize                            = 21
 	defaultNetworkAttachmentReadbackTimeout     = 60 * time.Second
@@ -34,12 +40,23 @@ const (
 	defaultNetworkAttachmentReadbackMinInterval = 500 * time.Millisecond
 	defaultNetworkAttachmentReadbackMaxInterval = 5 * time.Second
 	defaultProtectionAuditTimeout               = 15 * time.Second
+	defaultLaunchCleanupTimeout                 = 30 * time.Second
+	defaultLaunchFloatingIPCleanupTimeout       = 10 * time.Second
+	canonicalVMReadConcurrency                  = 8
 )
 
 var (
 	errWorkerSupervisorVIPCollision  = errors.New("worker private IPv4 collides with the private RKE2 supervisor VIP")
 	errWorkerServiceVIPPoolCollision = errors.New("worker private IPv4 collides with the reserved private Service VIP pool")
 	errFirewallAssignmentNotVisible  = errors.New("intended worker firewall assignment is not visible")
+	errPersistedOwnershipIncomplete  = errors.New("persisted VM ownership record is incomplete")
+	errVMAbsenceUncertain            = errors.New("VM absence could not be established")
+	errFloatingIPCleanupUncertain    = errors.New("floating IP cleanup did not converge")
+	errFirewallCleanupUncertain      = errors.New("firewall cleanup did not converge")
+	vmUUIDPattern                    = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
+	ownedInstanceTypePattern         = regexp.MustCompile(`^is-(compute|general|memory)-([0-9]+)c-([0-9]+)g$`)
+	karpenterOwnershipPrefixPattern  = regexp.MustCompile(`^\s*\{\s*"schema"\s*:\s*"(karpenter\.inspace\.cloud/[^"\s]+)"(?:\s*[,}]|\s*$)`)
+	karpenterClusterPattern          = regexp.MustCompile(`"cluster"\s*:\s*"([^"]*)"`)
 	fixedClusterNetworks             = [...]struct {
 		description string
 		prefix      netip.Prefix
@@ -76,6 +93,8 @@ type Adapter struct {
 	networkAttachmentReadbackMinDelay time.Duration
 	networkAttachmentReadbackMaxDelay time.Duration
 	protectionAuditTimeout            time.Duration
+	launchCleanupTimeout              time.Duration
+	launchFloatingIPCleanupTimeout    time.Duration
 }
 
 func New(api API) (*Adapter, error) {
@@ -97,6 +116,8 @@ func newAdapter(api API, passwordGenerator func() (string, error)) (*Adapter, er
 		networkAttachmentReadbackMinDelay: defaultNetworkAttachmentReadbackMinInterval,
 		networkAttachmentReadbackMaxDelay: defaultNetworkAttachmentReadbackMaxInterval,
 		protectionAuditTimeout:            defaultProtectionAuditTimeout,
+		launchCleanupTimeout:              defaultLaunchCleanupTimeout,
+		launchFloatingIPCleanupTimeout:    defaultLaunchFloatingIPCleanupTimeout,
 	}, nil
 }
 
@@ -104,9 +125,13 @@ type ownership struct {
 	Schema                       string `json:"schema"`
 	Cluster                      string `json:"cluster"`
 	NodeClaim                    string `json:"nodeClaim"`
+	VMName                       string `json:"vmName,omitempty"`
 	KeyHash                      string `json:"keyHash"`
 	HostClass                    string `json:"hostClass"`
 	InstanceType                 string `json:"instanceType"`
+	HostPoolUUID                 string `json:"hostPoolUUID,omitempty"`
+	VCPU                         int    `json:"vCPU,omitempty"`
+	MemoryGiB                    int    `json:"memoryGiB,omitempty"`
 	RootDiskGiB                  int32  `json:"rootDiskGiB"`
 	SpecHash                     string `json:"specHash"`
 	BootstrapHash                string `json:"bootstrapHash"`
@@ -124,8 +149,9 @@ type ownership struct {
 
 func newOwnership(request cloudapi.CreateVMRequest, floatingIP sdk.FloatingIP) ownership {
 	return ownership{
-		Schema: ownershipSchema, Cluster: request.ClusterName, NodeClaim: request.NodeClaimName,
+		Schema: ownershipSchema, Cluster: request.ClusterName, NodeClaim: request.NodeClaimName, VMName: request.Name,
 		KeyHash: hashKey(request.IdempotencyKey), HostClass: request.HostClass, InstanceType: request.InstanceType,
+		HostPoolUUID: request.HostPoolUUID, VCPU: request.VCPU, MemoryGiB: request.MemoryGiB,
 		RootDiskGiB: request.RootDiskGiB, SpecHash: request.SpecHash, BootstrapHash: request.BootstrapHash,
 		FirewallUUID: request.FirewallUUID, NetworkUUID: request.NetworkUUID, ControlPlaneVIP: request.ControlPlaneVIP,
 		PrivateLoadBalancerPoolStart: request.PrivateLoadBalancerPoolStart, PrivateLoadBalancerPoolStop: request.PrivateLoadBalancerPoolStop,
@@ -158,9 +184,9 @@ func (a *Adapter) CreateVM(ctx context.Context, request cloudapi.CreateVMRequest
 		if err := validateExisting(*existing, request, actual, expected); err != nil {
 			return nil, err
 		}
-		networkPrefix, err := a.ensureWorkerNetworkIdentity(ctx, request, existing)
+		persisted, networkPrefix, ownershipProven, err := a.ensureWorkerNetworkIdentity(ctx, request, existing.UUID, expected)
 		if err != nil {
-			if actual.ControlPlaneVIP != "" && (errors.Is(err, errWorkerSupervisorVIPCollision) || errors.Is(err, errWorkerServiceVIPPoolCollision)) {
+			if ownershipProven && actual.ControlPlaneVIP != "" && (errors.Is(err, errWorkerSupervisorVIPCollision) || errors.Is(err, errWorkerServiceVIPPoolCollision)) {
 				return nil, a.cleanupLaunch(ctx, request.Location, request.FirewallUUID, existing.UUID, expectedFloatingIP, err)
 			}
 			return nil, fmt.Errorf("verifying network identity for owned VM %s: %w", existing.UUID, err)
@@ -175,7 +201,7 @@ func (a *Adapter) CreateVM(ctx context.Context, request cloudapi.CreateVMRequest
 		if err := a.ensureCloudProtections(ctx, request, existing.UUID, *floatingIP, networkPrefix); err != nil {
 			return nil, fmt.Errorf("verifying protection for owned VM %s: %w", existing.UUID, err)
 		}
-		return fromSDK(existing, request.Location, actual), nil
+		return fromSDK(persisted, request.Location, actual), nil
 	}
 	floatingIP, floatingIPCreated, err := a.ensureFloatingIP(ctx, request)
 	if err != nil {
@@ -263,20 +289,14 @@ func (a *Adapter) CreateVM(ctx context.Context, request cloudapi.CreateVMRequest
 		cleanupErr := a.cleanupUnassignedFloatingIP(ctx, request.Location, *floatingIP)
 		return nil, errors.Join(fmt.Errorf("creating InSpace VM returned no UUID"), cleanupErr)
 	}
-	// Some create responses omit request fields. Merge only sent values;
-	// subsequent Get/List still require the persisted ownership JSON.
-	created.Description = string(description)
-	created.OSName = request.OSName
-	created.OSVersion = request.OSVersion
-	created.DesignatedPoolUUID = request.HostPoolUUID
-	if created.NetworkUUID != "" && created.NetworkUUID != request.NetworkUUID {
-		return nil, a.cleanupLaunch(ctx, request.Location, request.FirewallUUID, created.UUID, *floatingIP,
-			fmt.Errorf("created VM is attached to network %q instead of %q", created.NetworkUUID, request.NetworkUUID))
-	}
-	if err := a.ensureProtection(ctx, request, created, *floatingIP); err != nil {
+	// A create response may be sparse and is not durable ownership authority.
+	// Use only its UUID, then require the subsequent VM detail read to contain
+	// the complete, exact ownership record before making protection mutations.
+	persisted, _, err := a.ensureProtection(ctx, request, created.UUID, *floatingIP, record)
+	if err != nil {
 		return nil, a.cleanupLaunch(ctx, request.Location, request.FirewallUUID, created.UUID, *floatingIP, err)
 	}
-	return fromSDK(created, request.Location, record), nil
+	return fromSDK(persisted, request.Location, record), nil
 }
 
 func (a *Adapter) findCreate(ctx context.Context, request cloudapi.CreateVMRequest, expected ownership, floatingIP *sdk.FloatingIP, rollbackNewLaunch bool) (*cloudapi.VM, error) {
@@ -290,13 +310,16 @@ func (a *Adapter) findCreate(ctx context.Context, request cloudapi.CreateVMReque
 	if err := validateExistingFloatingIP(*floatingIP, actual, vm.UUID); err != nil {
 		return nil, err
 	}
-	if err := a.ensureProtection(ctx, request, vm, *floatingIP); err != nil {
-		if (actual.ControlPlaneVIP != "" && (errors.Is(err, errWorkerSupervisorVIPCollision) || errors.Is(err, errWorkerServiceVIPPoolCollision))) || rollbackNewLaunch {
+	persisted, ownershipProven, err := a.ensureProtection(ctx, request, vm.UUID, *floatingIP, expected)
+	if err != nil {
+		unsafeAddressCollision := actual.ControlPlaneVIP != "" &&
+			(errors.Is(err, errWorkerSupervisorVIPCollision) || errors.Is(err, errWorkerServiceVIPPoolCollision))
+		if ownershipProven && (unsafeAddressCollision || rollbackNewLaunch) {
 			return nil, a.cleanupLaunch(ctx, request.Location, request.FirewallUUID, vm.UUID, *floatingIP, err)
 		}
 		return nil, fmt.Errorf("verifying protection for owned VM %s: %w", vm.UUID, err)
 	}
-	return fromSDK(vm, request.Location, actual), nil
+	return fromSDK(persisted, request.Location, actual), nil
 }
 
 func (a *Adapter) findOwnedVM(ctx context.Context, request cloudapi.CreateVMRequest) (*sdk.VM, ownership, error) {
@@ -304,42 +327,107 @@ func (a *Adapter) findOwnedVM(ctx context.Context, request cloudapi.CreateVMRequ
 	if err != nil {
 		return nil, ownership{}, fmt.Errorf("listing VMs before create: %w", err)
 	}
-	type match struct {
-		vm     sdk.VM
-		record ownership
+	if err := validateVMListSnapshot(vms); err != nil {
+		return nil, ownership{}, fmt.Errorf("validating VM list before create: %w", err)
 	}
-	var matches []match
+	var candidates []sdk.VM
 	keyHash := hashKey(request.IdempotencyKey)
 	for i := range vms {
 		record, managed := parseOwnership(vms[i].Description)
-		if managed && record.Cluster == request.ClusterName && record.NodeClaim == request.NodeClaimName && record.KeyHash == keyHash {
-			matches = append(matches, match{vm: vms[i], record: record})
-			continue
-		}
-		if vms[i].Name == request.Name {
-			return nil, ownership{}, fmt.Errorf("refusing create: VM name %q already exists without matching ownership", request.Name)
+		listOwnershipCandidate := managed && record.Cluster == request.ClusterName &&
+			record.NodeClaim == request.NodeClaimName && record.KeyHash == keyHash
+		if vms[i].Name == request.Name || listOwnershipCandidate {
+			candidates = append(candidates, vms[i])
 		}
 	}
-	if len(matches) > 1 {
-		return nil, ownership{}, fmt.Errorf("refusing create: %d VMs have the same Karpenter ownership identity", len(matches))
+	if len(candidates) > 1 {
+		return nil, ownership{}, fmt.Errorf("refusing create: %d VM list rows match the deterministic name or Karpenter ownership key", len(candidates))
 	}
-	if len(matches) == 1 {
-		return &matches[0].vm, matches[0].record, nil
+	if len(candidates) == 0 {
+		return nil, ownership{}, nil
 	}
-	return nil, ownership{}, nil
+	vm, record, err := a.readCanonicalCreateCandidate(ctx, request, candidates[0])
+	if err != nil {
+		return nil, ownership{}, fmt.Errorf("refusing create: canonical detail for listed VM %q: %w", candidates[0].Name, err)
+	}
+	return vm, record, nil
+}
+
+func validateVMListSnapshot(vms []sdk.VM) error {
+	uuids := make(map[string]bool, len(vms))
+	for i := range vms {
+		if !vmUUIDPattern.MatchString(vms[i].UUID) {
+			return fmt.Errorf("VM list row %d has invalid UUID %q", i, vms[i].UUID)
+		}
+		if uuids[vms[i].UUID] {
+			return fmt.Errorf("VM list contains duplicate UUID %s", vms[i].UUID)
+		}
+		uuids[vms[i].UUID] = true
+	}
+	return nil
+}
+
+// readCanonicalCreateCandidate treats ListVMs only as location-wide discovery
+// and collision evidence. Ownership, launch identity, and adoption authority
+// all come from bounded GetVM detail reads for the exact listed UUID.
+func (a *Adapter) readCanonicalCreateCandidate(ctx context.Context, request cloudapi.CreateVMRequest, summary sdk.VM) (*sdk.VM, ownership, error) {
+	readbackCtx, cancel := context.WithTimeout(ctx, a.networkAttachmentReadbackTimeout)
+	defer cancel()
+	var lastObservation error
+	readbackDelay := a.networkAttachmentReadbackMinDelay
+	for {
+		requestCtx, requestCancel := context.WithTimeout(readbackCtx, a.networkAttachmentRequestTimeout)
+		vm, err := a.api.GetVM(requestCtx, request.Location, summary.UUID)
+		requestCancel()
+		var currentObservation error
+		if err != nil {
+			currentObservation = fmt.Errorf("getting canonical VM %s: %w", summary.UUID, err)
+		}
+		if readbackErr := readbackCtx.Err(); readbackErr != nil {
+			return nil, ownership{}, fmt.Errorf("canonical VM %s read-back stopped: %w", summary.UUID, errors.Join(lastObservation, currentObservation, readbackErr))
+		}
+		switch {
+		case err != nil:
+			if !sdk.IsNotFound(err) && !isRetryableReadback(readbackCtx, err) {
+				return nil, ownership{}, currentObservation
+			}
+			lastObservation = currentObservation
+		case vm == nil:
+			lastObservation = fmt.Errorf("%w: canonical VM %s detail response is empty: %w", cloudapi.ErrOwnershipMismatch, summary.UUID, errPersistedOwnershipIncomplete)
+		case vm.UUID != summary.UUID:
+			return nil, ownership{}, fmt.Errorf("%w: canonical VM detail UUID %q does not match listed UUID %q", cloudapi.ErrOwnershipMismatch, vm.UUID, summary.UUID)
+		case summary.Name != "" && vm.Name != "" && vm.Name != summary.Name:
+			return nil, ownership{}, fmt.Errorf("%w: canonical VM detail name %q does not match listed name %q", cloudapi.ErrOwnershipMismatch, vm.Name, summary.Name)
+		default:
+			var actual ownership
+			_ = json.Unmarshal([]byte(vm.Description), &actual)
+			expected := newOwnership(request, sdk.FloatingIP{
+				Name: floatingIPName(request.ClusterName, request.NodeClaimName), Address: actual.PublicIPv4,
+				BillingAccountID: request.BillingAccountID,
+			})
+			validationErr := validatePersistedVM(*vm, summary.UUID, request, expected)
+			if validationErr == nil && actual.PublicIPv4 == "" {
+				validationErr = fmt.Errorf("%w: VM %s canonical ownership lacks its public IPv4: %w", cloudapi.ErrOwnershipMismatch, summary.UUID, errPersistedOwnershipIncomplete)
+			}
+			if errors.Is(validationErr, errPersistedOwnershipIncomplete) {
+				lastObservation = validationErr
+			} else if validationErr != nil {
+				return nil, ownership{}, validationErr
+			} else {
+				return vm, actual, nil
+			}
+		}
+		if err := waitForReadback(readbackCtx, readbackDelay); err != nil {
+			return nil, ownership{}, fmt.Errorf("canonical VM %s ownership did not converge before the read-back deadline: %w", summary.UUID, errors.Join(lastObservation, err))
+		}
+		readbackDelay = nextReadbackDelay(readbackDelay, a.networkAttachmentReadbackMaxDelay)
+	}
 }
 
 func (a *Adapter) GetVM(ctx context.Context, location, uuid, clusterName string) (*cloudapi.VM, error) {
-	vm, err := a.api.GetVM(ctx, location, uuid)
+	vm, record, err := a.readEstablishedVM(ctx, location, uuid, clusterName)
 	if err != nil {
-		if sdk.IsNotFound(err) {
-			return nil, cloudapi.ErrNotFound
-		}
 		return nil, err
-	}
-	record, managed := parseOwnership(vm.Description)
-	if !managed || record.Cluster != clusterName {
-		return nil, fmt.Errorf("%w: VM %s is not managed for cluster %q", cloudapi.ErrOwnershipMismatch, uuid, clusterName)
 	}
 	if err := a.auditEstablishedVMProtections(ctx, location, []ownedVM{{vm: *vm, record: record}}); err != nil {
 		return nil, err
@@ -347,15 +435,88 @@ func (a *Adapter) GetVM(ctx context.Context, location, uuid, clusterName string)
 	return fromSDK(vm, location, record), nil
 }
 
+// readEstablishedVM gives eventually consistent detail fields a bounded
+// chance to converge. Missing ownership or launch fields are uncertainty;
+// every supplied conflict remains an immediate, fail-closed error.
+func (a *Adapter) readEstablishedVM(ctx context.Context, location, uuid, clusterName string) (*sdk.VM, ownership, error) {
+	readbackCtx, cancel := context.WithTimeout(ctx, a.protectionAuditTimeout)
+	defer cancel()
+	var lastObservation error
+	readbackDelay := a.networkAttachmentReadbackMinDelay
+	for {
+		if readbackErr := readbackCtx.Err(); readbackErr != nil {
+			return nil, ownership{}, fmt.Errorf("canonical VM %s established read-back stopped: %w", uuid, errors.Join(lastObservation, readbackErr))
+		}
+		requestCtx, requestCancel := context.WithTimeout(readbackCtx, a.networkAttachmentRequestTimeout)
+		vm, err := a.api.GetVM(requestCtx, location, uuid)
+		requestCancel()
+		if err != nil {
+			if sdk.IsNotFound(err) {
+				return nil, ownership{}, cloudapi.ErrNotFound
+			}
+			if readbackErr := readbackCtx.Err(); readbackErr != nil {
+				observation := fmt.Errorf("reading canonical detail for established VM %s: %w", uuid, err)
+				return nil, ownership{}, fmt.Errorf("canonical VM %s established read-back stopped: %w", uuid, errors.Join(lastObservation, observation, readbackErr))
+			}
+			if !isRetryableReadback(readbackCtx, err) {
+				return nil, ownership{}, err
+			}
+			lastObservation = fmt.Errorf("reading canonical detail for established VM %s: %w", uuid, err)
+		} else if vm == nil {
+			lastObservation = fmt.Errorf("%w: canonical VM %s detail response is empty: %w", cloudapi.ErrOwnershipMismatch, uuid, errPersistedOwnershipIncomplete)
+		} else if vm.UUID != uuid {
+			return nil, ownership{}, fmt.Errorf("%w: canonical VM %s returned detail UUID %q", cloudapi.ErrOwnershipMismatch, uuid, vm.UUID)
+		} else {
+			record, managed, complete, err := inspectOwnershipDescription(vm.Description, clusterName)
+			if err != nil {
+				return nil, ownership{}, fmt.Errorf("canonical VM %s ownership: %w", uuid, err)
+			}
+			if !managed || record.Cluster != clusterName {
+				return nil, ownership{}, fmt.Errorf("%w: VM %s is not managed for cluster %q", cloudapi.ErrOwnershipMismatch, uuid, clusterName)
+			}
+			switch {
+			case !complete:
+				lastObservation = fmt.Errorf("%w: established worker VM %s lacks complete persisted ownership: %w", cloudapi.ErrOwnershipMismatch, uuid, errPersistedOwnershipIncomplete)
+			default:
+				validationErr := validateEstablishedLaunchIdentity(*vm, record)
+				if validationErr == nil {
+					return vm, record, nil
+				}
+				if !errors.Is(validationErr, errPersistedOwnershipIncomplete) {
+					return nil, ownership{}, fmt.Errorf("established worker VM %s launch identity drift: %w", uuid, validationErr)
+				}
+				lastObservation = fmt.Errorf("established worker VM %s launch identity has not converged: %w", uuid, validationErr)
+			}
+		}
+		if err := waitForReadback(readbackCtx, readbackDelay); err != nil {
+			return nil, ownership{}, fmt.Errorf("canonical VM %s established identity did not converge before the read-back deadline: %w", uuid, errors.Join(lastObservation, err))
+		}
+		readbackDelay = nextReadbackDelay(readbackDelay, a.networkAttachmentReadbackMaxDelay)
+	}
+}
+
 func (a *Adapter) ListVMs(ctx context.Context, location, clusterName string) ([]*cloudapi.VM, error) {
-	vms, err := a.api.ListVMs(ctx, location)
+	listed, err := a.api.ListVMs(ctx, location)
+	if err != nil {
+		return nil, err
+	}
+	vms, err := a.canonicalListedVMDetails(ctx, location, clusterName, listed)
 	if err != nil {
 		return nil, err
 	}
 	owned := make([]ownedVM, 0, len(vms))
 	for i := range vms {
-		record, managed := parseOwnership(vms[i].Description)
+		record, managed, complete, err := inspectOwnershipDescription(vms[i].Description, clusterName)
+		if err != nil {
+			return nil, fmt.Errorf("canonical VM %s ownership: %w", vms[i].UUID, err)
+		}
 		if managed && record.Cluster == clusterName {
+			if !complete {
+				return nil, fmt.Errorf("%w: established worker VM %s lacks complete persisted ownership: %w", cloudapi.ErrOwnershipMismatch, vms[i].UUID, errPersistedOwnershipIncomplete)
+			}
+			if err := validateEstablishedLaunchIdentity(vms[i], record); err != nil {
+				return nil, fmt.Errorf("established worker VM %s launch identity drift: %w", vms[i].UUID, err)
+			}
 			owned = append(owned, ownedVM{vm: vms[i], record: record})
 		}
 	}
@@ -368,6 +529,166 @@ func (a *Adapter) ListVMs(ctx context.Context, location, clusterName string) ([]
 	}
 	sort.Slice(result, func(i, j int) bool { return result[i].UUID < result[j].UUID })
 	return result, nil
+}
+
+func (a *Adapter) canonicalListedVMDetails(ctx context.Context, location, clusterName string, listed []sdk.VM) ([]sdk.VM, error) {
+	if err := validateVMListSnapshot(listed); err != nil {
+		return nil, fmt.Errorf("validating VM list for canonical read audit: %w", err)
+	}
+	auditCtx, cancel := context.WithTimeout(ctx, a.protectionAuditTimeout)
+	defer cancel()
+	workerCtx, cancelWorkers := context.WithCancel(auditCtx)
+	defer cancelWorkers()
+	summaries := append([]sdk.VM(nil), listed...)
+	sort.Slice(summaries, func(i, j int) bool { return summaries[i].UUID < summaries[j].UUID })
+	details := make([]*sdk.VM, len(summaries))
+	errs := make([]error, len(summaries))
+	jobs := make(chan int, len(summaries))
+	for index := range summaries {
+		jobs <- index
+	}
+	close(jobs)
+	workers := canonicalVMReadConcurrency
+	if len(summaries) < workers {
+		workers = len(summaries)
+	}
+	var reads sync.WaitGroup
+	var firstErr error
+	var firstErrOnce sync.Once
+	for range workers {
+		reads.Add(1)
+		go func() {
+			defer reads.Done()
+			for index := range jobs {
+				details[index], errs[index] = a.readCanonicalListedVM(workerCtx, location, clusterName, summaries[index])
+				if errs[index] != nil {
+					firstErrOnce.Do(func() {
+						firstErr = errs[index]
+						cancelWorkers()
+					})
+				}
+			}
+		}()
+	}
+	reads.Wait()
+	if firstErr != nil {
+		return nil, firstErr
+	}
+	result := make([]sdk.VM, 0, len(details))
+	for i := range details {
+		if errs[i] != nil {
+			return nil, errs[i]
+		}
+		if details[i] != nil {
+			result = append(result, *details[i])
+		}
+	}
+	return result, nil
+}
+
+// readCanonicalListedVM lets an authoritative 404 remove a stale list row and
+// lets definitively unmanaged descriptions pass through for the caller to
+// ignore. Once either the list row or a detail response carries Karpenter
+// ownership evidence, however, an incomplete canonical record is uncertainty:
+// poll it within the shared ListVMs bound and fail closed if it never converges.
+func (a *Adapter) readCanonicalListedVM(ctx context.Context, location, clusterName string, summary sdk.VM) (*sdk.VM, error) {
+	listedRecord, listedKarpenter, listedRecordComplete, err := inspectOwnershipDescription(summary.Description, clusterName)
+	if err != nil {
+		return nil, fmt.Errorf("listed VM %s ownership: %w", summary.UUID, err)
+	}
+	ownershipEvidence := listedKarpenter && (listedRecord.Cluster == "" || listedRecord.Cluster == clusterName)
+	var lastObservation error
+	readbackDelay := a.networkAttachmentReadbackMinDelay
+	for {
+		if readbackErr := ctx.Err(); readbackErr != nil {
+			return nil, fmt.Errorf("canonical VM %s list read-back stopped: %w", summary.UUID, errors.Join(lastObservation, readbackErr))
+		}
+		requestCtx, requestCancel := context.WithTimeout(ctx, a.networkAttachmentRequestTimeout)
+		vm, err := a.api.GetVM(requestCtx, location, summary.UUID)
+		requestCancel()
+		var currentObservation error
+		if err != nil {
+			currentObservation = fmt.Errorf("reading canonical detail for listed VM %s: %w", summary.UUID, err)
+		}
+		if readbackErr := ctx.Err(); readbackErr != nil {
+			return nil, fmt.Errorf("canonical VM %s list read-back stopped: %w", summary.UUID, errors.Join(lastObservation, currentObservation, readbackErr))
+		}
+		if sdk.IsNotFound(err) {
+			// The list row became stale after the snapshot. Canonical current
+			// state says the VM is absent, so omitting it is authoritative.
+			return nil, nil
+		}
+		if err != nil {
+			if ownershipEvidence && isRetryableReadback(ctx, err) {
+				lastObservation = currentObservation
+				if err := waitForReadback(ctx, readbackDelay); err != nil {
+					return nil, fmt.Errorf("canonical VM %s Karpenter ownership did not converge before the list read-back deadline: %w", summary.UUID, errors.Join(lastObservation, err))
+				}
+				readbackDelay = nextReadbackDelay(readbackDelay, a.networkAttachmentReadbackMaxDelay)
+				continue
+			}
+			return nil, currentObservation
+		}
+		if vm == nil {
+			if ownershipEvidence {
+				lastObservation = fmt.Errorf("%w: canonical detail for listed VM %s is empty: %w", cloudapi.ErrOwnershipMismatch, summary.UUID, errPersistedOwnershipIncomplete)
+				if err := waitForReadback(ctx, readbackDelay); err != nil {
+					return nil, fmt.Errorf("canonical VM %s Karpenter ownership did not converge before the list read-back deadline: %w", summary.UUID, errors.Join(lastObservation, err))
+				}
+				readbackDelay = nextReadbackDelay(readbackDelay, a.networkAttachmentReadbackMaxDelay)
+				continue
+			}
+			return nil, fmt.Errorf("%w: canonical detail for listed VM %s is empty", cloudapi.ErrOwnershipMismatch, summary.UUID)
+		}
+		if vm.UUID != summary.UUID || (summary.Name != "" && vm.Name != "" && vm.Name != summary.Name) {
+			return nil, fmt.Errorf("%w: canonical detail identity for listed VM %s/%q does not match its list row", cloudapi.ErrOwnershipMismatch, summary.UUID, summary.Name)
+		}
+		record, canonicalKarpenter, canonicalRecordComplete, err := inspectOwnershipDescription(vm.Description, clusterName)
+		if err != nil {
+			return nil, fmt.Errorf("canonical VM %s ownership: %w", summary.UUID, err)
+		}
+		if canonicalKarpenter && record.Cluster != "" && record.Cluster != clusterName && !ownershipEvidence {
+			// With no list-side target or ambiguous ownership evidence, an
+			// explicit record for another cluster is foreign to this query.
+			// Its cluster and unrelated ownership fields may legitimately
+			// change without blocking target-cluster inventory.
+			return vm, nil
+		}
+		if listedKarpenter && canonicalKarpenter && listedRecord.Cluster != "" && record.Cluster != "" && listedRecord.Cluster != record.Cluster {
+			return nil, fmt.Errorf("%w: canonical Karpenter cluster %q for listed VM %s differs from list cluster %q", cloudapi.ErrOwnershipMismatch, record.Cluster, summary.UUID, listedRecord.Cluster)
+		}
+		if listedRecordComplete && canonicalRecordComplete && listedRecord != record {
+			return nil, fmt.Errorf("%w: canonical Karpenter ownership for listed VM %s differs from its complete list record", cloudapi.ErrOwnershipMismatch, summary.UUID)
+		}
+		if canonicalRecordComplete && record.Cluster == clusterName {
+			validationErr := validateEstablishedLaunchIdentity(*vm, record)
+			if validationErr == nil {
+				return vm, nil
+			}
+			if !errors.Is(validationErr, errPersistedOwnershipIncomplete) {
+				return nil, fmt.Errorf("established worker VM %s launch identity drift: %w", summary.UUID, validationErr)
+			}
+			ownershipEvidence = true
+			lastObservation = fmt.Errorf("established worker VM %s launch identity has not converged: %w", summary.UUID, validationErr)
+			if err := waitForReadback(ctx, readbackDelay); err != nil {
+				return nil, fmt.Errorf("canonical VM %s established identity did not converge before the list read-back deadline: %w", summary.UUID, errors.Join(lastObservation, err))
+			}
+			readbackDelay = nextReadbackDelay(readbackDelay, a.networkAttachmentReadbackMaxDelay)
+			continue
+		}
+		canonicalTargetsCluster := canonicalKarpenter && (record.Cluster == "" || record.Cluster == clusterName)
+		if !ownershipEvidence && !canonicalTargetsCluster {
+			// A non-Karpenter description is authoritative unmanaged inventory,
+			// not an account-wide reason to fail a cluster-scoped list.
+			return vm, nil
+		}
+		ownershipEvidence = true
+		lastObservation = fmt.Errorf("%w: canonical detail for listed VM %s lacks a complete Karpenter ownership record: %w", cloudapi.ErrOwnershipMismatch, summary.UUID, errPersistedOwnershipIncomplete)
+		if err := waitForReadback(ctx, readbackDelay); err != nil {
+			return nil, fmt.Errorf("canonical VM %s Karpenter ownership did not converge before the list read-back deadline: %w", summary.UUID, errors.Join(lastObservation, err))
+		}
+		readbackDelay = nextReadbackDelay(readbackDelay, a.networkAttachmentReadbackMaxDelay)
+	}
 }
 
 type ownedVM struct {
@@ -479,28 +800,34 @@ func auditEstablishedVMProtection(vm sdk.VM, record ownership, network *sdk.Netw
 }
 
 func (a *Adapter) DeleteVM(ctx context.Context, location, uuid, clusterName, nodeClaimName string) error {
-	vm, getErr := a.api.GetVM(ctx, location, uuid)
-	var record ownership
-	vmMissing := false
+	vm, vmMissing, getErr := a.readVMForDelete(ctx, location, uuid)
 	if getErr != nil {
-		if !sdk.IsNotFound(getErr) {
-			return getErr
+		return getErr
+	}
+	var record ownership
+	if !vmMissing {
+		var managed, complete bool
+		var ownershipErr error
+		record, managed, complete, ownershipErr = inspectOwnershipDescription(vm.Description, clusterName)
+		if ownershipErr != nil {
+			return fmt.Errorf("authorizing deletion of VM %s: %w", uuid, ownershipErr)
 		}
-		vmMissing = true
-	} else {
-		var managed bool
-		record, managed = parseOwnership(vm.Description)
-		if !managed || record.Cluster != clusterName || record.NodeClaim != nodeClaimName {
+		if !managed || !complete || record.Cluster != clusterName || record.NodeClaim != nodeClaimName {
 			return fmt.Errorf("%w: VM %s is not managed for cluster %q and NodeClaim %q", cloudapi.ErrOwnershipMismatch, uuid, clusterName, nodeClaimName)
 		}
 	}
 
-	floatingIP, floatingErr := a.findFloatingIPByName(ctx, location, floatingIPName(clusterName, nodeClaimName), 0)
-	if floatingErr != nil && !errors.Is(floatingErr, cloudapi.ErrNotFound) {
-		return floatingErr
-	}
-	if floatingIP != nil && record.PublicIPv4 != "" && (floatingIP.Address != record.PublicIPv4 || floatingIP.Name != record.FloatingIPName) {
-		return fmt.Errorf("%w: floating IP ownership does not match VM %s", cloudapi.ErrOwnershipMismatch, uuid)
+	var floatingIP *sdk.FloatingIP
+	if vmMissing {
+		var floatingErr error
+		floatingIP, floatingErr = a.readOrphanFloatingIPForDelete(ctx, location, floatingIPName(clusterName, nodeClaimName), uuid)
+		if floatingErr != nil {
+			return floatingErr
+		}
+	} else {
+		floatingIP = &sdk.FloatingIP{
+			Name: record.FloatingIPName, Address: record.PublicIPv4, BillingAccountID: record.BillingAccountID,
+		}
 	}
 
 	var errs []error
@@ -508,37 +835,29 @@ func (a *Adapter) DeleteVM(ctx context.Context, location, uuid, clusterName, nod
 	if floatingIP != nil {
 		floatingCleanupErr = a.deleteOwnedFloatingIP(ctx, location, *floatingIP, uuid)
 	}
-	vmGone := vmMissing
-	if !vmMissing {
-		if err := a.api.DeleteVM(ctx, location, uuid); err != nil {
-			if sdk.IsNotFound(err) {
-				vmGone = true
-				vmMissing = true
-			} else {
-				// The cloud firewall deliberately remains attached whenever VM
-				// deletion fails, even if floating-IP cleanup also failed.
-				if floatingCleanupErr != nil {
-					errs = append(errs, floatingCleanupErr)
-				}
-				errs = append(errs, fmt.Errorf("deleting VM %s: %w", uuid, err))
-				return errors.Join(errs...)
-			}
-		} else {
-			vmGone = true
-		}
-	}
-	if vmGone && floatingCleanupErr != nil && floatingIP != nil {
-		// VM deletion may cause the API to release an assignment, so retry the
-		// owned IP cleanup once after the protected VM is gone.
-		floatingCleanupErr = a.deleteOwnedFloatingIP(ctx, location, *floatingIP, uuid)
-	}
 	if floatingCleanupErr != nil {
-		errs = append(errs, floatingCleanupErr)
+		// Dependent identity or convergence failures are a hard precondition:
+		// preserve the VM and firewall so the next reconciliation can retry from
+		// an owned, protected state.
+		return floatingCleanupErr
 	}
-	if vmGone {
-		if err := a.detachFirewallAfterVMDeletion(ctx, location, record.FirewallUUID, uuid); err != nil {
-			errs = append(errs, err)
+	if !vmMissing {
+		requestCtx, requestCancel := context.WithTimeout(ctx, a.networkAttachmentRequestTimeout)
+		deleteErr := a.api.DeleteVM(requestCtx, location, uuid)
+		requestCancel()
+		// A remote 2xx, 404, or error response only proves that the request was
+		// dispatched. Keep the firewall attached until canonical GET and list
+		// read-back independently agree that the VM is absent.
+		if absenceErr := a.waitForVMAbsence(ctx, location, uuid, "after delete"); absenceErr != nil {
+			if deleteErr != nil {
+				errs = append(errs, fmt.Errorf("deleting VM %s: %w", uuid, deleteErr))
+			}
+			errs = append(errs, absenceErr)
+			return errors.Join(errs...)
 		}
+	}
+	if err := a.detachFirewallAfterVMDeletion(ctx, location, record.FirewallUUID, uuid); err != nil {
+		errs = append(errs, err)
 	}
 	if len(errs) != 0 {
 		return errors.Join(errs...)
@@ -547,6 +866,163 @@ func (a *Adapter) DeleteVM(ctx context.Context, location, uuid, clusterName, nod
 		return cloudapi.ErrNotFound
 	}
 	return nil
+}
+
+// waitForVMAbsence is the post-mutation counterpart to readVMForDelete. It
+// never turns a DELETE response into state: two consecutive canonical 404s,
+// each corroborated by a valid location-wide list without the UUID, are
+// required before dependent firewall cleanup can begin.
+func (a *Adapter) waitForVMAbsence(ctx context.Context, location, uuid, phase string) error {
+	readbackCtx, cancel := context.WithTimeout(ctx, a.networkAttachmentReadbackTimeout)
+	defer cancel()
+	absenceConfirmations := 0
+	var lastObservation error
+	readbackDelay := a.networkAttachmentReadbackMinDelay
+	for {
+		if readbackErr := readbackCtx.Err(); readbackErr != nil {
+			return fmt.Errorf("VM %s absence %s stopped: %w", uuid, phase, errors.Join(errVMAbsenceUncertain, lastObservation, readbackErr))
+		}
+		requestCtx, requestCancel := context.WithTimeout(readbackCtx, a.networkAttachmentRequestTimeout)
+		vm, getErr := a.api.GetVM(requestCtx, location, uuid)
+		requestCancel()
+		if readbackErr := readbackCtx.Err(); readbackErr != nil {
+			return fmt.Errorf("VM %s absence %s stopped: %w", uuid, phase, errors.Join(errVMAbsenceUncertain, lastObservation, getErr, readbackErr))
+		}
+		switch {
+		case getErr == nil && vm == nil:
+			absenceConfirmations = 0
+			lastObservation = fmt.Errorf("%w: VM %s detail response is empty", errVMAbsenceUncertain, uuid)
+		case getErr == nil && vm.UUID != uuid:
+			return fmt.Errorf("%w: canonical VM detail UUID %q does not match delete target %q", cloudapi.ErrOwnershipMismatch, vm.UUID, uuid)
+		case getErr == nil:
+			absenceConfirmations = 0
+			lastObservation = fmt.Errorf("VM %s remains visible %s", uuid, phase)
+		case !sdk.IsNotFound(getErr):
+			absenceConfirmations = 0
+			lastObservation = fmt.Errorf("getting VM %s %s: %w", uuid, phase, getErr)
+			if !isRetryableReadback(readbackCtx, getErr) {
+				return lastObservation
+			}
+		default:
+			requestCtx, requestCancel := context.WithTimeout(readbackCtx, a.networkAttachmentRequestTimeout)
+			listed, listErr := a.api.ListVMs(requestCtx, location)
+			requestCancel()
+			if readbackErr := readbackCtx.Err(); readbackErr != nil {
+				return fmt.Errorf("VM %s absence %s stopped: %w", uuid, phase, errors.Join(errVMAbsenceUncertain, lastObservation, listErr, readbackErr))
+			}
+			if listErr != nil {
+				absenceConfirmations = 0
+				lastObservation = fmt.Errorf("listing VMs to confirm absence of %s %s: %w", uuid, phase, listErr)
+				if !isRetryableReadback(readbackCtx, listErr) {
+					return lastObservation
+				}
+			} else if err := validateVMListSnapshot(listed); err != nil {
+				return fmt.Errorf("validating VM list to confirm absence of %s %s: %w", uuid, phase, err)
+			} else {
+				listedPresent := false
+				for i := range listed {
+					if listed[i].UUID == uuid {
+						listedPresent = true
+						break
+					}
+				}
+				if listedPresent {
+					absenceConfirmations = 0
+					lastObservation = fmt.Errorf("%w: GetVM reports %s absent while ListVMs still contains it", cloudapi.ErrOwnershipMismatch, uuid)
+				} else {
+					absenceConfirmations++
+					lastObservation = fmt.Errorf("VM %s absence confirmation %d of 2 %s", uuid, absenceConfirmations, phase)
+					if absenceConfirmations == 2 {
+						return nil
+					}
+				}
+			}
+		}
+		if err := waitForReadback(readbackCtx, readbackDelay); err != nil {
+			return fmt.Errorf("VM %s absence did not converge %s: %w", uuid, phase, errors.Join(errVMAbsenceUncertain, lastObservation, err))
+		}
+		readbackDelay = nextReadbackDelay(readbackDelay, a.networkAttachmentReadbackMaxDelay)
+	}
+}
+
+// readVMForDelete never treats one eventually consistent 404 as permission to
+// clean dependent resources. Absence requires two consecutive confirmations
+// from both GetVM and the location-wide VM list. If either source still sees
+// the UUID, reads continue within a fixed bound and no mutation is attempted.
+func (a *Adapter) readVMForDelete(ctx context.Context, location, uuid string) (*sdk.VM, bool, error) {
+	readbackCtx, cancel := context.WithTimeout(ctx, a.networkAttachmentReadbackTimeout)
+	defer cancel()
+	absenceConfirmations := 0
+	var lastObservation error
+	readbackDelay := a.networkAttachmentReadbackMinDelay
+	for {
+		if readbackErr := readbackCtx.Err(); readbackErr != nil {
+			return nil, false, fmt.Errorf("VM %s delete preflight stopped: %w", uuid, errors.Join(errVMAbsenceUncertain, lastObservation, readbackErr))
+		}
+		requestCtx, requestCancel := context.WithTimeout(readbackCtx, a.networkAttachmentRequestTimeout)
+		vm, getErr := a.api.GetVM(requestCtx, location, uuid)
+		requestCancel()
+		var currentObservation error
+		if getErr != nil {
+			currentObservation = fmt.Errorf("getting VM %s before delete: %w", uuid, getErr)
+		}
+		if readbackErr := readbackCtx.Err(); readbackErr != nil {
+			return nil, false, fmt.Errorf("VM %s delete preflight stopped: %w", uuid, errors.Join(errVMAbsenceUncertain, lastObservation, currentObservation, readbackErr))
+		}
+		switch {
+		case getErr == nil && vm == nil:
+			absenceConfirmations = 0
+			lastObservation = fmt.Errorf("%w: VM %s detail response is empty", errVMAbsenceUncertain, uuid)
+		case getErr == nil && vm.UUID != uuid:
+			return nil, false, fmt.Errorf("%w: canonical VM detail UUID %q does not match delete target %q", cloudapi.ErrOwnershipMismatch, vm.UUID, uuid)
+		case getErr == nil:
+			return vm, false, nil
+		case !sdk.IsNotFound(getErr):
+			absenceConfirmations = 0
+			if !isRetryableReadback(readbackCtx, getErr) {
+				return nil, false, currentObservation
+			}
+			lastObservation = currentObservation
+		default:
+			requestCtx, requestCancel := context.WithTimeout(readbackCtx, a.networkAttachmentRequestTimeout)
+			listed, listErr := a.api.ListVMs(requestCtx, location)
+			requestCancel()
+			if readbackErr := readbackCtx.Err(); readbackErr != nil {
+				return nil, false, fmt.Errorf("VM %s delete preflight stopped: %w", uuid, errors.Join(errVMAbsenceUncertain, lastObservation, currentObservation, listErr, readbackErr))
+			}
+			if listErr != nil {
+				absenceConfirmations = 0
+				lastObservation = fmt.Errorf("listing VMs to confirm absence of %s: %w", uuid, listErr)
+				if !isRetryableReadback(readbackCtx, listErr) {
+					return nil, false, lastObservation
+				}
+			} else if err := validateVMListSnapshot(listed); err != nil {
+				return nil, false, fmt.Errorf("validating VM list to confirm absence of %s: %w", uuid, err)
+			} else {
+				listedPresent := false
+				for i := range listed {
+					if listed[i].UUID == uuid {
+						listedPresent = true
+						break
+					}
+				}
+				if listedPresent {
+					absenceConfirmations = 0
+					lastObservation = fmt.Errorf("%w: GetVM reports %s absent while ListVMs still contains it", cloudapi.ErrOwnershipMismatch, uuid)
+				} else {
+					absenceConfirmations++
+					lastObservation = fmt.Errorf("VM %s absence confirmation %d of 2", uuid, absenceConfirmations)
+					if absenceConfirmations == 2 {
+						return nil, true, nil
+					}
+				}
+			}
+		}
+		if err := waitForReadback(readbackCtx, readbackDelay); err != nil {
+			return nil, false, fmt.Errorf("VM %s absence did not converge before delete preflight deadline: %w", uuid, errors.Join(errVMAbsenceUncertain, lastObservation, err))
+		}
+		readbackDelay = nextReadbackDelay(readbackDelay, a.networkAttachmentReadbackMaxDelay)
+	}
 }
 
 func (a *Adapter) ValidateNodeClass(ctx context.Context, location, networkUUID, controlPlaneVIP, privateLoadBalancerPoolStart, privateLoadBalancerPoolStop, hostPoolUUID, firewallUUID string) error {
@@ -631,8 +1107,18 @@ func validateCreateRequest(r cloudapi.CreateVMRequest) error {
 	case r.CloudInitJSON == "":
 		return fmt.Errorf("cloud-init JSON is required")
 	}
+	if err := validateV2WorkerName(r.ClusterName, r.NodeClaimName, r.Name); err != nil {
+		return err
+	}
 	if _, err := validateControlPlaneVIP(r.ControlPlaneVIP); err != nil {
 		return err
+	}
+	if _, partial, err := normalizeOwnershipLaunchIdentity(ownership{
+		HostClass: r.HostClass, InstanceType: r.InstanceType, HostPoolUUID: r.HostPoolUUID, VCPU: r.VCPU, MemoryGiB: r.MemoryGiB,
+	}); err != nil {
+		return fmt.Errorf("invalid worker launch identity: %v", err)
+	} else if partial {
+		return fmt.Errorf("invalid worker launch identity: host class and instance type are required")
 	}
 	vip, _ := validateControlPlaneVIP(r.ControlPlaneVIP)
 	privateLoadBalancerPool := inspacev1.PrivateLoadBalancerPool{Start: r.PrivateLoadBalancerPoolStart, Stop: r.PrivateLoadBalancerPoolStop}
@@ -686,13 +1172,284 @@ func validateGeneratedPassword(password string) error {
 }
 
 func validateExisting(vm sdk.VM, request cloudapi.CreateVMRequest, actual, expected ownership) error {
-	if actual != expected || vm.Name != request.Name || vm.VCPU != request.VCPU || vm.MemoryMiB != request.MemoryGiB*1024 ||
+	normalizedActual, actualPartial, actualErr := normalizeOwnershipLaunchIdentity(actual)
+	normalizedExpected, expectedPartial, expectedErr := normalizeOwnershipLaunchIdentity(expected)
+	if actualErr != nil || expectedErr != nil || actualPartial || expectedPartial || normalizedActual != normalizedExpected ||
+		vm.Name != request.Name || vm.VCPU != request.VCPU || vm.MemoryMiB != request.MemoryGiB*1024 ||
+		(vm.Hostname != "" && vm.Hostname != request.Name) ||
 		(vm.OSName != "" && vm.OSName != request.OSName) || (vm.OSVersion != "" && vm.OSVersion != request.OSVersion) ||
 		(vm.DesignatedPoolUUID != "" && vm.DesignatedPoolUUID != request.HostPoolUUID) ||
 		(vm.NetworkUUID != "" && vm.NetworkUUID != request.NetworkUUID) {
 		return fmt.Errorf("owned VM %s exists but launch parameters differ; refusing duplicate create", vm.UUID)
 	}
 	return nil
+}
+
+func validatePersistedVM(vm sdk.VM, vmUUID string, request cloudapi.CreateVMRequest, expected ownership) error {
+	if vm.UUID != vmUUID {
+		return fmt.Errorf("%w: VM detail read-back UUID %q does not match launched VM %q", cloudapi.ErrOwnershipMismatch, vm.UUID, vmUUID)
+	}
+	incomplete := false
+	var actual ownership
+	if err := json.Unmarshal([]byte(vm.Description), &actual); err != nil {
+		incomplete = true
+	} else {
+		normalizedActual, actualPartial, actualErr := normalizeOwnershipLaunchIdentity(actual)
+		normalizedExpected, expectedPartial, expectedErr := normalizeOwnershipLaunchIdentity(expected)
+		if actualErr != nil || expectedErr != nil {
+			return fmt.Errorf("%w: VM %s persisted Karpenter ownership has conflicting launch identity", cloudapi.ErrOwnershipMismatch, vmUUID)
+		}
+		if actualPartial || expectedPartial {
+			incomplete = true
+		}
+		if normalizedActual != normalizedExpected && ownershipMatchesExpectedWherePresent(normalizedActual, normalizedExpected) {
+			incomplete = true
+		} else if normalizedActual != normalizedExpected {
+			return fmt.Errorf("%w: VM %s persisted Karpenter ownership differs from the launched NodeClaim", cloudapi.ErrOwnershipMismatch, vmUUID)
+		}
+	}
+	launchIdentityIncomplete, err := validatePersistedLaunchIdentity(vm, request)
+	if err != nil {
+		return fmt.Errorf("%w: VM %s persisted launch identity differs from the launched NodeClaim: %v", cloudapi.ErrOwnershipMismatch, vmUUID, err)
+	}
+	if incomplete || launchIdentityIncomplete {
+		return fmt.Errorf("%w: VM %s detail read-back lacks complete persisted ownership or launch identity: %w", cloudapi.ErrOwnershipMismatch, vmUUID, errPersistedOwnershipIncomplete)
+	}
+	return nil
+}
+
+// validatePersistedLaunchIdentity returns incomplete=true only when every
+// value the API supplied agrees with the create request but at least one
+// required field is still absent. Any present conflict fails immediately.
+func validatePersistedLaunchIdentity(vm sdk.VM, request cloudapi.CreateVMRequest) (incomplete bool, err error) {
+	return validatePersistedLaunchIdentityWithNetworkPolicy(vm, request, false)
+}
+
+// validateEstablishedPersistedLaunchIdentity accepts an omitted NetworkUUID
+// because the detail endpoint may not echo it for an established VM. A
+// present value must still match exactly; authoritative attachment is proven
+// separately through GetNetwork membership during the protection audit.
+func validateEstablishedPersistedLaunchIdentity(vm sdk.VM, request cloudapi.CreateVMRequest) (incomplete bool, err error) {
+	return validatePersistedLaunchIdentityWithNetworkPolicy(vm, request, true)
+}
+
+func validatePersistedLaunchIdentityWithNetworkPolicy(vm sdk.VM, request cloudapi.CreateVMRequest, allowMissingNetwork bool) (incomplete bool, err error) {
+	checkString := func(field, actual, expected string) error {
+		if actual == "" {
+			incomplete = true
+			return nil
+		}
+		if actual != expected {
+			return fmt.Errorf("%s %q does not match %q", field, actual, expected)
+		}
+		return nil
+	}
+	checkPositive := func(field string, actual, expected int) error {
+		if actual == 0 {
+			incomplete = true
+			return nil
+		}
+		if actual != expected {
+			return fmt.Errorf("%s %d does not match %d", field, actual, expected)
+		}
+		return nil
+	}
+	for _, check := range []func() error{
+		func() error { return checkString("name", vm.Name, request.Name) },
+		func() error {
+			if vm.Hostname != "" && vm.Hostname != request.Name {
+				return fmt.Errorf("hostname %q does not match %q", vm.Hostname, request.Name)
+			}
+			return nil
+		},
+		func() error { return checkPositive("vCPU", vm.VCPU, request.VCPU) },
+		func() error { return checkPositive("memory MiB", vm.MemoryMiB, request.MemoryGiB*1024) },
+		func() error { return checkString("OS name", vm.OSName, request.OSName) },
+		func() error { return checkString("OS version", vm.OSVersion, request.OSVersion) },
+		func() error { return checkString("designated pool UUID", vm.DesignatedPoolUUID, request.HostPoolUUID) },
+		func() error {
+			if vm.NetworkUUID == "" {
+				if !allowMissingNetwork {
+					incomplete = true
+				}
+				return nil
+			}
+			if vm.NetworkUUID != request.NetworkUUID {
+				return fmt.Errorf("worker is attached to network %q instead of %q", vm.NetworkUUID, request.NetworkUUID)
+			}
+			return nil
+		},
+	} {
+		if err := check(); err != nil {
+			return false, err
+		}
+	}
+	if vm.BillingAccountID == 0 {
+		incomplete = true
+	} else if vm.BillingAccountID != request.BillingAccountID {
+		return false, fmt.Errorf("billing account %d does not match %d", vm.BillingAccountID, request.BillingAccountID)
+	}
+	primaryDisks := 0
+	for _, disk := range vm.Storage {
+		if !disk.Primary {
+			continue
+		}
+		primaryDisks++
+		if primaryDisks > 1 {
+			return false, fmt.Errorf("VM reports multiple primary root disks")
+		}
+		if disk.SizeGiB == 0 {
+			incomplete = true
+		} else if disk.SizeGiB != int(request.RootDiskGiB) {
+			return false, fmt.Errorf("primary root disk size %d GiB does not match %d GiB", disk.SizeGiB, request.RootDiskGiB)
+		}
+	}
+	if primaryDisks == 0 {
+		incomplete = true
+	}
+	return incomplete, nil
+}
+
+func normalizeOwnershipLaunchIdentity(record ownership) (normalized ownership, partial bool, err error) {
+	normalized = record
+	// v1 records used the NodeClaim name for the VM, guest hostname, and RKE2
+	// Node name. Normalize that deliberate compatibility contract to v2 before
+	// comparing ownership; a v2 record may never omit its separate VM name.
+	if normalized.Schema == legacyOwnershipSchema {
+		if normalized.VMName != "" && normalized.VMName != normalized.NodeClaim {
+			return ownership{}, false, fmt.Errorf("legacy v1 VM name %q contradicts NodeClaim identity %q", normalized.VMName, normalized.NodeClaim)
+		}
+		normalized.VMName = normalized.NodeClaim
+	} else if normalized.Schema == ownershipSchema {
+		if normalized.Cluster == "" || normalized.NodeClaim == "" || normalized.VMName == "" {
+			return normalized, true, nil
+		}
+		if err := validateV2WorkerName(normalized.Cluster, normalized.NodeClaim, normalized.VMName); err != nil {
+			return ownership{}, false, fmt.Errorf("invalid v2 worker identity: %v", err)
+		}
+	}
+	if record.HostClass == "" || record.InstanceType == "" {
+		return normalized, true, nil
+	}
+	derivedHostPoolUUID, knownHostClass := (inspacev1.HostPoolSelector{Class: record.HostClass}).UUID()
+	if !knownHostClass {
+		return ownership{}, false, fmt.Errorf("unsupported recorded host class %q", record.HostClass)
+	}
+	if record.HostPoolUUID != "" && record.HostPoolUUID != derivedHostPoolUUID {
+		return ownership{}, false, fmt.Errorf("recorded host pool %q does not match host class %q", record.HostPoolUUID, record.HostClass)
+	}
+	matches := ownedInstanceTypePattern.FindStringSubmatch(record.InstanceType)
+	if len(matches) != 4 {
+		return ownership{}, false, fmt.Errorf("recorded instance type %q is not canonical", record.InstanceType)
+	}
+	derivedVCPU, vCPUErr := strconv.Atoi(matches[2])
+	derivedMemoryGiB, memoryErr := strconv.Atoi(matches[3])
+	memoryPerVCPU := map[string]int{"compute": 1, "general": 2, "memory": 4}[matches[1]]
+	if vCPUErr != nil || memoryErr != nil || derivedVCPU < 2 || derivedVCPU > 16 || derivedVCPU%2 != 0 || derivedMemoryGiB != derivedVCPU*memoryPerVCPU {
+		return ownership{}, false, fmt.Errorf("recorded instance type %q has invalid capacity", record.InstanceType)
+	}
+	if record.VCPU < 0 || record.MemoryGiB < 0 {
+		return ownership{}, false, fmt.Errorf("recorded exact capacity must be positive")
+	}
+	if (record.VCPU != 0 && record.VCPU != derivedVCPU) || (record.MemoryGiB != 0 && record.MemoryGiB != derivedMemoryGiB) {
+		return ownership{}, false, fmt.Errorf("recorded exact capacity %d vCPU/%d GiB differs from instance type %q", record.VCPU, record.MemoryGiB, record.InstanceType)
+	}
+	extensionFields := 0
+	if record.HostPoolUUID != "" {
+		extensionFields++
+	}
+	if record.VCPU != 0 {
+		extensionFields++
+	}
+	if record.MemoryGiB != 0 {
+		extensionFields++
+	}
+	partial = extensionFields != 0 && extensionFields != 3
+	normalized.HostPoolUUID = derivedHostPoolUUID
+	normalized.VCPU = derivedVCPU
+	normalized.MemoryGiB = derivedMemoryGiB
+	return normalized, partial, nil
+}
+
+func validateV2WorkerName(clusterName, nodeClaimName, vmName string) error {
+	if messages := k8svalidation.IsDNS1123Label(clusterName); len(messages) != 0 {
+		return fmt.Errorf("cluster name %q must be a DNS-1123 hostname label: %s", clusterName, strings.Join(messages, "; "))
+	}
+	if messages := k8svalidation.IsDNS1123Label(nodeClaimName); len(messages) != 0 {
+		return fmt.Errorf("NodeClaim name %q must be a DNS-1123 hostname label: %s", nodeClaimName, strings.Join(messages, "; "))
+	}
+	expected := clusterName + "-karp-" + nodeClaimName
+	if vmName != expected {
+		return fmt.Errorf("VM name %q must exactly equal cluster-derived worker name %q", vmName, expected)
+	}
+	if messages := k8svalidation.IsDNS1123Label(vmName); len(messages) != 0 {
+		return fmt.Errorf("derived VM name %q must be a DNS-1123 hostname label: %s", vmName, strings.Join(messages, "; "))
+	}
+	return nil
+}
+
+func validateEstablishedLaunchIdentity(vm sdk.VM, record ownership) error {
+	normalized, partial, err := normalizeOwnershipLaunchIdentity(record)
+	if err != nil {
+		return fmt.Errorf("%w: established ownership cannot resolve exact launch identity: %v", cloudapi.ErrOwnershipMismatch, err)
+	}
+	if partial {
+		return fmt.Errorf("%w: established ownership lacks complete exact launch identity: %w", cloudapi.ErrOwnershipMismatch, errPersistedOwnershipIncomplete)
+	}
+	expected := cloudapi.CreateVMRequest{
+		Name:             normalized.VMName,
+		BillingAccountID: normalized.BillingAccountID,
+		NetworkUUID:      normalized.NetworkUUID,
+		OSName:           normalized.OSName,
+		OSVersion:        normalized.OSVersion,
+		HostPoolUUID:     normalized.HostPoolUUID,
+		VCPU:             normalized.VCPU,
+		MemoryGiB:        normalized.MemoryGiB,
+		RootDiskGiB:      normalized.RootDiskGiB,
+	}
+	incomplete, err := validateEstablishedPersistedLaunchIdentity(vm, expected)
+	if err != nil {
+		return fmt.Errorf("%w: established VM launch identity differs from persisted ownership: %v", cloudapi.ErrOwnershipMismatch, err)
+	}
+	if incomplete {
+		return fmt.Errorf("%w: established VM lacks complete launch identity: %w", cloudapi.ErrOwnershipMismatch, errPersistedOwnershipIncomplete)
+	}
+	return nil
+}
+
+// ownershipMatchesExpectedWherePresent distinguishes an eventually
+// consistent partial read-back from a complete conflicting ownership record.
+// Empty fields are allowed only as missing evidence; every field the API did
+// return must already agree with the exact record sent on create.
+func ownershipMatchesExpectedWherePresent(actual, expected ownership) bool {
+	return fieldMatchesOrIsMissing(actual.Schema, expected.Schema) &&
+		fieldMatchesOrIsMissing(actual.Cluster, expected.Cluster) &&
+		fieldMatchesOrIsMissing(actual.NodeClaim, expected.NodeClaim) &&
+		fieldMatchesOrIsMissing(actual.VMName, expected.VMName) &&
+		fieldMatchesOrIsMissing(actual.KeyHash, expected.KeyHash) &&
+		fieldMatchesOrIsMissing(actual.HostClass, expected.HostClass) &&
+		fieldMatchesOrIsMissing(actual.InstanceType, expected.InstanceType) &&
+		fieldMatchesOrIsMissing(actual.HostPoolUUID, expected.HostPoolUUID) &&
+		fieldMatchesOrIsMissing(actual.VCPU, expected.VCPU) &&
+		fieldMatchesOrIsMissing(actual.MemoryGiB, expected.MemoryGiB) &&
+		fieldMatchesOrIsMissing(actual.RootDiskGiB, expected.RootDiskGiB) &&
+		fieldMatchesOrIsMissing(actual.SpecHash, expected.SpecHash) &&
+		fieldMatchesOrIsMissing(actual.BootstrapHash, expected.BootstrapHash) &&
+		fieldMatchesOrIsMissing(actual.FirewallUUID, expected.FirewallUUID) &&
+		fieldMatchesOrIsMissing(actual.NetworkUUID, expected.NetworkUUID) &&
+		fieldMatchesOrIsMissing(actual.ControlPlaneVIP, expected.ControlPlaneVIP) &&
+		fieldMatchesOrIsMissing(actual.PrivateLoadBalancerPoolStart, expected.PrivateLoadBalancerPoolStart) &&
+		fieldMatchesOrIsMissing(actual.PrivateLoadBalancerPoolStop, expected.PrivateLoadBalancerPoolStop) &&
+		fieldMatchesOrIsMissing(actual.OSName, expected.OSName) &&
+		fieldMatchesOrIsMissing(actual.OSVersion, expected.OSVersion) &&
+		fieldMatchesOrIsMissing(actual.BillingAccountID, expected.BillingAccountID) &&
+		fieldMatchesOrIsMissing(actual.FloatingIPName, expected.FloatingIPName) &&
+		fieldMatchesOrIsMissing(actual.PublicIPv4, expected.PublicIPv4)
+}
+
+func fieldMatchesOrIsMissing[T comparable](actual, expected T) bool {
+	var zero T
+	return actual == zero || actual == expected
 }
 
 func validateExistingFloatingIP(floatingIP sdk.FloatingIP, record ownership, vmUUID string) error {
@@ -770,36 +1527,39 @@ func (a *Adapter) ensureFloatingIP(ctx context.Context, request cloudapi.CreateV
 	return created, true, nil
 }
 
-func (a *Adapter) ensureProtection(ctx context.Context, request cloudapi.CreateVMRequest, vm *sdk.VM, floatingIP sdk.FloatingIP) error {
-	networkPrefix, err := a.ensureWorkerNetworkIdentity(ctx, request, vm)
+func (a *Adapter) ensureProtection(ctx context.Context, request cloudapi.CreateVMRequest, vmUUID string, floatingIP sdk.FloatingIP, expected ownership) (*sdk.VM, bool, error) {
+	persisted, networkPrefix, ownershipProven, err := a.ensureWorkerNetworkIdentity(ctx, request, vmUUID, expected)
 	if err != nil {
-		return err
+		return nil, ownershipProven, err
 	}
-	return a.ensureCloudProtections(ctx, request, vm.UUID, floatingIP, networkPrefix)
+	if err := a.ensureCloudProtections(ctx, request, vmUUID, floatingIP, networkPrefix); err != nil {
+		return nil, true, err
+	}
+	return persisted, true, nil
 }
 
-func (a *Adapter) ensureWorkerNetworkIdentity(ctx context.Context, request cloudapi.CreateVMRequest, vm *sdk.VM) (netip.Prefix, error) {
-	if vm == nil || vm.UUID == "" {
-		return netip.Prefix{}, fmt.Errorf("worker VM UUID is required for protection read-back")
+func (a *Adapter) ensureWorkerNetworkIdentity(ctx context.Context, request cloudapi.CreateVMRequest, vmUUID string, expected ownership) (*sdk.VM, netip.Prefix, bool, error) {
+	if vmUUID == "" {
+		return nil, netip.Prefix{}, false, fmt.Errorf("worker VM UUID is required for protection read-back")
 	}
 	vip, err := validateControlPlaneVIP(request.ControlPlaneVIP)
 	if err != nil {
-		return netip.Prefix{}, err
+		return nil, netip.Prefix{}, false, err
 	}
 	privateLoadBalancerPool := inspacev1.PrivateLoadBalancerPool{Start: request.PrivateLoadBalancerPoolStart, Stop: request.PrivateLoadBalancerPoolStop}
 	if err := privateLoadBalancerPool.ValidateForSupervisor(vip); err != nil {
-		return netip.Prefix{}, err
+		return nil, netip.Prefix{}, false, err
 	}
-	networkPrefix, err := a.ensureNetworkAttachment(ctx, request.Location, request.NetworkUUID, vm.UUID, vip, privateLoadBalancerPool)
+	networkPrefix, err := a.ensureNetworkAttachment(ctx, request.Location, request.NetworkUUID, vmUUID, vip, privateLoadBalancerPool)
 	if err != nil {
-		return netip.Prefix{}, err
+		return nil, netip.Prefix{}, false, err
 	}
-	privateIPv4, err := a.ensureWorkerPrivateIPv4(ctx, request.Location, request.NetworkUUID, vm.UUID, networkPrefix, vip, privateLoadBalancerPool)
+	persisted, privateIPv4, ownershipProven, err := a.ensureWorkerPrivateIPv4(ctx, request, vmUUID, networkPrefix, vip, privateLoadBalancerPool, expected)
 	if err != nil {
-		return netip.Prefix{}, err
+		return nil, netip.Prefix{}, ownershipProven, err
 	}
-	vm.PrivateIPv4 = privateIPv4.String()
-	return networkPrefix, nil
+	persisted.PrivateIPv4 = privateIPv4.String()
+	return persisted, networkPrefix, true, nil
 }
 
 func (a *Adapter) ensureCloudProtections(ctx context.Context, request cloudapi.CreateVMRequest, vmUUID string, floatingIP sdk.FloatingIP, networkPrefix netip.Prefix) error {
@@ -826,7 +1586,7 @@ func (a *Adapter) ensureNetworkAttachment(ctx context.Context, location, network
 		requestCancel()
 		if readbackErr := readbackCtx.Err(); readbackErr != nil {
 			return netip.Prefix{}, fmt.Errorf(
-				"VM %s attachment to network %s read-back stopped: %w", vmUUID, networkUUID, readbackErr,
+				"VM %s attachment to network %s read-back stopped: %w", vmUUID, networkUUID, errors.Join(lastObservation, readbackErr),
 			)
 		}
 		if err != nil {
@@ -877,40 +1637,47 @@ func (a *Adapter) ensureNetworkAttachment(ctx context.Context, location, network
 	}
 }
 
-func (a *Adapter) ensureWorkerPrivateIPv4(ctx context.Context, location, networkUUID, vmUUID string, networkPrefix netip.Prefix, controlPlaneVIP netip.Addr, privateLoadBalancerPool inspacev1.PrivateLoadBalancerPool) (netip.Addr, error) {
+func (a *Adapter) ensureWorkerPrivateIPv4(ctx context.Context, request cloudapi.CreateVMRequest, vmUUID string, networkPrefix netip.Prefix, controlPlaneVIP netip.Addr, privateLoadBalancerPool inspacev1.PrivateLoadBalancerPool, expected ownership) (*sdk.VM, netip.Addr, bool, error) {
 	readbackCtx, cancel := context.WithTimeout(ctx, a.networkAttachmentReadbackTimeout)
 	defer cancel()
 	var lastObservation error
+	ownershipProven := false
 	readbackDelay := a.networkAttachmentReadbackMinDelay
 	for {
 		requestCtx, requestCancel := context.WithTimeout(readbackCtx, a.networkAttachmentRequestTimeout)
-		vm, err := a.api.GetVM(requestCtx, location, vmUUID)
+		vm, err := a.api.GetVM(requestCtx, request.Location, vmUUID)
 		requestCancel()
 		if readbackErr := readbackCtx.Err(); readbackErr != nil {
-			return netip.Addr{}, fmt.Errorf("VM %s private IPv4 read-back stopped: %w", vmUUID, readbackErr)
+			return nil, netip.Addr{}, ownershipProven, fmt.Errorf("VM %s private IPv4 read-back stopped: %w", vmUUID, errors.Join(lastObservation, readbackErr))
 		}
 		if err != nil {
 			lastObservation = fmt.Errorf("getting worker VM %s for private IPv4 read-back: %w", vmUUID, err)
 			if !sdk.IsNotFound(err) && !isRetryableReadback(readbackCtx, err) {
-				return netip.Addr{}, lastObservation
+				return nil, netip.Addr{}, ownershipProven, lastObservation
 			}
 		} else if vm == nil {
-			return netip.Addr{}, fmt.Errorf("getting worker VM %s for private IPv4 read-back: API returned no VM", vmUUID)
+			return nil, netip.Addr{}, ownershipProven, fmt.Errorf("getting worker VM %s for private IPv4 read-back: API returned no VM", vmUUID)
 		} else {
-			if vm.NetworkUUID != "" && vm.NetworkUUID != networkUUID {
-				return netip.Addr{}, fmt.Errorf("worker VM %s is attached to network %q instead of %q", vmUUID, vm.NetworkUUID, networkUUID)
+			if validationErr := validatePersistedVM(*vm, vmUUID, request, expected); errors.Is(validationErr, errPersistedOwnershipIncomplete) {
+				lastObservation = validationErr
+			} else if validationErr != nil {
+				// A conflicting authoritative detail invalidates any sparse-list
+				// ownership signal. The caller must not delete or protect this VM.
+				return nil, netip.Addr{}, false, validationErr
+			} else {
+				ownershipProven = true
+				privateIPv4, privateIPv4Err := validateWorkerPrivateIPv4(*vm, networkPrefix, controlPlaneVIP, privateLoadBalancerPool)
+				if privateIPv4Err == nil {
+					return vm, privateIPv4, true, nil
+				}
+				if vm.PrivateIPv4 != "" {
+					return nil, netip.Addr{}, true, privateIPv4Err
+				}
+				lastObservation = privateIPv4Err
 			}
-			privateIPv4, validationErr := validateWorkerPrivateIPv4(*vm, networkPrefix, controlPlaneVIP, privateLoadBalancerPool)
-			if validationErr == nil {
-				return privateIPv4, nil
-			}
-			if vm.PrivateIPv4 != "" {
-				return netip.Addr{}, validationErr
-			}
-			lastObservation = validationErr
 		}
 		if err := waitForReadback(readbackCtx, readbackDelay); err != nil {
-			return netip.Addr{}, fmt.Errorf("VM %s did not obtain exactly one safe private IPv4 before the read-back deadline: %w", vmUUID, errors.Join(lastObservation, err))
+			return nil, netip.Addr{}, ownershipProven, fmt.Errorf("VM %s did not expose complete persisted identity and exactly one safe private IPv4 before the read-back deadline: %w", vmUUID, errors.Join(lastObservation, err))
 		}
 		readbackDelay = nextReadbackDelay(readbackDelay, a.networkAttachmentReadbackMaxDelay)
 	}
@@ -1146,32 +1913,45 @@ func validateWorkerFloatingIPAssignmentsInList(addresses []sdk.FloatingIP, expec
 }
 
 func (a *Adapter) cleanupLaunch(ctx context.Context, location, firewallUUID, vmUUID string, floatingIP sdk.FloatingIP, cause error) error {
-	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), a.launchCleanupTimeout)
 	defer cancel()
 	var errs []error
-	floatingErr := a.deleteOwnedFloatingIP(cleanupCtx, location, floatingIP, vmUUID)
+	// Reserve most of the detached cleanup window for deletion of the
+	// ownership-proven unprotected VM. A persistently uncertain floating-IP
+	// readback must not consume the entire window before VM DELETE is sent.
+	floatingCtx, floatingCancel := context.WithTimeout(cleanupCtx, a.launchFloatingIPCleanupTimeout)
+	floatingErr := a.deleteOwnedFloatingIP(floatingCtx, location, floatingIP, vmUUID)
+	floatingCancel()
 	vmDeleteErr := a.api.DeleteVM(cleanupCtx, location, vmUUID)
-	if vmDeleteErr != nil && !sdk.IsNotFound(vmDeleteErr) {
+	if absenceErr := a.waitForVMAbsence(cleanupCtx, location, vmUUID, "after launch rollback"); absenceErr != nil {
 		if floatingErr != nil {
 			errs = append(errs, floatingErr)
 		}
-		errs = append(errs, fmt.Errorf("cleanup of unprotected VM %s failed; cloud firewall remains attached: %w", vmUUID, vmDeleteErr))
+		if vmDeleteErr != nil {
+			errs = append(errs, fmt.Errorf("deleting unprotected VM %s during launch rollback: %w", vmUUID, vmDeleteErr))
+		}
+		errs = append(errs, fmt.Errorf("cleanup of unprotected VM %s did not prove absence; cloud firewall remains attached: %w", vmUUID, absenceErr))
 		return errors.Join(append([]error{cause}, errs...)...)
 	}
+	// Once VM absence is canonical, retire every stale firewall assignment
+	// before spending the remaining detached cleanup budget on the recoverable,
+	// deterministically named floating IP.
+	if err := a.detachFirewallAfterVMDeletion(cleanupCtx, location, firewallUUID, vmUUID); err != nil {
+		errs = append(errs, err)
+	}
 	if floatingErr != nil {
+		// A VM deletion may release the assignment asynchronously. Retry the
+		// exact address only after canonical VM absence has been established.
 		floatingErr = a.deleteOwnedFloatingIP(cleanupCtx, location, floatingIP, vmUUID)
 	}
 	if floatingErr != nil {
 		errs = append(errs, floatingErr)
 	}
-	if err := a.detachFirewallAfterVMDeletion(cleanupCtx, location, firewallUUID, vmUUID); err != nil {
-		errs = append(errs, err)
-	}
 	return errors.Join(append([]error{cause}, errs...)...)
 }
 
 func (a *Adapter) cleanupUnassignedFloatingIP(ctx context.Context, location string, floatingIP sdk.FloatingIP) error {
-	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), defaultLaunchCleanupTimeout)
 	defer cancel()
 	return a.deleteOwnedFloatingIP(cleanupCtx, location, floatingIP, "")
 }
@@ -1179,46 +1959,232 @@ func (a *Adapter) cleanupUnassignedFloatingIP(ctx context.Context, location stri
 func (a *Adapter) detachFirewallAfterVMDeletion(ctx context.Context, location, _ string, vmUUID string) error {
 	// The caller invokes this only after VM absence is confirmed. Scan every
 	// firewall for the exact deleted VM UUID so rollback also cleans unexpected
-	// second-firewall assignments without ever detaching a live VM.
-	firewalls, err := a.api.ListFirewalls(ctx, location)
-	if err != nil {
-		return fmt.Errorf("listing firewalls for deleted VM cleanup: %w", err)
-	}
-	var errs []error
-	for _, firewall := range firewalls {
-		if !firewallHasVM(firewall, vmUUID) {
-			continue
+	// second-firewall assignments without ever detaching a live VM. A mutation
+	// response is not convergence: require repeated authoritative list absence.
+	readbackCtx, cancel := context.WithTimeout(ctx, a.networkAttachmentReadbackTimeout)
+	defer cancel()
+	absenceConfirmations := 0
+	var lastObservation, mutationErr error
+	readbackDelay := a.networkAttachmentReadbackMinDelay
+	for {
+		requestCtx, requestCancel := context.WithTimeout(readbackCtx, a.networkAttachmentRequestTimeout)
+		firewalls, err := a.api.ListFirewalls(requestCtx, location)
+		requestCancel()
+		if readbackErr := readbackCtx.Err(); readbackErr != nil {
+			return fmt.Errorf("firewall cleanup for deleted VM %s stopped: %w", vmUUID, errors.Join(errFirewallCleanupUncertain, lastObservation, mutationErr, readbackErr))
 		}
-		if err := a.api.UnassignFirewallFromVM(ctx, location, firewall.UUID, vmUUID); err != nil && !sdk.IsNotFound(err) {
-			errs = append(errs, fmt.Errorf("cleaning stale firewall %s assignment for deleted VM %s: %w", firewall.UUID, vmUUID, err))
+		if err != nil {
+			lastObservation = fmt.Errorf("listing firewalls for deleted VM cleanup: %w", err)
+			if !isRetryableReadback(readbackCtx, err) {
+				return lastObservation
+			}
+		} else {
+			assignments, validationErr := firewallAssignmentsForVM(firewalls, vmUUID)
+			if validationErr != nil {
+				return validationErr
+			}
+			if len(assignments) == 0 {
+				absenceConfirmations++
+				lastObservation = fmt.Errorf("firewall assignment absence confirmation %d of 2 for VM %s", absenceConfirmations, vmUUID)
+				if absenceConfirmations == 2 {
+					return nil
+				}
+			} else {
+				absenceConfirmations = 0
+				lastObservation = fmt.Errorf("VM %s remains assigned to firewalls %v", vmUUID, assignments)
+				for _, firewallUUID := range assignments {
+					requestCtx, requestCancel := context.WithTimeout(readbackCtx, a.networkAttachmentRequestTimeout)
+					err := a.api.UnassignFirewallFromVM(requestCtx, location, firewallUUID, vmUUID)
+					requestCancel()
+					if err != nil {
+						mutationErr = fmt.Errorf("unassigning firewall %s from deleted VM %s: %w", firewallUUID, vmUUID, err)
+						if !isRetryableCleanupMutation(err) {
+							return mutationErr
+						}
+					}
+				}
+			}
 		}
+		if err := waitForReadback(readbackCtx, readbackDelay); err != nil {
+			return fmt.Errorf("firewall assignments for deleted VM %s did not converge: %w", vmUUID, errors.Join(errFirewallCleanupUncertain, lastObservation, mutationErr, err))
+		}
+		readbackDelay = nextReadbackDelay(readbackDelay, a.networkAttachmentReadbackMaxDelay)
 	}
-	return errors.Join(errs...)
 }
 
 func (a *Adapter) deleteOwnedFloatingIP(ctx context.Context, location string, floatingIP sdk.FloatingIP, expectedVMUUID string) error {
-	current, err := a.findFloatingIPByNameRaw(ctx, location, floatingIP.Name, floatingIP.BillingAccountID)
-	if err != nil {
-		if errors.Is(err, cloudapi.ErrNotFound) {
-			return nil
+	if floatingIP.Name == "" || floatingIP.Address == "" || floatingIP.BillingAccountID <= 0 {
+		return fmt.Errorf("%w: incomplete floating IP ownership anchor", cloudapi.ErrOwnershipMismatch)
+	}
+	readbackCtx, cancel := context.WithTimeout(ctx, a.networkAttachmentReadbackTimeout)
+	defer cancel()
+	absenceConfirmations := 0
+	var lastObservation, mutationErr error
+	readbackDelay := a.networkAttachmentReadbackMinDelay
+	for {
+		requestCtx, requestCancel := context.WithTimeout(readbackCtx, a.networkAttachmentRequestTimeout)
+		addresses, err := a.api.ListFloatingIPs(requestCtx, location, nil)
+		requestCancel()
+		if readbackErr := readbackCtx.Err(); readbackErr != nil {
+			return fmt.Errorf("floating IP %s cleanup stopped: %w", floatingIP.Address, errors.Join(errFloatingIPCleanupUncertain, lastObservation, mutationErr, readbackErr))
 		}
-		return err
-	}
-	if current.Address != floatingIP.Address {
-		return fmt.Errorf("%w: refusing to delete changed floating IP %q", cloudapi.ErrOwnershipMismatch, floatingIP.Name)
-	}
-	if current.AssignedTo != "" {
-		if expectedVMUUID == "" || current.AssignedTo != expectedVMUUID || current.AssignedToResourceType != "virtual_machine" {
-			return fmt.Errorf("%w: refusing to unassign floating IP %s from %s", cloudapi.ErrOwnershipMismatch, current.Address, current.AssignedTo)
+		if err != nil {
+			lastObservation = fmt.Errorf("listing floating IPs for cleanup: %w", err)
+			if !isRetryableReadback(readbackCtx, err) {
+				return lastObservation
+			}
+		} else {
+			current, present, validationErr := exactFloatingIPForCleanup(addresses, floatingIP, expectedVMUUID)
+			if validationErr != nil {
+				return validationErr
+			}
+			if !present {
+				absenceConfirmations++
+				lastObservation = fmt.Errorf("floating IP %s absence confirmation %d of 2", floatingIP.Address, absenceConfirmations)
+				if absenceConfirmations == 2 {
+					return nil
+				}
+			} else {
+				absenceConfirmations = 0
+				switch {
+				case current.AssignedTo != "":
+					if expectedVMUUID == "" || current.AssignedTo != expectedVMUUID || current.AssignedToResourceType != "virtual_machine" {
+						return fmt.Errorf("%w: refusing to unassign floating IP %s from %s", cloudapi.ErrOwnershipMismatch, current.Address, current.AssignedTo)
+					}
+					lastObservation = fmt.Errorf("floating IP %s remains assigned to VM %s", current.Address, expectedVMUUID)
+					requestCtx, requestCancel := context.WithTimeout(readbackCtx, a.networkAttachmentRequestTimeout)
+					_, err := a.api.UnassignFloatingIP(requestCtx, location, current.Address)
+					requestCancel()
+					if err != nil {
+						mutationErr = fmt.Errorf("unassigning floating IP %s: %w", current.Address, err)
+						if !isRetryableCleanupMutation(err) {
+							return mutationErr
+						}
+					}
+				default:
+					lastObservation = fmt.Errorf("floating IP %s remains visible and unassigned", current.Address)
+					requestCtx, requestCancel := context.WithTimeout(readbackCtx, a.networkAttachmentRequestTimeout)
+					err := a.api.DeleteFloatingIP(requestCtx, location, current.Address)
+					requestCancel()
+					if err != nil {
+						mutationErr = fmt.Errorf("deleting floating IP %s: %w", current.Address, err)
+						if !isRetryableCleanupMutation(err) {
+							return mutationErr
+						}
+					}
+				}
+			}
 		}
-		if _, err := a.api.UnassignFloatingIP(ctx, location, current.Address); err != nil && !sdk.IsNotFound(err) {
-			return fmt.Errorf("unassigning floating IP %s: %w", current.Address, err)
+		if err := waitForReadback(readbackCtx, readbackDelay); err != nil {
+			return fmt.Errorf("floating IP %s cleanup did not converge: %w", floatingIP.Address, errors.Join(errFloatingIPCleanupUncertain, lastObservation, mutationErr, err))
+		}
+		readbackDelay = nextReadbackDelay(readbackDelay, a.networkAttachmentReadbackMaxDelay)
+	}
+}
+
+func exactFloatingIPForCleanup(addresses []sdk.FloatingIP, expected sdk.FloatingIP, expectedVMUUID string) (*sdk.FloatingIP, bool, error) {
+	var exact []sdk.FloatingIP
+	for i := range addresses {
+		address := addresses[i]
+		if address.IsDeleted {
+			// List responses may retain stale deletion tombstones. They are not
+			// active ownership conflicts and cannot be mutation targets.
+			continue
+		}
+		identityOverlap := address.Name == expected.Name || address.Address == expected.Address ||
+			(expectedVMUUID != "" && address.AssignedTo == expectedVMUUID)
+		if !identityOverlap {
+			continue
+		}
+		if address.Name != expected.Name || address.Address != expected.Address || address.BillingAccountID != expected.BillingAccountID {
+			return nil, false, fmt.Errorf("%w: floating IP ownership anchor %q/%s/account-%d changed", cloudapi.ErrOwnershipMismatch, expected.Name, expected.Address, expected.BillingAccountID)
+		}
+		exact = append(exact, address)
+	}
+	if len(exact) == 0 {
+		return nil, false, nil
+	}
+	if len(exact) != 1 {
+		return nil, false, fmt.Errorf("%w: floating IP ownership anchor %q/%s appears %d times", cloudapi.ErrOwnershipMismatch, expected.Name, expected.Address, len(exact))
+	}
+	return &exact[0], true, nil
+}
+
+func firewallAssignmentsForVM(firewalls []sdk.Firewall, vmUUID string) ([]string, error) {
+	seenFirewalls := make(map[string]bool, len(firewalls))
+	assignments := make([]string, 0, 1)
+	for i := range firewalls {
+		if firewalls[i].UUID == "" {
+			return nil, fmt.Errorf("%w: firewall list row %d has no UUID", cloudapi.ErrOwnershipMismatch, i)
+		}
+		if seenFirewalls[firewalls[i].UUID] {
+			return nil, fmt.Errorf("%w: firewall list contains duplicate UUID %s", cloudapi.ErrOwnershipMismatch, firewalls[i].UUID)
+		}
+		seenFirewalls[firewalls[i].UUID] = true
+		for _, resource := range firewalls[i].ResourcesAssigned {
+			if resource.ResourceUUID != vmUUID {
+				continue
+			}
+			if !strings.EqualFold(resource.ResourceType, "vm") {
+				return nil, fmt.Errorf("%w: resource UUID %s appears on firewall %s with type %q", cloudapi.ErrOwnershipMismatch, vmUUID, firewalls[i].UUID, resource.ResourceType)
+			}
+			assignments = append(assignments, firewalls[i].UUID)
 		}
 	}
-	if err := a.api.DeleteFloatingIP(ctx, location, current.Address); err != nil && !sdk.IsNotFound(err) {
-		return fmt.Errorf("deleting floating IP %s: %w", current.Address, err)
+	sort.Strings(assignments)
+	return assignments, nil
+}
+
+func (a *Adapter) readOrphanFloatingIPForDelete(ctx context.Context, location, name, vmUUID string) (*sdk.FloatingIP, error) {
+	readbackCtx, cancel := context.WithTimeout(ctx, a.networkAttachmentReadbackTimeout)
+	defer cancel()
+	absenceConfirmations := 0
+	var lastObservation error
+	readbackDelay := a.networkAttachmentReadbackMinDelay
+	for {
+		requestCtx, requestCancel := context.WithTimeout(readbackCtx, a.networkAttachmentRequestTimeout)
+		addresses, err := a.api.ListFloatingIPs(requestCtx, location, nil)
+		requestCancel()
+		if readbackErr := readbackCtx.Err(); readbackErr != nil {
+			return nil, fmt.Errorf("orphan floating IP discovery for missing VM %s stopped: %w", vmUUID, errors.Join(lastObservation, readbackErr))
+		}
+		if err != nil {
+			lastObservation = fmt.Errorf("listing floating IPs for missing VM %s: %w", vmUUID, err)
+			if !isRetryableReadback(readbackCtx, err) {
+				return nil, lastObservation
+			}
+		} else {
+			matches := make([]sdk.FloatingIP, 0, 1)
+			for i := range addresses {
+				if addresses[i].Name == name && !addresses[i].IsDeleted {
+					matches = append(matches, addresses[i])
+				}
+			}
+			switch len(matches) {
+			case 0:
+				absenceConfirmations++
+				lastObservation = fmt.Errorf("named floating IP absence confirmation %d of 2 for missing VM %s", absenceConfirmations, vmUUID)
+				if absenceConfirmations == 2 {
+					return nil, nil
+				}
+			case 1:
+				candidate := matches[0]
+				if candidate.BillingAccountID <= 0 || candidate.Address == "" || candidate.AssignedTo != vmUUID || candidate.AssignedToResourceType != "virtual_machine" {
+					return nil, fmt.Errorf("%w: named floating IP %q cannot be proven to belong to missing VM %s", cloudapi.ErrOwnershipMismatch, name, vmUUID)
+				}
+				if err := validateUsableFloatingIP(candidate); err != nil {
+					return nil, fmt.Errorf("%w: named floating IP %q for missing VM %s is unusable: %v", cloudapi.ErrOwnershipMismatch, name, vmUUID, err)
+				}
+				return &candidate, nil
+			default:
+				return nil, fmt.Errorf("%w: %d floating IPs share owned name %q", cloudapi.ErrOwnershipMismatch, len(matches), name)
+			}
+		}
+		if err := waitForReadback(readbackCtx, readbackDelay); err != nil {
+			return nil, fmt.Errorf("orphan floating IP discovery for missing VM %s did not converge: %w", vmUUID, errors.Join(lastObservation, err))
+		}
+		readbackDelay = nextReadbackDelay(readbackDelay, a.networkAttachmentReadbackMaxDelay)
 	}
-	return nil
 }
 
 func (a *Adapter) findFloatingIPByName(ctx context.Context, location, name string, billingAccountID int64) (*sdk.FloatingIP, error) {
@@ -1493,11 +2459,77 @@ func isRFC1918Prefix(prefix netip.Prefix) bool {
 
 func parseOwnership(description string) (ownership, bool) {
 	var record ownership
-	if json.Unmarshal([]byte(description), &record) != nil || record.Schema != ownershipSchema || record.Cluster == "" ||
+	if json.Unmarshal([]byte(description), &record) != nil || (record.Schema != ownershipSchema && record.Schema != legacyOwnershipSchema) || record.Cluster == "" ||
 		record.NodeClaim == "" || record.KeyHash == "" || record.FloatingIPName == "" || record.PublicIPv4 == "" {
 		return ownership{}, false
 	}
 	return record, true
+}
+
+func inspectOwnershipDescription(description, targetCluster string) (record ownership, karpenter, complete bool, err error) {
+	var envelope struct {
+		Schema  json.RawMessage `json:"schema"`
+		Cluster json.RawMessage `json:"cluster"`
+	}
+	if json.Unmarshal([]byte(description), &envelope) == nil {
+		var schema string
+		if json.Unmarshal(envelope.Schema, &schema) != nil {
+			return ownership{}, false, false, nil
+		}
+		if strings.HasPrefix(schema, ownershipSchemaNamespace) && schema != ownershipSchema && schema != legacyOwnershipSchema {
+			return ownership{}, false, false, fmt.Errorf("%w: unsupported Karpenter ownership schema %q", cloudapi.ErrOwnershipMismatch, schema)
+		}
+		if schema != ownershipSchema && schema != legacyOwnershipSchema {
+			return ownership{}, false, false, nil
+		}
+		if json.Unmarshal([]byte(description), &record) != nil {
+			// The minimal schema envelope is authoritative even when another
+			// v1 field has an incompatible JSON type. Preserve any independently
+			// decodable cluster evidence and keep the record fail-closed.
+			record.Schema = schema
+			_ = json.Unmarshal(envelope.Cluster, &record.Cluster)
+			return record, true, false, nil
+		}
+		if !ownershipRecordStructurallyComplete(record) {
+			return record, true, false, nil
+		}
+		// A complete, explicit record for another cluster is foreign inventory.
+		// Route it before interpreting target-cluster host/capacity extensions:
+		// another provider revision's semantics must not break this scoped list.
+		// Reserved future schemas remain rejected above for every cluster.
+		if record.Cluster != targetCluster {
+			return record, true, true, nil
+		}
+		normalized, partial, err := normalizeOwnershipLaunchIdentity(record)
+		if err != nil {
+			return ownership{}, false, false, fmt.Errorf("%w: invalid Karpenter ownership launch identity: %v", cloudapi.ErrOwnershipMismatch, err)
+		}
+		return normalized, true, !partial, nil
+	}
+	// Ownership JSON is encoded with schema first. An anchored prefix retains
+	// evidence from an eventually consistent truncated response without
+	// treating arbitrary user notes that mention the schema as managed state.
+	prefix := karpenterOwnershipPrefixPattern.FindStringSubmatch(description)
+	if len(prefix) != 2 {
+		return ownership{}, false, false, nil
+	}
+	record.Schema = prefix[1]
+	if record.Schema != ownershipSchema && record.Schema != legacyOwnershipSchema {
+		return ownership{}, false, false, fmt.Errorf("%w: unsupported Karpenter ownership schema %q", cloudapi.ErrOwnershipMismatch, record.Schema)
+	}
+	if match := karpenterClusterPattern.FindStringSubmatch(description); len(match) == 2 {
+		record.Cluster = match[1]
+	}
+	return record, true, false, nil
+}
+
+func ownershipRecordStructurallyComplete(record ownership) bool {
+	validSchemaAndName := (record.Schema == ownershipSchema && record.VMName != "") || record.Schema == legacyOwnershipSchema
+	return validSchemaAndName && record.Cluster != "" && record.NodeClaim != "" && record.KeyHash != "" &&
+		record.HostClass != "" && record.InstanceType != "" && record.RootDiskGiB > 0 && record.SpecHash != "" &&
+		record.BootstrapHash != "" && record.FirewallUUID != "" && record.NetworkUUID != "" && record.ControlPlaneVIP != "" &&
+		record.PrivateLoadBalancerPoolStart != "" && record.PrivateLoadBalancerPoolStop != "" && record.OSName != "" &&
+		record.OSVersion != "" && record.BillingAccountID > 0 && record.FloatingIPName != "" && record.PublicIPv4 != ""
 }
 
 func hashKey(key string) string {
@@ -1526,6 +2558,24 @@ func isRetryableReadback(ctx context.Context, err error) bool {
 	}
 	// A non-HTTP error from a GET is a transport or response-read failure. It is
 	// safe to retry within the bounded window because reads do not mutate state.
+	return true
+}
+
+func isRetryableCleanupMutation(err error) bool {
+	if errors.Is(err, sdk.ErrCrossOriginRedirect) || errors.Is(err, sdk.ErrMutationBlocked) {
+		return false
+	}
+	if sdk.IsNotFound(err) {
+		// A remote 404 may be stale or may describe an asynchronously applied
+		// prior mutation. Re-read exact state and retry only if it remains.
+		return true
+	}
+	var apiErr *sdk.APIError
+	if errors.As(err, &apiErr) {
+		return apiErr.Retryable || apiErr.StatusCode == http.StatusRequestTimeout
+	}
+	// Transport and response-read failures are ambiguous. Exact identity is
+	// revalidated before every bounded retry.
 	return true
 }
 

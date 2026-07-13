@@ -41,9 +41,11 @@ The provider uses a fail-closed sequence:
    `reserve_public_ip=false`, avoiding an untracked implicit address.
 4. Read back that exact network until the VM UUID appears exactly once in its
    authoritative `vm_uuids` membership.
-5. Read back the VM until it has exactly one usable RFC1918 private IPv4 inside
-   that VPC, and reject an address equal to the private RKE2 supervisor VIP or
-   inside the reserved Service VIP range.
+5. Read back the VM until its complete NodeClaim ownership/spec record, exact
+   name, capacity, image, host pool, VPC, billing account, and one correctly
+   sized primary root disk are persisted, and it has exactly one usable
+   RFC1918 private IPv4 inside that VPC; reject an address equal to the private
+   RKE2 supervisor VIP or inside the reserved Service VIP range.
 6. Audit all InSpace firewalls, assign the intended firewall, and require the
    worker to be attached exactly once to that firewall and no other.
 7. Assign and read back the owned Floating IP.
@@ -51,8 +53,10 @@ The provider uses a fail-closed sequence:
 9. Return the NodeClaim only after VPC attachment and both protections are
    confirmed.
 
-Network membership read-back has a 60-second total bound, 10-second request
-bounds, exponential polling, and retries for transient read failures. A newly
+Network membership and canonical VM read-back each have a 60-second bound,
+10-second request bounds, exponential polling, and retries for transient read
+failures or fields that are still absent. Any launch-identity value that is
+already present but conflicts with the request fails immediately. A newly
 created VM that cannot prove attachment or protection triggers detached,
 bounded rollback of its floating IP and VM; cleanup failures are joined to the
 launch error, and the firewall stays attached if VM deletion is uncertain. An
@@ -62,14 +66,41 @@ without destroying that VM. A positively owned VM whose private address equals
 its ownership-recorded supervisor VIP or falls inside its ownership-recorded
 Service VIP range is unsafe and is rolled back, including a late ambiguous
 commit; generic ownership mismatches are never deleted. Delete removes both
-resources, including an orphan floating IP when the VM has already disappeared.
-Create POSTs are never blindly retried; read-before-create ownership records
-recover ambiguous responses.
+resources. One VM-detail 404 never authorizes cleanup: an already-missing VM
+must be absent from both `GetVM` and `ListVMs` in two consecutive bounded
+observations before its orphan floating IP or firewall assignments are changed.
+A later owned detail resumes the normal ownership-checked delete path; any
+presence uncertainty fails without mutation. Create POSTs are never blindly
+retried; read-before-create ownership records recover ambiguous responses.
 
 `GetVM` and `ListVMs` repeat these checks through a bounded read-only snapshot.
-One firewall list, one Floating-IP list, and one network read per unique VPC
-detect a lost/disabled address, a second or public firewall, membership drift,
-or a private-IP/supervisor-or-Service-VIP collision without mutating resources.
+VM list rows are only discovery and collision evidence: exact per-VM detail is
+the ownership authority, including when the list omits descriptions. `ListVMs`
+resolves detail with at most eight parallel reads, omits a row that became 404
+after the snapshot, retries an incomplete detail when either view contains
+Karpenter ownership evidence for the requested cluster (or cannot yet expose
+the cluster), and fails closed if that evidence does not converge within the
+read bound. Complete list and detail ownership records must agree exactly.
+Definitively unmanaged descriptions and explicit records for another cluster
+remain cluster-independent inventory and are ignored. A schema in the reserved
+`karpenter.inspace.cloud/` namespace must be a deliberately supported version; an
+unknown version fails closed instead of silently hiding a managed VM. Any other
+read or list/detail identity uncertainty also fails closed. One firewall list,
+one Floating-IP list, and one network read per unique VPC then detect a
+lost/disabled address, a second or public firewall,
+membership drift, or a private-IP/supervisor-or-Service-VIP collision without
+mutating resources.
+
+New v2 ownership records persist the cloud VM/node name separately from the
+NodeClaim ownership identity, plus the exact host-pool UUID, vCPU count, and
+memory size used at launch. Established reads compare canonical VM name,
+capacity, image, host pool, VPC, billing account, and exactly one primary root
+disk against that record before reporting a worker healthy. Older complete v1
+records remain compatible: their VM/node name is the NodeClaim name, capacity
+is derived from the frozen 24-variant instance name, and the pool UUID is
+derived from the frozen host-class mapping. Partial or contradictory exact
+fields fail closed; operators should recycle any legacy worker whose identity
+cannot be derived.
 
 `spec.networkUUID` and the literal VIP in `spec.rke2.server` must exactly match
 the controller-wide `INSPACE_NETWORK_UUID` and `INSPACE_CONTROL_PLANE_VIP`.
@@ -115,13 +146,19 @@ the private VPC through the dedicated bastion; workload traffic reaches private
 targets through the TCP service path. Direct public SSH and NodePort access are
 not part of the worker firewall contract.
 
-Worker network policy relies on the validated InSpace cloud firewall. Generated bootstrap does not install or enable UFW. One `set -eu` orchestrator runs every bootstrap stage in order, executes `additionalUserData`, then disables and verifies UFW before it can start RKE2. The RKE2 service also has an `ExecStartPre` verifier, so initial launch and later restarts fail unless `ufw status` is inactive and its unit is inactive and disabled (an absent unit is safe). It never flushes or rewrites iptables/nftables, which belong to Cilium and RKE2. The adapter replaces a single strict VPC-subnet placeholder with the exact API-reported prefix before VM creation. Bootstrap then requires exactly one guest address in that prefix and writes it as `node-ip`; it never chooses the default interface or mistakes the floating address for a NIC address. A separate strict placeholder is replaced with the one allocated floating IPv4 for `node-external-ip`; unresolved or duplicate placeholders fail launch. The external CCM remains authoritative and must publish the same API-reported addresses as `InternalIP` and `ExternalIP`. InSpace service targets use the private node address. Deletion removes the Floating IP first, deletes the VM, and only then removes every stale firewall attachment for that exact VM UUID.
+Worker network policy relies on the validated InSpace cloud firewall. Generated bootstrap does not install or enable UFW. One `set -eu` orchestrator runs every bootstrap stage in order, executes `additionalUserData`, reapplies the required node tuning, then disables and verifies UFW before it can start RKE2. The RKE2 service also has an `ExecStartPre` verifier, so initial launch and later restarts fail unless `ufw status` is inactive and its unit is inactive and disabled (an absent unit is safe). It never flushes or rewrites iptables/nftables, which belong to Cilium and RKE2. The adapter replaces a single strict VPC-subnet placeholder with the exact API-reported prefix before VM creation. Bootstrap then requires exactly one guest address in that prefix and writes it as `node-ip`; it never chooses the default interface or mistakes the floating address for a NIC address. A separate strict placeholder is replaced with the one allocated floating IPv4 for `node-external-ip`; unresolved or duplicate placeholders fail launch. The external CCM remains authoritative and must publish the same API-reported addresses as `InternalIP` and `ExternalIP`. InSpace service targets use the private node address. Deletion removes the Floating IP first, deletes the VM, and only then removes every stale firewall attachment for that exact VM UUID.
 
 ## RKE2 agent bootstrap
 
 `cloud_init` is sent as an API-compatible JSON object. On stock Ubuntu 24.04 it:
 
-- waits up to 60 attempts for `apt-get` to succeed after floating-IP egress exists, then installs `curl`, CA certificates, `gzip`, `iproute2`, and `tar`;
+- sets `/etc/hostname`, the active guest hostname, and RKE2 `node-name` to the
+  same validated worker name;
+- disables active swap and idempotently comments persistent swap entries in `/etc/fstab`;
+- changes stock Ubuntu archive endpoints to Thailand's regional mirror when they appear in either the deb822 or legacy source file;
+- waits within one hard ten-minute package-preparation budget for floating-IP egress, then updates and upgrades the image before installing `curl`, CA certificates, `gzip`, `iproute2`, `procps`, and `tar`;
+- persists and applies IPv4 forwarding plus the RKE2-recommended inotify instance/watch limits under `/etc/sysctl.d`;
+- persists a high `nofile` PAM limit and applies `NOFILE`, unlimited process/memory-lock, and unlimited task limits directly to `rke2-agent.service`;
 - downloads the exact RKE2 `rke2.linux-amd64.tar.gz` release and its `sha256sum-amd64.txt` asset with at most 60 attempts per asset;
 - verifies the tarball checksum and installed RKE2 version;
 - configures the agent to join the stable TCP/9345 supervisor endpoint;
@@ -141,6 +178,15 @@ supported OpenSSH `authorized_keys` public-key line. Private keys are never
 accepted or sent.
 
 The RKE2 token is read from `spec.rke2.tokenSecretRef`. Because the NodeClass is cluster-scoped, the reference cannot choose an arbitrary namespace: it is fixed to Secret `inspace-rke2-agent-token`, key `token`, in `INSPACE_SECRET_NAMESPACE` (default `karpenter`). The resolver uses an uncached, resource-name-scoped GET and cannot select the separate `inspace-api` cloud credential Secret.
+
+Worker cloud VM names, guest hostnames, and Kubernetes Node names are exactly
+`<clusterName>-karp-<NodeClaim name>`. Karpenter generates the NodeClaim name as
+`<NodePool name>-<random suffix>`, yielding the operator-facing form
+`<clusterName>-karp-<NodePool name>-<random suffix>`. The provider requires that
+prefix relationship and a combined DNS-1123 hostname no longer than 63
+characters before any cloud mutation. NodeClaim ownership and deletion remain
+bound to the original NodeClaim name; Node registration binds through the
+canonical `inspace://<location>/<vm-uuid>` provider ID.
 
 ## Run the controller
 
@@ -186,7 +232,7 @@ INSPACE_ALLOW_REMOTE_MUTATIONS=true \
 make live-test
 ```
 
-It additionally requires `INSPACE_API_TOKEN`, `INSPACE_BILLING_ACCOUNT_ID`, `INSPACE_NETWORK_UUID`, `INSPACE_CONTROL_PLANE_VIP`, `INSPACE_PRIVATE_LOAD_BALANCER_POOL_START`, `INSPACE_PRIVATE_LOAD_BALANCER_POOL_STOP`, `INSPACE_FIREWALL_UUID`, and `INSPACE_INTEL_HOST_POOL_UUID`. The VPC, supervisor VIP, and Service range must satisfy the fixed pod/Service-CIDR constraints above. The supplied firewall must already satisfy the VPC/pod-CIDR TCP, UDP, and ICMP contract above with no public inbound rule; the live test performs a read-only preflight before creating resources. Normal `go test ./...` compiles this test but skips it before reading those values.
+It additionally requires `INSPACE_API_TOKEN`, `INSPACE_BILLING_ACCOUNT_ID`, `INSPACE_NETWORK_UUID`, `INSPACE_CONTROL_PLANE_VIP`, `INSPACE_PRIVATE_LOAD_BALANCER_POOL_START`, `INSPACE_PRIVATE_LOAD_BALANCER_POOL_STOP`, `INSPACE_FIREWALL_UUID`, and `INSPACE_AMD_HOST_POOL_UUID`. The live adapter lifecycle deliberately creates its worker on the `amd-epyc` class. The VPC, supervisor VIP, and Service range must satisfy the fixed pod/Service-CIDR constraints above. The supplied firewall must already satisfy the VPC/pod-CIDR TCP, UDP, and ICMP contract above with no public inbound rule; the live test performs a read-only preflight before creating resources. Normal `go test ./...` compiles this test but skips it before reading those values.
 
 That smaller test covers the InSpace API lifecycle only. The separate
 [full-cluster release acceptance test](../../test/e2e/README.md) deploys the

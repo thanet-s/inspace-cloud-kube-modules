@@ -12,13 +12,14 @@ import (
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
+	k8svalidation "k8s.io/apimachinery/pkg/util/validation"
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 )
 
 // SchemaVersion must be bumped whenever generated bootstrap semantics change.
 // It is included in the provider drift hash so existing nodes are replaced.
 const (
-	SchemaVersion           = "stock-ubuntu-rke2-v3"
+	SchemaVersion           = "stock-ubuntu-rke2-v5"
 	ExternalIPv4Placeholder = "__INSPACE_FLOATING_IPV4__"
 	VPCSubnetPlaceholder    = "__INSPACE_VPC_SUBNET__"
 	NativeRoutingPodCIDR    = "10.42.0.0/16"
@@ -38,8 +39,10 @@ type Config struct {
 }
 
 type document struct {
-	WriteFiles []writeFile `json:"write_files"`
-	RunCmd     []string    `json:"runcmd"`
+	Hostname         string      `json:"hostname,omitempty"`
+	PreserveHostname bool        `json:"preserve_hostname"`
+	WriteFiles       []writeFile `json:"write_files"`
+	RunCmd           []string    `json:"runcmd"`
 }
 
 type writeFile struct {
@@ -56,6 +59,9 @@ type writeFile struct {
 func RenderCloudInit(config Config) (string, error) {
 	if config.NodeName == "" || config.Server == "" || config.Token == "" || config.RKE2Version == "" {
 		return "", fmt.Errorf("node name, server, token, and RKE2 version are required")
+	}
+	if messages := k8svalidation.IsDNS1123Label(config.NodeName); len(messages) != 0 {
+		return "", fmt.Errorf("node name must be a DNS-1123 hostname label: %s", strings.Join(messages, "; "))
 	}
 	if !exactRKE2VersionPattern.MatchString(config.RKE2Version) {
 		return "", fmt.Errorf("RKE2 version must be an exact vX.Y.Z+rke2rN release")
@@ -101,6 +107,47 @@ func RenderCloudInit(config Config) (string, error) {
 	serviceDropIn := `[Service]
 ExecStartPre=/usr/local/sbin/inspace-detect-private-ip
 ExecStartPre=/usr/local/sbin/inspace-verify-host-firewall
+`
+	nodeLimitsDropIn := `[Service]
+LimitNOFILE=1048576
+LimitNPROC=infinity
+LimitMEMLOCK=infinity
+TasksMax=infinity
+`
+	sysctlConfig := `net.ipv4.ip_forward = 1
+fs.inotify.max_user_instances = 8192
+fs.inotify.max_user_watches = 524288
+`
+	securityLimits := `* soft nofile 1048576
+* hard nofile 1048576
+root soft nofile 1048576
+root hard nofile 1048576
+`
+	prepareHost := fmt.Sprintf(`#!/bin/sh
+set -eu
+expected_hostname=%s
+hostnamectl set-hostname --static "$expected_hostname"
+[ "$(hostnamectl --static)" = "$expected_hostname" ]
+swapoff -a
+if [ -f /etc/fstab ]; then
+  sed -Ei '/^[[:space:]]*#/! { /[[:space:]]swap[[:space:]]/ s/^/#/; }' /etc/fstab
+fi
+for ubuntu_sources in /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list; do
+  [ -f "$ubuntu_sources" ] || continue
+  sed -E -i 's|https?://archive\.ubuntu\.com|http://th.archive.ubuntu.com|g' "$ubuntu_sources"
+  if grep -E 'https?://archive\.ubuntu\.com' "$ubuntu_sources" >/dev/null; then exit 1; fi
+done
+`, shellQuote(config.NodeName))
+	applyNodeTuning := `#!/bin/sh
+set -eu
+sysctl --system >/dev/null
+[ "$(sysctl -n net.ipv4.ip_forward)" -eq 1 ]
+[ "$(sysctl -n fs.inotify.max_user_instances)" -ge 8192 ]
+[ "$(sysctl -n fs.inotify.max_user_watches)" -ge 524288 ]
+[ -z "$(swapon --show --noheadings)" ]
+install -d -m 0755 /var/lib/inspace
+: > /var/lib/inspace/kubernetes-node-prepared-v1
+chmod 0600 /var/lib/inspace/kubernetes-node-prepared-v1
 `
 	privateIP := fmt.Sprintf(`#!/bin/sh
 set -eu
@@ -184,16 +231,25 @@ done
 `
 	prerequisites := `#!/bin/sh
 set -eu
+package_deadline=$(( $(date +%s) + 600 ))
+run_package_command() {
+  package_remaining=$(( package_deadline - $(date +%s) ))
+  [ "$package_remaining" -gt 0 ] || return 124
+  timeout --kill-after=30s "${package_remaining}s" "$@"
+}
 attempt=0
 while [ "$attempt" -lt 60 ]; do
   attempt=$((attempt + 1))
-  if apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 update && \
-     DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=30 install -y --no-install-recommends ca-certificates curl gzip iproute2 tar; then
+  if run_package_command apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 update && \
+     run_package_command env NEEDRESTART_MODE=a DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=30 upgrade -y && \
+     run_package_command env NEEDRESTART_MODE=a DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=30 install -y --no-install-recommends ca-certificates curl gzip iproute2 procps tar; then
     exit 0
   fi
   echo "waiting for floating-IP egress before package installation (attempt $attempt)" >&2
-  if [ "$attempt" -lt 60 ]; then
+  if [ "$attempt" -lt 60 ] && [ "$(date +%s)" -lt "$package_deadline" ]; then
     sleep 5
+  else
+    break
   fi
 done
 echo "package installation failed after $attempt attempts" >&2
@@ -239,11 +295,19 @@ tar -xzf "$tmpdir/rke2.linux-amd64.tar.gz" -C /usr/local
 `, shellQuote(config.RKE2Version), shellQuote(releaseBase), shellQuote(releaseBase))
 
 	doc := document{
+		Hostname:         config.NodeName,
+		PreserveHostname: false,
 		WriteFiles: []writeFile{
+			encodedWriteFile("/etc/hostname", "0644", config.NodeName+"\n"),
 			encodedWriteFile("/etc/rancher/rke2/config.yaml", "0600", rke2.String()),
 			encodedWriteFile("/etc/systemd/system/rke2-agent.service.d/10-inspace-private-ip.conf", "0644", serviceDropIn),
+			encodedWriteFile("/etc/systemd/system/rke2-agent.service.d/20-inspace-node-limits.conf", "0644", nodeLimitsDropIn),
+			encodedWriteFile("/etc/sysctl.d/90-inspace-kubernetes.conf", "0644", sysctlConfig),
+			encodedWriteFile("/etc/security/limits.d/90-inspace-kubernetes.conf", "0644", securityLimits),
+			encodedWriteFile("/usr/local/sbin/inspace-prepare-kubernetes-node", "0700", prepareHost),
 			encodedWriteFile("/usr/local/sbin/inspace-install-prerequisites", "0700", prerequisites),
 			encodedWriteFile("/usr/local/sbin/inspace-install-rke2", "0700", install),
+			encodedWriteFile("/usr/local/sbin/inspace-apply-node-tuning", "0700", applyNodeTuning),
 			encodedWriteFile("/usr/local/sbin/inspace-detect-private-ip", "0700", privateIP),
 			encodedWriteFile("/usr/local/sbin/inspace-disable-host-firewall", "0700", disableHostFirewall),
 			encodedWriteFile("/usr/local/sbin/inspace-verify-host-firewall", "0700", verifyHostFirewall),
@@ -253,6 +317,7 @@ tar -xzf "$tmpdir/rke2.linux-amd64.tar.gz" -C /usr/local
 	var orchestrator strings.Builder
 	orchestrator.WriteString(`#!/bin/sh
 set -eu
+/usr/local/sbin/inspace-prepare-kubernetes-node
 /usr/local/sbin/inspace-install-prerequisites
 /usr/local/sbin/inspace-install-rke2
 /usr/local/sbin/inspace-detect-private-ip
@@ -267,7 +332,8 @@ set -eu
 		// fail-fast orchestrator is manually replayed during troubleshooting.
 		orchestrator.WriteString("cloud-init-per once inspace-additional-user-data /bin/sh /usr/local/sbin/inspace-additional-user-data\n")
 	}
-	orchestrator.WriteString(`/usr/local/sbin/inspace-disable-host-firewall
+	orchestrator.WriteString(`/usr/local/sbin/inspace-apply-node-tuning
+/usr/local/sbin/inspace-disable-host-firewall
 /usr/local/sbin/inspace-verify-host-firewall
 /usr/local/sbin/inspace-start-rke2-agent
 `)

@@ -10,6 +10,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/signal"
@@ -24,6 +25,21 @@ import (
 	"github.com/thanet-s/inspace-cloud-kube-modules/modules/cloud-provider/api/v1alpha1"
 	"github.com/thanet-s/inspace-cloud-kube-modules/modules/cloud-provider/pkg/bootstrap"
 )
+
+type infrastructureReconciler interface {
+	Reconcile(context.Context, *v1alpha1.InSpaceCluster, string) (bootstrap.Result, error)
+	Destroy(context.Context, *v1alpha1.InSpaceCluster) (bootstrap.DestroyResult, error)
+}
+
+type controllerLoopOptions struct {
+	Once           bool
+	UntilReady     bool
+	DeleteOwned    bool
+	Interval       time.Duration
+	OutputFormat   string
+	StandardOutput io.Writer
+	StandardError  io.Writer
+}
 
 func main() {
 	if err := run(); err != nil {
@@ -115,54 +131,61 @@ func run() error {
 	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
+	return runControllerLoop(ctx, reconciler, &cluster, rke2Token, controllerLoopOptions{
+		Once: once, UntilReady: untilReady, DeleteOwned: deleteOwned,
+		Interval: interval, OutputFormat: output,
+		StandardOutput: os.Stdout, StandardError: os.Stderr,
+	})
+}
 
+func runControllerLoop(ctx context.Context, reconciler infrastructureReconciler, cluster *v1alpha1.InSpaceCluster, rke2Token string, options controllerLoopOptions) error {
 	for {
-		if deleteOwned {
-			result, destroyErr := reconciler.Destroy(ctx, &cluster)
+		if options.DeleteOwned {
+			result, destroyErr := reconciler.Destroy(ctx, cluster)
 			if destroyErr != nil {
-				if once || !isRetryable(destroyErr) {
+				if options.Once || !isRetryable(destroyErr) {
 					return destroyErr
 				}
-				fmt.Fprintf(os.Stderr, "transient destroy error; retrying: %v\n", destroyErr)
-				if !waitFor(ctx, interval) {
+				fmt.Fprintf(options.StandardError, "transient destroy error; retrying: %v\n", destroyErr)
+				if !waitFor(ctx, options.Interval) {
 					return nil
 				}
 				continue
 			}
-			if err := emitDestroyResult(os.Stdout, output, result); err != nil {
+			if err := emitDestroyResult(options.StandardOutput, options.OutputFormat, result); err != nil {
 				return err
 			}
-			if once || result.Done {
+			if options.Once || result.Done {
 				return nil
 			}
-			if !waitFor(ctx, interval) {
+			if !waitFor(ctx, options.Interval) {
 				return nil
 			}
 			continue
 		}
-		result, reconcileErr := reconciler.Reconcile(ctx, &cluster, rke2Token)
+		result, reconcileErr := reconciler.Reconcile(ctx, cluster, rke2Token)
 		if reconcileErr != nil {
-			if once || !isRetryable(reconcileErr) {
+			if options.Once || !isRetryable(reconcileErr) {
 				return reconcileErr
 			}
-			fmt.Fprintf(os.Stderr, "transient reconciliation error; retrying: %v\n", reconcileErr)
-			if !waitFor(ctx, interval) {
+			fmt.Fprintf(options.StandardError, "transient reconciliation error; retrying: %v\n", reconcileErr)
+			if !waitFor(ctx, options.Interval) {
 				return nil
 			}
 			continue
 		}
-		if err := emitResult(os.Stdout, output, result); err != nil {
+		if err := emitResult(options.StandardOutput, options.OutputFormat, result); err != nil {
 			return err
 		}
-		if once {
+		if options.Once {
 			return nil
 		}
-		if untilReady && result.Ready {
+		if options.UntilReady && result.Ready {
 			return nil
 		}
 		wait := result.RequeueAfter
-		if wait < interval {
-			wait = interval
+		if wait < options.Interval {
+			wait = options.Interval
 		}
 		timer := time.NewTimer(wait)
 		select {
@@ -174,7 +197,7 @@ func run() error {
 	}
 }
 
-func emitDestroyResult(output *os.File, format string, result bootstrap.DestroyResult) error {
+func emitDestroyResult(output io.Writer, format string, result bootstrap.DestroyResult) error {
 	if format == "json" {
 		encoder := json.NewEncoder(output)
 		encoder.SetEscapeHTML(false)
@@ -184,7 +207,7 @@ func emitDestroyResult(output *os.File, format string, result bootstrap.DestroyR
 	return err
 }
 
-func emitResult(output *os.File, format string, result bootstrap.Result) error {
+func emitResult(output io.Writer, format string, result bootstrap.Result) error {
 	if format == "json" {
 		encoder := json.NewEncoder(output)
 		encoder.SetEscapeHTML(false)
@@ -215,6 +238,9 @@ func parseTCPPorts(value string) ([]int, error) {
 }
 
 func isRetryable(err error) bool {
+	if errors.Is(err, bootstrap.ErrRetryableAmbiguousVMDelete) {
+		return true
+	}
 	var apiErr *inspace.APIError
 	if errors.As(err, &apiErr) {
 		return apiErr.Retryable

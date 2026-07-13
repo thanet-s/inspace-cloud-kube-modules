@@ -2,9 +2,12 @@
 """Static contract test for the destructive E2E harness; never touches cloud state."""
 
 import importlib.util
+import json
 import pathlib
 import re
+import subprocess
 import sys
+import tempfile
 
 
 ROOT = pathlib.Path(__file__).resolve().parent
@@ -34,6 +37,186 @@ def load_script_module(name: str, path: pathlib.Path):
     return module
 
 
+def yaml_mapping_scalar(document: str, *path: str) -> str:
+    """Read one scalar at an exact indentation-defined YAML mapping path."""
+    stack: list[tuple[int, str]] = []
+    matches: list[str] = []
+    for line_number, line in enumerate(document.splitlines(), start=1):
+        require("\t" not in line, f"YAML template line {line_number} contains a tab")
+        stripped = line.strip()
+        if not stripped or stripped.startswith(("#", "-")):
+            continue
+        indent = len(line) - len(line.lstrip(" "))
+        key_match = re.match(r"^([A-Za-z0-9_-]+):(.*)$", stripped)
+        if key_match is None:
+            continue
+        while stack and indent <= stack[-1][0]:
+            stack.pop()
+        key, raw_value = key_match.groups()
+        value = raw_value.strip()
+        current_path = tuple(item[1] for item in stack) + (key,)
+        if current_path == path:
+            require(value != "", f"YAML path {'.'.join(path)} is not a scalar")
+            matches.append(value)
+        if value == "":
+            stack.append((indent, key))
+    require(len(matches) == 1, f"YAML path {'.'.join(path)} matched {len(matches)} times")
+    return matches[0]
+
+
+def named_yaml_sequence_item(document: str, name: str, indent: int) -> str:
+    """Return one named play/task block, bounded by its YAML sequence indentation."""
+    lines = document.splitlines()
+    marker = " " * indent + f"- name: {name}"
+    starts = [index for index, line in enumerate(lines) if line == marker]
+    require(len(starts) == 1, f"YAML sequence item {name!r} matched {len(starts)} times")
+    start = starts[0]
+    next_item = re.compile(rf"^ {{{indent}}}- name: ")
+    stop = next((index for index in range(start + 1, len(lines)) if next_item.match(lines[index])), len(lines))
+    return "\n".join(lines[start:stop])
+
+
+def require_yaml_key(block: str, indent: int, key: str, value: str) -> None:
+    pattern = rf"(?m)^ {{{indent}}}{re.escape(key)}: {re.escape(value)}$"
+    require(re.search(pattern, block) is not None, f"YAML block lacks exact {key}: {value}")
+
+
+def yaml_scalar_sequence(block: str, indent: int, key: str) -> list[str]:
+    """Read one exact-format scalar sequence from a bounded YAML block."""
+    lines = block.splitlines()
+    marker = " " * indent + f"{key}:"
+    starts = [index for index, line in enumerate(lines) if line == marker]
+    require(len(starts) == 1, f"YAML sequence {key!r} matched {len(starts)} times")
+    values: list[str] = []
+    item_prefix = " " * (indent + 2) + "- "
+    for line in lines[starts[0] + 1:]:
+        if not line.strip():
+            continue
+        current_indent = len(line) - len(line.lstrip(" "))
+        if current_indent <= indent:
+            break
+        require(line.startswith(item_prefix), f"YAML sequence {key!r} contains a non-scalar item: {line}")
+        values.append(line[len(item_prefix):])
+    require(values, f"YAML sequence {key!r} is empty")
+    return values
+
+
+def require_unrestricted_parallel_task(block: str) -> None:
+    """Reject task-level controls that would serialize a free-strategy wait."""
+    for key in ("run_once", "throttle"):
+        require(
+            re.search(rf"(?m)^ {{6}}{key}:", block) is None,
+            f"parallel task must not set {key}",
+        )
+
+
+def verify_host_launcher_external_allow_list() -> None:
+    """Execute both volume branches with Docker as the only PATH command."""
+    for inspect_fails in (False, True):
+      with tempfile.TemporaryDirectory(prefix="inspace-e2e-static-") as temporary:
+        root = pathlib.Path(temporary)
+        bin_dir = root / "bin"
+        bin_dir.mkdir(mode=0o700)
+        docker_log = root / "docker.log"
+        unknown_log = root / "unknown.log"
+        docker = bin_dir / "docker"
+        docker.write_text(
+            "#!/bin/sh\n"
+            "printf '%s\\n' \"$*\" >> \"$E2E_DOCKER_LOG\"\n"
+            "if [ \"${E2E_DOCKER_INSPECT_FAIL:-false}\" = true ] && "
+            "[ \"$1\" = volume ] && [ \"$2\" = inspect ]; then\n"
+            "  exit 1\n"
+            "fi\n",
+            encoding="utf-8",
+        )
+        docker.chmod(0o700)
+        bash_env = root / "bash-env"
+        bash_env.write_text(
+            "command_not_found_handle() { printf '%s\\n' \"$1\" >> \"$E2E_UNKNOWN_COMMAND_LOG\"; return 127; }\n",
+            encoding="utf-8",
+        )
+        bash_env.chmod(0o600)
+        inputs = {
+            "workspace.env": "INSPACE_API_TOKEN=not-a-real-token\n",
+            "id_rsa": "not-a-real-private-key\n",
+            "id_rsa.pub": "ssh-ed25519 not-a-real-public-key\n",
+        }
+        for name, contents in inputs.items():
+            path = root / name
+            path.write_text(contents, encoding="utf-8")
+            path.chmod(0o600)
+        environment = {
+            "PATH": str(bin_dir),
+            "HOME": str(root),
+            "BASH_ENV": str(bash_env),
+            "E2E_DOCKER_LOG": str(docker_log),
+            "E2E_UNKNOWN_COMMAND_LOG": str(unknown_log),
+            "E2E_DOCKER_INSPECT_FAIL": str(inspect_fails).lower(),
+            "INSPACE_E2E_ENV_FILE": str(root / "workspace.env"),
+            "INSPACE_E2E_SSH_PRIVATE_KEY": str(root / "id_rsa"),
+            "INSPACE_E2E_SSH_PUBLIC_KEY": str(root / "id_rsa.pub"),
+            "INSPACE_E2E_STATE_VOLUME": "static-contract-state",
+            "CONFIRM_INSPACE_CLUSTER_E2E": "static-contract-account",
+            "INSPACE_E2E_VERSION": "0.0.0-static",
+        }
+        result = subprocess.run(
+            ["/bin/bash", "-x", str(ROOT / "run.sh")],
+            cwd=ROOT.parent.parent,
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        require(result.returncode == 0, f"host launcher failed with Docker-only PATH: {result.stderr}")
+        traced_commands = []
+        for line in result.stderr.splitlines():
+            match = re.match(r"^\++ (.*)$", line)
+            if match is not None:
+                traced_commands.append(match.group(1))
+        require(traced_commands, "host launcher produced no Bash execution trace")
+        allowed_builtins = {"set", "[[", "case", "cd", "pwd", "docker"}
+        for command_line in traced_commands:
+            command_word = command_line.split(maxsplit=1)[0]
+            assignment = re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", command_line)
+            require(
+                command_word != "command" or command_line == "command -v docker",
+                f"host launcher command builtin is restricted to exact command -v docker: {command_line}",
+            )
+            require(
+                assignment is not None or command_line == "command -v docker" or command_word in allowed_builtins,
+                f"host launcher executed a command outside the Docker/builtin allow-list: {command_line}",
+            )
+        unknown = unknown_log.read_text(encoding="utf-8").strip() if unknown_log.exists() else ""
+        require(not unknown, f"host launcher attempted non-Docker external commands: {unknown}")
+        calls = docker_log.read_text(encoding="utf-8").splitlines()
+        expected_calls = ["volume inspect static-contract-state"]
+        if inspect_fails:
+            expected_calls.append("volume create static-contract-state")
+        expected_calls.extend([
+            "build --platform linux/amd64 --file test/e2e/Dockerfile --target published-live "
+            "--build-arg CONTROLLER_IMAGE=ghcr.io/thanet-s/inspace-cloud-controller-manager:0.0.0-static "
+            "--tag inspace-cloud-rke2-e2e:local .",
+            " ".join((
+                "run --rm --platform linux/amd64",
+                "--env CONFIRM_INSPACE_CLUSTER_E2E=static-contract-account",
+                "--env INSPACE_E2E_VERSION=0.0.0-static",
+                "--env INSPACE_E2E_KEEP_RESOURCES=false",
+                "--env INSPACE_E2E_RUN_ID=",
+                "--env INSPACE_E2E_RECOVERY_ONLY=false",
+                "--env INSPACE_E2E_RECOVER_RETAINED=false",
+                f"--mount type=bind,src={root / 'workspace.env'},dst=/run/config/workspace.env,readonly",
+                f"--mount type=bind,src={root / 'id_rsa'},dst=/run/secrets/e2e_ssh_key,readonly",
+                f"--mount type=bind,src={root / 'id_rsa.pub'},dst=/run/secrets/e2e_ssh_key.pub,readonly",
+                "--mount type=volume,src=static-contract-state,dst=/state",
+                "inspace-cloud-rke2-e2e:local",
+            )),
+        ])
+        require(
+            calls == expected_calls,
+            f"unexpected host Docker call sequence: got {calls!r}, want {expected_calls!r}",
+        )
+
+
 def main() -> None:
     host = (ROOT / "run.sh").read_text(encoding="utf-8")
     dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
@@ -57,8 +240,7 @@ def main() -> None:
         line.split("#", 1)[0] for line in host.splitlines()
         if not line.lstrip().startswith("#")
     )
-    for forbidden in ("ansible-playbook", " go ", "helm ", "kubectl ", "ssh ", "curl "):
-        require(forbidden not in executable_host, f"host launcher executes forbidden tool marker: {forbidden!r}")
+    verify_host_launcher_external_allow_list()
     require("docker build" in executable_host and "docker run" in executable_host, "host launcher must build and run Docker")
     require("runner_platform=${INSPACE_E2E_RUNNER_PLATFORM:-linux/amd64}" in executable_host,
             "E2E runner must default explicitly to linux/amd64")
@@ -113,6 +295,9 @@ def main() -> None:
                 f"Dockerfile-specific ignore is missing {forbidden_build_input}")
     require("INSPACE_CONTROL_PLANE_VIP" in entrypoint,
             "runner must require the private control-plane VIP before provisioning")
+    require("INSPACE_INTEL_HOST_POOL_UUID" in entrypoint and
+            "INSPACE_AMD_HOST_POOL_UUID" in entrypoint,
+            "runner must require the Intel bootstrap and AMD EPYC worker pools")
     for variable in (
         "INSPACE_PRIVATE_LOAD_BALANCER_POOL_START",
         "INSPACE_PRIVATE_LOAD_BALANCER_POOL_STOP",
@@ -133,6 +318,188 @@ def main() -> None:
     require(re.search(r"^task_timeout\s*=\s*(?:2[1-9][0-9]{2}|[3-9][0-9]{3,})$", ansible_cfg, re.MULTILINE) is not None,
             "every Ansible action must have a hard timeout of at least 2100 seconds")
 
+    # Exact-path scanning is only authoritative when template control flow cannot
+    # hide the replicas field at render time. Value expressions remain allowed.
+    require("{%" not in cluster and "{#" not in cluster,
+            "cluster template must not contain Jinja control flow or template comments")
+    require(yaml_mapping_scalar(cluster, "spec", "controlPlane", "replicas") == "3",
+            "cluster template spec.controlPlane.replicas must be exactly 3")
+    provision_play = named_yaml_sequence_item(
+        playbook, "Provision the RKE2 control plane through the product bootstrap controller", 0
+    )
+    require_yaml_key(provision_play, 2, "hosts", "localhost")
+    launch_task = named_yaml_sequence_item(provision_play, "Launch the bootstrap reconciler asynchronously", 4)
+    require("\n      ansible.builtin.command:" in launch_task,
+            "bootstrap launch task must use ansible.builtin.command")
+    require(
+        yaml_scalar_sequence(launch_task, 8, "argv") == [
+            "inspace-cluster-controller",
+            "--cluster-config",
+            '"{{ e2e_cluster_file }}"',
+            "--ssh-public-key-file",
+            '"{{ lookup(\'env\', \'E2E_PUBLIC_KEY\') }}"',
+            "--ssh-username",
+            '"{{ e2e_ssh_user }}"',
+            "--management-cidr",
+            '"{{ e2e_management_cidr }}"',
+            "--management-tcp-ports",
+            '"22"',
+            "--until-ready",
+            "--interval",
+            "15s",
+            "--output=json",
+        ],
+        "bootstrap launch argv must be the canonical until-ready controller invocation",
+    )
+    require_yaml_key(launch_task, 6, "async", "2700")
+    require_yaml_key(launch_task, 6, "poll", "0")
+    require_yaml_key(launch_task, 6, "register", "e2e_bootstrap_job")
+    bootstrap_wait_task = named_yaml_sequence_item(
+        provision_play, "Wait robustly for the product reconciler to finish", 4
+    )
+    require("\n      ansible.builtin.async_status:" in bootstrap_wait_task,
+            "bootstrap wait task must use ansible.builtin.async_status")
+    require_yaml_key(
+        bootstrap_wait_task, 8, "jid", '"{{ e2e_bootstrap_job.ansible_job_id }}"'
+    )
+    require_yaml_key(bootstrap_wait_task, 6, "register", "e2e_bootstrap_wait")
+    require_yaml_key(bootstrap_wait_task, 6, "until", "e2e_bootstrap_wait.finished")
+    require_yaml_key(bootstrap_wait_task, 6, "retries", "270")
+    require_yaml_key(bootstrap_wait_task, 6, "delay", "10")
+    parallel_assertion = named_yaml_sequence_item(
+        provision_play, "Prove exact and parallel three-control-plane provisioning", 4
+    )
+    for clause in (
+        "e2e_bootstrap_result.controlPlaneVMs | length == 3",
+        "e2e_bootstrap_result.controlPlaneVMs | unique | length == 3",
+        "e2e_bootstrap_result.maxParallelControlPlaneCreates | int == 3",
+    ):
+        require(f"\n          - {clause}" in parallel_assertion,
+                f"parallel provisioning assertion lacks exact clause: {clause}")
+    authoritative_parallel_binding = named_yaml_sequence_item(
+        provision_play, "Bind the parallel-create contract to the authoritative three VM identities", 4
+    )
+    for clause in (
+        "e2e_state.controlPlanes | length == 3",
+        "e2e_state.controlPlanes | map(attribute='uuid') | list | unique | length == 3",
+        "e2e_state.controlPlanes | map(attribute='uuid') | list | difference(e2e_bootstrap_result.controlPlaneVMs) | length == 0",
+        "e2e_bootstrap_result.controlPlaneVMs | difference(e2e_state.controlPlanes | map(attribute='uuid') | list) | length == 0",
+        "(e2e_bootstrap_result.maxParallelControlPlaneCreates | int) == (e2e_state.controlPlanes | length)",
+    ):
+        require(f"\n          - {clause}" in authoritative_parallel_binding,
+                f"authoritative parallel-create binding lacks exact clause: {clause}")
+
+    control_plane_wait_play = named_yaml_sequence_item(
+        playbook, "Wait for all RKE2 servers independently and in parallel through the bastion", 0
+    )
+    require_yaml_key(control_plane_wait_play, 2, "hosts", "rke2_control_plane")
+    require_yaml_key(control_plane_wait_play, 2, "strategy", "free")
+    require_yaml_key(control_plane_wait_play, 2, "any_errors_fatal", "true")
+    require(re.search(r"(?m)^  serial:", control_plane_wait_play) is None,
+            "parallel control-plane wait play must not set serial")
+    private_ssh_probe = named_yaml_sequence_item(
+        control_plane_wait_play, "Probe every private control-plane SSH port from the bastion in parallel", 4
+    )
+    require("\n      ansible.builtin.command:" in private_ssh_probe,
+            "private control-plane SSH probe must be a command task")
+    require_unrestricted_parallel_task(private_ssh_probe)
+    require_yaml_key(private_ssh_probe, 6, "retries", "120")
+    require_yaml_key(private_ssh_probe, 6, "delay", "5")
+    require_yaml_key(private_ssh_probe, 6, "until", "e2e_private_ssh_probe.rc == 0")
+    host_key_wait = named_yaml_sequence_item(
+        control_plane_wait_play, "Scan each private control-plane host key from the bastion", 4
+    )
+    require_unrestricted_parallel_task(host_key_wait)
+    require_yaml_key(host_key_wait, 6, "retries", "20")
+    require_yaml_key(host_key_wait, 6, "delay", "5")
+    require_yaml_key(
+        host_key_wait, 6, "until", "e2e_host_keyscan.rc == 0 and e2e_host_keyscan.stdout | length > 0"
+    )
+    connection_wait = named_yaml_sequence_item(
+        control_plane_wait_play, "Wait for authenticated SSH on every control plane in parallel", 4
+    )
+    require_unrestricted_parallel_task(connection_wait)
+    require("\n      ansible.builtin.wait_for_connection:" in connection_wait,
+            "control-plane authenticated SSH wait must use wait_for_connection")
+    require_yaml_key(connection_wait, 8, "connect_timeout", "10")
+    require_yaml_key(connection_wait, 8, "sleep", "5")
+    require_yaml_key(connection_wait, 8, "timeout", "1200")
+    cloud_init_wait = named_yaml_sequence_item(
+        control_plane_wait_play, "Wait for cloud-init completion on every control plane in parallel", 4
+    )
+    require_unrestricted_parallel_task(cloud_init_wait)
+    require("\n      ansible.builtin.raw: >-" in cloud_init_wait and
+            "timeout --kill-after=5s 1800s sh -c" in cloud_init_wait,
+            "control-plane cloud-init wait must be bounded inside the free-strategy play")
+    product_preparation = named_yaml_sequence_item(
+        control_plane_wait_play, "Detect completed product node preparation on every control plane", 4
+    )
+    require("ansible.builtin.stat:" in product_preparation and
+            "path: /var/lib/inspace/kubernetes-node-prepared-v1" in product_preparation,
+            "Ansible node preparation must detect the product bootstrap checkpoint")
+    persistent_swap = named_yaml_sequence_item(
+        control_plane_wait_play, "Disable persistent swap entries on every control plane in parallel", 4
+    )
+    require("ansible.builtin.replace:" in persistent_swap and
+            r"regexp: '^(?!\s*#)(.*\s+swap\s+.*)$'" in persistent_swap and
+            "when: not e2e_node_preparation.stat.exists" in persistent_swap,
+            "persistent swap removal must use the exact idempotent Python regexp and checkpoint guard")
+    mirror_selection = named_yaml_sequence_item(
+        control_plane_wait_play, "Select the Thailand Ubuntu archive mirror on every control plane in parallel", 4
+    )
+    require(r"regexp: 'https?://archive\.ubuntu\.com'" in mirror_selection and
+            "replace: 'http://th.archive.ubuntu.com'" in mirror_selection,
+            "Ansible node preparation must select the Thailand mirror for HTTP or HTTPS sources")
+    package_upgrade = named_yaml_sequence_item(
+        control_plane_wait_play, "Update and upgrade every control plane in parallel", 4
+    )
+    require("update_cache: true" in package_upgrade and "upgrade: 'yes'" in package_upgrade and
+            "NEEDRESTART_MODE: l" in package_upgrade and
+            "async: 600" in package_upgrade and "poll: 10" in package_upgrade and
+            "when: not e2e_node_preparation.stat.exists" in package_upgrade,
+            "Ansible node preparation upgrade must be noninteractive, bounded, and checkpoint guarded")
+    repaired_restart = named_yaml_sequence_item(
+        control_plane_wait_play, "Restart repaired RKE2 servers one at a time and prove local readiness", 4
+    )
+    require("throttle: 1" in repaired_restart and "systemctl restart --no-block rke2-server.service" in repaired_restart and
+            "old_pid=$(systemctl show rke2-server.service --property=MainPID --value)" in repaired_restart and
+            'test "$new_pid" != "$old_pid"' in repaired_restart and
+            "restart_deadline=$(( $(date +%s) + 1200 ))" in repaired_restart and "timeout 10s" in repaired_restart and
+            "[+]etcd ok" in repaired_restart and '"$attempt" -ge 180' in repaired_restart and
+            "sysctl -n net.ipv4.ip_forward" in repaired_restart and "LimitNOFILE" in repaired_restart,
+            "repaired control planes must restart serially and prove bounded local etcd and tuning readiness")
+    for marker in (
+        "Persist Kubernetes sysctls on repaired control planes",
+        "dest: /etc/sysctl.d/90-inspace-kubernetes.conf",
+        "Persist Kubernetes PAM limits on repaired control planes",
+        "dest: /etc/security/limits.d/90-inspace-kubernetes.conf",
+        "Create the repaired RKE2 server drop-in directory",
+        "path: /etc/systemd/system/rke2-server.service.d",
+        "state: directory",
+        "Persist RKE2 server limits on repaired control planes",
+        "dest: /etc/systemd/system/rke2-server.service.d/20-inspace-node-limits.conf",
+        "Apply Kubernetes sysctls on repaired control planes",
+        "Persist completed repaired node preparation",
+    ):
+        require(marker in control_plane_wait_play,
+                f"repaired control-plane convergence is missing: {marker}")
+    rke2_wait = named_yaml_sequence_item(
+        control_plane_wait_play, "Wait for every rke2-server service in parallel", 4
+    )
+    require_unrestricted_parallel_task(rke2_wait)
+    require_yaml_key(rke2_wait, 6, "retries", "180")
+    require_yaml_key(rke2_wait, 6, "delay", "10")
+    require_yaml_key(
+        rke2_wait, 6, "until", "e2e_rke2_service.rc == 0 and e2e_rke2_service.stdout == 'active'"
+    )
+    readyz_wait = named_yaml_sequence_item(
+        control_plane_wait_play, "Wait for embedded etcd and the local API on every server in parallel", 4
+    )
+    require_unrestricted_parallel_task(readyz_wait)
+    require_yaml_key(readyz_wait, 6, "retries", "120")
+    require_yaml_key(readyz_wait, 6, "delay", "10")
+    require_yaml_key(readyz_wait, 6, "until", "e2e_local_readyz.rc == 0")
+
     for marker in (
         "maxParallelControlPlaneCreates | int == 3",
         "e2e_bootstrap_result.apiLoadBalancerUUID is not defined",
@@ -150,6 +517,7 @@ def main() -> None:
         "KubeProxyReplacement:[[:space:]]+True",
         "Direct Routing",
         "auto-direct-node-routes",
+        "enable-bpf-masquerade",
         "enable-l2-announcements",
         "default-lb-service-ipam",
         "defaultLBServiceIPAM:[[:space:]]*none",
@@ -167,6 +535,17 @@ def main() -> None:
         "global.inspace.privateLoadBalancerPool.stop",
         "global.inspace.controlPlaneVIP",
         "Verify Cilium native routing and full kube-proxy replacement",
+        "Masquerading:[[:space:]]+BPF",
+        "EnableBPFMasquerade",
+        "EnableIPv4Masquerade",
+        "10\\.42\\.0\\.0/16",
+        "Disable active swap on every control plane in parallel",
+        "Disable persistent swap entries on every control plane in parallel",
+        "Select the Thailand Ubuntu archive mirror on every control plane in parallel",
+        "Update and upgrade every control plane in parallel",
+        "/etc/sysctl.d/90-inspace-kubernetes.conf",
+        "/etc/security/limits.d/90-inspace-kubernetes.conf",
+        "LimitMEMLOCK",
     ):
         require(marker in playbook, f"playbook is missing contract marker: {marker}")
 
@@ -179,6 +558,12 @@ def main() -> None:
     require("rke2:" in nodeclass and "privateRegistrationEndpoint" in nodeclass,
             "NodeClass must use the private RKE2 registration endpoint")
     require("inspace-rke2-agent-token" in nodeclass, "NodeClass must use the RKE2 token secret")
+    require("class: amd-epyc" in nodeclass and "class: intel-scalable" not in nodeclass,
+            "E2E NodeClass must select AMD EPYC workers")
+    require('.spec.hostPoolSelector.class == "amd-epyc"' in playbook and
+            ".status.hostPoolUUID == $pool" in playbook and
+            "INSPACE_AMD_HOST_POOL_UUID" in playbook,
+            "live NodeClass readiness must prove the exact AMD EPYC pool")
     private_services = [
         manifest_document(workload, "Service", "inspace-e2e-private-a"),
         manifest_document(workload, "Service", "inspace-e2e-private-b"),
@@ -260,6 +645,10 @@ def main() -> None:
     digest = "sha256:49b77655f9f109bedc5eb25723bb0e4c57d8513ba33cc69c31be3f243eb2386d"
     require(playbook.count(digest) >= 2, "kube-vip tag and live pods must use the audited digest")
     require("expected one exact egress FIP for each control plane and bastion" in bootstrap_discovery and
+            "vm_by_name = canonical_owned_vm_details(listed_owned_vms)" in bootstrap_discovery and
+            'expected_cp_names = [f"{cluster_resource_name}-cp{index}"' in bootstrap_discovery and
+            'vm.get("hostname") not in (None, "", name)' in bootstrap_discovery and
+            "user-resource/vm?" in bootstrap_discovery and
             "enabled non-virtual InSpace type=public FIP" in bootstrap_discovery and
             'assigned_to_resource_type") != "virtual_machine"' in bootstrap_discovery and
             "private-VIP bootstrap must not create or adopt a control-plane load balancer" in bootstrap_discovery and
@@ -268,6 +657,118 @@ def main() -> None:
             "node firewall must be assigned to exactly the three control-plane VMs" in bootstrap_discovery and
             "bastion public ingress must be only management /32 TCP/22" in bootstrap_discovery,
             "bootstrap discovery must prove exact VM FIPs, zero control NLBs, and firewall isolation")
+    require('test "$(hostname)" = "{{ e2e_node_name }}"' in playbook and
+            "[.controlPlanes[].name] | sort" in playbook and
+            "[.items[].metadata.name] | sort" in playbook,
+            "live E2E must bind cloud, guest-hostname, and Kubernetes control-plane identities")
+
+    bootstrap_discovery_module = load_script_module(
+        "e2e_discover_bootstrap_static", ROOT / "scripts/discover-bootstrap.py"
+    )
+    sparse_owned_vms = [
+        {"uuid": "11111111-2222-4333-8444-555555555555", "name": "inspace-e2e-unit-cp0"},
+        {"uuid": "66666666-7777-4888-8999-aaaaaaaaaaaa", "name": "rke2-owner-bastion"},
+    ]
+    canonical_vm_records = {
+        item["uuid"]: {
+            **item,
+            "description": "persisted ownership",
+            "network_uuid": "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff",
+            "designated_pool_uuid": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+            "storage": [{"primary": True, "size": 30}],
+        }
+        for item in sparse_owned_vms
+    }
+    detail_queries = []
+
+    def canonical_vm_getter(path: str):
+        detail_queries.append(path)
+        prefix = "user-resource/vm?uuid="
+        require(path.startswith(prefix), "bootstrap VM detail lookup used the wrong endpoint")
+        return canonical_vm_records[path.removeprefix(prefix)]
+
+    canonical = bootstrap_discovery_module.canonical_owned_vm_details(
+        sparse_owned_vms, canonical_vm_getter
+    )
+    require(set(canonical) == {item["name"] for item in sparse_owned_vms},
+            "bootstrap VM detail canonicalization lost an owned name")
+    require(all(item.get("network_uuid") for item in canonical.values()) and len(detail_queries) == 2,
+            "bootstrap discovery did not replace every sparse list row with complete detail")
+
+    def mismatched_vm_getter(_path: str):
+        return {"uuid": sparse_owned_vms[0]["uuid"], "name": "foreign"}
+
+    try:
+        bootstrap_discovery_module.canonical_owned_vm_details(
+            sparse_owned_vms[:1], mismatched_vm_getter
+        )
+    except SystemExit as error:
+        require("does not match its list UUID/name" in str(error),
+                "bootstrap discovery returned the wrong mismatch diagnostic")
+    else:
+        require(False, "bootstrap discovery accepted a mismatched canonical VM identity")
+
+    detail_error = RuntimeError("injected detail lookup failure")
+
+    def failing_vm_getter(_path: str):
+        raise detail_error
+
+    try:
+        bootstrap_discovery_module.canonical_owned_vm_details(
+            sparse_owned_vms[:1], failing_vm_getter
+        )
+    except RuntimeError as error:
+        require(error is detail_error, "bootstrap discovery replaced the authoritative lookup error")
+    else:
+        require(False, "bootstrap discovery ignored an authoritative VM detail lookup failure")
+
+    worker_discovery_module = load_script_module(
+        "e2e_discover_worker_static", ROOT / "scripts/discover-worker.py"
+    )
+    worker_name = "inspace-e2e-run-karp-general-abc123"
+    worker_nodeclaim_name = "general-abc123"
+    worker_summary = {"uuid": "12345678-1234-4abc-8def-1234567890ab", "name": worker_name}
+    worker_detail = {
+        **worker_summary,
+        "hostname": worker_name,
+        "description": json.dumps({
+            "schema": "karpenter.inspace.cloud/v2",
+            "cluster": "inspace-e2e-run",
+            "nodeClaim": worker_nodeclaim_name,
+            "vmName": worker_name,
+            "floatingIPName": "worker-fip",
+            "hostClass": "amd-epyc",
+        }),
+        "designated_pool_uuid": "6976fdc8-4492-465b-bd16-9ad5f6b00b03",
+    }
+    worker_detail_queries = []
+
+    def worker_detail_getter(path: str):
+        worker_detail_queries.append(path)
+        return worker_detail
+
+    canonical_worker = worker_discovery_module.canonical_worker_vm_detail(
+        [worker_summary], worker_name, worker_nodeclaim_name,
+        "inspace-e2e-run", "general", worker_detail_getter
+    )
+    require(canonical_worker is worker_detail and
+            worker_detail_queries == ["user-resource/vm?uuid=12345678-1234-4abc-8def-1234567890ab"],
+            "worker discovery did not resolve a sparse list identity through exact VM detail")
+
+    def mismatched_worker_getter(_path: str):
+        return {**worker_detail, "name": "foreign-worker"}
+
+    try:
+        worker_discovery_module.canonical_worker_vm_detail(
+            [worker_summary], worker_name, worker_nodeclaim_name,
+            "inspace-e2e-run", "general", mismatched_worker_getter
+        )
+    except SystemExit as error:
+        require("does not match the list UUID and Node name" in str(error),
+                "worker canonicalization returned the wrong identity mismatch diagnostic")
+    else:
+        require(False, "worker discovery accepted a mismatched canonical VM detail")
+
     require("ProxyJump e2e-bastion" in ssh_config and "HostName {private}" in ssh_config,
             "all control-plane and worker SSH must use private IPs through the bastion")
     require("127.0.0.1:16443:$virtual_ip:6443" in tunnel and "StrictHostKeyChecking=yes" in tunnel,
@@ -276,7 +777,16 @@ def main() -> None:
             "worker must be attached to exactly the intended managed cloud firewall" in worker_discovery and
             'ip.get("is_virtual") is False' in worker_discovery and
             "managed node firewall must protect exactly three control planes and the worker" in worker_discovery and
-            "worker InternalIP collides with the private control-plane VIP" in worker_discovery,
+            "worker InternalIP collides with the private control-plane VIP" in worker_discovery and
+            'os.environ["INSPACE_AMD_HOST_POOL_UUID"]' in worker_discovery and
+            "canonical_worker_vm_detail(" in worker_discovery and
+            'record.get("schema") != "karpenter.inspace.cloud/v2"' in worker_discovery and
+            'record.get("nodeClaim") != node.get("nodeClaimName")' in worker_discovery and
+            'record.get("vmName") != node.get("name")' in worker_discovery and
+            ".status.nodeName == $nodeName" in playbook and
+            'test "$(hostname)" = "{{ e2e_node_name }}"' in playbook and
+            'record.get("hostClass") != "amd-epyc"' in worker_discovery and
+            'vm.get("designated_pool_uuid") != amd_pool_uuid' in worker_discovery,
             "worker proof must bind exactly one egress FIP, exclude reserved VIPs, and bind the managed cloud firewall")
     require('($attachments | length) == 1' in playbook and
             '$attachments[0].spec.attacher == "csi.inspace.cloud"' in playbook and
@@ -301,6 +811,10 @@ def main() -> None:
             'item.get("is_deleted") is True' in cloud_audit and
             cloud_audit.count("active_resources(") == 6,
             "deterministic cleanup audit must ignore only explicitly deleted cloud rows")
+    require('worker_vm_prefix = f"{args.cluster}-karp-{args.nodepool}-"' in cloud_audit and
+            'worker_fip_prefix = f"karpenter-{args.nodepool}-"' in cloud_audit and
+            'state.get("workerVMs", [])' in cloud_audit,
+            "cleanup audit must retain new worker VM/FIP naming even with sparse list descriptions")
     cloud_audit_module = load_script_module("e2e_cloud_audit_static", ROOT / "scripts/cloud-audit.py")
     require(cloud_audit_module.parse_description('{"cluster":"expected"}') == {"cluster": "expected"},
             "cloud audit must parse structured VM ownership descriptions")
@@ -342,7 +856,8 @@ def main() -> None:
             "recovery must restore its private API tunnel before probing Kubernetes")
     require(re.search(r"preserving\s+cloud infrastructure is the fail-closed outcome", cleanup) is not None,
             "cleanup must fail closed when ownership is uncertain")
-    require("^rke2-' + e2e_cleanup_state.owner + '-(cp-[0-2]|bastion)$" in cleanup,
+    require("e2e_cleanup_state.clusterResourceName + '-cp[0-2]|rke2-'" in cleanup and
+            "e2e_cleanup_state.owner + '-bastion)$'" in cleanup,
             "controller uninstall must permit only the three control planes and exact bastion")
     print("E2E static contract verified (no live resources touched)")
 

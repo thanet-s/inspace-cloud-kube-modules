@@ -35,7 +35,10 @@ func TestFakeProvisioningLifecycleMakesNoNetworkCalls(t *testing.T) {
 		t.Fatal(err)
 	}
 	nodeClaim := &karpv1.NodeClaim{
-		ObjectMeta: metav1.ObjectMeta{Name: "general-worker", UID: types.UID("nodeclaim-uid-1")},
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "general-abc123", UID: types.UID("nodeclaim-uid-1"),
+			Labels: map[string]string{karpv1.NodePoolLabelKey: "general"},
+		},
 		Spec: karpv1.NodeClaimSpec{
 			NodeClassRef: &karpv1.NodeClassReference{Group: inspacev1.Group, Kind: inspacev1.Kind, Name: nodeClass.Name},
 			Requirements: []karpv1.NodeSelectorRequirementWithMinValues{
@@ -55,6 +58,10 @@ func TestFakeProvisioningLifecycleMakesNoNetworkCalls(t *testing.T) {
 	}
 	if created.Labels[corev1.LabelInstanceTypeStable] != "is-general-4c-8g" {
 		t.Fatalf("unexpected selection %q", created.Labels[corev1.LabelInstanceTypeStable])
+	}
+	const expectedNodeName = "smoke-cluster-karp-general-abc123"
+	if created.Name != nodeClaim.Name || created.Annotations[provider.AnnotationNodeName] != expectedNodeName {
+		t.Fatalf("NodeClaim identity or worker node annotation changed: name=%q annotations=%#v", created.Name, created.Annotations)
 	}
 	retried, err := cloudProvider.Create(ctx, nodeClaim)
 	if err != nil {
@@ -84,6 +91,9 @@ func TestFakeProvisioningLifecycleMakesNoNetworkCalls(t *testing.T) {
 	if !request.PublicIPv4 {
 		t.Fatal("worker must request a public IPv4 address because InSpace has no managed NAT")
 	}
+	if request.Name != expectedNodeName || request.NodeClaimName != nodeClaim.Name {
+		t.Fatalf("cloud VM and NodeClaim identities were not kept separate: VM=%q NodeClaim=%q", request.Name, request.NodeClaimName)
+	}
 	if request.ControlPlaneVIP != "10.0.0.10" {
 		t.Fatalf("private RKE2 supervisor VIP was not propagated: %q", request.ControlPlaneVIP)
 	}
@@ -97,6 +107,19 @@ func TestFakeProvisioningLifecycleMakesNoNetworkCalls(t *testing.T) {
 		t.Fatalf("worker SSH access was not propagated through the provider request")
 	}
 	decodedBootstrap := decodedCloudInitFiles(t, request.CloudInitJSON)
+	var cloudInit struct {
+		Hostname         string `json:"hostname"`
+		PreserveHostname bool   `json:"preserve_hostname"`
+	}
+	if err := json.Unmarshal([]byte(request.CloudInitJSON), &cloudInit); err != nil {
+		t.Fatal(err)
+	}
+	if cloudInit.Hostname != expectedNodeName || cloudInit.PreserveHostname {
+		t.Fatalf("cloud-init hostname contract = %#v", cloudInit)
+	}
+	if !strings.Contains(decodedBootstrap, `node-name: "`+expectedNodeName+`"`) || !strings.Contains(decodedBootstrap, "hostnamectl set-hostname --static") {
+		t.Fatalf("guest hostname and RKE2 node-name are not identical\n%s", decodedBootstrap)
+	}
 	if strings.Count(decodedBootstrap, "karpenter.sh/unregistered:NoExecute") != 1 {
 		t.Fatalf("bootstrap must contain exactly one registration taint\n%s", request.CloudInitJSON)
 	}

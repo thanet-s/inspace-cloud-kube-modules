@@ -2,9 +2,11 @@ package provider
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 
@@ -12,6 +14,70 @@ import (
 	cloudapi "github.com/thanet-s/inspace-cloud-kube-modules/modules/karpenter-provider/pkg/cloud"
 	cloudfake "github.com/thanet-s/inspace-cloud-kube-modules/modules/karpenter-provider/pkg/cloud/fake"
 )
+
+func TestWorkerNodeNameUsesClusterAndKarpenterNodeClaimSuffix(t *testing.T) {
+	nodeClaim := &karpv1.NodeClaim{ObjectMeta: metav1.ObjectMeta{
+		Name: "general-a1b2c", UID: types.UID("stable-nodeclaim-uid"),
+		Labels: map[string]string{karpv1.NodePoolLabelKey: "general"},
+	}}
+	got, err := workerNodeName("production", nodeClaim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "production-karp-general-a1b2c" {
+		t.Fatalf("workerNodeName() = %q", got)
+	}
+	nodeClaim.UID = types.UID("different-uid")
+	if retry, err := workerNodeName("production", nodeClaim); err != nil || retry != got {
+		t.Fatalf("worker name must be derived from visible NodeClaim identity, got %q, %v", retry, err)
+	}
+}
+
+func TestWorkerNodeNameRejectsUnsafeOrUncorrelatedIdentity(t *testing.T) {
+	tests := map[string]struct {
+		cluster string
+		claim   *karpv1.NodeClaim
+	}{
+		"missing NodePool label":            {cluster: "cluster", claim: &karpv1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Name: "workers-abc"}}},
+		"NodeClaim outside NodePool prefix": {cluster: "cluster", claim: &karpv1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Name: "other-abc", Labels: map[string]string{karpv1.NodePoolLabelKey: "workers"}}}},
+		"empty random suffix":               {cluster: "cluster", claim: &karpv1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Name: "workers-", Labels: map[string]string{karpv1.NodePoolLabelKey: "workers"}}}},
+		"hostname too long":                 {cluster: strings.Repeat("a", 40), claim: &karpv1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Name: "workers-" + strings.Repeat("b", 20), Labels: map[string]string{karpv1.NodePoolLabelKey: "workers"}}}},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			if got, err := workerNodeName(test.cluster, test.claim); err == nil {
+				t.Fatalf("workerNodeName() = %q, want validation error", got)
+			}
+		})
+	}
+}
+
+func TestNewRejectsClusterNameThatCannotBeAHostnameLabel(t *testing.T) {
+	nodeClass := providerNodeClass()
+	opts := providerOptions(nodeClass)
+	opts.ClusterName = "cluster.example"
+	if _, err := New(cloudfake.New(), NewStaticResolver(nodeClass), opts); err == nil || !strings.Contains(err.Error(), "DNS-1123 hostname label") {
+		t.Fatalf("New() error = %v, want hostname-label validation", err)
+	}
+}
+
+func TestCreateRejectsUnsafeWorkerNameBeforeCloudMutation(t *testing.T) {
+	nodeClass := providerNodeClass()
+	cloud := cloudfake.New()
+	provider, err := New(cloud, NewStaticResolver(nodeClass), providerOptions(nodeClass))
+	if err != nil {
+		t.Fatal(err)
+	}
+	nodeClaim := &karpv1.NodeClaim{ObjectMeta: metav1.ObjectMeta{
+		Name: "workers-" + strings.Repeat("a", 55), Labels: map[string]string{karpv1.NodePoolLabelKey: "workers"},
+	}}
+	if _, err := provider.Create(context.Background(), nodeClaim); err == nil {
+		t.Fatal("Create() accepted an unsafe or uncorrelated worker name")
+	}
+	if vms, err := cloud.ListVMs(context.Background(), inspacev1.LocationBangkok, nodeClass.Spec.ClusterName); err != nil || len(vms) != 0 {
+		t.Fatalf("invalid name reached cloud mutation: VMs=%#v, err=%v", vms, err)
+	}
+}
 
 func TestDeleteMalformedProviderIDDoesNotReleaseFinalizer(t *testing.T) {
 	nodeClass := providerNodeClass()
