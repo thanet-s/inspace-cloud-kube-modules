@@ -17,6 +17,7 @@ import (
 
 	"github.com/thanet-s/inspace-cloud-kube-modules/modules/client"
 	"github.com/thanet-s/inspace-cloud-kube-modules/modules/cloud-provider/api/v1alpha1"
+	"sigs.k8s.io/yaml"
 )
 
 func TestReconcileBuildsBastionThenExactlyThreeControlPlaneVMs(t *testing.T) {
@@ -1431,6 +1432,17 @@ func assertControlPlaneCloudInit(t *testing.T, raw string, initialize bool) {
 			t.Errorf("RKE2 config lacks %q", required)
 		}
 	}
+	var rke2Config struct {
+		CNI              string `json:"cni"`
+		ClusterCIDR      string `json:"cluster-cidr"`
+		DisableKubeProxy bool   `json:"disable-kube-proxy"`
+	}
+	if err := yaml.Unmarshal([]byte(config), &rke2Config); err != nil {
+		t.Fatalf("parse generated RKE2 config: %v", err)
+	}
+	if rke2Config.CNI != "cilium" || rke2Config.ClusterCIDR != "10.42.0.0/16" || !rke2Config.DisableKubeProxy {
+		t.Fatalf("generated RKE2 CNI/kube-proxy contract=%#v", rke2Config)
+	}
 	if initialize == strings.Contains(config, "server: ") {
 		t.Errorf("initialize/join config mismatch: %s", config)
 	}
@@ -1447,6 +1459,28 @@ func assertControlPlaneCloudInit(t *testing.T, raw string, initialize bool) {
 		t.Errorf("kube-vip manifest enables an obsolete deployment/service path: %s", staticPod)
 	}
 	ciliumConfig := files["/var/lib/inspace/rke2-cilium-config"]
+	var helmChartConfig struct {
+		Spec struct {
+			ValuesContent string `json:"valuesContent"`
+		} `json:"spec"`
+	}
+	if err := yaml.Unmarshal([]byte(ciliumConfig), &helmChartConfig); err != nil {
+		t.Fatalf("parse generated RKE2 Cilium HelmChartConfig: %v", err)
+	}
+	var ciliumValues struct {
+		RoutingMode           string `json:"routingMode"`
+		IPv4NativeRoutingCIDR string `json:"ipv4NativeRoutingCIDR"`
+		AutoDirectNodeRoutes  bool   `json:"autoDirectNodeRoutes"`
+		KubeProxyReplacement  bool   `json:"kubeProxyReplacement"`
+		EnableIPv4Masquerade  bool   `json:"enableIPv4Masquerade"`
+	}
+	if err := yaml.Unmarshal([]byte(helmChartConfig.Spec.ValuesContent), &ciliumValues); err != nil {
+		t.Fatalf("parse generated RKE2 Cilium values: %v", err)
+	}
+	if ciliumValues.RoutingMode != "native" || ciliumValues.IPv4NativeRoutingCIDR != "10.42.0.0/16" ||
+		!ciliumValues.AutoDirectNodeRoutes || !ciliumValues.KubeProxyReplacement || !ciliumValues.EnableIPv4Masquerade {
+		t.Fatalf("generated Cilium native-routing contract=%#v", ciliumValues)
+	}
 	for _, required := range []string{"l2announcements:\n      enabled: true", "defaultLBServiceIPAM: none", "nodeIPAM:\n      enabled: false", "k8sClientRateLimit:\n      qps: 10\n      burst: 20"} {
 		if !strings.Contains(ciliumConfig, required) {
 			t.Errorf("RKE2 Cilium config lacks %q", required)

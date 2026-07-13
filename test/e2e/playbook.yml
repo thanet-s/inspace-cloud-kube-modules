@@ -310,6 +310,16 @@
       ansible.builtin.set_fact:
         e2e_state: "{{ lookup('file', e2e_state_file) | from_json }}"
 
+    - name: Bind the parallel-create contract to the authoritative three VM identities
+      ansible.builtin.assert:
+        that:
+          - e2e_state.controlPlanes | length == 3
+          - e2e_state.controlPlanes | map(attribute='uuid') | list | unique | length == 3
+          - e2e_state.controlPlanes | map(attribute='uuid') | list | difference(e2e_bootstrap_result.controlPlaneVMs) | length == 0
+          - e2e_bootstrap_result.controlPlaneVMs | difference(e2e_state.controlPlanes | map(attribute='uuid') | list) | length == 0
+          - (e2e_bootstrap_result.maxParallelControlPlaneCreates | int) == (e2e_state.controlPlanes | length)
+        fail_msg: "The measured parallel-create batch is not the authoritative three-control-plane VM set"
+
     - name: Render the pinned bastion and private-node SSH configuration
       ansible.builtin.command:
         argv:
