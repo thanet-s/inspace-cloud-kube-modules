@@ -801,7 +801,7 @@ func (a *Adapter) DeleteVM(ctx context.Context, location, uuid, clusterName, nod
 	if !vmMissing {
 		var managed, complete bool
 		var ownershipErr error
-		record, managed, complete, ownershipErr = inspectOwnershipDescription(vm.Description)
+		record, managed, complete, ownershipErr = inspectOwnershipDescription(vm.Description, clusterName)
 		if ownershipErr != nil {
 			return fmt.Errorf("authorizing deletion of VM %s: %w", uuid, ownershipErr)
 		}
@@ -835,7 +835,9 @@ func (a *Adapter) DeleteVM(ctx context.Context, location, uuid, clusterName, nod
 		return floatingCleanupErr
 	}
 	if !vmMissing {
-		deleteErr := a.api.DeleteVM(ctx, location, uuid)
+		requestCtx, requestCancel := context.WithTimeout(ctx, a.networkAttachmentRequestTimeout)
+		deleteErr := a.api.DeleteVM(requestCtx, location, uuid)
+		requestCancel()
 		// A remote 2xx, 404, or error response only proves that the request was
 		// dispatched. Keep the firewall attached until canonical GET and list
 		// read-back independently agree that the VM is absent.
@@ -2035,6 +2037,11 @@ func exactFloatingIPForCleanup(addresses []sdk.FloatingIP, expected sdk.Floating
 	var exact []sdk.FloatingIP
 	for i := range addresses {
 		address := addresses[i]
+		if address.IsDeleted {
+			// List responses may retain stale deletion tombstones. They are not
+			// active ownership conflicts and cannot be mutation targets.
+			continue
+		}
 		identityOverlap := address.Name == expected.Name || address.Address == expected.Address ||
 			(expectedVMUUID != "" && address.AssignedTo == expectedVMUUID)
 		if !identityOverlap {

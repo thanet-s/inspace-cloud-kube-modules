@@ -2839,6 +2839,107 @@ func TestDeleteDoesNotTreatOneStaleDependentOmissionAsSuccess(t *testing.T) {
 	}
 }
 
+func TestDeleteIgnoresDeletedFloatingIPTombstones(t *testing.T) {
+	t.Run("tombstone only is already absent", func(t *testing.T) {
+		api := &fakeAPI{}
+		adapter, _ := New(api)
+		configureFastNetworkReadback(adapter, boundedReadbackTestTimeout)
+		created, err := adapter.CreateVM(context.Background(), testRequest())
+		if err != nil {
+			t.Fatal(err)
+		}
+		api.floatingIPs[0].IsDeleted = true
+		api.operations = nil
+		if err := adapter.DeleteVM(context.Background(), "bkk01", created.UUID, "cluster-a", "nodeclaim-a"); err != nil {
+			t.Fatal(err)
+		}
+		if countOperation(api.operations, "unassign-floating-ip") != 0 || countOperation(api.operations, "delete-floating-ip") != 0 {
+			t.Fatalf("deleted tombstone was mutated: operations=%v", api.operations)
+		}
+		if len(api.floatingIPs) != 1 || !api.floatingIPs[0].IsDeleted || len(api.vms) != 0 || firewallHasVM(api.firewalls[0], created.UUID) {
+			t.Fatalf("tombstone-only delete did not converge safely: VMs=%#v FIPs=%#v firewall=%#v", api.vms, api.floatingIPs, api.firewalls[0])
+		}
+	})
+
+	for name, mutate := range map[string]func(*sdk.FloatingIP){
+		"exact stale tombstone": func(*sdk.FloatingIP) {},
+		"wrong identity tombstone": func(address *sdk.FloatingIP) {
+			address.Address = "203.0.113.99"
+			address.BillingAccountID++
+		},
+	} {
+		t.Run(name+" beside active exact row", func(t *testing.T) {
+			api := &fakeAPI{}
+			adapter, _ := New(api)
+			configureFastNetworkReadback(adapter, boundedReadbackTestTimeout)
+			created, err := adapter.CreateVM(context.Background(), testRequest())
+			if err != nil {
+				t.Fatal(err)
+			}
+			tombstone := api.floatingIPs[0]
+			tombstone.IsDeleted = true
+			mutate(&tombstone)
+			api.floatingIPs = append(api.floatingIPs, tombstone)
+			api.operations = nil
+			if err := adapter.DeleteVM(context.Background(), "bkk01", created.UUID, "cluster-a", "nodeclaim-a"); err != nil {
+				t.Fatal(err)
+			}
+			if countOperation(api.operations, "unassign-floating-ip") != 1 || countOperation(api.operations, "delete-floating-ip") != 1 {
+				t.Fatalf("active exact address was not cleaned exactly once: operations=%v", api.operations)
+			}
+			if len(api.floatingIPs) != 1 || !api.floatingIPs[0].IsDeleted || len(api.vms) != 0 || firewallHasVM(api.firewalls[0], created.UUID) {
+				t.Fatalf("active-row cleanup mishandled stale tombstone: VMs=%#v FIPs=%#v firewall=%#v", api.vms, api.floatingIPs, api.firewalls[0])
+			}
+		})
+	}
+}
+
+func TestDeleteVMRequestDeadlineStillRequiresCanonicalAbsence(t *testing.T) {
+	t.Run("blocked delete leaves live VM firewall attached", func(t *testing.T) {
+		api := &fakeAPI{}
+		adapter, _ := New(api)
+		configureFastNetworkReadback(adapter, 120*time.Millisecond)
+		adapter.networkAttachmentRequestTimeout = 20 * time.Millisecond
+		created, err := adapter.CreateVM(context.Background(), testRequest())
+		if err != nil {
+			t.Fatal(err)
+		}
+		api.blockDeleteVM = true
+		api.operations = nil
+		started := time.Now()
+		err = adapter.DeleteVM(context.Background(), "bkk01", created.UUID, "cluster-a", "nodeclaim-a")
+		if !errors.Is(err, context.DeadlineExceeded) || !errors.Is(err, errVMAbsenceUncertain) {
+			t.Fatalf("DeleteVM() error = %v, want request timeout plus absence uncertainty", err)
+		}
+		if elapsed := time.Since(started); elapsed >= time.Second {
+			t.Fatalf("blocked VM DELETE exceeded bounded request/readback windows: %s", elapsed)
+		}
+		if !api.deleteVMContextCanceled || api.deleteVMCalls != 1 || len(api.vms) != 1 || !firewallHasVM(api.firewalls[0], created.UUID) || slicesContain(api.operations, "unassign-firewall") {
+			t.Fatalf("blocked VM DELETE detached live protection: canceled=%t deletes=%d operations=%v VMs=%#v firewall=%#v", api.deleteVMContextCanceled, api.deleteVMCalls, api.operations, api.vms, api.firewalls[0])
+		}
+	})
+
+	t.Run("timeout response that committed converges by readback", func(t *testing.T) {
+		api := &fakeAPI{}
+		adapter, _ := New(api)
+		configureFastNetworkReadback(adapter, 120*time.Millisecond)
+		adapter.networkAttachmentRequestTimeout = 20 * time.Millisecond
+		created, err := adapter.CreateVM(context.Background(), testRequest())
+		if err != nil {
+			t.Fatal(err)
+		}
+		api.blockDeleteVM = true
+		api.deleteVMCommitOnContext = true
+		api.operations = nil
+		if err := adapter.DeleteVM(context.Background(), "bkk01", created.UUID, "cluster-a", "nodeclaim-a"); err != nil {
+			t.Fatalf("DeleteVM() rejected canonically converged timeout outcome: %v", err)
+		}
+		if !api.deleteVMContextCanceled || len(api.vms) != 0 || firewallHasVM(api.firewalls[0], created.UUID) || !slicesContain(api.operations, "unassign-firewall") {
+			t.Fatalf("committed timeout outcome did not converge: canceled=%t operations=%v VMs=%#v firewall=%#v", api.deleteVMContextCanceled, api.operations, api.vms, api.firewalls[0])
+		}
+	})
+}
+
 func TestDeleteWaitsForAsyncVMAbsenceBeforeFirewallCleanup(t *testing.T) {
 	api := &fakeAPI{deleteVMKeepCount: 1}
 	adapter, _ := New(api)
@@ -3298,6 +3399,8 @@ type fakeAPI struct {
 	operations                      []string
 	deleteVMErr                     error
 	deleteVMKeepCount               int
+	blockDeleteVM                   bool
+	deleteVMCommitOnContext         bool
 	network                         *sdk.Network
 	networkGetCalls                 int
 	networkMembershipAfter          int
@@ -3605,10 +3708,23 @@ func (f *fakeAPI) CreateVM(_ context.Context, _ string, request sdk.CreateVMRequ
 }
 func (f *fakeAPI) DeleteVM(ctx context.Context, _, uuid string) error {
 	f.deleteVMCalls++
+	f.operations = append(f.operations, "delete-vm")
+	if f.blockDeleteVM {
+		<-ctx.Done()
+		f.deleteVMContextCanceled = true
+		if f.deleteVMCommitOnContext {
+			for i := range f.vms {
+				if f.vms[i].UUID == uuid {
+					f.vms = append(f.vms[:i], f.vms[i+1:]...)
+					break
+				}
+			}
+		}
+		return ctx.Err()
+	}
 	if ctx.Err() != nil {
 		f.deleteVMContextCanceled = true
 	}
-	f.operations = append(f.operations, "delete-vm")
 	if f.deleteVMErr != nil {
 		return f.deleteVMErr
 	}
