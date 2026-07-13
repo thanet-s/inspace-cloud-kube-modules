@@ -20,7 +20,8 @@ and the fixed three-server RKE2 bootstrap reconciler.
   caller-selected private VPC VIP; bootstrap creates no control-plane NLB.
 - Fixed control-plane VM, guest-hostname, and Kubernetes Node identities are
   `<metadata.name>-cp0`, `<metadata.name>-cp1`, and `<metadata.name>-cp2`.
-  `metadata.name` must be a lowercase DNS label of at most 59 characters.
+  The bastion VM and guest hostname are `<metadata.name>-bastion`.
+  `metadata.name` must be a lowercase DNS label of at most 55 characters.
 - A per-node RKE2 static Pod running kube-vip v1.2.1 by immutable multiarch
   digest. It advertises only the control-plane VIP with ARP and leader
   election; Kubernetes Service handling is disabled.
@@ -36,13 +37,19 @@ and the fixed three-server RKE2 bootstrap reconciler.
 - An operational continuous bootstrap CLI and a standard Kubernetes CCM
   command.
 
-InSpace has no outbound NAT. The bootstrap flow therefore preallocates one
-named floating IPv4 for every control-plane VM and the bastion, creates each
-private-only VM, assigns its validated firewall, then assigns the address. The
+InSpace has no outbound NAT. Every bootstrap VM is therefore created with
+`reserve_public_ip=true`. InSpace assigns one initially nameless floating IPv4;
+that address provides internet egress to cloud-init from the VM's first boot.
+The controller first attaches its already-created managed firewall and proves
+the exact policy and VM assignment by authoritative readback before returning
+from the create pass. On later passes it discovers the exact FIP assignment,
+validates its account and private-address binding, patches its deterministic
+owner-derived name, and requires authoritative readback before adoption. The
 guest NIC still has only its private RFC1918 address. RKE2 `node-ip` and
 `advertise-address` are explicitly derived from the real VPC address, so the
-VIP cannot become Kubernetes `InternalIP`; `node-external-ip` is each node's
-egress floating address. The node firewall admits the exact VPC and pod CIDRs
+VIP cannot become Kubernetes `InternalIP`; production cloud-init omits
+`node-external-ip`, and the external CCM publishes the validated FIP as the
+Kubernetes `ExternalIP`. The node firewall admits the exact VPC and pod CIDRs
 but no public ingress. The separate bastion firewall admits only the operator
 IPv4 `/32` on TCP/22. Guest UFW is not installed or configured by bootstrap;
 if present, bootstrap must disable it and verify it inactive/disabled without
@@ -59,6 +66,10 @@ another host. The client does not automatically retry POST requests.
 No credential belongs in Git, YAML, command-line flags, or logs. Supply it in
 `INSPACE_API_TOKEN` (or legacy `INSPACE_API_KEY`) from a local `.env` file or a
 Kubernetes Secret.
+
+The CCM also requires `INSPACE_BILLING_ACCOUNT_ID` to be a positive decimal
+integer at startup. This is an ownership invariant for node ExternalIP and
+public load-balancer FIP validation, not an optional Service-only setting.
 
 ## Fixed control-plane controller
 
@@ -126,13 +137,15 @@ an adoption candidate. An uncertain API response is resolved by listing and
 validating the exact deterministic name and owner/spec record on the next loop,
 not by blindly repeating the POST.
 
-Reconciliation never migrates the legacy `rke2-<owner>-cp-<slot>` display-name
-topology. It fails before mutation when those VMs are present. Teardown remains
-available for an exclusively legacy topology, including clusters whose older
-resource name exceeds the current 59-character create limit, but only after
-canonical VM detail, exact `cp/v2` owner/slot/spec records, deterministic FIPs,
-and firewall policy/assignments all validate. A mixed legacy/current topology
-is rejected.
+Reconciliation never migrates the legacy `rke2-<owner>-cp-<slot>` or
+`rke2-<owner>-bastion` display-name topology. It fails before mutation when
+those VMs are present. Teardown remains available for the released RC4/RC5
+topology (current control-plane names plus the owner-derived bastion) and the
+fully owner-derived older topology, including clusters whose older resource
+name exceeds the current 55-character create limit. Canonical VM detail,
+versioned owner/slot/spec records, deterministic FIPs, and firewall
+policy/assignments must all validate. Dual-bastion and mixed control-plane
+topologies are rejected.
 
 Owned teardown is deterministic and fail-closed. Before its first mutation it
 validates every deterministic VM/FIP name, assignment, billing account,
@@ -141,8 +154,10 @@ Sparse VM list entries are canonicalized through the per-VM detail endpoint
 before adoption or deletion.
 InSpace accepts firewall descriptions on create but omits them from readback,
 so an absent description is tolerated while any returned mismatch is rejected.
-It then removes all four owned FIPs, deletes the bastion and three control-plane
-VMs, and deletes both managed firewalls only after assignments are absent:
+It unassigns and deletes all four owned FIPs before deleting the bastion and
+three control-plane VMs, because InSpace VM deletion only leaves an automatic
+FIP active and unassigned. Both managed firewalls are deleted only after their
+assignments are absent:
 
 Before each owned VM deletion, the running controller records that exact VM
 UUID and its expected managed-firewall UUID. A successful or normalized

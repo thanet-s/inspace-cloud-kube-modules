@@ -19,11 +19,10 @@ import (
 // SchemaVersion must be bumped whenever generated bootstrap semantics change.
 // It is included in the provider drift hash so existing nodes are replaced.
 const (
-	SchemaVersion           = "stock-ubuntu-rke2-v5"
-	ExternalIPv4Placeholder = "__INSPACE_FLOATING_IPV4__"
-	VPCSubnetPlaceholder    = "__INSPACE_VPC_SUBNET__"
-	NativeRoutingPodCIDR    = "10.42.0.0/16"
-	KubernetesServiceCIDR   = "10.43.0.0/16"
+	SchemaVersion         = "stock-ubuntu-rke2-v6"
+	VPCSubnetPlaceholder  = "__INSPACE_VPC_SUBNET__"
+	NativeRoutingPodCIDR  = "10.42.0.0/16"
+	KubernetesServiceCIDR = "10.43.0.0/16"
 )
 
 var exactRKE2VersionPattern = regexp.MustCompile(`^v[0-9]+\.[0-9]+\.[0-9]+\+rke2r[0-9]+$`)
@@ -83,7 +82,6 @@ func RenderCloudInit(config Config) (string, error) {
 	fmt.Fprintf(&rke2, "server: %s\n", quote(config.Server))
 	fmt.Fprintf(&rke2, "token: %s\n", quote(config.Token))
 	fmt.Fprintf(&rke2, "node-name: %s\n", quote(config.NodeName))
-	fmt.Fprintf(&rke2, "node-external-ip: %s\n", quote(ExternalIPv4Placeholder))
 	rke2.WriteString("kubelet-arg:\n  - cloud-provider=external\n")
 
 	labelKeys := make([]string, 0, len(config.Labels))
@@ -347,23 +345,6 @@ set -eu
 	return string(data), nil
 }
 
-// ValidateExternalIPv4Template ensures adapter substitution is deterministic
-// and cannot silently leave a worker advertising a placeholder address.
-func ValidateExternalIPv4Template(cloudInitJSON string) error {
-	doc, err := parseDocument(cloudInitJSON)
-	if err != nil {
-		return err
-	}
-	count, err := placeholderCount(doc, cloudInitJSON, ExternalIPv4Placeholder)
-	if err != nil {
-		return err
-	}
-	if count != 1 {
-		return fmt.Errorf("cloud-init must contain exactly one external IPv4 placeholder, found %d", count)
-	}
-	return nil
-}
-
 // ValidateVPCSubnetTemplate ensures the production adapter can bind private-IP
 // discovery to the exact API-reported VPC prefix before the VM is created.
 func ValidateVPCSubnetTemplate(cloudInitJSON string) error {
@@ -379,19 +360,6 @@ func ValidateVPCSubnetTemplate(cloudInitJSON string) error {
 		return fmt.Errorf("cloud-init must contain exactly one VPC subnet placeholder, found %d", count)
 	}
 	return nil
-}
-
-// ResolveExternalIPv4 replaces the single strict template token immediately
-// before VM creation, after the adapter has allocated the named floating IP.
-func ResolveExternalIPv4(cloudInitJSON, address string) (string, error) {
-	if err := ValidateExternalIPv4Template(cloudInitJSON); err != nil {
-		return "", err
-	}
-	ip, err := netip.ParseAddr(address)
-	if err != nil || !ip.Is4() || !ip.IsGlobalUnicast() || ip.IsPrivate() {
-		return "", fmt.Errorf("external node IP must be a public IPv4 address")
-	}
-	return resolvePlaceholder(cloudInitJSON, ExternalIPv4Placeholder, address, "external IPv4")
 }
 
 // ResolveVPCSubnet replaces the exact private-network prefix after the adapter

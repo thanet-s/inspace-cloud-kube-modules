@@ -50,8 +50,8 @@ func TestRenderIncludesExactlyOneRegistrationTaint(t *testing.T) {
 	if count := strings.Count(decoded, "karpenter.sh/unregistered:NoExecute"); count != 1 {
 		t.Fatalf("expected one registration taint, found %d\n%s", count, data)
 	}
-	if count := strings.Count(decoded, ExternalIPv4Placeholder); count != 1 {
-		t.Fatalf("expected one external IPv4 placeholder, found %d", count)
+	if strings.Contains(decoded, "node-external-ip") || strings.Contains(decoded, "__INSPACE_FLOATING_IPV4__") {
+		t.Fatal("worker bootstrap must leave ExternalIP publication to the external CCM")
 	}
 	if count := strings.Count(decoded, VPCSubnetPlaceholder); count != 1 {
 		t.Fatalf("expected one VPC subnet placeholder, found %d", count)
@@ -67,21 +67,12 @@ func TestRenderIncludesExactlyOneRegistrationTaint(t *testing.T) {
 	if strings.Contains(data, "secret-token") {
 		t.Fatal("raw cloud-init JSON must not expose decoded file contents")
 	}
-	resolved, err := ResolveExternalIPv4(data, "203.0.113.10")
+	resolved, err := ResolveVPCSubnet(data, "10.0.0.0/24")
 	if err != nil {
 		t.Fatal(err)
 	}
 	_, resolvedContents := decodedDocument(t, resolved)
 	resolvedDecoded := strings.Join(resolvedContents, "\n")
-	if strings.Contains(resolvedDecoded, ExternalIPv4Placeholder) || !strings.Contains(resolvedDecoded, `node-external-ip: "203.0.113.10"`) {
-		t.Fatalf("external IPv4 was not resolved in RKE2 config: %s", resolved)
-	}
-	resolved, err = ResolveVPCSubnet(resolved, "10.0.0.0/24")
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, resolvedContents = decodedDocument(t, resolved)
-	resolvedDecoded = strings.Join(resolvedContents, "\n")
 	if strings.Contains(resolvedDecoded, VPCSubnetPlaceholder) || !strings.Contains(resolvedDecoded, "vpc_subnet='10.0.0.0/24'") {
 		t.Fatalf("VPC subnet was not resolved in private-IP detector: %s", resolved)
 	}
@@ -129,8 +120,8 @@ func TestRenderIncludesExactlyOneRegistrationTaint(t *testing.T) {
 	if strings.Contains(strings.ToLower(rendered), "k3s") {
 		t.Fatalf("RKE2 bootstrap retained a K3s artifact:\n%s", rendered)
 	}
-	if SchemaVersion != "stock-ubuntu-rke2-v5" {
-		t.Fatalf("bootstrap schema = %q, want host-preparation/node-tuning drift version v4", SchemaVersion)
+	if SchemaVersion != "stock-ubuntu-rke2-v6" {
+		t.Fatalf("bootstrap schema = %q, want external-CCM address ownership version v6", SchemaVersion)
 	}
 }
 
@@ -537,19 +528,6 @@ download_asset "https://example.invalid/rke2.tar.gz" "$DOWNLOAD_OUTPUT"
 	}
 	if got := readCounter(t, sleepCounter); got != 59 {
 		t.Fatalf("download retry sleeps = %d, want 59", got)
-	}
-}
-
-func TestResolveExternalIPv4RequiresExactlyOnePlaceholder(t *testing.T) {
-	for _, input := range []string{
-		`{"write_files":[]}`,
-		`{"value":"__INSPACE_FLOATING_IPV4____INSPACE_FLOATING_IPV4__"}`,
-		`{"write_files":[{"path":"/bad","encoding":"plain","content":"__INSPACE_FLOATING_IPV4__"}]}`,
-		`{"write_files":[{"path":"/config","encoding":"b64","content":"X19JTlNQQUNFX0ZMT0FUSU5HX0lQVjRfXw=="}],"runcmd":["echo __INSPACE_FLOATING_IPV4__"]}`,
-	} {
-		if _, err := ResolveExternalIPv4(input, "203.0.113.10"); err == nil {
-			t.Fatalf("expected strict placeholder validation for %s", input)
-		}
 	}
 }
 

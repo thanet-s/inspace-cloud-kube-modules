@@ -24,7 +24,14 @@ const (
 	BastionMemoryMiB     = 2048
 	BastionRootDiskGiB   = 30
 
-	ownedVMDeletionTransitionTTL = 5 * time.Minute
+	ownedVMDeletionTransitionTTL             = 5 * time.Minute
+	defaultProtectionAuditTimeout            = 15 * time.Second
+	defaultProtectionRequestTimeout          = 10 * time.Second
+	defaultProtectionReadbackMinInterval     = 500 * time.Millisecond
+	defaultProtectionReadbackMaxInterval     = 2 * time.Second
+	defaultCreatedVMRecoveryTimeout          = 15 * time.Second
+	defaultCreatedVMFloatingIPCleanupTimeout = 10 * time.Second
+	defaultCreatedVMDeleteTimeout            = 10 * time.Second
 )
 
 var (
@@ -48,8 +55,7 @@ type API interface {
 	AssignFirewallToVM(context.Context, string, string, string) error
 	DeleteFirewall(context.Context, string, string) error
 	ListFloatingIPs(context.Context, string, *inspace.FloatingIPFilters) ([]inspace.FloatingIP, error)
-	CreateFloatingIP(context.Context, string, inspace.CreateFloatingIPRequest) (*inspace.FloatingIP, error)
-	AssignFloatingIP(context.Context, string, string, string, string) (*inspace.FloatingIP, error)
+	UpdateFloatingIP(context.Context, string, string, inspace.UpdateFloatingIPRequest) (*inspace.FloatingIP, error)
 	UnassignFloatingIP(context.Context, string, string) (*inspace.FloatingIP, error)
 	DeleteFloatingIP(context.Context, string, string) error
 }
@@ -71,6 +77,14 @@ type Reconciler struct {
 	pendingDeletionMu  sync.Mutex
 	pendingVMDeletions map[string]pendingVMDeletion
 	now                func() time.Time
+
+	protectionAuditTimeout            time.Duration
+	protectionRequestTimeout          time.Duration
+	protectionReadbackMinInterval     time.Duration
+	protectionReadbackMaxInterval     time.Duration
+	createdVMRecoveryTimeout          time.Duration
+	createdVMFloatingIPCleanupTimeout time.Duration
+	createdVMDeleteTimeout            time.Duration
 }
 
 type pendingVMDeletion struct {
@@ -165,6 +179,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, cluster *v1alpha1.InSpaceClu
 		return Result{}, err
 	}
 	owner := ownerKey(cluster)
+	bastionVMName := currentBastionName(cluster.Metadata.Name)
 	vms, err := r.API.ListVMs(ctx, cluster.Spec.Location)
 	if err != nil {
 		return Result{}, err
@@ -224,38 +239,41 @@ func (r *Reconciler) Reconcile(ctx context.Context, cluster *v1alpha1.InSpaceClu
 	if err := validateOwnedFirewallAssignments(nodeFirewall, controlPlaneUUIDSet(byName, currentControlPlaneNames(cluster.Metadata.Name))); err != nil {
 		return Result{}, fmt.Errorf("bootstrap: node firewall assignment drift: %w", err)
 	}
-	if err := validateOwnedFirewallAssignments(bastionFirewall, bastionUUIDSet(byName, owner)); err != nil {
+	if err := validateOwnedFirewallAssignments(bastionFirewall, bastionUUIDSet(byName, bastionVMName)); err != nil {
 		return Result{}, fmt.Errorf("bootstrap: bastion firewall assignment drift: %w", err)
 	}
-	if err := validateReverseFirewallAssignments(firewalls, nodeFirewall, bastionFirewall, byName, owner, currentControlPlaneNames(cluster.Metadata.Name)); err != nil {
+	if err := validateReverseFirewallAssignments(firewalls, nodeFirewall, bastionFirewall, byName, bastionVMName, currentControlPlaneNames(cluster.Metadata.Name)); err != nil {
 		return Result{}, err
 	}
-	if err := r.validateExistingVMs(cluster, network, privatePool, owner, byName, floatingByName, rke2Token); err != nil {
+	if err := r.validateExistingVMs(cluster, network, privatePool, owner, byName, rke2Token); err != nil {
 		return Result{}, err
+	}
+	if byName[bastionVMName] == nil && floatingByName[bastionFloatingIPName(owner)] != nil {
+		return Result{}, fmt.Errorf("bootstrap: refusing to create bastion VM while residual floating IP %q already exists", bastionFloatingIPName(owner))
+	}
+	for slot := 0; slot < ControlPlaneReplicas; slot++ {
+		if byName[controlPlaneName(cluster.Metadata.Name, slot)] == nil && floatingByName[nodeFloatingIPName(owner, slot)] != nil {
+			return Result{}, fmt.Errorf("bootstrap: refusing to create control-plane slot %d while residual floating IP %q already exists", slot, nodeFloatingIPName(owner, slot))
+		}
 	}
 
-	nodeFirewall, err = r.ensureManagedNodeFirewall(ctx, cluster, network, owner, nodeFirewall)
-	if err != nil {
-		return Result{}, err
-	}
-	bastionFirewall, err = r.ensureManagedBastionFirewall(ctx, cluster, owner, bastionFirewall)
-	if err != nil {
-		return Result{}, err
-	}
-	bastion := byName[bastionName(owner)]
-	bastionIP, err := r.ensureOwnedFloatingIP(ctx, cluster, bastionFloatingIPName(owner), bastion, floatingByName[bastionFloatingIPName(owner)])
-	if err != nil {
-		return Result{}, err
-	}
+	bastion := byName[bastionVMName]
+	var bastionIP *inspace.FloatingIP
 	baseResult := func(vms []*inspace.VM, message string) Result {
 		result := progressResult(vms, message)
 		result.Owner = owner
-		result.FirewallUUID = nodeFirewall.UUID
-		result.BastionFirewallUUID = bastionFirewall.UUID
 		result.ControlPlaneEndpoint = fmt.Sprintf("https://%s:6443", cluster.Spec.Endpoint.VirtualIPv4)
 		result.PrivateControlPlaneEndpoint = result.ControlPlaneEndpoint
 		result.PrivateRegistrationEndpoint = fmt.Sprintf("https://%s:9345", cluster.Spec.Endpoint.VirtualIPv4)
-		result.BastionPublicIPv4 = bastionIP.Address
+		if nodeFirewall != nil {
+			result.FirewallUUID = nodeFirewall.UUID
+		}
+		if bastionFirewall != nil {
+			result.BastionFirewallUUID = bastionFirewall.UUID
+		}
+		if bastionIP != nil {
+			result.BastionPublicIPv4 = bastionIP.Address
+		}
 		if bastion != nil {
 			result.BastionVMUUID = bastion.UUID
 			result.BastionPrivateIPv4 = bastion.PrivateIPv4
@@ -267,15 +285,31 @@ func (r *Reconciler) Reconcile(ctx context.Context, cluster *v1alpha1.InSpaceClu
 		return Result{}, err
 	}
 	if bastion == nil {
+		bastionFirewall, err = r.ensureManagedBastionFirewall(ctx, cluster, owner, bastionFirewall)
+		if err != nil {
+			return Result{}, err
+		}
+		if err := r.rejectResidualFloatingIPNames(ctx, cluster.Spec.Location, bastionFloatingIPName(owner)); err != nil {
+			return Result{}, err
+		}
 		created, createErr := r.API.CreateVM(ctx, cluster.Spec.Location, bastionRequest)
-		if createErr != nil {
-			return Result{}, createErr
+		secured, secureErr := r.secureCreatedVMResponse(ctx, cluster, bastionFirewall, created, bastionRequest, bastionFloatingIPName(owner), network.Subnet, cluster.Spec.Endpoint.VirtualIPv4, privatePool)
+		if secureErr != nil || createErr != nil {
+			return Result{}, errors.Join(createErr, secureErr)
 		}
-		if responseErr := validateCreatedVMResponse(created, bastionRequest, network.Subnet, cluster.Spec.Endpoint.VirtualIPv4, privatePool); responseErr != nil {
-			return Result{}, r.rollbackMalformedCreatedVM(ctx, cluster.Spec.Location, created, bastionRequest, responseErr)
-		}
-		bastion = created
-		return baseResult(nil, "created the private bastion; waiting for authoritative VM readback before protection"), nil
+		bastion = secured
+		return baseResult(nil, "created and firewalled the private bastion; waiting for authoritative VM readback"), nil
+	}
+	bastionFirewall, err = r.ensureManagedBastionFirewall(ctx, cluster, owner, bastionFirewall)
+	if err != nil {
+		return Result{}, err
+	}
+	protected, err := r.ensureVMProtection(ctx, cluster, bastionFirewall, bastion)
+	if err != nil {
+		return Result{}, err
+	}
+	if !protected {
+		return baseResult(nil, "waiting for bastion firewall assignment readback"), nil
 	}
 	if !isVMReady(bastion) {
 		return baseResult(nil, "waiting for bastion private networking"), nil
@@ -283,27 +317,20 @@ func (r *Reconciler) Reconcile(ctx context.Context, cluster *v1alpha1.InSpaceClu
 	if err := validateVMPrivateIPv4(bastion, network.Subnet, cluster.Spec.Endpoint.VirtualIPv4, privatePool); err != nil {
 		return Result{}, err
 	}
-	protected, err := r.ensureVMProtection(ctx, cluster, bastionFirewall, bastionIP, bastion)
+	bastionIP, ready, err := r.ensureOwnedAutoFloatingIP(ctx, cluster, bastionFloatingIPName(owner), bastion, floatingByName[bastionFloatingIPName(owner)])
 	if err != nil {
 		return Result{}, err
 	}
-	if !protected {
-		return baseResult(nil, "waiting for bastion firewall or floating IP assignment readback"), nil
+	if !ready {
+		return baseResult(nil, "waiting for the bastion auto floating IP assignment"), nil
 	}
-
 	controlled := make([]*inspace.VM, ControlPlaneReplicas)
-	floatingIPs := make([]*inspace.FloatingIP, ControlPlaneReplicas)
 	desiredRequests := make([]inspace.CreateVMRequest, ControlPlaneReplicas)
 	for slot := 0; slot < ControlPlaneReplicas; slot++ {
 		name := controlPlaneName(cluster.Metadata.Name, slot)
 		vm := byName[name]
-		floatingIP, ipErr := r.ensureOwnedFloatingIP(ctx, cluster, nodeFloatingIPName(owner, slot), vm, floatingByName[nodeFloatingIPName(owner, slot)])
-		if ipErr != nil {
-			return Result{}, ipErr
-		}
-		floatingIPs[slot] = floatingIP
 		controlled[slot] = vm
-		desired, desiredErr := r.desiredControlPlaneVMRequest(cluster, network, owner, slot, floatingIP.Address, cluster.Spec.Endpoint.VirtualIPv4, rke2Token)
+		desired, desiredErr := r.desiredControlPlaneVMRequest(cluster, network, owner, slot, cluster.Spec.Endpoint.VirtualIPv4, rke2Token)
 		if desiredErr != nil {
 			return Result{}, desiredErr
 		}
@@ -316,25 +343,45 @@ func (r *Reconciler) Reconcile(ctx context.Context, cluster *v1alpha1.InSpaceClu
 	}
 	outcomes := make([]createOutcome, ControlPlaneReplicas)
 	missing := 0
+	for slot := 0; slot < ControlPlaneReplicas; slot++ {
+		if controlled[slot] == nil {
+			missing++
+		}
+	}
+	if missing != 0 {
+		nodeFirewall, err = r.ensureManagedNodeFirewall(ctx, cluster, network, owner, nodeFirewall)
+		if err != nil {
+			return Result{}, err
+		}
+		missingFloatingIPNames := make([]string, 0, missing)
+		for slot := 0; slot < ControlPlaneReplicas; slot++ {
+			if controlled[slot] == nil {
+				missingFloatingIPNames = append(missingFloatingIPNames, nodeFloatingIPName(owner, slot))
+			}
+		}
+		if err := r.rejectResidualFloatingIPNames(ctx, cluster.Spec.Location, missingFloatingIPNames...); err != nil {
+			return Result{}, err
+		}
+	}
 	var creates sync.WaitGroup
 	for slot := 0; slot < ControlPlaneReplicas; slot++ {
 		if controlled[slot] != nil {
 			continue
 		}
-		missing++
 		creates.Add(1)
 		go func(slot int) {
 			defer creates.Done()
+			if collisionErr := r.rejectResidualFloatingIPNames(ctx, cluster.Spec.Location, nodeFloatingIPName(owner, slot)); collisionErr != nil {
+				outcomes[slot].err = collisionErr
+				return
+			}
 			created, createErr := r.API.CreateVM(ctx, cluster.Spec.Location, desiredRequests[slot])
-			if createErr != nil {
-				outcomes[slot].err = createErr
+			secured, secureErr := r.secureCreatedVMResponse(ctx, cluster, nodeFirewall, created, desiredRequests[slot], nodeFloatingIPName(owner, slot), network.Subnet, cluster.Spec.Endpoint.VirtualIPv4, privatePool)
+			if secureErr != nil || createErr != nil {
+				outcomes[slot].err = errors.Join(createErr, secureErr)
 				return
 			}
-			if responseErr := validateCreatedVMResponse(created, desiredRequests[slot], network.Subnet, cluster.Spec.Endpoint.VirtualIPv4, privatePool); responseErr != nil {
-				outcomes[slot].err = r.rollbackMalformedCreatedVM(ctx, cluster.Spec.Location, created, desiredRequests[slot], responseErr)
-				return
-			}
-			outcomes[slot].vm = created
+			outcomes[slot].vm = secured
 		}(slot)
 	}
 	creates.Wait()
@@ -348,11 +395,26 @@ func (r *Reconciler) Reconcile(ctx context.Context, cluster *v1alpha1.InSpaceClu
 				createErrs = append(createErrs, fmt.Errorf("bootstrap: control-plane slot %d: %w", slot, outcomes[slot].err))
 			}
 		}
-		result := baseResult(controlled, "created missing private RKE2 control-plane VMs in parallel; waiting for authoritative VM readback before protection")
+		result := baseResult(controlled, "created and firewalled missing private RKE2 control-plane VMs in parallel; waiting for authoritative VM readback")
 		if len(createErrs) != 0 {
 			return result, errors.Join(createErrs...)
 		}
 		return result, nil
+	}
+	nodeFirewall, err = r.ensureManagedNodeFirewall(ctx, cluster, network, owner, nodeFirewall)
+	if err != nil {
+		return Result{}, err
+	}
+	allProtected := true
+	for slot := 0; slot < ControlPlaneReplicas; slot++ {
+		protected, protectErr := r.ensureVMProtection(ctx, cluster, nodeFirewall, controlled[slot])
+		if protectErr != nil {
+			return Result{}, protectErr
+		}
+		allProtected = allProtected && protected
+	}
+	if !allProtected {
+		return baseResult(controlled, "waiting for control-plane firewall assignment readback"), nil
 	}
 
 	for slot := 0; slot < ControlPlaneReplicas; slot++ {
@@ -370,12 +432,12 @@ func (r *Reconciler) Reconcile(ctx context.Context, cluster *v1alpha1.InSpaceClu
 		if err := validateVMPrivateIPv4(vm, network.Subnet, cluster.Spec.Endpoint.VirtualIPv4, privatePool); err != nil {
 			return Result{}, err
 		}
-		protected, err := r.ensureVMProtection(ctx, cluster, nodeFirewall, floatingIPs[slot], vm)
+		_, ready, err := r.ensureOwnedAutoFloatingIP(ctx, cluster, nodeFloatingIPName(owner, slot), vm, floatingByName[nodeFloatingIPName(owner, slot)])
 		if err != nil {
 			return Result{}, err
 		}
-		if !protected {
-			result := baseResult(controlled, "waiting for firewall or floating IP assignment readback")
+		if !ready {
+			result := baseResult(controlled, "waiting for control-plane auto floating IP assignments")
 			return result, nil
 		}
 	}
@@ -422,7 +484,7 @@ func (r *Reconciler) Destroy(ctx context.Context, cluster *v1alpha1.InSpaceClust
 	if err != nil {
 		return result, err
 	}
-	ownedVMs, controlPlaneNames, err := uniqueDestroyVMs(vms, owner, cluster.Metadata.Name)
+	ownedVMs, controlPlaneNames, bastionVMName, err := uniqueDestroyVMs(vms, owner, cluster.Metadata.Name)
 	if err != nil {
 		return result, err
 	}
@@ -435,19 +497,20 @@ func (r *Reconciler) Destroy(ctx context.Context, cluster *v1alpha1.InSpaceClust
 		result.Message = fmt.Sprintf("waiting for stale VM list entry %q to disappear after authoritative detail was not found", pendingVMDetail)
 		return result, nil
 	}
-	if err := validateDestroyVMOwnership(ownedVMs, owner, controlPlaneNames); err != nil {
+	if err := validateDestroyVMOwnership(ownedVMs, owner, cluster.Metadata.Name, bastionVMName, controlPlaneNames); err != nil {
 		return result, err
 	}
 	floatingIPSnapshot, err := r.API.ListFloatingIPs(ctx, cluster.Spec.Location, nil)
 	if err != nil {
 		return result, err
 	}
-	floatingByName, err := validateOwnedFloatingIPsForControlPlanes(floatingIPSnapshot, cluster, owner, ownedVMs, controlPlaneNames)
+	floatingByName, err := validateOwnedFloatingIPsForControlPlanes(floatingIPSnapshot, cluster, owner, ownedVMs, bastionVMName, controlPlaneNames)
 	if err != nil {
 		return result, err
 	}
-	floatingNames := []string{bastionFloatingIPName(owner)}
-	floatingVMByName := map[string]*inspace.VM{bastionFloatingIPName(owner): ownedVMs[bastionName(owner)]}
+	bastionIPName := bastionFloatingIPName(owner)
+	floatingNames := []string{bastionIPName}
+	floatingVMByName := map[string]*inspace.VM{bastionIPName: ownedVMs[bastionVMName]}
 	for slot := 0; slot < ControlPlaneReplicas; slot++ {
 		name := nodeFloatingIPName(owner, slot)
 		floatingNames = append(floatingNames, name)
@@ -482,7 +545,7 @@ func (r *Reconciler) Destroy(ctx context.Context, cluster *v1alpha1.InSpaceClust
 		return result, err
 	}
 	nodeAllowed := controlPlaneUUIDSet(ownedVMs, controlPlaneNames)
-	bastionAllowed := bastionUUIDSet(ownedVMs, owner)
+	bastionAllowed := bastionUUIDSet(ownedVMs, bastionVMName)
 	for _, deletion := range pendingDeletions {
 		switch {
 		case nodeFirewall != nil && deletion.FirewallUUID == nodeFirewall.UUID:
@@ -499,10 +562,10 @@ func (r *Reconciler) Destroy(ctx context.Context, cluster *v1alpha1.InSpaceClust
 	if err := validateOwnedFirewallAssignments(bastionFirewall, bastionAllowed); err != nil {
 		return result, fmt.Errorf("bootstrap: refusing bastion firewall assignment drift: %w", err)
 	}
-	if err := validateReverseFirewallAssignments(firewalls, nodeFirewall, bastionFirewall, ownedVMs, owner, controlPlaneNames); err != nil {
+	if err := validateReverseFirewallAssignments(firewalls, nodeFirewall, bastionFirewall, ownedVMs, bastionVMName, controlPlaneNames); err != nil {
 		return result, err
 	}
-	vmNames := []string{bastionName(owner)}
+	vmNames := []string{bastionVMName}
 	for slot := 0; slot < ControlPlaneReplicas; slot++ {
 		vmNames = append(vmNames, controlPlaneNames[slot])
 	}
@@ -523,24 +586,41 @@ func (r *Reconciler) Destroy(ctx context.Context, cluster *v1alpha1.InSpaceClust
 		if item == nil {
 			continue
 		}
+		if item.Name == "" {
+			_, ready, renameErr := r.ensureOwnedAutoFloatingIP(ctx, cluster, name, floatingVMByName[name], item)
+			if renameErr != nil {
+				return result, renameErr
+			}
+			if !ready {
+				result.Message = "waiting to name " + name + " before cleanup"
+				return result, nil
+			}
+			result.Message = "named " + name + " before cleanup"
+			return result, nil
+		}
 		if item.AssignedTo != "" {
 			updated, unassignErr := r.API.UnassignFloatingIP(ctx, cluster.Spec.Location, item.Address)
-			if unassignErr != nil && !inspace.IsNotFound(unassignErr) {
-				return result, unassignErr
-			}
 			if unassignErr == nil {
-				if err := validateOwnedFloatingIP(updated, cluster, name, floatingVMByName[name]); err != nil {
+				if err := validateFloatingIPCleanupReadback(updated, cluster, name, item.Address); err != nil {
 					return result, err
 				}
-				if updated.AssignedTo != "" {
-					return result, fmt.Errorf("bootstrap: floating IP %q remained assigned after unassign", name)
+			} else if !inspace.IsNotFound(unassignErr) {
+				readback, readErr := r.findFloatingIPByAddress(ctx, cluster.Spec.Location, item.Address)
+				if readErr != nil || readback == nil {
+					return result, errors.Join(unassignErr, readErr)
+				}
+				if err := validateFloatingIPCleanupReadback(readback, cluster, name, item.Address); err != nil {
+					return result, errors.Join(unassignErr, err)
 				}
 			}
 			result.Message = "unassigned " + name
 			return result, nil
 		}
-		if err := r.API.DeleteFloatingIP(ctx, cluster.Spec.Location, item.Address); err != nil && !inspace.IsNotFound(err) {
-			return result, err
+		if deleteErr := r.API.DeleteFloatingIP(ctx, cluster.Spec.Location, item.Address); deleteErr != nil && !inspace.IsNotFound(deleteErr) {
+			readback, readErr := r.findFloatingIPByAddress(ctx, cluster.Spec.Location, item.Address)
+			if readErr != nil || readback != nil {
+				return result, errors.Join(deleteErr, readErr)
+			}
 		}
 		result.Message = "deleted " + name
 		return result, nil
@@ -552,7 +632,7 @@ func (r *Reconciler) Destroy(ctx context.Context, cluster *v1alpha1.InSpaceClust
 			continue
 		}
 		firewallUUID := ""
-		if name == bastionName(owner) {
+		if name == bastionVMName {
 			if bastionFirewall != nil {
 				firewallUUID = bastionFirewall.UUID
 			}
@@ -597,32 +677,69 @@ func (r *Reconciler) Destroy(ctx context.Context, cluster *v1alpha1.InSpaceClust
 // becoming deletion authority. Destroy cannot recompute the full spec hash
 // without the original RKE2 token, but it can require the versioned ownership
 // record written by this controller and an exact control-plane slot name.
-func validateDestroyVMOwnership(vms map[string]*inspace.VM, owner string, controlPlaneNames [ControlPlaneReplicas]string) error {
+func validateDestroyVMOwnership(vms map[string]*inspace.VM, owner, clusterName, bastionVMName string, controlPlaneNames [ControlPlaneReplicas]string) error {
+	hasControlPlaneV2 := false
+	hasControlPlaneV3 := false
 	for name, vm := range vms {
 		if vm == nil || !vmUUIDPattern.MatchString(vm.UUID) {
 			return fmt.Errorf("bootstrap: refusing to delete VM %q with an invalid UUID", name)
 		}
-		prefix := ""
-		if name == bastionName(owner) {
-			prefix = fmt.Sprintf("inspace-rke2-bastion/v1 owner=%s spec=", owner)
+		var prefixes []string
+		if name == bastionVMName {
+			if name == legacyBastionName(owner) {
+				prefixes = append(prefixes, fmt.Sprintf("inspace-rke2-bastion/v1 owner=%s spec=", owner))
+			} else {
+				prefixes = append(prefixes, fmt.Sprintf("inspace-rke2-bastion/v3 owner=%s spec=", owner))
+			}
 		}
 		slot := -1
 		for candidate := 0; candidate < ControlPlaneReplicas; candidate++ {
 			if name == controlPlaneNames[candidate] {
 				slot = candidate
-				prefix = fmt.Sprintf("inspace-rke2-cp/v2 owner=%s slot=%d spec=", owner, slot)
+				if name == controlPlaneName(clusterName, candidate) {
+					prefixes = append(prefixes, fmt.Sprintf("inspace-rke2-cp/v3 owner=%s slot=%d spec=", owner, slot))
+				}
+				prefixes = append(prefixes, fmt.Sprintf("inspace-rke2-cp/v2 owner=%s slot=%d spec=", owner, slot))
 				break
 			}
 		}
-		if prefix == "" {
+		if len(prefixes) == 0 {
 			return fmt.Errorf("bootstrap: refusing to delete VM %q outside the owned bastion/control-plane slots", name)
 		}
-		hash := strings.TrimPrefix(vm.Description, prefix)
-		if hash == vm.Description || len(hash) != sha256.Size*2 {
+		hash := ""
+		matchedPrefix := ""
+		for _, prefix := range prefixes {
+			candidate := strings.TrimPrefix(vm.Description, prefix)
+			if candidate != vm.Description {
+				hash = candidate
+				matchedPrefix = prefix
+				break
+			}
+		}
+		if len(hash) != sha256.Size*2 {
 			return fmt.Errorf("bootstrap: refusing to delete VM %q without the expected ownership record", name)
 		}
 		if _, err := hex.DecodeString(hash); err != nil {
 			return fmt.Errorf("bootstrap: refusing to delete VM %q with an invalid ownership hash", name)
+		}
+		if slot >= 0 {
+			hasControlPlaneV2 = hasControlPlaneV2 || strings.HasPrefix(matchedPrefix, "inspace-rke2-cp/v2 ")
+			hasControlPlaneV3 = hasControlPlaneV3 || strings.HasPrefix(matchedPrefix, "inspace-rke2-cp/v3 ")
+		}
+	}
+	if hasControlPlaneV2 && hasControlPlaneV3 {
+		return errors.New("bootstrap: refusing incoherent teardown ownership schema with mixed v2 and v3 control-plane records")
+	}
+	if vms[bastionVMName] != nil {
+		switch bastionVMName {
+		case currentBastionName(clusterName):
+			if hasControlPlaneV2 {
+				return errors.New("bootstrap: refusing incoherent teardown ownership schema: v3 bastion cannot authorize v2 control-plane deletion")
+			}
+		case legacyBastionName(owner):
+			if hasControlPlaneV3 {
+				return errors.New("bootstrap: refusing incoherent teardown ownership schema: v1 bastion cannot authorize v3 control-plane deletion")
+			}
 		}
 	}
 	return nil
@@ -676,6 +793,13 @@ func (r *Reconciler) currentTime() time.Time {
 		return r.now()
 	}
 	return time.Now()
+}
+
+func configuredDuration(value, fallback time.Duration) time.Duration {
+	if value > 0 {
+		return value
+	}
+	return fallback
 }
 
 // rememberPendingVMDeletion retains only the exact canonical VM and managed
@@ -767,9 +891,10 @@ func (r *Reconciler) activePendingVMDeletions(owner, location string, firewalls 
 }
 
 // validateCreatedVMResponse only trusts fields that the create response
-// actually supplied. Firewall and floating-IP attachment is deliberately
-// deferred until the next reconcile has validated the authoritative VM,
-// network, and ownership list readback.
+// actually supplied. Its exact UUID/name pair is enough to attach the already
+// validated managed firewall immediately; canonical ownership and machine
+// state are still required from authoritative readback before any later
+// adoption or floating-IP mutation.
 func validateCreatedVMResponse(vm *inspace.VM, desired inspace.CreateVMRequest, subnet, virtualIPv4 string, privatePool privateIPv4Range) error {
 	if vm == nil {
 		return errors.New("bootstrap: create VM returned an empty response")
@@ -820,12 +945,259 @@ func validateCreatedVMResponse(vm *inspace.VM, desired inspace.CreateVMRequest, 
 	return nil
 }
 
-func (r *Reconciler) rollbackMalformedCreatedVM(ctx context.Context, location string, vm *inspace.VM, desired inspace.CreateVMRequest, responseErr error) error {
-	if vm == nil || !vmUUIDPattern.MatchString(vm.UUID) || vm.Name != desired.Name || vm.Description != desired.Description {
+func (r *Reconciler) rollbackMalformedCreatedVM(ctx context.Context, cluster *v1alpha1.InSpaceCluster, vm *inspace.VM, desired inspace.CreateVMRequest, floatingIPName string, responseErr error) error {
+	if vm == nil || !vmUUIDPattern.MatchString(vm.UUID) || vm.Name != desired.Name {
 		return responseErr
 	}
-	rollbackErr := r.API.DeleteVM(ctx, location, vm.UUID)
-	return errors.Join(responseErr, rollbackErr)
+	cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), configuredDuration(r.createdVMFloatingIPCleanupTimeout, defaultCreatedVMFloatingIPCleanupTimeout))
+	cleanupErr := r.cleanupCreatedVMFloatingIP(cleanupCtx, cluster, vm, floatingIPName)
+	cleanupCancel()
+	deleteCtx, deleteCancel := context.WithTimeout(context.WithoutCancel(ctx), configuredDuration(r.createdVMDeleteTimeout, defaultCreatedVMDeleteTimeout))
+	rollbackErr := r.API.DeleteVM(deleteCtx, cluster.Spec.Location, vm.UUID)
+	deleteCancel()
+	return errors.Join(responseErr, cleanupErr, rollbackErr)
+}
+
+// secureCreatedVMResponse closes the public-exposure window opened by
+// ReservePublicIP before a create pass returns. A valid UUID from the just
+// issued POST authorizes restrictive firewall attachment even when other
+// response fields are sparse or contradictory. Destructive rollback remains
+// stricter: it requires the exact requested VM name or a canonical
+// name/ownership recovery.
+func (r *Reconciler) secureCreatedVMResponse(ctx context.Context, cluster *v1alpha1.InSpaceCluster, firewall *inspace.Firewall, vm *inspace.VM, desired inspace.CreateVMRequest, floatingIPName, subnet, virtualIPv4 string, privatePool privateIPv4Range) (*inspace.VM, error) {
+	responseErr := validateCreatedVMResponse(vm, desired, subnet, virtualIPv4, privatePool)
+	if vm == nil || !vmUUIDPattern.MatchString(vm.UUID) {
+		identity, discoveryErr := r.discoverCreatedVMIdentity(ctx, cluster, desired)
+		if discoveryErr != nil {
+			return nil, errors.Join(responseErr, fmt.Errorf("bootstrap: created VM protection is uncertain because the POST returned no usable UUID and exact-name discovery did not converge: %w", discoveryErr))
+		}
+		// The exact deterministic list identity is enough to install and prove the
+		// restrictive firewall. Do this before slower GetVM/GetNetwork ownership
+		// recovery so the VM is not left publicly exposed for that audit window.
+		if protectErr := r.protectReturnedVMUUID(ctx, cluster.Spec.Location, firewall, identity.UUID); protectErr != nil {
+			return nil, r.rollbackMalformedCreatedVM(ctx, cluster, identity, desired, floatingIPName, errors.Join(responseErr, protectErr))
+		}
+		canonical, recoveryErr := r.recoverCreatedVM(ctx, cluster, desired, identity.UUID, subnet, virtualIPv4, privatePool)
+		if recoveryErr != nil {
+			cause := errors.Join(responseErr, fmt.Errorf("bootstrap: canonical created VM recovery after firewall protection: %w", recoveryErr))
+			return nil, r.rollbackMalformedCreatedVM(ctx, cluster, identity, desired, floatingIPName, cause)
+		}
+		return canonical, nil
+	}
+
+	protectErr := r.protectReturnedVMUUID(ctx, cluster.Spec.Location, firewall, vm.UUID)
+	if protectErr != nil {
+		cause := errors.Join(responseErr, protectErr)
+		if vm.Name == desired.Name {
+			return nil, r.rollbackMalformedCreatedVM(ctx, cluster, vm, desired, floatingIPName, cause)
+		}
+		return nil, errors.Join(cause, fmt.Errorf("bootstrap: returned VM UUID %s could not be protected and its mismatched name forbids destructive rollback", vm.UUID))
+	}
+	if responseErr == nil {
+		return vm, nil
+	}
+
+	canonical, recoveryErr := r.recoverCreatedVM(ctx, cluster, desired, vm.UUID, subnet, virtualIPv4, privatePool)
+	if recoveryErr == nil {
+		return canonical, nil
+	}
+	cause := errors.Join(responseErr, fmt.Errorf("bootstrap: canonical created VM recovery: %w", recoveryErr))
+	if vm.Name == desired.Name {
+		return nil, r.rollbackMalformedCreatedVM(ctx, cluster, vm, desired, floatingIPName, cause)
+	}
+	return nil, errors.Join(cause, fmt.Errorf("bootstrap: returned VM UUID %s is firewalled but ownership remains uncertain", vm.UUID))
+}
+
+func (r *Reconciler) protectReturnedVMUUID(ctx context.Context, location string, firewall *inspace.Firewall, vmUUID string) error {
+	if firewall == nil || !vmUUIDPattern.MatchString(firewall.UUID) {
+		return errors.New("bootstrap: cannot protect a created VM without its validated managed firewall")
+	}
+	if !vmUUIDPattern.MatchString(vmUUID) {
+		return errors.New("bootstrap: cannot protect a created VM without its returned or recovered UUID")
+	}
+	assignCtx, assignCancel := context.WithTimeout(context.WithoutCancel(ctx), configuredDuration(r.protectionRequestTimeout, defaultProtectionRequestTimeout))
+	assignErr := r.API.AssignFirewallToVM(assignCtx, location, firewall.UUID, vmUUID)
+	assignCancel()
+	readbackErr := r.waitForExactFirewallAssignment(context.WithoutCancel(ctx), location, firewall, vmUUID)
+	if readbackErr == nil {
+		return nil
+	}
+	if assignErr == nil {
+		assignErr = errors.New("assignment call returned success without authoritative commit evidence")
+	}
+	return errors.Join(fmt.Errorf("bootstrap: assign managed firewall to newly created VM %s: %w", vmUUID, assignErr), readbackErr)
+}
+
+// discoverCreatedVMIdentity obtains the minimum authoritative identity needed
+// to protect a create whose response omitted a usable UUID. Only one exact
+// deterministic-name row is acceptable; malformed or duplicate exact rows are
+// ambiguity, not a reason to issue a second create.
+func (r *Reconciler) discoverCreatedVMIdentity(ctx context.Context, cluster *v1alpha1.InSpaceCluster, desired inspace.CreateVMRequest) (*inspace.VM, error) {
+	recoveryCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), configuredDuration(r.createdVMRecoveryTimeout, defaultCreatedVMRecoveryTimeout))
+	defer cancel()
+	requestTimeout := configuredDuration(r.protectionRequestTimeout, defaultProtectionRequestTimeout)
+	delay := configuredDuration(r.protectionReadbackMinInterval, defaultProtectionReadbackMinInterval)
+	maxDelay := configuredDuration(r.protectionReadbackMaxInterval, defaultProtectionReadbackMaxInterval)
+	if maxDelay < delay {
+		maxDelay = delay
+	}
+	var lastErr error
+	for {
+		requestCtx, requestCancel := context.WithTimeout(recoveryCtx, requestTimeout)
+		items, err := r.API.ListVMs(requestCtx, cluster.Spec.Location)
+		requestCancel()
+		if err != nil {
+			lastErr = fmt.Errorf("list VMs during create recovery: %w", err)
+		} else {
+			var candidate *inspace.VM
+			for i := range items {
+				if items[i].Name != desired.Name {
+					continue
+				}
+				if candidate != nil {
+					return nil, fmt.Errorf("multiple VMs named %q appeared during create recovery", desired.Name)
+				}
+				copy := items[i]
+				candidate = &copy
+			}
+			if candidate == nil {
+				lastErr = fmt.Errorf("VM %q is not yet visible during create recovery", desired.Name)
+			} else if !vmUUIDPattern.MatchString(candidate.UUID) {
+				return nil, fmt.Errorf("VM %q has an invalid UUID during create recovery", desired.Name)
+			} else {
+				return &inspace.VM{UUID: candidate.UUID, Name: desired.Name}, nil
+			}
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-recoveryCtx.Done():
+			timer.Stop()
+			return nil, errors.Join(lastErr, recoveryCtx.Err())
+		case <-timer.C:
+		}
+		if delay < maxDelay {
+			delay *= 2
+			if delay > maxDelay {
+				delay = maxDelay
+			}
+		}
+	}
+}
+
+func (r *Reconciler) recoverCreatedVM(ctx context.Context, cluster *v1alpha1.InSpaceCluster, desired inspace.CreateVMRequest, returnedUUID, subnet, virtualIPv4 string, privatePool privateIPv4Range) (*inspace.VM, error) {
+	recoveryCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), configuredDuration(r.createdVMRecoveryTimeout, defaultCreatedVMRecoveryTimeout))
+	defer cancel()
+	requestTimeout := configuredDuration(r.protectionRequestTimeout, defaultProtectionRequestTimeout)
+	delay := configuredDuration(r.protectionReadbackMinInterval, defaultProtectionReadbackMinInterval)
+	maxDelay := configuredDuration(r.protectionReadbackMaxInterval, defaultProtectionReadbackMaxInterval)
+	if maxDelay < delay {
+		maxDelay = delay
+	}
+	var lastErr error
+	for {
+		requestCtx, requestCancel := context.WithTimeout(recoveryCtx, requestTimeout)
+		detail, detailErr := r.API.GetVM(requestCtx, cluster.Spec.Location, returnedUUID)
+		requestCancel()
+		if detailErr != nil || detail == nil {
+			lastErr = errors.Join(fmt.Errorf("get VM %q during create recovery", desired.Name), detailErr)
+		} else {
+			requestCtx, requestCancel = context.WithTimeout(recoveryCtx, requestTimeout)
+			network, networkErr := r.API.GetNetwork(requestCtx, cluster.Spec.Location, desired.NetworkUUID)
+			requestCancel()
+			if networkErr != nil || network == nil {
+				lastErr = errors.Join(errors.New("get VPC during create recovery"), networkErr)
+			} else if validationErr := validateOwnedVM(detail, desired, network); validationErr != nil {
+				lastErr = validationErr
+			} else if detail.PrivateIPv4 != "" {
+				if validationErr := validateVMPrivateIPv4(detail, subnet, virtualIPv4, privatePool); validationErr != nil {
+					lastErr = validationErr
+				} else {
+					return detail, nil
+				}
+			} else {
+				return detail, nil
+			}
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-recoveryCtx.Done():
+			timer.Stop()
+			return nil, errors.Join(lastErr, recoveryCtx.Err())
+		case <-timer.C:
+		}
+		if delay < maxDelay {
+			delay *= 2
+			if delay > maxDelay {
+				delay = maxDelay
+			}
+		}
+	}
+}
+
+func (r *Reconciler) cleanupCreatedVMFloatingIP(ctx context.Context, cluster *v1alpha1.InSpaceCluster, vm *inspace.VM, expectedName string) error {
+	items, err := r.API.ListFloatingIPs(ctx, cluster.Spec.Location, nil)
+	if err != nil {
+		return err
+	}
+	var found *inspace.FloatingIP
+	validationVM := *vm
+	validationVM.PrivateIPv4 = ""
+	for i := range items {
+		item := &items[i]
+		if item.IsDeleted || item.AssignedTo != vm.UUID && item.Name != expectedName {
+			continue
+		}
+		if found != nil {
+			return fmt.Errorf("bootstrap: refusing rollback for VM %q with multiple floating IPs", vm.Name)
+		}
+		if item.Name != "" && item.Name != expectedName {
+			return fmt.Errorf("bootstrap: refusing rollback for VM %q with foreign floating IP name %q", vm.Name, item.Name)
+		}
+		if item.Name == "" {
+			if err := validateAutoAssignedFloatingIP(item, cluster, &validationVM); err != nil {
+				return err
+			}
+		} else if err := validateOwnedFloatingIP(item, cluster, expectedName, &validationVM); err != nil {
+			return err
+		}
+		found = item
+	}
+	if found == nil {
+		return fmt.Errorf("bootstrap: waiting for VM %q auto floating IP before rollback", vm.Name)
+	}
+	if found.Name == "" {
+		renamed, ready, renameErr := r.ensureOwnedAutoFloatingIP(ctx, cluster, expectedName, &validationVM, found)
+		if renameErr != nil {
+			return renameErr
+		}
+		if !ready || renamed == nil {
+			return fmt.Errorf("bootstrap: waiting to name VM %q auto floating IP before rollback", vm.Name)
+		}
+		found = renamed
+	}
+	if found.AssignedTo != "" {
+		updated, unassignErr := r.API.UnassignFloatingIP(ctx, cluster.Spec.Location, found.Address)
+		if unassignErr == nil {
+			if err := validateFloatingIPCleanupReadback(updated, cluster, expectedName, found.Address); err != nil {
+				return err
+			}
+		} else {
+			readback, readErr := r.findFloatingIPByAddress(ctx, cluster.Spec.Location, found.Address)
+			if readErr != nil || readback == nil {
+				return errors.Join(unassignErr, readErr)
+			}
+			if err := validateFloatingIPCleanupReadback(readback, cluster, expectedName, found.Address); err != nil {
+				return errors.Join(unassignErr, err)
+			}
+		}
+	}
+	if deleteErr := r.API.DeleteFloatingIP(ctx, cluster.Spec.Location, found.Address); deleteErr != nil && !inspace.IsNotFound(deleteErr) {
+		readback, readErr := r.findFloatingIPByAddress(ctx, cluster.Spec.Location, found.Address)
+		if readErr != nil || readback != nil {
+			return errors.Join(deleteErr, readErr)
+		}
+	}
+	return nil
 }
 
 func (r *Reconciler) ensureManagedNodeFirewall(ctx context.Context, cluster *v1alpha1.InSpaceCluster, network *inspace.Network, owner string, found *inspace.Firewall) (*inspace.Firewall, error) {
@@ -954,63 +1326,168 @@ func validateManagedBastionFirewall(firewall *inspace.Firewall, cluster *v1alpha
 	return nil
 }
 
-func (r *Reconciler) ensureOwnedFloatingIP(ctx context.Context, cluster *v1alpha1.InSpaceCluster, name string, vm *inspace.VM, item *inspace.FloatingIP) (*inspace.FloatingIP, error) {
-	var err error
+func (r *Reconciler) ensureOwnedAutoFloatingIP(ctx context.Context, cluster *v1alpha1.InSpaceCluster, name string, vm *inspace.VM, item *inspace.FloatingIP) (*inspace.FloatingIP, bool, error) {
+	if vm == nil {
+		return nil, false, errors.New("bootstrap: cannot discover an auto floating IP without its owned VM")
+	}
 	if item == nil {
-		item, err = r.API.CreateFloatingIP(ctx, cluster.Spec.Location, inspace.CreateFloatingIPRequest{Name: name, BillingAccountID: cluster.Spec.BillingAccountID})
-		if err != nil {
-			return nil, err
+		return nil, false, nil
+	}
+	if item.Name == name {
+		if err := validateOwnedFloatingIP(item, cluster, name, vm); err != nil {
+			return nil, false, err
+		}
+		if item.AssignedTo != vm.UUID {
+			return nil, false, fmt.Errorf("bootstrap: floating IP %q is not assigned to owned VM %q", name, vm.Name)
+		}
+		return item, true, nil
+	}
+	if err := validateAutoAssignedFloatingIP(item, cluster, vm); err != nil {
+		return nil, false, err
+	}
+	updated, updateErr := r.API.UpdateFloatingIP(ctx, cluster.Spec.Location, item.Address, inspace.UpdateFloatingIPRequest{
+		Name: name, BillingAccountID: cluster.Spec.BillingAccountID,
+	})
+	if updateErr == nil {
+		if err := validateOwnedFloatingIP(updated, cluster, name, vm); err != nil {
+			return nil, false, fmt.Errorf("bootstrap: update floating IP %q response: %w", name, err)
 		}
 	}
-	if err := validateOwnedFloatingIP(item, cluster, name, vm); err != nil {
-		return nil, err
+	readback, readErr := r.findFloatingIP(ctx, cluster, name, vm, item.Address)
+	if readErr != nil || readback == nil {
+		return nil, false, errors.Join(updateErr, readErr, fmt.Errorf("bootstrap: floating IP %q update did not converge", name))
 	}
-	return item, nil
+	return readback, true, nil
 }
 
-func (r *Reconciler) ensureVMProtection(ctx context.Context, cluster *v1alpha1.InSpaceCluster, firewall *inspace.Firewall, floatingIP *inspace.FloatingIP, vm *inspace.VM) (bool, error) {
+func (r *Reconciler) ensureVMProtection(ctx context.Context, cluster *v1alpha1.InSpaceCluster, firewall *inspace.Firewall, vm *inspace.VM) (bool, error) {
 	if !firewallHasVM(firewall, vm.UUID) {
-		if err := r.API.AssignFirewallToVM(ctx, cluster.Spec.Location, firewall.UUID, vm.UUID); err != nil {
-			if !r.firewallAssignmentVisible(ctx, cluster.Spec.Location, firewall.UUID, vm.UUID) {
-				return false, fmt.Errorf("bootstrap: assign firewall: %w", err)
+		requestCtx, cancel := context.WithTimeout(ctx, configuredDuration(r.protectionRequestTimeout, defaultProtectionRequestTimeout))
+		assignErr := r.API.AssignFirewallToVM(requestCtx, cluster.Spec.Location, firewall.UUID, vm.UUID)
+		cancel()
+		if readbackErr := r.waitForExactFirewallAssignment(ctx, cluster.Spec.Location, firewall, vm.UUID); readbackErr != nil {
+			if assignErr == nil {
+				assignErr = errors.New("assignment call returned success without authoritative commit evidence")
 			}
+			return false, errors.Join(fmt.Errorf("bootstrap: assign firewall: %w", assignErr), readbackErr)
 		}
-		return false, nil
-	}
-	if floatingIP.AssignedTo == "" {
-		assigned, err := r.API.AssignFloatingIP(ctx, cluster.Spec.Location, floatingIP.Address, vm.UUID, "virtual_machine")
-		if err == nil {
-			if validateErr := validateOwnedFloatingIP(assigned, cluster, floatingIP.Name, vm); validateErr != nil {
-				return false, validateErr
-			}
-			return false, nil
-		}
-		readback, readErr := r.findFloatingIP(ctx, cluster, floatingIP.Name, vm)
-		if readErr != nil || readback == nil || readback.AssignedTo != vm.UUID {
-			return false, errors.Join(err, readErr)
-		}
-		return false, nil
+		return true, nil
 	}
 	return true, nil
 }
 
-func (r *Reconciler) firewallAssignmentVisible(ctx context.Context, location, firewallUUID, vmUUID string) bool {
-	items, err := r.API.ListFirewalls(ctx, location)
-	if err != nil {
-		return false
+func (r *Reconciler) waitForExactFirewallAssignment(ctx context.Context, location string, expectedFirewall *inspace.Firewall, vmUUID string) error {
+	if expectedFirewall == nil || !vmUUIDPattern.MatchString(expectedFirewall.UUID) || !vmUUIDPattern.MatchString(vmUUID) {
+		return errors.New("bootstrap: exact firewall assignment readback requires valid firewall and VM UUIDs")
 	}
-	for i := range items {
-		if items[i].UUID == firewallUUID {
-			return firewallHasVM(&items[i], vmUUID)
+	auditCtx, cancel := context.WithTimeout(ctx, configuredDuration(r.protectionAuditTimeout, defaultProtectionAuditTimeout))
+	defer cancel()
+	requestTimeout := configuredDuration(r.protectionRequestTimeout, defaultProtectionRequestTimeout)
+	delay := configuredDuration(r.protectionReadbackMinInterval, defaultProtectionReadbackMinInterval)
+	maxDelay := configuredDuration(r.protectionReadbackMaxInterval, defaultProtectionReadbackMaxInterval)
+	if maxDelay < delay {
+		maxDelay = delay
+	}
+	var lastErr error
+	for {
+		requestCtx, requestCancel := context.WithTimeout(auditCtx, requestTimeout)
+		items, err := r.API.ListFirewalls(requestCtx, location)
+		requestCancel()
+		if err != nil {
+			lastErr = fmt.Errorf("bootstrap: list firewalls for assignment readback: %w", err)
+		} else {
+			expectedRows := 0
+			assignmentRows := 0
+			for i := range items {
+				firewall := &items[i]
+				if firewall.UUID == expectedFirewall.UUID {
+					expectedRows++
+					if firewall.EffectiveName() != expectedFirewall.EffectiveName() || firewall.BillingAccountID != expectedFirewall.BillingAccountID {
+						return errors.New("bootstrap: managed firewall identity drifted during assignment readback")
+					}
+					if !sameFirewallPolicy(firewall.Rules, expectedFirewall.Rules) {
+						return errors.New("bootstrap: managed firewall policy drifted during assignment readback")
+					}
+				}
+				for _, resource := range firewall.ResourcesAssigned {
+					if resource.ResourceUUID != vmUUID {
+						continue
+					}
+					assignmentRows++
+					if resource.ResourceType != "vm" || firewall.UUID != expectedFirewall.UUID {
+						return fmt.Errorf("bootstrap: VM %s appeared on the wrong firewall or resource type during assignment readback", vmUUID)
+					}
+				}
+			}
+			if expectedRows > 1 {
+				return fmt.Errorf("bootstrap: expected one managed firewall row during assignment readback, got %d", expectedRows)
+			}
+			if expectedRows == 0 {
+				lastErr = errors.New("bootstrap: managed firewall row is not yet visible during assignment readback")
+			} else {
+				switch assignmentRows {
+				case 1:
+					return nil
+				case 0:
+					lastErr = fmt.Errorf("bootstrap: VM %s firewall assignment is not yet visible", vmUUID)
+				default:
+					return fmt.Errorf("bootstrap: VM %s has duplicate firewall assignments during readback", vmUUID)
+				}
+			}
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-auditCtx.Done():
+			timer.Stop()
+			return errors.Join(lastErr, auditCtx.Err())
+		case <-timer.C:
+		}
+		if delay < maxDelay {
+			delay *= 2
+			if delay > maxDelay {
+				delay = maxDelay
+			}
 		}
 	}
-	return false
 }
 
-func (r *Reconciler) desiredControlPlaneVMRequest(cluster *v1alpha1.InSpaceCluster, network *inspace.Network, owner string, slot int, externalIP, joinAddress, token string) (inspace.CreateVMRequest, error) {
+func sameFirewallPolicy(actual, expected []inspace.FirewallRule) bool {
+	if len(actual) != len(expected) {
+		return false
+	}
+	normalize := func(rules []inspace.FirewallRule) []string {
+		result := make([]string, 0, len(rules))
+		for _, rule := range rules {
+			endpoints := append([]string(nil), rule.EndpointSpec...)
+			sort.Strings(endpoints)
+			portStart, portEnd := "", ""
+			if rule.PortStart != nil {
+				portStart = fmt.Sprint(*rule.PortStart)
+			}
+			if rule.PortEnd != nil {
+				portEnd = fmt.Sprint(*rule.PortEnd)
+			}
+			result = append(result, strings.Join([]string{
+				rule.Protocol, rule.Direction, portStart, portEnd, rule.EndpointSpecType, strings.Join(endpoints, ","),
+			}, "\x00"))
+		}
+		sort.Strings(result)
+		return result
+	}
+	actualNormalized := normalize(actual)
+	expectedNormalized := normalize(expected)
+	for i := range actualNormalized {
+		if actualNormalized[i] != expectedNormalized[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func (r *Reconciler) desiredControlPlaneVMRequest(cluster *v1alpha1.InSpaceCluster, network *inspace.Network, owner string, slot int, joinAddress, token string) (inspace.CreateVMRequest, error) {
 	tlsNames := append([]string{cluster.Spec.Endpoint.VirtualIPv4}, cluster.Spec.RKE2.TLSSubjectAltNames...)
 	cloudInit, err := RenderCloudInitJSON(CloudInitInput{
-		NodeName: controlPlaneName(cluster.Metadata.Name, slot), NodeExternalIPv4: externalIP, PrivateSubnet: network.Subnet, VirtualIPv4: cluster.Spec.Endpoint.VirtualIPv4,
+		NodeName: controlPlaneName(cluster.Metadata.Name, slot), PrivateSubnet: network.Subnet, VirtualIPv4: cluster.Spec.Endpoint.VirtualIPv4,
 		RKE2Version: cluster.Spec.RKE2.Version, RKE2Token: token, Initialize: slot == 0, ServerAddress: joinAddress,
 		PodCIDR: cluster.Spec.Network.PodCIDR, ServiceCIDR: cluster.Spec.Network.ServiceCIDR,
 		PrivateLoadBalancerPoolStart: cluster.Spec.Network.PrivateLoadBalancerPool.Start,
@@ -1020,7 +1497,7 @@ func (r *Reconciler) desiredControlPlaneVMRequest(cluster *v1alpha1.InSpaceClust
 	if err != nil {
 		return inspace.CreateVMRequest{}, err
 	}
-	reserve := false
+	reserve := true
 	machine := cluster.Spec.ControlPlane.Machine
 	request := inspace.CreateVMRequest{
 		Name:   controlPlaneName(cluster.Metadata.Name, slot),
@@ -1037,18 +1514,19 @@ func (r *Reconciler) desiredControlPlaneVMRequest(cluster *v1alpha1.InSpaceClust
 		return inspace.CreateVMRequest{}, err
 	}
 	sum := sha256.Sum256(data)
-	request.Description = fmt.Sprintf("inspace-rke2-cp/v2 owner=%s slot=%d spec=%s", owner, slot, hex.EncodeToString(sum[:]))
+	request.Description = fmt.Sprintf("inspace-rke2-cp/v3 owner=%s slot=%d spec=%s", owner, slot, hex.EncodeToString(sum[:]))
 	return request, nil
 }
 
 func (r *Reconciler) desiredBastionVMRequest(cluster *v1alpha1.InSpaceCluster, owner string) (inspace.CreateVMRequest, error) {
-	cloudInit, err := RenderBastionCloudInitJSON()
+	name := currentBastionName(cluster.Metadata.Name)
+	cloudInit, err := RenderBastionCloudInitJSON(name)
 	if err != nil {
 		return inspace.CreateVMRequest{}, err
 	}
-	reserve := false
+	reserve := true
 	request := inspace.CreateVMRequest{
-		Name: bastionName(owner), OSName: "ubuntu", OSVersion: "24.04", DiskGiB: BastionRootDiskGiB,
+		Name: name, OSName: "ubuntu", OSVersion: "24.04", DiskGiB: BastionRootDiskGiB,
 		VCPU: BastionVCPU, MemoryMiB: BastionMemoryMiB, DesignatedPoolUUID: cluster.Spec.ControlPlane.Machine.HostPoolUUID,
 		BillingAccountID: cluster.Spec.BillingAccountID, NetworkUUID: cluster.Spec.Network.UUID,
 		Username: r.SSHUsername, PublicKey: r.SSHPublicKey, CloudInit: cloudInit, ReservePublicIP: &reserve,
@@ -1060,19 +1538,16 @@ func (r *Reconciler) desiredBastionVMRequest(cluster *v1alpha1.InSpaceCluster, o
 		return inspace.CreateVMRequest{}, err
 	}
 	sum := sha256.Sum256(data)
-	request.Description = fmt.Sprintf("inspace-rke2-bastion/v1 owner=%s spec=%s", owner, hex.EncodeToString(sum[:]))
+	request.Description = fmt.Sprintf("inspace-rke2-bastion/v3 owner=%s spec=%s", owner, hex.EncodeToString(sum[:]))
 	return request, nil
 }
 
-func (r *Reconciler) validateExistingVMs(cluster *v1alpha1.InSpaceCluster, network *inspace.Network, privatePool privateIPv4Range, owner string, byName map[string]*inspace.VM, floatingByName map[string]*inspace.FloatingIP, token string) error {
-	if bastion := byName[bastionName(owner)]; bastion != nil {
+func (r *Reconciler) validateExistingVMs(cluster *v1alpha1.InSpaceCluster, network *inspace.Network, privatePool privateIPv4Range, owner string, byName map[string]*inspace.VM, token string) error {
+	if bastion := byName[currentBastionName(cluster.Metadata.Name)]; bastion != nil {
 		if bastion.PrivateIPv4 != "" {
 			if err := validateVMPrivateIPv4(bastion, network.Subnet, cluster.Spec.Endpoint.VirtualIPv4, privatePool); err != nil {
 				return err
 			}
-		}
-		if floatingByName[bastionFloatingIPName(owner)] == nil {
-			return errors.New("bootstrap: refusing to adopt bastion without its deterministic floating IP")
 		}
 		desired, err := r.desiredBastionVMRequest(cluster, owner)
 		if err != nil {
@@ -1080,6 +1555,9 @@ func (r *Reconciler) validateExistingVMs(cluster *v1alpha1.InSpaceCluster, netwo
 		}
 		if err := validateOwnedVM(bastion, desired, network); err != nil {
 			return err
+		}
+		if bastion.Hostname != "" && bastion.Hostname != desired.Name {
+			return fmt.Errorf("bootstrap: refusing to adopt bastion VM %q whose authoritative hostname is %q", bastion.Name, bastion.Hostname)
 		}
 	}
 	for slot := 0; slot < ControlPlaneReplicas; slot++ {
@@ -1092,11 +1570,7 @@ func (r *Reconciler) validateExistingVMs(cluster *v1alpha1.InSpaceCluster, netwo
 				return err
 			}
 		}
-		floatingIP := floatingByName[nodeFloatingIPName(owner, slot)]
-		if floatingIP == nil {
-			return fmt.Errorf("bootstrap: refusing to adopt control-plane slot %d without its deterministic floating IP", slot)
-		}
-		desired, err := r.desiredControlPlaneVMRequest(cluster, network, owner, slot, floatingIP.Address, cluster.Spec.Endpoint.VirtualIPv4, token)
+		desired, err := r.desiredControlPlaneVMRequest(cluster, network, owner, slot, cluster.Spec.Endpoint.VirtualIPv4, token)
 		if err != nil {
 			return err
 		}
@@ -1111,17 +1585,37 @@ func (r *Reconciler) validateExistingVMs(cluster *v1alpha1.InSpaceCluster, netwo
 }
 
 func validateOwnedFloatingIPs(items []inspace.FloatingIP, cluster *v1alpha1.InSpaceCluster, owner string, ownedVMs map[string]*inspace.VM) (map[string]*inspace.FloatingIP, error) {
-	return validateOwnedFloatingIPsForControlPlanes(items, cluster, owner, ownedVMs, currentControlPlaneNames(cluster.Metadata.Name))
+	return validateOwnedFloatingIPsForControlPlanes(items, cluster, owner, ownedVMs, currentBastionName(cluster.Metadata.Name), currentControlPlaneNames(cluster.Metadata.Name))
 }
 
-func validateOwnedFloatingIPsForControlPlanes(items []inspace.FloatingIP, cluster *v1alpha1.InSpaceCluster, owner string, ownedVMs map[string]*inspace.VM, controlPlaneNames [ControlPlaneReplicas]string) (map[string]*inspace.FloatingIP, error) {
-	expected := map[string]*inspace.VM{bastionFloatingIPName(owner): ownedVMs[bastionName(owner)]}
-	ownedUUIDs := bastionUUIDSet(ownedVMs, owner)
-	for uuid := range controlPlaneUUIDSet(ownedVMs, controlPlaneNames) {
-		ownedUUIDs[uuid] = true
+func (r *Reconciler) rejectResidualFloatingIPNames(ctx context.Context, location string, names ...string) error {
+	wanted := make(map[string]bool, len(names))
+	for _, name := range names {
+		wanted[name] = true
 	}
+	items, err := r.API.ListFloatingIPs(ctx, location, nil)
+	if err != nil {
+		return fmt.Errorf("bootstrap: audit floating IP names immediately before VM create: %w", err)
+	}
+	for i := range items {
+		if items[i].IsDeleted || !wanted[items[i].Name] {
+			continue
+		}
+		return fmt.Errorf("bootstrap: refusing VM create while active residual floating IP %q already exists", items[i].Name)
+	}
+	return nil
+}
+
+func validateOwnedFloatingIPsForControlPlanes(items []inspace.FloatingIP, cluster *v1alpha1.InSpaceCluster, owner string, ownedVMs map[string]*inspace.VM, bastionVMName string, controlPlaneNames [ControlPlaneReplicas]string) (map[string]*inspace.FloatingIP, error) {
+	expected := map[string]*inspace.VM{bastionFloatingIPName(owner): ownedVMs[bastionVMName]}
 	for slot := 0; slot < ControlPlaneReplicas; slot++ {
 		expected[nodeFloatingIPName(owner, slot)] = ownedVMs[controlPlaneNames[slot]]
+	}
+	expectedByVMUUID := make(map[string]string, len(expected))
+	for name, vm := range expected {
+		if vm != nil && vm.UUID != "" {
+			expectedByVMUUID[vm.UUID] = name
+		}
 	}
 	result := make(map[string]*inspace.FloatingIP, len(expected))
 	for i := range items {
@@ -1130,19 +1624,31 @@ func validateOwnedFloatingIPsForControlPlanes(items []inspace.FloatingIP, cluste
 			continue
 		}
 		vm, isOwnedName := expected[item.Name]
-		if !isOwnedName {
-			if ownedUUIDs[item.AssignedTo] {
-				return nil, fmt.Errorf("bootstrap: unknown floating IP %s is assigned to an owned VM", item.Address)
-			}
+		expectedNameByAssignment, assignedToOwnedVM := expectedByVMUUID[item.AssignedTo]
+		if !isOwnedName && !assignedToOwnedVM {
 			continue
 		}
-		if result[item.Name] != nil {
-			return nil, fmt.Errorf("bootstrap: duplicate owned floating IP name %q", item.Name)
+		expectedName := item.Name
+		if !isOwnedName {
+			if item.Name != "" {
+				return nil, fmt.Errorf("bootstrap: floating IP %s with foreign name %q is assigned to owned VM %s", item.Address, item.Name, item.AssignedTo)
+			}
+			expectedName = expectedNameByAssignment
+			vm = expected[expectedName]
+		} else if assignedToOwnedVM && expectedNameByAssignment != expectedName {
+			return nil, fmt.Errorf("bootstrap: floating IP %q is assigned to the wrong owned VM", expectedName)
 		}
-		if err := validateOwnedFloatingIP(item, cluster, item.Name, vm); err != nil {
+		if result[expectedName] != nil {
+			return nil, fmt.Errorf("bootstrap: multiple floating IPs resolve to owned slot %q", expectedName)
+		}
+		if item.Name == "" {
+			if err := validateAutoAssignedFloatingIP(item, cluster, vm); err != nil {
+				return nil, err
+			}
+		} else if err := validateOwnedFloatingIP(item, cluster, expectedName, vm); err != nil {
 			return nil, err
 		}
-		result[item.Name] = item
+		result[expectedName] = item
 	}
 	return result, nil
 }
@@ -1161,7 +1667,7 @@ func validateOwnedFloatingIP(item *inspace.FloatingIP, cluster *v1alpha1.InSpace
 		return fmt.Errorf("bootstrap: floating IP %q must be enabled, active, non-virtual, and type public", expectedName)
 	}
 	address, err := netip.ParseAddr(item.Address)
-	if err != nil || !address.Is4() || !address.IsGlobalUnicast() || address.IsPrivate() {
+	if err != nil || !address.Is4() || !address.IsGlobalUnicast() || address.IsPrivate() || address.String() != item.Address {
 		return fmt.Errorf("bootstrap: floating IP %q has an invalid public IPv4", expectedName)
 	}
 	if item.AssignedTo == "" {
@@ -1173,8 +1679,26 @@ func validateOwnedFloatingIP(item *inspace.FloatingIP, cluster *v1alpha1.InSpace
 	if vm == nil || vm.UUID == "" || item.AssignedTo != vm.UUID || item.AssignedToResourceType != "virtual_machine" {
 		return fmt.Errorf("bootstrap: floating IP %q has an unexpected assignment", expectedName)
 	}
-	if vm.PrivateIPv4 != "" && item.AssignedToPrivateIP != "" && item.AssignedToPrivateIP != vm.PrivateIPv4 {
+	if vm.PrivateIPv4 != "" && item.AssignedToPrivateIP != vm.PrivateIPv4 {
 		return fmt.Errorf("bootstrap: floating IP %q assignment private IPv4 does not match VM %q", expectedName, vm.Name)
+	}
+	return nil
+}
+
+func validateAutoAssignedFloatingIP(item *inspace.FloatingIP, cluster *v1alpha1.InSpaceCluster, vm *inspace.VM) error {
+	if item == nil || vm == nil || vm.UUID == "" {
+		return errors.New("bootstrap: auto floating IP lacks an owned VM")
+	}
+	if item.Name != "" {
+		return fmt.Errorf("bootstrap: auto floating IP %s has unexpected name %q", item.Address, item.Name)
+	}
+	copy := *item
+	copy.Name = "auto"
+	if err := validateOwnedFloatingIP(&copy, cluster, "auto", vm); err != nil {
+		return fmt.Errorf("bootstrap: auto floating IP for VM %q: %w", vm.Name, err)
+	}
+	if item.AssignedTo == "" {
+		return fmt.Errorf("bootstrap: auto floating IP %s is not assigned to VM %q", item.Address, vm.Name)
 	}
 	return nil
 }
@@ -1221,27 +1745,75 @@ func validateOwnedVM(vm *inspace.VM, desired inspace.CreateVMRequest, network *i
 	return nil
 }
 
-func (r *Reconciler) findFloatingIP(ctx context.Context, cluster *v1alpha1.InSpaceCluster, name string, vm *inspace.VM) (*inspace.FloatingIP, error) {
+func (r *Reconciler) findFloatingIP(ctx context.Context, cluster *v1alpha1.InSpaceCluster, name string, vm *inspace.VM, address string) (*inspace.FloatingIP, error) {
 	items, err := r.API.ListFloatingIPs(ctx, cluster.Spec.Location, nil)
 	if err != nil {
 		return nil, err
 	}
 	var found *inspace.FloatingIP
 	for i := range items {
-		if items[i].Name != name || items[i].IsDeleted {
+		if items[i].IsDeleted || items[i].Name != name && items[i].AssignedTo != vm.UUID {
 			continue
 		}
+		if items[i].Name != name {
+			return nil, fmt.Errorf("bootstrap: foreign floating IP name %q remains assigned to VM %q after update", items[i].Name, vm.Name)
+		}
 		if found != nil {
-			return nil, fmt.Errorf("bootstrap: duplicate owned floating IP name %q", name)
+			return nil, fmt.Errorf("bootstrap: multiple floating IPs resolve to owned slot %q", name)
 		}
 		found = &items[i]
 	}
 	if found != nil {
+		if found.Address != address {
+			return nil, fmt.Errorf("bootstrap: floating IP %q update changed address from %s to %s", name, address, found.Address)
+		}
 		if err := validateOwnedFloatingIP(found, cluster, name, vm); err != nil {
 			return nil, err
 		}
+		if found.AssignedTo != vm.UUID {
+			return nil, fmt.Errorf("bootstrap: floating IP %q update lost its VM assignment", name)
+		}
 	}
 	return found, nil
+}
+
+func (r *Reconciler) findFloatingIPByAddress(ctx context.Context, location, address string) (*inspace.FloatingIP, error) {
+	items, err := r.API.ListFloatingIPs(ctx, location, nil)
+	if err != nil {
+		return nil, err
+	}
+	var found *inspace.FloatingIP
+	for i := range items {
+		if items[i].IsDeleted || items[i].Address != address {
+			continue
+		}
+		if found != nil {
+			return nil, fmt.Errorf("bootstrap: duplicate active floating IP address %s", address)
+		}
+		found = &items[i]
+	}
+	return found, nil
+}
+
+func validateFloatingIPCleanupReadback(item *inspace.FloatingIP, cluster *v1alpha1.InSpaceCluster, expectedName, expectedAddress string) error {
+	if item == nil {
+		return fmt.Errorf("bootstrap: floating IP %q cleanup returned an empty response", expectedName)
+	}
+	if item.Name != "" && item.Name != expectedName {
+		return fmt.Errorf("bootstrap: floating IP %q cleanup returned foreign name %q", expectedName, item.Name)
+	}
+	copy := *item
+	copy.Name = expectedName
+	if err := validateOwnedFloatingIP(&copy, cluster, expectedName, nil); err != nil {
+		return err
+	}
+	if item.Address != expectedAddress {
+		return fmt.Errorf("bootstrap: floating IP %q cleanup changed address from %s to %s", expectedName, expectedAddress, item.Address)
+	}
+	if item.AssignedTo != "" {
+		return fmt.Errorf("bootstrap: floating IP %q remained assigned after unassign", expectedName)
+	}
+	return nil
 }
 
 func managedFirewallRules(subnet, podCIDR, managementCIDR string, managementTCPPorts []int) []inspace.FirewallRule {
@@ -1324,13 +1896,13 @@ func validateOwnedFirewallAssignments(firewall *inspace.Firewall, allowed map[st
 // validateReverseFirewallAssignments audits every firewall, not only the two
 // deterministic managed objects. An owned VM must never be protected by a
 // second or foreign firewall because that policy could silently widen access.
-func validateReverseFirewallAssignments(firewalls []inspace.Firewall, nodeFirewall, bastionFirewall *inspace.Firewall, vms map[string]*inspace.VM, owner string, controlPlaneNames [ControlPlaneReplicas]string) error {
+func validateReverseFirewallAssignments(firewalls []inspace.Firewall, nodeFirewall, bastionFirewall *inspace.Firewall, vms map[string]*inspace.VM, bastionVMName string, controlPlaneNames [ControlPlaneReplicas]string) error {
 	type expectedAttachment struct {
 		firewallUUID string
 		role         string
 	}
 	expectedByVM := make(map[string]expectedAttachment, ControlPlaneReplicas+1)
-	if bastion := vms[bastionName(owner)]; bastion != nil && bastion.UUID != "" {
+	if bastion := vms[bastionVMName]; bastion != nil && bastion.UUID != "" {
 		expectedUUID := ""
 		if bastionFirewall != nil {
 			expectedUUID = bastionFirewall.UUID
@@ -1795,9 +2367,10 @@ func legacyControlPlaneNames(owner string) [ControlPlaneReplicas]string {
 	}
 	return names
 }
-func bastionName(owner string) string         { return "rke2-" + owner + "-bastion" }
-func firewallName(owner string) string        { return "rke2-" + owner + "-nodes" }
-func bastionFirewallName(owner string) string { return "rke2-" + owner + "-bastion" }
+func currentBastionName(clusterName string) string { return clusterName + "-bastion" }
+func legacyBastionName(owner string) string        { return "rke2-" + owner + "-bastion" }
+func firewallName(owner string) string             { return "rke2-" + owner + "-nodes" }
+func bastionFirewallName(owner string) string      { return "rke2-" + owner + "-bastion" }
 func bastionFloatingIPName(owner string) string {
 	return "rke2-" + owner + "-bastion-ip"
 }
@@ -1807,7 +2380,7 @@ func nodeFloatingIPName(owner string, slot int) string {
 
 func uniqueOwnedVMs(vms []inspace.VM, owner, clusterName string) (map[string]*inspace.VM, error) {
 	ownedPrefix := "rke2-" + owner + "-"
-	expected := map[string]bool{bastionName(owner): true}
+	expected := map[string]bool{currentBastionName(clusterName): true}
 	for slot := 0; slot < ControlPlaneReplicas; slot++ {
 		expected[controlPlaneName(clusterName, slot)] = true
 	}
@@ -1827,15 +2400,18 @@ func uniqueOwnedVMs(vms []inspace.VM, owner, clusterName string) (map[string]*in
 	return result, nil
 }
 
-// uniqueDestroyVMs recognizes either the current display-name topology or the
-// exact legacy owner-derived topology. A mixed graph is never deletion
-// authority: it can only be resolved by an explicit operator migration.
-func uniqueDestroyVMs(vms []inspace.VM, owner, clusterName string) (map[string]*inspace.VM, [ControlPlaneReplicas]string, error) {
+// uniqueDestroyVMs recognizes the current display-name topology, the RC4
+// owner-derived bastion with current control-plane names, and the fully legacy
+// owner-derived topology. A mixed graph is never deletion authority: it can
+// only be resolved by an explicit operator migration.
+func uniqueDestroyVMs(vms []inspace.VM, owner, clusterName string) (map[string]*inspace.VM, [ControlPlaneReplicas]string, string, error) {
 	ownedPrefix := "rke2-" + owner + "-"
 	currentNames := currentControlPlaneNames(clusterName)
 	legacyNames := legacyControlPlaneNames(owner)
-	expectedCurrent := map[string]bool{bastionName(owner): true}
-	expectedLegacy := map[string]bool{bastionName(owner): true}
+	currentBastion := currentBastionName(clusterName)
+	legacyBastion := legacyBastionName(owner)
+	expectedCurrent := map[string]bool{currentBastion: true}
+	expectedLegacy := map[string]bool{legacyBastion: true}
 	for slot := 0; slot < ControlPlaneReplicas; slot++ {
 		expectedCurrent[currentNames[slot]] = true
 		expectedLegacy[legacyNames[slot]] = true
@@ -1844,30 +2420,45 @@ func uniqueDestroyVMs(vms []inspace.VM, owner, clusterName string) (map[string]*
 	result := make(map[string]*inspace.VM, len(vms))
 	hasCurrent := false
 	hasLegacy := false
+	hasCurrentBastion := false
+	hasLegacyBastion := false
 	for i := range vms {
 		name := vms[i].Name
-		isCurrent := expectedCurrent[name] && name != bastionName(owner)
-		isLegacy := expectedLegacy[name] && name != bastionName(owner)
-		if !strings.HasPrefix(name, ownedPrefix) && !isCurrent {
+		isCurrentBastion := name == currentBastion
+		isLegacyBastion := name == legacyBastion
+		isCurrent := expectedCurrent[name] && !isCurrentBastion
+		isLegacy := expectedLegacy[name] && !isLegacyBastion
+		if !strings.HasPrefix(name, ownedPrefix) && !isCurrentBastion && !isCurrent {
 			continue
 		}
 		if _, exists := result[name]; exists {
-			return nil, currentNames, fmt.Errorf("bootstrap: duplicate VM name %q", name)
+			return nil, currentNames, currentBastion, fmt.Errorf("bootstrap: duplicate VM name %q", name)
 		}
-		if name != bastionName(owner) && !isCurrent && !isLegacy {
-			return nil, currentNames, fmt.Errorf("bootstrap: unexpected VM %q uses the cluster ownership prefix", name)
+		if !isCurrentBastion && !isLegacyBastion && !isCurrent && !isLegacy {
+			return nil, currentNames, currentBastion, fmt.Errorf("bootstrap: unexpected VM %q uses the cluster ownership prefix", name)
 		}
 		result[name] = &vms[i]
 		hasCurrent = hasCurrent || isCurrent
 		hasLegacy = hasLegacy || isLegacy
+		hasCurrentBastion = hasCurrentBastion || isCurrentBastion
+		hasLegacyBastion = hasLegacyBastion || isLegacyBastion
+	}
+	if hasCurrentBastion && hasLegacyBastion {
+		return nil, currentNames, currentBastion, errors.New("bootstrap: refusing both current and legacy bastion VMs")
 	}
 	if hasCurrent && hasLegacy {
-		return nil, currentNames, errors.New("bootstrap: refusing mixed current and legacy control-plane VM topology")
+		return nil, currentNames, currentBastion, errors.New("bootstrap: refusing mixed current and legacy control-plane VM topology")
 	}
 	if hasLegacy {
-		return result, legacyNames, nil
+		if hasCurrentBastion {
+			return nil, legacyNames, currentBastion, errors.New("bootstrap: refusing current bastion with legacy control-plane VM topology")
+		}
+		return result, legacyNames, legacyBastion, nil
 	}
-	return result, currentNames, nil
+	if hasLegacyBastion {
+		return result, currentNames, legacyBastion, nil
+	}
+	return result, currentNames, currentBastion, nil
 }
 
 func uniqueFirewallByName(items []inspace.Firewall, name string) (*inspace.Firewall, error) {
@@ -1903,9 +2494,9 @@ func controlPlaneUUIDSet(vms map[string]*inspace.VM, names [ControlPlaneReplicas
 	return result
 }
 
-func bastionUUIDSet(vms map[string]*inspace.VM, owner string) map[string]bool {
+func bastionUUIDSet(vms map[string]*inspace.VM, bastionVMName string) map[string]bool {
 	result := make(map[string]bool, 1)
-	if vm := vms[bastionName(owner)]; vm != nil {
+	if vm := vms[bastionVMName]; vm != nil {
 		result[vm.UUID] = true
 	}
 	return result

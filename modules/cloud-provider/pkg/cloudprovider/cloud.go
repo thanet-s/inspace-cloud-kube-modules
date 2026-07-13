@@ -80,6 +80,9 @@ func New(api API, config Config) (*Provider, error) {
 	if strings.TrimSpace(config.NetworkUUID) == "" {
 		return nil, errors.New("cloudprovider: network UUID is required")
 	}
+	if config.BillingAccountID < 1 {
+		return nil, errors.New("cloudprovider: billing account ID must be a positive integer")
+	}
 	if strings.TrimSpace(config.ClusterID) == "" {
 		return nil, errors.New("cloudprovider: cluster ID is required")
 	}
@@ -241,7 +244,9 @@ func instanceTypeForVM(vm *inspace.VM) string {
 		InstanceType string `json:"instanceType"`
 	}
 	if json.Unmarshal([]byte(vm.Description), &record) != nil ||
-		(record.Schema != "karpenter.inspace.cloud/v1" && record.Schema != "karpenter.inspace.cloud/v2") {
+		(record.Schema != "karpenter.inspace.cloud/v1" &&
+			record.Schema != "karpenter.inspace.cloud/v2" &&
+			record.Schema != "karpenter.inspace.cloud/v3") {
 		return fallback
 	}
 	if record.InstanceType == "" || len(utilvalidation.IsValidLabelValue(record.InstanceType)) != 0 {
@@ -255,23 +260,42 @@ func (p *Provider) externalIPv4ForVM(ctx context.Context, location string, vm *i
 	if err != nil {
 		return "", err
 	}
-	address := ""
-	for _, item := range items {
-		if item.IsDeleted || item.AssignedTo != vm.UUID || item.AssignedToResourceType != "virtual_machine" {
-			continue
-		}
-		if net.ParseIP(item.Address) == nil {
-			return "", fmt.Errorf("cloudprovider: floating IP %q is invalid", item.Address)
-		}
-		if address != "" && address != item.Address {
-			return "", fmt.Errorf("cloudprovider: VM %s has multiple assigned floating IPv4 addresses", vm.UUID)
-		}
-		address = item.Address
+	if len(items) == 0 {
+		// InSpace floating addresses are not guest-NIC addresses. Without an
+		// authoritative assignment row, vm.PublicIPv4 cannot prove ownership,
+		// billing account, or assignment state and must not be published.
+		return "", nil
 	}
-	if address != "" {
-		return address, nil
+	if len(items) != 1 {
+		return "", fmt.Errorf("cloudprovider: VM %s has %d floating IPv4 assignment rows; expected exactly one", vm.UUID, len(items))
 	}
-	return vm.PublicIPv4, nil
+	if err := p.validateVMFloatingIPv4(&items[0], vm); err != nil {
+		return "", err
+	}
+	return items[0].Address, nil
+}
+
+func (p *Provider) validateVMFloatingIPv4(item *inspace.FloatingIP, vm *inspace.VM) error {
+	if item == nil {
+		return errors.New("cloudprovider: VM floating IP returned an empty response")
+	}
+	if item.BillingAccountID != p.config.BillingAccountID {
+		return fmt.Errorf("cloudprovider: floating IP %q for VM %s belongs to billing account %d, expected %d", item.Address, vm.UUID, item.BillingAccountID, p.config.BillingAccountID)
+	}
+	if !item.Enabled || item.IsDeleted || item.IsVirtual || item.Type != "public" {
+		return fmt.Errorf("cloudprovider: floating IP %q for VM %s must be enabled, active, non-virtual, and type public", item.Address, vm.UUID)
+	}
+	address, err := netip.ParseAddr(item.Address)
+	if err != nil || !address.Is4() || !address.IsGlobalUnicast() || address.IsPrivate() || address.String() != item.Address {
+		return fmt.Errorf("cloudprovider: floating IP %q for VM %s must be one canonical global public IPv4 address", item.Address, vm.UUID)
+	}
+	if item.AssignedTo != vm.UUID || item.AssignedToResourceType != "virtual_machine" {
+		return fmt.Errorf("cloudprovider: floating IP %q is not assigned to the exact VM %s as resource type virtual_machine", item.Address, vm.UUID)
+	}
+	if vm.PrivateIPv4 != "" && item.AssignedToPrivateIP != vm.PrivateIPv4 {
+		return fmt.Errorf("cloudprovider: floating IP %q assignment private IPv4 %q does not match VM %s private IPv4 %q", item.Address, item.AssignedToPrivateIP, vm.UUID, vm.PrivateIPv4)
+	}
+	return nil
 }
 
 func (p *Provider) resolveVM(ctx context.Context, node *corev1.Node) (*inspace.VM, error) {

@@ -16,11 +16,13 @@ For local setup, verification, and live-test workflows, see the
 
 InSpace does not provide shared outbound NAT for private-only VMs. Every
 control-plane, Karpenter worker, and bastion VM therefore receives one floating
-public IPv4 for internet egress. A floating address is not configured on the
-guest NIC: RKE2 uses the NIC's RFC1918 address for node identity and cluster
-traffic, and separately sets `node-external-ip` to the allocated floating
-address. The external CCM reads that same assignment from the InSpace API and
-publishes it as `NodeExternalIP`; it never tries to discover it from the NIC.
+public IPv4 in the initial VM create request so internet egress is available to
+cloud-init from first boot. A floating address is not configured on the guest
+NIC: RKE2 uses the NIC's RFC1918 address for node identity and cluster traffic,
+and worker cloud-init does not set `node-external-ip`. The external CCM reads
+the floating-IP assignment from the InSpace API and publishes it as
+`NodeExternalIP`; it never tries to discover it from the NIC or from a VM
+`public_ipv4` field.
 
 Only the bastion accepts public ingress, restricted by the InSpace firewall to
 TCP/22 from the operator's exact `/32`. Control-plane and worker floating IPs
@@ -37,9 +39,14 @@ The fixed control-plane contract requires stock Ubuntu 24.04 with at least
 2 vCPU and 4 GiB RAM, matching the tested RKE2/Cilium platform floor.
 Its three VM names, guest hostnames, and Kubernetes Node names are exactly
 `<InSpaceCluster metadata.name>-cp0`, `-cp1`, and `-cp2`.
+The bastion VM and guest hostname are exactly
+`<InSpaceCluster metadata.name>-bastion`; its floating-IP and firewall names
+remain owner-derived cleanup identities. Cluster names are limited to 55
+characters so every fixed hostname remains a DNS label.
 Elastic worker VM names, guest hostnames, and Kubernetes Node names are exactly
-`<clusterName>-karp-<NodePool name>-<Karpenter random suffix>`; the separate
-NodeClaim identity remains the cloud ownership/deletion key.
+`<cluster>-karp-<NodePool>-<random>`. The provider derives the NodePool and
+random suffix from the Karpenter NodeClaim name; that NodeClaim identity remains
+the cloud ownership/deletion key.
 Control planes and elastic workers disable swap, rewrite stock Ubuntu archive
 endpoints to the Thailand mirror when present, and apply persistent Kubernetes
 sysctl and RKE2 systemd limits before their RKE2 service starts.
@@ -77,10 +84,20 @@ before cloud validation or worker provisioning.
 
 Every VM create request carries the configured VPC UUID. Karpenter additionally
 waits for the created VM UUID to appear exactly once in that network's
-authoritative `vm_uuids` read-back before assigning the firewall and floating
-IP. The full-cluster acceptance test also binds that UUID to the Kubernetes
-Node provider ID and verifies its sole `InternalIP` is inside the same VPC
-subnet.
+authoritative `vm_uuids` read-back. It creates a worker with
+`reserve_public_ip=true`; InSpace assigns one initially nameless Floating IP
+while the VM's `public_ipv4` remains empty, providing the egress required by
+cloud-init. Karpenter assigns the prevalidated cloud firewall immediately after
+the VM POST and proves its exact policy and sole assignment before waiting for
+the remaining VM state. It then discovers the exact sole Floating-IP assignment
+by VM UUID, validates it, patches its deterministic name and billing account,
+and requires exact read-back.
+New v3 ownership records persist the deterministic Floating-IP name but omit
+`publicIPv4`; the live assignment remains authoritative. Worker deletion
+removes that Floating IP before deleting the VM. The full-cluster acceptance
+test also binds the VM UUID to the Kubernetes Node provider ID, verifies its
+sole `InternalIP` is inside the same VPC subnet, and requires the CCM-published
+`ExternalIP` to equal the assigned Floating IP.
 
 ## Helm and releases
 
@@ -102,7 +119,9 @@ helm upgrade --install inspace-cloud-kube-modules \
 ```
 
 The workload chart references one existing InSpace API Secret contract,
-`inspace-cloud-credentials` with keys `api-token` and `billing-account-id`.
+`inspace-cloud-credentials` with keys `api-token` and `billing-account-id`;
+`billing-account-id` must contain a positive decimal integer or the CCM fails
+at startup before publishing node addresses.
 It never creates or copies this credential. Karpenter's RKE2 join credential is
 kept separate as `inspace-rke2-agent-token` key `token`. See the
 [`values` example](charts/inspace-cloud-kube-modules/examples/values.yaml),

@@ -86,7 +86,7 @@ controllers refer to one existing Secret in the release namespace:
 | --- | --- | --- |
 | `global.inspace.apiSecret.name` | `inspace-cloud-credentials` | Existing Secret name |
 | `global.inspace.apiSecret.tokenKey` | `api-token` | InSpace API token key |
-| `global.inspace.apiSecret.billingAccountIDKey` | `billing-account-id` | Decimal billing account ID key |
+| `global.inspace.apiSecret.billingAccountIDKey` | `billing-account-id` | Required positive decimal billing account ID key |
 
 Karpenter's RKE2 join token is intentionally separate. The provider validates
 the fixed `Secret/inspace-rke2-agent-token` key `token`; it cannot be pointed at

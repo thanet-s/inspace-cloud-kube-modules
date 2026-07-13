@@ -2,6 +2,7 @@
 """Bind a Ready Karpenter Node to one exact InSpace VM, VPC, and public IP."""
 
 import argparse
+import hashlib
 import ipaddress
 import json
 import os
@@ -35,6 +36,25 @@ def description(vm):
 VM_UUID_PATTERN = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
 )
+
+
+def deterministic_floating_ip_name(cluster: str, nodeclaim: str) -> str:
+    """Mirror the provider's persisted v3 FIP identity contract."""
+    base = "".join(
+        character if character.isascii() and (character.islower() or character.isdigit() or character == "-") else "-"
+        for character in nodeclaim.lower()
+    ).strip("-")
+    if not base.startswith("inspace-e2e-"):
+        base = "karpenter-" + base
+    suffix = hashlib.sha256(f"{cluster}\0{nodeclaim}".encode()).hexdigest()[:10]
+    base = base[:52].rstrip("-")
+    return f"{base}-{suffix}"
+
+
+def require_nonvirtual_flag(value: object, label: str) -> None:
+    """Accept the two raw API encodings for a non-virtual address."""
+    if value is not None and value is not False:
+        raise SystemExit(f"{label} must be a non-virtual InSpace address")
 
 
 def canonical_worker_vm_detail(
@@ -104,12 +124,14 @@ def main() -> None:
     vm_uuid = vm["uuid"]
     record = description(vm)
     amd_pool_uuid = os.environ["INSPACE_AMD_HOST_POOL_UUID"]
+    expected_fip_name = deterministic_floating_ip_name(cluster, node.get("nodeClaimName"))
     if (
-        record.get("schema") != "karpenter.inspace.cloud/v2"
+        record.get("schema") != "karpenter.inspace.cloud/v3"
         or record.get("cluster") != cluster
         or record.get("nodeClaim") != node.get("nodeClaimName")
         or record.get("vmName") != node.get("name")
-        or not record.get("floatingIPName")
+        or record.get("floatingIPName") != expected_fip_name
+        or record.get("publicIPv4") not in (None, "")
         or record.get("hostClass") != "amd-epyc"
         or record.get("hostPoolUUID") != amd_pool_uuid
         or vm.get("designated_pool_uuid") != amd_pool_uuid
@@ -177,36 +199,48 @@ def main() -> None:
     ):
         raise SystemExit("managed node firewall must protect exactly three control planes and the worker")
 
-    fip_name = record["floatingIPName"]
+    fip_name = expected_fip_name
+    billing_account = int(os.environ["INSPACE_BILLING_ACCOUNT_ID"])
     all_addresses = [
         ip for ip in api_get("network/ip_addresses")
         if not ip.get("is_deleted", False)
     ]
-    addresses = [
+    named_addresses = [
         ip for ip in all_addresses
         if ip.get("name") == fip_name
-        and ip.get("assigned_to") == vm_uuid
-        and ip.get("assigned_to_resource_type") == "virtual_machine"
-        and ip.get("enabled") is True
-        and ip.get("is_virtual") is False
-        and ip.get("type") == "public"
     ]
-    if len(addresses) != 1:
+    if len(named_addresses) != 1:
         raise SystemExit("worker must own exactly one expected floating IPv4")
-    if len([ip for ip in all_addresses if ip.get("assigned_to") == vm_uuid]) != 1:
+    address = named_addresses[0]
+    require_nonvirtual_flag(address.get("is_virtual"), "worker expected floating IPv4")
+    if (
+        address.get("billing_account_id") != billing_account
+        or address.get("assigned_to") != vm_uuid
+        or address.get("assigned_to_resource_type") != "virtual_machine"
+        or address.get("enabled") is not True
+        or address.get("type") != "public"
+    ):
+        raise SystemExit("worker expected floating IPv4 has contradictory ownership or usability")
+    assigned_addresses = [ip for ip in all_addresses if ip.get("assigned_to") == vm_uuid]
+    if len(assigned_addresses) != 1 or assigned_addresses[0] != address:
         raise SystemExit("worker must not have an additional or foreign-named floating IPv4")
-    public_ip = ipaddress.ip_address(addresses[0]["address"])
+    public_ip = ipaddress.ip_address(address["address"])
     if public_ip.version != 4 or not public_ip.is_global or public_ip.is_loopback or public_ip.is_multicast:
         raise SystemExit("worker floating address is not public IPv4")
-    if addresses[0].get("assigned_to_private_ip") and str(addresses[0]["assigned_to_private_ip"]) != str(internal_ip):
+    if address.get("assigned_to_private_ip") and str(address["assigned_to_private_ip"]) != str(internal_ip):
         raise SystemExit("worker FIP private-address readback disagrees with the Node InternalIP")
-    if vm.get("public_ipv4"):
-        try:
-            vm_public_ip = ipaddress.ip_address(str(vm["public_ipv4"]))
-        except ValueError as error:
-            raise SystemExit("worker VM public IPv4 readback is malformed") from error
-        if vm_public_ip != public_ip:
-            raise SystemExit("worker VM public IPv4 must equal its exact assigned FIP")
+    if vm.get("public_ipv4") not in (None, ""):
+        raise SystemExit("worker VM public_ipv4 must remain empty for an auto-reserved FIP")
+
+    external_ips = node.get("externalIPs", [])
+    if not isinstance(external_ips, list) or len(external_ips) != 1:
+        raise SystemExit("worker Node must expose exactly one CCM-published ExternalIP")
+    try:
+        node_external_ip = ipaddress.ip_address(str(external_ips[0]))
+    except ValueError as error:
+        raise SystemExit("worker Node ExternalIP is malformed") from error
+    if node_external_ip != public_ip:
+        raise SystemExit("worker Node ExternalIP must equal its exact assigned FIP")
 
     worker = {
         "uuid": vm_uuid,

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/awslabs/operatorpkg/status"
@@ -29,14 +30,15 @@ import (
 )
 
 const (
-	AnnotationNodeClassHash = "karpenter.inspace.cloud/nodeclass-hash"
-	AnnotationBootstrapHash = "karpenter.inspace.cloud/bootstrap-hash"
-	AnnotationVMState       = "karpenter.inspace.cloud/vm-state"
-	AnnotationPublicIPv4    = "karpenter.inspace.cloud/public-ipv4"
-	AnnotationFloatingIP    = "karpenter.inspace.cloud/floating-ip-name"
-	AnnotationNodeName      = "karpenter.inspace.cloud/node-name"
-	DriftReasonNodeClass    = cloudprovider.DriftReason("NodeClassDrifted")
-	ProviderSchemaVersion   = "inspace-provider-v2"
+	AnnotationNodeClassHash  = "karpenter.inspace.cloud/nodeclass-hash"
+	AnnotationBootstrapHash  = "karpenter.inspace.cloud/bootstrap-hash"
+	AnnotationVMState        = "karpenter.inspace.cloud/vm-state"
+	AnnotationPublicIPv4     = "karpenter.inspace.cloud/public-ipv4"
+	AnnotationFloatingIP     = "karpenter.inspace.cloud/floating-ip-name"
+	AnnotationBillingAccount = "karpenter.inspace.cloud/billing-account-id"
+	AnnotationNodeName       = "karpenter.inspace.cloud/node-name"
+	DriftReasonNodeClass     = cloudprovider.DriftReason("NodeClassDrifted")
+	ProviderSchemaVersion    = "inspace-provider-v2"
 )
 
 var _ cloudprovider.CloudProvider = (*CloudProvider)(nil)
@@ -177,6 +179,7 @@ func (p *CloudProvider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim)
 	created.Annotations[AnnotationVMState] = string(vm.State)
 	created.Annotations[AnnotationPublicIPv4] = vm.PublicIPv4
 	created.Annotations[AnnotationFloatingIP] = vm.FloatingIPName
+	created.Annotations[AnnotationBillingAccount] = strconv.FormatInt(vm.BillingAccountID, 10)
 	created.Annotations[AnnotationNodeName] = vm.Name
 	created.Status = karpv1.NodeClaimStatus{
 		ProviderID:  providerid.New(vm.Location, vm.UUID),
@@ -192,7 +195,18 @@ func (p *CloudProvider) Delete(ctx context.Context, nodeClaim *karpv1.NodeClaim)
 	if err != nil {
 		return fmt.Errorf("parsing provider ID for deletion: %w", err)
 	}
-	if err := p.cloud.DeleteVM(ctx, id.Location, id.VMUUID, p.opts.ClusterName, nodeClaim.Name); err != nil {
+	deleteIdentity := cloudapi.DeleteVMIdentity{
+		FloatingIPName: nodeClaim.Annotations[AnnotationFloatingIP],
+		PublicIPv4:     nodeClaim.Annotations[AnnotationPublicIPv4],
+	}
+	if value := nodeClaim.Annotations[AnnotationBillingAccount]; value != "" {
+		billingAccountID, parseErr := strconv.ParseInt(value, 10, 64)
+		if parseErr != nil || billingAccountID <= 0 {
+			return fmt.Errorf("durable billing-account annotation for deletion must be a positive decimal integer: %q", value)
+		}
+		deleteIdentity.BillingAccountID = billingAccountID
+	}
+	if err := p.cloud.DeleteVM(ctx, id.Location, id.VMUUID, p.opts.ClusterName, nodeClaim.Name, deleteIdentity); err != nil {
 		if errors.Is(err, cloudapi.ErrNotFound) {
 			return cloudprovider.NewNodeClaimNotFoundError(fmt.Errorf("VM %s no longer exists", id.VMUUID))
 		}
@@ -404,12 +418,13 @@ func nodeClaimFromVM(vm *cloudapi.VM) *karpv1.NodeClaim {
 			Name:   vm.NodeClaimName,
 			Labels: map[string]string{corev1.LabelInstanceTypeStable: vm.InstanceType, catalog.LabelHostClass: vm.HostClass},
 			Annotations: map[string]string{
-				AnnotationNodeClassHash: vm.SpecHash,
-				AnnotationBootstrapHash: vm.BootstrapHash,
-				AnnotationVMState:       string(vm.State),
-				AnnotationPublicIPv4:    vm.PublicIPv4,
-				AnnotationFloatingIP:    vm.FloatingIPName,
-				AnnotationNodeName:      vm.Name,
+				AnnotationNodeClassHash:  vm.SpecHash,
+				AnnotationBootstrapHash:  vm.BootstrapHash,
+				AnnotationVMState:        string(vm.State),
+				AnnotationPublicIPv4:     vm.PublicIPv4,
+				AnnotationFloatingIP:     vm.FloatingIPName,
+				AnnotationBillingAccount: strconv.FormatInt(vm.BillingAccountID, 10),
+				AnnotationNodeName:       vm.Name,
 			},
 		},
 		Status: karpv1.NodeClaimStatus{

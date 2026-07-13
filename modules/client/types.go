@@ -263,6 +263,11 @@ type CreateFloatingIPRequest struct {
 	BillingAccountID int64  `json:"billing_account_id"`
 }
 
+type UpdateFloatingIPRequest struct {
+	Name             string `json:"name"`
+	BillingAccountID int64  `json:"billing_account_id"`
+}
+
 type FloatingIPFilters struct {
 	BillingAccountID int64
 	VMUUID           string

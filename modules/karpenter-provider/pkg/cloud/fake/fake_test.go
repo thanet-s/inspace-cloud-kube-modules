@@ -27,10 +27,10 @@ func TestCreateAndDeleteDesiredStateIsIdempotent(t *testing.T) {
 	if len(vms) != 1 {
 		t.Fatalf("expected one VM after create retry, got %d", len(vms))
 	}
-	if err := cloud.DeleteVM(ctx, "bkk01", first.UUID, "test", "worker-1"); err != nil {
+	if err := cloud.DeleteVM(ctx, "bkk01", first.UUID, "test", "worker-1", cloudapi.DeleteVMIdentity{}); err != nil {
 		t.Fatal(err)
 	}
-	if err := cloud.DeleteVM(ctx, "bkk01", first.UUID, "test", "worker-1"); !errors.Is(err, cloudapi.ErrNotFound) {
+	if err := cloud.DeleteVM(ctx, "bkk01", first.UUID, "test", "worker-1", cloudapi.DeleteVMIdentity{}); !errors.Is(err, cloudapi.ErrNotFound) {
 		t.Fatalf("repeated delete should report desired not-found state, got %v", err)
 	}
 }

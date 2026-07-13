@@ -704,13 +704,16 @@ def main() -> None:
     require("expected one exact egress FIP for each control plane and bastion" in bootstrap_discovery and
             "vm_by_name = canonical_owned_vm_details(listed_owned_vms)" in bootstrap_discovery and
             'expected_cp_names = [f"{cluster_resource_name}-cp{index}"' in bootstrap_discovery and
-            'vm.get("hostname") not in (None, "", name)' in bootstrap_discovery and
+            "validate_optional_vm_hostname(vm, name, name)" in bootstrap_discovery and
             "user-resource/vm?" in bootstrap_discovery and
             "enabled non-virtual InSpace type=public FIP" in bootstrap_discovery and
             'assigned_to_resource_type") != "virtual_machine"' in bootstrap_discovery and
             "private-VIP bootstrap must not create or adopt a control-plane load balancer" in bootstrap_discovery and
             "2-vCPU / 4-GiB / 30-GiB control-plane shape" in bootstrap_discovery and
             "1-vCPU / 2-GiB / 30-GiB / configured-pool shape" in bootstrap_discovery and
+            "bootstrap FIPs must have the exact configured billing-account identity" in bootstrap_discovery and
+            "VM public_ipv4 must remain empty for an auto-reserved FIP" in bootstrap_discovery and
+            "bastion VM public_ipv4 must remain empty for an auto-reserved FIP" in bootstrap_discovery and
             "node firewall must be assigned to exactly the three control-plane VMs" in bootstrap_discovery and
             "bastion public ingress must be only management /32 TCP/22" in bootstrap_discovery,
             "bootstrap discovery must prove exact VM FIPs, zero control NLBs, and firewall isolation")
@@ -719,18 +722,119 @@ def main() -> None:
             "[.items[].metadata.name] | sort" in playbook,
             "live E2E must bind cloud, guest-hostname, and Kubernetes control-plane identities")
 
+    bastion_play = named_yaml_sequence_item(playbook, "Establish the pinned public bastion", 0)
+    for hostname_proof in (
+        'test "$(hostname)" = "{{ e2e_node_name }}"',
+        'test "$(hostnamectl --static)" = "{{ e2e_node_name }}"',
+        'test "$(tr -d \'\\n\' </etc/hostname)" = "{{ e2e_node_name }}"',
+    ):
+        require(hostname_proof in bastion_play,
+                f"bastion guest identity proof is missing: {hostname_proof}")
+    require('e2e_node_name: "{{ e2e_state.bastionName }}"' in playbook,
+            "dynamic bastion inventory must use the discovered exact VM name")
+    for naming_contract in (
+        're.compile(r"[a-z0-9](?:[a-z0-9-]{0,53}[a-z0-9])?")',
+        'return f"{cluster_resource_name}-bastion", owner_name, owner_name + "-ip"',
+        'bastion_name, bastion_owner_name, bastion_fip_name = bastion_resource_names(',
+        'rf"inspace-rke2-bastion/v3 owner={re.escape(owner)} spec=[0-9a-f]{{64}}"',
+        'validate_optional_vm_hostname(bastion, bastion_name, "bastion")',
+        '"bastionName": bastion_name',
+        '"bastionFloatingIPName": bastion_fip["name"]',
+    ):
+        require(naming_contract in bootstrap_discovery,
+                f"bootstrap bastion naming contract is missing: {naming_contract}")
+    require('expected_fip_names = set(expected_cp_fip_names) | {bastion_fip_name}' in bootstrap_discovery and
+            '== bastion_owner_name' in bootstrap_discovery,
+            "bastion VM naming must remain distinct from owner-derived FIP and firewall naming")
+
     bootstrap_discovery_module = load_script_module(
         "e2e_discover_bootstrap_static", ROOT / "scripts/discover-bootstrap.py"
     )
+    require(bootstrap_discovery_module.require_cluster_resource_name("a" * 55) == "a" * 55,
+            "bootstrap discovery rejected the longest valid cluster resource name")
+    try:
+        bootstrap_discovery_module.require_cluster_resource_name("a" * 56)
+    except SystemExit:
+        pass
+    else:
+        require(False, "bootstrap discovery accepted a cluster resource name longer than 55 characters")
+    bastion_names = bootstrap_discovery_module.bastion_resource_names("inspace-e2e-unit", "owner")
+    require(
+        bastion_names == (
+            "inspace-e2e-unit-bastion",
+            "rke2-owner-bastion",
+            "rke2-owner-bastion-ip",
+        )
+        and bastion_names[0] != bastion_names[1]
+        and bastion_names[0] != bastion_names[2],
+        "bastion VM name must be distinct from owner-derived firewall and FIP names",
+    )
+    for vm_detail in ({}, {"hostname": None}, {"hostname": ""}, {"hostname": bastion_names[0]}):
+        bootstrap_discovery_module.validate_optional_vm_hostname(
+            vm_detail, bastion_names[0], "unit bastion"
+        )
+    try:
+        bootstrap_discovery_module.validate_optional_vm_hostname(
+            {"hostname": bastion_names[1]}, bastion_names[0], "unit bastion"
+        )
+    except SystemExit as error:
+        require("contradictory hostname" in str(error),
+                "bootstrap discovery returned the wrong hostname contradiction diagnostic")
+    else:
+        require(False, "bootstrap discovery accepted the owner-derived firewall name as the bastion hostname")
+    require(
+        bootstrap_discovery.count(
+            'validate_optional_vm_hostname(bastion, bastion_name, "bastion")'
+        ) == 1
+        and bootstrap_discovery.count("validate_optional_vm_hostname(vm, name, name)") == 1,
+        "production bootstrap discovery must validate optional API hostnames for bastion and control planes",
+    )
+    expected_network_uuid = "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff"
+    for vm_detail in (
+        {},
+        {"network_uuid": None},
+        {"network_uuid": ""},
+        {"network_uuid": expected_network_uuid},
+    ):
+        bootstrap_discovery_module.validate_optional_vm_network_uuid(
+            vm_detail, expected_network_uuid, "unit VM"
+        )
+    for contradictory_network in (
+        "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+        " ",
+        0,
+        [],
+    ):
+        try:
+            bootstrap_discovery_module.validate_optional_vm_network_uuid(
+                {"network_uuid": contradictory_network}, expected_network_uuid, "unit VM"
+            )
+        except SystemExit as error:
+            require("contradicts the configured VPC" in str(error),
+                    "bootstrap discovery returned the wrong network contradiction diagnostic")
+        else:
+            require(False, f"bootstrap discovery accepted contradictory VM network {contradictory_network!r}")
+    require(
+        bootstrap_discovery.count(
+            'validate_optional_vm_network_uuid(bastion, network_uuid, "bastion")'
+        ) == 1
+        and bootstrap_discovery.count(
+            "validate_optional_vm_network_uuid(vm, network_uuid, name)"
+        ) == 1
+        and "network_members.count(vm_uuid) != 1" in bootstrap_discovery
+        and 'subnet = ipaddress.ip_network(network["subnet"], strict=False)' in bootstrap_discovery
+        and bootstrap_discovery.count("require_private_ipv4(") >= 3,
+        "production bootstrap discovery must combine optional detail validation with exact VPC membership and subnet checks",
+    )
     sparse_owned_vms = [
         {"uuid": "11111111-2222-4333-8444-555555555555", "name": "inspace-e2e-unit-cp0"},
-        {"uuid": "66666666-7777-4888-8999-aaaaaaaaaaaa", "name": "rke2-owner-bastion"},
+        {"uuid": "66666666-7777-4888-8999-aaaaaaaaaaaa", "name": "inspace-e2e-unit-bastion"},
     ]
     canonical_vm_records = {
         item["uuid"]: {
             **item,
             "description": "persisted ownership",
-            "network_uuid": "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff",
+            "network_uuid": expected_network_uuid,
             "designated_pool_uuid": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
             "storage": [{"primary": True, "size": 30}],
         }
@@ -751,6 +855,31 @@ def main() -> None:
             "bootstrap VM detail canonicalization lost an owned name")
     require(all(item.get("network_uuid") for item in canonical.values()) and len(detail_queries) == 2,
             "bootstrap discovery did not replace every sparse list row with complete detail")
+
+    raw_fip = {
+        "enabled": True,
+        "is_virtual": None,
+        "type": "public",
+        "address": "8.8.8.8",
+    }
+    require(
+        bootstrap_discovery_module.require_usable_fip(raw_fip, "raw bootstrap FIP") == "8.8.8.8",
+        "bootstrap discovery rejected a raw live non-virtual FIP with is_virtual=null",
+    )
+    for accepted_nonvirtual in (None, False):
+        bootstrap_discovery_module.require_usable_fip(
+            {**raw_fip, "is_virtual": accepted_nonvirtual}, "bootstrap FIP"
+        )
+    for contradictory_nonvirtual in (True, 0, "false", [], {}):
+        try:
+            bootstrap_discovery_module.require_usable_fip(
+                {**raw_fip, "is_virtual": contradictory_nonvirtual}, "bootstrap FIP"
+            )
+        except SystemExit as error:
+            require("enabled non-virtual" in str(error),
+                    "bootstrap discovery returned the wrong virtual-FIP diagnostic")
+        else:
+            require(False, f"bootstrap discovery accepted invalid is_virtual={contradictory_nonvirtual!r}")
 
     def mismatched_vm_getter(_path: str):
         return {"uuid": sparse_owned_vms[0]["uuid"], "name": "foreign"}
@@ -782,18 +911,38 @@ def main() -> None:
     worker_discovery_module = load_script_module(
         "e2e_discover_worker_static", ROOT / "scripts/discover-worker.py"
     )
+    for accepted_nonvirtual in (None, False):
+        worker_discovery_module.require_nonvirtual_flag(accepted_nonvirtual, "raw worker FIP")
+    for contradictory_nonvirtual in (True, 0, "false", [], {}):
+        try:
+            worker_discovery_module.require_nonvirtual_flag(
+                contradictory_nonvirtual, "raw worker FIP"
+            )
+        except SystemExit as error:
+            require("non-virtual InSpace address" in str(error),
+                    "worker discovery returned the wrong virtual-FIP diagnostic")
+        else:
+            require(False, f"worker discovery accepted invalid is_virtual={contradictory_nonvirtual!r}")
     worker_name = "inspace-e2e-run-karp-general-abc123"
     worker_nodeclaim_name = "general-abc123"
+    worker_fip_name = "karpenter-general-abc123-510fa6882d"
+    require(
+        worker_discovery_module.deterministic_floating_ip_name(
+            "inspace-e2e-run", worker_nodeclaim_name
+        ) == worker_fip_name,
+        "worker discovery does not mirror the provider's deterministic v3 FIP name",
+    )
     worker_summary = {"uuid": "12345678-1234-4abc-8def-1234567890ab", "name": worker_name}
     worker_detail = {
         **worker_summary,
         "hostname": worker_name,
+        "public_ipv4": None,
         "description": json.dumps({
-            "schema": "karpenter.inspace.cloud/v2",
+            "schema": "karpenter.inspace.cloud/v3",
             "cluster": "inspace-e2e-run",
             "nodeClaim": worker_nodeclaim_name,
             "vmName": worker_name,
-            "floatingIPName": "worker-fip",
+            "floatingIPName": worker_fip_name,
             "hostClass": "amd-epyc",
         }),
         "designated_pool_uuid": "6976fdc8-4492-465b-bd16-9ad5f6b00b03",
@@ -832,14 +981,20 @@ def main() -> None:
             "Kubernetes API must use the pinned bastion local forward")
     require("worker must not have an additional or foreign-named floating IPv4" in worker_discovery and
             "worker must be attached to exactly the intended managed cloud firewall" in worker_discovery and
-            'ip.get("is_virtual") is False' in worker_discovery and
+            'require_nonvirtual_flag(address.get("is_virtual")' in worker_discovery and
             "managed node firewall must protect exactly three control planes and the worker" in worker_discovery and
             "worker InternalIP collides with the private control-plane VIP" in worker_discovery and
             'os.environ["INSPACE_AMD_HOST_POOL_UUID"]' in worker_discovery and
             "canonical_worker_vm_detail(" in worker_discovery and
-            'record.get("schema") != "karpenter.inspace.cloud/v2"' in worker_discovery and
+            'record.get("schema") != "karpenter.inspace.cloud/v3"' in worker_discovery and
             'record.get("nodeClaim") != node.get("nodeClaimName")' in worker_discovery and
             'record.get("vmName") != node.get("name")' in worker_discovery and
+            'record.get("publicIPv4") not in (None, "")' in worker_discovery and
+            'vm.get("public_ipv4") not in (None, "")' in worker_discovery and
+            'address.get("billing_account_id") != billing_account' in worker_discovery and
+            "deterministic_floating_ip_name(" in worker_discovery and
+            "worker Node ExternalIP must equal its exact assigned FIP" in worker_discovery and
+            'externalIPs:[$node.status.addresses[]|select(.type=="ExternalIP")|.address]' in playbook and
             ".status.nodeName == $nodeName" in playbook and
             'test "$(hostname)" = "{{ e2e_node_name }}"' in playbook and
             'record.get("hostClass") != "amd-epyc"' in worker_discovery and
@@ -872,6 +1027,10 @@ def main() -> None:
             'worker_fip_prefix = f"karpenter-{args.nodepool}-"' in cloud_audit and
             'state.get("workerVMs", [])' in cloud_audit,
             "cleanup audit must retain new worker VM/FIP naming even with sparse list descriptions")
+    require('f"{args.cluster}-bastion"' in cloud_audit and
+            'f"rke2-{args.owner}-bastion"' in cloud_audit and
+            "or vm.get(\"name\") in bastion_vm_names" in cloud_audit,
+            "cleanup audit must allow the current bastion VM and safe prior owner-derived VM name")
     cloud_audit_module = load_script_module("e2e_cloud_audit_static", ROOT / "scripts/cloud-audit.py")
     require(cloud_audit_module.parse_description('{"cluster":"expected"}') == {"cluster": "expected"},
             "cloud audit must parse structured VM ownership descriptions")
@@ -913,9 +1072,10 @@ def main() -> None:
             "recovery must restore its private API tunnel before probing Kubernetes")
     require(re.search(r"preserving\s+cloud infrastructure is the fail-closed outcome", cleanup) is not None,
             "cleanup must fail closed when ownership is uncertain")
-    require("e2e_cleanup_state.clusterResourceName + '-cp[0-2]|rke2-'" in cleanup and
+    require("e2e_cleanup_state.clusterResourceName + '-cp[0-2]|'" in cleanup and
+            "e2e_cleanup_state.clusterResourceName + '-bastion|rke2-'" in cleanup and
             "e2e_cleanup_state.owner + '-bastion)$'" in cleanup,
-            "controller uninstall must permit only the three control planes and exact bastion")
+            "controller uninstall must permit only control planes and current or safe-prior bastion names")
     print("E2E static contract verified (no live resources touched)")
 
 

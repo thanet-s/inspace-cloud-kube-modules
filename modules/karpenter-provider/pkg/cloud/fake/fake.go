@@ -72,7 +72,7 @@ func (f *Cloud) CreateVM(_ context.Context, request cloud.CreateVMRequest) (*clo
 	return cloneVM(vm), nil
 }
 
-func (f *Cloud) DeleteVM(_ context.Context, location, id, clusterName, nodeClaimName string) error {
+func (f *Cloud) DeleteVM(_ context.Context, location, id, clusterName, nodeClaimName string, _ cloud.DeleteVMIdentity) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	vm, ok := f.byID[id]

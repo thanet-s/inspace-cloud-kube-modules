@@ -73,6 +73,7 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.global.inspace.apiSecret.name }}
                   key: {{ .Values.global.inspace.apiSecret.billingAccountIDKey }}
+                  optional: false
             - name: INSPACE_API_URL
               value: {{ .Values.global.inspace.apiBaseURL | quote }}
             - name: INSPACE_ALLOW_REMOTE_MUTATIONS

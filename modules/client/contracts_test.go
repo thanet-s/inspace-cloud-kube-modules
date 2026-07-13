@@ -129,6 +129,10 @@ func TestDocumentedResourceContracts(t *testing.T) {
 	if err != nil || createdIP.Address != floatingIP {
 		t.Fatalf("CreateFloatingIP() = %#v, %v", createdIP, err)
 	}
+	updatedIP, err := client.UpdateFloatingIP(ctx, "bkk01", floatingIP, inspace.UpdateFloatingIPRequest{Name: "k8s-ip", BillingAccountID: 129673})
+	if err != nil || updatedIP.Name != "k8s-ip" || updatedIP.BillingAccountID != 129673 {
+		t.Fatalf("UpdateFloatingIP() = %#v, %v", updatedIP, err)
+	}
 	ips, err := client.ListFloatingIPs(ctx, "bkk01", &inspace.FloatingIPFilters{BillingAccountID: 129673, VMUUID: vmUUID})
 	if err != nil || len(ips) != 1 || ips[0].Address != floatingIP {
 		t.Fatalf("ListFloatingIPs() = %#v, %v", ips, err)
@@ -250,6 +254,13 @@ func contractHandler(t *testing.T) http.HandlerFunc {
 			w.WriteHeader(http.StatusNoContent)
 		case "POST /v1/bkk01/network/ip_addresses":
 			writeLiteral(w, http.StatusCreated, floatingIPLiteral(false))
+		case "PATCH /v1/bkk01/network/ip_addresses/" + floatingIP:
+			var got inspace.UpdateFloatingIPRequest
+			decodeJSON(t, r, &got)
+			if got.Name != "k8s-ip" || got.BillingAccountID != 129673 {
+				t.Errorf("UpdateFloatingIP body = %#v", got)
+			}
+			writeLiteral(w, http.StatusOK, floatingIPLiteral(false))
 		case "GET /v1/bkk01/network/ip_addresses":
 			if r.URL.Query().Get("billing_account_id") != "129673" || r.URL.Query().Get("vm_uuid") != vmUUID {
 				t.Errorf("floating IP query = %s", r.URL.RawQuery)

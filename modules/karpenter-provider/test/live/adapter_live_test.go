@@ -84,7 +84,8 @@ func TestLiveAdapterCreateGetListDelete(t *testing.T) {
 		var cleanupErrors []error
 		if vms, listErr := adapter.ListVMs(cleanupCtx, request.Location, clusterName); listErr == nil {
 			for _, vm := range vms {
-				if err := adapter.DeleteVM(cleanupCtx, request.Location, vm.UUID, clusterName, nodeClaimName); err != nil && !errors.Is(err, cloudapi.ErrNotFound) {
+				identity := cloudapi.DeleteVMIdentity{FloatingIPName: vm.FloatingIPName, PublicIPv4: vm.PublicIPv4, BillingAccountID: vm.BillingAccountID}
+				if err := adapter.DeleteVM(cleanupCtx, request.Location, vm.UUID, clusterName, nodeClaimName, identity); err != nil && !errors.Is(err, cloudapi.ErrNotFound) {
 					cleanupErrors = append(cleanupErrors, fmt.Errorf("adapter cleanup VM %s: %w", vm.UUID, err))
 				}
 			}
@@ -165,7 +166,8 @@ func TestLiveAdapterCreateGetListDelete(t *testing.T) {
 	if err != nil || len(listed) != 1 || listed[0].UUID != created.UUID {
 		t.Fatalf("ListVMs = %#v, %v", listed, err)
 	}
-	if err := adapter.DeleteVM(ctx, request.Location, created.UUID, clusterName, nodeClaimName); err != nil {
+	identity := cloudapi.DeleteVMIdentity{FloatingIPName: created.FloatingIPName, PublicIPv4: created.PublicIPv4, BillingAccountID: created.BillingAccountID}
+	if err := adapter.DeleteVM(ctx, request.Location, created.UUID, clusterName, nodeClaimName, identity); err != nil {
 		t.Fatal(err)
 	}
 }
