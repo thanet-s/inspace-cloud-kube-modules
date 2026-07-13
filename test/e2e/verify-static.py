@@ -111,8 +111,8 @@ def require_unrestricted_parallel_task(block: str) -> None:
 
 
 def verify_host_launcher_external_allow_list() -> None:
-    """Execute both volume branches with Docker as the only PATH command."""
-    for inspect_fails in (False, True):
+    """Execute default and shell paths with Docker as the only PATH command."""
+    for inspect_fails, phase in ((False, None), (True, None), (False, "shell")):
       with tempfile.TemporaryDirectory(prefix="inspace-e2e-static-") as temporary:
         root = pathlib.Path(temporary)
         bin_dir = root / "bin"
@@ -159,8 +159,11 @@ def verify_host_launcher_external_allow_list() -> None:
             "CONFIRM_INSPACE_CLUSTER_E2E": "static-contract-account",
             "INSPACE_E2E_VERSION": "0.0.0-static",
         }
+        command = ["/bin/bash", "-x", str(ROOT / "run.sh")]
+        if phase is not None:
+            command.append(phase)
         result = subprocess.run(
-            ["/bin/bash", "-x", str(ROOT / "run.sh")],
+            command,
             cwd=ROOT.parent.parent,
             env=environment,
             capture_output=True,
@@ -197,18 +200,17 @@ def verify_host_launcher_external_allow_list() -> None:
             "--build-arg CONTROLLER_IMAGE=ghcr.io/thanet-s/inspace-cloud-controller-manager:0.0.0-static "
             "--tag inspace-cloud-rke2-e2e:local .",
             " ".join((
-                "run --rm --platform linux/amd64",
+                "run --rm" + (" -it" if phase == "shell" else "") + " --platform linux/amd64",
                 "--env CONFIRM_INSPACE_CLUSTER_E2E=static-contract-account",
                 "--env INSPACE_E2E_VERSION=0.0.0-static",
                 "--env INSPACE_E2E_KEEP_RESOURCES=false",
                 "--env INSPACE_E2E_RUN_ID=",
-                "--env INSPACE_E2E_RECOVERY_ONLY=false",
                 "--env INSPACE_E2E_RECOVER_RETAINED=false",
                 f"--mount type=bind,src={root / 'workspace.env'},dst=/run/config/workspace.env,readonly",
                 f"--mount type=bind,src={root / 'id_rsa'},dst=/run/secrets/e2e_ssh_key,readonly",
                 f"--mount type=bind,src={root / 'id_rsa.pub'},dst=/run/secrets/e2e_ssh_key.pub,readonly",
                 "--mount type=volume,src=static-contract-state,dst=/state",
-                "inspace-cloud-rke2-e2e:local",
+                f"inspace-cloud-rke2-e2e:local {phase or 'all'}",
             )),
         ])
         require(
@@ -222,8 +224,8 @@ def verify_retention_state_parser(entrypoint: str) -> None:
     function = re.search(r"(?ms)^read_retention_state\(\) \{\n.*?^\}\n", entrypoint)
     require(function is not None, "entrypoint lacks a testable retention-state parser")
     require(
-        entrypoint.count('retained=$(read_retention_state "$previous_dir/state.json") || {') == 1,
-        "unfinished-run recovery must use the tested retention-state parser exactly once",
+        entrypoint.count('read_retention_state "$directory/state.json"') == 1,
+        "all retention decisions must use the tested retention-state parser",
     )
     require("jq -er '.retained // false'" not in entrypoint,
             "unfinished-run recovery must not restore jq -e boolean parsing")
@@ -276,8 +278,10 @@ def verify_retention_state_parser(entrypoint: str) -> None:
 def main() -> None:
     host = (ROOT / "run.sh").read_text(encoding="utf-8")
     dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
-    playbook = (ROOT / "playbook.yml").read_text(encoding="utf-8")
-    cleanup = (ROOT / "cleanup.yml").read_text(encoding="utf-8")
+    init_playbook = (ROOT / "init-cluster.yml").read_text(encoding="utf-8")
+    test_playbook = (ROOT / "test.yml").read_text(encoding="utf-8")
+    cleanup = (ROOT / "destroy-cluster.yml").read_text(encoding="utf-8")
+    playbook = init_playbook + "\n" + test_playbook
     entrypoint = (ROOT / "scripts/container-entrypoint.sh").read_text(encoding="utf-8")
     dockerignore = (ROOT / "Dockerfile.dockerignore").read_text(encoding="utf-8")
     account_inventory = (ROOT / "scripts/account-inventory.py").read_text(encoding="utf-8")
@@ -313,6 +317,10 @@ def main() -> None:
     require("--env-file" not in executable_host,
             "token-bearing environment file must not be copied into Docker container metadata")
     require("--mount \"type=bind" in host and "type=volume" in host, "host launcher must explicitly validate/mount inputs")
+    require("phase=${1:-all}" in host and '"$runner_image" \\\n  "$phase"' in host,
+            "host launcher must default to the full lifecycle and pass one explicit phase")
+    require("interactive_arg=-it" in host and "[[ $phase == shell ]]" in host,
+            "only the tunneled debug shell phase must request an interactive container")
 
     for tool in ("kubectl", "helm", "jq", "openssh-client", "curl", "skopeo"):
         require(tool in dockerfile, f"runner image is missing {tool}")
@@ -322,13 +330,22 @@ def main() -> None:
             "FROM base AS published-live" in dockerfile and
             "COPY --from=published-controller /usr/local/bin/inspace-cluster-controller" in dockerfile,
             "runner must separate local validation from published live acceptance")
-    require('ansible-playbook "$@" --forks 10 &' in entrypoint,
-            "suite Ansible process must run as an explicitly managed child")
-    require('kill -TERM "$pid"' in entrypoint and 'kill -KILL "$pid"' in entrypoint,
-            "signal cleanup must terminate a bounded active Ansible child")
+    for playbook_name in ("init-cluster.yml", "test.yml", "destroy-cluster.yml"):
+        require(f"/opt/e2e/{playbook_name}" in dockerfile,
+                f"runner image must syntax-check {playbook_name}")
+    require('setsid ansible-playbook "$@" --forks 10 &' in entrypoint,
+            "suite Ansible process must run in an explicitly managed process group")
+    require('kill -TERM -- "-$pid"' in entrypoint and 'kill -KILL -- "-$pid"' in entrypoint and
+            'kill -0 -- "-$pid"' in entrypoint,
+            "signal cleanup must terminate and await the complete Ansible process group")
     require("terminate_active_ansible" in entrypoint and
-            "ansible-playbook /opt/e2e/cleanup.yml --forks 10" in entrypoint,
-            "signal handling must terminate the suite before cleanup")
+            entrypoint.count("cleanup_current_run ||") >= 3,
+            "signal handling must terminate the suite and route cleanup through the managed helper")
+    require("ansible_starting=true" in entrypoint and
+            "ansible_starting=false" in entrypoint and
+            "while the Ansible process group identity was not yet stable" in entrypoint and
+            "[[ $ansible_process_group_quiesced == true ]]" in entrypoint,
+            "signal handling must refuse cleanup across process-group startup or quiescence uncertainty")
     require("mounted E2E environment file must have mode 0600" in entrypoint,
             "runner must reject an over-permissive API-token file")
     require("flock -n 9" in entrypoint and "inspace-cloud-rke2-e2e.lock" in entrypoint,
@@ -342,7 +359,7 @@ def main() -> None:
             "missing without a mutations-not-started" in cleanup,
             "runner must journal the mutation boundary and reject run-ID reuse")
     require("[[ $retained == true ]] || ! final_audit_is_zero" in entrypoint and
-            "durable retention marker" in entrypoint,
+            "durable retained marker" in entrypoint,
             "explicit retention must override a possibly stale zero audit")
     for forbidden_build_input in (
         "**/.env", "**/*.env", "**/id_rsa", "**/id_ed25519", "**/*.pem", "**/*.key",
@@ -352,9 +369,14 @@ def main() -> None:
                 f"Dockerfile-specific ignore is missing {forbidden_build_input}")
     require("INSPACE_CONTROL_PLANE_VIP" in entrypoint,
             "runner must require the private control-plane VIP before provisioning")
-    require("INSPACE_INTEL_HOST_POOL_UUID" in entrypoint and
-            "INSPACE_AMD_HOST_POOL_UUID" in entrypoint,
-            "runner must require the Intel bootstrap and AMD EPYC worker pools")
+    require("INSPACE_AMD_HOST_POOL_UUID" in entrypoint and
+            "INSPACE_AMD_HOST_POOL_UUID" in cluster and
+            "INSPACE_AMD_HOST_POOL_UUID" in bootstrap_discovery,
+            "runner, bootstrap template, and readback must require the AMD EPYC pool")
+    require("INSPACE_INTEL_HOST_POOL_UUID" not in entrypoint and
+            "INSPACE_INTEL_HOST_POOL_UUID" not in cluster and
+            "INSPACE_INTEL_HOST_POOL_UUID" not in bootstrap_discovery,
+            "live cluster E2E must not retain an Intel pool input")
     for variable in (
         "INSPACE_PRIVATE_LOAD_BALANCER_POOL_START",
         "INSPACE_PRIVATE_LOAD_BALANCER_POOL_STOP",
@@ -365,10 +387,34 @@ def main() -> None:
     require("16 <= int(stop)-int(start)+1 <= 256" in playbook,
             "live preflight must enforce the v1alpha1 16-256-address pool bound")
     require("recovering unfinished E2E run" in entrypoint and
-            "unfinished-run cleanup lacks a final zero audit" in entrypoint and
+            "cleanup lacks a final zero audit" in entrypoint and
             "requires INSPACE_E2E_VERSION=" in entrypoint and
             "INSPACE_E2E_RECOVER_RETAINED" in entrypoint,
             "runner must recover unfinished state without deleting explicitly retained resources")
+    for phase_call in (
+        "run_ansible /opt/e2e/init-cluster.yml",
+        "run_ansible /opt/e2e/test.yml",
+        "run_ansible /opt/e2e/destroy-cluster.yml",
+        "run_ansible /opt/e2e/test.yml --tags e2e-attach",
+    ):
+        require(phase_call in entrypoint, f"phase-aware entrypoint is missing {phase_call}")
+    require("cluster preserved for debugging or explicit destroy" in entrypoint and
+            "cluster $E2E_RUN_ID preserved after test phase" in entrypoint and
+            "Tunneled kubectl shell" in entrypoint,
+            "init, test, and shell phases must preserve a reusable cluster")
+    require("mark_phase_preserved" in entrypoint and
+            "$previous_dir/phase-preserved" in entrypoint and
+            "preserved by the phased workflow" in entrypoint and
+            "clear_phase_preserved" in entrypoint,
+            "phased clusters must require explicit destroy instead of implicit all-mode recovery")
+    require("select_debuggable_run" in entrypoint and
+            "e2e_attach_require_initialized=false" in entrypoint and
+            "Normalize the persisted kubeconfig for the container-local tunnel" in test_playbook,
+            "the shell must support access-facts-gated debugging after a late init failure")
+    require("initComplete" in init_playbook and "testComplete" in test_playbook and
+            "Attach to an initialized RKE2 E2E cluster" in test_playbook and
+            "Heal state left by an interrupted acceptance run" in test_playbook,
+            "split phases must journal initialization and make acceptance re-attachable")
     require("ansible-core==" in (ROOT / "requirements.txt").read_text(), "ansible-core must be pinned")
     require(re.search(r"^forks\s*=\s*(?:[3-9]|[1-9][0-9]+)$", ansible_cfg, re.MULTILINE) is not None,
             "Ansible forks must be at least three")
@@ -385,7 +431,7 @@ def main() -> None:
         playbook, "Provision the RKE2 control plane through the product bootstrap controller", 0
     )
     require_yaml_key(provision_play, 2, "hosts", "localhost")
-    launch_task = named_yaml_sequence_item(provision_play, "Launch the bootstrap reconciler asynchronously", 4)
+    launch_task = named_yaml_sequence_item(provision_play, "Run the bootstrap reconciler synchronously to readiness", 4)
     require("\n      ansible.builtin.command:" in launch_task,
             "bootstrap launch task must use ansible.builtin.command")
     require(
@@ -408,21 +454,9 @@ def main() -> None:
         ],
         "bootstrap launch argv must be the canonical until-ready controller invocation",
     )
-    require_yaml_key(launch_task, 6, "async", "2700")
-    require_yaml_key(launch_task, 6, "poll", "0")
-    require_yaml_key(launch_task, 6, "register", "e2e_bootstrap_job")
-    bootstrap_wait_task = named_yaml_sequence_item(
-        provision_play, "Wait robustly for the product reconciler to finish", 4
-    )
-    require("\n      ansible.builtin.async_status:" in bootstrap_wait_task,
-            "bootstrap wait task must use ansible.builtin.async_status")
-    require_yaml_key(
-        bootstrap_wait_task, 8, "jid", '"{{ e2e_bootstrap_job.ansible_job_id }}"'
-    )
-    require_yaml_key(bootstrap_wait_task, 6, "register", "e2e_bootstrap_wait")
-    require_yaml_key(bootstrap_wait_task, 6, "until", "e2e_bootstrap_wait.finished")
-    require_yaml_key(bootstrap_wait_task, 6, "retries", "270")
-    require_yaml_key(bootstrap_wait_task, 6, "delay", "10")
+    require_yaml_key(launch_task, 6, "register", "e2e_bootstrap_wait")
+    require("\n      async:" not in launch_task and "ansible.builtin.async_status" not in provision_play,
+            "bootstrap cloud mutation must remain attached to the managed Ansible process group")
     parallel_assertion = named_yaml_sequence_item(
         provision_play, "Prove exact and parallel three-control-plane provisioning", 4
     )
@@ -582,9 +616,7 @@ def main() -> None:
         "groups: rke2_control_plane",
         "groups: rke2_bastion",
         "strategy: free",
-        "async: 2700",
-        "poll: 0",
-        "ansible.builtin.async_status",
+        "Run the bootstrap reconciler synchronously to readiness",
         "wait_for_connection",
         "systemctl is-active rke2-server",
         "timeout --kill-after=5s 1200s sh -c",
@@ -1109,6 +1141,13 @@ def main() -> None:
             "Flush the VIP neighbor and prove fresh ARP" in playbook,
             "private L2 failover must separately prove GARP update and fresh ARP resolution")
 
+    destroy_task = named_yaml_sequence_item(
+        cleanup, "Destroy only bootstrap-controller-owned infrastructure synchronously", 4
+    )
+    require("\n      ansible.builtin.command:" in destroy_task and
+            "\n      register: e2e_destroy_wait" in destroy_task and
+            "\n      async:" not in destroy_task,
+            "bootstrap destroy must remain attached to the managed Ansible process group")
     ordering = [
         "Delete workload owners before infrastructure owners",
         "Wait for E2E pods PVs and VolumeAttachments to disappear",
@@ -1118,7 +1157,7 @@ def main() -> None:
         "Delete the NodeClass after all worker ownership is gone",
         "Uninstall controllers only after their owners are quiescent",
         "Persist Kubernetes owner quiescence before bootstrap deletion",
-        "Destroy only bootstrap-controller-owned infrastructure asynchronously",
+        "Destroy only bootstrap-controller-owned infrastructure synchronously",
         "Require the final deterministic cloud audit to converge to zero",
         "Close the private API tunnel after the final zero audit",
     ]

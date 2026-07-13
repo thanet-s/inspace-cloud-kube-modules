@@ -195,24 +195,58 @@ CONFIRM_INSPACE_LIVE_TEST="$INSPACE_BILLING_ACCOUNT_ID" make live-test
 
 The lifecycle suite creates only resources named `inspace-e2e-*`, preserves
 firewall protection when deletion is uncertain, and performs a zero-leftover
-audit before and after the run. It covers VM, firewall, floating-IP, TCP-NLB,
-block-disk, and real Karpenter-adapter lifecycles. Never run it against a
-production billing account or from a pull request.
+audit before and after the run. Every test VM uses the configured AMD EPYC
+pool. The suite covers VM, firewall, floating-IP, TCP-NLB, block-disk, and real
+Karpenter-adapter lifecycles. Never run it against a production billing account
+or from a pull request.
 
 ## Full-cluster release acceptance
 
 From a checkout matching an exact published release candidate, the destructive
 release-acceptance suite proves the complete cluster lifecycle: three
-stock-Ubuntu RKE2 control planes with embedded etcd, Cilium native routing and
-kube-proxy replacement, CCM node identity, one Karpenter worker in the selected
-VPC, public-IP egress and RKE2 join, an RWO CSI volume that retains data through
-pod replacement, and a public TCP NLB response. It finishes with an
-exact-ownership, zero-leftover cloud audit.
+stock-Ubuntu RKE2 control planes with embedded etcd, a bastion, and one
+Karpenter worker, all on the configured AMD EPYC pool; Cilium native routing
+and kube-proxy replacement; CCM node identity; public-IP egress and RKE2 join;
+an RWO CSI volume that retains data through pod replacement; and a public TCP
+NLB response. The default workflow finishes with an exact-ownership,
+zero-leftover cloud audit.
 
 ```sh
 export INSPACE_E2E_VERSION='<published-version>'
 export CONFIRM_INSPACE_CLUSTER_E2E="$INSPACE_BILLING_ACCOUNT_ID"
-./test/e2e/run.sh
+make cluster-e2e
+```
+
+The default `all` workflow runs cluster initialization, acceptance tests, and
+destruction in order. Maintainers can preserve and reuse a cluster while
+debugging test-only changes:
+
+```sh
+make cluster-e2e-init
+make cluster-e2e-test
+make cluster-e2e-shell
+make cluster-e2e-test
+make cluster-e2e-destroy
+```
+
+`test`, `shell`, and `destroy` use `INSPACE_E2E_RUN_ID` when set, or the last
+run persisted in the shared state volume otherwise. The interactive shell
+reestablishes the private-API tunnel and exports `KUBECONFIG` for direct
+`kubectl` debugging. Phase containers hold the state-volume lock for their
+entire lifetime; `init`, `test`, and `shell` preserve the cluster instead of
+destroying it on exit or failure. Their durable phase marker also prevents a
+later default run from cleaning them implicitly; use the explicit destroy
+target. A shell can attach after a late init failure once the kubeconfig and
+pinned bastion access facts exist.
+
+If the default workflow was explicitly retained with
+`INSPACE_E2E_KEEP_RESOURCES=true`, its later destroy requires both the selected
+run and explicit retained-cleanup authorization:
+
+```sh
+export INSPACE_E2E_RUN_ID='<persisted-run-id>'
+export INSPACE_E2E_RECOVER_RETAINED=true
+make cluster-e2e-destroy
 ```
 
 The host entrypoint only builds and starts the pinned E2E runner image. The
@@ -223,8 +257,8 @@ recovery, and the fail-closed cleanup contract.
 
 ## CI architecture
 
-Current InSpace Intel and AMD instances are x86-64, so image CI and releases
-build `linux/amd64` by default. Native `linux/arm64` jobs remain available by
+Current InSpace compute instances are x86-64, so image CI and releases build
+`linux/amd64` by default. Native `linux/arm64` jobs remain available by
 setting the repository variable `ENABLE_ARM64_IMAGES=true`; disabled ARM jobs
 remain in the workflows for future instance support. The complete artifact and
 promotion process is documented in [RELEASING.md](RELEASING.md).

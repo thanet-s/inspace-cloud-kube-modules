@@ -55,9 +55,9 @@ authoritative readback before continuing. Karpenter persists ownership schema
 same address as the worker Node's sole `ExternalIP`. The worker proof binds
 Node/NodeClaim/provider ID to one exact VM,
 authoritative VPC membership, private subnet containment, the configured AMD
-EPYC host pool, and its exact FIP. Control planes and the bastion stay on the
-configured Intel Scalable pool, while the Karpenter NodeClass deliberately
-exercises `amd-epyc` worker provisioning.
+EPYC host pool, and its exact FIP. The control planes, bastion, and Karpenter
+worker all use that exact AMD EPYC pool; the NodeClass selects it through the
+`amd-epyc` host class.
 The three control-plane cloud names, guest hostnames, and Kubernetes Node names
 are live-proven as `<clusterResourceName>-cp0`, `-cp1`, and `-cp2`.
 The bastion cloud name and guest hostname are live-proven as
@@ -106,16 +106,23 @@ account inventory exactly equal that persisted baseline, in addition to its
 deterministic ownership audit. A malformed or unidentifiable active API item
 is fatal rather than silently ignored.
 
-One exclusive lock covers the shared state volume, and an existing run ID can
-never be reused for provisioning. A durable pre-mutation checkpoint allows a
-missing journal to be classified as safe only before any remote call could
-mutate state; once mutation may have started, missing or unreadable ownership
-state preserves resources and fails closed. Explicit retention is persisted
+One exclusive lock covers the shared state volume for the full lifetime of
+every phase container. An existing run ID can never be reused by the `init`
+phase for new provisioning, but `test`, `shell`, and `destroy` deliberately
+reuse an initialized run. A durable pre-mutation checkpoint allows a missing
+journal to be classified as safe only before any remote call could mutate
+state; once mutation may have started, missing or unreadable ownership state
+preserves resources and fails closed. Explicit retention is persisted
 independently of the journal and always wins over an old zero audit.
 
-Cleanup runs in a separate Ansible playbook after both success and failure
-(and on signals), unless resource retention was explicitly requested. Owner
-removal is ordered:
+The default `all` phase runs `init-cluster.yml`, then `test.yml`, and finally
+`destroy-cluster.yml`. It attempts destruction after completion or failure and
+on signals unless resource retention was explicitly requested. The standalone
+`init`, `test`, and `shell` phases instead preserve the cluster on success,
+failure, and signals so a failed assertion can be inspected or rerun without
+provisioning the cluster again. The `destroy` phase is the explicit cleanup
+path for those preserved runs. A durable `phase-preserved` marker prevents a
+later default `all` run from cleaning them implicitly. Owner removal is ordered:
 
 1. all public/private workloads, Services, and the PVC;
 2. pods, PV, and VolumeAttachments must disappear;
@@ -140,17 +147,19 @@ The `.env` file and SSH keys are mode-checked read-only bind mounts excluded
 from the build context. The token file is not copied into Docker container
 metadata. Only the SSH public key is submitted to InSpace.
 
-Before a new run, the entrypoint automatically cleans an unfinished last run
-with the same recorded published version and requires its final zero audit. If
-the requested version differs, recover using the recorded version first. A run retained with
-`INSPACE_E2E_KEEP_RESOURCES=true` is never removed implicitly. To clean one
-explicitly retained run without starting another:
+Before a default `all` run, the entrypoint cleans an unfinished non-phased run
+with the same recorded published version and requires its final zero audit. It
+refuses to clean a run carrying the durable phased-workflow marker. The
+standalone `init` phase refuses to start while the last run remains unfinished;
+use `test`, `shell`, or `destroy` for that run first. If the requested version
+differs, select the version recorded in its state before destroying it. A run
+retained with `INSPACE_E2E_KEEP_RESOURCES=true` is never removed implicitly.
+To destroy an explicitly retained run, authorize that exact action:
 
 ```sh
 export INSPACE_E2E_RUN_ID='<persisted-run-id>'
-export INSPACE_E2E_RECOVERY_ONLY=true
 export INSPACE_E2E_RECOVER_RETAINED=true
-./test/e2e/run.sh
+make cluster-e2e-destroy
 ```
 
 ## Run
@@ -162,12 +171,58 @@ and released SemVer:
 ```sh
 export INSPACE_E2E_VERSION='0.2.0-rc.1'
 export CONFIRM_INSPACE_CLUSTER_E2E='<isolated-billing-account-id>'
-./test/e2e/run.sh
+make cluster-e2e
 ```
 
+`make cluster-e2e` selects the default `all` phase, which initializes the
+cluster, runs the acceptance tests, and destroys the cluster with a final zero
+audit. The equivalent direct command is `./test/e2e/run.sh all`; omitting the
+argument also selects `all`.
+
+For development and test debugging, run the phases separately:
+
+```sh
+make cluster-e2e-init
+make cluster-e2e-test
+make cluster-e2e-shell
+# Run kubectl commands inside the tunneled shell, then exit.
+make cluster-e2e-test
+make cluster-e2e-destroy
+```
+
+`init` creates a new run and preserves it. `test` reuses that initialized
+cluster and preserves it whether the tests pass or fail, so test-only changes
+can be exercised repeatedly. `shell` reestablishes the private-API SSH tunnel,
+exports the persisted kubeconfig, and opens an interactive environment where
+commands such as `kubectl get nodes` work directly. Exiting the shell stops its
+local tunnel but leaves the cluster running. Each phase container holds the
+shared state-volume lock until it exits, so a shell blocks concurrent test or
+destroy operations. Inspect or restart pods freely, but do not manually
+delete/recreate the E2E Services or PVC: cleanup authority is bound to their
+persisted UIDs. Use `cluster-e2e-destroy` followed by a new `init` when those
+ownership objects must be replaced.
+
+After a late `init` failure, `shell` can also attach when the ownership journal,
+pinned bastion identity, and tunneled kubeconfig were already created. If the
+failure happened before those access facts existed, the fail-closed option is
+the explicit `destroy` phase.
+
+The `test`, `shell`, and `destroy` phases select `INSPACE_E2E_RUN_ID` when it is
+set; otherwise they select the run recorded in the state volume's
+`last-run-id`. Set the variable explicitly when working with an initialized run
+that is not the most recent one:
+
+```sh
+export INSPACE_E2E_RUN_ID='<persisted-run-id>'
+make cluster-e2e-shell
+```
+
+Preserved phase runs continue to incur charges until `cluster-e2e-destroy`
+completes.
+
 The runner image is built and executed as `linux/amd64` by default, matching
-the Intel and AMD CPU host pools currently available from InSpace. A future
-ARM-backed test account can opt in without changing the launcher:
+the x86-64 AMD EPYC pool used by every E2E VM. A future ARM-backed test account
+can opt in without changing the launcher:
 
 ```sh
 export INSPACE_E2E_RUNNER_PLATFORM='linux/arm64'
@@ -180,23 +235,27 @@ Required `.env` values are `INSPACE_API_URL`, `INSPACE_API_TOKEN`,
 `INSPACE_LOCATION`, `INSPACE_BILLING_ACCOUNT_ID`, `INSPACE_NETWORK_UUID`,
 `INSPACE_CONTROL_PLANE_VIP`, `INSPACE_PRIVATE_LOAD_BALANCER_POOL_START`,
 `INSPACE_PRIVATE_LOAD_BALANCER_POOL_STOP`, and
-`INSPACE_INTEL_HOST_POOL_UUID`, and `INSPACE_AMD_HOST_POOL_UUID`. The Intel
-pool is used by the fixed control planes and bastion; the AMD EPYC pool is
-used by the Karpenter worker. The control-plane VIP must be one unused
+`INSPACE_AMD_HOST_POOL_UUID`. The AMD EPYC pool is used by the fixed control
+planes, bastion, and Karpenter worker. The control-plane VIP must be one unused
 RFC1918 address inside that VPC subnet. The inclusive private Service range
 must contain 16-256 addresses, be excluded from InSpace VM and NLB allocation
 before the run, and not contain that VIP; the current InSpace API cannot
 reserve the range. Optional values include
 `INSPACE_E2E_SSH_USERNAME`, `INSPACE_OS_NAME`, and `INSPACE_OS_VERSION`.
 
-For an explicitly requested debugging session only:
+The default `all` workflow normally destroys its resources. To retain that
+workflow's cluster explicitly after its test phase:
 
 ```sh
 export INSPACE_E2E_KEEP_RESOURCES=true
+make cluster-e2e
 ```
 
-This continues to incur charges and intentionally skips automatic cleanup.
-The state directory is printed by the container for manual recovery.
+This marks the run as retained, continues to incur charges, and skips the
+default automatic destroy. Later cleanup requires
+`INSPACE_E2E_RECOVER_RETAINED=true` with `make cluster-e2e-destroy`, as shown
+above. The standalone phase workflow already preserves its cluster and does
+not require `INSPACE_E2E_KEEP_RESOURCES`.
 
 ## Non-live verification
 
