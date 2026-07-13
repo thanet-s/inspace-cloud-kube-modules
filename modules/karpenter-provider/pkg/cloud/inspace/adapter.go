@@ -443,30 +443,35 @@ func (a *Adapter) readEstablishedVM(ctx context.Context, location, uuid, cluster
 			if sdk.IsNotFound(err) {
 				return nil, ownership{}, cloudapi.ErrNotFound
 			}
-			return nil, ownership{}, err
-		}
-		if vm == nil || vm.UUID != uuid {
-			return nil, ownership{}, fmt.Errorf("%w: canonical VM %s returned invalid detail identity", cloudapi.ErrOwnershipMismatch, uuid)
-		}
-		record, managed, complete, err := inspectOwnershipDescription(vm.Description, clusterName)
-		if err != nil {
-			return nil, ownership{}, fmt.Errorf("canonical VM %s ownership: %w", uuid, err)
-		}
-		if !managed || record.Cluster != clusterName {
-			return nil, ownership{}, fmt.Errorf("%w: VM %s is not managed for cluster %q", cloudapi.ErrOwnershipMismatch, uuid, clusterName)
-		}
-		switch {
-		case !complete:
-			lastObservation = fmt.Errorf("%w: established worker VM %s lacks complete persisted ownership: %w", cloudapi.ErrOwnershipMismatch, uuid, errPersistedOwnershipIncomplete)
-		default:
-			validationErr := validateEstablishedLaunchIdentity(*vm, record)
-			if validationErr == nil {
-				return vm, record, nil
+			if !isRetryableReadback(readbackCtx, err) {
+				return nil, ownership{}, err
 			}
-			if !errors.Is(validationErr, errPersistedOwnershipIncomplete) {
-				return nil, ownership{}, fmt.Errorf("established worker VM %s launch identity drift: %w", uuid, validationErr)
+			lastObservation = fmt.Errorf("reading canonical detail for established VM %s: %w", uuid, err)
+		} else if vm == nil {
+			lastObservation = fmt.Errorf("%w: canonical VM %s detail response is empty: %w", cloudapi.ErrOwnershipMismatch, uuid, errPersistedOwnershipIncomplete)
+		} else if vm.UUID != uuid {
+			return nil, ownership{}, fmt.Errorf("%w: canonical VM %s returned detail UUID %q", cloudapi.ErrOwnershipMismatch, uuid, vm.UUID)
+		} else {
+			record, managed, complete, err := inspectOwnershipDescription(vm.Description, clusterName)
+			if err != nil {
+				return nil, ownership{}, fmt.Errorf("canonical VM %s ownership: %w", uuid, err)
 			}
-			lastObservation = fmt.Errorf("established worker VM %s launch identity has not converged: %w", uuid, validationErr)
+			if !managed || record.Cluster != clusterName {
+				return nil, ownership{}, fmt.Errorf("%w: VM %s is not managed for cluster %q", cloudapi.ErrOwnershipMismatch, uuid, clusterName)
+			}
+			switch {
+			case !complete:
+				lastObservation = fmt.Errorf("%w: established worker VM %s lacks complete persisted ownership: %w", cloudapi.ErrOwnershipMismatch, uuid, errPersistedOwnershipIncomplete)
+			default:
+				validationErr := validateEstablishedLaunchIdentity(*vm, record)
+				if validationErr == nil {
+					return vm, record, nil
+				}
+				if !errors.Is(validationErr, errPersistedOwnershipIncomplete) {
+					return nil, ownership{}, fmt.Errorf("established worker VM %s launch identity drift: %w", uuid, validationErr)
+				}
+				lastObservation = fmt.Errorf("established worker VM %s launch identity has not converged: %w", uuid, validationErr)
+			}
 		}
 		if err := waitForReadback(readbackCtx, readbackDelay); err != nil {
 			return nil, ownership{}, fmt.Errorf("canonical VM %s established identity did not converge before the read-back deadline: %w", uuid, errors.Join(lastObservation, err))
@@ -627,16 +632,18 @@ func (a *Adapter) readCanonicalListedVM(ctx context.Context, location, clusterNa
 		if err != nil {
 			return nil, fmt.Errorf("canonical VM %s ownership: %w", summary.UUID, err)
 		}
+		if canonicalKarpenter && record.Cluster != "" && record.Cluster != clusterName && !ownershipEvidence {
+			// With no list-side target or ambiguous ownership evidence, an
+			// explicit record for another cluster is foreign to this query.
+			// Its cluster and unrelated ownership fields may legitimately
+			// change without blocking target-cluster inventory.
+			return vm, nil
+		}
 		if listedKarpenter && canonicalKarpenter && listedRecord.Cluster != "" && record.Cluster != "" && listedRecord.Cluster != record.Cluster {
 			return nil, fmt.Errorf("%w: canonical Karpenter cluster %q for listed VM %s differs from list cluster %q", cloudapi.ErrOwnershipMismatch, record.Cluster, summary.UUID, listedRecord.Cluster)
 		}
 		if listedRecordComplete && canonicalRecordComplete && listedRecord != record {
 			return nil, fmt.Errorf("%w: canonical Karpenter ownership for listed VM %s differs from its complete list record", cloudapi.ErrOwnershipMismatch, summary.UUID)
-		}
-		if canonicalKarpenter && record.Cluster != "" && record.Cluster != clusterName && !ownershipEvidence {
-			// An explicit record for another cluster is foreign to this query;
-			// its unrelated optional fields need not converge here.
-			return vm, nil
 		}
 		if canonicalRecordComplete && record.Cluster == clusterName {
 			validationErr := validateEstablishedLaunchIdentity(*vm, record)
@@ -2126,12 +2133,28 @@ func parseOwnership(description string) (ownership, bool) {
 }
 
 func inspectOwnershipDescription(description, targetCluster string) (record ownership, karpenter, complete bool, err error) {
-	if json.Unmarshal([]byte(description), &record) == nil {
-		if strings.HasPrefix(record.Schema, ownershipSchemaNamespace) && record.Schema != ownershipSchema {
-			return ownership{}, false, false, fmt.Errorf("%w: unsupported Karpenter ownership schema %q", cloudapi.ErrOwnershipMismatch, record.Schema)
-		}
-		if record.Schema != ownershipSchema {
+	var envelope struct {
+		Schema  json.RawMessage `json:"schema"`
+		Cluster json.RawMessage `json:"cluster"`
+	}
+	if json.Unmarshal([]byte(description), &envelope) == nil {
+		var schema string
+		if json.Unmarshal(envelope.Schema, &schema) != nil {
 			return ownership{}, false, false, nil
+		}
+		if strings.HasPrefix(schema, ownershipSchemaNamespace) && schema != ownershipSchema {
+			return ownership{}, false, false, fmt.Errorf("%w: unsupported Karpenter ownership schema %q", cloudapi.ErrOwnershipMismatch, schema)
+		}
+		if schema != ownershipSchema {
+			return ownership{}, false, false, nil
+		}
+		if json.Unmarshal([]byte(description), &record) != nil {
+			// The minimal schema envelope is authoritative even when another
+			// v1 field has an incompatible JSON type. Preserve any independently
+			// decodable cluster evidence and keep the record fail-closed.
+			record.Schema = ownershipSchema
+			_ = json.Unmarshal(envelope.Cluster, &record.Cluster)
+			return record, true, false, nil
 		}
 		if !ownershipRecordStructurallyComplete(record) {
 			return record, true, false, nil
