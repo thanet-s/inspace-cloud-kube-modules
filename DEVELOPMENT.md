@@ -18,6 +18,133 @@ Module-specific development notes are available for the
 [CSI driver](modules/csi-driver/README.md), and
 [Karpenter provider](modules/karpenter-provider/README.md).
 
+## Network and node contract
+
+This section records implementation invariants for maintainers and release
+validation. The root README intentionally keeps only the user-facing summary.
+
+### Public egress and private identity
+
+InSpace does not provide shared outbound NAT for private-only VMs. Every
+control-plane, Karpenter worker, and bastion VM therefore requests one floating
+public IPv4 in its initial VM create call so internet egress is available to
+cloud-init from first boot.
+
+The floating address is not configured on the guest NIC. RKE2 uses the NIC's
+RFC1918 address for node identity and cluster traffic, and worker cloud-init does
+not set `node-external-ip`. The external CCM reads the exact floating-IP
+assignment from the InSpace API and publishes it as `NodeExternalIP`; it does
+not infer it from the NIC or a VM `public_ipv4` field.
+
+Only the bastion accepts public ingress, restricted by the InSpace firewall to
+TCP/22 from the operator's exact `/32`. Control-plane and worker floating IPs
+are egress-only, and their firewalls reject all public inbound rules. Ansible
+reaches private node addresses through the bastion. A VM is not ready until its
+intended cloud firewall assignment has been read back and verified.
+
+The bootstrap-owned bastion is fixed to Ubuntu 24.04, 1 vCPU, 2 GiB RAM, and a
+30 GiB root disk. Fixed control-plane nodes require Ubuntu 24.04 with at least
+2 vCPUs and 4 GiB RAM.
+
+### Node naming and preparation
+
+The control-plane VM names, guest hostnames, and Kubernetes Node names are
+exactly `<InSpaceCluster metadata.name>-cp0`, `-cp1`, and `-cp2`. The bastion is
+exactly `<InSpaceCluster metadata.name>-bastion`. Cluster names are limited to
+55 characters so every generated hostname remains a DNS label.
+
+Elastic worker VM names, guest hostnames, and Kubernetes Node names are
+`<cluster>-karp-<NodePool>-<random>`. The provider derives the NodePool and
+random suffix from the Karpenter NodeClaim name, while the original NodeClaim
+identity remains the cloud ownership and deletion key.
+
+Control planes and workers disable swap, rewrite stock Ubuntu archive endpoints
+to the Thailand mirror when present, and apply persistent Kubernetes sysctls,
+PAM limits, and RKE2 systemd limits before starting RKE2. Node firewalls are
+validated fail-closed for all-port TCP, UDP, and ICMP coverage from both the VPC
+subnet and native-routing pod CIDR, with matching outbound access.
+
+### RKE2, Cilium, and the control-plane VIP
+
+RKE2 uses its bundled Cilium chart in native-routing mode. Cilium installs
+direct pod-CIDR routes on the shared VPC, performs eBPF IPv4 masquerading for
+internet egress, and fully replaces kube-proxy with eBPF service handling.
+
+A private kube-vip address inside the VPC is advertised by control-plane nodes
+with ARP leader election. It is the stable RKE2 API endpoint on TCP/6443 and
+registration endpoint on TCP/9345. Bootstrap creates neither a control-plane
+NLB nor a public API endpoint.
+
+The kube-vip static Pod mounts `/etc/rancher/rke2/rke2.yaml` from the host at
+`/etc/kubernetes/admin.conf`, maps the `kubernetes` hostname to `127.0.0.1`, and
+does not rely on a `k8s_config_file` override. The downward API supplies
+`vip_nodename` from `spec.nodeName`, so the Lease holder is the exact
+control-plane Node. The container drops all Linux capabilities and adds only
+`NET_ADMIN` and `NET_RAW`.
+
+### Private and public Service load balancing
+
+Private `LoadBalancer` Services use Cilium LoadBalancer IPAM and L2
+Announcements. LB IPAM assigns a distinct private VIP to each Service, allowing
+multiple Services to reuse the same port without purchasing an InSpace NLB.
+The supported private contract is:
+
+```yaml
+metadata:
+  labels:
+    inspace.cloud/load-balancer-scope: private
+spec:
+  type: LoadBalancer
+  loadBalancerClass: io.cilium/l2-announcer
+  externalTrafficPolicy: Cluster
+```
+
+Bootstrap sets `defaultLBServiceIPAM: none`, so Cilium claims only its explicit
+class and cannot race the generic external CCM. Cilium Node IPAM is disabled;
+`loadBalancerClass: io.cilium/node` is unsupported. Public exposure remains an
+explicit, paid, TCP-only InSpace NLB path documented in the
+[public Service example](charts/inspace-cloud-kube-modules/examples/service-public-nlb.yaml).
+
+Operators must reserve an inclusive 16-256-address RFC1918 range for Cilium LB
+IPAM and exclude it from InSpace VM and NLB allocation. The InSpace API has no
+range-reservation operation, so controllers detect collisions and fail closed
+but cannot create the reservation. Treat the range as immutable after cluster
+creation because changing it can reassign Service VIPs.
+
+Cilium L2 Announcements is a beta feature and requires the VPC to accept ARP and
+gratuitous ARP for VIPs not assigned to a VM NIC. Release acceptance must prove
+that behavior before production use.
+
+The workload chart's `global.inspace.controlPlaneVIP`, VPC UUID, and private
+load-balancer range must exactly match bootstrap and every NodeClass. CCM uses
+the VIP and range to reject public-NLB address collisions; Karpenter rejects a
+NodeClass that differs before cloud validation or worker provisioning.
+
+### Worker ownership and deletion
+
+Every VM create request carries the configured VPC UUID. Karpenter additionally
+requires the created VM UUID to appear exactly once in the network's
+authoritative `vm_uuids` readback.
+
+Workers are created with `reserve_public_ip=true`. InSpace initially assigns a
+nameless floating IP while the VM's `public_ipv4` remains empty. Karpenter
+assigns the prevalidated cloud firewall immediately after the VM POST and proves
+its exact policy and sole assignment. It then discovers the VM's sole floating
+IP, validates it, patches its deterministic name and billing account, and
+requires exact readback.
+
+Version 3 ownership records persist the deterministic floating-IP name but omit
+`publicIPv4`; the live assignment remains authoritative. The returned NodeClaim
+stores the exact name, address, and billing account as durable orphan-cleanup
+identity. Deletion unassigns and deletes that floating IP first, deletes the VM
+only after FIP convergence, proves canonical VM absence, and finally removes
+every stale firewall assignment for the exact VM UUID. The shared firewall
+itself is not deleted with an individual worker.
+
+Full-cluster acceptance binds the VM UUID to the Kubernetes Node provider ID,
+requires its sole `InternalIP` to belong to the configured VPC, and requires the
+CCM-published `ExternalIP` to equal the assigned floating IP.
+
 ## Credentials and safety
 
 Copy [`.env.example`](.env.example) to `.env` for local credentials and set
