@@ -62,7 +62,7 @@ func TestCatalogHasAll24BoundedVariants(t *testing.T) {
 			hostClass := offering.Requirements.Get(LabelHostClass).Any()
 			hostClasses[hostClass] = true
 			hostPrices[hostClass] = offering.Price
-			if want := hourlyPriceTHB(cores, memoryGiB, 40); offering.Price != want {
+			if want := hourlyComputePriceTHB(cores, memoryGiB); offering.Price != want {
 				t.Fatalf("%s %s hourly price=%v THB, want %v THB", instanceType.Name, hostClass, offering.Price, want)
 			}
 		}
@@ -90,31 +90,50 @@ func TestCatalogHasAll24BoundedVariants(t *testing.T) {
 	}
 }
 
-func TestInSpaceCalculatorPriceFormula(t *testing.T) {
+func TestInSpaceComputePriceFormula(t *testing.T) {
 	tests := []struct {
 		name            string
 		cores           int
 		memoryGiB       int
-		diskGiB         int32
 		monthlyPriceTHB float64
 	}{
-		{name: "1 CPU 2 GiB RAM 30 GiB disk", cores: 1, memoryGiB: 2, diskGiB: 30, monthlyPriceTHB: 150},
-		{name: "2 CPU 4 GiB RAM 60 GiB disk", cores: 2, memoryGiB: 4, diskGiB: 60, monthlyPriceTHB: 300},
-		{name: "4 CPU 8 GiB RAM 120 GiB disk", cores: 4, memoryGiB: 8, diskGiB: 120, monthlyPriceTHB: 600},
-		{name: "8 CPU 16 GiB RAM 240 GiB disk", cores: 8, memoryGiB: 16, diskGiB: 240, monthlyPriceTHB: 1200},
-		{name: "2 CPU 8 GiB RAM 60 GiB disk", cores: 2, memoryGiB: 8, diskGiB: 60, monthlyPriceTHB: 420},
-		{name: "6 CPU 8 GiB RAM 60 GiB disk", cores: 6, memoryGiB: 8, diskGiB: 60, monthlyPriceTHB: 660},
-		{name: "10 CPU 26 GiB RAM 60 GiB disk", cores: 10, memoryGiB: 26, diskGiB: 60, monthlyPriceTHB: 1440},
+		{name: "1 CPU 2 GiB RAM", cores: 1, memoryGiB: 2, monthlyPriceTHB: 120},
+		{name: "2 CPU 4 GiB RAM", cores: 2, memoryGiB: 4, monthlyPriceTHB: 240},
+		{name: "2 CPU 8 GiB RAM", cores: 2, memoryGiB: 8, monthlyPriceTHB: 360},
+		{name: "6 CPU 8 GiB RAM", cores: 6, memoryGiB: 8, monthlyPriceTHB: 600},
+		{name: "10 CPU 26 GiB RAM", cores: 10, memoryGiB: 26, monthlyPriceTHB: 1380},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			if got := monthlyPriceTHB(test.cores, test.memoryGiB, test.diskGiB); got != test.monthlyPriceTHB {
+			if got := monthlyComputePriceTHB(test.cores, test.memoryGiB); got != test.monthlyPriceTHB {
 				t.Fatalf("monthly price=%v THB, want %v THB", got, test.monthlyPriceTHB)
 			}
-			if got, want := hourlyPriceTHB(test.cores, test.memoryGiB, test.diskGiB), test.monthlyPriceTHB/billingHoursPerMonth; got != want {
+			if got, want := hourlyComputePriceTHB(test.cores, test.memoryGiB), test.monthlyPriceTHB/billingHoursPerMonth; got != want {
 				t.Fatalf("hourly price=%v THB, want %v THB", got, want)
 			}
 		})
+	}
+}
+
+func TestCatalogPriceIgnoresNodeClassRootDisk(t *testing.T) {
+	smallDisk, err := New(Options{RootDiskGiB: 30})
+	if err != nil {
+		t.Fatal(err)
+	}
+	largeDisk, err := New(Options{RootDiskGiB: 2000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index := range smallDisk {
+		if smallDisk[index].Name != largeDisk[index].Name {
+			t.Fatalf("catalog order differs at %d: %s != %s", index, smallDisk[index].Name, largeDisk[index].Name)
+		}
+		for offeringIndex := range smallDisk[index].Offerings {
+			if smallDisk[index].Offerings[offeringIndex].Price != largeDisk[index].Offerings[offeringIndex].Price {
+				t.Fatalf("%s price changed with root disk: %v != %v", smallDisk[index].Name,
+					smallDisk[index].Offerings[offeringIndex].Price, largeDisk[index].Offerings[offeringIndex].Price)
+			}
+		}
 	}
 }
 

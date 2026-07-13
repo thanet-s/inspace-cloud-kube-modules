@@ -40,11 +40,13 @@ reports them as `status.hostPoolUUIDs`.
 > both equal-priced offerings eligible and no longer guarantee AMD. Use
 > `values: [intel-scalable, amd-epyc]` when both classes are intentional.
 
-Catalog offering prices follow the current InSpace custom-VM calculator:
-`monthly THB = CPU cores × 60 + RAM GiB × 30 + root-disk GiB × 1`, converted
-to hourly THB with 730 billing hours per month. Intel and AMD offerings for the
-same VM shape have the same price. Revalidate these frozen rates against
-InSpace before using cost-based consolidation decisions in production.
+Catalog offering prices use only the compute rates derived from the current
+InSpace custom-VM calculator: `monthly compute THB = CPU cores × 60 + RAM GiB
+× 30`, converted to hourly THB with 730 billing hours per month. Root-disk cost
+is intentionally excluded from Karpenter's price score; disk size remains a
+NodeClass capacity constraint. Intel and AMD offerings for the same VM shape
+have the same price. Revalidate these frozen rates against InSpace before using
+cost-based consolidation decisions in production.
 
 `spec.rke2` is the required bootstrap contract; the legacy `spec.k3s` field is
 not accepted. The RKE2 bootstrap schema has a distinct drift hash, including
