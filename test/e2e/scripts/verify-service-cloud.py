@@ -24,6 +24,12 @@ def api_get(path: str):
     return value
 
 
+def require_nonvirtual_flag(value: object) -> None:
+    """Accept only the two raw API encodings for a non-virtual address."""
+    if value is not None and value is not False:
+        raise SystemExit("public Service FIP must be a non-virtual InSpace address")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--state", required=True)
@@ -105,11 +111,11 @@ def main() -> None:
     ):
         raise SystemExit("public InSpace NLB private address collides with the control-plane VIP or reserved Cilium pool")
     public_address = ipaddress.ip_address(str(floating_ip.get("address")))
+    require_nonvirtual_flag(floating_ip.get("is_virtual"))
     if (
         public_address.version != 4
         or not public_address.is_global
         or floating_ip.get("enabled") is not True
-        or floating_ip.get("is_virtual") is not False
         or floating_ip.get("type") != "public"
         or floating_ip.get("assigned_to") != load_balancer.get("uuid")
         or floating_ip.get("assigned_to_resource_type") != "load_balancer"
