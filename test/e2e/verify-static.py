@@ -675,6 +675,11 @@ def main() -> None:
             "nodeIPAM:[[:space:]]*$" in playbook and
             "enabled:[[:space:]]*false" in playbook,
             "live Cilium checks must disable default and Node IPAM paths")
+    require('"cilium.io/IPAMRequestSatisfied"' in playbook and
+            'startswith("cilium.io/")' in playbook and
+            '"io.cilium/lb-ipam-request-satisfied"' not in playbook and
+            'startswith("io.cilium/")' not in playbook,
+            "live Service checks must use the current Cilium status-condition namespace")
     require(playbook.count("use_proxy: false") >= 4,
             "live HTTP probes must bypass ambient controller proxies")
     require("e2e-persistence-sentinel" in playbook and
@@ -725,6 +730,19 @@ def main() -> None:
             'choices=("present", "absent")' in service_cloud and
             "public Service NLB/FIP cleanup has not completed" in service_cloud,
             "service cloud verifier must prove private zero ownership and public transition cleanup")
+    service_cloud_module = load_script_module(
+        "e2e_verify_service_cloud_static", ROOT / "scripts/verify-service-cloud.py"
+    )
+    for accepted_nonvirtual in (None, False):
+        service_cloud_module.require_nonvirtual_flag(accepted_nonvirtual)
+    for contradictory_nonvirtual in (True, 0, "false", [], {}):
+        try:
+            service_cloud_module.require_nonvirtual_flag(contradictory_nonvirtual)
+        except SystemExit as error:
+            require("non-virtual InSpace address" in str(error),
+                    "service cloud verifier returned the wrong virtual-FIP diagnostic")
+        else:
+            require(False, f"service cloud verifier accepted invalid is_virtual={contradictory_nonvirtual!r}")
     require("private_address == control_plane_vip" in service_cloud,
             "public Service proof must reject a control-plane VIP collision")
     require("targets must be exactly three control planes and one worker" in service_cloud and
@@ -1034,7 +1052,7 @@ def main() -> None:
             "deterministic_floating_ip_name(" in worker_discovery and
             "worker Node ExternalIP must equal its exact assigned FIP" in worker_discovery and
             'externalIPs:[$node.status.addresses[]|select(.type=="ExternalIP")|.address]' in playbook and
-            ".status.nodeName == $nodeName" in playbook and
+            "'.status.nodeName == $nodeName' <<<\"$nodeclaim\" >/dev/null" in playbook and
             'test "$(hostname)" = "{{ e2e_node_name }}"' in playbook and
             'record.get("hostClass") != "amd-epyc"' in worker_discovery and
             'vm.get("designated_pool_uuid") != amd_pool_uuid' in worker_discovery,

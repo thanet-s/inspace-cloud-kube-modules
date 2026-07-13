@@ -1353,7 +1353,7 @@
           [.items[] | select(.status.providerID == $providerID)] |
           if length == 1 then .[0] else error("expected one NodeClaim bound through the worker provider ID") end')
         node_name=$(jq -er '.metadata.name' <<<"$node")
-        jq -e --arg nodeName "$node_name" '.status.nodeName == $nodeName' <<<"$nodeclaim"
+        jq -e --arg nodeName "$node_name" '.status.nodeName == $nodeName' <<<"$nodeclaim" >/dev/null
         jq -cn --argjson node "$node" --argjson nodeclaim "$nodeclaim" '
           {name:$node.metadata.name,nodeClaimName:$nodeclaim.metadata.name,providerID:$node.spec.providerID,
            internalIPs:[$node.status.addresses[]|select(.type=="InternalIP")|.address],
@@ -1681,7 +1681,7 @@
                 raise SystemExit("private Service VIP is outside the reserved range")
             conditions = service.get("status", {}).get("conditions", [])
             if not any(
-                condition.get("type") == "io.cilium/lb-ipam-request-satisfied"
+                condition.get("type") == "cilium.io/IPAMRequestSatisfied"
                 and condition.get("status") == "True"
                 for condition in conditions
             ):
@@ -2012,7 +2012,7 @@
           .metadata.annotations["service.beta.kubernetes.io/inspace-load-balancer-public"] == "true" and
           (.spec.loadBalancerClass == null) and
           .spec.externalTrafficPolicy == "Cluster" and
-          all(.status.conditions[]?; (.type | startswith("io.cilium/")) | not)'
+          all(.status.conditions[]?; (.type | startswith("cilium.io/")) | not)'
         kubectl get services --all-namespaces -o json | jq -e '
           all(.items[]; .spec.loadBalancerClass != "io.cilium/node")'
         kubectl -n kube-system get leases -o json | jq -e '
