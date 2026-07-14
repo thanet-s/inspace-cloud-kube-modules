@@ -582,7 +582,7 @@
           test "$(docker compose -f "$compose_file" ps --services --status running "$service")" = "$service"
           container_id=$(docker compose -f "$compose_file" ps -q "$service")
           test -n "$container_id"
-          docker inspect "$container_id" | grep -Fq '"Status": "healthy"'
+          test "$(docker inspect --format '{{ '{{' }}.State.Health.Status{{ '}}' }}' "$container_id")" = healthy
         done
         test "$(docker compose -f "$compose_file" ps --services --status running | wc -l)" -eq 2
         test "$(awk -F '\t' 'NF == 2 { count++ } END { print count + 0 }' /etc/inspace-cache/images.tsv)" -eq 34

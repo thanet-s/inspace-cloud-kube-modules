@@ -967,7 +967,8 @@ def main() -> None:
         "mountpoint -q /var/lib/inspace/bootstrap-cache",
         "findmnt -n -o FSTYPE /var/lib/inspace/bootstrap-cache",
         "docker compose -f \"$compose_file\" ps --services --status running",
-        '\"Status\": \"healthy\"',
+        "docker inspect --format",
+        ".State.Health.Status",
         "Public Key Algorithm: id-ecPublicKey",
         "ASN1 OID: prime256v1",
         '-verify_hostname "$cache_host"',
@@ -980,6 +981,8 @@ def main() -> None:
         'test "$write_status" = 403',
     ):
         require(marker in bastion_cache, f"bastion cache acceptance is missing: {marker}")
+    require('docker inspect "$container_id" | grep -Fq' not in bastion_cache,
+            "bastion health acceptance must not use an early-closing grep pipeline under pipefail")
     require('test "$cache_address" = "{{ e2e_private_ip }}"' in bastion_cache,
             "bastion cache acceptance must use the allocator-assigned bastion private address")
     require('e2e_node_name: "{{ e2e_state.bastionName }}"' in playbook,
