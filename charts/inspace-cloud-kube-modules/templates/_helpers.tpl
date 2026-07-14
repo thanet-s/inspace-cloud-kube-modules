@@ -55,11 +55,27 @@ app.kubernetes.io/instance: {{ .root.Release.Name }}
 {{- default .Release.Namespace .Values.karpenter.namespace -}}
 {{- end -}}
 
-{{- define "inspace.image" -}}
-{{- if .image.digest -}}
-{{- printf "%s@%s" .image.repository .image.digest -}}
+{{/*
+Rewrite only system images owned by this chart. User-supplied repositories
+outside the two explicit source namespaces are intentionally left unchanged.
+*/}}
+{{- define "inspace.systemImage" -}}
+{{- $registry := .root.Values.global.inspace.systemImageRegistry -}}
+{{- if and $registry (hasPrefix "ghcr.io/thanet-s/" .image) -}}
+{{- printf "%s/%s" $registry (trimPrefix "ghcr.io/" .image) -}}
+{{- else if and $registry (hasPrefix "registry.k8s.io/sig-storage/" .image) -}}
+{{- printf "%s/%s" $registry (trimPrefix "registry.k8s.io/" .image) -}}
 {{- else -}}
-{{- printf "%s:%s" .image.repository (default .root.Chart.AppVersion .image.tag) -}}
+{{- .image -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "inspace.image" -}}
+{{- $repository := include "inspace.systemImage" (dict "root" .root "image" .image.repository) -}}
+{{- if .image.digest -}}
+{{- printf "%s@%s" $repository .image.digest -}}
+{{- else -}}
+{{- printf "%s:%s" $repository (default .root.Chart.AppVersion .image.tag) -}}
 {{- end -}}
 {{- end -}}
 

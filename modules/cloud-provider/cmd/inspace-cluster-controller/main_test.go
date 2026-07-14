@@ -63,6 +63,55 @@ func TestParseTCPPorts(t *testing.T) {
 	}
 }
 
+func TestLoadBootstrapCacheSettingsRequiresPersistedKeyAndRealInitializationTime(t *testing.T) {
+	cluster := &v1alpha1.InSpaceCluster{}
+	notBefore := time.Now().UTC().Add(-time.Minute).Truncate(time.Second)
+	t.Setenv("INSPACE_BOOTSTRAP_CACHE_KEY", strings.Repeat("ab", 32))
+	t.Setenv("INSPACE_BOOTSTRAP_CACHE_NOT_BEFORE", notBefore.Format(time.RFC3339))
+	key, gotNotBefore, err := loadBootstrapCacheSettings(cluster, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(key) != 32 || gotNotBefore != notBefore {
+		t.Fatalf("cache settings = %x %s", key, gotNotBefore)
+	}
+
+	cluster.Spec.BootstrapCache.DirectDownload = true
+	t.Setenv("INSPACE_BOOTSTRAP_CACHE_KEY", "")
+	t.Setenv("INSPACE_BOOTSTRAP_CACHE_NOT_BEFORE", "")
+	if key, start, err := loadBootstrapCacheSettings(cluster, false); err != nil || key != nil || !start.IsZero() {
+		t.Fatalf("direct-download settings = %x %s %v", key, start, err)
+	}
+	cluster.Spec.BootstrapCache.DirectDownload = false
+	if key, start, err := loadBootstrapCacheSettings(cluster, true); err != nil || key != nil || !start.IsZero() {
+		t.Fatalf("destroy settings = %x %s %v", key, start, err)
+	}
+}
+
+func TestLoadBootstrapCacheSettingsRejectsUnstableOrExpiredInputs(t *testing.T) {
+	cluster := &v1alpha1.InSpaceCluster{}
+	validTime := time.Now().UTC().Add(-time.Minute).Truncate(time.Second).Format(time.RFC3339)
+	for name, values := range map[string][2]string{
+		"short key":        {"abcd", validTime},
+		"uppercase key":    {strings.Repeat("AB", 32), validTime},
+		"invalid key":      {strings.Repeat("zz", 32), validTime},
+		"missing time":     {strings.Repeat("ab", 32), ""},
+		"fractional time":  {strings.Repeat("ab", 32), time.Now().UTC().Format(time.RFC3339Nano)},
+		"near-future time": {strings.Repeat("ab", 32), time.Now().UTC().Add(2 * time.Minute).Truncate(time.Second).Format(time.RFC3339)},
+		"future time":      {strings.Repeat("ab", 32), time.Now().UTC().Add(time.Hour).Truncate(time.Second).Format(time.RFC3339)},
+		"expired time":     {strings.Repeat("ab", 32), time.Now().UTC().AddDate(-16, 0, 0).Truncate(time.Second).Format(time.RFC3339)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			key, start := values[0], values[1]
+			t.Setenv("INSPACE_BOOTSTRAP_CACHE_KEY", key)
+			t.Setenv("INSPACE_BOOTSTRAP_CACHE_NOT_BEFORE", start)
+			if _, _, err := loadBootstrapCacheSettings(cluster, false); err == nil {
+				t.Fatal("expected validation error")
+			}
+		})
+	}
+}
+
 func TestEmitJSONResult(t *testing.T) {
 	file, err := os.CreateTemp(t.TempDir(), "result-*.json")
 	if err != nil {

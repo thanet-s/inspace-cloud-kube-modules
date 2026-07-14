@@ -50,12 +50,16 @@ type Options struct {
 	NetworkUUID             string
 	ControlPlaneVIP         string
 	PrivateLoadBalancerPool inspacev1.PrivateLoadBalancerPool
+	// CacheHealthProber is injectable for deterministic tests. Nil uses the
+	// strict private-HTTPS implementation.
+	CacheHealthProber CacheHealthProber
 }
 
 type CloudProvider struct {
 	cloud    cloudapi.Cloud
 	resolver NodeClassResolver
 	opts     Options
+	cache    CacheHealthProber
 }
 
 func New(cloud cloudapi.Cloud, resolver NodeClassResolver, opts Options) (*CloudProvider, error) {
@@ -82,7 +86,11 @@ func New(cloud cloudapi.Cloud, resolver NodeClassResolver, opts Options) (*Cloud
 	if opts.Location == "" {
 		opts.Location = inspacev1.LocationBangkok
 	}
-	return &CloudProvider{cloud: cloud, resolver: resolver, opts: opts}, nil
+	cache := opts.CacheHealthProber
+	if cache == nil {
+		cache = HTTPSCacheHealthProber{}
+	}
+	return &CloudProvider{cloud: cloud, resolver: resolver, opts: opts, cache: cache}, nil
 }
 
 func (p *CloudProvider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim) (*karpv1.NodeClaim, error) {
@@ -102,6 +110,15 @@ func (p *CloudProvider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim)
 	}
 	if err := ensureNodeClassReady(nodeClass); err != nil {
 		return nil, cloudprovider.NewNodeClassNotReadyError(err)
+	}
+	if !nodeClass.Spec.BootstrapCache.DirectDownload {
+		if err := p.cache.Probe(ctx,
+			inspacev1.BootstrapCacheHealthURL(nodeClass.Spec.ClusterName),
+			nodeClass.Spec.BootstrapCache.Address,
+			nodeClass.Spec.BootstrapCache.CABundle,
+		); err != nil {
+			return nil, cloudprovider.NewNodeClassNotReadyError(fmt.Errorf("bootstrap cache health probe: %w", err))
+		}
 	}
 	controlPlaneVIP, err := nodeClass.Spec.RKE2.ServerVIP()
 	if err != nil {
@@ -124,7 +141,7 @@ func (p *CloudProvider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim)
 	if err != nil {
 		return nil, cloudprovider.NewNodeClassNotReadyError(err)
 	}
-	userData, err := bootstrap.RenderCloudInit(bootstrap.Config{
+	bootstrapConfig := bootstrap.Config{
 		NodeName:         workerName,
 		Server:           nodeClass.Spec.RKE2.Server,
 		Token:            token,
@@ -132,7 +149,15 @@ func (p *CloudProvider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim)
 		Labels:           labels,
 		Taints:           append(append([]corev1.Taint{}, nodeClaim.Spec.Taints...), nodeClaim.Spec.StartupTaints...),
 		AdditionalScript: nodeClass.Spec.AdditionalUserData,
-	})
+	}
+	if !nodeClass.Spec.BootstrapCache.DirectDownload {
+		bootstrapConfig.BootstrapCache = &bootstrap.CacheConfig{
+			Host:     inspacev1.BootstrapCacheHost(nodeClass.Spec.ClusterName),
+			Address:  nodeClass.Spec.BootstrapCache.Address,
+			CABundle: nodeClass.Spec.BootstrapCache.CABundle,
+		}
+	}
+	userData, err := bootstrap.RenderCloudInit(bootstrapConfig)
 	if err != nil {
 		return nil, fmt.Errorf("rendering worker bootstrap: %w", err)
 	}
@@ -549,10 +574,12 @@ func BootstrapHash(nodeClass *inspacev1.InSpaceNodeClass) string {
 		SSHUsername        string
 		SSHPublicKey       string
 		AdditionalUserData string
+		BootstrapCache     inspacev1.BootstrapCacheSpec
 	}{
 		Schema: bootstrap.SchemaVersion, Image: nodeClass.Spec.ImageSelector, RKE2: nodeClass.Spec.RKE2,
 		SSHUsername: nodeClass.Spec.SSHUsername, SSHPublicKey: nodeClass.Spec.SSHPublicKey,
 		AdditionalUserData: nodeClass.Spec.AdditionalUserData,
+		BootstrapCache:     nodeClass.Spec.BootstrapCache,
 	})
 	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:16])

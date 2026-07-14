@@ -74,7 +74,7 @@ spec:
             - name: devices
               mountPath: /dev
         - name: node-driver-registrar
-          image: {{ .Values.csi.sidecars.registrar.image }}
+          image: {{ include "inspace.systemImage" (dict "root" . "image" .Values.csi.sidecars.registrar.image) }}
           args:
             - --csi-address=/csi/csi.sock
             - --kubelet-registration-path={{ .Values.csi.node.kubeletDir }}/plugins/csi.inspace.cloud/csi.sock
@@ -88,7 +88,7 @@ spec:
             capabilities:
               drop: ["ALL"]
         - name: liveness-probe
-          image: {{ .Values.csi.sidecars.livenessProbe.image }}
+          image: {{ include "inspace.systemImage" (dict "root" . "image" .Values.csi.sidecars.livenessProbe.image) }}
           args:
             - --csi-address=/csi/csi.sock
             - --health-port=9808

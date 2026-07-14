@@ -12,9 +12,11 @@ resources. For normal upgrades, keep the release installed and run
 `helm upgrade --install`.
 
 ```sh
+export VERSION='<release-version>'
+
 helm upgrade --install inspace-cloud-kube-modules-crds \
   oci://ghcr.io/thanet-s/charts/inspace-cloud-kube-modules-crds \
-  --version 0.1.0
+  --version "$VERSION"
 ```
 
 The Karpenter files are copied byte-for-byte from

@@ -1,6 +1,9 @@
 # Replace the zero UUID and example names with the cluster's real values.
 global:
   inspace:
+    # Empty pulls chart-owned system images directly. Set this to the bastion
+    # cache registry host, for example cache.cluster.inspace.internal:8443.
+    systemImageRegistry: ""
     networkUUID: 11111111-1111-4111-8111-111111111111
     clusterID: example-rke2
     controlPlaneVIP: 10.20.30.10

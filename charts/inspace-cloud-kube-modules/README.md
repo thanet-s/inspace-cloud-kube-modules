@@ -112,10 +112,43 @@ chart into `kube-system` needs exactly one cloud API Secret object. Set
 namespaces, so the same existing cloud API Secret contract must then also be
 provisioned in that namespace. The chart never copies secret data.
 
+## System image registry
+
+`global.inspace.systemImageRegistry` optionally redirects only the system
+images owned by this chart through one registry host. It does not select the
+cluster bootstrap mode. For the default cached mode, set it to the stable
+bastion endpoint after its ECDSA P-256 CA trust has been installed on every
+node. Bootstrap mints that CA and the server certificate from the persisted
+real cluster-initialization instant for exactly 15 calendar years. Leave it
+empty (the chart default) only for explicit direct-download mode. Use a host
+without a URL scheme or path, for example:
+
+```yaml
+global:
+  inspace:
+    systemImageRegistry: cache.<cluster>.inspace.internal:8443
+```
+
+When set, the chart applies these exact rewrites while preserving tags and
+digests:
+
+| Source | Rendered repository prefix |
+| --- | --- |
+| `ghcr.io/thanet-s/*` | `cache.<cluster>.inspace.internal:8443/thanet-s/*` |
+| `registry.k8s.io/sig-storage/*` | `cache.<cluster>.inspace.internal:8443/sig-storage/*` |
+
+The setting covers the CCM, CSI, Karpenter, and CSI sidecar images rendered by
+this chart. It does not rewrite kubelet, RKE2, Cilium, kube-vip, user-supplied
+repositories outside those two prefixes, or arbitrary workload images. The
+registry and its CA trust must already be configured on every node before
+enabling this value. The bastion registry is private and read-only: its TLS
+frontend accepts only `GET` and `HEAD`, and it must not be exposed through a
+public load balancer.
+
 ## Install
 
 ```sh
-export VERSION=0.1.0
+export VERSION='<release-version>'
 
 helm upgrade --install inspace-cloud-kube-modules-crds \
   oci://ghcr.io/thanet-s/charts/inspace-cloud-kube-modules-crds \

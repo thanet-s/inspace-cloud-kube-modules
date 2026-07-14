@@ -7,6 +7,9 @@ global:
     apiBaseURL: https://api.inspace.cloud
     location: bkk01
     region: thailand
+    # Optional registry host (without a scheme or path) for chart-owned system
+    # images. Empty keeps direct pulls from GHCR and registry.k8s.io.
+    systemImageRegistry: ""
     networkUUID: ""
     clusterID: ""
     # Private kube-vip used by the RKE2 API and supervisor endpoints. CCM uses

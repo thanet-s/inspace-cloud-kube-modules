@@ -51,6 +51,26 @@ existing
 K3s-backed NodeClaims are treated as drifted and replaced through Karpenter's
 normal disruption controls after their NodeClasses are migrated.
 
+`spec.bootstrapCache` makes the worker download path explicit. A cached
+NodeClass sets `directDownload: false`, the bastion's canonical RFC1918
+`address`, and the PEM public `caBundle` produced by control-plane bootstrap.
+The provider derives `cache.<spec.clusterName>.inspace.internal:8443`, probes
+that endpoint with the pinned CA before creating a billable VM, and binds the
+stable hostname to the supplied address in worker `/etc/hosts`. Worker
+cloud-init then downloads the RKE2 release assets from the cache and configures
+RKE2's system-default registry to use it.
+
+A direct NodeClass sets `directDownload: true` and must omit both `address` and
+`caBundle`. It downloads RKE2 assets and system images from their upstream
+HTTPS locations and installs no cache CA, host entry, or registry setting.
+The cached-mode CA is an ECDSA P-256 certificate minted from the persisted real
+cluster-initialization instant with an exact 15-calendar-year validity window.
+Keep the NodeClass mode aligned with `InSpaceCluster.spec.bootstrapCache`; a
+partially configured cache is rejected rather than silently falling back to
+the public internet. The registry configuration contains no public-registry
+mirror rules, so arbitrary workload images retain their original repositories
+in either mode.
+
 ## Public IPv4 and firewall model
 
 InSpace currently has no managed NAT gateway, so each worker must have exactly one provider-owned floating public IPv4 for internet egress. It is reserved in the initial VM create request so cloud-init has internet access from first boot. The guest NIC still exposes exactly one private RFC1918 address. The private address is the Kubernetes `InternalIP`; the CCM publishes the floating address only as `ExternalIP`. The managed firewall blocks public ingress to the floating address.
@@ -226,6 +246,9 @@ Worker network policy relies on the validated InSpace cloud firewall. Generated 
 - persists and applies IPv4 forwarding plus the RKE2-recommended inotify instance/watch limits under `/etc/sysctl.d`;
 - persists a high `nofile` PAM limit and applies `NOFILE`, unlimited process/memory-lock, and unlimited task limits directly to `rke2-agent.service`;
 - downloads the exact RKE2 `rke2.linux-amd64.tar.gz` release and its `sha256sum-amd64.txt` asset with at most 60 attempts per asset;
+- in cached mode, health-checks the private TLS endpoint first and downloads
+  those assets from `cache.<cluster>.inspace.internal:8443`; direct mode uses
+  the upstream GitHub release URL;
 - verifies the tarball checksum and installed RKE2 version;
 - configures the agent to join the stable TCP/9345 supervisor endpoint;
 - enables the agent, starts it with `--no-block`, and waits at most 180 five-second checks for `active`, failing immediately on a failed service;

@@ -33,6 +33,8 @@
       loop:
         - "{{ e2e_kubeconfig }}"
         - "{{ e2e_state_dir }}/known-hosts-bastion"
+        - "{{ e2e_state_dir }}/bootstrap-cache-key"
+        - "{{ e2e_state_dir }}/bootstrap-cache-not-before"
       register: e2e_attach_access_files
 
     - name: Validate the exact reusable cluster identity
@@ -46,7 +48,11 @@
           - e2e_attach_state.bastionPublicIPv4 | default('') | length > 0
           - e2e_attach_state.bastionPrivateIPv4 | default('') | length > 0
           - e2e_attach_state.virtualIPv4 | default('') | length > 0
-          - e2e_attach_access_files.results | selectattr('stat.exists') | list | length == 2
+          - e2e_attach_state.bootstrapCacheAddress == e2e_attach_state.bastionPrivateIPv4
+          - e2e_attach_state.bootstrapCacheRegistry == 'cache.' + e2e_attach_state.clusterName + '.inspace.internal:8443'
+          - e2e_attach_state.bootstrapCacheEndpoint == 'https://' + e2e_attach_state.bootstrapCacheRegistry
+          - e2e_attach_state.bootstrapCacheCABundle is match('^-----BEGIN CERTIFICATE-----\n')
+          - e2e_attach_access_files.results | selectattr('stat.exists') | list | length == 4
         fail_msg: >-
           The selected run lacks the required cluster access facts or, for a
           test phase, is not completely initialized.
@@ -108,6 +114,7 @@
     e2e_state_dir: "{{ lookup('env', 'E2E_STATE_DIR') }}"
     e2e_state_file: "{{ lookup('env', 'E2E_STATE_DIR') }}/state.json"
     e2e_kubeconfig: "{{ lookup('env', 'E2E_STATE_DIR') }}/kubeconfig.yaml"
+    e2e_state: "{{ lookup('file', lookup('env', 'E2E_STATE_DIR') + '/state.json') | from_json }}"
   environment:
     KUBECONFIG: "{{ e2e_kubeconfig }}"
   tasks:
@@ -172,6 +179,43 @@
         - deployment/inspace-karpenter
         - daemonset/cilium
       changed_when: false
+
+    - name: Require the persisted default bootstrap cache contract
+      ansible.builtin.shell: |
+        set -euo pipefail
+        cache_address={{ e2e_state.bootstrapCacheAddress | quote }}
+        cache_registry={{ e2e_state.bootstrapCacheRegistry | quote }}
+        cache_ca={{ e2e_state.bootstrapCacheCABundle | quote }}
+        nodeclass=$(kubectl get "inspacenodeclass/{{ e2e_state.nodeClassName }}" -o json)
+        jq -e --arg address "$cache_address" --arg ca "$cache_ca" '
+          (.spec.bootstrapCache | keys | sort) == ["address", "caBundle", "directDownload"] and
+          .spec.bootstrapCache.directDownload == false and
+          .spec.bootstrapCache.address == $address and
+          .spec.bootstrapCache.caBundle == $ca' <<<"$nodeclass"
+        test "$(helm -n kube-system get values inspace -o json | jq -r '.global.inspace.systemImageRegistry')" = "$cache_registry"
+        test "$(kubectl -n default get deployment/inspace-e2e-trigger -o jsonpath='{.spec.template.spec.containers[0].image}')" = \
+          'registry.k8s.io/pause:3.10.1'
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Recheck the private bastion cache by its stable TLS hostname
+      ansible.builtin.command:
+        argv:
+          - ssh
+          - -F
+          - "{{ e2e_state_dir }}/ssh-config"
+          - e2e-bastion
+          - >-
+            curl --fail --silent --show-error
+            --cacert /etc/inspace-cache/tls/ca.crt
+            --resolve "{{ e2e_state.bootstrapCacheRegistry }}:{{ e2e_state.bootstrapCacheAddress }}"
+            "{{ e2e_state.bootstrapCacheEndpoint }}/healthz"
+      register: e2e_cache_health
+      changed_when: false
+      retries: 12
+      delay: 5
+      until: e2e_cache_health.rc == 0 and e2e_cache_health.stdout | trim == 'ready'
 
     - name: Require the fixed control plane and one Karpenter worker to remain Ready
       ansible.builtin.shell: |

@@ -62,6 +62,17 @@ type API interface {
 
 type Reconciler struct {
 	API API
+	// BootstrapCacheKey deterministically derives the private cache's P-256
+	// CA and server key. Cached mode requires exactly 32 bytes. The raw key is
+	// never sent to a VM or exposed in Result.
+	BootstrapCacheKey []byte
+	// BootstrapCacheNotBefore is minted once at cluster initialization and
+	// persisted by the caller. Reusing it keeps the 15-year certificate and VM
+	// ownership hashes stable across controller restarts.
+	BootstrapCacheNotBefore time.Time
+	// ModuleVersion selects the exact released InSpace controller images that
+	// the bastion pre-seeds. Development builds must use directDownload.
+	ModuleVersion string
 
 	// SSHUsername and SSHPublicKey are optional and must be set together. The
 	// public key is sent to InSpace's VM-create API; private key material is
@@ -119,6 +130,10 @@ type Result struct {
 	BastionVMUUID                  string        `json:"bastionVMUUID,omitempty"`
 	BastionPublicIPv4              string        `json:"bastionPublicIPv4,omitempty"`
 	BastionPrivateIPv4             string        `json:"bastionPrivateIPv4,omitempty"`
+	BootstrapCacheEndpoint         string        `json:"bootstrapCacheEndpoint,omitempty"`
+	BootstrapCacheRegistry         string        `json:"bootstrapCacheRegistry,omitempty"`
+	BootstrapCacheAddress          string        `json:"bootstrapCacheAddress,omitempty"`
+	BootstrapCacheCABundle         string        `json:"bootstrapCacheCABundle,omitempty"`
 	ControlPlaneEndpoint           string        `json:"controlPlaneEndpoint,omitempty"`
 	PrivateControlPlaneEndpoint    string        `json:"privateControlPlaneEndpoint,omitempty"`
 	PrivateRegistrationEndpoint    string        `json:"privateRegistrationEndpoint,omitempty"`
@@ -150,6 +165,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, cluster *v1alpha1.InSpaceClu
 		return Result{}, errors.New("bootstrap: RKE2 token is required")
 	}
 	if err := r.validateBastionAccess(); err != nil {
+		return Result{}, err
+	}
+	owner := ownerKey(cluster)
+	cacheTLS, err := r.bootstrapCacheTLS(cluster, owner)
+	if err != nil {
 		return Result{}, err
 	}
 	network, err := r.API.GetNetwork(ctx, cluster.Spec.Location, cluster.Spec.Network.UUID)
@@ -185,7 +205,6 @@ func (r *Reconciler) Reconcile(ctx context.Context, cluster *v1alpha1.InSpaceClu
 	if err := validateNoLoadBalancerPoolCollision(loadBalancers, network.UUID, privatePool); err != nil {
 		return Result{}, err
 	}
-	owner := ownerKey(cluster)
 	bastionVMName := currentBastionName(cluster.Metadata.Name)
 	vms, err := r.API.ListVMs(ctx, cluster.Spec.Location)
 	if err != nil {
@@ -244,7 +263,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, cluster *v1alpha1.InSpaceClu
 	if err := validateManagedNodeFirewall(nodeFirewall, cluster, network, owner, resourceNames.NodeFirewall); err != nil {
 		return Result{}, err
 	}
-	if err := validateManagedBastionFirewall(bastionFirewall, cluster, owner, resourceNames.BastionFirewall, r.ManagementCIDR); err != nil {
+	if err := validateManagedBastionFirewall(bastionFirewall, cluster, network.Subnet, owner, resourceNames.BastionFirewall, r.ManagementCIDR); err != nil {
 		return Result{}, err
 	}
 	if err := validateOwnedFirewallAssignments(nodeFirewall, controlPlaneUUIDSet(byName, currentControlPlaneNames(cluster.Metadata.Name))); err != nil {
@@ -256,7 +275,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, cluster *v1alpha1.InSpaceClu
 	if err := validateReverseFirewallAssignments(firewalls, nodeFirewall, bastionFirewall, byName, bastionVMName, currentControlPlaneNames(cluster.Metadata.Name)); err != nil {
 		return Result{}, err
 	}
-	if err := r.validateExistingVMs(cluster, network, privatePool, owner, byName, rke2Token); err != nil {
+	if err := r.validateExistingVMs(cluster, network, privatePool, owner, byName, rke2Token, cacheTLS); err != nil {
 		return Result{}, err
 	}
 	if byName[bastionVMName] == nil && floatingByName[resourceNames.BastionFloatingIP] != nil {
@@ -289,14 +308,23 @@ func (r *Reconciler) Reconcile(ctx context.Context, cluster *v1alpha1.InSpaceClu
 			result.BastionVMUUID = bastion.UUID
 			result.BastionPrivateIPv4 = bastion.PrivateIPv4
 		}
+		if !cluster.Spec.BootstrapCache.DirectDownload {
+			hostname := bootstrapCacheHostname(cluster.Metadata.Name)
+			result.BootstrapCacheEndpoint = fmt.Sprintf("https://%s:%d", hostname, BootstrapCachePort)
+			result.BootstrapCacheRegistry = fmt.Sprintf("%s:%d", hostname, BootstrapCachePort)
+			result.BootstrapCacheCABundle = cacheTLS.CACertificate
+			if bastion != nil {
+				result.BootstrapCacheAddress = bastion.PrivateIPv4
+			}
+		}
 		return result
 	}
-	bastionRequest, err := r.desiredBastionVMRequest(cluster, owner)
+	bastionRequest, err := r.desiredBastionVMRequest(cluster, network, owner, cacheTLS)
 	if err != nil {
 		return Result{}, err
 	}
 	if bastion == nil {
-		bastionFirewall, err = r.ensureManagedBastionFirewall(ctx, cluster, owner, bastionFirewall)
+		bastionFirewall, err = r.ensureManagedBastionFirewall(ctx, cluster, network.Subnet, owner, bastionFirewall)
 		if err != nil {
 			return Result{}, err
 		}
@@ -311,7 +339,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, cluster *v1alpha1.InSpaceClu
 		bastion = secured
 		return baseResult(nil, "created and firewalled the private bastion; waiting for authoritative VM readback"), nil
 	}
-	bastionFirewall, err = r.ensureManagedBastionFirewall(ctx, cluster, owner, bastionFirewall)
+	bastionFirewall, err = r.ensureManagedBastionFirewall(ctx, cluster, network.Subnet, owner, bastionFirewall)
 	if err != nil {
 		return Result{}, err
 	}
@@ -335,13 +363,17 @@ func (r *Reconciler) Reconcile(ctx context.Context, cluster *v1alpha1.InSpaceClu
 	if !ready {
 		return baseResult(nil, "waiting for the bastion auto floating IP assignment"), nil
 	}
+	nodeCache, err := nodeCacheConfig(cluster, bastion.PrivateIPv4, cacheTLS)
+	if err != nil {
+		return Result{}, err
+	}
 	controlled := make([]*inspace.VM, ControlPlaneReplicas)
 	desiredRequests := make([]inspace.CreateVMRequest, ControlPlaneReplicas)
 	for slot := 0; slot < ControlPlaneReplicas; slot++ {
 		name := controlPlaneName(cluster.Metadata.Name, slot)
 		vm := byName[name]
 		controlled[slot] = vm
-		desired, desiredErr := r.desiredControlPlaneVMRequest(cluster, network, owner, slot, cluster.Spec.Endpoint.VirtualIPv4, rke2Token)
+		desired, desiredErr := r.desiredControlPlaneVMRequest(cluster, network, owner, slot, cluster.Spec.Endpoint.VirtualIPv4, rke2Token, nodeCache)
 		if desiredErr != nil {
 			return Result{}, desiredErr
 		}
@@ -556,7 +588,7 @@ func (r *Reconciler) Destroy(ctx context.Context, cluster *v1alpha1.InSpaceClust
 	if err := validateManagedNodeFirewall(nodeFirewall, cluster, network, owner, resourceNames.NodeFirewall); err != nil {
 		return result, err
 	}
-	if err := validateManagedBastionFirewall(bastionFirewall, cluster, owner, resourceNames.BastionFirewall, r.ManagementCIDR); err != nil {
+	if err := validateManagedBastionFirewall(bastionFirewall, cluster, network.Subnet, owner, resourceNames.BastionFirewall, r.ManagementCIDR); err != nil {
 		return result, err
 	}
 	pendingDeletions, err := r.activePendingVMDeletions(owner, cluster.Spec.Location, firewalls)
@@ -1251,7 +1283,7 @@ func (r *Reconciler) ensureManagedNodeFirewall(ctx context.Context, cluster *v1a
 	return readback, nil
 }
 
-func (r *Reconciler) ensureManagedBastionFirewall(ctx context.Context, cluster *v1alpha1.InSpaceCluster, owner string, found *inspace.Firewall) (*inspace.Firewall, error) {
+func (r *Reconciler) ensureManagedBastionFirewall(ctx context.Context, cluster *v1alpha1.InSpaceCluster, privateSubnet, owner string, found *inspace.Firewall) (*inspace.Firewall, error) {
 	if found != nil {
 		return found, nil
 	}
@@ -1259,7 +1291,7 @@ func (r *Reconciler) ensureManagedBastionFirewall(ctx context.Context, cluster *
 	created, err := r.API.CreateFirewall(ctx, cluster.Spec.Location, inspace.CreateFirewallRequest{
 		DisplayName: expectedName, Description: "Managed RKE2 bastion firewall for " + owner,
 		BillingAccountID: cluster.Spec.BillingAccountID,
-		Rules:            managedBastionFirewallRules(r.ManagementCIDR),
+		Rules:            managedBastionFirewallRules(r.ManagementCIDR, privateSubnet, !cluster.Spec.BootstrapCache.DirectDownload),
 	})
 	if err != nil {
 		return nil, err
@@ -1277,7 +1309,7 @@ func (r *Reconciler) ensureManagedBastionFirewall(ctx context.Context, cluster *
 	if err != nil || readback == nil || readback.UUID != created.UUID {
 		return nil, errors.Join(errors.New("bootstrap: bastion firewall creation readback mismatch"), err)
 	}
-	if err := validateManagedBastionFirewall(readback, cluster, owner, expectedName, r.ManagementCIDR); err != nil {
+	if err := validateManagedBastionFirewall(readback, cluster, privateSubnet, owner, expectedName, r.ManagementCIDR); err != nil {
 		return nil, err
 	}
 	return readback, nil
@@ -1330,7 +1362,7 @@ func validateManagedNodeFirewall(firewall *inspace.Firewall, cluster *v1alpha1.I
 	return nil
 }
 
-func validateManagedBastionFirewall(firewall *inspace.Firewall, cluster *v1alpha1.InSpaceCluster, owner, expectedName, managementCIDR string) error {
+func validateManagedBastionFirewall(firewall *inspace.Firewall, cluster *v1alpha1.InSpaceCluster, privateSubnet, owner, expectedName, managementCIDR string) error {
 	if firewall == nil {
 		return nil
 	}
@@ -1341,7 +1373,7 @@ func validateManagedBastionFirewall(firewall *inspace.Firewall, cluster *v1alpha
 	if firewall.Description != "" && firewall.Description != expectedDescription {
 		return errors.New("bootstrap: bastion firewall has an unexpected description")
 	}
-	if err := validateBastionFirewallPolicy(firewall, managementCIDR); err != nil {
+	if err := validateBastionFirewallPolicy(firewall, managementCIDR, privateSubnet, !cluster.Spec.BootstrapCache.DirectDownload); err != nil {
 		return fmt.Errorf("bootstrap: bastion firewall policy: %w", err)
 	}
 	return nil
@@ -1505,7 +1537,36 @@ func sameFirewallPolicy(actual, expected []inspace.FirewallRule) bool {
 	return true
 }
 
-func (r *Reconciler) desiredControlPlaneVMRequest(cluster *v1alpha1.InSpaceCluster, network *inspace.Network, owner string, slot int, joinAddress, token string) (inspace.CreateVMRequest, error) {
+func (r *Reconciler) bootstrapCacheTLS(cluster *v1alpha1.InSpaceCluster, owner string) (cacheTLSMaterial, error) {
+	if cluster.Spec.BootstrapCache.DirectDownload {
+		return cacheTLSMaterial{}, nil
+	}
+	if len(r.BootstrapCacheKey) != 32 {
+		return cacheTLSMaterial{}, errors.New("bootstrap: cached mode requires a persisted 32-byte INSPACE_BOOTSTRAP_CACHE_KEY")
+	}
+	if _, err := renderCacheImageManifest(cluster.Spec.RKE2.Version, r.ModuleVersion); err != nil {
+		return cacheTLSMaterial{}, err
+	}
+	return deriveCacheTLS(r.BootstrapCacheKey, owner, bootstrapCacheHostname(cluster.Metadata.Name), r.BootstrapCacheNotBefore)
+}
+
+func nodeCacheConfig(cluster *v1alpha1.InSpaceCluster, address string, material cacheTLSMaterial) (*NodeCacheConfig, error) {
+	if cluster.Spec.BootstrapCache.DirectDownload {
+		return nil, nil
+	}
+	parsed, err := netip.ParseAddr(address)
+	if err != nil || !parsed.Is4() || !parsed.IsPrivate() || parsed.String() != address {
+		return nil, errors.New("bootstrap: cached mode requires the bastion's canonical RFC1918 address")
+	}
+	if material.CACertificate == "" {
+		return nil, errors.New("bootstrap: cached mode requires a derived CA certificate")
+	}
+	return &NodeCacheConfig{
+		Address: address, Hostname: bootstrapCacheHostname(cluster.Metadata.Name), CABundle: material.CACertificate,
+	}, nil
+}
+
+func (r *Reconciler) desiredControlPlaneVMRequest(cluster *v1alpha1.InSpaceCluster, network *inspace.Network, owner string, slot int, joinAddress, token string, cache *NodeCacheConfig) (inspace.CreateVMRequest, error) {
 	tlsNames := append([]string{cluster.Spec.Endpoint.VirtualIPv4}, cluster.Spec.RKE2.TLSSubjectAltNames...)
 	cloudInit, err := RenderCloudInitJSON(CloudInitInput{
 		NodeName: controlPlaneName(cluster.Metadata.Name, slot), PrivateSubnet: network.Subnet, VirtualIPv4: cluster.Spec.Endpoint.VirtualIPv4,
@@ -1514,6 +1575,7 @@ func (r *Reconciler) desiredControlPlaneVMRequest(cluster *v1alpha1.InSpaceClust
 		PrivateLoadBalancerPoolStart: cluster.Spec.Network.PrivateLoadBalancerPool.Start,
 		PrivateLoadBalancerPoolStop:  cluster.Spec.Network.PrivateLoadBalancerPool.Stop,
 		TLSSubjectAltNames:           tlsNames, Disable: cluster.Spec.RKE2.Disable,
+		BootstrapCache: cache,
 	})
 	if err != nil {
 		return inspace.CreateVMRequest{}, err
@@ -1539,9 +1601,19 @@ func (r *Reconciler) desiredControlPlaneVMRequest(cluster *v1alpha1.InSpaceClust
 	return request, nil
 }
 
-func (r *Reconciler) desiredBastionVMRequest(cluster *v1alpha1.InSpaceCluster, owner string) (inspace.CreateVMRequest, error) {
+func (r *Reconciler) desiredBastionVMRequest(cluster *v1alpha1.InSpaceCluster, network *inspace.Network, owner string, material cacheTLSMaterial) (inspace.CreateVMRequest, error) {
 	name := currentBastionName(cluster.Metadata.Name)
-	cloudInit, err := RenderBastionCloudInitJSON(name)
+	cloudInit := ""
+	var err error
+	if cluster.Spec.BootstrapCache.DirectDownload {
+		cloudInit, err = RenderBastionCloudInitJSON(name)
+	} else {
+		cloudInit, err = RenderCacheBastionCloudInitJSON(CacheBastionCloudInitInput{
+			NodeName: name, PrivateSubnet: network.Subnet, CacheHostname: bootstrapCacheHostname(cluster.Metadata.Name),
+			RKE2Version: cluster.Spec.RKE2.Version, ModuleVersion: r.ModuleVersion,
+			CACertificate: material.CACertificate, ServerCertificate: material.ServerCertificate, ServerPrivateKey: material.ServerPrivateKey,
+		})
+	}
 	if err != nil {
 		return inspace.CreateVMRequest{}, err
 	}
@@ -1563,14 +1635,15 @@ func (r *Reconciler) desiredBastionVMRequest(cluster *v1alpha1.InSpaceCluster, o
 	return request, nil
 }
 
-func (r *Reconciler) validateExistingVMs(cluster *v1alpha1.InSpaceCluster, network *inspace.Network, privatePool privateIPv4Range, owner string, byName map[string]*inspace.VM, token string) error {
+func (r *Reconciler) validateExistingVMs(cluster *v1alpha1.InSpaceCluster, network *inspace.Network, privatePool privateIPv4Range, owner string, byName map[string]*inspace.VM, token string, material cacheTLSMaterial) error {
+	var cache *NodeCacheConfig
 	if bastion := byName[currentBastionName(cluster.Metadata.Name)]; bastion != nil {
 		if bastion.PrivateIPv4 != "" {
 			if err := validateVMPrivateIPv4(bastion, network.Subnet, cluster.Spec.Endpoint.VirtualIPv4, privatePool); err != nil {
 				return err
 			}
 		}
-		desired, err := r.desiredBastionVMRequest(cluster, owner)
+		desired, err := r.desiredBastionVMRequest(cluster, network, owner, material)
 		if err != nil {
 			return err
 		}
@@ -1579,6 +1652,12 @@ func (r *Reconciler) validateExistingVMs(cluster *v1alpha1.InSpaceCluster, netwo
 		}
 		if bastion.Hostname != "" && bastion.Hostname != desired.Name {
 			return fmt.Errorf("bootstrap: refusing to adopt bastion VM %q whose authoritative hostname is %q", bastion.Name, bastion.Hostname)
+		}
+		if bastion.PrivateIPv4 != "" {
+			cache, err = nodeCacheConfig(cluster, bastion.PrivateIPv4, material)
+			if err != nil {
+				return err
+			}
 		}
 	}
 	for slot := 0; slot < ControlPlaneReplicas; slot++ {
@@ -1591,7 +1670,10 @@ func (r *Reconciler) validateExistingVMs(cluster *v1alpha1.InSpaceCluster, netwo
 				return err
 			}
 		}
-		desired, err := r.desiredControlPlaneVMRequest(cluster, network, owner, slot, cluster.Spec.Endpoint.VirtualIPv4, token)
+		if !cluster.Spec.BootstrapCache.DirectDownload && cache == nil {
+			return errors.New("bootstrap: refusing to validate cached control-plane VMs before the bastion private address is authoritative")
+		}
+		desired, err := r.desiredControlPlaneVMRequest(cluster, network, owner, slot, cluster.Spec.Endpoint.VirtualIPv4, token, cache)
 		if err != nil {
 			return err
 		}
@@ -1853,38 +1935,56 @@ func managedFirewallRules(subnet, podCIDR, managementCIDR string, managementTCPP
 	return result
 }
 
-func managedBastionFirewallRules(managementCIDR string) []inspace.FirewallRule {
+func managedBastionFirewallRules(managementCIDR, privateSubnet string, cacheEnabled bool) []inspace.FirewallRule {
 	port := int32(22)
 	result := []inspace.FirewallRule{{
 		Protocol: "tcp", Direction: "inbound", PortStart: &port, PortEnd: &port,
 		EndpointSpecType: "ip_prefixes", EndpointSpec: []string{managementCIDR},
 	}}
+	if cacheEnabled {
+		cachePort := int32(BootstrapCachePort)
+		result = append(result, inspace.FirewallRule{
+			Protocol: "tcp", Direction: "inbound", PortStart: &cachePort, PortEnd: &cachePort,
+			EndpointSpecType: "ip_prefixes", EndpointSpec: []string{privateSubnet},
+		})
+	}
 	for _, protocol := range []string{"tcp", "udp", "icmp"} {
 		result = append(result, inspace.FirewallRule{Protocol: protocol, Direction: "outbound", EndpointSpecType: "any"})
 	}
 	return result
 }
 
-func validateBastionFirewallPolicy(firewall *inspace.Firewall, managementCIDR string) error {
+func validateBastionFirewallPolicy(firewall *inspace.Firewall, managementCIDR, privateSubnet string, cacheEnabled bool) error {
 	if firewall == nil {
 		return errors.New("bootstrap: bastion firewall is required")
 	}
 	if err := validateManagementAccess(managementCIDR, []int{22}); err != nil {
 		return err
 	}
-	if len(firewall.Rules) != 4 {
-		return errors.New("bootstrap: bastion firewall must contain exactly SSH ingress plus TCP/UDP/ICMP egress")
+	expectedRules := 4
+	if cacheEnabled {
+		expectedRules++
+	}
+	if len(firewall.Rules) != expectedRules {
+		return errors.New("bootstrap: bastion firewall has an unexpected rule count")
 	}
 	sshIngress := false
+	cacheIngress := false
 	outbound := map[string]bool{"tcp": false, "udp": false, "icmp": false}
 	for _, rule := range firewall.Rules {
 		switch rule.Direction {
 		case "inbound":
-			if sshIngress || rule.Protocol != "tcp" || rule.PortStart == nil || rule.PortEnd == nil || *rule.PortStart != 22 || *rule.PortEnd != 22 ||
-				rule.EndpointSpecType != "ip_prefixes" || len(rule.EndpointSpec) != 1 || rule.EndpointSpec[0] != managementCIDR {
-				return errors.New("bootstrap: bastion inbound policy must be only management /32 TCP/22")
+			if rule.Protocol != "tcp" || rule.PortStart == nil || rule.PortEnd == nil || rule.EndpointSpecType != "ip_prefixes" || len(rule.EndpointSpec) != 1 {
+				return errors.New("bootstrap: bastion inbound policy is invalid")
 			}
-			sshIngress = true
+			switch {
+			case *rule.PortStart == 22 && *rule.PortEnd == 22 && rule.EndpointSpec[0] == managementCIDR && !sshIngress:
+				sshIngress = true
+			case cacheEnabled && *rule.PortStart == BootstrapCachePort && *rule.PortEnd == BootstrapCachePort && rule.EndpointSpec[0] == privateSubnet && !cacheIngress:
+				cacheIngress = true
+			default:
+				return errors.New("bootstrap: bastion inbound policy must contain only management TCP/22 and optional VPC TCP/8443")
+			}
 		case "outbound":
 			if _, ok := outbound[rule.Protocol]; !ok || outbound[rule.Protocol] || rule.PortStart != nil || rule.PortEnd != nil || rule.EndpointSpecType != "any" {
 				return errors.New("bootstrap: bastion outbound policy must be one unrestricted TCP/UDP/ICMP rule")
@@ -1894,7 +1994,7 @@ func validateBastionFirewallPolicy(firewall *inspace.Firewall, managementCIDR st
 			return errors.New("bootstrap: bastion firewall has an invalid direction")
 		}
 	}
-	if !sshIngress || !outbound["tcp"] || !outbound["udp"] || !outbound["icmp"] {
+	if !sshIngress || cacheIngress != cacheEnabled || !outbound["tcp"] || !outbound["udp"] || !outbound["icmp"] {
 		return errors.New("bootstrap: bastion firewall policy is incomplete")
 	}
 	return nil

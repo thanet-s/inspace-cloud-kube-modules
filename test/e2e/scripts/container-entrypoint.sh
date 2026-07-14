@@ -75,7 +75,7 @@ for name in INSPACE_E2E_KEEP_RESOURCES INSPACE_E2E_RECOVER_RETAINED; do
   [[ ${!name} == false || ${!name} == true ]] || { echo "$name must be true or false" >&2; exit 2; }
 done
 
-for command_name in ansible-playbook autossh curl flock helm jq kubectl openssl setsid skopeo ss ssh ssh-keygen stat; do
+for command_name in ansible-playbook autossh curl date flock helm jq kubectl openssl setsid skopeo ss ssh ssh-keygen stat; do
   command -v "$command_name" >/dev/null || { echo "runner image is missing $command_name" >&2; exit 2; }
 done
 api_tunnel_instance_file=/run/inspace-e2e-api-tunnel-instance

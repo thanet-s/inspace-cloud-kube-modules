@@ -47,11 +47,12 @@
         "inspace": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["apiBaseURL", "location", "region", "networkUUID", "clusterID", "controlPlaneVIP", "privateLoadBalancerPool", "apiSecret"],
+          "required": ["apiBaseURL", "location", "region", "systemImageRegistry", "networkUUID", "clusterID", "controlPlaneVIP", "privateLoadBalancerPool", "apiSecret"],
           "properties": {
             "apiBaseURL": {"type": "string", "pattern": "^https://"},
             "location": {"type": "string", "enum": ["bkk01"]},
             "region": {"type": "string", "minLength": 1},
+            "systemImageRegistry": {"type": "string", "pattern": "^(|[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?(?::[0-9]{1,5})?)$"},
             "networkUUID": {"type": "string", "pattern": "^(|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12})$"},
             "clusterID": {"type": "string", "maxLength": 63, "pattern": "^(|[a-z0-9]([-a-z0-9]*[a-z0-9])?)$"},
             "controlPlaneVIP": {"$ref": "#/definitions/privateIPv4"},

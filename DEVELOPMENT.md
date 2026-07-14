@@ -70,6 +70,52 @@ is an explicit operator action. Node firewalls are
 validated fail-closed for all-port TCP, UDP, and ICMP coverage from both the VPC
 subnet and native-routing pod CIDR, with matching outbound access.
 
+### Bastion bootstrap cache
+
+`InSpaceCluster.spec.bootstrapCache` is required. Its `directDownload` switch
+defaults to `false`, so the normal path turns the existing bastion into a
+private bootstrap cache and wires the control plane to use it. Setting it to
+`true` is an explicit opt-out: the bastion remains the SSH hop, but nodes fetch
+RKE2 assets and system images directly from their upstream HTTPS locations.
+
+The cache does not consume a second virtual address. After InSpace allocates
+the bastion's RFC1918 NIC address, bootstrap binds it to the deterministic
+per-cluster name `cache.<cluster>.inspace.internal` in node `/etc/hosts` files
+and serves TLS on TCP/8443. The listener binds only that private address. The
+bastion cache pre-seeds the audited RKE2 release assets and system-image
+inventory; it is not a general-purpose pull-through proxy. Its dedicated 10 GB
+filesystem reserves 1 GB of free space. Daily maintenance prunes unpinned RKE2
+artifacts and local Docker data older than 30 days.
+
+Cached initialization and reconciliation require two persistent controller
+inputs. `INSPACE_BOOTSTRAP_CACHE_KEY` is an operator secret containing exactly
+64 lowercase hexadecimal characters (32 random bytes).
+`INSPACE_BOOTSTRAP_CACHE_NOT_BEFORE` is captured from the real clock at the
+actual first initialization and persisted in canonical whole-second UTC
+RFC3339 form (`YYYY-MM-DDTHH:MM:SSZ`); it must not be in the future. Together
+the inputs derive stable ECDSA P-256 cluster-scoped CA and server certificates
+whose validity starts at that persisted instant and ends exactly 15 calendar
+years later; only the public CA is copied to nodes.
+They never belong in an `InSpaceCluster` or `InSpaceNodeClass` resource.
+Preserve both values for the complete cluster lifecycle.
+
+The full-cluster E2E runner persists them as `bootstrap-cache-key` and
+`bootstrap-cache-not-before` in its state directory, both with mode `0600`.
+It supplies both values to initialization and later cached reconciliation.
+Teardown requires and receives neither cache input.
+
+The private cache endpoint permits only `GET` and `HEAD`. Its registry backend
+is switched to read-only after the deterministic seed completes, registry
+deletion is disabled, and the containers run with read-only roots, dropped
+capabilities, `no-new-privileges`, and bounded local logs. VPC firewall policy
+and the private listener are the access boundary; the cache must never be
+published through the bastion floating IP or an InSpace NLB.
+
+Docker Compose uses `restart: unless-stopped` for both services. Docker and
+service logs use the local driver with three compressed 10 MB files per
+container, so bootstrap logging cannot consume the cache filesystem without a
+bound.
+
 ### RKE2, Cilium, and the control-plane VIP
 
 RKE2 uses its bundled Cilium chart in native-routing mode. Cilium installs
@@ -179,6 +225,9 @@ The following rules apply to every development and test workflow:
   only after its billing-account confirmation succeeds.
 - API tokens, join tokens, private keys, generated kubeconfigs, state journals,
   and credential-bearing Helm values must never be committed or printed.
+- The bootstrap-cache key is operator secret material even though it is not an
+  API credential; keep `INSPACE_BOOTSTRAP_CACHE_KEY` and both persisted cache
+  initialization files out of logs and source control.
 
 ## Local verification
 
@@ -222,8 +271,9 @@ release-acceptance suite proves the complete cluster lifecycle: three
 stock-Ubuntu RKE2 control planes with embedded etcd, a bastion, and one
 Karpenter worker, all on the configured AMD EPYC pool; Cilium native routing
 and kube-proxy replacement; CCM node identity; public-IP egress and RKE2 join;
-an RWO CSI volume that retains data through pod replacement; and a public TCP
-NLB response. The default workflow finishes with an exact-ownership,
+the default private bootstrap cache and its pinned TLS trust; an RWO CSI volume
+that retains data through pod replacement; and a public TCP NLB response. The
+default workflow finishes with an exact-ownership,
 zero-leftover cloud audit.
 
 ```sh

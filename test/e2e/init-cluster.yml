@@ -12,8 +12,11 @@
     e2e_cluster_file: "{{ lookup('env', 'E2E_STATE_DIR') }}/cluster.yaml"
     e2e_state_file: "{{ lookup('env', 'E2E_STATE_DIR') }}/state.json"
     e2e_token_file: "{{ lookup('env', 'E2E_STATE_DIR') }}/rke2-token"
+    e2e_bootstrap_cache_key_file: "{{ lookup('env', 'E2E_STATE_DIR') }}/bootstrap-cache-key"
+    e2e_bootstrap_cache_not_before_file: "{{ lookup('env', 'E2E_STATE_DIR') }}/bootstrap-cache-not-before"
     e2e_kubeconfig: "{{ lookup('env', 'E2E_STATE_DIR') }}/kubeconfig.yaml"
     e2e_bootstrap_result_file: "{{ lookup('env', 'E2E_STATE_DIR') }}/bootstrap-result.json"
+    e2e_bootstrap_cache_ca_file: "{{ lookup('env', 'E2E_STATE_DIR') }}/bootstrap-cache-ca.crt"
     e2e_baseline_inventory_file: "{{ lookup('env', 'E2E_STATE_DIR') }}/baseline-inventory.json"
     e2e_ssh_config: "{{ lookup('env', 'E2E_STATE_DIR') }}/ssh-config"
     e2e_virtual_ip: "{{ lookup('env', 'INSPACE_CONTROL_PLANE_VIP') }}"
@@ -96,6 +99,71 @@
         mode: "0600"
       no_log: true
       when: not e2e_token_stat.stat.exists
+
+    - name: Check whether a bootstrap cache key already exists for a resumed run
+      ansible.builtin.stat:
+        path: "{{ e2e_bootstrap_cache_key_file }}"
+      register: e2e_bootstrap_cache_key_stat
+
+    - name: Generate the 256-bit bootstrap cache key inside the runner
+      ansible.builtin.command:
+        argv: [openssl, rand, -hex, "32"]
+      register: e2e_generated_bootstrap_cache_key
+      no_log: true
+      when: not e2e_bootstrap_cache_key_stat.stat.exists
+
+    - name: Persist the bootstrap cache key with restrictive permissions
+      ansible.builtin.copy:
+        content: "{{ e2e_generated_bootstrap_cache_key.stdout }}"
+        dest: "{{ e2e_bootstrap_cache_key_file }}"
+        mode: "0600"
+      no_log: true
+      when: not e2e_bootstrap_cache_key_stat.stat.exists
+
+    - name: Inspect the persisted bootstrap cache key
+      ansible.builtin.stat:
+        path: "{{ e2e_bootstrap_cache_key_file }}"
+      register: e2e_persisted_bootstrap_cache_key
+
+    - name: Require an exact persisted 32-byte bootstrap cache key
+      ansible.builtin.assert:
+        that:
+          - e2e_persisted_bootstrap_cache_key.stat.isreg
+          - e2e_persisted_bootstrap_cache_key.stat.mode == '0600'
+          - lookup('file', e2e_bootstrap_cache_key_file) is match('^[0-9a-f]{64}$')
+        fail_msg: "The persisted bootstrap cache key must be mode 0600 and exactly 64 lowercase hexadecimal characters."
+      no_log: true
+
+    - name: Check whether a bootstrap cache certificate epoch already exists
+      ansible.builtin.stat:
+        path: "{{ e2e_bootstrap_cache_not_before_file }}"
+      register: e2e_bootstrap_cache_not_before_stat
+
+    - name: Capture the bootstrap cache certificate epoch at cluster initialization
+      ansible.builtin.command:
+        argv: [date, -u, "+%Y-%m-%dT%H:%M:%SZ"]
+      register: e2e_generated_bootstrap_cache_not_before
+      when: not e2e_bootstrap_cache_not_before_stat.stat.exists
+
+    - name: Persist the bootstrap cache certificate epoch with restrictive permissions
+      ansible.builtin.copy:
+        content: "{{ e2e_generated_bootstrap_cache_not_before.stdout }}"
+        dest: "{{ e2e_bootstrap_cache_not_before_file }}"
+        mode: "0600"
+      when: not e2e_bootstrap_cache_not_before_stat.stat.exists
+
+    - name: Inspect the persisted bootstrap cache certificate epoch
+      ansible.builtin.stat:
+        path: "{{ e2e_bootstrap_cache_not_before_file }}"
+      register: e2e_persisted_bootstrap_cache_not_before
+
+    - name: Require an exact persisted UTC bootstrap cache certificate epoch
+      ansible.builtin.assert:
+        that:
+          - e2e_persisted_bootstrap_cache_not_before.stat.isreg
+          - e2e_persisted_bootstrap_cache_not_before.stat.mode == '0600'
+          - lookup('file', e2e_bootstrap_cache_not_before_file) is match('^[0-9]{4}-(0[1-9]|1[0-2])-([0-2][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]Z$')
+        fail_msg: "The persisted bootstrap cache certificate epoch must be mode 0600 UTC RFC3339."
 
     - name: Render the RKE2 bootstrap resource
       ansible.builtin.template:
@@ -254,6 +322,8 @@
         INSPACE_API_URL: "{{ lookup('env', 'INSPACE_API_URL') }}"
         INSPACE_API_TOKEN: "{{ lookup('env', 'INSPACE_API_TOKEN') }}"
         INSPACE_RKE2_TOKEN: "{{ lookup('file', e2e_token_file) | trim }}"
+        INSPACE_BOOTSTRAP_CACHE_KEY: "{{ lookup('file', e2e_bootstrap_cache_key_file) | trim }}"
+        INSPACE_BOOTSTRAP_CACHE_NOT_BEFORE: "{{ lookup('file', e2e_bootstrap_cache_not_before_file) | trim }}"
       register: e2e_bootstrap_wait
       changed_when: true
       no_log: true
@@ -269,6 +339,42 @@
         dest: "{{ e2e_bootstrap_result_file }}"
         mode: "0600"
 
+    - name: Persist the public bootstrap cache CA for certificate verification
+      ansible.builtin.copy:
+        content: "{{ e2e_bootstrap_result.bootstrapCacheCABundle }}"
+        dest: "{{ e2e_bootstrap_cache_ca_file }}"
+        mode: "0600"
+
+    - name: Prove the cache CA is ECDSA P-256 with exactly fifteen years from the persisted epoch
+      ansible.builtin.shell: |
+        set -euo pipefail
+        ca_text=$(openssl x509 -in "{{ e2e_bootstrap_cache_ca_file }}" -noout -text)
+        grep -Fq 'Public Key Algorithm: id-ecPublicKey' <<<"$ca_text"
+        grep -Fq 'ASN1 OID: prime256v1' <<<"$ca_text"
+        expected_not_before=$(cat "{{ e2e_bootstrap_cache_not_before_file }}")
+        actual_not_before=$(openssl x509 -in "{{ e2e_bootstrap_cache_ca_file }}" -noout -startdate -dateopt iso_8601 | sed -e 's/^notBefore=//' -e 's/ /T/')
+        actual_not_after=$(openssl x509 -in "{{ e2e_bootstrap_cache_ca_file }}" -noout -enddate -dateopt iso_8601 | sed -e 's/^notAfter=//' -e 's/ /T/')
+        python3 - "$expected_not_before" "$actual_not_before" "$actual_not_after" <<'PY'
+        import datetime
+        import sys
+
+        def parse(value):
+            return datetime.datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)
+
+        expected = parse(sys.argv[1])
+        actual_start = parse(sys.argv[2])
+        actual_stop = parse(sys.argv[3])
+        try:
+            expected_stop = expected.replace(year=expected.year + 15)
+        except ValueError:
+            expected_stop = expected.replace(year=expected.year + 15, month=3, day=1)
+        if actual_start != expected or actual_stop != expected_stop:
+            raise SystemExit("bootstrap cache CA validity does not equal the persisted initialization epoch plus 15 years")
+        PY
+      args:
+        executable: /bin/bash
+      changed_when: false
+
     - name: Prove exact and parallel three-control-plane provisioning
       ansible.builtin.assert:
         that:
@@ -283,6 +389,11 @@
           - e2e_bootstrap_result.bastionFirewallUUID | length > 0
           - e2e_bootstrap_result.bastionPublicIPv4 | length > 0
           - e2e_bootstrap_result.bastionPrivateIPv4 | length > 0
+          - e2e_bootstrap_result.bootstrapCacheEndpoint == 'https://cache.' + e2e_cluster_name + '.inspace.internal:8443'
+          - e2e_bootstrap_result.bootstrapCacheRegistry == 'cache.' + e2e_cluster_name + '.inspace.internal:8443'
+          - e2e_bootstrap_result.bootstrapCacheAddress == e2e_bootstrap_result.bastionPrivateIPv4
+          - e2e_bootstrap_result.bootstrapCacheCABundle is match('^-----BEGIN CERTIFICATE-----\n')
+          - e2e_bootstrap_result.bootstrapCacheCABundle is search('-----END CERTIFICATE-----\n$')
           - e2e_bootstrap_result.apiLoadBalancerUUID is not defined
           - e2e_bootstrap_result.registrationLoadBalancerUUID is not defined
           - e2e_bootstrap_result.allocatedEndpointIPv4 is not defined
@@ -334,6 +445,10 @@
         e2e_public_ip: "{{ e2e_state.bastionPublicIPv4 }}"
         e2e_private_ip: "{{ e2e_state.bastionPrivateIPv4 }}"
         e2e_node_name: "{{ e2e_state.bastionName }}"
+        e2e_cache_address: "{{ e2e_state.bootstrapCacheAddress }}"
+        e2e_cache_endpoint: "{{ e2e_state.bootstrapCacheEndpoint }}"
+        e2e_cache_registry: "{{ e2e_state.bootstrapCacheRegistry }}"
+        e2e_cache_ca_bundle: "{{ e2e_state.bootstrapCacheCABundle }}"
 
     - name: Add exactly three dynamic RKE2 control-plane hosts
       ansible.builtin.add_host:
@@ -347,6 +462,10 @@
         e2e_private_ip: "{{ item.privateIPv4 }}"
         e2e_public_ip: "{{ item.publicIPv4 }}"
         e2e_known_hosts: "{{ e2e_state_dir }}/known-hosts-cp-{{ e2e_cp_index }}"
+        e2e_cache_address: "{{ e2e_state.bootstrapCacheAddress }}"
+        e2e_cache_endpoint: "{{ e2e_state.bootstrapCacheEndpoint }}"
+        e2e_cache_registry: "{{ e2e_state.bootstrapCacheRegistry }}"
+        e2e_cache_ca_bundle: "{{ e2e_state.bootstrapCacheCABundle }}"
       loop: "{{ e2e_state.controlPlanes }}"
       loop_control:
         index_var: e2e_cp_index
@@ -399,7 +518,7 @@
 
     - name: Wait for bounded bastion cloud-init completion
       ansible.builtin.raw: >-
-        timeout --kill-after=5s 1200s sh -c
+        timeout --kill-after=5s 4800s sh -c
         'cloud-init status --wait >/dev/null 2>&1 || test $? -eq 2'
       become: true
       changed_when: false
@@ -436,6 +555,74 @@
         . /etc/os-release
         test "$ID" = ubuntu
         test "$VERSION_ID" = 24.04
+      args:
+        executable: /bin/bash
+      become: true
+      changed_when: false
+
+    - name: Prove the default bastion cache is mounted healthy complete and read-only
+      ansible.builtin.shell: |
+        set -euo pipefail
+        cache_address={{ e2e_cache_address | quote }}
+        cache_endpoint={{ e2e_cache_endpoint | quote }}
+        cache_registry={{ e2e_cache_registry | quote }}
+        cache_host=${cache_registry%:8443}
+        cache_ca=/etc/inspace-cache/tls/ca.crt
+        compose_file=/opt/inspace-cache/compose.yaml
+        test "$cache_address" = "{{ e2e_private_ip }}"
+        test "$(stat -c %s /var/lib/inspace/bootstrap-cache.img)" = 10000000000
+        mountpoint -q /var/lib/inspace/bootstrap-cache
+        test "$(findmnt -n -o TARGET /var/lib/inspace/bootstrap-cache)" = /var/lib/inspace/bootstrap-cache
+        test "$(findmnt -n -o FSTYPE /var/lib/inspace/bootstrap-cache)" = ext4
+        grep -Fq '/var/lib/inspace/bootstrap-cache.img /var/lib/inspace/bootstrap-cache ext4 loop,nosuid,nodev 0 0' /etc/fstab
+        for unit in containerd.service docker.service inspace-cache.service; do
+          systemctl is-active --quiet "$unit"
+        done
+        for service in registry nginx; do
+          test "$(docker compose -f "$compose_file" ps --services --status running "$service")" = "$service"
+          container_id=$(docker compose -f "$compose_file" ps -q "$service")
+          test -n "$container_id"
+          docker inspect "$container_id" | grep -Fq '"Status": "healthy"'
+        done
+        test "$(docker compose -f "$compose_file" ps --services --status running | wc -l)" -eq 2
+        test "$(awk -F '\t' 'NF == 2 { count++ } END { print count + 0 }' /etc/inspace-cache/images.tsv)" -eq 34
+        test "$(cat /var/lib/inspace/bootstrap-cache/state/ready)" = ready
+        for certificate in "$cache_ca" /etc/inspace-cache/tls/server.crt; do
+          certificate_text=$(openssl x509 -in "$certificate" -noout -text)
+          grep -Fq 'Public Key Algorithm: id-ecPublicKey' <<<"$certificate_text"
+          grep -Fq 'ASN1 OID: prime256v1' <<<"$certificate_text"
+        done
+        served_certificate=$(mktemp)
+        trap 'rm -f "$served_certificate"' EXIT
+        openssl s_client \
+          -connect "$cache_address:8443" \
+          -servername "$cache_host" \
+          -verify_hostname "$cache_host" \
+          -verify_return_error \
+          -CAfile "$cache_ca" </dev/null 2>/dev/null | \
+          openssl x509 -out "$served_certificate"
+        cmp -s /etc/inspace-cache/tls/server.crt "$served_certificate"
+        rm -f "$served_certificate"
+        trap - EXIT
+        resolve=(--resolve "$cache_host:8443:$cache_address")
+        test "$(curl --fail --silent --show-error --cacert "$cache_ca" "${resolve[@]}" "$cache_endpoint/healthz")" = ready
+        curl --fail --silent --show-error --cacert "$cache_ca" "${resolve[@]}" "$cache_endpoint/v2/" >/dev/null
+        image_count=0
+        while IFS="$(printf '\t')" read -r _ target; do
+          test -n "$target" || continue
+          repository=${target%:*}
+          reference=${target##*:}
+          test "$repository" != "$target"
+          curl --fail --silent --show-error --cacert "$cache_ca" "${resolve[@]}" \
+            --header 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json' \
+            "$cache_endpoint/v2/$repository/manifests/$reference" >/dev/null
+          image_count=$((image_count + 1))
+        done </etc/inspace-cache/images.tsv
+        test "$image_count" -eq 34
+        write_status=$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
+          --cacert "$cache_ca" "${resolve[@]}" --request POST \
+          "$cache_endpoint/v2/inspace-e2e-write-denied/blobs/uploads/")
+        test "$write_status" = 403
       args:
         executable: /bin/bash
       become: true
@@ -492,7 +679,7 @@
 
     - name: Wait for cloud-init completion on every control plane in parallel
       ansible.builtin.raw: >-
-        timeout --kill-after=5s 1800s sh -c
+        timeout --kill-after=5s 4800s sh -c
         'cloud-init status --wait >/dev/null 2>&1 || test $? -eq 2'
       become: true
       changed_when: false
@@ -724,10 +911,18 @@
         test "$(hostname)" = "{{ e2e_node_name }}"
         test "$(hostnamectl --static)" = "{{ e2e_node_name }}"
         test "$(cat /etc/hostname)" = "{{ e2e_node_name }}"
+        cache_registry={{ e2e_cache_registry | quote }}
+        cache_host=${cache_registry%:8443}
+        grep -Fqx -- "{{ e2e_cache_address }} $cache_host # inspace-bootstrap-cache" /etc/hosts
+        grep -Fqx -- "system-default-registry: \"$cache_registry\"" /etc/rancher/rke2/config.yaml
+        printf '%s' {{ e2e_cache_ca_bundle | quote }} | cmp -s - /etc/rancher/rke2/bootstrap-cache-ca.crt
+        test "$(grep -Fc -- "  \"$cache_registry\":" /etc/rancher/rke2/registries.yaml)" -eq 1
+        grep -Fqx -- '      ca_file: /etc/rancher/rke2/bootstrap-cache-ca.crt' /etc/rancher/rke2/registries.yaml
         /usr/local/bin/rke2 --version | grep -F 'v1.35.6+rke2r1'
         kube_vip_manifest=/var/lib/rancher/rke2/agent/pod-manifests/kube-vip.yaml
-        grep -F 'ghcr.io/kube-vip/kube-vip:v1.2.1@sha256:49b77655f9f109bedc5eb25723bb0e4c57d8513ba33cc69c31be3f243eb2386d' \
+        grep -F "$cache_registry/kube-vip/kube-vip:v1.2.1@sha256:44035f68040c9eb99103c65f1f9ab9698d93f9f272110825705338ac1926f3d9" \
           "$kube_vip_manifest"
+        ! grep -Fq 'ghcr.io/kube-vip/' "$kube_vip_manifest"
         test "$(grep -Fc '    - ip: "127.0.0.1"' "$kube_vip_manifest")" -eq 1
         test "$(grep -Fc '        - "kubernetes"' "$kube_vip_manifest")" -eq 1
         test "$(grep -Fc '        - name: vip_nodename' "$kube_vip_manifest")" -eq 1
@@ -898,7 +1093,7 @@
         set -euo pipefail
         kubectl wait --for=condition=Ready node --all --timeout=10m
         nodes=$(kubectl get nodes -o json)
-        jq -e '
+        jq -e --arg image "{{ e2e_state.bootstrapCacheRegistry }}/kube-vip/kube-vip:v1.2.1@sha256:44035f68040c9eb99103c65f1f9ab9698d93f9f272110825705338ac1926f3d9" '
           .items | length == 3 and
           all(.[]; any(.status.conditions[]; .type == "Ready" and .status == "True"))' <<<"$nodes"
         expected_names=$(jq -c '[.controlPlanes[].name] | sort' "{{ e2e_state_file }}")
@@ -996,7 +1191,7 @@
                 .hostPath.type == "File")] | length) == 1 and
             any(.spec.containers[];
               .name == "kube-vip" and
-              .image == "ghcr.io/kube-vip/kube-vip:v1.2.1@sha256:49b77655f9f109bedc5eb25723bb0e4c57d8513ba33cc69c31be3f243eb2386d" and
+              .image == $image and
               ([.env[]? | select(.name == "k8s_config_file")] | length) == 0 and
               ([.env[]? |
                 select(.name == "vip_nodename" and
@@ -1287,6 +1482,8 @@
           - "global.inspace.clusterID={{ e2e_cluster_name }}"
           - --set
           - "global.inspace.controlPlaneVIP={{ e2e_state.virtualIPv4 }}"
+          - --set-string
+          - "global.inspace.systemImageRegistry={{ e2e_state.bootstrapCacheRegistry }}"
           - --set
           - "global.inspace.privateLoadBalancerPool.start={{ lookup('env', 'INSPACE_PRIVATE_LOAD_BALANCER_POOL_START') }}"
           - --set
@@ -1315,14 +1512,26 @@
       ansible.builtin.shell: |
         set -euo pipefail
         version={{ lookup('env', 'INSPACE_E2E_VERSION') | quote }}
+        registry={{ e2e_state.bootstrapCacheRegistry | quote }}
+        test "$(helm -n kube-system get values inspace -o json | jq -r '.global.inspace.systemImageRegistry')" = "$registry"
         test "$(kubectl -n kube-system get deployment/inspace-ccm -o json | jq -r '.spec.template.spec.containers[] | select(.name=="cloud-controller-manager") | .image')" = \
-          "ghcr.io/thanet-s/inspace-cloud-controller-manager:$version"
+          "$registry/thanet-s/inspace-cloud-controller-manager:$version"
         test "$(kubectl -n kube-system get deployment/inspace-csi-controller -o json | jq -r '.spec.template.spec.containers[] | select(.name=="driver") | .image')" = \
-          "ghcr.io/thanet-s/inspace-csi-driver:$version"
+          "$registry/thanet-s/inspace-csi-driver:$version"
         test "$(kubectl -n kube-system get daemonset/inspace-csi-node -o json | jq -r '.spec.template.spec.containers[] | select(.name=="driver") | .image')" = \
-          "ghcr.io/thanet-s/inspace-csi-driver:$version"
+          "$registry/thanet-s/inspace-csi-driver:$version"
         test "$(kubectl -n kube-system get deployment/inspace-karpenter -o json | jq -r '.spec.template.spec.containers[] | select(.name=="controller") | .image')" = \
-          "ghcr.io/thanet-s/karpenter-provider-inspace:$version"
+          "$registry/thanet-s/karpenter-provider-inspace:$version"
+        test "$(kubectl -n kube-system get deployment/inspace-csi-controller -o json | jq -r '.spec.template.spec.containers[] | select(.name=="csi-provisioner") | .image')" = \
+          "$registry/sig-storage/csi-provisioner:v5.2.0"
+        test "$(kubectl -n kube-system get deployment/inspace-csi-controller -o json | jq -r '.spec.template.spec.containers[] | select(.name=="csi-attacher") | .image')" = \
+          "$registry/sig-storage/csi-attacher:v4.8.1"
+        test "$(kubectl -n kube-system get deployment/inspace-csi-controller -o json | jq -r '.spec.template.spec.containers[] | select(.name=="liveness-probe") | .image')" = \
+          "$registry/sig-storage/livenessprobe:v2.15.0"
+        test "$(kubectl -n kube-system get daemonset/inspace-csi-node -o json | jq -r '.spec.template.spec.containers[] | select(.name=="node-driver-registrar") | .image')" = \
+          "$registry/sig-storage/csi-node-driver-registrar:v2.13.0"
+        test "$(kubectl -n kube-system get daemonset/inspace-csi-node -o json | jq -r '.spec.template.spec.containers[] | select(.name=="liveness-probe") | .image')" = \
+          "$registry/sig-storage/livenessprobe:v2.15.0"
       args:
         executable: /bin/bash
       changed_when: false
@@ -1353,12 +1562,20 @@
     - name: Apply Karpenter resources and require NodeClass readiness
       ansible.builtin.shell: |
         set -euo pipefail
+        cache_address={{ e2e_state.bootstrapCacheAddress | quote }}
+        cache_ca={{ e2e_state.bootstrapCacheCABundle | quote }}
         kubectl apply -f "{{ e2e_state_dir }}/karpenter.yaml"
         kubectl wait --for=condition=Ready "inspacenodeclass/{{ e2e_nodeclass_name }}" --timeout=10m
         kubectl get "inspacenodeclass/{{ e2e_nodeclass_name }}" -o json | jq -e \
           --arg amd "$INSPACE_AMD_HOST_POOL_UUID" \
-          --arg intel "aac7dd66-f390-4edd-80c0-dd7cae49bd99" '
+          --arg intel "aac7dd66-f390-4edd-80c0-dd7cae49bd99" \
+          --arg cacheAddress "$cache_address" \
+          --arg cacheCA "$cache_ca" '
           (.spec | has("hostPoolSelector") | not) and
+          (.spec.bootstrapCache | keys | sort) == ["address", "caBundle", "directDownload"] and
+          .spec.bootstrapCache.directDownload == false and
+          .spec.bootstrapCache.address == $cacheAddress and
+          .spec.bootstrapCache.caBundle == $cacheCA and
           (.status.hostPoolUUIDs | sort) == ([$intel, $amd] | sort)'
         kubectl get "nodepool/{{ e2e_nodepool_name }}" -o json | jq -e '
           .spec.template.spec.requirements as $requirements |
@@ -1390,6 +1607,8 @@
         set -euo pipefail
         kubectl apply -f "{{ e2e_state_dir }}/trigger.yaml"
         kubectl -n default rollout status deployment/inspace-e2e-trigger --timeout=20m
+        test "$(kubectl -n default get deployment/inspace-e2e-trigger -o jsonpath='{.spec.template.spec.containers[0].image}')" = \
+          'registry.k8s.io/pause:3.10.1'
         kubectl wait --for=condition=Ready node -l "karpenter.sh/nodepool={{ e2e_nodepool_name }}" --timeout=10m
         kubectl get nodeclaims -l "karpenter.sh/nodepool={{ e2e_nodepool_name }}" -o json | jq -e '
           .items | length == 1 and
@@ -1470,8 +1689,12 @@
   hosts: rke2_worker
   gather_facts: false
   vars:
+    e2e_worker_state: "{{ lookup('file', lookup('env', 'E2E_STATE_DIR') + '/state.json') | from_json }}"
     e2e_private_registration_endpoint: >-
-      {{ (lookup('file', lookup('env', 'E2E_STATE_DIR') + '/state.json') | from_json).privateRegistrationEndpoint }}
+      {{ e2e_worker_state.privateRegistrationEndpoint }}
+    e2e_cache_address: "{{ e2e_worker_state.bootstrapCacheAddress }}"
+    e2e_cache_registry: "{{ e2e_worker_state.bootstrapCacheRegistry }}"
+    e2e_cache_ca_bundle: "{{ e2e_worker_state.bootstrapCacheCABundle }}"
   tasks:
     - name: Probe worker private SSH from the bastion
       ansible.builtin.command:
@@ -1530,6 +1753,13 @@
         /usr/local/bin/rke2 --version | grep -F 'v1.35.6+rke2r1'
         grep -F -- 'server: "{{ e2e_private_registration_endpoint }}"' /etc/rancher/rke2/config.yaml
         grep -Fqx -- 'node-name: "{{ e2e_node_name }}"' /etc/rancher/rke2/config.yaml
+        cache_registry={{ e2e_cache_registry | quote }}
+        cache_host=${cache_registry%:8443}
+        grep -Fqx -- "{{ e2e_cache_address }} $cache_host # inspace-bootstrap-cache" /etc/hosts
+        grep -Fqx -- "system-default-registry: \"$cache_registry\"" /etc/rancher/rke2/config.yaml
+        printf '%s' {{ e2e_cache_ca_bundle | quote }} | cmp -s - /etc/rancher/rke2/bootstrap-cache-ca.crt
+        test "$(grep -Fc -- "  \"$cache_registry\":" /etc/rancher/rke2/registries.yaml)" -eq 1
+        grep -Fqx -- '      ca_file: "/etc/rancher/rke2/bootstrap-cache-ca.crt"' /etc/rancher/rke2/registries.yaml
         test "$(hostname)" = "{{ e2e_node_name }}"
         test "$(hostnamectl --static)" = "{{ e2e_node_name }}"
         test "$(cat /etc/hostname)" = "{{ e2e_node_name }}"

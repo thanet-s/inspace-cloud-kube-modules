@@ -47,6 +47,7 @@ type InSpaceClusterSpec struct {
 	BillingAccountID     int64                `json:"billingAccountID,omitempty"`
 	CredentialsSecretRef SecretKeyReference   `json:"credentialsSecretRef"`
 	ControlPlane         ControlPlaneSpec     `json:"controlPlane"`
+	BootstrapCache       BootstrapCacheSpec   `json:"bootstrapCache"`
 	RKE2                 RKE2Spec             `json:"rke2"`
 	Network              NetworkSpec          `json:"network"`
 	Firewall             FirewallSpec         `json:"firewall"`
@@ -75,6 +76,12 @@ type MachineSpec struct {
 type ImageSpec struct {
 	OSName    string `json:"osName"`
 	OSVersion string `json:"osVersion"`
+}
+
+// BootstrapCacheSpec selects the default bastion cache or explicitly opts a
+// cluster into direct guest downloads.
+type BootstrapCacheSpec struct {
+	DirectDownload bool `json:"directDownload,omitempty"`
 }
 
 type RKE2Spec struct {

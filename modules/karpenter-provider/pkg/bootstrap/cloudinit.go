@@ -14,15 +14,18 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	k8svalidation "k8s.io/apimachinery/pkg/util/validation"
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+
+	inspacev1 "github.com/thanet-s/inspace-cloud-kube-modules/modules/karpenter-provider/pkg/apis/v1alpha1"
 )
 
 // SchemaVersion must be bumped whenever generated bootstrap semantics change.
 // It is included in the provider drift hash so existing nodes are replaced.
 const (
-	SchemaVersion         = "stock-ubuntu-rke2-v7"
+	SchemaVersion         = "stock-ubuntu-rke2-v8"
 	VPCSubnetPlaceholder  = "__INSPACE_VPC_SUBNET__"
 	NativeRoutingPodCIDR  = "10.42.0.0/16"
 	KubernetesServiceCIDR = "10.43.0.0/16"
+	bootstrapCacheCAPath  = "/etc/rancher/rke2/bootstrap-cache-ca.crt"
 )
 
 var exactRKE2VersionPattern = regexp.MustCompile(`^v[0-9]+\.[0-9]+\.[0-9]+\+rke2r[0-9]+$`)
@@ -35,6 +38,14 @@ type Config struct {
 	Labels           map[string]string
 	Taints           []corev1.Taint
 	AdditionalScript string
+	// BootstrapCache is nil only for the explicit direct-download mode.
+	BootstrapCache *CacheConfig
+}
+
+type CacheConfig struct {
+	Host     string
+	Address  string
+	CABundle string
 }
 
 type document struct {
@@ -54,7 +65,9 @@ type writeFile struct {
 
 // RenderCloudInit returns the JSON object expected by the InSpace cloud_init
 // form field. It bootstraps a stock Ubuntu image and pins both the RKE2
-// distribution tarball and checksum asset to the exact NodeClass version.
+// distribution tarball and checksum asset to the exact NodeClass version. A
+// configured private cache rewrites only RKE2-owned system images and assets;
+// it never installs public-registry mirrors for arbitrary workloads.
 func RenderCloudInit(config Config) (string, error) {
 	if config.NodeName == "" || config.Server == "" || config.Token == "" || config.RKE2Version == "" {
 		return "", fmt.Errorf("node name, server, token, and RKE2 version are required")
@@ -64,6 +77,9 @@ func RenderCloudInit(config Config) (string, error) {
 	}
 	if !exactRKE2VersionPattern.MatchString(config.RKE2Version) {
 		return "", fmt.Errorf("RKE2 version must be an exact vX.Y.Z+rke2rN release")
+	}
+	if err := validateCacheConfig(config.BootstrapCache); err != nil {
+		return "", err
 	}
 	server, err := url.Parse(config.Server)
 	if err != nil || server.Scheme != "https" || server.Port() != "9345" || server.Path != "" || server.RawPath != "" || server.Opaque != "" || server.User != nil || server.RawQuery != "" || server.ForceQuery || server.Fragment != "" {
@@ -82,6 +98,11 @@ func RenderCloudInit(config Config) (string, error) {
 	fmt.Fprintf(&rke2, "server: %s\n", quote(config.Server))
 	fmt.Fprintf(&rke2, "token: %s\n", quote(config.Token))
 	fmt.Fprintf(&rke2, "node-name: %s\n", quote(config.NodeName))
+	cacheRegistry := ""
+	if config.BootstrapCache != nil {
+		cacheRegistry = fmt.Sprintf("%s:%d", config.BootstrapCache.Host, inspacev1.BootstrapCachePort)
+		fmt.Fprintf(&rke2, "system-default-registry: %s\n", quote(cacheRegistry))
+	}
 	rke2.WriteString("kubelet-arg:\n  - cloud-provider=external\n")
 
 	labelKeys := make([]string, 0, len(config.Labels))
@@ -127,11 +148,22 @@ APT::Periodic::Download-Upgradeable-Packages "0";
 APT::Periodic::AutocleanInterval "0";
 APT::Periodic::Unattended-Upgrade "0";
 `
+	cacheHostsCommands := ""
+	if config.BootstrapCache != nil {
+		cacheHostsCommands = fmt.Sprintf(`cache_host=%s
+cache_ipv4=%s
+cache_entry="$cache_ipv4 $cache_host # inspace-bootstrap-cache"
+sed -i '\|[[:space:]]# inspace-bootstrap-cache$|d' /etc/hosts
+printf '%%s\n' "$cache_entry" >> /etc/hosts
+grep -Fqx -- "$cache_entry" /etc/hosts
+`, shellQuote(config.BootstrapCache.Host), shellQuote(config.BootstrapCache.Address))
+	}
 	prepareHost := fmt.Sprintf(`#!/bin/sh
 set -eu
 expected_hostname=%s
 hostnamectl set-hostname --static "$expected_hostname"
 [ "$(hostnamectl --static)" = "$expected_hostname" ]
+%s
 swapoff -a
 if [ -f /etc/fstab ]; then
   sed -Ei '/^[[:space:]]*#/! { /[[:space:]]swap[[:space:]]/ s/^/#/; }' /etc/fstab
@@ -141,7 +173,7 @@ for ubuntu_sources in /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.li
   sed -E -i 's|https?://archive\.ubuntu\.com|http://th.archive.ubuntu.com|g' "$ubuntu_sources"
   if grep -E 'https?://archive\.ubuntu\.com' "$ubuntu_sources" >/dev/null; then exit 1; fi
 done
-`, shellQuote(config.NodeName))
+`, shellQuote(config.NodeName), strings.TrimSpace(cacheHostsCommands))
 	applyNodeTuning := `#!/bin/sh
 set -eu
 sysctl --system >/dev/null
@@ -301,9 +333,30 @@ fi
 
 	versionURL := url.PathEscape(config.RKE2Version)
 	releaseBase := "https://github.com/rancher/rke2/releases/download/" + versionURL
+	cacheCA := ""
+	cacheHealthURL := ""
+	if config.BootstrapCache != nil {
+		releaseBase = "https://" + cacheRegistry + "/rke2/" + versionURL
+		cacheCA = bootstrapCacheCAPath
+		cacheHealthURL = "https://" + cacheRegistry + "/healthz"
+	}
 	install := fmt.Sprintf(`#!/bin/sh
 set -eu
 version=%s
+cache_ca=%s
+cache_health_url=%s
+if [ -n "$cache_ca" ]; then
+  [ -s "$cache_ca" ]
+  attempt=0
+  until curl --fail --silent --show-error --connect-timeout 5 --max-time 15 --retry 2 --retry-all-errors --cacert "$cache_ca" --output /dev/null "$cache_health_url"; do
+    attempt=$((attempt + 1))
+    if [ "$attempt" -ge 60 ]; then
+      echo "bootstrap cache did not become healthy after $attempt attempts" >&2
+      exit 1
+    fi
+    sleep 5
+  done
+fi
 if [ -x /usr/local/bin/rke2 ] && \
    [ -f /usr/local/lib/systemd/system/rke2-agent.service ] && \
    /usr/local/bin/rke2 --version 2>/dev/null | grep -F -- "rke2 version $version" >/dev/null; then
@@ -314,10 +367,18 @@ trap 'rm -rf "$tmpdir"' EXIT INT TERM
 download_asset() {
   url="$1"
   output="$2"
+  cache_ca=${cache_ca:-}
   attempt=0
   while [ "$attempt" -lt 60 ]; do
     attempt=$((attempt + 1))
-    if curl --fail --location --silent --show-error --connect-timeout 15 --max-time 300 --retry 3 --retry-all-errors --output "$output" "$url"; then
+    if [ -n "$cache_ca" ]; then
+      curl_result=0
+      curl --fail --location --silent --show-error --connect-timeout 15 --max-time 300 --retry 3 --retry-all-errors --cacert "$cache_ca" --output "$output" "$url" || curl_result=$?
+    else
+      curl_result=0
+      curl --fail --location --silent --show-error --connect-timeout 15 --max-time 300 --retry 3 --retry-all-errors --output "$output" "$url" || curl_result=$?
+    fi
+    if [ "$curl_result" -eq 0 ]; then
       return 0
     fi
     if [ "$attempt" -lt 60 ]; then
@@ -335,7 +396,7 @@ actual="$(sha256sum "$tmpdir/rke2.linux-amd64.tar.gz" | awk '{ print $1 }')"
 [ "$actual" = "$expected" ]
 tar -xzf "$tmpdir/rke2.linux-amd64.tar.gz" -C /usr/local
 /usr/local/bin/rke2 --version | grep -F -- "rke2 version $version" >/dev/null
-`, shellQuote(config.RKE2Version), shellQuote(releaseBase), shellQuote(releaseBase))
+`, shellQuote(config.RKE2Version), shellQuote(cacheCA), shellQuote(cacheHealthURL), shellQuote(releaseBase), shellQuote(releaseBase))
 
 	doc := document{
 		Hostname:         config.NodeName,
@@ -358,6 +419,13 @@ tar -xzf "$tmpdir/rke2.linux-amd64.tar.gz" -C /usr/local
 			encodedWriteFile("/usr/local/sbin/inspace-verify-host-firewall", "0700", verifyHostFirewall),
 			encodedWriteFile("/usr/local/sbin/inspace-start-rke2-agent", "0700", startAgent),
 		},
+	}
+	if config.BootstrapCache != nil {
+		registryConfig := fmt.Sprintf("configs:\n  %s:\n    tls:\n      ca_file: %s\n", quote(cacheRegistry), quote(bootstrapCacheCAPath))
+		doc.WriteFiles = append(doc.WriteFiles,
+			encodedWriteFile(bootstrapCacheCAPath, "0644", config.BootstrapCache.CABundle),
+			encodedWriteFile("/etc/rancher/rke2/registries.yaml", "0600", registryConfig),
+		)
 	}
 	var orchestrator strings.Builder
 	orchestrator.WriteString(`#!/bin/sh
@@ -392,6 +460,22 @@ set -eu
 		return "", fmt.Errorf("marshal cloud-init JSON: %w", err)
 	}
 	return string(data), nil
+}
+
+func validateCacheConfig(cache *CacheConfig) error {
+	if cache == nil {
+		return nil
+	}
+	if messages := k8svalidation.IsDNS1123Subdomain(cache.Host); len(messages) != 0 {
+		return fmt.Errorf("bootstrap cache host must be a DNS-1123 subdomain: %s", strings.Join(messages, "; "))
+	}
+	if err := inspacev1.ValidateBootstrapCache(inspacev1.BootstrapCacheSpec{
+		Address:  cache.Address,
+		CABundle: cache.CABundle,
+	}); err != nil {
+		return fmt.Errorf("bootstrap cache: %w", err)
+	}
+	return nil
 }
 
 // ValidateVPCSubnetTemplate ensures the production adapter can bind private-IP

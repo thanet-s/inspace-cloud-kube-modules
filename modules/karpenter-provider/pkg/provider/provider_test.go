@@ -2,8 +2,16 @@ package provider
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
+	"fmt"
+	"math/big"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/awslabs/operatorpkg/status"
 	corev1 "k8s.io/api/core/v1"
@@ -356,6 +364,84 @@ func TestCreateAndReadbackPreserveOfferingAndNumericIdentity(t *testing.T) {
 	assertCapacityLabels(t, listed[0].Labels)
 }
 
+func TestCreateGatesCachedWorkersOnHealthWithoutProbingDirectMode(t *testing.T) {
+	for _, test := range []struct {
+		name           string
+		directDownload bool
+		probeError     error
+		wantProbeCalls int
+		wantError      bool
+		wantVMs        int
+	}{
+		{name: "healthy private cache", wantProbeCalls: 1, wantVMs: 1},
+		{name: "unhealthy private cache", probeError: fmt.Errorf("cache unavailable"), wantProbeCalls: 1, wantError: true},
+		{name: "explicit direct download", directDownload: true, probeError: fmt.Errorf("must not be called"), wantVMs: 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			nodeClass := readyProviderNodeClass()
+			if test.directDownload {
+				nodeClass.Spec.BootstrapCache = inspacev1.BootstrapCacheSpec{DirectDownload: true}
+			} else {
+				nodeClass.Spec.BootstrapCache = inspacev1.BootstrapCacheSpec{
+					Address:  "10.0.0.30",
+					CABundle: providerTestCABundle(t),
+				}
+			}
+			nodeClass.Status.ObservedSpecHash = NodeClassHash(nodeClass)
+			resolver := NewStaticResolver(nodeClass)
+			resolver.SetToken(inspacev1.RKE2AgentTokenSecretName, inspacev1.RKE2AgentTokenSecretKey, "agent-token")
+			probe := &recordingCacheHealthProber{err: test.probeError}
+			opts := providerOptions(nodeClass)
+			opts.CacheHealthProber = probe
+			cloud := cloudfake.New()
+			provider, err := New(cloud, resolver, opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			claim := &karpv1.NodeClaim{
+				ObjectMeta: metav1.ObjectMeta{Name: "general-cache1", UID: types.UID("cache-claim"), Labels: map[string]string{karpv1.NodePoolLabelKey: "general"}},
+				Spec:       karpv1.NodeClaimSpec{NodeClassRef: &karpv1.NodeClassReference{Group: inspacev1.Group, Kind: inspacev1.Kind, Name: nodeClass.Name}},
+			}
+			_, err = provider.Create(context.Background(), claim)
+			if test.wantError {
+				if !cloudprovider.IsNodeClassNotReadyError(err) || !strings.Contains(err.Error(), "bootstrap cache health probe") {
+					t.Fatalf("Create() error = %v, want cache NodeClassNotReady", err)
+				}
+			} else if err != nil {
+				t.Fatalf("Create() error = %v", err)
+			}
+			if probe.calls != test.wantProbeCalls {
+				t.Fatalf("cache probe calls = %d, want %d", probe.calls, test.wantProbeCalls)
+			}
+			if probe.calls != 0 {
+				if probe.healthURL != "https://cache.provider-test.inspace.internal:8443/healthz" || probe.address != "10.0.0.30" || probe.caBundle == "" {
+					t.Fatalf("cache probe contract = %#v", probe)
+				}
+			}
+			vms, listErr := cloud.ListVMs(context.Background(), nodeClass.Spec.Location, nodeClass.Spec.ClusterName)
+			if listErr != nil || len(vms) != test.wantVMs {
+				t.Fatalf("VMs after probe = %d, want %d (err=%v)", len(vms), test.wantVMs, listErr)
+			}
+		})
+	}
+}
+
+type recordingCacheHealthProber struct {
+	calls     int
+	healthURL string
+	address   string
+	caBundle  string
+	err       error
+}
+
+func (p *recordingCacheHealthProber) Probe(_ context.Context, healthURL, address, caBundle string) error {
+	p.calls++
+	p.healthURL = healthURL
+	p.address = address
+	p.caBundle = caBundle
+	return p.err
+}
+
 func TestGetInstanceTypesRejectsNodeClassServicePoolDifferentFromController(t *testing.T) {
 	nodeClass := providerNodeClass()
 	provider, err := New(cloudfake.New(), NewStaticResolver(nodeClass), Options{
@@ -482,6 +568,23 @@ func TestRKE2ConfigChangesNodeClassAndBootstrapHashes(t *testing.T) {
 	}
 }
 
+func TestBootstrapCacheChangesNodeClassAndBootstrapHashes(t *testing.T) {
+	nodeClass := providerNodeClass()
+	nodeClassHash := NodeClassHash(nodeClass)
+	bootstrapHash := BootstrapHash(nodeClass)
+
+	nodeClass.Spec.BootstrapCache = inspacev1.BootstrapCacheSpec{
+		Address:  "10.0.0.30",
+		CABundle: providerTestCABundle(t),
+	}
+	if NodeClassHash(nodeClass) == nodeClassHash {
+		t.Fatal("bootstrap-cache change did not change NodeClass hash")
+	}
+	if BootstrapHash(nodeClass) == bootstrapHash {
+		t.Fatal("bootstrap-cache change did not change bootstrap hash")
+	}
+}
+
 func providerNodeClass() *inspacev1.InSpaceNodeClass {
 	return &inspacev1.InSpaceNodeClass{
 		ObjectMeta: metav1.ObjectMeta{Name: "workers"},
@@ -500,6 +603,7 @@ func providerNodeClass() *inspacev1.InSpaceNodeClass {
 				Server:         "https://10.0.0.10:9345",
 				TokenSecretRef: inspacev1.SecretKeySelector{Name: inspacev1.RKE2AgentTokenSecretName, Key: inspacev1.RKE2AgentTokenSecretKey},
 			},
+			BootstrapCache: inspacev1.BootstrapCacheSpec{DirectDownload: true},
 		},
 	}
 }
@@ -520,4 +624,27 @@ func providerOptions(nodeClass *inspacev1.InSpaceNodeClass) Options {
 		NetworkUUID: nodeClass.Spec.NetworkUUID, ControlPlaneVIP: vip.String(),
 		PrivateLoadBalancerPool: nodeClass.Spec.PrivateLoadBalancerPool,
 	}
+}
+
+func providerTestCABundle(t *testing.T) string {
+	t.Helper()
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	template := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "InSpace provider cache test"},
+		NotBefore:             now.Add(-time.Hour),
+		NotAfter:              now.Add(time.Hour),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, template, template, publicKey, privateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}))
 }

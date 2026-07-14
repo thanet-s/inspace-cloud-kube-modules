@@ -294,6 +294,7 @@ def main() -> None:
     nodeclass = (ROOT / "templates/karpenter.yaml.j2").read_text(encoding="utf-8")
     cluster = (ROOT / "templates/cluster.yaml.j2").read_text(encoding="utf-8")
     workload = (ROOT / "templates/workload.yaml.j2").read_text(encoding="utf-8")
+    trigger = (ROOT / "templates/trigger.yaml.j2").read_text(encoding="utf-8")
     ansible_cfg = (ROOT / "ansible.cfg").read_text(encoding="utf-8")
 
     executable_host = "\n".join(
@@ -348,6 +349,8 @@ def main() -> None:
             "signal handling must refuse cleanup across process-group startup or quiescence uncertainty")
     require("mounted E2E environment file must have mode 0600" in entrypoint,
             "runner must reject an over-permissive API-token file")
+    require("ansible-playbook autossh curl date flock" in entrypoint,
+            "runner must require the UTC timestamp command before cache initialization")
     require("flock -n 9" in entrypoint and "inspace-cloud-rke2-e2e.lock" in entrypoint,
             "runner must hold one exclusive shared-state lock")
     require('value != "https://api.inspace.cloud"' in entrypoint and
@@ -427,6 +430,23 @@ def main() -> None:
             "cluster template must not contain Jinja control flow or template comments")
     require(yaml_mapping_scalar(cluster, "spec", "controlPlane", "replicas") == "3",
             "cluster template spec.controlPlane.replicas must be exactly 3")
+    require(yaml_mapping_scalar(cluster, "spec", "bootstrapCache", "directDownload") == "false",
+            "cluster template must enable the default bastion cache explicitly")
+    for marker in (
+        'e2e_bootstrap_cache_key_file: "{{ lookup(\'env\', \'E2E_STATE_DIR\') }}/bootstrap-cache-key"',
+        "Generate the 256-bit bootstrap cache key inside the runner",
+        'argv: [openssl, rand, -hex, "32"]',
+        "lookup('file', e2e_bootstrap_cache_key_file) is match('^[0-9a-f]{64}$')",
+        'e2e_bootstrap_cache_not_before_file: "{{ lookup(\'env\', \'E2E_STATE_DIR\') }}/bootstrap-cache-not-before"',
+        "Capture the bootstrap cache certificate epoch at cluster initialization",
+        'argv: [date, -u, "+%Y-%m-%dT%H:%M:%SZ"]',
+        "Require an exact persisted UTC bootstrap cache certificate epoch",
+        "Prove the cache CA is ECDSA P-256 with exactly fifteen years from the persisted epoch",
+        "Public Key Algorithm: id-ecPublicKey",
+        "ASN1 OID: prime256v1",
+        "expected.replace(year=expected.year + 15)",
+    ):
+        require(marker in init_playbook, f"cached bootstrap initialization is missing: {marker}")
     provision_play = named_yaml_sequence_item(
         playbook, "Provision the RKE2 control plane through the product bootstrap controller", 0
     )
@@ -455,6 +475,9 @@ def main() -> None:
         "bootstrap launch argv must be the canonical until-ready controller invocation",
     )
     require_yaml_key(launch_task, 6, "register", "e2e_bootstrap_wait")
+    require('INSPACE_BOOTSTRAP_CACHE_KEY: "{{ lookup(\'file\', e2e_bootstrap_cache_key_file) | trim }}"' in launch_task and
+            'INSPACE_BOOTSTRAP_CACHE_NOT_BEFORE: "{{ lookup(\'file\', e2e_bootstrap_cache_not_before_file) | trim }}"' in launch_task,
+            "cached bootstrap launch must receive its persisted key and certificate epoch")
     require("\n      async:" not in launch_task and "ansible.builtin.async_status" not in provision_play,
             "bootstrap cloud mutation must remain attached to the managed Ansible process group")
     parallel_assertion = named_yaml_sequence_item(
@@ -464,6 +487,10 @@ def main() -> None:
         "e2e_bootstrap_result.controlPlaneVMs | length == 3",
         "e2e_bootstrap_result.controlPlaneVMs | unique | length == 3",
         "e2e_bootstrap_result.maxParallelControlPlaneCreates | int == 3",
+        "e2e_bootstrap_result.bootstrapCacheEndpoint == 'https://cache.' + e2e_cluster_name + '.inspace.internal:8443'",
+        "e2e_bootstrap_result.bootstrapCacheRegistry == 'cache.' + e2e_cluster_name + '.inspace.internal:8443'",
+        "e2e_bootstrap_result.bootstrapCacheAddress == e2e_bootstrap_result.bastionPrivateIPv4",
+        "e2e_bootstrap_result.bootstrapCacheCABundle is match('^-----BEGIN CERTIFICATE-----\\n')",
     ):
         require(f"\n          - {clause}" in parallel_assertion,
                 f"parallel provisioning assertion lacks exact clause: {clause}")
@@ -520,8 +547,8 @@ def main() -> None:
     )
     require_unrestricted_parallel_task(cloud_init_wait)
     require("\n      ansible.builtin.raw: >-" in cloud_init_wait and
-            "timeout --kill-after=5s 1800s sh -c" in cloud_init_wait,
-            "control-plane cloud-init wait must be bounded inside the free-strategy play")
+            "timeout --kill-after=5s 4800s sh -c" in cloud_init_wait,
+            "control-plane cloud-init wait must cover bounded cold-cache initialization inside the free-strategy play")
     product_preparation = named_yaml_sequence_item(
         control_plane_wait_play, "Detect completed product node preparation on every control plane", 4
     )
@@ -594,7 +621,13 @@ def main() -> None:
         control_plane_wait_play, "Verify pinned RKE2 and Ubuntu versions on every control plane", 4
     )
     for marker in (
+        '# inspace-bootstrap-cache" /etc/hosts',
+        'system-default-registry: \\"$cache_registry\\"',
+        "cmp -s - /etc/rancher/rke2/bootstrap-cache-ca.crt",
+        "/etc/rancher/rke2/registries.yaml",
         "kube_vip_manifest=/var/lib/rancher/rke2/agent/pod-manifests/kube-vip.yaml",
+        "$cache_registry/kube-vip/kube-vip:v1.2.1@sha256:44035f68040c9eb99103c65f1f9ab9698d93f9f272110825705338ac1926f3d9",
+        "! grep -Fq 'ghcr.io/kube-vip/' \"$kube_vip_manifest\"",
         "grep -Fc '    - ip: \"127.0.0.1\"'",
         "grep -Fc '        - \"kubernetes\"'",
         "grep -Fc '        - name: vip_nodename'",
@@ -640,6 +673,9 @@ def main() -> None:
         "global.inspace.privateLoadBalancerPool.start",
         "global.inspace.privateLoadBalancerPool.stop",
         "global.inspace.controlPlaneVIP",
+        "global.inspace.systemImageRegistry",
+        "Require the persisted default bootstrap cache contract",
+        "Recheck the private bastion cache by its stable TLS hostname",
         "Verify Cilium native routing and full kube-proxy replacement",
         "Masquerading:[[:space:]]+BPF",
         "EnableBPFMasquerade",
@@ -668,6 +704,11 @@ def main() -> None:
             "NodeClass must use the private RKE2 registration endpoint")
     require("inspace-rke2-agent-token" in nodeclass, "NodeClass must use the RKE2 token secret")
     require("rootDiskGiB: 100" in nodeclass, "E2E Karpenter workers must use 100 GiB root disks")
+    require("bootstrapCache:" in nodeclass and
+            "directDownload: false" in nodeclass and
+            'address: "{{ e2e_bootstrap_result.bootstrapCacheAddress }}"' in nodeclass and
+            "caBundle: {{ e2e_bootstrap_result.bootstrapCacheCABundle | to_json }}" in nodeclass,
+            "E2E NodeClass must consume the reconciler's bastion address and public cache CA")
     require("hostPoolSelector" not in nodeclass and
             "key: inspace.cloud/host-class" in nodeclass and
             "values: [amd-epyc]" in nodeclass and
@@ -692,6 +733,19 @@ def main() -> None:
             'all($requirements[]; .key != "inspace.cloud/instance-memory")' in playbook and
             "INSPACE_AMD_HOST_POOL_UUID" in playbook,
             "live NodeClass and NodePool checks must prove the unpinned-memory AMD general Gt 1 selection")
+    require('(.spec.bootstrapCache | keys | sort) == ["address", "caBundle", "directDownload"]' in playbook and
+            ".spec.bootstrapCache.directDownload == false" in playbook and
+            ".spec.bootstrapCache.address == $cacheAddress" in init_playbook and
+            ".spec.bootstrapCache.caBundle == $cacheCA" in init_playbook,
+            "live NodeClass acceptance must prove the complete cached-mode contract")
+    require('"global.inspace.systemImageRegistry={{ e2e_state.bootstrapCacheRegistry }}"' in init_playbook and
+            '"$registry/thanet-s/inspace-cloud-controller-manager:$version"' in init_playbook and
+            '"$registry/sig-storage/csi-provisioner:v5.2.0"' in init_playbook,
+            "released chart installation must route its audited system images through the cache")
+    require("image: registry.k8s.io/pause:3.10.1" in trigger and
+            "'registry.k8s.io/pause:3.10.1'" in playbook and
+            "cache.{{" not in trigger,
+            "an arbitrary Karpenter workload image must remain on its upstream registry")
     require(playbook.count('.metadata.labels["inspace.cloud/host-class"] == "amd-epyc"') >= 2 and
             playbook.count('.metadata.labels["inspace.cloud/instance-cpu"] == "2"') >= 2 and
             playbook.count('.metadata.labels["inspace.cloud/instance-memory"] == "4096"') >= 2,
@@ -864,8 +918,12 @@ def main() -> None:
             playbook.count('APT::Periodic::Unattended-Upgrade "0";') == 4 and
             playbook.count('systemctl is-enabled "$apt_unit"') == 4,
             "control planes (including repair), worker, and bastion must prove automatic APT updates are masked")
-    digest = "sha256:49b77655f9f109bedc5eb25723bb0e4c57d8513ba33cc69c31be3f243eb2386d"
-    require(playbook.count(digest) >= 2, "kube-vip tag and live pods must use the audited digest")
+    upstream_digest = "sha256:49b77655f9f109bedc5eb25723bb0e4c57d8513ba33cc69c31be3f243eb2386d"
+    cached_digest = "sha256:44035f68040c9eb99103c65f1f9ab9698d93f9f272110825705338ac1926f3d9"
+    require(init_playbook.count(upstream_digest) == 1,
+            "preflight must audit the upstream multiarch kube-vip manifest exactly once")
+    require(init_playbook.count(cached_digest) >= 2,
+            "control-plane manifests and live pods must use the cached amd64 kube-vip digest")
     require("expected one exact egress FIP for each control plane and bastion" in bootstrap_discovery and
             "vm_by_name = canonical_owned_vm_details(listed_owned_vms)" in bootstrap_discovery and
             'expected_cp_names = [f"{cluster_resource_name}-cp{index}"' in bootstrap_discovery and
@@ -888,6 +946,11 @@ def main() -> None:
             "live E2E must bind cloud, guest-hostname, and Kubernetes control-plane identities")
 
     bastion_play = named_yaml_sequence_item(playbook, "Establish the pinned public bastion", 0)
+    bastion_cloud_init = named_yaml_sequence_item(
+        bastion_play, "Wait for bounded bastion cloud-init completion", 4
+    )
+    require("timeout --kill-after=5s 4800s sh -c" in bastion_cloud_init,
+            "bastion cloud-init wait must cover bounded cold-cache initialization")
     for hostname_proof in (
         'test "$(hostname)" = "{{ e2e_node_name }}"',
         'test "$(hostnamectl --static)" = "{{ e2e_node_name }}"',
@@ -895,8 +958,40 @@ def main() -> None:
     ):
         require(hostname_proof in bastion_play,
                 f"bastion guest identity proof is missing: {hostname_proof}")
+    bastion_cache = named_yaml_sequence_item(
+        bastion_play, "Prove the default bastion cache is mounted healthy complete and read-only", 4
+    )
+    for marker in (
+        "stat -c %s /var/lib/inspace/bootstrap-cache.img",
+        "10000000000",
+        "mountpoint -q /var/lib/inspace/bootstrap-cache",
+        "findmnt -n -o FSTYPE /var/lib/inspace/bootstrap-cache",
+        "docker compose -f \"$compose_file\" ps --services --status running",
+        '\"Status\": \"healthy\"',
+        "Public Key Algorithm: id-ecPublicKey",
+        "ASN1 OID: prime256v1",
+        '-verify_hostname "$cache_host"',
+        'cmp -s /etc/inspace-cache/tls/server.crt "$served_certificate"',
+        "/etc/inspace-cache/images.tsv)\" -eq 34",
+        '"${resolve[@]}" "$cache_endpoint/healthz"',
+        '"${resolve[@]}" "$cache_endpoint/v2/"',
+        '"$cache_endpoint/v2/$repository/manifests/$reference"',
+        "--request POST",
+        'test "$write_status" = 403',
+    ):
+        require(marker in bastion_cache, f"bastion cache acceptance is missing: {marker}")
+    require('test "$cache_address" = "{{ e2e_private_ip }}"' in bastion_cache,
+            "bastion cache acceptance must use the allocator-assigned bastion private address")
     require('e2e_node_name: "{{ e2e_state.bastionName }}"' in playbook,
             "dynamic bastion inventory must use the discovered exact VM name")
+    for field in (
+        '"bootstrapCacheAddress": bastion_private',
+        '"bootstrapCacheEndpoint": cache_endpoint',
+        '"bootstrapCacheRegistry": cache_registry',
+        '"bootstrapCacheCABundle": cache_ca_bundle',
+    ):
+        require(field in bootstrap_discovery,
+                f"bootstrap discovery does not persist the reconciled cache contract: {field}")
     for naming_contract in (
         're.compile(r"[a-z0-9](?:[a-z0-9-]{0,53}[a-z0-9])?")',
         'f"{cluster_resource_name}-bastion-{owner}"',
@@ -1282,6 +1377,9 @@ def main() -> None:
             "\n      register: e2e_destroy_wait" in destroy_task and
             "\n      async:" not in destroy_task,
             "bootstrap destroy must remain attached to the managed Ansible process group")
+    require("INSPACE_BOOTSTRAP_CACHE_KEY" not in destroy_task and
+            "INSPACE_BOOTSTRAP_CACHE_NOT_BEFORE" not in destroy_task,
+            "bootstrap destroy must not require cache key or certificate time input")
     ordering = [
         "Delete workload owners before infrastructure owners",
         "Wait for E2E pods PVs and VolumeAttachments to disappear",

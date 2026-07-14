@@ -25,6 +25,11 @@ spec:
   imageSelector:
     osName: ubuntu
     osVersion: "24.04"
+  # This standalone example uses the explicit direct path. For the default
+  # cached cluster mode, set directDownload to false and supply the bastion's
+  # reconciled private address and public CA bundle instead.
+  bootstrapCache:
+    directDownload: true
   # Hardware class is selected by each NodePool with
   # inspace.cloud/host-class, so this NodeClass can serve Intel, AMD, or mixed
   # pools without duplicating network and bootstrap configuration.

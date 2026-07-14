@@ -63,6 +63,7 @@ type CloudInitInput struct {
 	PrivateLoadBalancerPoolStop  string
 	TLSSubjectAltNames           []string
 	Disable                      []string
+	BootstrapCache               *NodeCacheConfig
 }
 
 // RenderCloudInitJSON returns the JSON object expected by InSpace's
@@ -94,6 +95,12 @@ func RenderCloudInitJSON(input CloudInitInput) (string, error) {
 	if err := validateVirtualIPv4(input.PrivateSubnet, input.VirtualIPv4); err != nil {
 		return "", err
 	}
+	if err := validateNodeCacheConfig(input.BootstrapCache, input.PrivateSubnet); err != nil {
+		return "", err
+	}
+	if input.BootstrapCache != nil && input.BootstrapCache.Address == input.VirtualIPv4 {
+		return "", errors.New("bootstrap: cache address must not equal the control-plane virtual IPv4")
+	}
 	privatePool, err := validatePrivateLoadBalancerPool(
 		input.PrivateSubnet, input.PodCIDR, input.ServiceCIDR, input.VirtualIPv4,
 		input.PrivateLoadBalancerPoolStart, input.PrivateLoadBalancerPoolStop,
@@ -104,7 +111,7 @@ func RenderCloudInitJSON(input CloudInitInput) (string, error) {
 	config := renderRKE2Config(input)
 	ciliumConfig := renderRKE2CiliumConfig(input.PodCIDR, privatePool.AddressCount)
 	ciliumLoadBalancerConfig := renderCiliumPrivateLoadBalancerManifest(input.PrivateLoadBalancerPoolStart, input.PrivateLoadBalancerPoolStop)
-	kubeVIPConfig := renderKubeVIPStaticPod(input.VirtualIPv4)
+	kubeVIPConfig := renderKubeVIPStaticPod(input.VirtualIPv4, input.BootstrapCache)
 	script := renderInstallScript(input)
 	payload := struct {
 		Hostname         string `json:"hostname"`
@@ -135,6 +142,10 @@ func RenderCloudInitJSON(input CloudInitInput) (string, error) {
 	addFile("/var/lib/inspace/rke2-cilium-config", ciliumConfig, "0600")
 	addFile("/var/lib/inspace/rke2-cilium-private-load-balancer", ciliumLoadBalancerConfig, "0600")
 	addFile("/var/lib/inspace/rke2-kube-vip", kubeVIPConfig, "0600")
+	if input.BootstrapCache != nil {
+		addFile("/etc/rancher/rke2/bootstrap-cache-ca.crt", input.BootstrapCache.CABundle, "0644")
+		addFile("/etc/rancher/rke2/registries.yaml", renderCacheRegistriesConfig(input.BootstrapCache), "0600")
+	}
 	addFile("/etc/sysctl.d/90-inspace-kubernetes.conf", kubernetesSysctlConfig, "0644")
 	addFile("/etc/security/limits.d/90-inspace-kubernetes.conf", kubernetesLimitsConfig, "0644")
 	addFile("/etc/systemd/system/rke2-server.service.d/20-inspace-node-limits.conf", rke2ServerLimitsConfig, "0644")
@@ -209,6 +220,9 @@ func renderRKE2Config(input CloudInitInput) string {
 		"  - node-role.kubernetes.io/control-plane=true:NoSchedule",
 		"kubelet-arg:",
 		"  - cloud-provider=external",
+	}
+	if input.BootstrapCache != nil {
+		lines = append(lines, "system-default-registry: "+yamlString(input.BootstrapCache.Registry()))
 	}
 	if input.NodeExternalIPv4 != "" {
 		lines = append(lines, "node-external-ip: "+yamlString(input.NodeExternalIPv4))
@@ -306,7 +320,11 @@ spec:
 `, yamlString(start), yamlString(stop))
 }
 
-func renderKubeVIPStaticPod(virtualIPv4 string) string {
+func renderKubeVIPStaticPod(virtualIPv4 string, cache *NodeCacheConfig) string {
+	image := kubeVIPImage
+	if cache != nil {
+		image = cache.Registry() + "/" + cachedKubeVIPImage
+	}
 	return fmt.Sprintf(`apiVersion: v1
 kind: Pod
 metadata:
@@ -365,7 +383,30 @@ spec:
       hostPath:
         path: /etc/rancher/rke2/rke2.yaml
         type: File
-`, kubeVIPImage, yamlString(virtualIPv4))
+`, image, yamlString(virtualIPv4))
+}
+
+func renderCacheRegistriesConfig(cache *NodeCacheConfig) string {
+	return fmt.Sprintf(`configs:
+  %s:
+    tls:
+      ca_file: /etc/rancher/rke2/bootstrap-cache-ca.crt
+`, yamlString(cache.Registry()))
+}
+
+func renderNodeCacheHostsSetup(cache *NodeCacheConfig) string {
+	if cache == nil {
+		return ":"
+	}
+	return fmt.Sprintf(`cache_address=%s
+cache_hostname=%s
+cache_hosts_tmp="$(mktemp)"
+awk -v host="$cache_hostname" '{ keep=1; for (i=2; i<=NF; i++) if ($i == host) keep=0; if (keep) print }' /etc/hosts >"$cache_hosts_tmp"
+install -m 0644 "$cache_hosts_tmp" /etc/hosts
+rm -f "$cache_hosts_tmp"
+printf '%%s %%s # inspace-bootstrap-cache\n' "$cache_address" "$cache_hostname" >>/etc/hosts
+getent ahostsv4 "$cache_hostname" | awk -v expected="$cache_address" '$1 == expected { found=1 } END { exit !found }'
+`, shellSingleQuote(cache.Address), shellSingleQuote(cache.Hostname))
 }
 
 func renderDisableUFWScript() string {
@@ -432,6 +473,126 @@ done
 }
 
 func renderInstallScript(input CloudInitInput) string {
+	if input.BootstrapCache == nil {
+		return renderDirectInstallScript(input)
+	}
+	releaseBase := "https://github.com/rancher/rke2/releases/download/" + url.PathEscape(input.RKE2Version)
+	cacheWait := "cache_curl_option=\n"
+	cacheHostsSetup := renderNodeCacheHostsSetup(input.BootstrapCache)
+	if input.BootstrapCache != nil {
+		releaseBase = input.BootstrapCache.Endpoint() + "/rke2/" + url.PathEscape(input.RKE2Version)
+		cacheWait = fmt.Sprintf(`cache_curl_option="--cacert /etc/rancher/rke2/bootstrap-cache-ca.crt"
+cache_deadline=$(( $(date +%%s) + 2700 ))
+until curl --fail --silent --show-error --cacert /etc/rancher/rke2/bootstrap-cache-ca.crt --connect-timeout 5 --max-time 10 %s/healthz >/dev/null; do
+  if [ "$(date +%%s)" -ge "$cache_deadline" ]; then
+    echo "bootstrap cache did not become ready" >&2
+    exit 1
+  fi
+  sleep 5
+done
+`, shellSingleQuote(input.BootstrapCache.Endpoint()))
+	}
+	return fmt.Sprintf(`#!/bin/sh
+set -eu
+
+swapoff -a
+if [ -f /etc/fstab ]; then
+  sed -Ei '/^[[:space:]]*#/! { /[[:space:]]swap[[:space:]]/ s/^/#/; }' /etc/fstab
+fi
+for ubuntu_sources in /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list; do
+  [ -f "$ubuntu_sources" ] || continue
+  sed -E -i 's|https?://archive\.ubuntu\.com|http://th.archive.ubuntu.com|g' "$ubuntu_sources"
+  if grep -E 'https?://archive\.ubuntu\.com' "$ubuntu_sources" >/dev/null; then exit 1; fi
+done
+
+package_deadline=$(( $(date +%%s) + 600 ))
+run_package_command() {
+  package_remaining=$(( package_deadline - $(date +%%s) ))
+  [ "$package_remaining" -gt 0 ] || return 124
+  timeout --kill-after=30s "${package_remaining}s" "$@"
+}
+attempt=0
+until run_package_command apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 update && \
+	  run_package_command env NEEDRESTART_MODE=a DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=30 upgrade -y && \
+	  run_package_command env NEEDRESTART_MODE=a DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=30 install -y --no-install-recommends ca-certificates curl iproute2 procps tar; do
+  attempt=$((attempt + 1))
+  if [ "$attempt" -ge 60 ] || [ "$(date +%%s)" -ge "$package_deadline" ]; then exit 1; fi
+  sleep 10
+done
+
+%s
+
+sysctl --system >/dev/null
+test "$(sysctl -n net.ipv4.ip_forward)" -eq 1
+test "$(sysctl -n fs.inotify.max_user_instances)" -ge 8192
+test "$(sysctl -n fs.inotify.max_user_watches)" -ge 524288
+test -z "$(swapon --show --noheadings)"
+install -d -m 0755 /var/lib/inspace
+: > /var/lib/inspace/kubernetes-node-prepared-v1
+chmod 0600 /var/lib/inspace/kubernetes-node-prepared-v1
+
+vpc_subnet='%s'
+virtual_ip='%s'
+vpc_identities="$(ip -o -4 addr show to "$vpc_subnet" scope global | awk -v vip="$virtual_ip" '$3 == "inet" { split($4, address, "/"); if (address[1] != vip) print $2, address[1] }')"
+test -n "$vpc_identities"
+test "$(printf '%%s\n' "$vpc_identities" | awk 'NF { count++ } END { print count + 0 }')" -eq 1
+set -- $vpc_identities
+PRIVATE_IF=${1%%%%@*}
+PRIVATE_IP=$2
+test -n "$PRIVATE_IF"
+test -n "$PRIVATE_IP"
+
+%s
+
+install -d -m 0700 /etc/rancher/rke2 /var/lib/rancher/rke2/server/manifests /var/lib/rancher/rke2/agent/pod-manifests
+install -m 0600 /var/lib/inspace/rke2-config /etc/rancher/rke2/config.yaml
+sed -i "s/__PRIVATE_IP__/$PRIVATE_IP/g" /etc/rancher/rke2/config.yaml
+chmod 0600 /etc/rancher/rke2/config.yaml
+install -m 0600 /var/lib/inspace/rke2-cilium-config /var/lib/rancher/rke2/server/manifests/rke2-cilium-config.yaml
+install -m 0600 /var/lib/inspace/rke2-cilium-private-load-balancer /var/lib/rancher/rke2/server/manifests/inspace-private-load-balancer.yaml
+install -m 0600 /var/lib/inspace/rke2-kube-vip /var/lib/rancher/rke2/agent/pod-manifests/kube-vip.yaml
+sed -i "s/__PRIVATE_IFACE__/$PRIVATE_IF/g" /var/lib/rancher/rke2/agent/pod-manifests/kube-vip.yaml
+
+%s
+
+%s
+
+version='%s'
+release_base='%s'
+if ! [ -x /usr/local/bin/rke2 ] || ! [ -f /usr/local/lib/systemd/system/rke2-server.service ] || ! /usr/local/bin/rke2 --version 2>/dev/null | grep -F -- "rke2 version $version" >/dev/null; then
+  tmpdir="$(mktemp -d)"
+  trap 'rm -rf "$tmpdir"' EXIT INT TERM
+  attempt=0
+  until curl --fail --location --silent --show-error --connect-timeout 15 --max-time 300 --retry 3 --retry-all-errors $cache_curl_option --output "$tmpdir/rke2.linux-amd64.tar.gz" "$release_base/rke2.linux-amd64.tar.gz" && \
+        curl --fail --location --silent --show-error --connect-timeout 15 --max-time 300 --retry 3 --retry-all-errors $cache_curl_option --output "$tmpdir/sha256sum-amd64.txt" "$release_base/sha256sum-amd64.txt"; do
+    attempt=$((attempt + 1))
+    if [ "$attempt" -ge 60 ]; then exit 1; fi
+    sleep 10
+  done
+  expected="$(awk '$2 == "rke2.linux-amd64.tar.gz" || $2 == "./rke2.linux-amd64.tar.gz" {print $1; exit}' "$tmpdir/sha256sum-amd64.txt")"
+  test -n "$expected"
+  actual="$(sha256sum "$tmpdir/rke2.linux-amd64.tar.gz" | awk '{print $1}')"
+  test "$actual" = "$expected"
+  tar --extract --gzip --file "$tmpdir/rke2.linux-amd64.tar.gz" --directory /usr/local
+fi
+/usr/local/bin/rke2 --version | grep -F -- "rke2 version $version" >/dev/null
+systemctl daemon-reload
+systemctl enable rke2-server.service
+systemctl start --no-block rke2-server.service
+attempt=0
+until systemctl is-active --quiet rke2-server.service && [ -s /etc/rancher/rke2/rke2.yaml ]; do
+  attempt=$((attempt + 1))
+  if systemctl is-failed --quiet rke2-server.service || [ "$attempt" -ge 180 ]; then exit 1; fi
+  sleep 5
+done
+`, strings.TrimSpace(renderDisableAutomaticAPTUpdatesCommands()), input.PrivateSubnet, input.VirtualIPv4, cacheHostsSetup, strings.TrimSpace(strings.TrimPrefix(renderDisableUFWScript(), "#!/bin/sh\nset -eu\n")), cacheWait, input.RKE2Version, releaseBase)
+}
+
+// renderDirectInstallScript intentionally preserves the byte-for-byte v0.3
+// direct-download cloud-init contract. Control-plane VM ownership hashes cover
+// the complete script, so even inert cache placeholders would make an existing
+// direct cluster impossible to reconcile after upgrading the controller.
+func renderDirectInstallScript(input CloudInitInput) string {
 	releaseBase := "https://github.com/rancher/rke2/releases/download/" + url.PathEscape(input.RKE2Version)
 	return fmt.Sprintf(`#!/bin/sh
 set -eu

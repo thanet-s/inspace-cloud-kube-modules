@@ -19,6 +19,8 @@ spec:
       image:
         osName: ubuntu
         osVersion: "24.04"
+  bootstrapCache:
+    directDownload: false
   rke2:
     version: v1.35.6+rke2r1
     tokenSecretRef:
