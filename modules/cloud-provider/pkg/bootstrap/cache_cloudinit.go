@@ -173,6 +173,12 @@ storage:
       age: 24h
       interval: 24h
       dryrun: false
+    # Distribution v3.0.0 decodes this nested YAML object with interface keys,
+    # so its environment parser cannot descend into the map. Compose replaces
+    # the whole section. The base fails closed as read-only; seeding explicitly
+    # overrides it to false and steady-state serving restores true.
+    readonly:
+      enabled: true
 http:
   addr: 127.0.0.1:5000
 health:
@@ -193,8 +199,7 @@ const cacheComposeYAML = `services:
     security_opt:
       - no-new-privileges:true
     environment:
-      REGISTRY_CONFIGURATION_PATH: /etc/distribution/config.yml
-      REGISTRY_STORAGE_MAINTENANCE_READONLY_ENABLED: "${REGISTRY_READONLY:-true}"
+      REGISTRY_STORAGE_MAINTENANCE_READONLY: "{enabled: ${REGISTRY_READONLY:-true}}"
     volumes:
       - /etc/inspace-cache/registry.yml:/etc/distribution/config.yml:ro
       - /var/lib/inspace/bootstrap-cache/registry:/var/lib/registry
