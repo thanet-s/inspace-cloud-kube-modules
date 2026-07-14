@@ -1,6 +1,8 @@
 package v1alpha1
 
 import (
+	"fmt"
+
 	"github.com/awslabs/operatorpkg/status"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
@@ -11,6 +13,7 @@ const (
 	OSVersionUbuntu          = "24.04"
 	RKE2AgentTokenSecretName = "inspace-rke2-agent-token"
 	RKE2AgentTokenSecretKey  = "token"
+	BootstrapCachePort       = 8443
 
 	HostClassIntelScalable = "intel-scalable"
 	HostClassAMDEPYC       = "amd-epyc"
@@ -77,12 +80,42 @@ type InSpaceNodeClassSpec struct {
 	RootDiskGiB int32 `json:"rootDiskGiB"`
 	// RKE2 configures agents to join the fixed supervisor endpoint.
 	RKE2 RKE2Config `json:"rke2"`
+	// BootstrapCache selects the private bootstrap cache by default. Set
+	// DirectDownload only as an explicit opt-out; cached mode pins the cache
+	// allocator-assigned bastion address and public CA bundle into worker
+	// cloud-init. No separate cache VIP is created.
+	BootstrapCache BootstrapCacheSpec `json:"bootstrapCache"`
 	// SSHUsername and SSHPublicKey optionally enable controlled operator access.
 	// They must be configured together. Private key material is never accepted.
 	SSHUsername  string `json:"sshUsername,omitempty"`
 	SSHPublicKey string `json:"sshPublicKey,omitempty"`
 	// AdditionalUserData runs once through cloud-init-per. It must not contain secrets.
 	AdditionalUserData string `json:"additionalUserData,omitempty"`
+}
+
+type BootstrapCacheSpec struct {
+	// DirectDownload bypasses the private cache and downloads RKE2 assets from
+	// their upstream release URL. It requires Address and CABundle to be
+	// empty so a partially configured cache can never be silently ignored.
+	DirectDownload bool `json:"directDownload"`
+	// Address is the canonical RFC1918 address serving the cache inside the
+	// worker VPC. Workers bind the deterministic cache hostname to this address.
+	Address string `json:"address,omitempty"`
+	// CABundle contains one or more PEM-encoded CA certificates used only for
+	// the private cache TLS endpoint. CA certificates are public material.
+	CABundle string `json:"caBundle,omitempty"`
+}
+
+func BootstrapCacheHost(clusterName string) string {
+	return "cache." + clusterName + ".inspace.internal"
+}
+
+func BootstrapCacheRegistry(clusterName string) string {
+	return fmt.Sprintf("%s:%d", BootstrapCacheHost(clusterName), BootstrapCachePort)
+}
+
+func BootstrapCacheHealthURL(clusterName string) string {
+	return "https://" + BootstrapCacheRegistry(clusterName) + "/healthz"
 }
 
 type ImageSelector struct {

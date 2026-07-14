@@ -1,13 +1,20 @@
 package bootstrap
 
 import (
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/json"
+	"encoding/pem"
+	"math/big"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
@@ -123,8 +130,101 @@ func TestRenderIncludesExactlyOneRegistrationTaint(t *testing.T) {
 	if strings.Contains(strings.ToLower(rendered), "k3s") {
 		t.Fatalf("RKE2 bootstrap retained a K3s artifact:\n%s", rendered)
 	}
-	if SchemaVersion != "stock-ubuntu-rke2-v7" {
-		t.Fatalf("bootstrap schema = %q, want automatic-APT-disable version v7", SchemaVersion)
+	if SchemaVersion != "stock-ubuntu-rke2-v8" {
+		t.Fatalf("bootstrap schema = %q, want private-cache version v8", SchemaVersion)
+	}
+}
+
+func TestRenderPrivateBootstrapCacheOnlyRewritesSystemInfrastructure(t *testing.T) {
+	caBundle := bootstrapTestCABundle(t)
+	data, err := RenderCloudInit(Config{
+		NodeName: "worker-1", Server: "https://10.0.0.10:9345", Token: "secret-token",
+		RKE2Version: "v1.35.6+rke2r1",
+		BootstrapCache: &CacheConfig{
+			Host: "cache.test-cluster.inspace.internal", Address: "10.20.30.20", CABundle: caBundle,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc := mustDocument(t, data)
+	rke2Config := writeFileContent(t, doc, "/etc/rancher/rke2/config.yaml")
+	if !strings.Contains(rke2Config, `system-default-registry: "cache.test-cluster.inspace.internal:8443"`) {
+		t.Fatalf("RKE2 config lacks private system registry:\n%s", rke2Config)
+	}
+	registryConfig := writeFileContent(t, doc, "/etc/rancher/rke2/registries.yaml")
+	wantRegistryConfig := "configs:\n  \"cache.test-cluster.inspace.internal:8443\":\n    tls:\n      ca_file: \"/etc/rancher/rke2/bootstrap-cache-ca.crt\"\n"
+	if registryConfig != wantRegistryConfig {
+		t.Fatalf("registry config differs\ngot:\n%swant:\n%s", registryConfig, wantRegistryConfig)
+	}
+	if strings.Contains(registryConfig, "mirrors:") || strings.Contains(registryConfig, "docker.io") || strings.Contains(registryConfig, "ghcr.io") || strings.Contains(registryConfig, "registry.k8s.io") {
+		t.Fatalf("private registry config added a public workload mirror:\n%s", registryConfig)
+	}
+	if got := writeFileContent(t, doc, bootstrapCacheCAPath); got != caBundle {
+		t.Fatal("rendered cache CA differs from the pinned NodeClass bundle")
+	}
+	prepare := writeFileContent(t, doc, "/usr/local/sbin/inspace-prepare-kubernetes-node")
+	for _, expected := range []string{
+		"cache_host='cache.test-cluster.inspace.internal'",
+		"cache_ipv4='10.20.30.20'",
+		"# inspace-bootstrap-cache",
+		`grep -Fqx -- "$cache_entry" /etc/hosts`,
+	} {
+		if !strings.Contains(prepare, expected) {
+			t.Errorf("host preparation lacks %q:\n%s", expected, prepare)
+		}
+	}
+	install := writeFileContent(t, doc, "/usr/local/sbin/inspace-install-rke2")
+	for _, expected := range []string{
+		"https://cache.test-cluster.inspace.internal:8443/healthz",
+		"https://cache.test-cluster.inspace.internal:8443/rke2/v1.35.6+rke2r1",
+		`--cacert "$cache_ca"`,
+		"bootstrap cache did not become healthy",
+	} {
+		if !strings.Contains(install, expected) {
+			t.Errorf("cached RKE2 install lacks %q:\n%s", expected, install)
+		}
+	}
+	if strings.Contains(install, "github.com/rancher/rke2") {
+		t.Fatalf("cached RKE2 install retained a direct release URL:\n%s", install)
+	}
+	for _, script := range []string{prepare, install} {
+		command := exec.Command("sh", "-n")
+		command.Stdin = strings.NewReader(script)
+		if output, err := command.CombinedOutput(); err != nil {
+			t.Fatalf("cached shell syntax: %v\n%s", err, output)
+		}
+	}
+}
+
+func TestRenderDirectDownloadOmitsEveryCacheArtifact(t *testing.T) {
+	data, err := RenderCloudInit(Config{
+		NodeName: "worker-1", Server: "https://10.0.0.10:9345", Token: "secret-token", RKE2Version: "v1.35.6+rke2r1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc := mustDocument(t, data)
+	for _, path := range []string{bootstrapCacheCAPath, "/etc/rancher/rke2/registries.yaml"} {
+		for _, file := range doc.WriteFiles {
+			if file.Path == path {
+				t.Fatalf("direct-download cloud-init unexpectedly writes %s", path)
+			}
+		}
+	}
+	decoded := ""
+	for _, file := range doc.WriteFiles {
+		content, decodeErr := decodeWriteFile(file)
+		if decodeErr != nil {
+			t.Fatal(decodeErr)
+		}
+		decoded += content
+	}
+	if strings.Contains(decoded, "system-default-registry") || strings.Contains(decoded, "inspace-bootstrap-cache") || strings.Contains(decoded, "/healthz") {
+		t.Fatalf("direct-download cloud-init retained private cache wiring:\n%s", decoded)
+	}
+	if !strings.Contains(decoded, "https://github.com/rancher/rke2/releases/download/v1.35.6+rke2r1") {
+		t.Fatal("direct-download cloud-init lost the pinned upstream RKE2 release URL")
 	}
 }
 
@@ -697,6 +797,28 @@ func TestRenderRequiresExactRKE2ReleaseAndSupervisorEndpoint(t *testing.T) {
 	}
 }
 
+func TestRenderRejectsInvalidPrivateCache(t *testing.T) {
+	base := Config{
+		NodeName: "worker-1", Server: "https://10.0.0.10:9345", Token: "secret-token", RKE2Version: "v1.35.6+rke2r1",
+		BootstrapCache: &CacheConfig{Host: "cache.test-cluster.inspace.internal", Address: "10.20.30.20", CABundle: bootstrapTestCABundle(t)},
+	}
+	for name, mutate := range map[string]func(*Config){
+		"unsafe host":    func(config *Config) { config.BootstrapCache.Host = "cache;command" },
+		"public address": func(config *Config) { config.BootstrapCache.Address = "203.0.113.10" },
+		"invalid CA":     func(config *Config) { config.BootstrapCache.CABundle = "not PEM" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			config := base
+			cacheCopy := *base.BootstrapCache
+			config.BootstrapCache = &cacheCopy
+			mutate(&config)
+			if _, err := RenderCloudInit(config); err == nil {
+				t.Fatal("RenderCloudInit() accepted invalid private cache")
+			}
+		})
+	}
+}
+
 func TestAdditionalScriptUsesCloudInitOnceSemaphore(t *testing.T) {
 	data, err := RenderCloudInit(Config{
 		NodeName: "worker-1", Server: "https://10.0.0.10:9345", Token: "secret-token",
@@ -788,4 +910,27 @@ func mustDocument(t *testing.T, data string) document {
 		t.Fatalf("decode cloud-init document: %v", err)
 	}
 	return doc
+}
+
+func bootstrapTestCABundle(t *testing.T) string {
+	t.Helper()
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	template := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "InSpace bootstrap cloud-init test"},
+		NotBefore:             now.Add(-time.Hour),
+		NotAfter:              now.Add(time.Hour),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, template, template, publicKey, privateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}))
 }

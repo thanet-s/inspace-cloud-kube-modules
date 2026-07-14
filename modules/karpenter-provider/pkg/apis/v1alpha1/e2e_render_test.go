@@ -84,7 +84,8 @@ func TestClusterE2EProvisionsAndWaitsForThreeControlPlanesInParallel(t *testing.
 		"version: v1.35.6+rke2r1",
 		"name: inspace-rke2-agent-token",
 		"podCIDR: 10.42.0.0/16",
-		"virtualIPv4:",
+		"bootstrapCache:",
+		"directDownload: false",
 		"hostPoolUUID: {{ lookup('env', 'INSPACE_AMD_HOST_POOL_UUID') }}",
 	} {
 		mustContain(t, "cluster template", clusterTemplate, expected)
@@ -185,7 +186,7 @@ func TestClusterE2EProvisionsAndWaitsForThreeControlPlanesInParallel(t *testing.
 	cloudInit := exactAnsibleTask(t, controlPlaneWait, "Wait for cloud-init completion on every control plane in parallel")
 	requireParallelTask(t, cloudInit)
 	requireTaskModule(t, cloudInit, "ansible.builtin.raw")
-	mustContain(t, "control-plane cloud-init wait", taskString(t, cloudInit, "ansible.builtin.raw"), "timeout --kill-after=5s 1800s")
+	mustContain(t, "control-plane cloud-init wait", taskString(t, cloudInit, "ansible.builtin.raw"), "timeout --kill-after=5s 4800s")
 	prepared := exactAnsibleTask(t, controlPlaneWait, "Detect completed product node preparation on every control plane")
 	requireParallelTask(t, prepared)
 	preparedConfig := requireTaskMapping(t, prepared, "ansible.builtin.stat")

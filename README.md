@@ -19,6 +19,8 @@ Kubernetes service.
 ## Highlights
 
 - Three-node RKE2 control plane with embedded etcd and a dedicated bastion.
+- Private, bastion-backed bootstrap cache by default, with an explicit
+  direct-download mode.
 - Cilium native routing, eBPF masquerading, and full kube-proxy replacement.
 - External cloud-controller-manager for node addresses and TCP load balancers.
 - CSI driver for dynamically provisioned `ReadWriteOnce` block volumes.
@@ -44,6 +46,11 @@ Each component is an independently buildable Go module linked locally by
   does not provide shared NAT.
 - Only the bastion accepts public ingress; the Kubernetes API uses a private
   kube-vip endpoint.
+- By default the bastion also serves a private, read-only bootstrap cache at
+  `cache.<cluster>.inspace.internal:8443`; it uses the bastion's allocated VPC
+  address rather than another reserved VIP. Its ECDSA P-256 TLS material starts
+  at the persisted real initialization time and is valid for exactly 15
+  calendar years.
 - Private `LoadBalancer` Services use Cilium LB IPAM and L2 Announcements.
 - Public `LoadBalancer` Services use an explicit, optional, TCP-only InSpace NLB.
 - InSpace firewalls enforce node policy; guest UFW is disabled.
@@ -77,7 +84,11 @@ helm upgrade --install inspace-cloud-kube-modules \
 
 Start with the [example values](charts/inspace-cloud-kube-modules/examples/values.yaml)
 and keep its VPC UUID, control-plane VIP, and private Service range identical to
-the bootstrap and every `InSpaceNodeClass`.
+the bootstrap and every `InSpaceNodeClass`. Cached clusters must also give each
+NodeClass the bastion cache address and public CA produced by bootstrap. Set
+`InSpaceCluster.spec.bootstrapCache.directDownload: true` and use the matching
+direct NodeClass mode only when every node should download its RKE2 assets and
+system images directly from the upstream hosts.
 
 ## Supported scope
 

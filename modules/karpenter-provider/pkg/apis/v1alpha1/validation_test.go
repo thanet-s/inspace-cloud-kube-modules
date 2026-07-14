@@ -1,8 +1,15 @@
 package v1alpha1
 
 import (
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
+	"math/big"
 	"strings"
 	"testing"
+	"time"
 )
 
 const validTestSSHPublicKey = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINdamAGCsQq31Uv+08lkBzoO4XLz2qYjJa8CGmj3B1Ea test@example"
@@ -141,6 +148,68 @@ func TestNodeClassValidationAcceptsPairedSSHAccess(t *testing.T) {
 	}
 }
 
+func TestValidateBootstrapCacheModes(t *testing.T) {
+	caBundle := testBootstrapCacheCA(t)
+	tests := map[string]struct {
+		cache     BootstrapCacheSpec
+		wantError string
+	}{
+		"private cache": {
+			cache: BootstrapCacheSpec{Address: "10.20.30.20", CABundle: caBundle},
+		},
+		"direct download": {
+			cache: BootstrapCacheSpec{DirectDownload: true},
+		},
+		"cache missing address": {
+			cache: BootstrapCacheSpec{CABundle: caBundle}, wantError: "address",
+		},
+		"cache public address": {
+			cache: BootstrapCacheSpec{Address: "203.0.113.10", CABundle: caBundle}, wantError: "RFC1918",
+		},
+		"cache noncanonical address": {
+			cache: BootstrapCacheSpec{Address: "10.020.30.20", CABundle: caBundle}, wantError: "canonical",
+		},
+		"cache invalid PEM": {
+			cache: BootstrapCacheSpec{Address: "10.20.30.20", CABundle: "not a certificate"}, wantError: "PEM",
+		},
+		"cache PEM with leading garbage": {
+			cache: BootstrapCacheSpec{Address: "10.20.30.20", CABundle: "garbage\n" + caBundle}, wantError: "only PEM",
+		},
+		"cache non-CA certificate": {
+			cache: BootstrapCacheSpec{Address: "10.20.30.20", CABundle: testCertificate(t, false)}, wantError: "not a CA",
+		},
+		"direct address ambiguity": {
+			cache: BootstrapCacheSpec{DirectDownload: true, Address: "10.20.30.20"}, wantError: "requires address and caBundle to be empty",
+		},
+		"direct CA ambiguity": {
+			cache: BootstrapCacheSpec{DirectDownload: true, CABundle: caBundle}, wantError: "requires address and caBundle to be empty",
+		},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			err := ValidateBootstrapCache(test.cache)
+			if test.wantError == "" && err != nil {
+				t.Fatalf("ValidateBootstrapCache() error = %v", err)
+			}
+			if test.wantError != "" && (err == nil || !strings.Contains(err.Error(), test.wantError)) {
+				t.Fatalf("ValidateBootstrapCache() error = %v, want %q", err, test.wantError)
+			}
+		})
+	}
+}
+
+func TestBootstrapCacheEndpointIsDeterministic(t *testing.T) {
+	if got := BootstrapCacheHost("test-cluster"); got != "cache.test-cluster.inspace.internal" {
+		t.Fatalf("BootstrapCacheHost() = %q", got)
+	}
+	if got := BootstrapCacheRegistry("test-cluster"); got != "cache.test-cluster.inspace.internal:8443" {
+		t.Fatalf("BootstrapCacheRegistry() = %q", got)
+	}
+	if got := BootstrapCacheHealthURL("test-cluster"); got != "https://cache.test-cluster.inspace.internal:8443/healthz" {
+		t.Fatalf("BootstrapCacheHealthURL() = %q", got)
+	}
+}
+
 func validNodeClass() *InSpaceNodeClass {
 	return &InSpaceNodeClass{Spec: InSpaceNodeClassSpec{
 		ClusterName:             "test-cluster",
@@ -157,5 +226,37 @@ func validNodeClass() *InSpaceNodeClass {
 			Server:         "https://10.0.0.10:9345",
 			TokenSecretRef: SecretKeySelector{Name: RKE2AgentTokenSecretName, Key: RKE2AgentTokenSecretKey},
 		},
+		BootstrapCache: BootstrapCacheSpec{DirectDownload: true},
 	}}
+}
+
+func testBootstrapCacheCA(t *testing.T) string {
+	t.Helper()
+	return testCertificate(t, true)
+}
+
+func testCertificate(t *testing.T, isCA bool) string {
+	t.Helper()
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	template := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "InSpace bootstrap cache test"},
+		NotBefore:             now.Add(-time.Hour),
+		NotAfter:              now.Add(time.Hour),
+		IsCA:                  isCA,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageDigitalSignature,
+	}
+	if isCA {
+		template.KeyUsage |= x509.KeyUsageCertSign
+	}
+	der, err := x509.CreateCertificate(rand.Reader, template, template, publicKey, privateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}))
 }

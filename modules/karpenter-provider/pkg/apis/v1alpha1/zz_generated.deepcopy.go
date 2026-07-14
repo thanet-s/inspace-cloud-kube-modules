@@ -7,6 +7,19 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 )
 
+func (in *BootstrapCacheSpec) DeepCopyInto(out *BootstrapCacheSpec) {
+	*out = *in
+}
+
+func (in *BootstrapCacheSpec) DeepCopy() *BootstrapCacheSpec {
+	if in == nil {
+		return nil
+	}
+	out := new(BootstrapCacheSpec)
+	in.DeepCopyInto(out)
+	return out
+}
+
 func (in *InSpaceNodeClass) DeepCopyInto(out *InSpaceNodeClass) {
 	*out = *in
 	out.TypeMeta = in.TypeMeta

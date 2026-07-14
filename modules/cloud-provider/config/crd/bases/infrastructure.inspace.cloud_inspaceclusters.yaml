@@ -42,7 +42,7 @@ spec:
               type: object
             spec:
               type: object
-              required: [location, billingAccountID, credentialsSecretRef, controlPlane, rke2, network, firewall, publicIPv4, endpoint]
+              required: [location, billingAccountID, credentialsSecretRef, controlPlane, bootstrapCache, rke2, network, firewall, publicIPv4, endpoint]
               x-kubernetes-validations:
                 - rule: '!self.endpoint.virtualIPv4.startsWith("10.42.") && !self.endpoint.virtualIPv4.startsWith("10.43.")'
                   message: control-plane virtualIPv4 must not overlap podCIDR or serviceCIDR
@@ -105,6 +105,12 @@ spec:
                             osVersion:
                               type: string
                               enum: ["24.04"]
+                bootstrapCache:
+                  type: object
+                  properties:
+                    directDownload:
+                      type: boolean
+                      default: false
                 rke2:
                   type: object
                   required: [version, tokenSecretRef]

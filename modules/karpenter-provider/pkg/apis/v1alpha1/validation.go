@@ -1,13 +1,17 @@
 package v1alpha1
 
 import (
+	"bytes"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/pem"
 	"fmt"
 	"net/netip"
 	"net/url"
 	"regexp"
 	"strings"
+	"unicode"
 
 	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/apimachinery/pkg/util/validation/field"
@@ -20,6 +24,7 @@ var (
 )
 
 const maxSSHPublicKeyLength = 16384
+const maxBootstrapCacheCABundleLength = 65536
 
 // Validate returns all local, deterministic validation failures. It performs no
 // network lookup and is also used by tests and the NodeClass reconciler.
@@ -79,6 +84,9 @@ func (n *InSpaceNodeClass) Validate() field.ErrorList {
 	} else if n.Spec.RKE2.TokenSecretRef.Key != RKE2AgentTokenSecretKey {
 		errs = append(errs, field.NotSupported(p.Child("rke2", "tokenSecretRef", "key"), n.Spec.RKE2.TokenSecretRef.Key, []string{RKE2AgentTokenSecretKey}))
 	}
+	if err := ValidateBootstrapCache(n.Spec.BootstrapCache); err != nil {
+		errs = append(errs, field.Invalid(p.Child("bootstrapCache"), n.Spec.BootstrapCache, err.Error()))
+	}
 	if err := ValidateSSHAccess(n.Spec.SSHUsername, n.Spec.SSHPublicKey); err != nil {
 		errs = append(errs, field.Invalid(p.Child("sshPublicKey"), "", err.Error()))
 	}
@@ -86,6 +94,66 @@ func (n *InSpaceNodeClass) Validate() field.ErrorList {
 		errs = append(errs, field.TooLong(p.Child("additionalUserData"), "", 65536))
 	}
 	return errs
+}
+
+// ValidateBootstrapCache enforces an unambiguous choice between the private
+// cache and direct upstream downloads. Cached mode trusts only explicitly
+// supplied CA certificates and never falls back to public registry mirrors.
+func ValidateBootstrapCache(cache BootstrapCacheSpec) error {
+	if cache.DirectDownload {
+		if cache.Address != "" || cache.CABundle != "" {
+			return fmt.Errorf("directDownload requires address and caBundle to be empty")
+		}
+		return nil
+	}
+	address, err := netip.ParseAddr(cache.Address)
+	if err != nil || !address.Is4() || !address.IsPrivate() || address.String() != cache.Address {
+		return fmt.Errorf("address must be a canonical RFC1918 IPv4 address")
+	}
+	if err := ValidateBootstrapCacheCABundle(cache.CABundle); err != nil {
+		return fmt.Errorf("caBundle %w", err)
+	}
+	return nil
+}
+
+// ValidateBootstrapCacheCABundle accepts only PEM CERTIFICATE blocks whose
+// parsed certificates are marked as CAs. Whitespace between blocks is allowed,
+// but unrelated PEM blocks or trailing non-PEM data are rejected.
+func ValidateBootstrapCacheCABundle(bundle string) error {
+	if bundle == "" {
+		return fmt.Errorf("must contain at least one PEM CA certificate")
+	}
+	if len(bundle) > maxBootstrapCacheCABundleLength {
+		return fmt.Errorf("must not exceed %d bytes", maxBootstrapCacheCABundleLength)
+	}
+	rest := []byte(bundle)
+	certificates := 0
+	for len(strings.TrimSpace(string(rest))) != 0 {
+		rest = bytes.TrimLeftFunc(rest, unicode.IsSpace)
+		if !bytes.HasPrefix(rest, []byte("-----BEGIN CERTIFICATE-----")) {
+			return fmt.Errorf("must contain only PEM CERTIFICATE blocks")
+		}
+		block, remainder := pem.Decode(rest)
+		if block == nil {
+			return fmt.Errorf("must contain only PEM CERTIFICATE blocks")
+		}
+		if block.Type != "CERTIFICATE" || len(block.Headers) != 0 {
+			return fmt.Errorf("must contain only headerless PEM CERTIFICATE blocks")
+		}
+		certificate, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			return fmt.Errorf("contains an invalid certificate: %v", err)
+		}
+		if !certificate.BasicConstraintsValid || !certificate.IsCA {
+			return fmt.Errorf("contains a certificate that is not a CA")
+		}
+		certificates++
+		rest = remainder
+	}
+	if certificates == 0 {
+		return fmt.Errorf("must contain at least one PEM CA certificate")
+	}
+	return nil
 }
 
 // ServerVIP returns the literal private IPv4 address from the fixed RKE2

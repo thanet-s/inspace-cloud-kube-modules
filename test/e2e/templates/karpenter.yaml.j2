@@ -16,6 +16,10 @@ spec:
     osName: {{ lookup('env', 'INSPACE_OS_NAME') | default('ubuntu', true) }}
     osVersion: "{{ lookup('env', 'INSPACE_OS_VERSION') | default('24.04', true) }}"
   rootDiskGiB: 100
+  bootstrapCache:
+    directDownload: false
+    address: "{{ e2e_bootstrap_result.bootstrapCacheAddress }}"
+    caBundle: {{ e2e_bootstrap_result.bootstrapCacheCABundle | to_json }}
   rke2:
     version: v1.35.6+rke2r1
     server: {{ e2e_bootstrap_result.privateRegistrationEndpoint }}

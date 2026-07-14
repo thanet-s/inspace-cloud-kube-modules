@@ -229,6 +229,7 @@ func smokeNodeClass() *inspacev1.InSpaceNodeClass {
 				Server:         "https://10.0.0.10:9345",
 				TokenSecretRef: inspacev1.SecretKeySelector{Name: inspacev1.RKE2AgentTokenSecretName, Key: inspacev1.RKE2AgentTokenSecretKey},
 			},
+			BootstrapCache: inspacev1.BootstrapCacheSpec{DirectDownload: true},
 		},
 	}
 	nodeClass.Status.ObservedGeneration = nodeClass.Generation

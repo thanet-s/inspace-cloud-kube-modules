@@ -60,6 +60,63 @@ grep -Fx '                  key: privateLoadBalancerPoolStart' "$tmpdir/ccm-depl
 grep -Fx '                  key: privateLoadBalancerPoolStop' "$tmpdir/ccm-deployment.yaml" >/dev/null
 
 helm template bootstrap "$chart" --namespace kube-system --values "$values" \
+  >"$tmpdir/direct-system-images.yaml"
+for image in \
+  'ghcr.io/thanet-s/inspace-cloud-controller-manager:0.1.0' \
+  'ghcr.io/thanet-s/inspace-csi-driver:0.1.0' \
+  'ghcr.io/thanet-s/karpenter-provider-inspace:0.1.0' \
+  'registry.k8s.io/sig-storage/csi-provisioner:v5.2.0' \
+  'registry.k8s.io/sig-storage/csi-attacher:v4.8.1' \
+  'registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.13.0' \
+  'registry.k8s.io/sig-storage/livenessprobe:v2.15.0'; do
+  grep -F "          image: $image" "$tmpdir/direct-system-images.yaml" >/dev/null
+done
+
+cache_registry=cache.cluster.inspace.internal:8443
+helm template bootstrap "$chart" --namespace kube-system --values "$values" \
+  --set-string "global.inspace.systemImageRegistry=$cache_registry" \
+  >"$tmpdir/cached-system-images.yaml"
+for image in \
+  "$cache_registry/thanet-s/inspace-cloud-controller-manager:0.1.0" \
+  "$cache_registry/thanet-s/inspace-csi-driver:0.1.0" \
+  "$cache_registry/thanet-s/karpenter-provider-inspace:0.1.0" \
+  "$cache_registry/sig-storage/csi-provisioner:v5.2.0" \
+  "$cache_registry/sig-storage/csi-attacher:v4.8.1" \
+  "$cache_registry/sig-storage/csi-node-driver-registrar:v2.13.0" \
+  "$cache_registry/sig-storage/livenessprobe:v2.15.0"; do
+  grep -F "          image: $image" "$tmpdir/cached-system-images.yaml" >/dev/null
+done
+if grep -E 'image: (ghcr\.io/thanet-s/|registry\.k8s\.io/sig-storage/)' \
+  "$tmpdir/cached-system-images.yaml" >/dev/null; then
+  echo "cache registry left a chart-owned system image on its direct origin" >&2
+  exit 1
+fi
+
+digest=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+helm template bootstrap "$chart" --namespace kube-system --values "$values" \
+  --show-only templates/ccm-deployment.yaml \
+  --set-string "global.inspace.systemImageRegistry=$cache_registry" \
+  --set-string "ccm.image.digest=$digest" >"$tmpdir/cached-digest.yaml"
+grep -F "          image: $cache_registry/thanet-s/inspace-cloud-controller-manager@$digest" \
+  "$tmpdir/cached-digest.yaml" >/dev/null
+
+helm template bootstrap "$chart" --namespace kube-system --values "$values" \
+  --set-string "global.inspace.systemImageRegistry=$cache_registry" \
+  --set-string ccm.image.repository=quay.io/example/custom-ccm \
+  --set-string csi.sidecars.provisioner.image=quay.io/example/custom-provisioner:v1 \
+  >"$tmpdir/custom-system-images.yaml"
+grep -F '          image: quay.io/example/custom-ccm:0.1.0' \
+  "$tmpdir/custom-system-images.yaml" >/dev/null
+grep -F '          image: quay.io/example/custom-provisioner:v1' \
+  "$tmpdir/custom-system-images.yaml" >/dev/null
+
+if helm template invalid "$chart" --namespace kube-system --values "$values" \
+  --set-string global.inspace.systemImageRegistry=https://cache.example.test >/dev/null 2>&1; then
+  echo "system image registry with a URL scheme unexpectedly rendered" >&2
+  exit 1
+fi
+
+helm template bootstrap "$chart" --namespace kube-system --values "$values" \
   --show-only templates/csi-controller.yaml >"$tmpdir/csi-controller.yaml"
 require_toleration "$tmpdir/csi-controller.yaml"
 test "$(grep -Fc '        fsGroup: 65532' "$tmpdir/csi-controller.yaml")" -eq 1

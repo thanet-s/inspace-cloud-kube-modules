@@ -19,6 +19,8 @@ spec:
       image:
         osName: {{ lookup('env', 'INSPACE_OS_NAME') | default('ubuntu', true) }}
         osVersion: "{{ lookup('env', 'INSPACE_OS_VERSION') | default('24.04', true) }}"
+  bootstrapCache:
+    directDownload: false
   rke2:
     version: v1.35.6+rke2r1
     tokenSecretRef:

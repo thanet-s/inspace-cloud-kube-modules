@@ -79,7 +79,7 @@ func TestReconcileBuildsBastionThenExactlyThreeControlPlaneVMs(t *testing.T) {
 	if err := validateFirewallPolicy(nodeFirewall, api.network.Subnet, cluster.Spec.Network.PodCIDR, "", nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := validateBastionFirewallPolicy(bastionFirewall, reconciler.ManagementCIDR); err != nil {
+	if err := validateBastionFirewallPolicy(bastionFirewall, reconciler.ManagementCIDR, api.network.Subnet, false); err != nil {
 		t.Fatal(err)
 	}
 	if len(nodeFirewall.ResourcesAssigned) != 3 || len(bastionFirewall.ResourcesAssigned) != 1 {
@@ -2679,6 +2679,7 @@ func testCluster() *v1alpha1.InSpaceCluster {
 		Metadata: v1alpha1.ObjectMeta{Name: "unit", Namespace: "default"},
 		Spec: v1alpha1.InSpaceClusterSpec{
 			Location: "bkk01", BillingAccountID: 42,
+			BootstrapCache:       v1alpha1.BootstrapCacheSpec{DirectDownload: true},
 			CredentialsSecretRef: v1alpha1.SecretKeyReference{Name: "inspace-api", Key: "apikey"},
 			ControlPlane: v1alpha1.ControlPlaneSpec{Replicas: 3, Machine: v1alpha1.MachineSpec{
 				VCPU: 4, MemoryMiB: 8192, RootDiskGiB: 60,

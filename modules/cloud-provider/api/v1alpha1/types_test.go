@@ -63,6 +63,16 @@ func TestRKE2VersionValidationRequiresExactRelease(t *testing.T) {
 	}
 }
 
+func TestBootstrapCacheModesAreValid(t *testing.T) {
+	for _, directDownload := range []bool{false, true} {
+		spec := validSpec()
+		spec.BootstrapCache.DirectDownload = directDownload
+		if errs := spec.Validate(); len(errs) != 0 {
+			t.Fatalf("directDownload=%t: unexpected validation errors: %v", directDownload, errs)
+		}
+	}
+}
+
 func TestControlPlaneMachineRequiresRKE2MinimumsAndUbuntu2404(t *testing.T) {
 	minimum := validSpec()
 	minimum.ControlPlane.Machine.VCPU = 2
@@ -180,10 +190,22 @@ func TestControlPlaneCRDMatchesMachineValidationContract(t *testing.T) {
 		"control-plane virtualIPv4 must not overlap podCIDR or serviceCIDR",
 		"disable:\n                      type: array\n                      x-kubernetes-list-type: set\n                      items:",
 		"component != \"rke2-cilium\"",
+		"required: [location, billingAccountID, credentialsSecretRef, controlPlane, bootstrapCache, rke2, network, firewall, publicIPv4, endpoint]",
+		"bootstrapCache:\n                  type: object",
+		"directDownload:\n                      type: boolean\n                      default: false",
 	} {
 		if !strings.Contains(crd, required) {
 			t.Errorf("CRD does not contain validation contract fragment %q", required)
 		}
+	}
+	cacheStart := strings.Index(crd, "\n                bootstrapCache:")
+	cacheEnd := strings.Index(crd[cacheStart+1:], "\n                rke2:")
+	if cacheStart < 0 || cacheEnd < 0 {
+		t.Fatal("CRD does not contain a bounded bootstrapCache schema")
+	}
+	cacheSchema := crd[cacheStart : cacheStart+1+cacheEnd]
+	if strings.Contains(cacheSchema, "virtualIPv4") || strings.Contains(cacheSchema, "x-kubernetes-validations") {
+		t.Fatalf("bootstrapCache schema must contain only the directDownload mode switch:\n%s", cacheSchema)
 	}
 }
 
@@ -211,7 +233,8 @@ func validSpec() InSpaceClusterSpec {
 			HostPoolUUID: "aac7dd66-f390-4edd-80c0-dd7cae49bd99",
 			Image:        ImageSpec{OSName: "ubuntu", OSVersion: "24.04"},
 		}},
-		RKE2: RKE2Spec{Version: "v1.35.6+rke2r1", TokenSecretRef: SecretKeyReference{Name: "token", Key: "token"}},
+		BootstrapCache: BootstrapCacheSpec{},
+		RKE2:           RKE2Spec{Version: "v1.35.6+rke2r1", TokenSecretRef: SecretKeyReference{Name: "token", Key: "token"}},
 		Network: NetworkSpec{
 			UUID: "11111111-2222-3333-4444-555555555555", PodCIDR: "10.42.0.0/16", ServiceCIDR: "10.43.0.0/16",
 			PrivateLoadBalancerPool: PrivateLoadBalancerPoolSpec{Start: "10.20.30.200", Stop: "10.20.30.239"},

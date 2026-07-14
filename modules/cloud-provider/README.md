@@ -18,6 +18,10 @@ and the fixed three-server RKE2 bootstrap reconciler.
   (1 vCPU/2048 MiB/30 GiB), then creates exactly three Ubuntu 24.04 RKE2
   servers in one bounded parallel batch. The API and RKE2 registration use a
   caller-selected private VPC VIP; bootstrap creates no control-plane NLB.
+- A cache-by-default bastion path. The cache listens only on the bastion's
+  allocator-assigned private address as
+  `cache.<metadata.name>.inspace.internal:8443`; it does not allocate another
+  VIP. `spec.bootstrapCache.directDownload: true` explicitly disables it.
 - Fixed control-plane VM, guest-hostname, and Kubernetes Node identities are
   `<metadata.name>-cp0`, `<metadata.name>-cp1`, and `<metadata.name>-cp2`.
   The bastion VM and guest hostname are `<metadata.name>-bastion`.
@@ -91,6 +95,35 @@ bounded batch: all three slots are launched concurrently, and slot-ordered
 errors retain every successful VM for the next pass. Each server must use
 exactly Ubuntu 24.04 with 2-16 vCPUs and 4096-65536 MiB memory.
 
+`spec.bootstrapCache` is required and `directDownload` defaults to `false`.
+Cached mode provisions the bastion with Docker from Docker's official Ubuntu
+APT repository, pre-seeds the audited RKE2 release assets and system images,
+and then exposes them through a private TLS, read-only endpoint. The endpoint
+uses the bastion's API-allocated RFC1918 address—never a manually selected
+cache VIP—and the stable hostname
+`cache.<metadata.name>.inspace.internal` on TCP/8443. Bootstrap writes that
+binding into each node's `/etc/hosts`, so it does not depend on public DNS.
+
+Cached initialization and reconciliation also require two persistent
+controller values. `INSPACE_BOOTSTRAP_CACHE_KEY` is exactly 64 lowercase
+hexadecimal characters encoding 32 random bytes.
+`INSPACE_BOOTSTRAP_CACHE_NOT_BEFORE` is captured from the real clock at the
+actual first initialization and persisted in UTC RFC3339 whole-second form
+(`YYYY-MM-DDTHH:MM:SSZ`); it must not be in the future. Together the inputs
+deterministically derive ECDSA P-256 cluster cache CA and server certificates
+whose validity starts at that persisted instant and ends exactly 15 calendar
+years later. Treat the key as an operator secret,
+preserve both values for the cluster lifecycle, and never put either in
+`InSpaceCluster` YAML. Only the public CA is distributed to nodes. With
+`directDownload: true`, the bastion remains required for private operator
+access, but no cache is configured and neither value is required.
+
+The TLS frontend accepts only `GET` and `HEAD`; the registry is read-only after
+seeding and has deletion disabled. It is reachable only through the bastion's
+private listener and VPC firewall rules. Do not publish TCP/8443 on the
+bastion floating IP or through an NLB. This is a bounded, pre-seeded system
+cache rather than a general-purpose registry or arbitrary-workload proxy.
+
 `spec.endpoint.virtualIPv4` must be an unused host address inside the actual
 InSpace VPC subnet. Bootstrap rejects network/broadcast/out-of-subnet values
 and any same-VPC VM or load-balancer readback collision before kube-vip
@@ -121,6 +154,9 @@ lease migration without relying on interface names.
 ```sh
 export INSPACE_API_TOKEN='...'
 export INSPACE_RKE2_TOKEN='a-long-random-cluster-token'
+# Generate and persist these once; reuse the exact values on every reconcile.
+export INSPACE_BOOTSTRAP_CACHE_KEY='<64-lowercase-hex-characters>'
+export INSPACE_BOOTSTRAP_CACHE_NOT_BEFORE='<YYYY-MM-DDTHH:MM:SSZ>'
 export INSPACE_ALLOW_REMOTE_MUTATIONS=true
 
 go run ./cmd/inspace-cluster-controller \
@@ -202,8 +238,11 @@ floating addresses, and both firewall assignments exist in the API. It does
 reports `controlPlaneEndpoint`/`privateControlPlaneEndpoint` as
 `https://<virtualIPv4>:6443`, `privateRegistrationEndpoint` as
 `https://<virtualIPv4>:9345`, and the bastion UUID/public/private IPv4 plus
-both firewall UUIDs. `maxParallelControlPlaneCreates: 3` is the hard CP
-creation bound.
+both firewall UUIDs. In cached mode it also reports
+`bootstrapCacheAddress`, `bootstrapCacheEndpoint`, `bootstrapCacheRegistry`,
+and the public `bootstrapCacheCABundle`; use the address and CA bundle in
+cached `InSpaceNodeClass` resources. Direct mode omits those fields.
+`maxParallelControlPlaneCreates: 3` is the hard CP creation bound.
 
 Control-plane slot 0 is the one-time RKE2 initializer. The controller creates
 it only when no control-plane VM exists. If slot 0 is absent while slot 1 or 2

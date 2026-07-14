@@ -341,6 +341,23 @@ def main() -> None:
     bastion_public = require_usable_fip(bastion_fip, "bastion public address")
     if bastion_private != str(result.get("bastionPrivateIPv4")) or bastion_public != str(result.get("bastionPublicIPv4")):
         raise SystemExit("bastion result addresses do not match authoritative cloud records")
+    cache_host = f"cache.{state['clusterName']}.inspace.internal"
+    cache_registry = f"{cache_host}:8443"
+    cache_endpoint = f"https://{cache_registry}"
+    cache_ca_bundle = result.get("bootstrapCacheCABundle")
+    if (
+        result.get("bootstrapCacheAddress") != bastion_private
+        or result.get("bootstrapCacheRegistry") != cache_registry
+        or result.get("bootstrapCacheEndpoint") != cache_endpoint
+        or not isinstance(cache_ca_bundle, str)
+        or not cache_ca_bundle.startswith("-----BEGIN CERTIFICATE-----\n")
+        or not cache_ca_bundle.endswith("-----END CERTIFICATE-----\n")
+    ):
+        raise SystemExit("bootstrap cache result must bind the stable TLS endpoint to the authoritative bastion private address")
+    try:
+        ssl.PEM_cert_to_DER_cert(cache_ca_bundle)
+    except ValueError as error:
+        raise SystemExit("bootstrap cache result CA bundle is not a valid PEM certificate") from error
     if bastion.get("public_ipv4") not in (None, ""):
         raise SystemExit("bastion VM public_ipv4 must remain empty for an auto-reserved FIP")
     if bastion_fip.get("assigned_to_private_ip") and str(bastion_fip["assigned_to_private_ip"]) != bastion_private:
@@ -450,6 +467,10 @@ def main() -> None:
         "bastionPrivateIPv4": bastion_private,
         "bastionPublicIPv4": bastion_public,
         "bastionFloatingIPName": bastion_fip["name"],
+        "bootstrapCacheAddress": bastion_private,
+        "bootstrapCacheEndpoint": cache_endpoint,
+        "bootstrapCacheRegistry": cache_registry,
+        "bootstrapCacheCABundle": cache_ca_bundle,
     })
     atomic_write(state_path, state)
     print(json.dumps({"controlPlanes": control_planes, "bastion": {

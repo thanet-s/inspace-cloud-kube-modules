@@ -6,6 +6,7 @@ package main
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -114,6 +115,10 @@ func run() error {
 	if !deleteOwned && rke2Token == "" {
 		return errors.New("INSPACE_RKE2_TOKEN is required")
 	}
+	cacheKey, cacheNotBefore, err := loadBootstrapCacheSettings(&cluster, deleteOwned)
+	if err != nil {
+		return err
+	}
 	allowMutations, err := strconv.ParseBool(defaultValue(os.Getenv("INSPACE_ALLOW_REMOTE_MUTATIONS"), "false"))
 	if err != nil {
 		return fmt.Errorf("parse INSPACE_ALLOW_REMOTE_MUTATIONS: %w", err)
@@ -129,6 +134,7 @@ func run() error {
 	reconciler := &bootstrap.Reconciler{
 		API: api, SSHUsername: sshUsername, SSHPublicKey: sshPublicKey,
 		ManagementCIDR: managementCIDR, ManagementTCPPorts: ports,
+		BootstrapCacheKey: cacheKey, BootstrapCacheNotBefore: cacheNotBefore, ModuleVersion: buildversion.Version,
 	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
@@ -214,11 +220,39 @@ func emitResult(output io.Writer, format string, result bootstrap.Result) error 
 		encoder.SetEscapeHTML(false)
 		return encoder.Encode(result)
 	}
-	_, err := fmt.Fprintf(output, "infrastructureReady=%t controlPlaneVMs=%d endpoint=%q privateEndpoint=%q privateRegistrationEndpoint=%q owner=%q firewallUUID=%q bastionFirewallUUID=%q bastionVMUUID=%q bastionPublicIPv4=%q bastionPrivateIPv4=%q message=%q\n",
+	_, err := fmt.Fprintf(output, "infrastructureReady=%t controlPlaneVMs=%d endpoint=%q privateEndpoint=%q privateRegistrationEndpoint=%q owner=%q firewallUUID=%q bastionFirewallUUID=%q bastionVMUUID=%q bastionPublicIPv4=%q bastionPrivateIPv4=%q bootstrapCacheEndpoint=%q bootstrapCacheRegistry=%q bootstrapCacheAddress=%q message=%q\n",
 		result.Ready, len(result.ControlPlaneVMs), result.ControlPlaneEndpoint, result.PrivateControlPlaneEndpoint,
 		result.PrivateRegistrationEndpoint, result.Owner, result.FirewallUUID, result.BastionFirewallUUID,
-		result.BastionVMUUID, result.BastionPublicIPv4, result.BastionPrivateIPv4, result.Message)
+		result.BastionVMUUID, result.BastionPublicIPv4, result.BastionPrivateIPv4,
+		result.BootstrapCacheEndpoint, result.BootstrapCacheRegistry, result.BootstrapCacheAddress, result.Message)
 	return err
+}
+
+func loadBootstrapCacheSettings(cluster *v1alpha1.InSpaceCluster, deleting bool) ([]byte, time.Time, error) {
+	if deleting || cluster.Spec.BootstrapCache.DirectDownload {
+		return nil, time.Time{}, nil
+	}
+	rawKey := strings.TrimSpace(os.Getenv("INSPACE_BOOTSTRAP_CACHE_KEY"))
+	if len(rawKey) != 64 || strings.ToLower(rawKey) != rawKey {
+		return nil, time.Time{}, errors.New("INSPACE_BOOTSTRAP_CACHE_KEY must be exactly 64 lowercase hexadecimal characters in cached mode")
+	}
+	key, err := hex.DecodeString(rawKey)
+	if err != nil || len(key) != 32 {
+		return nil, time.Time{}, errors.New("INSPACE_BOOTSTRAP_CACHE_KEY must encode exactly 32 bytes")
+	}
+	rawNotBefore := strings.TrimSpace(os.Getenv("INSPACE_BOOTSTRAP_CACHE_NOT_BEFORE"))
+	notBefore, err := time.Parse(time.RFC3339, rawNotBefore)
+	if err != nil || notBefore.Location() != time.UTC || notBefore.Format(time.RFC3339) != rawNotBefore {
+		return nil, time.Time{}, errors.New("INSPACE_BOOTSTRAP_CACHE_NOT_BEFORE must be the persisted UTC RFC3339 cluster-initialization time")
+	}
+	now := time.Now().UTC()
+	if notBefore.After(now) {
+		return nil, time.Time{}, errors.New("INSPACE_BOOTSTRAP_CACHE_NOT_BEFORE must not be in the future")
+	}
+	if !now.Before(notBefore.AddDate(15, 0, 0)) {
+		return nil, time.Time{}, errors.New("the persisted bootstrap cache certificate lifetime has expired")
+	}
+	return key, notBefore, nil
 }
 
 func parseTCPPorts(value string) ([]int, error) {

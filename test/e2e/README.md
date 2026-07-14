@@ -200,7 +200,7 @@ the ignored, mode-`0600` root `.env`, then export the destructive confirmation
 and released SemVer:
 
 ```sh
-export INSPACE_E2E_VERSION='0.2.0-rc.1'
+export INSPACE_E2E_VERSION='<published-version>'
 export CONFIRM_INSPACE_CLUSTER_E2E='<isolated-billing-account-id>'
 make cluster-e2e
 ```
