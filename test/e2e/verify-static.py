@@ -1031,6 +1031,74 @@ def main() -> None:
         and bastion_names[0] != bastion_names[2],
         "bastion VM name must be distinct from cluster-prefixed firewall and FIP names",
     )
+    bastion_vm_uuid = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+    management_cidr = "203.0.113.7/32"
+    private_subnet = "10.91.72.0/24"
+    bastion_egress = [
+        {
+            "direction": "outbound",
+            "protocol": protocol,
+            "port_start": None,
+            "port_end": None,
+            "endpoint_spec_type": "any",
+            "endpoint_spec": None,
+        }
+        for protocol in ("tcp", "udp", "icmp")
+    ]
+    bastion_ssh_ingress = {
+        "direction": "inbound",
+        "protocol": "tcp",
+        "port_start": 22,
+        "port_end": 22,
+        "endpoint_spec_type": "ip_prefixes",
+        "endpoint_spec": [management_cidr],
+    }
+    bastion_cache_ingress = {
+        "direction": "inbound",
+        "protocol": "tcp",
+        "port_start": 8443,
+        "port_end": 8443,
+        "endpoint_spec_type": "ip_prefixes",
+        "endpoint_spec": [private_subnet],
+    }
+    bastion_assignments = [{"resource_type": "vm", "resource_uuid": bastion_vm_uuid}]
+    bootstrap_discovery_module.validate_bastion_firewall(
+        {
+            "resources_assigned": bastion_assignments,
+            "rules": bastion_egress + [bastion_ssh_ingress, bastion_cache_ingress],
+        },
+        management_cidr,
+        private_subnet,
+        bastion_vm_uuid,
+        cache_enabled=True,
+    )
+    bootstrap_discovery_module.validate_bastion_firewall(
+        {
+            "resources_assigned": bastion_assignments,
+            "rules": bastion_egress + [bastion_ssh_ingress],
+        },
+        management_cidr,
+        private_subnet,
+        bastion_vm_uuid,
+        cache_enabled=False,
+    )
+    wrong_cache_ingress = dict(bastion_cache_ingress, endpoint_spec=[management_cidr])
+    try:
+        bootstrap_discovery_module.validate_bastion_firewall(
+            {
+                "resources_assigned": bastion_assignments,
+                "rules": bastion_egress + [bastion_ssh_ingress, wrong_cache_ingress],
+            },
+            management_cidr,
+            private_subnet,
+            bastion_vm_uuid,
+            cache_enabled=True,
+        )
+    except SystemExit as error:
+        require("cache ingress" in str(error),
+                "bootstrap discovery returned the wrong cache-ingress diagnostic")
+    else:
+        require(False, "bootstrap discovery accepted cache ingress from outside the VPC subnet")
     for vm_detail in ({}, {"hostname": None}, {"hostname": ""}, {"hostname": bastion_names[0]}):
         bootstrap_discovery_module.validate_optional_vm_hostname(
             vm_detail, bastion_names[0], "unit bastion"

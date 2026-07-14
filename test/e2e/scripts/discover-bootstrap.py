@@ -138,7 +138,13 @@ def validate_node_firewall(firewall, subnet: str, pod_cidr: str, vm_ids: set[str
                     raise SystemExit("node firewall must have no public inbound source")
 
 
-def validate_bastion_firewall(firewall, management_cidr: str, vm_uuid: str) -> None:
+def validate_bastion_firewall(
+    firewall,
+    management_cidr: str,
+    private_subnet: str,
+    vm_uuid: str,
+    cache_enabled: bool,
+) -> None:
     assignments = firewall.get("resources_assigned", [])
     if assignments != [{"resource_type": "vm", "resource_uuid": vm_uuid}]:
         # API response objects may contain additional harmless display fields,
@@ -146,11 +152,35 @@ def validate_bastion_firewall(firewall, management_cidr: str, vm_uuid: str) -> N
         if len(assignments) != 1 or assignments[0].get("resource_type") != "vm" or assignments[0].get("resource_uuid") != vm_uuid:
             raise SystemExit("bastion firewall must be assigned only to the bastion VM")
     rules = firewall.get("rules", [])
-    if len(rules) != 4:
-        raise SystemExit("bastion firewall must contain only SSH ingress and three egress rules")
+    expected_rule_count = 5 if cache_enabled else 4
+    if len(rules) != expected_rule_count:
+        raise SystemExit(
+            "bastion firewall must contain only SSH ingress, optional private cache ingress, and three egress rules"
+        )
     inbound = [rule for rule in rules if rule.get("direction") == "inbound"]
-    if len(inbound) != 1 or inbound[0].get("protocol") != "tcp" or inbound[0].get("port_start") != 22 or inbound[0].get("port_end") != 22 or inbound[0].get("endpoint_spec_type") != "ip_prefixes" or inbound[0].get("endpoint_spec") != [management_cidr]:
+    ssh_ingress = [
+        rule
+        for rule in inbound
+        if rule.get("protocol") == "tcp"
+        and rule.get("port_start") == 22
+        and rule.get("port_end") == 22
+        and rule.get("endpoint_spec_type") == "ip_prefixes"
+        and rule.get("endpoint_spec") == [management_cidr]
+    ]
+    cache_ingress = [
+        rule
+        for rule in inbound
+        if rule.get("protocol") == "tcp"
+        and rule.get("port_start") == 8443
+        and rule.get("port_end") == 8443
+        and rule.get("endpoint_spec_type") == "ip_prefixes"
+        and rule.get("endpoint_spec") == [private_subnet]
+    ]
+    expected_inbound_count = 2 if cache_enabled else 1
+    if len(inbound) != expected_inbound_count or len(ssh_ingress) != 1:
         raise SystemExit("bastion public ingress must be only management /32 TCP/22")
+    if (cache_enabled and len(cache_ingress) != 1) or (not cache_enabled and cache_ingress):
+        raise SystemExit("bastion cache ingress must be exactly VPC TCP/8443 when cached bootstrap is enabled")
     for protocol in ("tcp", "udp", "icmp"):
         outbound = [rule for rule in rules if rule.get("direction") == "outbound" and rule.get("protocol") == protocol]
         if len(outbound) != 1 or not no_ports(outbound[0]) or outbound[0].get("endpoint_spec_type") != "any" or outbound[0].get("endpoint_spec", []) not in ([], None):
@@ -448,7 +478,13 @@ def main() -> None:
     if bastion_description not in (None, "", f"Managed RKE2 bastion firewall for {owner}"):
         raise SystemExit("bastion firewall has an unexpected description")
     validate_node_firewall(node_firewall, str(subnet), "10.42.0.0/16", set(result_cp_ids))
-    validate_bastion_firewall(bastion_firewall, state["managementCIDR"], bastion["uuid"])
+    validate_bastion_firewall(
+        bastion_firewall,
+        state["managementCIDR"],
+        str(subnet),
+        bastion["uuid"],
+        cache_enabled=True,
+    )
 
     state.update({
         "virtualIPv4": str(vip),
