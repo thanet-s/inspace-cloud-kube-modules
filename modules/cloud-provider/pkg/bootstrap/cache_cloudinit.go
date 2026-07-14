@@ -75,6 +75,11 @@ func RenderCacheBastionCloudInitJSON(input CacheBastionCloudInitInput) (string, 
 		{"/etc/systemd/system/inspace-cache-maintenance.timer", cacheMaintenanceTimerUnit, "0644"},
 		{"/var/lib/inspace/apt-periodic-disabled", automaticAPTUpdatesDisabledConfig, "0644"},
 	}
+	files = append(files,
+		struct{ path, content, permissions string }{"/var/lib/inspace/ubuntu-mirrors.list", ubuntuAPTMirrorListConfig, "0644"},
+		struct{ path, content, permissions string }{"/var/lib/inspace/ubuntu.sources", ubuntuAPTSourcesConfig, "0644"},
+		struct{ path, content, permissions string }{"/var/lib/inspace/static-resolv.conf", staticGoogleResolverConfig, "0644"},
+	)
 	payload := struct {
 		Hostname         string               `json:"hostname"`
 		PreserveHostname bool                 `json:"preserve_hostname"`
@@ -361,11 +366,7 @@ set -eu
 
 hostnamectl set-hostname --static __NODE_NAME__
 test "$(hostnamectl --static)" = __NODE_NAME__
-for ubuntu_sources in /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list; do
-  [ -f "$ubuntu_sources" ] || continue
-  sed -E -i 's|https?://archive\.ubuntu\.com|http://th.archive.ubuntu.com|g' "$ubuntu_sources"
-  if grep -E 'https?://archive\.ubuntu\.com' "$ubuntu_sources" >/dev/null; then exit 1; fi
-done
+` + renderUbuntuRepositoryAndResolverCommands() + `
 
 package_deadline=$(( $(date +%s) + 1200 ))
 run_package_command() {

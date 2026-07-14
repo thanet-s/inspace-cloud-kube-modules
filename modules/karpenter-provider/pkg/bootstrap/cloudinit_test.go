@@ -103,7 +103,11 @@ func TestRenderIncludesExactlyOneRegistrationTaint(t *testing.T) {
 		"hostnamectl set-hostname --static",
 		`expected_hostname='worker-1'`,
 		"/etc/hostname",
-		"http://th.archive.ubuntu.com",
+		"http://mirror1.totbb.net/ubuntu/",
+		"https://mirror.kku.ac.th/ubuntu/",
+		"nameserver 8.8.8.8",
+		"nameserver 8.8.4.4",
+		"systemctl disable --now systemd-resolved.service",
 		"apt-get -o DPkg::Lock::Timeout=30 upgrade -y",
 		"/etc/apt/apt.conf.d/99-inspace-disable-periodic",
 		`APT::Periodic::Unattended-Upgrade "0";`,
@@ -130,8 +134,8 @@ func TestRenderIncludesExactlyOneRegistrationTaint(t *testing.T) {
 	if strings.Contains(strings.ToLower(rendered), "k3s") {
 		t.Fatalf("RKE2 bootstrap retained a K3s artifact:\n%s", rendered)
 	}
-	if SchemaVersion != "stock-ubuntu-rke2-v8" {
-		t.Fatalf("bootstrap schema = %q, want private-cache version v8", SchemaVersion)
+	if SchemaVersion != "stock-ubuntu-rke2-v9" {
+		t.Fatalf("bootstrap schema = %q, want repository/resolver version v9", SchemaVersion)
 	}
 }
 
@@ -278,14 +282,27 @@ func TestRenderedHostPreparationAndNodeTuningContracts(t *testing.T) {
 	for _, want := range []string{
 		"swapoff -a",
 		`/^[[:space:]]*#/! { /[[:space:]]swap[[:space:]]/ s/^/#/; }`,
+		"/etc/apt/mirrors/inspace-ubuntu.list",
 		"/etc/apt/sources.list.d/ubuntu.sources",
-		"/etc/apt/sources.list",
-		`sed -E -i 's|https?://archive\.ubuntu\.com|http://th.archive.ubuntu.com|g' "$ubuntu_sources"`,
-		`[ -f "$ubuntu_sources" ] || continue`,
+		"rm -f /etc/apt/sources.list",
+		"systemctl disable --now systemd-resolved.service",
+		"systemctl mask systemd-resolved.service",
+		"test ! -L /etc/resolv.conf",
+		"nameserver 8.8.8.8",
+		"nameserver 8.8.4.4",
 	} {
 		if !strings.Contains(prepare, want) {
 			t.Errorf("host-preparation script is missing %q\n%s", want, prepare)
 		}
+	}
+	if got, want := writeFileContent(t, doc, "/var/lib/inspace/ubuntu-mirrors.list"), "http://mirror1.totbb.net/ubuntu/\tpriority:1\nhttps://mirror.kku.ac.th/ubuntu/\tpriority:2\n"; got != want {
+		t.Fatalf("Ubuntu mirror list differs\ngot:\n%swant:\n%s", got, want)
+	}
+	if got := writeFileContent(t, doc, "/var/lib/inspace/ubuntu.sources"); strings.Count(got, "URIs: mirror+file:/etc/apt/mirrors/inspace-ubuntu.list") != 2 || !strings.Contains(got, "Suites: noble-security") {
+		t.Fatalf("Ubuntu sources do not share the ordered mirror list for update and security suites:\n%s", got)
+	}
+	if got, want := writeFileContent(t, doc, "/var/lib/inspace/static-resolv.conf"), "# Managed by InSpace Kubernetes bootstrap.\nnameserver 8.8.8.8\nnameserver 8.8.4.4\noptions edns0\n"; got != want {
+		t.Fatalf("static resolver differs\ngot:\n%swant:\n%s", got, want)
 	}
 	if strings.Contains(prepare, "apt-get") {
 		t.Fatalf("host preparation must finish before the separately retried package stage\n%s", prepare)

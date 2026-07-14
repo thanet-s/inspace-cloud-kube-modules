@@ -240,7 +240,8 @@ Worker network policy relies on the validated InSpace cloud firewall. Generated 
 - sets `/etc/hostname`, the active guest hostname, and RKE2 `node-name` to the
   same validated worker name;
 - disables active swap and idempotently comments persistent swap entries in `/etc/fstab`;
-- changes stock Ubuntu archive endpoints to Thailand's regional mirror when they appear in either the deb822 or legacy source file;
+- configures TOT as the primary Ubuntu mirror and KKU as its request-failure fallback for both regular and security suites;
+- replaces DHCP-provided DNS with static Google resolvers and stops and masks `systemd-resolved`;
 - waits within one hard ten-minute package-preparation budget for floating-IP egress, then intentionally updates and upgrades the image before installing `curl`, CA certificates, `gzip`, `iproute2`, `procps`, and `tar`;
 - after that one bootstrap package stage, persists `APT::Periodic` disablement and masks/stops `apt-daily`, `apt-daily-upgrade`, and `unattended-upgrades` systemd units so a Karpenter worker never starts an automatic package update later; this policy is reasserted after `additionalUserData`;
 - persists and applies IPv4 forwarding plus the RKE2-recommended inotify instance/watch limits under `/etc/sysctl.d`;

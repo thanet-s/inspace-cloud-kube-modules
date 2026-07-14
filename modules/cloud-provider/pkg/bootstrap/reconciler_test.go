@@ -41,7 +41,7 @@ func TestReconcileBuildsBastionThenExactlyThreeControlPlaneVMs(t *testing.T) {
 	}
 	owner := ownerKey(cluster)
 	resourceNames := currentBootstrapResourceNames(cluster.Metadata.Name, owner)
-	if !strings.HasPrefix(api.vmCreates[0].Description, "inspace-rke2-bastion/v3 owner="+owner+" spec=") {
+	if !strings.HasPrefix(api.vmCreates[0].Description, "inspace-rke2-bastion/v4 owner="+owner+" spec=") {
 		t.Fatalf("bastion ownership description = %q", api.vmCreates[0].Description)
 	}
 	assertBastionCloudInit(t, api.vmCreates[0].CloudInit, wantBastionName)
@@ -2708,8 +2708,8 @@ func assertControlPlaneCloudInit(t *testing.T, raw, expectedNodeName string, ini
 		t.Errorf("cloud-init guest identity hostname=%q, want %q with preserve_hostname=false", identity.Hostname, expectedNodeName)
 	}
 	files := decodeWriteFiles(t, raw)
-	if len(files) != 9 {
-		t.Fatalf("write_files=%d, want 9", len(files))
+	if len(files) != 12 {
+		t.Fatalf("write_files=%d, want 12", len(files))
 	}
 	script := files["/usr/local/sbin/inspace-bootstrap-rke2"]
 	command := exec.Command("sh", "-n")
@@ -2722,7 +2722,8 @@ func assertControlPlaneCloudInit(t *testing.T, raw, expectedNodeName string, ini
 		"systemctl enable rke2-server.service", "systemctl start --no-block rke2-server.service", `"$attempt" -ge 180`,
 		"--max-time 300 --retry 3 --retry-all-errors", "/var/lib/rancher/rke2/agent/pod-manifests/kube-vip.yaml",
 		"/var/lib/rancher/rke2/server/manifests/inspace-private-load-balancer.yaml",
-		"swapoff -a", `sed -Ei '/^[[:space:]]*#/!`, "/etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list", "http://th.archive.ubuntu.com",
+		"swapoff -a", `sed -Ei '/^[[:space:]]*#/!`, "/etc/apt/mirrors/inspace-ubuntu.list", "http://mirror1.totbb.net/ubuntu/", "https://mirror.kku.ac.th/ubuntu/",
+		"systemctl disable --now systemd-resolved.service", "nameserver 8.8.8.8", "nameserver 8.8.4.4",
 		"NEEDRESTART_MODE=a DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=30 upgrade -y", "ca-certificates curl iproute2 procps tar",
 		"package_deadline=$(( $(date +%s) + 600 ))", "timeout --kill-after=30s",
 		"sysctl --system", "sysctl -n net.ipv4.ip_forward", "sysctl -n fs.inotify.max_user_instances", "sysctl -n fs.inotify.max_user_watches",
@@ -2742,9 +2743,10 @@ func assertControlPlaneCloudInit(t *testing.T, raw, expectedNodeName string, ini
 		t.Errorf("rke2-server limits mismatch:\n%s", got)
 	}
 	assertAutomaticAPTUpdatesDisabled(t, files, script)
+	assertUbuntuRepositoryAndResolver(t, files, script)
 	for before, after := range map[string]string{
-		"swapoff -a":                                   "apt-get -o Acquire::Retries=3",
-		"http://th.archive.ubuntu.com":                 "apt-get -o Acquire::Retries=3",
+		"swapoff -a": "apt-get -o Acquire::Retries=3",
+		"systemctl mask systemd-resolved.service":      "apt-get -o Acquire::Retries=3",
 		"apt-get -o Acquire::Retries=3":                "apt-get -o DPkg::Lock::Timeout=30 upgrade -y",
 		"apt-get -o DPkg::Lock::Timeout=30 upgrade -y": "install -y --no-install-recommends",
 		"install -y --no-install-recommends":           "/etc/apt/apt.conf.d/99-inspace-disable-periodic",
@@ -2926,8 +2928,8 @@ func assertBastionCloudInit(t *testing.T, raw, expectedHostname string) {
 		t.Fatalf("bastion cloud-init runcmd=%#v", payload.RunCmd)
 	}
 	files := decodeWriteFiles(t, raw)
-	if len(files) != 2 {
-		t.Fatalf("bastion write_files=%d, want 2", len(files))
+	if len(files) != 5 {
+		t.Fatalf("bastion write_files=%d, want 5", len(files))
 	}
 	script := files["/usr/local/sbin/inspace-bootstrap-bastion"]
 	command := exec.Command("sh", "-n")
@@ -2936,7 +2938,8 @@ func assertBastionCloudInit(t *testing.T, raw, expectedHostname string) {
 		t.Fatalf("invalid bastion bootstrap shell: %v: %s", err, output)
 	}
 	for _, required := range []string{
-		"/etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list", "http://th.archive.ubuntu.com",
+		"/etc/apt/mirrors/inspace-ubuntu.list", "http://mirror1.totbb.net/ubuntu/", "https://mirror.kku.ac.th/ubuntu/",
+		"systemctl disable --now systemd-resolved.service", "nameserver 8.8.8.8", "nameserver 8.8.4.4",
 		"apt-get -o Acquire::Retries=3", "NEEDRESTART_MODE=a DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=30 upgrade -y",
 		"package_deadline=$(( $(date +%s) + 600 ))", "timeout --kill-after=30s",
 	} {
@@ -2945,6 +2948,7 @@ func assertBastionCloudInit(t *testing.T, raw, expectedHostname string) {
 		}
 	}
 	assertAutomaticAPTUpdatesDisabled(t, files, script)
+	assertUbuntuRepositoryAndResolver(t, files, script)
 	for _, required := range []string{"ufw --force disable", "systemctl list-unit-files --type=service", "systemctl disable --now ufw.service", "disabled|masked", "ufw status", "systemctl is-active", "systemctl is-enabled"} {
 		if !strings.Contains(script, required) {
 			t.Errorf("bastion UFW script lacks %q", required)
@@ -2954,13 +2958,37 @@ func assertBastionCloudInit(t *testing.T, raw, expectedHostname string) {
 		t.Errorf("bastion UFW disable is not fail-closed: %s", script)
 	}
 	for before, after := range map[string]string{
-		"http://th.archive.ubuntu.com":                 "apt-get -o Acquire::Retries=3",
+		"systemctl mask systemd-resolved.service":      "apt-get -o Acquire::Retries=3",
 		"apt-get -o Acquire::Retries=3":                "apt-get -o DPkg::Lock::Timeout=30 upgrade -y",
 		"apt-get -o DPkg::Lock::Timeout=30 upgrade -y": "/etc/apt/apt.conf.d/99-inspace-disable-periodic",
 		"test \"$apt_unit_state\" = masked":            "ufw --force disable",
 	} {
 		if beforeIndex, afterIndex := strings.Index(script, before), strings.Index(script, after); beforeIndex < 0 || afterIndex <= beforeIndex {
 			t.Errorf("bastion bootstrap order %q -> %q is not enforced", before, after)
+		}
+	}
+}
+
+func assertUbuntuRepositoryAndResolver(t *testing.T, files map[string]string, script string) {
+	t.Helper()
+	if got := files["/var/lib/inspace/ubuntu-mirrors.list"]; got != ubuntuAPTMirrorListConfig {
+		t.Errorf("Ubuntu mirror list mismatch:\n%s", got)
+	}
+	if got := files["/var/lib/inspace/ubuntu.sources"]; got != ubuntuAPTSourcesConfig {
+		t.Errorf("Ubuntu sources mismatch:\n%s", got)
+	}
+	if got := files["/var/lib/inspace/static-resolv.conf"]; got != staticGoogleResolverConfig {
+		t.Errorf("static resolver mismatch:\n%s", got)
+	}
+	for _, required := range []string{
+		"install -m 0644 /var/lib/inspace/ubuntu-mirrors.list /etc/apt/mirrors/inspace-ubuntu.list",
+		"install -m 0644 /var/lib/inspace/ubuntu.sources /etc/apt/sources.list.d/ubuntu.sources",
+		"install -m 0644 /var/lib/inspace/static-resolv.conf /etc/resolv.conf",
+		"systemctl disable --now systemd-resolved.service", "systemctl mask systemd-resolved.service",
+		"test ! -L /etc/resolv.conf", "nameserver 8.8.8.8", "nameserver 8.8.4.4",
+	} {
+		if !strings.Contains(script, required) {
+			t.Errorf("Ubuntu repository/resolver setup lacks %q", required)
 		}
 	}
 }

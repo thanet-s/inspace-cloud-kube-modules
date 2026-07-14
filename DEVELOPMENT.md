@@ -61,12 +61,14 @@ Elastic worker VM names, guest hostnames, and Kubernetes Node names are
 random suffix from the Karpenter NodeClaim name, while the original NodeClaim
 identity remains the cloud ownership and deletion key.
 
-Control planes and workers disable swap, rewrite stock Ubuntu archive endpoints
-to the Thailand mirror when present, and apply persistent Kubernetes sysctls,
-PAM limits, and RKE2 systemd limits before starting RKE2. After the deliberate
-one-time package update and upgrade, control planes, workers, and the bastion
-disable APT periodic updates and mask the unattended-upgrade units; OS patching
-is an explicit operator action. Node firewalls are
+Control planes, workers, and the bastion use TOT as the primary Ubuntu mirror
+and KKU as its request-failure fallback for both regular and security suites.
+They replace DHCP-provided DNS with static Google resolvers and stop and mask
+`systemd-resolved`. Control planes and workers also disable swap and apply
+persistent Kubernetes sysctls, PAM limits, and RKE2 systemd limits before
+starting RKE2. After the deliberate one-time package update and upgrade, all
+nodes disable APT periodic updates and mask the unattended-upgrade units; OS
+patching is an explicit operator action. Node firewalls are
 validated fail-closed for all-port TCP, UDP, and ICMP coverage from both the VPC
 subnet and native-routing pod CIDR, with matching outbound access.
 

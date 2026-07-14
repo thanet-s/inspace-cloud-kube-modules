@@ -37,9 +37,11 @@ and the fixed three-server RKE2 bootstrap reconciler.
   `ALL` and adds exactly `NET_ADMIN` and `NET_RAW`.
 - Pinned RKE2 release tarball installation verified against the matching
   official `sha256sum-amd64.txt` release asset.
-- Pre-RKE2 Ubuntu preparation disables swap, rewrites stock archive endpoints
-  to the Thailand archive mirror, updates and upgrades packages within a hard
-  ten-minute budget, then disables APT periodic updates and masks every
+- Pre-RKE2 Ubuntu preparation disables swap, configures TOT as the primary
+  Ubuntu mirror with KKU as the request-failure fallback for both regular and
+  security suites, installs static Google DNS while stopping and masking
+  `systemd-resolved`, updates and upgrades packages within a hard ten-minute
+  budget, then disables APT periodic updates and masks every
   `apt-daily*` unit plus `unattended-upgrades.service`. It also persists IPv4
   forwarding, RKE2 inotify values, PAM `nofile`, and matching
   `rke2-server.service` resource limits. Bastion cloud-init performs the same
