@@ -665,7 +665,7 @@ def main() -> None:
         "ciliuml2announcementpolicy inspace-private",
         "EnableL2Announcements",
         "inspace-control-plane-vip",
-        "kube-vip.yaml.e2e-disabled",
+        "/var/lib/inspace/kube-vip.yaml.e2e-disabled",
         "Require uninterrupted API reachability during kube-vip failover",
         "Prove the chart launched the exact released product image tags",
         "/opt/e2e/scripts/api-tunnel.sh",
@@ -843,6 +843,11 @@ def main() -> None:
     require('select(.name == "vip_nodename" and' in kube_vip_ready and
             '.valueFrom.fieldRef.fieldPath == "spec.nodeName")] | length) == 1' in kube_vip_ready,
             "live kube-vip proof must require exactly one downward-API node-name identity")
+    require('--arg image "{{ e2e_state.bootstrapCacheRegistry }}/kube-vip/kube-vip:v1.2.1@sha256:' in kube_vip_ready and
+            '.image == $image' in kube_vip_ready,
+            "live kube-vip proof must bind and compare the exact cached image")
+    require('/var/lib/rancher/rke2/agent/pod-manifests/kube-vip.yaml.e2e-disabled' not in playbook,
+            "kube-vip failover must move the manifest outside the kubelet static-pod directory")
     for lease in (
         "cilium-l2announce-default-inspace-e2e-private-a",
         "cilium-l2announce-default-inspace-e2e-private-b",
