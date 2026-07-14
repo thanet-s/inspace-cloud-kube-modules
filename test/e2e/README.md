@@ -21,7 +21,9 @@ RKE2 uses Cilium in native-routing mode with the pod CIDR
 Cilium ConfigMap, `auto-direct-node-routes`, live `cilium-dbg status --verbose`
 on every control-plane and worker node, and the absence of kube-proxy
 DaemonSets, pods, and host processes. The unused `rke2-ingress-nginx` addon is
-disabled.
+disabled. The complete audited cache inventory has 34 images; this cluster
+must seed exactly 32 because it omits the disabled addon's webhook-certgen and
+ingress-controller images.
 
 The API and registration listeners share the configured private kube-vip
 address on TCP/6443 and TCP/9345. No bootstrap NLB or API endpoint FIP exists.
@@ -90,6 +92,9 @@ The worker cloud name, API hostname when returned, guest hostname, and
 Kubernetes Node name are live-proven as
 `<clusterResourceName>-karp-general-<Karpenter random suffix>` while its
 separate `general-<random suffix>` NodeClaim remains the ownership identity.
+The suite requires every control plane, worker, and bastion hostname to resolve
+to `127.0.1.1` through its generated `/etc/hosts` entry. Fixed-node ownership
+must be schema v5, and the Karpenter worker must use bootstrap schema v10.
 Managed InSpace cloud firewalls are the only host firewalls; guest UFW must be
 inactive and disabled or masked on the control planes, worker, and bastion.
 

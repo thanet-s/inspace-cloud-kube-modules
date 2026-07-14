@@ -18,6 +18,7 @@ type CacheBastionCloudInitInput struct {
 	CacheHostname     string
 	RKE2Version       string
 	ModuleVersion     string
+	Disable           []string
 	CACertificate     string
 	ServerCertificate string
 	ServerPrivateKey  string
@@ -52,7 +53,7 @@ func RenderCacheBastionCloudInitJSON(input CacheBastionCloudInitInput) (string, 
 	if err := validateCacheTLSMaterial(input); err != nil {
 		return "", err
 	}
-	imageManifest, err := renderCacheImageManifest(input.RKE2Version, input.ModuleVersion)
+	imageManifest, err := renderCacheImageManifest(input.RKE2Version, input.ModuleVersion, input.Disable)
 	if err != nil {
 		return "", err
 	}
@@ -366,7 +367,7 @@ set -eu
 
 hostnamectl set-hostname --static __NODE_NAME__
 test "$(hostnamectl --static)" = __NODE_NAME__
-` + renderUbuntuRepositoryAndResolverCommands() + `
+` + renderUbuntuRepositoryAndResolverCommands(input.NodeName) + `
 
 package_deadline=$(( $(date +%s) + 1200 ))
 run_package_command() {
@@ -540,10 +541,20 @@ test "$listed_rke2_sha" = "$expected_rke2_sha"
 chmod 0444 "$artifact_dir/rke2.linux-amd64.tar.gz" "$artifact_dir/sha256sum-amd64.txt"
 
 cd /opt/inspace-cache
+compose_up() {
+  readonly_mode="$1"
+  shift
+  attempt=0
+  until REGISTRY_READONLY="$readonly_mode" docker compose up -d --wait "$@"; do
+    attempt=$((attempt + 1))
+    test "$attempt" -lt 9
+    sleep $((attempt * 5))
+  done
+}
 manifest_hash="$(sha256sum /etc/inspace-cache/images.tsv | awk '{print $1}')"
 seeded_hash="$(cat "$state_dir/images.sha256" 2>/dev/null || true)"
 if [ "$seeded_hash" != "$manifest_hash" ]; then
-  REGISTRY_READONLY=false docker compose up -d --wait registry
+  compose_up false registry
   attempt=0
   until curl --fail --silent --show-error http://127.0.0.1:5000/v2/ >/dev/null; do
     attempt=$((attempt + 1))
@@ -561,7 +572,7 @@ if [ "$seeded_hash" != "$manifest_hash" ]; then
   mv -f "$state_dir/images.sha256.tmp" "$state_dir/images.sha256"
 fi
 
-REGISTRY_READONLY=true docker compose up -d --force-recreate --wait registry nginx
+compose_up true --force-recreate registry nginx
 curl --fail --silent --show-error http://127.0.0.1:5000/v2/ >/dev/null
 test "$(cat "$state_dir/images.sha256")" = "$manifest_hash"
 ensure_capacity

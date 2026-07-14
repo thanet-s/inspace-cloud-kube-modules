@@ -50,7 +50,11 @@ Each component is an independently buildable Go module linked locally by
   `cache.<cluster>.inspace.internal:8443`; it uses the bastion's allocated VPC
   address rather than another reserved VIP. Its ECDSA P-256 TLS material starts
   at the persisted real initialization time and is valid for exactly 15
-  calendar years.
+  calendar years. The audited image seed follows the cluster's disabled RKE2
+  addons instead of caching images used only by disabled components.
+- Before package or Kubernetes setup, bootstrap binds each generated guest
+  hostname to `127.0.1.1` and verifies local resolution independently of DHCP
+  and external DNS.
 - Private `LoadBalancer` Services use Cilium LB IPAM and L2 Announcements.
 - Public `LoadBalancer` Services use an explicit, optional, TCP-only InSpace NLB.
 - InSpace firewalls enforce node policy; guest UFW is disabled.

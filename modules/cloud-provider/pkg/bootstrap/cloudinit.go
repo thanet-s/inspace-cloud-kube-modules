@@ -71,8 +71,12 @@ nameserver 8.8.4.4
 options edns0
 `
 
-func renderUbuntuRepositoryAndResolverCommands() string {
-	return `install -d -m 0755 /etc/apt/mirrors /etc/apt/sources.list.d
+func renderUbuntuRepositoryAndResolverCommands(nodeName string) string {
+	return `node_name=` + shellSingleQuote(nodeName) + `
+sed -Ei '/^[[:space:]]*127\.0\.1\.1([[:space:]]|$)/d' /etc/hosts
+printf '127.0.1.1\t%s\n' "$node_name" >>/etc/hosts
+getent hosts "$node_name" | grep -Eq '^127\.0\.1\.1[[:space:]]'
+install -d -m 0755 /etc/apt/mirrors /etc/apt/sources.list.d
 install -m 0644 /var/lib/inspace/ubuntu-mirrors.list /etc/apt/mirrors/inspace-ubuntu.list
 install -m 0644 /var/lib/inspace/ubuntu.sources /etc/apt/sources.list.d/ubuntu.sources
 rm -f /etc/apt/sources.list
@@ -233,7 +237,7 @@ func RenderBastionCloudInitJSON(nodeName string) (string, error) {
 			Owner       string `json:"owner"`
 		}{
 			{
-				Path: "/usr/local/sbin/inspace-bootstrap-bastion", Content: base64.StdEncoding.EncodeToString([]byte(renderBastionBootstrapScript())),
+				Path: "/usr/local/sbin/inspace-bootstrap-bastion", Content: base64.StdEncoding.EncodeToString([]byte(renderBastionBootstrapScript(nodeName))),
 				Permissions: "0700", Encoding: "b64", Owner: "root:root",
 			},
 			{
@@ -503,11 +507,11 @@ done
 `
 }
 
-func renderBastionBootstrapScript() string {
+func renderBastionBootstrapScript(nodeName string) string {
 	return `#!/bin/sh
 set -eu
 
-` + renderUbuntuRepositoryAndResolverCommands() + `
+` + renderUbuntuRepositoryAndResolverCommands(nodeName) + `
 
 package_deadline=$(( $(date +%s) + 600 ))
 run_package_command() {
@@ -636,7 +640,7 @@ until systemctl is-active --quiet rke2-server.service && [ -s /etc/rancher/rke2/
   if systemctl is-failed --quiet rke2-server.service || [ "$attempt" -ge 180 ]; then exit 1; fi
   sleep 5
 done
-`, strings.TrimSpace(renderUbuntuRepositoryAndResolverCommands()), strings.TrimSpace(renderDisableAutomaticAPTUpdatesCommands()), input.PrivateSubnet, input.VirtualIPv4, cacheHostsSetup, strings.TrimSpace(strings.TrimPrefix(renderDisableUFWScript(), "#!/bin/sh\nset -eu\n")), cacheWait, input.RKE2Version, releaseBase)
+`, strings.TrimSpace(renderUbuntuRepositoryAndResolverCommands(input.NodeName)), strings.TrimSpace(renderDisableAutomaticAPTUpdatesCommands()), input.PrivateSubnet, input.VirtualIPv4, cacheHostsSetup, strings.TrimSpace(strings.TrimPrefix(renderDisableUFWScript(), "#!/bin/sh\nset -eu\n")), cacheWait, input.RKE2Version, releaseBase)
 }
 
 func renderDirectInstallScript(input CloudInitInput) string {
@@ -726,7 +730,7 @@ until systemctl is-active --quiet rke2-server.service && [ -s /etc/rancher/rke2/
   if systemctl is-failed --quiet rke2-server.service || [ "$attempt" -ge 180 ]; then exit 1; fi
   sleep 5
 done
-`, strings.TrimSpace(renderUbuntuRepositoryAndResolverCommands()), strings.TrimSpace(renderDisableAutomaticAPTUpdatesCommands()), input.PrivateSubnet, input.VirtualIPv4, strings.TrimSpace(strings.TrimPrefix(renderDisableUFWScript(), "#!/bin/sh\nset -eu\n")), input.RKE2Version, releaseBase)
+`, strings.TrimSpace(renderUbuntuRepositoryAndResolverCommands(input.NodeName)), strings.TrimSpace(renderDisableAutomaticAPTUpdatesCommands()), input.PrivateSubnet, input.VirtualIPv4, strings.TrimSpace(strings.TrimPrefix(renderDisableUFWScript(), "#!/bin/sh\nset -eu\n")), input.RKE2Version, releaseBase)
 }
 
 func sortedUniquePorts(ports []int) []int {

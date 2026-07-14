@@ -61,6 +61,15 @@ Elastic worker VM names, guest hostnames, and Kubernetes Node names are
 random suffix from the Karpenter NodeClaim name, while the original NodeClaim
 identity remains the cloud ownership and deletion key.
 
+Immediately after setting the static hostname, every control plane, worker,
+and bastion removes any stale `127.0.1.1` mapping, writes exactly
+`127.0.1.1 <generated-hostname>` to `/etc/hosts`, and requires `getent` to
+resolve that name locally. Package installation and resolver replacement do
+not begin until this check succeeds. Current fixed control-plane and bastion
+ownership records use schema v5. Karpenter's current immutable bootstrap drift
+schema is `stock-ubuntu-rke2-v10`; this is separate from its cloud VM ownership
+record version.
+
 Control planes, workers, and the bastion use TOT as the primary Ubuntu mirror
 and KKU as its request-failure fallback for both regular and security suites.
 They replace DHCP-provided DNS with static Google resolvers and stop and mask
@@ -84,10 +93,13 @@ The cache does not consume a second virtual address. After InSpace allocates
 the bastion's RFC1918 NIC address, bootstrap binds it to the deterministic
 per-cluster name `cache.<cluster>.inspace.internal` in node `/etc/hosts` files
 and serves TLS on TCP/8443. The listener binds only that private address. The
-bastion cache pre-seeds the audited RKE2 release assets and system-image
-inventory; it is not a general-purpose pull-through proxy. Its dedicated 10 GB
-filesystem reserves 1 GB of free space. Daily maintenance prunes unpinned RKE2
-artifacts and local Docker data older than 30 days.
+bastion cache pre-seeds the audited RKE2 release assets and an addon-aware
+system-image inventory; it is not a general-purpose pull-through proxy. The
+complete inventory contains 34 images. When `spec.rke2.disable` contains
+`rke2-ingress-nginx`, bootstrap excludes its webhook-certgen and ingress
+controller images, producing the 32-image seed used by the E2E cluster. Its
+dedicated 10 GB filesystem reserves 1 GB of free space. Daily maintenance
+prunes unpinned RKE2 artifacts and local Docker data older than 30 days.
 
 Cached initialization and reconciliation require two persistent controller
 inputs. `INSPACE_BOOTSTRAP_CACHE_KEY` is an operator secret containing exactly
@@ -116,7 +128,10 @@ published through the bastion floating IP or an InSpace NLB.
 Docker Compose uses `restart: unless-stopped` for both services. Docker and
 service logs use the local driver with three compressed 10 MB files per
 container, so bootstrap logging cannot consume the cache filesystem without a
-bound.
+bound. Both the writable seed-registry start and final forced recreation of the
+read-only registry plus NGINX use bounded incremental retry, with at most nine
+Compose attempts, so a transient Docker startup race does not abandon
+cloud-init.
 
 ### RKE2, Cilium, and the control-plane VIP
 
