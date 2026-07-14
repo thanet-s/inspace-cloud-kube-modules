@@ -9,6 +9,7 @@ import (
 	"net/netip"
 	"reflect"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -522,6 +523,191 @@ func TestCreateAllowsVMNameDistinctFromNodeClaimIdentity(t *testing.T) {
 	record := newOwnership(request)
 	if record.VMName != request.Name || record.NodeClaim != request.NodeClaimName {
 		t.Fatalf("ownership identities were not persisted separately: %#v", record)
+	}
+}
+
+func TestCreateAcceptsCurrentMiniAndExtraMemoryShapes(t *testing.T) {
+	for _, shape := range []struct {
+		instanceType string
+		vCPU         int
+		memoryGiB    int
+	}{
+		{instanceType: "is-general-1c-2g", vCPU: 1, memoryGiB: 2},
+		{instanceType: "is-memory-1c-4g", vCPU: 1, memoryGiB: 4},
+		{instanceType: "is-extra-memory-1c-8g", vCPU: 1, memoryGiB: 8},
+		{instanceType: "is-extra-memory-2c-16g", vCPU: 2, memoryGiB: 16},
+		{instanceType: "is-extra-memory-4c-32g", vCPU: 4, memoryGiB: 32},
+		{instanceType: "is-extra-memory-6c-48g", vCPU: 6, memoryGiB: 48},
+		{instanceType: "is-extra-memory-8c-64g", vCPU: 8, memoryGiB: 64},
+	} {
+		t.Run(shape.instanceType, func(t *testing.T) {
+			api := &fakeAPI{}
+			adapter, _ := New(api)
+			request := testRequest()
+			request.InstanceType = shape.instanceType
+			request.VCPU = shape.vCPU
+			request.MemoryGiB = shape.memoryGiB
+
+			created, err := adapter.CreateVM(context.Background(), request)
+			if err != nil {
+				t.Fatalf("CreateVM() error = %v, want supported current worker shape", err)
+			}
+			if created.VCPU != shape.vCPU || created.MemoryGiB != shape.memoryGiB || api.createCalls != 1 || api.lastVMRequest.VCPU != shape.vCPU || api.lastVMRequest.MemoryMiB != shape.memoryGiB*1024 {
+				t.Fatalf("CreateVM() = %#v, VMPOSTs=%d request=%#v; want exact %d vCPU/%d GiB launch", created, api.createCalls, api.lastVMRequest, shape.vCPU, shape.memoryGiB)
+			}
+			var record ownership
+			if err := json.Unmarshal([]byte(api.lastVMRequest.Description), &record); err != nil {
+				t.Fatalf("decode ownership: %v", err)
+			}
+			if record.Schema != ownershipSchema || record.InstanceType != request.InstanceType || record.VCPU != shape.vCPU || record.MemoryGiB != shape.memoryGiB {
+				t.Fatalf("persisted ownership = %#v, want exact v3 %d vCPU/%d GiB identity", record, shape.vCPU, shape.memoryGiB)
+			}
+		})
+	}
+}
+
+func TestCreateRejectsUnsupportedMiniOddAndExtraMemoryShapesBeforeMutation(t *testing.T) {
+	for _, instanceType := range []string{
+		"is-compute-1c-1g",
+		"is-general-01c-02g",
+		"is-general-3c-6g",
+		"is-compute-3c-3g",
+		"is-memory-3c-12g",
+		"is-extra-memory-01c-08g",
+		"is-extra-memory-3c-24g",
+		"is-extra-memory-5c-40g",
+		"is-extra-memory-7c-56g",
+		"is-extra-memory-8c-63g",
+		"is-extra-memory-10c-80g",
+	} {
+		t.Run(instanceType, func(t *testing.T) {
+			api := &fakeAPI{}
+			adapter, _ := New(api)
+			request := testRequest()
+			matches := ownedInstanceTypePattern.FindStringSubmatch(instanceType)
+			request.InstanceType = instanceType
+			request.VCPU, _ = strconv.Atoi(matches[2])
+			request.MemoryGiB, _ = strconv.Atoi(matches[3])
+
+			_, err := adapter.CreateVM(context.Background(), request)
+			if err == nil || !strings.Contains(err.Error(), "has invalid capacity") {
+				t.Fatalf("CreateVM() error = %v, want unsupported capacity rejection", err)
+			}
+			if api.createCalls != 0 || api.firewallAssignCalls != 0 || len(api.operations) != 0 {
+				t.Fatalf("invalid shape reached mutation: VMPOSTs=%d firewall=%d operations=%v", api.createCalls, api.firewallAssignCalls, api.operations)
+			}
+		})
+	}
+}
+
+func TestCurrentMiniAndExtraMemoryOwnershipSchemaCompatibility(t *testing.T) {
+	for name, schema := range map[string]string{
+		"schema-empty preflight": "",
+		"v3":                     ownershipSchema,
+	} {
+		t.Run(name, func(t *testing.T) {
+			for _, shape := range []struct {
+				instanceType string
+				vCPU         int
+				memoryGiB    int
+			}{
+				{instanceType: "is-general-1c-2g", vCPU: 1, memoryGiB: 2},
+				{instanceType: "is-memory-1c-4g", vCPU: 1, memoryGiB: 4},
+				{instanceType: "is-extra-memory-1c-8g", vCPU: 1, memoryGiB: 8},
+				{instanceType: "is-extra-memory-2c-16g", vCPU: 2, memoryGiB: 16},
+				{instanceType: "is-extra-memory-4c-32g", vCPU: 4, memoryGiB: 32},
+				{instanceType: "is-extra-memory-6c-48g", vCPU: 6, memoryGiB: 48},
+				{instanceType: "is-extra-memory-8c-64g", vCPU: 8, memoryGiB: 64},
+			} {
+				record := newOwnership(testRequest())
+				record.Schema = schema
+				record.InstanceType = shape.instanceType
+				record.VCPU = shape.vCPU
+				record.MemoryGiB = shape.memoryGiB
+				normalized, partial, err := normalizeOwnershipLaunchIdentity(record)
+				if err != nil || partial || normalized.VCPU != shape.vCPU || normalized.MemoryGiB != shape.memoryGiB {
+					t.Fatalf("%s normalizeOwnershipLaunchIdentity() = %#v, partial=%t, err=%v; want exact supported capacity", shape.instanceType, normalized, partial, err)
+				}
+			}
+			for _, instanceType := range []string{"is-general-01c-02g", "is-extra-memory-01c-08g"} {
+				record := newOwnership(testRequest())
+				record.Schema = schema
+				record.InstanceType = instanceType
+				if _, partial, err := normalizeOwnershipLaunchIdentity(record); err == nil || partial || !strings.Contains(err.Error(), "has invalid capacity") {
+					t.Fatalf("%s normalizeOwnershipLaunchIdentity() partial=%t, err=%v; want non-canonical alias rejection", instanceType, partial, err)
+				}
+			}
+		})
+	}
+
+	for name, schema := range map[string]string{
+		"v1": legacyOwnershipSchema,
+		"v2": legacyV2OwnershipSchema,
+	} {
+		t.Run(name, func(t *testing.T) {
+			for _, shape := range []struct {
+				instanceType string
+				vCPU         int
+				memoryGiB    int
+			}{
+				{instanceType: "is-general-1c-2g", vCPU: 1, memoryGiB: 2},
+				{instanceType: "is-memory-1c-4g", vCPU: 1, memoryGiB: 4},
+				{instanceType: "is-extra-memory-1c-8g", vCPU: 1, memoryGiB: 8},
+				{instanceType: "is-extra-memory-2c-16g", vCPU: 2, memoryGiB: 16},
+				{instanceType: "is-extra-memory-4c-32g", vCPU: 4, memoryGiB: 32},
+				{instanceType: "is-extra-memory-6c-48g", vCPU: 6, memoryGiB: 48},
+				{instanceType: "is-extra-memory-8c-64g", vCPU: 8, memoryGiB: 64},
+				{instanceType: "is-general-02c-04g", vCPU: 2, memoryGiB: 4},
+			} {
+				record := newOwnership(testRequest())
+				record.Schema = schema
+				record.InstanceType = shape.instanceType
+				record.VCPU = shape.vCPU
+				record.MemoryGiB = shape.memoryGiB
+				if schema == legacyOwnershipSchema {
+					record.VMName = record.NodeClaim
+				}
+				if _, partial, err := normalizeOwnershipLaunchIdentity(record); err == nil || partial || !strings.Contains(err.Error(), "has invalid capacity") {
+					t.Fatalf("%s normalizeOwnershipLaunchIdentity() partial=%t, err=%v; want legacy family/capacity rejection", shape.instanceType, partial, err)
+				}
+			}
+		})
+	}
+}
+
+func TestLegacyOwnershipRetainsEvenTwoThroughSixteenCoreContract(t *testing.T) {
+	for name, schema := range map[string]string{
+		"v1": legacyOwnershipSchema,
+		"v2": legacyV2OwnershipSchema,
+	} {
+		t.Run(name, func(t *testing.T) {
+			for _, vCPU := range []int{2, 16} {
+				record := newOwnership(testRequest())
+				record.Schema = schema
+				record.InstanceType = fmt.Sprintf("is-general-%dc-%dg", vCPU, vCPU*2)
+				record.VCPU = vCPU
+				record.MemoryGiB = vCPU * 2
+				if schema == legacyOwnershipSchema {
+					record.VMName = record.NodeClaim
+				}
+				normalized, partial, err := normalizeOwnershipLaunchIdentity(record)
+				if err != nil || partial || normalized.VCPU != vCPU || normalized.MemoryGiB != vCPU*2 {
+					t.Fatalf("%d-core normalizeOwnershipLaunchIdentity() = %#v, partial=%t, err=%v; want supported legacy capacity", vCPU, normalized, partial, err)
+				}
+			}
+
+			record := newOwnership(testRequest())
+			record.Schema = schema
+			record.InstanceType = "is-general-18c-36g"
+			record.VCPU = 18
+			record.MemoryGiB = 36
+			if schema == legacyOwnershipSchema {
+				record.VMName = record.NodeClaim
+			}
+			if _, partial, err := normalizeOwnershipLaunchIdentity(record); err == nil || partial || !strings.Contains(err.Error(), "has invalid capacity") {
+				t.Fatalf("18-core normalizeOwnershipLaunchIdentity() partial=%t, err=%v; want legacy upper-bound rejection", partial, err)
+			}
+		})
 	}
 }
 

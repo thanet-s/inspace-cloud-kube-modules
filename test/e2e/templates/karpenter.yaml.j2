@@ -43,6 +43,9 @@ spec:
         - key: inspace.cloud/instance-family
           operator: In
           values: [general]
+        - key: inspace.cloud/instance-cpu
+          operator: Gt
+          values: ["1"]
         - key: inspace.cloud/host-class
           operator: In
           values: [amd-epyc]

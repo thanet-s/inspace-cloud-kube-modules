@@ -57,7 +57,7 @@ var (
 	errFloatingIPCleanupUncertain    = errors.New("floating IP cleanup did not converge")
 	errFirewallCleanupUncertain      = errors.New("firewall cleanup did not converge")
 	vmUUIDPattern                    = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
-	ownedInstanceTypePattern         = regexp.MustCompile(`^is-(compute|general|memory)-([0-9]+)c-([0-9]+)g$`)
+	ownedInstanceTypePattern         = regexp.MustCompile(`^is-(compute|general|memory|extra-memory)-([0-9]+)c-([0-9]+)g$`)
 	karpenterOwnershipPrefixPattern  = regexp.MustCompile(`^\s*\{\s*"schema"\s*:\s*"(karpenter\.inspace\.cloud/[^"\s]+)"(?:\s*[,}]|\s*$)`)
 	karpenterClusterPattern          = regexp.MustCompile(`"cluster"\s*:\s*"([^"]*)"`)
 	fixedClusterNetworks             = [...]struct {
@@ -1592,8 +1592,18 @@ func normalizeOwnershipLaunchIdentity(record ownership) (normalized ownership, p
 	}
 	derivedVCPU, vCPUErr := strconv.Atoi(matches[2])
 	derivedMemoryGiB, memoryErr := strconv.Atoi(matches[3])
-	memoryPerVCPU := map[string]int{"compute": 1, "general": 2, "memory": 4}[matches[1]]
-	if vCPUErr != nil || memoryErr != nil || derivedVCPU < 2 || derivedVCPU > 16 || derivedVCPU%2 != 0 || derivedMemoryGiB != derivedVCPU*memoryPerVCPU {
+	family := matches[1]
+	memoryPerVCPU := map[string]int{"compute": 1, "general": 2, "memory": 4, "extra-memory": 8}[family]
+	parsedCapacity := vCPUErr == nil && memoryErr == nil &&
+		record.InstanceType == fmt.Sprintf("is-%s-%dc-%dg", family, derivedVCPU, derivedMemoryGiB)
+	currentSchema := record.Schema == "" || record.Schema == ownershipSchema
+	validOriginalCapacity := parsedCapacity && family != "extra-memory" &&
+		derivedVCPU >= 2 && derivedVCPU <= 16 && derivedVCPU%2 == 0 && derivedMemoryGiB == derivedVCPU*memoryPerVCPU
+	validCurrentMiniCapacity := parsedCapacity && currentSchema && derivedVCPU == 1 &&
+		((family == "general" && derivedMemoryGiB == 2) || (family == "memory" && derivedMemoryGiB == 4))
+	validCurrentExtraMemoryCapacity := parsedCapacity && currentSchema && family == "extra-memory" &&
+		derivedVCPU >= 1 && derivedVCPU <= 8 && (derivedVCPU == 1 || derivedVCPU%2 == 0) && derivedMemoryGiB == derivedVCPU*memoryPerVCPU
+	if !validOriginalCapacity && !validCurrentMiniCapacity && !validCurrentExtraMemoryCapacity {
 		return ownership{}, false, fmt.Errorf("recorded instance type %q has invalid capacity", record.InstanceType)
 	}
 	if record.VCPU < 0 || record.MemoryGiB < 0 {

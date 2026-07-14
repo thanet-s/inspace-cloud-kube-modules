@@ -1,20 +1,25 @@
 # Karpenter Provider for InSpace
 
-This repository implements the InSpace provider for Karpenter `v1.14.0` and RKE2. It includes a production API adapter, `InSpaceNodeClass`, a 24-variant instance catalog, stock-Ubuntu bootstrap, NodeClass readiness reconciliation, and a runnable Karpenter controller command.
+This repository implements the InSpace provider for Karpenter `v1.14.0` and RKE2. It includes a production API adapter, `InSpaceNodeClass`, a 31-variant instance catalog, stock-Ubuntu bootstrap, NodeClass readiness reconciliation, and a runnable Karpenter controller command.
 
 ## Supported contract
 
 - Location `bkk01`, Linux/amd64, on-demand capacity
 - `intel-scalable` host pool `aac7dd66-f390-4edd-80c0-dd7cae49bd99`
 - `amd-epyc` host pool `6976fdc8-4492-465b-bd16-9ad5f6b00b03`
-- `compute`, `general`, and `memory` families at 1, 2, and 4 GiB/vCPU
-- CPU sizes `2, 4, 6, 8, 10, 12, 14, 16`; maximum 16 vCPU / 64 GiB
+- The original 24-shape matrix: `compute`, `general`, and `memory` families at
+  1, 2, and 4 GiB/vCPU for CPU sizes `2, 4, 6, 8, 10, 12, 14, 16`
+- Two additional single-core shapes, `is-general-1c-2g` and
+  `is-memory-1c-4g`
+- The `extra-memory` family at 8 GiB/vCPU for CPU sizes `1, 2, 4, 6, 8`;
+  it stops at 8 vCPU because instances cannot exceed 64 GiB RAM
+- Maximum 16 vCPU / 64 GiB across the catalog
 - Ubuntu 24.04 and an exactly pinned RKE2 agent version
 - Ephemeral root disks; persistent workload data belongs on RWO CSI volumes
 - One immutable, inclusive 16-to-256-address RFC1918 Service VIP range reserved
   from worker NIC allocation
 
-Variant names describe raw VM capacity, for example `is-compute-4c-4g`, `is-general-6c-12g`, and `is-memory-16c-64g`. Allocatable disk reserves 8 GiB for Ubuntu/RKE2 plus a 4 GiB eviction threshold.
+Variant names describe raw VM capacity, for example `is-general-1c-2g`, `is-memory-1c-4g`, `is-extra-memory-1c-8g`, and `is-extra-memory-8c-64g`. Allocatable disk reserves 8 GiB for Ubuntu/RKE2 plus a 4 GiB eviction threshold.
 
 Every catalog shape advertises numeric `inspace.cloud/instance-cpu` (cores)
 and `inspace.cloud/instance-memory` (MiB) labels. NodePool requirements can use
@@ -154,9 +159,11 @@ always recovered from the exact live Floating-IP assignment. Established reads
 compare canonical VM name, capacity, image, host pool, VPC, billing account,
 and exactly one primary root disk against that record before reporting a worker
 healthy. Complete established v1 and v2 records remain available for compatible
-read and ownership-checked deletion. A v1 record uses the NodeClaim name as its
-VM/node name, derives capacity from the frozen 24-variant instance name, and
-derives the pool UUID from the frozen host-class mapping. Partial or
+read and ownership-checked deletion. Both legacy schemas derive capacity from
+the frozen 24-variant set, which intentionally excludes the two added
+single-core shapes and the entire `extra-memory` family, and derive the pool
+UUID from the frozen host-class mapping. A v1 record additionally uses the
+NodeClaim name as its VM/node name. Partial or
 contradictory exact fields fail closed; operators should recycle any legacy
 worker whose identity cannot be derived.
 

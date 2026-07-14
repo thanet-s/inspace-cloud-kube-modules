@@ -1361,10 +1361,20 @@
           (.spec | has("hostPoolSelector") | not) and
           (.status.hostPoolUUIDs | sort) == ([$intel, $amd] | sort)'
         kubectl get "nodepool/{{ e2e_nodepool_name }}" -o json | jq -e '
-          any(.spec.template.spec.requirements[];
+          .spec.template.spec.requirements as $requirements |
+          ([ $requirements[] | select(
+            .key == "inspace.cloud/instance-family" and
+            .operator == "In" and
+            .values == ["general"])] | length) == 1 and
+          ([ $requirements[] | select(
+            .key == "inspace.cloud/instance-cpu" and
+            .operator == "Gt" and
+            .values == ["1"])] | length) == 1 and
+          ([ $requirements[] | select(
             .key == "inspace.cloud/host-class" and
             .operator == "In" and
-            .values == ["amd-epyc"])'
+            .values == ["amd-epyc"])] | length) == 1 and
+          all($requirements[]; .key != "inspace.cloud/instance-memory")'
       args:
         executable: /bin/bash
       changed_when: true

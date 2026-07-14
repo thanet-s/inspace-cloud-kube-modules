@@ -1021,6 +1021,40 @@
       delay: 5
       until: e2e_replacement_marker.status == 200 and e2e_replacement_marker.content | trim == e2e_marker
 
+    - name: Delete only the paid public Service after its acceptance checks
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - -n
+          - default
+          - delete
+          - service/inspace-e2e-web
+          - --wait=false
+      changed_when: true
+
+    - name: Require public NLB FIP cleanup while preserving the remaining workloads
+      ansible.builtin.shell: |
+        set -euo pipefail
+        public_service=$(kubectl -n default get service/inspace-e2e-web --ignore-not-found -o name)
+        test -z "$public_service"
+        kubectl -n default get service/inspace-e2e-private-a >/dev/null
+        kubectl -n default get service/inspace-e2e-private-b >/dev/null
+        kubectl -n default get deployment/inspace-e2e-web >/dev/null
+        kubectl -n default get deployment/inspace-e2e-private-a >/dev/null
+        kubectl -n default get deployment/inspace-e2e-private-b >/dev/null
+        kubectl -n default get deployment/inspace-e2e-trigger >/dev/null
+        kubectl -n default get pvc/inspace-e2e-rwo >/dev/null
+        /opt/e2e/scripts/verify-service-cloud.py \
+          --state "{{ e2e_state_file }}" --public absent >/dev/null
+      args:
+        executable: /bin/bash
+      register: e2e_final_public_cleanup
+      changed_when: false
+      retries: 120
+      delay: 5
+      until: e2e_final_public_cleanup.rc == 0
+      no_log: true
+
     - name: Mark the full RKE2 CCM CSI Karpenter acceptance suite complete
       ansible.builtin.command:
         argv:
