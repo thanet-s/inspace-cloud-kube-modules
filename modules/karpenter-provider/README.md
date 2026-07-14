@@ -31,15 +31,6 @@ weights. Specify the requirement whenever hardware identity matters.
 NodeClass readiness validates both frozen class-to-pool UUID mappings and
 reports them as `status.hostPoolUUIDs`.
 
-> [!IMPORTANT]
-> Before upgrading an existing installation to this schema, add an explicit
-> `inspace.cloud/host-class` requirement to every NodePool and wait for that
-> change to be stored. Then update the CRD and controller. The removed
-> `spec.hostPoolSelector` field is pruned by the API server; a former AMD
-> NodeClass whose NodePool has no host-class requirement would otherwise make
-> both equal-priced offerings eligible and no longer guarantee AMD. Use
-> `values: [intel-scalable, amd-epyc]` when both classes are intentional.
-
 Catalog offering prices use only the compute rates derived from the current
 InSpace custom-VM calculator: `monthly compute THB = CPU cores × 60 + RAM GiB
 × 30`, converted to hourly THB with 730 billing hours per month. Root-disk cost

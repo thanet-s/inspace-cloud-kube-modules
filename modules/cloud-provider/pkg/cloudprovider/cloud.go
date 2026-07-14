@@ -43,6 +43,8 @@ const (
 
 	clusterAutoscalerDeletionTaint = "ToBeDeletedByClusterAutoscaler"
 	karpenterDisruptionTaint       = "karpenter.sh/disrupted"
+	nodeRoleControlPlaneLabel      = "node-role.kubernetes.io/control-plane"
+	nodeRoleMasterLabel            = "node-role.kubernetes.io/master"
 )
 
 // API is the exact SDK surface used by the CCM and permits loopback-only
@@ -978,7 +980,7 @@ func (p *Provider) targetUUIDs(service *corev1.Service, nodes []*corev1.Node) ([
 }
 
 func loadBalancerNodeEligible(node *corev1.Node) bool {
-	if node == nil || !node.DeletionTimestamp.IsZero() || nodeExcludedFromLoadBalancers(node) {
+	if node == nil || !node.DeletionTimestamp.IsZero() || nodeExcludedFromLoadBalancers(node) || nodeHasControlPlaneRole(node) {
 		return false
 	}
 	for _, taint := range node.Spec.Taints {
@@ -992,6 +994,15 @@ func loadBalancerNodeEligible(node *corev1.Node) bool {
 		}
 	}
 	return false
+}
+
+func nodeHasControlPlaneRole(node *corev1.Node) bool {
+	if node == nil {
+		return false
+	}
+	_, controlPlane := node.Labels[nodeRoleControlPlaneLabel]
+	_, legacyMaster := node.Labels[nodeRoleMasterLabel]
+	return controlPlane || legacyMaster
 }
 
 func nodeExcludedFromLoadBalancers(node *corev1.Node) bool {

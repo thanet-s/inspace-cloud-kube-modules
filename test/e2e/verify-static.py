@@ -791,14 +791,28 @@ def main() -> None:
             require(False, f"service cloud verifier accepted invalid is_virtual={contradictory_nonvirtual!r}")
     require("private_address == control_plane_vip" in service_cloud,
             "public Service proof must reject a control-plane VIP collision")
-    require("target must be exactly the ready local-endpoint worker" in service_cloud and
-            "targets must be empty without an eligible ready local endpoint" in service_cloud and
+    require("target must be exactly the eligible Ready worker" in service_cloud and
+            "targets must be empty without an eligible Ready target" in service_cloud and
             "exactly one TCP 80-to-30080 forwarding rule" in service_cloud,
             "public Service proof must bind the exact NLB forwarding and VM target contracts")
+    cluster_policy_exercise = named_yaml_sequence_item(
+        test_playbook, "Exercise control-plane exclusion under Cluster traffic policy", 4
+    )
+    require("Switch the public Service to Cluster traffic policy" in cluster_policy_exercise and
+            "Require Cluster policy and exactly three Ready control-plane nodes" in cluster_policy_exercise and
+            "Require Cluster public NLB target to remain exactly the eligible Ready worker" in cluster_policy_exercise and
+            "\n      always:\n" in cluster_policy_exercise and
+            "Restore the public Service to Local traffic policy" in cluster_policy_exercise and
+            "Require restored Local policy and exact eligible Ready worker target" in cluster_policy_exercise and
+            '{"spec":{"externalTrafficPolicy":"Cluster"}}' in cluster_policy_exercise and
+            '{"spec":{"externalTrafficPolicy":"Local"}}' in cluster_policy_exercise and
+            "node-role.kubernetes.io/control-plane" in cluster_policy_exercise and
+            "node-role.kubernetes.io/master" in cluster_policy_exercise,
+            "live public NLB acceptance must prove control-plane exclusion under Cluster policy and restore Local")
     require("node.kubernetes.io/exclude-from-external-load-balancers=true" in playbook and
             "Require the public NLB to remove the excluded local-endpoint node" in playbook and
             "Require zero public NLB targets without a ready local endpoint" in playbook and
-            playbook.count("--targets") >= 4,
+            playbook.count("--targets") >= 6,
             "live public NLB acceptance must prove Node and EndpointSlice target removal/restoration")
     require(playbook.count("/opt/e2e/scripts/verify-service-cloud.py") >= 2 and
             "service.beta.kubernetes.io/inspace-load-balancer-public" in playbook,

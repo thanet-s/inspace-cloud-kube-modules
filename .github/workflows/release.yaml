@@ -593,7 +593,7 @@ jobs:
           filtered_notes="$(mktemp)"
           trap 'rm -f "$generated_notes" "$filtered_notes"' EXIT
           gh release view "$TAG" --json body --jq .body >"$generated_notes"
-          awk -f scripts/filter-release-notes.awk "$generated_notes" >"$filtered_notes"
+          ./scripts/compose-release-notes.sh "$TAG" "$generated_notes" "$filtered_notes"
           if [[ ! -s "$filtered_notes" ]]; then
             echo "Refusing to publish $TAG with empty release notes" >&2
             exit 1

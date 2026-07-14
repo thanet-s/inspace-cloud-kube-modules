@@ -38,7 +38,7 @@ def main() -> None:
         "--targets",
         choices=("ready", "empty"),
         default="ready",
-        help="expected public NLB local-endpoint target state",
+        help="expected public NLB target state",
     )
     args = parser.parse_args()
 
@@ -89,8 +89,8 @@ def main() -> None:
         or {target.get("target_uuid") for target in targets} != expected_targets
     ):
         if args.targets == "ready":
-            raise SystemExit("public Service NLB target must be exactly the ready local-endpoint worker")
-        raise SystemExit("public Service NLB targets must be empty without an eligible ready local endpoint")
+            raise SystemExit("public Service NLB target must be exactly the eligible Ready worker")
+        raise SystemExit("public Service NLB targets must be empty without an eligible Ready target")
     forwarding_rules = load_balancer.get("forwarding_rules")
     if (
         not isinstance(forwarding_rules, list)

@@ -93,3 +93,42 @@ printf '# Notes\r\n\r\n## New Contributors\r\n* @owner\r\n\r\n**Full Changelog**
 printf '# Notes\r\n\r\n**Full Changelog**: https://example.test/compare/a...b\r\n' \
   >"$tmpdir/crlf.expected"
 check_case crlf
+
+composer=$workspace/scripts/compose-release-notes.sh
+generated=$tmpdir/composer-generated.md
+composed=$tmpdir/composer-composed.md
+recomposed=$tmpdir/composer-recomposed.md
+cat >"$generated" <<'EOF'
+## What's Changed
+* fix: exclude control-plane nodes from public NLB targets
+
+## New Contributors
+* @owner made their first contribution
+
+**Full Changelog**: https://example.test/compare/v0.3.0...v0.3.1
+EOF
+
+"$composer" v0.3.1 "$generated" "$composed"
+grep -Fx '<!-- inspace-project-release-notes:v0.3.1 -->' "$composed" >/dev/null
+grep -Fx '## Breaking change' "$composed" >/dev/null
+grep -F 'InSpaceNodeClass.spec.hostPoolSelector' "$composed" >/dev/null
+grep -Fx '## Cloud load balancer improvements' "$composed" >/dev/null
+grep -Fx "## What's Changed" "$composed" >/dev/null
+grep -F 'New Contributors' "$composed" >/dev/null && {
+  echo 'release-note composer retained New Contributors' >&2
+  exit 1
+}
+
+"$composer" v0.3.1 "$composed" "$recomposed"
+if ! cmp -s "$composed" "$recomposed"; then
+  echo 'release-note composer is not idempotent' >&2
+  diff -u "$composed" "$recomposed" >&2 || true
+  exit 1
+fi
+
+without_project_notes=$tmpdir/composer-without-project-notes.md
+"$composer" v9.9.9 "$generated" "$without_project_notes"
+if grep -F 'inspace-project-release-notes' "$without_project_notes" >/dev/null; then
+  echo 'release-note composer added a marker without project notes' >&2
+  exit 1
+fi

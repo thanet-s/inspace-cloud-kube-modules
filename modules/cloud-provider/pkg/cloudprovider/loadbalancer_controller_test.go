@@ -29,6 +29,8 @@ import (
 const (
 	testVMUUIDB = "cccccccc-3333-4333-8444-dddddddddddd"
 	testVMUUIDC = "dddddddd-4444-4444-8555-eeeeeeeeeeee"
+	testVMUUIDD = "eeeeeeee-5555-4555-8666-ffffffffffff"
+	testVMUUIDE = "ffffffff-6666-4666-8777-aaaaaaaaaaaa"
 )
 
 func TestProviderInformerWiringStartsOnlyAfterInitialize(t *testing.T) {
@@ -258,9 +260,12 @@ func TestLocalTargetsUseOnlyReadyNonTerminatingEndpointNodes(t *testing.T) {
 	notReady.Status.Conditions[0].Status = corev1.ConditionFalse
 	if err := endpointIndexer.Add(testEndpointSlice("default", "web", "web-b",
 		endpointForNode("worker-e", true, false),
+		endpointForNode("control-plane-a", true, false),
 	)); err != nil {
 		t.Fatal(err)
 	}
+	controlPlane := readyNode("control-plane-a", "inspace://bkk01/"+testVMUUIDD)
+	controlPlane.Labels = map[string]string{nodeRoleControlPlaneLabel: ""}
 
 	targets, err := provider.targetUUIDs(service, []*corev1.Node{
 		readyNode("worker-a", "inspace://bkk01/"+testVMUUID),
@@ -268,6 +273,7 @@ func TestLocalTargetsUseOnlyReadyNonTerminatingEndpointNodes(t *testing.T) {
 		readyNode("worker-c", "inspace://bkk01/"+testVMUUIDC),
 		readyNode("worker-d", "inspace://bkk01/99999999-1111-4222-8333-444444444444"),
 		notReady,
+		controlPlane,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -340,8 +346,14 @@ func TestClusterTargetsOnlyReadyEligibleNodes(t *testing.T) {
 	disrupted := readyNode("worker-e", "inspace://bkk01/88888888-1111-4222-8333-444444444444")
 	disrupted.Spec.Taints = []corev1.Taint{{Key: karpenterDisruptionTaint, Effect: corev1.TaintEffectNoSchedule}}
 	uninitialized := readyNode("worker-f", "")
+	controlPlane := readyNode("control-plane-a", "inspace://bkk01/"+testVMUUIDD)
+	controlPlane.Labels = map[string]string{nodeRoleControlPlaneLabel: ""}
+	legacyMaster := readyNode("master-a", "inspace://bkk01/"+testVMUUIDE)
+	legacyMaster.Labels = map[string]string{nodeRoleMasterLabel: "false"}
 
-	targets, err := provider.targetUUIDs(service, []*corev1.Node{ready, notReady, deleting, excluded, disrupted, uninitialized})
+	targets, err := provider.targetUUIDs(service, []*corev1.Node{
+		ready, notReady, deleting, excluded, disrupted, uninitialized, controlPlane, legacyMaster,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -369,6 +381,12 @@ func TestLoadBalancerNodeEligibility(t *testing.T) {
 		}},
 		{name: "explicit inclusion", want: true, mutate: func(node *corev1.Node) {
 			node.Labels = map[string]string{corev1.LabelNodeExcludeBalancers: "false"}
+		}},
+		{name: "control-plane role", mutate: func(node *corev1.Node) {
+			node.Labels = map[string]string{nodeRoleControlPlaneLabel: ""}
+		}},
+		{name: "legacy master role presence", mutate: func(node *corev1.Node) {
+			node.Labels = map[string]string{nodeRoleMasterLabel: "false"}
 		}},
 		{name: "cluster autoscaler deletion", mutate: func(node *corev1.Node) {
 			node.Spec.Taints = []corev1.Taint{{Key: clusterAutoscalerDeletionTaint}}
@@ -492,6 +510,16 @@ func TestTargetControllerReconcilesNodeReadyAddAndDelete(t *testing.T) {
 			},
 			currentTargets: []string{testVMUUID, testVMUUIDB}, wantDrop: []string{testVMUUIDB},
 		},
+		{
+			name: "Ready node becomes control plane",
+			nodes: func() []*corev1.Node {
+				a := readyNode("worker-a", "inspace://bkk01/"+testVMUUID)
+				b := readyNode("control-plane-a", "inspace://bkk01/"+testVMUUIDB)
+				b.Labels = map[string]string{nodeRoleControlPlaneLabel: ""}
+				return []*corev1.Node{a, b}
+			}(),
+			currentTargets: []string{testVMUUID, testVMUUIDB}, wantDrop: []string{testVMUUIDB},
+		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			api := &fakeAPI{}
@@ -591,6 +619,20 @@ func TestTargetControllerEventFiltering(t *testing.T) {
 	unchanged.Status.Conditions[0].LastHeartbeatTime = metav1.Now()
 	fixture.controller.onNodeUpdate(oldNode, unchanged)
 	assertQueuedKeys(t, fixture.controller.queue)
+
+	for _, roleLabel := range []string{nodeRoleControlPlaneLabel, nodeRoleMasterLabel} {
+		roleNode := oldNode.DeepCopy()
+		roleNode.Labels = map[string]string{roleLabel: ""}
+		fixture.controller.onNodeUpdate(oldNode, roleNode)
+		assertQueuedKeys(t, fixture.controller.queue, "default/web")
+		fixture.controller.onNodeUpdate(roleNode, oldNode)
+		assertQueuedKeys(t, fixture.controller.queue, "default/web")
+
+		roleValueChanged := roleNode.DeepCopy()
+		roleValueChanged.Labels[roleLabel] = "false"
+		fixture.controller.onNodeUpdate(roleNode, roleValueChanged)
+		assertQueuedKeys(t, fixture.controller.queue)
+	}
 
 	fixture.controller.onNodeAdd(oldNode)
 	assertQueuedKeys(t, fixture.controller.queue, "default/web")
