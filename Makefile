@@ -2,7 +2,7 @@ SHELL := /bin/sh
 
 MODULES := modules/client modules/cloud-provider modules/csi-driver modules/karpenter-provider
 
-.PHONY: all fmt test smoke vet helm-verify helm-package e2e-static release-notes-verify verify images status live-audit live-test cluster-e2e cluster-e2e-init cluster-e2e-test cluster-e2e-shell cluster-e2e-destroy
+.PHONY: all fmt test smoke cache-registry-smoke vet helm-verify helm-package e2e-static release-notes-verify verify images status live-audit live-test cluster-e2e cluster-e2e-init cluster-e2e-test cluster-e2e-shell cluster-e2e-destroy
 
 all: test
 
@@ -35,6 +35,9 @@ smoke:
 			GOWORK=off \
 			$(MAKE) smoke); \
 	done
+
+cache-registry-smoke:
+	@./scripts/verify-cache-registry.sh
 
 vet:
 	@set -eu; for module in $(MODULES); do \

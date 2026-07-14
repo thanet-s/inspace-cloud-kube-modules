@@ -261,8 +261,11 @@ func TestCacheBastionCloudInitIsPrivateBoundedAndReadOnly(t *testing.T) {
 	if !strings.Contains(dockerDaemon, `"data-root": "/var/lib/inspace/bootstrap-cache/docker"`) ||
 		!strings.Contains(compose, "/var/lib/inspace/bootstrap-cache/registry:/var/lib/registry") ||
 		strings.Count(compose, "read_only: true") != 2 ||
-		!strings.Contains(compose, `REGISTRY_STORAGE_MAINTENANCE_READONLY_ENABLED: "${REGISTRY_READONLY:-true}"`) ||
-		!strings.Contains(registry, "delete:\n    enabled: false") {
+		!strings.Contains(compose, `REGISTRY_STORAGE_MAINTENANCE_READONLY: "{enabled: ${REGISTRY_READONLY:-true}}"`) ||
+		strings.Contains(compose, "REGISTRY_STORAGE_MAINTENANCE_READONLY_ENABLED") ||
+		strings.Contains(compose, "REGISTRY_CONFIGURATION_PATH") ||
+		!strings.Contains(registry, "delete:\n    enabled: false") ||
+		!strings.Contains(registry, "readonly:\n      enabled: true") {
 		t.Fatalf("Docker/registry content is not bounded inside the cache image or read-only:\ndaemon=%s\ncompose=%s\nregistry=%s", dockerDaemon, compose, registry)
 	}
 	if !strings.Contains(startScript, "REGISTRY_READONLY=false docker compose up -d --wait registry") ||
