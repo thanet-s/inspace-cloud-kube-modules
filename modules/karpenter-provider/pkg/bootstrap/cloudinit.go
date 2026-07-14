@@ -21,7 +21,7 @@ import (
 // SchemaVersion must be bumped whenever generated bootstrap semantics change.
 // It is included in the provider drift hash so existing nodes are replaced.
 const (
-	SchemaVersion         = "stock-ubuntu-rke2-v8"
+	SchemaVersion         = "stock-ubuntu-rke2-v9"
 	VPCSubnetPlaceholder  = "__INSPACE_VPC_SUBNET__"
 	NativeRoutingPodCIDR  = "10.42.0.0/16"
 	KubernetesServiceCIDR = "10.43.0.0/16"
@@ -148,6 +148,26 @@ APT::Periodic::Download-Upgradeable-Packages "0";
 APT::Periodic::AutocleanInterval "0";
 APT::Periodic::Unattended-Upgrade "0";
 `
+	ubuntuMirrorList := `http://mirror1.totbb.net/ubuntu/	priority:1
+https://mirror.kku.ac.th/ubuntu/	priority:2
+`
+	ubuntuSources := `Types: deb
+URIs: mirror+file:/etc/apt/mirrors/inspace-ubuntu.list
+Suites: noble noble-updates noble-backports
+Components: main restricted universe multiverse
+Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+
+Types: deb
+URIs: mirror+file:/etc/apt/mirrors/inspace-ubuntu.list
+Suites: noble-security
+Components: main restricted universe multiverse
+Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+`
+	staticResolver := `# Managed by InSpace Kubernetes bootstrap.
+nameserver 8.8.8.8
+nameserver 8.8.4.4
+options edns0
+`
 	cacheHostsCommands := ""
 	if config.BootstrapCache != nil {
 		cacheHostsCommands = fmt.Sprintf(`cache_host=%s
@@ -168,11 +188,22 @@ swapoff -a
 if [ -f /etc/fstab ]; then
   sed -Ei '/^[[:space:]]*#/! { /[[:space:]]swap[[:space:]]/ s/^/#/; }' /etc/fstab
 fi
-for ubuntu_sources in /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list; do
-  [ -f "$ubuntu_sources" ] || continue
-  sed -E -i 's|https?://archive\.ubuntu\.com|http://th.archive.ubuntu.com|g' "$ubuntu_sources"
-  if grep -E 'https?://archive\.ubuntu\.com' "$ubuntu_sources" >/dev/null; then exit 1; fi
-done
+install -d -m 0755 /etc/apt/mirrors /etc/apt/sources.list.d
+install -m 0644 /var/lib/inspace/ubuntu-mirrors.list /etc/apt/mirrors/inspace-ubuntu.list
+install -m 0644 /var/lib/inspace/ubuntu.sources /etc/apt/sources.list.d/ubuntu.sources
+rm -f /etc/apt/sources.list
+rm -f /etc/resolv.conf
+install -m 0644 /var/lib/inspace/static-resolv.conf /etc/resolv.conf
+systemctl disable --now systemd-resolved.service >/dev/null
+systemctl mask systemd-resolved.service >/dev/null
+test ! -L /etc/resolv.conf
+grep -Fqx 'nameserver 8.8.8.8' /etc/resolv.conf
+grep -Fqx 'nameserver 8.8.4.4' /etc/resolv.conf
+test "$(systemctl is-enabled systemd-resolved.service 2>/dev/null || true)" = masked
+! systemctl is-active --quiet systemd-resolved.service
+grep -Fqx 'http://mirror1.totbb.net/ubuntu/	priority:1' /etc/apt/mirrors/inspace-ubuntu.list
+grep -Fqx 'https://mirror.kku.ac.th/ubuntu/	priority:2' /etc/apt/mirrors/inspace-ubuntu.list
+test "$(grep -Fc 'URIs: mirror+file:/etc/apt/mirrors/inspace-ubuntu.list' /etc/apt/sources.list.d/ubuntu.sources)" -eq 2
 `, shellQuote(config.NodeName), strings.TrimSpace(cacheHostsCommands))
 	applyNodeTuning := `#!/bin/sh
 set -eu
@@ -409,6 +440,9 @@ tar -xzf "$tmpdir/rke2.linux-amd64.tar.gz" -C /usr/local
 			encodedWriteFile("/etc/sysctl.d/90-inspace-kubernetes.conf", "0644", sysctlConfig),
 			encodedWriteFile("/etc/security/limits.d/90-inspace-kubernetes.conf", "0644", securityLimits),
 			encodedWriteFile("/etc/apt/apt.conf.d/99-inspace-disable-periodic", "0644", disablePeriodicAPTConfig),
+			encodedWriteFile("/var/lib/inspace/ubuntu-mirrors.list", "0644", ubuntuMirrorList),
+			encodedWriteFile("/var/lib/inspace/ubuntu.sources", "0644", ubuntuSources),
+			encodedWriteFile("/var/lib/inspace/static-resolv.conf", "0644", staticResolver),
 			encodedWriteFile("/usr/local/sbin/inspace-prepare-kubernetes-node", "0700", prepareHost),
 			encodedWriteFile("/usr/local/sbin/inspace-install-prerequisites", "0700", prerequisites),
 			encodedWriteFile("/usr/local/sbin/inspace-disable-automatic-apt-updates", "0700", disableAutomaticAPTUpdates),

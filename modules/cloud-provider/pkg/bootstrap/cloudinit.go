@@ -48,6 +48,49 @@ APT::Periodic::AutocleanInterval "0";
 Unattended-Upgrade::Automatic-Reboot "false";
 `
 
+const ubuntuAPTMirrorListConfig = `http://mirror1.totbb.net/ubuntu/	priority:1
+https://mirror.kku.ac.th/ubuntu/	priority:2
+`
+
+const ubuntuAPTSourcesConfig = `Types: deb
+URIs: mirror+file:/etc/apt/mirrors/inspace-ubuntu.list
+Suites: noble noble-updates noble-backports
+Components: main restricted universe multiverse
+Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+
+Types: deb
+URIs: mirror+file:/etc/apt/mirrors/inspace-ubuntu.list
+Suites: noble-security
+Components: main restricted universe multiverse
+Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+`
+
+const staticGoogleResolverConfig = `# Managed by InSpace Kubernetes bootstrap.
+nameserver 8.8.8.8
+nameserver 8.8.4.4
+options edns0
+`
+
+func renderUbuntuRepositoryAndResolverCommands() string {
+	return `install -d -m 0755 /etc/apt/mirrors /etc/apt/sources.list.d
+install -m 0644 /var/lib/inspace/ubuntu-mirrors.list /etc/apt/mirrors/inspace-ubuntu.list
+install -m 0644 /var/lib/inspace/ubuntu.sources /etc/apt/sources.list.d/ubuntu.sources
+rm -f /etc/apt/sources.list
+rm -f /etc/resolv.conf
+install -m 0644 /var/lib/inspace/static-resolv.conf /etc/resolv.conf
+systemctl disable --now systemd-resolved.service >/dev/null
+systemctl mask systemd-resolved.service >/dev/null
+test ! -L /etc/resolv.conf
+grep -Fqx 'nameserver 8.8.8.8' /etc/resolv.conf
+grep -Fqx 'nameserver 8.8.4.4' /etc/resolv.conf
+test "$(systemctl is-enabled systemd-resolved.service 2>/dev/null || true)" = masked
+! systemctl is-active --quiet systemd-resolved.service
+grep -Fqx 'http://mirror1.totbb.net/ubuntu/	priority:1' /etc/apt/mirrors/inspace-ubuntu.list
+grep -Fqx 'https://mirror.kku.ac.th/ubuntu/	priority:2' /etc/apt/mirrors/inspace-ubuntu.list
+test "$(grep -Fc 'URIs: mirror+file:/etc/apt/mirrors/inspace-ubuntu.list' /etc/apt/sources.list.d/ubuntu.sources)" -eq 2
+`
+}
+
 type CloudInitInput struct {
 	NodeName                     string
 	NodeExternalIPv4             string
@@ -150,6 +193,9 @@ func RenderCloudInitJSON(input CloudInitInput) (string, error) {
 	addFile("/etc/security/limits.d/90-inspace-kubernetes.conf", kubernetesLimitsConfig, "0644")
 	addFile("/etc/systemd/system/rke2-server.service.d/20-inspace-node-limits.conf", rke2ServerLimitsConfig, "0644")
 	addFile("/var/lib/inspace/apt-periodic-disabled", automaticAPTUpdatesDisabledConfig, "0644")
+	addFile("/var/lib/inspace/ubuntu-mirrors.list", ubuntuAPTMirrorListConfig, "0644")
+	addFile("/var/lib/inspace/ubuntu.sources", ubuntuAPTSourcesConfig, "0644")
+	addFile("/var/lib/inspace/static-resolv.conf", staticGoogleResolverConfig, "0644")
 	payload.RunCmd = []string{"/usr/local/sbin/inspace-bootstrap-rke2"}
 	data, err := json.Marshal(payload)
 	if err != nil {
@@ -196,6 +242,19 @@ func RenderBastionCloudInitJSON(nodeName string) (string, error) {
 			},
 		},
 		RunCmd: []string{"/usr/local/sbin/inspace-bootstrap-bastion"},
+	}
+	for _, file := range []struct{ path, content string }{
+		{"/var/lib/inspace/ubuntu-mirrors.list", ubuntuAPTMirrorListConfig},
+		{"/var/lib/inspace/ubuntu.sources", ubuntuAPTSourcesConfig},
+		{"/var/lib/inspace/static-resolv.conf", staticGoogleResolverConfig},
+	} {
+		payload.WriteFiles = append(payload.WriteFiles, struct {
+			Path        string `json:"path"`
+			Content     string `json:"content"`
+			Permissions string `json:"permissions"`
+			Encoding    string `json:"encoding"`
+			Owner       string `json:"owner"`
+		}{Path: file.path, Content: base64.StdEncoding.EncodeToString([]byte(file.content)), Permissions: "0644", Encoding: "b64", Owner: "root:root"})
 	}
 	data, err := json.Marshal(payload)
 	if err != nil {
@@ -448,11 +507,7 @@ func renderBastionBootstrapScript() string {
 	return `#!/bin/sh
 set -eu
 
-for ubuntu_sources in /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list; do
-  [ -f "$ubuntu_sources" ] || continue
-  sed -E -i 's|https?://archive\.ubuntu\.com|http://th.archive.ubuntu.com|g' "$ubuntu_sources"
-  if grep -E 'https?://archive\.ubuntu\.com' "$ubuntu_sources" >/dev/null; then exit 1; fi
-done
+` + renderUbuntuRepositoryAndResolverCommands() + `
 
 package_deadline=$(( $(date +%s) + 600 ))
 run_package_command() {
@@ -499,11 +554,7 @@ swapoff -a
 if [ -f /etc/fstab ]; then
   sed -Ei '/^[[:space:]]*#/! { /[[:space:]]swap[[:space:]]/ s/^/#/; }' /etc/fstab
 fi
-for ubuntu_sources in /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list; do
-  [ -f "$ubuntu_sources" ] || continue
-  sed -E -i 's|https?://archive\.ubuntu\.com|http://th.archive.ubuntu.com|g' "$ubuntu_sources"
-  if grep -E 'https?://archive\.ubuntu\.com' "$ubuntu_sources" >/dev/null; then exit 1; fi
-done
+%s
 
 package_deadline=$(( $(date +%%s) + 600 ))
 run_package_command() {
@@ -585,13 +636,9 @@ until systemctl is-active --quiet rke2-server.service && [ -s /etc/rancher/rke2/
   if systemctl is-failed --quiet rke2-server.service || [ "$attempt" -ge 180 ]; then exit 1; fi
   sleep 5
 done
-`, strings.TrimSpace(renderDisableAutomaticAPTUpdatesCommands()), input.PrivateSubnet, input.VirtualIPv4, cacheHostsSetup, strings.TrimSpace(strings.TrimPrefix(renderDisableUFWScript(), "#!/bin/sh\nset -eu\n")), cacheWait, input.RKE2Version, releaseBase)
+`, strings.TrimSpace(renderUbuntuRepositoryAndResolverCommands()), strings.TrimSpace(renderDisableAutomaticAPTUpdatesCommands()), input.PrivateSubnet, input.VirtualIPv4, cacheHostsSetup, strings.TrimSpace(strings.TrimPrefix(renderDisableUFWScript(), "#!/bin/sh\nset -eu\n")), cacheWait, input.RKE2Version, releaseBase)
 }
 
-// renderDirectInstallScript intentionally preserves the byte-for-byte v0.3
-// direct-download cloud-init contract. Control-plane VM ownership hashes cover
-// the complete script, so even inert cache placeholders would make an existing
-// direct cluster impossible to reconcile after upgrading the controller.
 func renderDirectInstallScript(input CloudInitInput) string {
 	releaseBase := "https://github.com/rancher/rke2/releases/download/" + url.PathEscape(input.RKE2Version)
 	return fmt.Sprintf(`#!/bin/sh
@@ -601,11 +648,7 @@ swapoff -a
 if [ -f /etc/fstab ]; then
   sed -Ei '/^[[:space:]]*#/! { /[[:space:]]swap[[:space:]]/ s/^/#/; }' /etc/fstab
 fi
-for ubuntu_sources in /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list; do
-  [ -f "$ubuntu_sources" ] || continue
-  sed -E -i 's|https?://archive\.ubuntu\.com|http://th.archive.ubuntu.com|g' "$ubuntu_sources"
-  if grep -E 'https?://archive\.ubuntu\.com' "$ubuntu_sources" >/dev/null; then exit 1; fi
-done
+%s
 
 package_deadline=$(( $(date +%%s) + 600 ))
 run_package_command() {
@@ -683,7 +726,7 @@ until systemctl is-active --quiet rke2-server.service && [ -s /etc/rancher/rke2/
   if systemctl is-failed --quiet rke2-server.service || [ "$attempt" -ge 180 ]; then exit 1; fi
   sleep 5
 done
-`, strings.TrimSpace(renderDisableAutomaticAPTUpdatesCommands()), input.PrivateSubnet, input.VirtualIPv4, strings.TrimSpace(strings.TrimPrefix(renderDisableUFWScript(), "#!/bin/sh\nset -eu\n")), input.RKE2Version, releaseBase)
+`, strings.TrimSpace(renderUbuntuRepositoryAndResolverCommands()), strings.TrimSpace(renderDisableAutomaticAPTUpdatesCommands()), input.PrivateSubnet, input.VirtualIPv4, strings.TrimSpace(strings.TrimPrefix(renderDisableUFWScript(), "#!/bin/sh\nset -eu\n")), input.RKE2Version, releaseBase)
 }
 
 func sortedUniquePorts(ports []int) []int {

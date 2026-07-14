@@ -199,11 +199,26 @@ func TestClusterE2EProvisionsAndWaitsForThreeControlPlanesInParallel(t *testing.
 	requireParallelTask(t, persistSwap)
 	persistSwapConfig := requireTaskMapping(t, persistSwap, "ansible.builtin.replace")
 	requireMappingString(t, persistSwapConfig, "regexp", `^(?!\s*#)(.*\s+swap\s+.*)$`)
-	mirror := exactAnsibleTask(t, controlPlaneWait, "Select the Thailand Ubuntu archive mirror on every control plane in parallel")
+	mirror := exactAnsibleTask(t, controlPlaneWait, "Configure ordered TOT and KKU Ubuntu mirrors on every control plane in parallel")
 	requireParallelTask(t, mirror)
-	mirrorConfig := requireTaskMapping(t, mirror, "ansible.builtin.replace")
-	requireMappingString(t, mirrorConfig, "regexp", `https?://archive\.ubuntu\.com`)
-	requireMappingString(t, mirrorConfig, "replace", "http://th.archive.ubuntu.com")
+	mirrorConfig := requireTaskMapping(t, mirror, "ansible.builtin.copy")
+	requireMappingString(t, mirrorConfig, "dest", "/etc/apt/mirrors/inspace-ubuntu.list")
+	requireMappingContains(t, mirrorConfig, "content", `http://mirror1.totbb.net/ubuntu/{{ "\t" }}priority:1`)
+	requireMappingContains(t, mirrorConfig, "content", `https://mirror.kku.ac.th/ubuntu/{{ "\t" }}priority:2`)
+	sources := exactAnsibleTask(t, controlPlaneWait, "Configure Ubuntu update and security suites on every control plane in parallel")
+	requireParallelTask(t, sources)
+	sourcesConfig := requireTaskMapping(t, sources, "ansible.builtin.copy")
+	requireMappingString(t, sourcesConfig, "dest", "/etc/apt/sources.list.d/ubuntu.sources")
+	requireMappingContains(t, sourcesConfig, "content", "Suites: noble-security")
+	resolver := exactAnsibleTask(t, controlPlaneWait, "Configure static Google DNS on every control plane in parallel")
+	requireParallelTask(t, resolver)
+	resolverConfig := requireTaskMapping(t, resolver, "ansible.builtin.copy")
+	requireMappingString(t, resolverConfig, "dest", "/etc/resolv.conf")
+	requireMappingContains(t, resolverConfig, "content", "nameserver 8.8.8.8")
+	resolved := exactAnsibleTask(t, controlPlaneWait, "Disable systemd-resolved on every control plane in parallel")
+	requireParallelTask(t, resolved)
+	resolvedConfig := requireTaskMapping(t, resolved, "ansible.builtin.systemd_service")
+	requireMappingString(t, resolvedConfig, "name", "systemd-resolved.service")
 	upgrade := exactAnsibleTask(t, controlPlaneWait, "Update and upgrade every control plane in parallel")
 	requireParallelTask(t, upgrade)
 	upgradeConfig := requireTaskMapping(t, upgrade, "ansible.builtin.apt")
@@ -798,6 +813,21 @@ func requireMappingString(t *testing.T, mapping map[string]any, key, expected st
 	}
 	if actual != expected {
 		t.Fatalf("mapping field %q=%q, want %q", key, actual, expected)
+	}
+}
+
+func requireMappingContains(t *testing.T, mapping map[string]any, key, expected string) {
+	t.Helper()
+	value, exists := mapping[key]
+	if !exists {
+		t.Fatalf("mapping lacks string field %q", key)
+	}
+	actual, ok := value.(string)
+	if !ok {
+		t.Fatalf("mapping field %q has type %T, want string", key, value)
+	}
+	if !strings.Contains(actual, expected) {
+		t.Fatalf("mapping field %q does not contain %q: %q", key, expected, actual)
 	}
 }
 

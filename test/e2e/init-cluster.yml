@@ -710,23 +710,83 @@
       become: true
       when: not e2e_node_preparation.stat.exists
 
-    - name: Detect Ubuntu archive source files on every control plane
-      ansible.builtin.stat:
-        path: "{{ item }}"
-      loop:
-        - /etc/apt/sources.list.d/ubuntu.sources
-        - /etc/apt/sources.list
-      register: e2e_ubuntu_sources
+    - name: Create the APT mirror directory on every control plane in parallel
+      ansible.builtin.file:
+        path: /etc/apt/mirrors
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
       become: true
+      when: not e2e_node_preparation.stat.exists
 
-    - name: Select the Thailand Ubuntu archive mirror on every control plane in parallel
-      ansible.builtin.replace:
-        path: "{{ item }}"
-        regexp: 'https?://archive\.ubuntu\.com'
-        replace: 'http://th.archive.ubuntu.com'
-      loop: >-
-        {{ (e2e_ubuntu_sources.results | default([])) |
-           selectattr('stat.exists') | map(attribute='item') | list }}
+    - name: Configure ordered TOT and KKU Ubuntu mirrors on every control plane in parallel
+      ansible.builtin.copy:
+        content: |
+          http://mirror1.totbb.net/ubuntu/{{ "\t" }}priority:1
+          https://mirror.kku.ac.th/ubuntu/{{ "\t" }}priority:2
+        dest: /etc/apt/mirrors/inspace-ubuntu.list
+        owner: root
+        group: root
+        mode: "0644"
+      become: true
+      when: not e2e_node_preparation.stat.exists
+
+    - name: Configure Ubuntu update and security suites on every control plane in parallel
+      ansible.builtin.copy:
+        content: |
+          Types: deb
+          URIs: mirror+file:/etc/apt/mirrors/inspace-ubuntu.list
+          Suites: noble noble-updates noble-backports
+          Components: main restricted universe multiverse
+          Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+
+          Types: deb
+          URIs: mirror+file:/etc/apt/mirrors/inspace-ubuntu.list
+          Suites: noble-security
+          Components: main restricted universe multiverse
+          Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+        dest: /etc/apt/sources.list.d/ubuntu.sources
+        owner: root
+        group: root
+        mode: "0644"
+      become: true
+      when: not e2e_node_preparation.stat.exists
+
+    - name: Remove the legacy Ubuntu sources list on every control plane in parallel
+      ansible.builtin.file:
+        path: /etc/apt/sources.list
+        state: absent
+      become: true
+      when: not e2e_node_preparation.stat.exists
+
+    - name: Remove the systemd-resolved resolv.conf link on every control plane in parallel
+      ansible.builtin.file:
+        path: /etc/resolv.conf
+        state: absent
+      become: true
+      when: not e2e_node_preparation.stat.exists
+
+    - name: Configure static Google DNS on every control plane in parallel
+      ansible.builtin.copy:
+        content: |
+          # Managed by InSpace Kubernetes bootstrap.
+          nameserver 8.8.8.8
+          nameserver 8.8.4.4
+          options edns0
+        dest: /etc/resolv.conf
+        owner: root
+        group: root
+        mode: "0644"
+      become: true
+      when: not e2e_node_preparation.stat.exists
+
+    - name: Disable systemd-resolved on every control plane in parallel
+      ansible.builtin.systemd_service:
+        name: systemd-resolved.service
+        state: stopped
+        enabled: false
+        masked: true
       become: true
       when: not e2e_node_preparation.stat.exists
 
@@ -938,9 +998,17 @@
         test -f /var/lib/inspace/kubernetes-node-prepared-v1
         test -z "$(swapon --noheadings)"
         if awk '$0 !~ /^[[:space:]]*#/ && NF >= 3 && $3 == "swap" { found=1 } END { exit found ? 0 : 1 }' /etc/fstab; then exit 1; fi
-        for ubuntu_sources in /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list; do
-          test ! -f "$ubuntu_sources" || ! grep -E 'https?://archive\.ubuntu\.com' "$ubuntu_sources"
-        done
+        test ! -e /etc/apt/sources.list
+        grep -Fqx $'http://mirror1.totbb.net/ubuntu/\tpriority:1' /etc/apt/mirrors/inspace-ubuntu.list
+        grep -Fqx $'https://mirror.kku.ac.th/ubuntu/\tpriority:2' /etc/apt/mirrors/inspace-ubuntu.list
+        test "$(grep -Fc 'URIs: mirror+file:/etc/apt/mirrors/inspace-ubuntu.list' /etc/apt/sources.list.d/ubuntu.sources)" -eq 2
+        grep -Fqx 'Suites: noble noble-updates noble-backports' /etc/apt/sources.list.d/ubuntu.sources
+        grep -Fqx 'Suites: noble-security' /etc/apt/sources.list.d/ubuntu.sources
+        test ! -L /etc/resolv.conf
+        grep -Fqx 'nameserver 8.8.8.8' /etc/resolv.conf
+        grep -Fqx 'nameserver 8.8.4.4' /etc/resolv.conf
+        test "$(systemctl is-enabled systemd-resolved.service 2>/dev/null || true)" = masked
+        ! systemctl is-active --quiet systemd-resolved.service
         grep -Fqx 'APT::Periodic::Enable "0";' /etc/apt/apt.conf.d/99-inspace-disable-periodic
         grep -Fqx 'APT::Periodic::Update-Package-Lists "0";' /etc/apt/apt.conf.d/99-inspace-disable-periodic
         grep -Fqx 'APT::Periodic::Unattended-Upgrade "0";' /etc/apt/apt.conf.d/99-inspace-disable-periodic
@@ -1799,9 +1867,17 @@
         test -f /var/lib/inspace/kubernetes-node-prepared-v1
         test -z "$(swapon --noheadings)"
         if awk '$0 !~ /^[[:space:]]*#/ && NF >= 3 && $3 == "swap" { found=1 } END { exit found ? 0 : 1 }' /etc/fstab; then exit 1; fi
-        for ubuntu_sources in /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list; do
-          test ! -f "$ubuntu_sources" || ! grep -E 'https?://archive\.ubuntu\.com' "$ubuntu_sources"
-        done
+        test ! -e /etc/apt/sources.list
+        grep -Fqx $'http://mirror1.totbb.net/ubuntu/\tpriority:1' /etc/apt/mirrors/inspace-ubuntu.list
+        grep -Fqx $'https://mirror.kku.ac.th/ubuntu/\tpriority:2' /etc/apt/mirrors/inspace-ubuntu.list
+        test "$(grep -Fc 'URIs: mirror+file:/etc/apt/mirrors/inspace-ubuntu.list' /etc/apt/sources.list.d/ubuntu.sources)" -eq 2
+        grep -Fqx 'Suites: noble noble-updates noble-backports' /etc/apt/sources.list.d/ubuntu.sources
+        grep -Fqx 'Suites: noble-security' /etc/apt/sources.list.d/ubuntu.sources
+        test ! -L /etc/resolv.conf
+        grep -Fqx 'nameserver 8.8.8.8' /etc/resolv.conf
+        grep -Fqx 'nameserver 8.8.4.4' /etc/resolv.conf
+        test "$(systemctl is-enabled systemd-resolved.service 2>/dev/null || true)" = masked
+        ! systemctl is-active --quiet systemd-resolved.service
         grep -Fqx 'APT::Periodic::Enable "0";' /etc/apt/apt.conf.d/99-inspace-disable-periodic
         grep -Fqx 'APT::Periodic::Update-Package-Lists "0";' /etc/apt/apt.conf.d/99-inspace-disable-periodic
         grep -Fqx 'APT::Periodic::Unattended-Upgrade "0";' /etc/apt/apt.conf.d/99-inspace-disable-periodic

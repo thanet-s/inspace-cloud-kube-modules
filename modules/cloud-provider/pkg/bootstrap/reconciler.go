@@ -731,6 +731,8 @@ func (r *Reconciler) Destroy(ctx context.Context, cluster *v1alpha1.InSpaceClust
 func validateDestroyVMOwnership(vms map[string]*inspace.VM, owner, clusterName, bastionVMName string, controlPlaneNames [ControlPlaneReplicas]string) error {
 	hasControlPlaneV2 := false
 	hasControlPlaneV3 := false
+	hasControlPlaneV4 := false
+	bastionSchema := 0
 	for name, vm := range vms {
 		if vm == nil || !vmUUIDPattern.MatchString(vm.UUID) {
 			return fmt.Errorf("bootstrap: refusing to delete VM %q with an invalid UUID", name)
@@ -740,6 +742,7 @@ func validateDestroyVMOwnership(vms map[string]*inspace.VM, owner, clusterName, 
 			if name == legacyBastionName(owner) {
 				prefixes = append(prefixes, fmt.Sprintf("inspace-rke2-bastion/v1 owner=%s spec=", owner))
 			} else {
+				prefixes = append(prefixes, fmt.Sprintf("inspace-rke2-bastion/v4 owner=%s spec=", owner))
 				prefixes = append(prefixes, fmt.Sprintf("inspace-rke2-bastion/v3 owner=%s spec=", owner))
 			}
 		}
@@ -748,6 +751,7 @@ func validateDestroyVMOwnership(vms map[string]*inspace.VM, owner, clusterName, 
 			if name == controlPlaneNames[candidate] {
 				slot = candidate
 				if name == controlPlaneName(clusterName, candidate) {
+					prefixes = append(prefixes, fmt.Sprintf("inspace-rke2-cp/v4 owner=%s slot=%d spec=", owner, slot))
 					prefixes = append(prefixes, fmt.Sprintf("inspace-rke2-cp/v3 owner=%s slot=%d spec=", owner, slot))
 				}
 				prefixes = append(prefixes, fmt.Sprintf("inspace-rke2-cp/v2 owner=%s slot=%d spec=", owner, slot))
@@ -776,21 +780,40 @@ func validateDestroyVMOwnership(vms map[string]*inspace.VM, owner, clusterName, 
 		if slot >= 0 {
 			hasControlPlaneV2 = hasControlPlaneV2 || strings.HasPrefix(matchedPrefix, "inspace-rke2-cp/v2 ")
 			hasControlPlaneV3 = hasControlPlaneV3 || strings.HasPrefix(matchedPrefix, "inspace-rke2-cp/v3 ")
+			hasControlPlaneV4 = hasControlPlaneV4 || strings.HasPrefix(matchedPrefix, "inspace-rke2-cp/v4 ")
+		} else {
+			switch {
+			case strings.HasPrefix(matchedPrefix, "inspace-rke2-bastion/v1 "):
+				bastionSchema = 1
+			case strings.HasPrefix(matchedPrefix, "inspace-rke2-bastion/v3 "):
+				bastionSchema = 3
+			case strings.HasPrefix(matchedPrefix, "inspace-rke2-bastion/v4 "):
+				bastionSchema = 4
+			}
 		}
 	}
-	if hasControlPlaneV2 && hasControlPlaneV3 {
-		return errors.New("bootstrap: refusing incoherent teardown ownership schema with mixed v2 and v3 control-plane records")
+	schemaCount := 0
+	for _, present := range []bool{hasControlPlaneV2, hasControlPlaneV3, hasControlPlaneV4} {
+		if present {
+			schemaCount++
+		}
 	}
-	if vms[bastionVMName] != nil {
-		switch bastionVMName {
-		case currentBastionName(clusterName):
-			if hasControlPlaneV2 {
-				return errors.New("bootstrap: refusing incoherent teardown ownership schema: v3 bastion cannot authorize v2 control-plane deletion")
-			}
-		case legacyBastionName(owner):
-			if hasControlPlaneV3 {
-				return errors.New("bootstrap: refusing incoherent teardown ownership schema: v1 bastion cannot authorize v3 control-plane deletion")
-			}
+	if schemaCount > 1 {
+		return errors.New("bootstrap: refusing incoherent teardown ownership schema with mixed control-plane records")
+	}
+	if vms[bastionVMName] != nil && schemaCount == 1 {
+		controlPlaneSchema := 2
+		if hasControlPlaneV3 {
+			controlPlaneSchema = 3
+		} else if hasControlPlaneV4 {
+			controlPlaneSchema = 4
+		}
+		expectedControlPlaneSchema := bastionSchema
+		if bastionSchema == 1 {
+			expectedControlPlaneSchema = 2
+		}
+		if expectedControlPlaneSchema != controlPlaneSchema {
+			return errors.New("bootstrap: refusing incoherent teardown ownership schema: bastion and control planes use incompatible schemas")
 		}
 	}
 	return nil
@@ -1597,7 +1620,7 @@ func (r *Reconciler) desiredControlPlaneVMRequest(cluster *v1alpha1.InSpaceClust
 		return inspace.CreateVMRequest{}, err
 	}
 	sum := sha256.Sum256(data)
-	request.Description = fmt.Sprintf("inspace-rke2-cp/v3 owner=%s slot=%d spec=%s", owner, slot, hex.EncodeToString(sum[:]))
+	request.Description = fmt.Sprintf("inspace-rke2-cp/v4 owner=%s slot=%d spec=%s", owner, slot, hex.EncodeToString(sum[:]))
 	return request, nil
 }
 
@@ -1631,7 +1654,7 @@ func (r *Reconciler) desiredBastionVMRequest(cluster *v1alpha1.InSpaceCluster, n
 		return inspace.CreateVMRequest{}, err
 	}
 	sum := sha256.Sum256(data)
-	request.Description = fmt.Sprintf("inspace-rke2-bastion/v3 owner=%s spec=%s", owner, hex.EncodeToString(sum[:]))
+	request.Description = fmt.Sprintf("inspace-rke2-bastion/v4 owner=%s spec=%s", owner, hex.EncodeToString(sum[:]))
 	return request, nil
 }
 

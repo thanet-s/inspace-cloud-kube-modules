@@ -581,11 +581,31 @@ def main() -> None:
             "when: not e2e_node_preparation.stat.exists" in persistent_swap,
             "persistent swap removal must use the exact idempotent Python regexp and checkpoint guard")
     mirror_selection = named_yaml_sequence_item(
-        control_plane_wait_play, "Select the Thailand Ubuntu archive mirror on every control plane in parallel", 4
+        control_plane_wait_play, "Configure ordered TOT and KKU Ubuntu mirrors on every control plane in parallel", 4
     )
-    require(r"regexp: 'https?://archive\.ubuntu\.com'" in mirror_selection and
-            "replace: 'http://th.archive.ubuntu.com'" in mirror_selection,
-            "Ansible node preparation must select the Thailand mirror for HTTP or HTTPS sources")
+    require("dest: /etc/apt/mirrors/inspace-ubuntu.list" in mirror_selection and
+            'http://mirror1.totbb.net/ubuntu/{{ "\\t" }}priority:1' in mirror_selection and
+            'https://mirror.kku.ac.th/ubuntu/{{ "\\t" }}priority:2' in mirror_selection,
+            "Ansible node preparation must configure the ordered TOT and KKU mirror list")
+    ubuntu_sources = named_yaml_sequence_item(
+        control_plane_wait_play, "Configure Ubuntu update and security suites on every control plane in parallel", 4
+    )
+    require("dest: /etc/apt/sources.list.d/ubuntu.sources" in ubuntu_sources and
+            ubuntu_sources.count("URIs: mirror+file:/etc/apt/mirrors/inspace-ubuntu.list") == 2 and
+            "Suites: noble-security" in ubuntu_sources,
+            "Ansible node preparation must use the ordered mirror list for update and security suites")
+    static_dns = named_yaml_sequence_item(
+        control_plane_wait_play, "Configure static Google DNS on every control plane in parallel", 4
+    )
+    require("dest: /etc/resolv.conf" in static_dns and "nameserver 8.8.8.8" in static_dns and
+            "nameserver 8.8.4.4" in static_dns,
+            "Ansible node preparation must install the static Google resolver")
+    disable_resolved = named_yaml_sequence_item(
+        control_plane_wait_play, "Disable systemd-resolved on every control plane in parallel", 4
+    )
+    require("ansible.builtin.systemd_service:" in disable_resolved and
+            "name: systemd-resolved.service" in disable_resolved and "masked: true" in disable_resolved,
+            "Ansible node preparation must stop and mask systemd-resolved")
     package_upgrade = named_yaml_sequence_item(
         control_plane_wait_play, "Update and upgrade every control plane in parallel", 4
     )
@@ -701,7 +721,10 @@ def main() -> None:
         "10\\.42\\.0\\.0/16",
         "Disable active swap on every control plane in parallel",
         "Disable persistent swap entries on every control plane in parallel",
-        "Select the Thailand Ubuntu archive mirror on every control plane in parallel",
+        "Configure ordered TOT and KKU Ubuntu mirrors on every control plane in parallel",
+        "Configure Ubuntu update and security suites on every control plane in parallel",
+        "Configure static Google DNS on every control plane in parallel",
+        "Disable systemd-resolved on every control plane in parallel",
         "Update and upgrade every control plane in parallel",
         "/etc/apt/apt.conf.d/99-inspace-disable-periodic",
         'APT::Periodic::Unattended-Upgrade "0";',
@@ -1065,7 +1088,7 @@ def main() -> None:
         'f"{cluster_resource_name}-bastion-{owner}"',
         'f"{cluster_resource_name}-bastion-ip"',
         'bastion_name, bastion_firewall_name, bastion_fip_name = bastion_resource_names(',
-        'rf"inspace-rke2-bastion/v3 owner={re.escape(owner)} spec=[0-9a-f]{{64}}"',
+        'rf"inspace-rke2-bastion/v4 owner={re.escape(owner)} spec=[0-9a-f]{{64}}"',
         'validate_optional_vm_hostname(bastion, bastion_name, "bastion")',
         '"bastionName": bastion_name',
         '"bastionFloatingIPName": bastion_fip["name"]',
