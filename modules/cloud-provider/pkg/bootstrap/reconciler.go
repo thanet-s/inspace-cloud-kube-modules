@@ -733,6 +733,7 @@ func validateDestroyVMOwnership(vms map[string]*inspace.VM, owner, clusterName, 
 	hasControlPlaneV3 := false
 	hasControlPlaneV4 := false
 	hasControlPlaneV5 := false
+	hasControlPlaneV6 := false
 	bastionSchema := 0
 	for name, vm := range vms {
 		if vm == nil || !vmUUIDPattern.MatchString(vm.UUID) {
@@ -743,6 +744,7 @@ func validateDestroyVMOwnership(vms map[string]*inspace.VM, owner, clusterName, 
 			if name == legacyBastionName(owner) {
 				prefixes = append(prefixes, fmt.Sprintf("inspace-rke2-bastion/v1 owner=%s spec=", owner))
 			} else {
+				prefixes = append(prefixes, fmt.Sprintf("inspace-rke2-bastion/v6 owner=%s spec=", owner))
 				prefixes = append(prefixes, fmt.Sprintf("inspace-rke2-bastion/v5 owner=%s spec=", owner))
 				prefixes = append(prefixes, fmt.Sprintf("inspace-rke2-bastion/v4 owner=%s spec=", owner))
 				prefixes = append(prefixes, fmt.Sprintf("inspace-rke2-bastion/v3 owner=%s spec=", owner))
@@ -753,6 +755,7 @@ func validateDestroyVMOwnership(vms map[string]*inspace.VM, owner, clusterName, 
 			if name == controlPlaneNames[candidate] {
 				slot = candidate
 				if name == controlPlaneName(clusterName, candidate) {
+					prefixes = append(prefixes, fmt.Sprintf("inspace-rke2-cp/v6 owner=%s slot=%d spec=", owner, slot))
 					prefixes = append(prefixes, fmt.Sprintf("inspace-rke2-cp/v5 owner=%s slot=%d spec=", owner, slot))
 					prefixes = append(prefixes, fmt.Sprintf("inspace-rke2-cp/v4 owner=%s slot=%d spec=", owner, slot))
 					prefixes = append(prefixes, fmt.Sprintf("inspace-rke2-cp/v3 owner=%s slot=%d spec=", owner, slot))
@@ -785,6 +788,7 @@ func validateDestroyVMOwnership(vms map[string]*inspace.VM, owner, clusterName, 
 			hasControlPlaneV3 = hasControlPlaneV3 || strings.HasPrefix(matchedPrefix, "inspace-rke2-cp/v3 ")
 			hasControlPlaneV4 = hasControlPlaneV4 || strings.HasPrefix(matchedPrefix, "inspace-rke2-cp/v4 ")
 			hasControlPlaneV5 = hasControlPlaneV5 || strings.HasPrefix(matchedPrefix, "inspace-rke2-cp/v5 ")
+			hasControlPlaneV6 = hasControlPlaneV6 || strings.HasPrefix(matchedPrefix, "inspace-rke2-cp/v6 ")
 		} else {
 			switch {
 			case strings.HasPrefix(matchedPrefix, "inspace-rke2-bastion/v1 "):
@@ -795,11 +799,13 @@ func validateDestroyVMOwnership(vms map[string]*inspace.VM, owner, clusterName, 
 				bastionSchema = 4
 			case strings.HasPrefix(matchedPrefix, "inspace-rke2-bastion/v5 "):
 				bastionSchema = 5
+			case strings.HasPrefix(matchedPrefix, "inspace-rke2-bastion/v6 "):
+				bastionSchema = 6
 			}
 		}
 	}
 	schemaCount := 0
-	for _, present := range []bool{hasControlPlaneV2, hasControlPlaneV3, hasControlPlaneV4, hasControlPlaneV5} {
+	for _, present := range []bool{hasControlPlaneV2, hasControlPlaneV3, hasControlPlaneV4, hasControlPlaneV5, hasControlPlaneV6} {
 		if present {
 			schemaCount++
 		}
@@ -815,6 +821,8 @@ func validateDestroyVMOwnership(vms map[string]*inspace.VM, owner, clusterName, 
 			controlPlaneSchema = 4
 		} else if hasControlPlaneV5 {
 			controlPlaneSchema = 5
+		} else if hasControlPlaneV6 {
+			controlPlaneSchema = 6
 		}
 		expectedControlPlaneSchema := bastionSchema
 		if bastionSchema == 1 {
@@ -1628,7 +1636,7 @@ func (r *Reconciler) desiredControlPlaneVMRequest(cluster *v1alpha1.InSpaceClust
 		return inspace.CreateVMRequest{}, err
 	}
 	sum := sha256.Sum256(data)
-	request.Description = fmt.Sprintf("inspace-rke2-cp/v5 owner=%s slot=%d spec=%s", owner, slot, hex.EncodeToString(sum[:]))
+	request.Description = fmt.Sprintf("inspace-rke2-cp/v6 owner=%s slot=%d spec=%s", owner, slot, hex.EncodeToString(sum[:]))
 	return request, nil
 }
 
@@ -1663,7 +1671,7 @@ func (r *Reconciler) desiredBastionVMRequest(cluster *v1alpha1.InSpaceCluster, n
 		return inspace.CreateVMRequest{}, err
 	}
 	sum := sha256.Sum256(data)
-	request.Description = fmt.Sprintf("inspace-rke2-bastion/v5 owner=%s spec=%s", owner, hex.EncodeToString(sum[:]))
+	request.Description = fmt.Sprintf("inspace-rke2-bastion/v6 owner=%s spec=%s", owner, hex.EncodeToString(sum[:]))
 	return request, nil
 }
 

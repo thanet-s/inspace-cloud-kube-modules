@@ -21,7 +21,7 @@ import (
 // SchemaVersion must be bumped whenever generated bootstrap semantics change.
 // It is included in the provider drift hash so existing nodes are replaced.
 const (
-	SchemaVersion         = "stock-ubuntu-rke2-v10"
+	SchemaVersion         = "stock-ubuntu-rke2-v11"
 	VPCSubnetPlaceholder  = "__INSPACE_VPC_SUBNET__"
 	NativeRoutingPodCIDR  = "10.42.0.0/16"
 	KubernetesServiceCIDR = "10.43.0.0/16"
@@ -185,7 +185,15 @@ hostnamectl set-hostname --static "$expected_hostname"
 [ "$(hostnamectl --static)" = "$expected_hostname" ]
 sed -Ei '/^[[:space:]]*127\.0\.1\.1([[:space:]]|$)/d' /etc/hosts
 printf '127.0.1.1\t%%s\n' "$expected_hostname" >>/etc/hosts
-getent hosts "$expected_hostname" | grep -Eq '^127\.0\.1\.1[[:space:]]'
+hostname_attempt=0
+until getent hosts "$expected_hostname" | grep -Eq '^127\.0\.1\.1[[:space:]]'; do
+  hostname_attempt=$((hostname_attempt + 1))
+  if [ "$hostname_attempt" -ge 30 ]; then
+    echo "generated hostname did not resolve to 127.0.1.1" >&2
+    exit 1
+  fi
+  sleep 1
+done
 %s
 swapoff -a
 if [ -f /etc/fstab ]; then

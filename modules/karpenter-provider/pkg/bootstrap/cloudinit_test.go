@@ -104,6 +104,9 @@ func TestRenderIncludesExactlyOneRegistrationTaint(t *testing.T) {
 		`expected_hostname='worker-1'`,
 		`printf '127.0.1.1\t%s\n' "$expected_hostname" >>/etc/hosts`,
 		`getent hosts "$expected_hostname" | grep -Eq '^127\.0\.1\.1[[:space:]]'`,
+		`hostname_attempt=$((hostname_attempt + 1))`,
+		`[ "$hostname_attempt" -ge 30 ]`,
+		`generated hostname did not resolve to 127.0.1.1`,
 		"/etc/hostname",
 		"http://mirror1.totbb.net/ubuntu/",
 		"https://mirror.kku.ac.th/ubuntu/",
@@ -136,8 +139,8 @@ func TestRenderIncludesExactlyOneRegistrationTaint(t *testing.T) {
 	if strings.Contains(strings.ToLower(rendered), "k3s") {
 		t.Fatalf("RKE2 bootstrap retained a K3s artifact:\n%s", rendered)
 	}
-	if SchemaVersion != "stock-ubuntu-rke2-v10" {
-		t.Fatalf("bootstrap schema = %q, want hostname/repository/resolver version v10", SchemaVersion)
+	if SchemaVersion != "stock-ubuntu-rke2-v11" {
+		t.Fatalf("bootstrap schema = %q, want bounded hostname readback version v11", SchemaVersion)
 	}
 }
 

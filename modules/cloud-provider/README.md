@@ -40,10 +40,10 @@ and the fixed three-server RKE2 bootstrap reconciler.
 - Pre-RKE2 Ubuntu preparation disables swap, configures TOT as the primary
   Ubuntu mirror with KKU as the request-failure fallback for both regular and
   security suites, binds the generated hostname to `127.0.1.1` with verified
-  local resolution, installs static Google DNS while stopping and masking
-  `systemd-resolved`, updates and upgrades packages within a hard ten-minute
-  budget, then disables APT periodic updates and masks every
-  `apt-daily*` unit plus `unattended-upgrades.service`. It also persists IPv4
+  local resolution through bounded readback retry, installs static Google DNS
+  while stopping and masking `systemd-resolved`, updates and upgrades packages
+  within a hard ten-minute budget, then disables APT periodic updates and masks
+  every `apt-daily*` unit plus `unattended-upgrades.service`. It also persists IPv4
   forwarding, RKE2 inotify values, PAM `nofile`, and matching
   `rke2-server.service` resource limits. Bastion cloud-init performs the same
   bounded one-time package update/upgrade and automatic-update shutdown before
@@ -192,10 +192,10 @@ an adoption candidate. An uncertain API response is resolved by listing and
 validating the exact deterministic name and owner/spec record on the next loop,
 not by blindly repeating the POST.
 
-New control-plane and bastion owner/spec records use schema v5 because local
-hostname setup is immutable cloud-init input. Reconciliation does not adopt an
-older fixed VM into v5; use an explicit destroy/recreate lifecycle. Owned
-teardown continues to recognize the supported older fixed-node schemas.
+New control-plane and bastion owner/spec records use schema v6 because bounded
+local-hostname readback is immutable cloud-init input. Reconciliation does not
+adopt an older fixed VM into v6; use an explicit destroy/recreate lifecycle.
+Owned teardown continues to recognize the supported older fixed-node schemas.
 
 New bootstrap FIPs are `<metadata.name>-bastion-ip` and
 `<metadata.name>-cp0-ip` through `-cp2-ip`. The two firewall display names are

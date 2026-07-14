@@ -63,12 +63,14 @@ identity remains the cloud ownership and deletion key.
 
 Immediately after setting the static hostname, every control plane, worker,
 and bastion removes any stale `127.0.1.1` mapping, writes exactly
-`127.0.1.1 <generated-hostname>` to `/etc/hosts`, and requires `getent` to
-resolve that name locally. Package installation and resolver replacement do
-not begin until this check succeeds. Current fixed control-plane and bastion
-ownership records use schema v5. Karpenter's current immutable bootstrap drift
-schema is `stock-ubuntu-rke2-v10`; this is separate from its cloud VM ownership
-record version.
+`127.0.1.1 <generated-hostname>` to `/etc/hosts`, and retries the exact
+`getent` readback within a fixed bound until that name resolves locally. This
+bounded retry accounts for a short NSS readback delay after a successful file
+append; package installation and resolver replacement do not begin until the
+mapping is visible. Current fixed control-plane and bastion ownership records
+use schema v6. Karpenter's current immutable bootstrap drift schema is
+`stock-ubuntu-rke2-v11`; this is separate from its cloud VM ownership record
+version.
 
 Control planes, workers, and the bastion use TOT as the primary Ubuntu mirror
 and KKU as its request-failure fallback for both regular and security suites.
