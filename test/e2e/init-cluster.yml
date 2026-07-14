@@ -1608,7 +1608,7 @@
         kubectl apply -f "{{ e2e_state_dir }}/trigger.yaml"
         kubectl -n default rollout status deployment/inspace-e2e-trigger --timeout=20m
         test "$(kubectl -n default get deployment/inspace-e2e-trigger -o jsonpath='{.spec.template.spec.containers[0].image}')" = \
-          'registry.k8s.io/pause:3.10.1'
+          '{{ e2e_state.bootstrapCacheRegistry }}/rancher/mirrored-pause:3.6@sha256:c2280d2f5f56cf9c9a01bb64b2db4651e35efd6d62a54dcfc12049fe6449c5e4'
         kubectl wait --for=condition=Ready node -l "karpenter.sh/nodepool={{ e2e_nodepool_name }}" --timeout=10m
         kubectl get nodeclaims -l "karpenter.sh/nodepool={{ e2e_nodepool_name }}" -o json | jq -e '
           .items | length == 1 and

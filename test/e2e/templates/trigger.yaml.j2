@@ -15,6 +15,6 @@ spec:
         karpenter.sh/nodepool: {{ e2e_nodepool_name }}
       containers:
         - name: pause
-          image: registry.k8s.io/pause:3.10.1
+          image: {{ e2e_state.bootstrapCacheRegistry }}/rancher/mirrored-pause:3.6@sha256:c2280d2f5f56cf9c9a01bb64b2db4651e35efd6d62a54dcfc12049fe6449c5e4
           resources:
             requests: {cpu: 100m, memory: 64Mi}

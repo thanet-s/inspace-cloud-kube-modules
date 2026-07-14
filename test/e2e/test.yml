@@ -194,7 +194,7 @@
           .spec.bootstrapCache.caBundle == $ca' <<<"$nodeclass"
         test "$(helm -n kube-system get values inspace -o json | jq -r '.global.inspace.systemImageRegistry')" = "$cache_registry"
         test "$(kubectl -n default get deployment/inspace-e2e-trigger -o jsonpath='{.spec.template.spec.containers[0].image}')" = \
-          'registry.k8s.io/pause:3.10.1'
+          "$cache_registry/rancher/mirrored-pause:3.6@sha256:c2280d2f5f56cf9c9a01bb64b2db4651e35efd6d62a54dcfc12049fe6449c5e4"
       args:
         executable: /bin/bash
       changed_when: false
