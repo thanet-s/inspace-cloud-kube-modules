@@ -594,6 +594,9 @@ def main() -> None:
             ubuntu_sources.count("URIs: mirror+file:/etc/apt/mirrors/inspace-ubuntu.list") == 2 and
             "Suites: noble-security" in ubuntu_sources,
             "Ansible node preparation must use the ordered mirror list for update and security suites")
+    require(init_playbook.count("test ! -s /etc/apt/sources.list") == 2 and
+            "test ! -e /etc/apt/sources.list" not in init_playbook,
+            "control-plane and worker acceptance must allow only an absent or empty legacy sources.list")
     static_dns = named_yaml_sequence_item(
         control_plane_wait_play, "Configure static Google DNS on every control plane in parallel", 4
     )
@@ -718,6 +721,9 @@ def main() -> None:
         "Masquerading:[[:space:]]+BPF",
         "EnableBPFMasquerade",
         "EnableIPv4Masquerade",
+        "exec_cilium",
+        "cilium_exec_attempt=$((cilium_exec_attempt + 1))",
+        '"$cilium_exec_attempt" -ge 5',
         "10\\.42\\.0\\.0/16",
         "Disable active swap on every control plane in parallel",
         "Disable persistent swap entries on every control plane in parallel",

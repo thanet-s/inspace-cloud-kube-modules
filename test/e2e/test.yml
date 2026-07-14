@@ -264,13 +264,31 @@
           .items | length == 4 and
           ([.[].spec.nodeName] | sort) == $nodes and
           all(.[]; .status.phase == "Running")' <<<"$cilium"
+        exec_cilium() {
+          local pod=$1
+          shift
+          local cilium_exec_attempt=0
+          local cilium_exec_output
+          while true; do
+            cilium_exec_attempt=$((cilium_exec_attempt + 1))
+            if cilium_exec_output=$(timeout --kill-after=5s 60s kubectl -n kube-system exec "$pod" -- "$@" 2>&1); then
+              printf '%s\n' "$cilium_exec_output"
+              return 0
+            fi
+            if [ "$cilium_exec_attempt" -ge 5 ]; then
+              printf '%s\n' "$cilium_exec_output" >&2
+              return 1
+            fi
+            sleep 2
+          done
+        }
         while IFS=$'\t' read -r pod node; do
           test -n "$pod"
-          status=$(timeout --kill-after=5s 60s kubectl -n kube-system exec "$pod" -- cilium-dbg status --verbose)
+          status=$(exec_cilium "$pod" cilium-dbg status --verbose)
           grep -E 'KubeProxyReplacement:[[:space:]]+True' <<<"$status"
           grep -E '(Routing:.*Native|Direct Routing)' <<<"$status"
           grep -E '^[[:space:]]*Masquerading:[[:space:]]+BPF([[:space:]]+\(ip-masq-agent\))?[[:space:]]+\[[^][]+\][[:space:]]+10\.42\.0\.0/16([[:space:]]|$)' <<<"$status"
-          config=$(timeout --kill-after=5s 60s kubectl -n kube-system exec "$pod" -- cilium-dbg config --all)
+          config=$(exec_cilium "$pod" cilium-dbg config --all)
           grep -E '^EnableBPFMasquerade[[:space:]]*:[[:space:]]*true$' <<<"$config"
           grep -E '^EnableIPv4Masquerade[[:space:]]*:[[:space:]]*true$' <<<"$config"
           grep -E 'EnableL2Announcements[[:space:]]*:[[:space:]]*true' <<<"$config"
