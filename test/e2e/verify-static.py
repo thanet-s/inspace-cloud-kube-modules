@@ -673,15 +673,46 @@ def main() -> None:
             "values: [amd-epyc]" in nodeclass and
             "intel-scalable" not in nodeclass,
             "E2E NodePool must exclusively select AMD EPYC workers")
+    require(nodeclass.count("""        - key: inspace.cloud/instance-family
+          operator: In
+          values: [general]""") == 1 and
+            nodeclass.count("""        - key: inspace.cloud/instance-cpu
+          operator: Gt
+          values: ["1"]""") == 1 and
+            "key: inspace.cloud/instance-memory" not in nodeclass,
+            "E2E general NodePool must require CPU Gt 1 without an instance-memory selector")
     require('(.spec | has("hostPoolSelector") | not)' in playbook and
             ".status.hostPoolUUIDs | sort" in playbook and
+            '.key == "inspace.cloud/instance-family"' in playbook and
+            '.values == ["general"]' in playbook and
+            '.key == "inspace.cloud/instance-cpu"' in playbook and
+            '.operator == "Gt"' in playbook and
+            '.values == ["1"]' in playbook and
             '.key == "inspace.cloud/host-class"' in playbook and
+            'all($requirements[]; .key != "inspace.cloud/instance-memory")' in playbook and
             "INSPACE_AMD_HOST_POOL_UUID" in playbook,
-            "live NodeClass and NodePool checks must prove the multi-class catalog and AMD selection")
+            "live NodeClass and NodePool checks must prove the unpinned-memory AMD general Gt 1 selection")
     require(playbook.count('.metadata.labels["inspace.cloud/host-class"] == "amd-epyc"') >= 2 and
             playbook.count('.metadata.labels["inspace.cloud/instance-cpu"] == "2"') >= 2 and
             playbook.count('.metadata.labels["inspace.cloud/instance-memory"] == "4096"') >= 2,
             "live worker checks must prove resolved host-class and numeric capacity labels")
+    public_recheck = playbook.index("- name: Recheck the public TCP NLB after pod replacement")
+    public_delete = playbook.index("- name: Delete only the paid public Service after its acceptance checks")
+    suite_complete = playbook.index("- name: Mark the full RKE2 CCM CSI Karpenter acceptance suite complete")
+    cleanup_window = playbook[public_delete:suite_complete]
+    require(public_recheck < public_delete < suite_complete and
+            "service/inspace-e2e-web" in cleanup_window and
+            "--wait=false" in cleanup_window and
+            "--ignore-not-found -o name" in cleanup_window and
+            "service/inspace-e2e-private-a" in cleanup_window and
+            "service/inspace-e2e-private-b" in cleanup_window and
+            "deployment/inspace-e2e-web" in cleanup_window and
+            "deployment/inspace-e2e-private-a" in cleanup_window and
+            "deployment/inspace-e2e-private-b" in cleanup_window and
+            "deployment/inspace-e2e-trigger" in cleanup_window and
+            "pvc/inspace-e2e-rwo" in cleanup_window and
+            "--state \"{{ e2e_state_file }}\" --public absent" in cleanup_window,
+            "live acceptance must delete only the paid public Service, prove cloud cleanup, and preserve every other workload")
     private_services = [
         manifest_document(workload, "Service", "inspace-e2e-private-a"),
         manifest_document(workload, "Service", "inspace-e2e-private-b"),

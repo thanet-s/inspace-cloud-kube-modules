@@ -61,7 +61,11 @@ the worker NodePool selects it with an
 `inspace.cloud/host-class In [amd-epyc]` requirement. The reusable NodeClass
 validates both supported class-to-pool mappings, while the live Node and
 NodeClaim must advertise `instance-cpu=2`, `instance-memory=4096` MiB, and the
-resolved AMD host class.
+resolved AMD host class. The E2E NodePool selects the `general` family and
+requires `instance-cpu Gt ["1"]` without an instance-memory selector. This
+excludes every 1-vCPU shape, while the pool limits and live Node/NodeClaim
+assertions prove the selected worker is 2 vCPU / 4 GiB. The explicit family
+requirement excludes every non-`general` shape, including `extra-memory`.
 The three control-plane cloud names, guest hostnames, and Kubernetes Node names
 are live-proven as `<clusterResourceName>-cp0`, `-cp1`, and `-cp2`.
 Each E2E control plane uses a 60 GiB root disk, and the E2E Karpenter NodeClass
@@ -118,7 +122,11 @@ intact), waits for that NLB/FIP to be deleted and its status cleared, and
 restores only the label to prove label-driven recreation. This directly
 exercises CCM's provider-intent trigger for changes the generic Service
 controller otherwise does not observe. UDP is not tested on the public path
-because the InSpace NLB supports TCP only.
+because the InSpace NLB supports TCP only. After the final public-path check,
+the suite deletes only this paid public Service and requires both its NLB and
+FIP to be absent before it marks acceptance complete. The deployments, PVC,
+private Services, cluster, and worker remain available to later checks or a
+preserved phased run.
 
 ## Safety and cleanup
 
@@ -215,7 +223,10 @@ make cluster-e2e-destroy
 
 `init` creates a new run and preserves it. `test` reuses that initialized
 cluster and preserves it whether the tests pass or fail, so test-only changes
-can be exercised repeatedly. `shell` reestablishes the private-API SSH tunnel,
+can be exercised repeatedly. A successful `test` removes the paid public
+Service/NLB/FIP after its acceptance checks while retaining the other test
+resources; a later `test` recreates and revalidates that Service through the
+normal manifest apply. `shell` reestablishes the private-API SSH tunnel,
 exports the persisted kubeconfig, and opens an interactive environment where
 commands such as `kubectl get nodes` work directly. Exiting the shell stops its
 local tunnel but leaves the cluster running. Each phase container holds the

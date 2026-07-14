@@ -13,13 +13,24 @@ import (
 	inspacev1 "github.com/thanet-s/inspace-cloud-kube-modules/modules/karpenter-provider/pkg/apis/v1alpha1"
 )
 
-func TestCatalogHasAll24BoundedVariants(t *testing.T) {
+func TestCatalogHasAll31BoundedVariants(t *testing.T) {
 	types, err := New(Options{Location: inspacev1.LocationBangkok, RootDiskGiB: 40})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(types) != 24 {
-		t.Fatalf("expected 24 instance types, got %d", len(types))
+	if len(types) != 31 {
+		t.Fatalf("expected 31 instance types, got %d", len(types))
+	}
+
+	expected := map[string]bool{}
+	for _, family := range Families {
+		for _, cores := range family.CoreCounts {
+			name := fmt.Sprintf("is-%s-%dc-%dg", family.Name, cores, cores*family.MemoryGiBPerVCPU)
+			expected[name] = true
+		}
+	}
+	if len(expected) != 31 {
+		t.Fatalf("test catalog definition has %d unique variants, want 31", len(expected))
 	}
 
 	seen := map[string]bool{}
@@ -28,16 +39,22 @@ func TestCatalogHasAll24BoundedVariants(t *testing.T) {
 			t.Fatalf("duplicate instance type %q", instanceType.Name)
 		}
 		seen[instanceType.Name] = true
+		if !expected[instanceType.Name] {
+			t.Fatalf("catalog contains unexpected instance type %q", instanceType.Name)
+		}
 		cores := int(instanceType.Capacity.Cpu().Value())
 		memoryGiB := int(instanceType.Capacity.Memory().Value() / (1024 * 1024 * 1024))
-		if cores < 2 || cores > 16 || cores%2 != 0 {
+		if cores < 1 || cores > 16 || (cores > 1 && cores%2 != 0) {
 			t.Fatalf("%s has invalid CPU count %d", instanceType.Name, cores)
 		}
 		if memoryGiB > 64 {
 			t.Fatalf("%s exceeds the 64 GiB limit", instanceType.Name)
 		}
 		family := instanceType.Requirements.Get(LabelFamily).Any()
-		ratio := map[string]int{"compute": 1, "general": 2, "memory": 4}[family]
+		ratio := map[string]int{"compute": 1, "general": 2, "memory": 4, "extra-memory": 8}[family]
+		if ratio == 0 {
+			t.Fatalf("%s has unknown family %q", instanceType.Name, family)
+		}
 		if memoryGiB != cores*ratio {
 			t.Fatalf("%s has %d GiB, expected %d", instanceType.Name, memoryGiB, cores*ratio)
 		}
@@ -81,11 +98,70 @@ func TestCatalogHasAll24BoundedVariants(t *testing.T) {
 	}
 
 	for _, family := range Families {
-		for _, cores := range CoreCounts {
+		for _, cores := range family.CoreCounts {
 			name := fmt.Sprintf("is-%s-%dc-%dg", family.Name, cores, cores*family.MemoryGiBPerVCPU)
 			if !seen[name] {
 				t.Errorf("catalog is missing %s", name)
 			}
+		}
+	}
+}
+
+func TestCatalogHasOnlySupportedOneCoreAndExtraMemoryShapes(t *testing.T) {
+	types, err := New(Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	byName := map[string][]*cloudprovider.InstanceType{}
+	for _, instanceType := range types {
+		byName[instanceType.Name] = append(byName[instanceType.Name], instanceType)
+	}
+
+	specialPrices := map[string]float64{
+		"is-general-1c-2g":       120,
+		"is-memory-1c-4g":        180,
+		"is-extra-memory-1c-8g":  300,
+		"is-extra-memory-2c-16g": 600,
+		"is-extra-memory-4c-32g": 1200,
+		"is-extra-memory-6c-48g": 1800,
+		"is-extra-memory-8c-64g": 2400,
+	}
+	for name, monthlyPrice := range specialPrices {
+		matches := byName[name]
+		if len(matches) != 1 {
+			t.Fatalf("%s occurs %d times, want exactly once", name, len(matches))
+		}
+		instanceType := matches[0]
+		if len(instanceType.Offerings) != len(inspacev1.SupportedHostClasses()) {
+			t.Fatalf("%s offerings=%d, want %d", name, len(instanceType.Offerings), len(inspacev1.SupportedHostClasses()))
+		}
+		prices := map[string]float64{}
+		for _, offering := range instanceType.Offerings {
+			hostClass := offering.Requirements.Get(LabelHostClass).Any()
+			prices[hostClass] = offering.Price
+			if want := monthlyPrice / billingHoursPerMonth; offering.Price != want {
+				t.Fatalf("%s %s hourly price=%v THB, want %v THB", name, hostClass, offering.Price, want)
+			}
+		}
+		if prices[inspacev1.HostClassIntelScalable] != prices[inspacev1.HostClassAMDEPYC] {
+			t.Fatalf("%s host-class prices differ: Intel=%v AMD=%v", name,
+				prices[inspacev1.HostClassIntelScalable], prices[inspacev1.HostClassAMDEPYC])
+		}
+	}
+
+	unsupported := []string{
+		"is-compute-1c-1g",
+		"is-extra-memory-3c-24g",
+		"is-extra-memory-5c-40g",
+		"is-extra-memory-7c-56g",
+		"is-extra-memory-10c-80g",
+		"is-extra-memory-12c-96g",
+		"is-extra-memory-14c-112g",
+		"is-extra-memory-16c-128g",
+	}
+	for _, name := range unsupported {
+		if len(byName[name]) != 0 {
+			t.Errorf("catalog unexpectedly contains unsupported %s", name)
 		}
 	}
 }
@@ -98,10 +174,13 @@ func TestInSpaceComputePriceFormula(t *testing.T) {
 		monthlyPriceTHB float64
 	}{
 		{name: "1 CPU 2 GiB RAM", cores: 1, memoryGiB: 2, monthlyPriceTHB: 120},
+		{name: "1 CPU 4 GiB RAM", cores: 1, memoryGiB: 4, monthlyPriceTHB: 180},
+		{name: "1 CPU 8 GiB RAM", cores: 1, memoryGiB: 8, monthlyPriceTHB: 300},
 		{name: "2 CPU 4 GiB RAM", cores: 2, memoryGiB: 4, monthlyPriceTHB: 240},
 		{name: "2 CPU 8 GiB RAM", cores: 2, memoryGiB: 8, monthlyPriceTHB: 360},
 		{name: "6 CPU 8 GiB RAM", cores: 6, memoryGiB: 8, monthlyPriceTHB: 600},
 		{name: "10 CPU 26 GiB RAM", cores: 10, memoryGiB: 26, monthlyPriceTHB: 1380},
+		{name: "8 CPU 64 GiB RAM", cores: 8, memoryGiB: 64, monthlyPriceTHB: 2400},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

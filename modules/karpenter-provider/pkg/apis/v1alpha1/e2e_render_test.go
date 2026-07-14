@@ -271,6 +271,8 @@ func TestClusterE2ERendersRKE2WorkerAndCiliumKubeProxyReplacement(t *testing.T) 
 		"version: v1.35.6+rke2r1",
 		"server: {{ e2e_bootstrap_result.privateRegistrationEndpoint }}",
 		"name: inspace-rke2-agent-token",
+		"key: inspace.cloud/instance-cpu",
+		`values: ["1"]`,
 		"key: inspace.cloud/host-class",
 		"values: [amd-epyc]",
 		"sshUsername: {{ e2e_ssh_user }}",
@@ -285,6 +287,17 @@ func TestClusterE2ERendersRKE2WorkerAndCiliumKubeProxyReplacement(t *testing.T) 
 	}
 	if strings.Contains(workerTemplate, "hostPoolSelector") {
 		t.Fatal("Karpenter E2E template must select hardware class in NodePool, not NodeClass")
+	}
+	familyPattern := regexp.MustCompile(`(?m)^\s*- key: inspace\.cloud/instance-family\s*$\n^\s+operator: In\s*$\n^\s+values: \[general\]\s*$`)
+	if matches := familyPattern.FindAllString(workerTemplate, -1); len(matches) != 1 {
+		t.Fatalf("Karpenter E2E template must contain exactly one general-family requirement so no extra-memory shape is selected, got %d", len(matches))
+	}
+	cpuPattern := regexp.MustCompile(`(?m)^\s*- key: inspace\.cloud/instance-cpu\s*$\n^\s+operator: Gt\s*$\n^\s+values: \["1"\]\s*$`)
+	if matches := cpuPattern.FindAllString(workerTemplate, -1); len(matches) != 1 {
+		t.Fatalf("Karpenter E2E general pool must contain exactly one instance-cpu Gt [\"1\"] requirement so no 1-vCPU shape is selected, got %d", len(matches))
+	}
+	if strings.Contains(workerTemplate, "key: inspace.cloud/instance-memory") {
+		t.Fatal("Karpenter E2E template must not constrain instance-memory")
 	}
 	for _, expected := range []string{
 		"--management-cidr",
