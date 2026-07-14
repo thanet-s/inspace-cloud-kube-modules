@@ -1093,7 +1093,7 @@
         set -euo pipefail
         kubectl wait --for=condition=Ready node --all --timeout=10m
         nodes=$(kubectl get nodes -o json)
-        jq -e --arg image "{{ e2e_state.bootstrapCacheRegistry }}/kube-vip/kube-vip:v1.2.1@sha256:44035f68040c9eb99103c65f1f9ab9698d93f9f272110825705338ac1926f3d9" '
+        jq -e '
           .items | length == 3 and
           all(.[]; any(.status.conditions[]; .type == "Ready" and .status == "True"))' <<<"$nodes"
         expected_names=$(jq -c '[.controlPlanes[].name] | sort' "{{ e2e_state_file }}")
@@ -1177,7 +1177,7 @@
         set -euo pipefail
         pods=$(kubectl -n kube-system get pods \
           -l 'app.kubernetes.io/name=kube-vip,app.kubernetes.io/component=control-plane-vip' -o json)
-        jq -e '
+        jq -e --arg image "{{ e2e_state.bootstrapCacheRegistry }}/kube-vip/kube-vip:v1.2.1@sha256:44035f68040c9eb99103c65f1f9ab9698d93f9f272110825705338ac1926f3d9" '
           .items | length == 3 and
           ([.[].spec.nodeName] | unique | length) == 3 and
           all(.[];
@@ -1298,7 +1298,7 @@
               - "{{ e2e_kube_vip_leader.stdout | trim }}"
               - >-
                 sudo mv /var/lib/rancher/rke2/agent/pod-manifests/kube-vip.yaml
-                /var/lib/rancher/rke2/agent/pod-manifests/kube-vip.yaml.e2e-disabled
+                /var/lib/inspace/kube-vip.yaml.e2e-disabled
           changed_when: true
 
         - name: Require VIP ownership to move to exactly one different control plane
@@ -1347,8 +1347,8 @@
               - "{{ e2e_kube_vip_leader.stdout | default('') | trim }}"
               - >-
                 sudo sh -c 'if test -e
-                /var/lib/rancher/rke2/agent/pod-manifests/kube-vip.yaml.e2e-disabled;
-                then mv /var/lib/rancher/rke2/agent/pod-manifests/kube-vip.yaml.e2e-disabled
+                /var/lib/inspace/kube-vip.yaml.e2e-disabled;
+                then mv /var/lib/inspace/kube-vip.yaml.e2e-disabled
                 /var/lib/rancher/rke2/agent/pod-manifests/kube-vip.yaml; fi'
           register: e2e_kube_vip_restore
           retries: 12
