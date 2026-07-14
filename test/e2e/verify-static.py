@@ -1046,6 +1046,24 @@ def main() -> None:
     ):
         require(hostname_proof in bastion_play,
                 f"bastion guest identity proof is missing: {hostname_proof}")
+    worker_play = named_yaml_sequence_item(
+        playbook, "Verify the dynamically provisioned RKE2 worker", 0
+    )
+    worker_contract = named_yaml_sequence_item(
+        worker_play, "Verify cloud-init Ubuntu and the RKE2 agent", 4
+    )
+    for role, contract in (
+        ("bastion", bastion_play),
+        ("control plane", control_plane_contract),
+        ("worker", worker_contract),
+    ):
+        for hostname_mapping_proof in (
+            'test "$(awk \'$1 == "127.0.1.1" { count++ } END { print count + 0 }\' /etc/hosts)" -eq 1',
+            "grep -Eq '^127\\.0\\.1\\.1[[:space:]]+{{ e2e_node_name }}([[:space:]]|$)' /etc/hosts",
+            'getent hosts "{{ e2e_node_name }}" | grep -Eq \'^127\\.0\\.1\\.1[[:space:]]\'',
+        ):
+            require(hostname_mapping_proof in contract,
+                    f"{role} hostname mapping proof is missing: {hostname_mapping_proof}")
     bastion_cache = named_yaml_sequence_item(
         bastion_play, "Prove the default bastion cache is mounted healthy complete and read-only", 4
     )
@@ -1061,7 +1079,10 @@ def main() -> None:
         "ASN1 OID: prime256v1",
         '-verify_hostname "$cache_host"',
         'cmp -s /etc/inspace-cache/tls/server.crt "$served_certificate"',
-        "/etc/inspace-cache/images.tsv)\" -eq 34",
+        "/etc/inspace-cache/images.tsv)\" -eq 32",
+        '$2 == "rancher/kube-webhook-certgen:v1.14.5-hardened2" { count++ } END { print count + 0 }\' /etc/inspace-cache/images.tsv)" -eq 0',
+        '$2 == "rancher/nginx-ingress-controller:v1.14.5-hardened2" { count++ } END { print count + 0 }\' /etc/inspace-cache/images.tsv)" -eq 0',
+        'test "$image_count" -eq 32',
         '"${resolve[@]}" "$cache_endpoint/healthz"',
         '"${resolve[@]}" "$cache_endpoint/v2/"',
         '"$cache_endpoint/v2/$repository/manifests/$reference"',
@@ -1088,7 +1109,8 @@ def main() -> None:
         'f"{cluster_resource_name}-bastion-{owner}"',
         'f"{cluster_resource_name}-bastion-ip"',
         'bastion_name, bastion_firewall_name, bastion_fip_name = bastion_resource_names(',
-        'rf"inspace-rke2-bastion/v4 owner={re.escape(owner)} spec=[0-9a-f]{{64}}"',
+        'rf"inspace-rke2-bastion/v5 owner={re.escape(owner)} spec=[0-9a-f]{{64}}"',
+        'rf"inspace-rke2-cp/v5 owner={re.escape(owner)} slot={slot} spec=[0-9a-f]{{64}}"',
         'validate_optional_vm_hostname(bastion, bastion_name, "bastion")',
         '"bastionName": bastion_name',
         '"bastionFloatingIPName": bastion_fip["name"]',

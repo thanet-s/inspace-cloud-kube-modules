@@ -39,7 +39,8 @@ and the fixed three-server RKE2 bootstrap reconciler.
   official `sha256sum-amd64.txt` release asset.
 - Pre-RKE2 Ubuntu preparation disables swap, configures TOT as the primary
   Ubuntu mirror with KKU as the request-failure fallback for both regular and
-  security suites, installs static Google DNS while stopping and masking
+  security suites, binds the generated hostname to `127.0.1.1` with verified
+  local resolution, installs static Google DNS while stopping and masking
   `systemd-resolved`, updates and upgrades packages within a hard ten-minute
   budget, then disables APT periodic updates and masks every
   `apt-daily*` unit plus `unattended-upgrades.service`. It also persists IPv4
@@ -99,12 +100,15 @@ exactly Ubuntu 24.04 with 2-16 vCPUs and 4096-65536 MiB memory.
 
 `spec.bootstrapCache` is required and `directDownload` defaults to `false`.
 Cached mode provisions the bastion with Docker from Docker's official Ubuntu
-APT repository, pre-seeds the audited RKE2 release assets and system images,
-and then exposes them through a private TLS, read-only endpoint. The endpoint
-uses the bastion's API-allocated RFC1918 address—never a manually selected
-cache VIP—and the stable hostname
-`cache.<metadata.name>.inspace.internal` on TCP/8443. Bootstrap writes that
-binding into each node's `/etc/hosts`, so it does not depend on public DNS.
+APT repository, pre-seeds the audited RKE2 release assets and an addon-aware
+system-image inventory, and then exposes them through a private TLS, read-only
+endpoint. The full inventory contains 34 images. If `spec.rke2.disable`
+contains `rke2-ingress-nginx`, its webhook-certgen and ingress-controller
+images are omitted, leaving 32 entries. The endpoint uses the bastion's
+API-allocated RFC1918 address—never a manually selected cache VIP—and the
+stable hostname `cache.<metadata.name>.inspace.internal` on TCP/8443.
+Bootstrap writes that binding into each node's `/etc/hosts`, so it does not
+depend on public DNS.
 
 Cached initialization and reconciliation also require two persistent
 controller values. `INSPACE_BOOTSTRAP_CACHE_KEY` is exactly 64 lowercase
@@ -125,6 +129,9 @@ seeding and has deletion disabled. It is reachable only through the bastion's
 private listener and VPC firewall rules. Do not publish TCP/8443 on the
 bastion floating IP or through an NLB. This is a bounded, pre-seeded system
 cache rather than a general-purpose registry or arbitrary-workload proxy.
+Bootstrap retries both the writable seed-registry start and the final
+read-only registry/NGINX recreation with bounded incremental backoff, allowing
+at most nine Compose attempts for each startup.
 
 `spec.endpoint.virtualIPv4` must be an unused host address inside the actual
 InSpace VPC subnet. Bootstrap rejects network/broadcast/out-of-subnet values
@@ -184,6 +191,11 @@ This makes a same-name VM from another namespace a fail-closed collision, not
 an adoption candidate. An uncertain API response is resolved by listing and
 validating the exact deterministic name and owner/spec record on the next loop,
 not by blindly repeating the POST.
+
+New control-plane and bastion owner/spec records use schema v5 because local
+hostname setup is immutable cloud-init input. Reconciliation does not adopt an
+older fixed VM into v5; use an explicit destroy/recreate lifecycle. Owned
+teardown continues to recognize the supported older fixed-node schemas.
 
 New bootstrap FIPs are `<metadata.name>-bastion-ip` and
 `<metadata.name>-cp0-ip` through `-cp2-ip`. The two firewall display names are

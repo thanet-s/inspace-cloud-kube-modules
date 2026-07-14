@@ -102,6 +102,8 @@ func TestRenderIncludesExactlyOneRegistrationTaint(t *testing.T) {
 		"swapoff -a",
 		"hostnamectl set-hostname --static",
 		`expected_hostname='worker-1'`,
+		`printf '127.0.1.1\t%s\n' "$expected_hostname" >>/etc/hosts`,
+		`getent hosts "$expected_hostname" | grep -Eq '^127\.0\.1\.1[[:space:]]'`,
 		"/etc/hostname",
 		"http://mirror1.totbb.net/ubuntu/",
 		"https://mirror.kku.ac.th/ubuntu/",
@@ -134,8 +136,8 @@ func TestRenderIncludesExactlyOneRegistrationTaint(t *testing.T) {
 	if strings.Contains(strings.ToLower(rendered), "k3s") {
 		t.Fatalf("RKE2 bootstrap retained a K3s artifact:\n%s", rendered)
 	}
-	if SchemaVersion != "stock-ubuntu-rke2-v9" {
-		t.Fatalf("bootstrap schema = %q, want repository/resolver version v9", SchemaVersion)
+	if SchemaVersion != "stock-ubuntu-rke2-v10" {
+		t.Fatalf("bootstrap schema = %q, want hostname/repository/resolver version v10", SchemaVersion)
 	}
 }
 

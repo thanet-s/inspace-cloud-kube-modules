@@ -41,7 +41,7 @@ func TestReconcileBuildsBastionThenExactlyThreeControlPlaneVMs(t *testing.T) {
 	}
 	owner := ownerKey(cluster)
 	resourceNames := currentBootstrapResourceNames(cluster.Metadata.Name, owner)
-	if !strings.HasPrefix(api.vmCreates[0].Description, "inspace-rke2-bastion/v4 owner="+owner+" spec=") {
+	if !strings.HasPrefix(api.vmCreates[0].Description, "inspace-rke2-bastion/v5 owner="+owner+" spec=") {
 		t.Fatalf("bastion ownership description = %q", api.vmCreates[0].Description)
 	}
 	assertBastionCloudInit(t, api.vmCreates[0].CloudInit, wantBastionName)
@@ -1765,6 +1765,25 @@ func TestDestroyConvergesForRC4BastionWithCurrentControlPlanes(t *testing.T) {
 	}
 }
 
+func TestDestroyConvergesForV4OwnershipRecords(t *testing.T) {
+	api := newFakeAPI()
+	cluster := testCluster()
+	reconciler := testReconciler(api)
+	reconcileUntilReady(t, reconciler, cluster)
+
+	bastion := mustVM(t, api.vms, currentBastionName(cluster.Metadata.Name))
+	bastion.Description = strings.Replace(bastion.Description, "inspace-rke2-bastion/v5 ", "inspace-rke2-bastion/v4 ", 1)
+	for slot := 0; slot < ControlPlaneReplicas; slot++ {
+		controlPlane := mustVM(t, api.vms, controlPlaneName(cluster.Metadata.Name, slot))
+		controlPlane.Description = strings.Replace(controlPlane.Description, "inspace-rke2-cp/v5 ", "inspace-rke2-cp/v4 ", 1)
+	}
+
+	result := destroyUntilDone(t, reconciler, cluster)
+	if !result.Done || len(api.vms) != 0 || len(api.floatingIPs) != 0 || len(api.firewalls) != 0 {
+		t.Fatalf("v4 ownership topology did not converge: result=%#v VMs=%#v FIPs=%#v firewalls=%#v", result, api.vms, api.floatingIPs, api.firewalls)
+	}
+}
+
 func TestDestroyRejectsIncoherentOwnershipSchemaTopology(t *testing.T) {
 	tests := map[string]func(*testing.T, *fakeAPI, *v1alpha1.InSpaceCluster){
 		"v3 bastion with v2 control planes": func(t *testing.T, api *fakeAPI, cluster *v1alpha1.InSpaceCluster) {
@@ -2718,6 +2737,7 @@ func assertControlPlaneCloudInit(t *testing.T, raw, expectedNodeName string, ini
 		t.Fatalf("invalid shell: %v: %s", err, output)
 	}
 	for _, required := range []string{
+		`node_name='` + expectedNodeName + `'`, `printf '127.0.1.1\t%s\n' "$node_name" >>/etc/hosts`, `getent hosts "$node_name" | grep -Eq '^127\.0\.1\.1[[:space:]]'`,
 		`ip -o -4 addr show to "$vpc_subnet" scope global`, "PRIVATE_IF=", "PRIVATE_IP=", "systemctl list-unit-files --type=service", "systemctl disable --now ufw.service", "disabled|masked", "ufw status",
 		"systemctl enable rke2-server.service", "systemctl start --no-block rke2-server.service", `"$attempt" -ge 180`,
 		"--max-time 300 --retry 3 --retry-all-errors", "/var/lib/rancher/rke2/agent/pod-manifests/kube-vip.yaml",
@@ -2938,6 +2958,7 @@ func assertBastionCloudInit(t *testing.T, raw, expectedHostname string) {
 		t.Fatalf("invalid bastion bootstrap shell: %v: %s", err, output)
 	}
 	for _, required := range []string{
+		`node_name='` + expectedHostname + `'`, `printf '127.0.1.1\t%s\n' "$node_name" >>/etc/hosts`, `getent hosts "$node_name" | grep -Eq '^127\.0\.1\.1[[:space:]]'`,
 		"/etc/apt/mirrors/inspace-ubuntu.list", "http://mirror1.totbb.net/ubuntu/", "https://mirror.kku.ac.th/ubuntu/",
 		"systemctl disable --now systemd-resolved.service", "nameserver 8.8.8.8", "nameserver 8.8.4.4",
 		"apt-get -o Acquire::Retries=3", "NEEDRESTART_MODE=a DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=30 upgrade -y",

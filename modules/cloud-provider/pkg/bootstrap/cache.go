@@ -314,14 +314,26 @@ func source(repository, _ string, digest string) string {
 	return "docker://docker.io/" + repository + "@sha256:" + digest
 }
 
-func renderCacheImageManifest(rke2Version, moduleVersion string) (string, error) {
+func renderCacheImageManifest(rke2Version, moduleVersion string, disabled []string) (string, error) {
 	if rke2Version != bootstrapCacheRKE2Version {
 		return "", fmt.Errorf("bootstrap cache has no audited image inventory for RKE2 %s; use %s or set spec.bootstrapCache.directDownload=true", rke2Version, bootstrapCacheRKE2Version)
 	}
 	if !moduleVersionPattern.MatchString(moduleVersion) {
 		return "", fmt.Errorf("bootstrap cache requires an exact released module version, got %q", moduleVersion)
 	}
-	images := append([]cachedImage(nil), rke2CacheImages...)
+	disabledSet := make(map[string]struct{}, len(disabled))
+	for _, component := range disabled {
+		disabledSet[component] = struct{}{}
+	}
+	images := make([]cachedImage, 0, len(rke2CacheImages)+len(fixedCacheImages)+3)
+	for _, image := range rke2CacheImages {
+		if _, ingressDisabled := disabledSet["rke2-ingress-nginx"]; ingressDisabled &&
+			(image.Target == "rancher/kube-webhook-certgen:v1.14.5-hardened2" ||
+				image.Target == "rancher/nginx-ingress-controller:v1.14.5-hardened2") {
+			continue
+		}
+		images = append(images, image)
+	}
 	images = append(images, fixedCacheImages...)
 	for _, component := range []string{"inspace-cloud-controller-manager", "inspace-csi-driver", "karpenter-provider-inspace"} {
 		images = append(images, cachedImage{

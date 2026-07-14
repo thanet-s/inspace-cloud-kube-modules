@@ -50,6 +50,9 @@ the exact-VPC private-IP, verified-UFW, and bounded-agent-start contract, so
 existing
 K3s-backed NodeClaims are treated as drifted and replaced through Karpenter's
 normal disruption controls after their NodeClasses are migrated.
+The current immutable bootstrap schema is `stock-ubuntu-rke2-v10`; its local
+hostname-resolution change makes workers rendered with older bootstrap schemas
+eligible for normal Karpenter drift replacement.
 
 `spec.bootstrapCache` makes the worker download path explicit. A cached
 NodeClass sets `directDownload: false`, the bastion's canonical RFC1918
@@ -239,6 +242,8 @@ Worker network policy relies on the validated InSpace cloud firewall. Generated 
 
 - sets `/etc/hostname`, the active guest hostname, and RKE2 `node-name` to the
   same validated worker name;
+- replaces any stale `127.0.1.1` host entry with that exact worker name and
+  verifies it through `getent` before package or resolver setup;
 - disables active swap and idempotently comments persistent swap entries in `/etc/fstab`;
 - configures TOT as the primary Ubuntu mirror and KKU as its request-failure fallback for both regular and security suites;
 - replaces DHCP-provided DNS with static Google resolvers and stops and masks `systemd-resolved`;

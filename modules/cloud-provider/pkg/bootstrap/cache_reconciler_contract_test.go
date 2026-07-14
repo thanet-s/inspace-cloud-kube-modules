@@ -67,8 +67,8 @@ func TestCachedReconcilePublishesBastionAddressAndVPCOnlyRegistry(t *testing.T) 
 	bastionRequest := mustVMRequest(t, api.vmCreates, currentBastionName(cluster.Metadata.Name))
 	bastionFiles := cacheContractDecodeCloudInit(t, bastionRequest.CloudInit)
 	imageManifest := bastionFiles["/etc/inspace-cache/images.tsv"].Content
-	if got := len(strings.Split(strings.TrimSuffix(imageManifest, "\n"), "\n")); got != 34 {
-		t.Fatalf("reconciled bastion image manifest entries=%d, want 34", got)
+	if got := len(strings.Split(strings.TrimSuffix(imageManifest, "\n"), "\n")); got != 32 {
+		t.Fatalf("reconciled bastion image manifest entries=%d, want 32 with disabled ingress", got)
 	}
 	if !strings.Contains(imageManifest, ":"+reconciler.ModuleVersion+"\tthanet-s/inspace-cloud-controller-manager:"+reconciler.ModuleVersion) {
 		t.Fatalf("reconciled bastion did not pin the requested module version:\n%s", imageManifest)

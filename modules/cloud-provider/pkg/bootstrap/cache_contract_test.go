@@ -114,7 +114,7 @@ func TestCacheTLSContractIsStableP256AndBoundToPersistedInputs(t *testing.T) {
 
 func TestCacheImageManifestContainsExactlyAuditedThirtyFourImages(t *testing.T) {
 	const moduleVersion = "0.3.1-rc.2"
-	manifest, err := renderCacheImageManifest(bootstrapCacheRKE2Version, moduleVersion)
+	manifest, err := renderCacheImageManifest(bootstrapCacheRKE2Version, moduleVersion, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -153,6 +153,22 @@ func TestCacheImageManifestContainsExactlyAuditedThirtyFourImages(t *testing.T) 
 	}
 	if moduleTargets != 3 {
 		t.Fatalf("module image count=%d, want 3", moduleTargets)
+	}
+}
+
+func TestCacheImageManifestExcludesDisabledRKE2Ingress(t *testing.T) {
+	manifest, err := renderCacheImageManifest(bootstrapCacheRKE2Version, "0.4.1-rc.2", []string{"rke2-ingress-nginx"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSuffix(manifest, "\n"), "\n")
+	if len(lines) != 32 {
+		t.Fatalf("disabled-ingress cache manifest entries=%d, want 32", len(lines))
+	}
+	for _, forbidden := range []string{"rancher/kube-webhook-certgen:", "rancher/nginx-ingress-controller:"} {
+		if strings.Contains(manifest, forbidden) {
+			t.Fatalf("disabled ingress cache manifest retains %q", forbidden)
+		}
 	}
 }
 
@@ -238,6 +254,9 @@ func TestCacheBastionCloudInitIsPrivateBoundedAndReadOnly(t *testing.T) {
 		t.Fatalf("NGINX is not GET/HEAD-only and private-address-bound:\n%s", nginx)
 	}
 	for _, required := range []string{
+		`node_name='unit-bastion'`,
+		`printf '127.0.1.1\t%s\n' "$node_name" >>/etc/hosts`,
+		`getent hosts "$node_name" | grep -Eq '^127\.0\.1\.1[[:space:]]'`,
 		`ip -o -4 addr show to "$vpc_subnet" scope global`,
 		`sed -i "s/__PRIVATE_IP__/$private_ip/g" /etc/inspace-cache/nginx.conf`,
 		`printf '%s %s\n' "$private_ip" "$cache_hostname" >>/etc/hosts`,
@@ -268,8 +287,9 @@ func TestCacheBastionCloudInitIsPrivateBoundedAndReadOnly(t *testing.T) {
 		!strings.Contains(registry, "readonly:\n      enabled: true") {
 		t.Fatalf("Docker/registry content is not bounded inside the cache image or read-only:\ndaemon=%s\ncompose=%s\nregistry=%s", dockerDaemon, compose, registry)
 	}
-	if !strings.Contains(startScript, "REGISTRY_READONLY=false docker compose up -d --wait registry") ||
-		!strings.Contains(startScript, "REGISTRY_READONLY=true docker compose up -d --force-recreate --wait registry nginx") {
+	if !strings.Contains(startScript, "compose_up false registry") ||
+		!strings.Contains(startScript, "compose_up true --force-recreate registry nginx") ||
+		!strings.Contains(startScript, `test "$attempt" -lt 9`) {
 		t.Fatalf("registry seed/read-only transition is absent:\n%s", startScript)
 	}
 	if BootstrapCacheMinFree != 1_000_000_000 ||
@@ -345,14 +365,14 @@ func TestControlPlaneCloudInitUsesPrivateCacheOrDirectUpstreamExclusively(t *tes
 	cacheContractAssertShell(t, directScript)
 }
 
-func TestDirectControlPlaneCloudInitV4OwnershipBytes(t *testing.T) {
+func TestDirectControlPlaneCloudInitV5OwnershipBytes(t *testing.T) {
 	raw, err := RenderCloudInitJSON(cacheContractControlPlaneInput())
 	if err != nil {
 		t.Fatal(err)
 	}
-	const v4DirectHash = "41ff22fce10f98196c8aabec5f2b634b89dfbc24c65e28913b0cafc2b7b8db40"
-	if got := fmt.Sprintf("%x", sha256.Sum256([]byte(raw))); got != v4DirectHash {
-		t.Fatalf("direct control-plane cloud-init hash=%s, want frozen v4 hash %s", got, v4DirectHash)
+	const v5DirectHash = "3ec4790bfd7ff348dd2b4d5f19ac6b24a51e272b7f4e4faaba3606981b3ca3ee"
+	if got := fmt.Sprintf("%x", sha256.Sum256([]byte(raw))); got != v5DirectHash {
+		t.Fatalf("direct control-plane cloud-init hash=%s, want frozen v5 hash %s", got, v5DirectHash)
 	}
 }
 

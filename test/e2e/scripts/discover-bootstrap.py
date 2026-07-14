@@ -290,7 +290,7 @@ def main() -> None:
         or bastion.get("designated_pool_uuid") != os.environ["INSPACE_AMD_HOST_POOL_UUID"]
         or bastion.get("billing_account") != int(os.environ["INSPACE_BILLING_ACCOUNT_ID"])
         or re.fullmatch(
-            rf"inspace-rke2-bastion/v4 owner={re.escape(owner)} spec=[0-9a-f]{{64}}",
+            rf"inspace-rke2-bastion/v5 owner={re.escape(owner)} spec=[0-9a-f]{{64}}",
             str(bastion.get("description", "")),
         ) is None
         or len(root_disks) != 1
@@ -332,7 +332,7 @@ def main() -> None:
             or vm.get("designated_pool_uuid") != os.environ["INSPACE_AMD_HOST_POOL_UUID"]
             or vm.get("billing_account") != int(os.environ["INSPACE_BILLING_ACCOUNT_ID"])
             or re.fullmatch(
-                rf"inspace-rke2-cp/v4 owner={re.escape(owner)} slot={slot} spec=[0-9a-f]{{64}}",
+                rf"inspace-rke2-cp/v5 owner={re.escape(owner)} slot={slot} spec=[0-9a-f]{{64}}",
                 str(vm.get("description", "")),
             ) is None
             or len(root_disks) != 1
