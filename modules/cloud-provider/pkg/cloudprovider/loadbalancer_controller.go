@@ -402,11 +402,12 @@ func (c *loadBalancerTargetController) onNodeDelete(object any) {
 }
 
 type nodeTargetState struct {
-	providerID string
-	ready      corev1.ConditionStatus
-	deleting   bool
-	excluded   bool
-	disrupted  bool
+	providerID   string
+	ready        corev1.ConditionStatus
+	deleting     bool
+	excluded     bool
+	controlPlane bool
+	disrupted    bool
 }
 
 func nodeTargetStateEqual(left, right *corev1.Node) bool {
@@ -418,9 +419,10 @@ func targetStateForNode(node *corev1.Node) nodeTargetState {
 		return nodeTargetState{}
 	}
 	state := nodeTargetState{
-		providerID: node.Spec.ProviderID,
-		deleting:   !node.DeletionTimestamp.IsZero(),
-		excluded:   nodeExcludedFromLoadBalancers(node),
+		providerID:   node.Spec.ProviderID,
+		deleting:     !node.DeletionTimestamp.IsZero(),
+		excluded:     nodeExcludedFromLoadBalancers(node),
+		controlPlane: nodeHasControlPlaneRole(node),
 	}
 	for _, taint := range node.Spec.Taints {
 		if taint.Key == clusterAutoscalerDeletionTaint || taint.Key == karpenterDisruptionTaint {

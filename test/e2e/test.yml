@@ -695,6 +695,85 @@
         executable: /bin/bash
       changed_when: false
 
+    - name: Exercise control-plane exclusion under Cluster traffic policy
+      block:
+        - name: Switch the public Service to Cluster traffic policy
+          ansible.builtin.command:
+            argv:
+              - kubectl
+              - -n
+              - default
+              - patch
+              - service
+              - inspace-e2e-web
+              - --type=merge
+              - --patch
+              - '{"spec":{"externalTrafficPolicy":"Cluster"}}'
+          changed_when: true
+
+        - name: Require Cluster policy and exactly three Ready control-plane nodes
+          ansible.builtin.shell: |
+            set -euo pipefail
+            test "$(kubectl -n default get service inspace-e2e-web -o jsonpath='{.spec.externalTrafficPolicy}')" = Cluster
+            kubectl get nodes -o json | jq -e '
+              [.items[] | select(
+                .metadata.labels["node-role.kubernetes.io/control-plane"] != null or
+                .metadata.labels["node-role.kubernetes.io/master"] != null
+              )] as $control_planes |
+              ($control_planes | length) == 3 and
+              all($control_planes[]; any(.status.conditions[]?; .type == "Ready" and .status == "True"))'
+          args:
+            executable: /bin/bash
+          changed_when: false
+
+        - name: Require Cluster public NLB target to remain exactly the eligible Ready worker
+          ansible.builtin.command:
+            argv:
+              - /opt/e2e/scripts/verify-service-cloud.py
+              - --state
+              - "{{ e2e_state_file }}"
+              - --public
+              - present
+              - --targets
+              - ready
+          register: e2e_cluster_public_target
+          changed_when: false
+          retries: 120
+          delay: 1
+          until: e2e_cluster_public_target.rc == 0
+          no_log: true
+      always:
+        - name: Restore the public Service to Local traffic policy
+          ansible.builtin.command:
+            argv:
+              - kubectl
+              - -n
+              - default
+              - patch
+              - service
+              - inspace-e2e-web
+              - --type=merge
+              - --patch
+              - '{"spec":{"externalTrafficPolicy":"Local"}}'
+          changed_when: true
+
+        - name: Require restored Local policy and exact eligible Ready worker target
+          ansible.builtin.shell: |
+            set -euo pipefail
+            test "$(kubectl -n default get service inspace-e2e-web -o jsonpath='{.spec.externalTrafficPolicy}')" = Local
+            /opt/e2e/scripts/verify-service-cloud.py \
+              --state "{{ e2e_state_file }}" \
+              --public present \
+              --targets ready
+          args:
+            executable: /bin/bash
+          register: e2e_local_public_target
+          changed_when: false
+          retries: 120
+          delay: 1
+          until: e2e_local_public_target.rc == 0
+          no_log: true
+
     - name: Exercise public NLB removal for a node excluded from external load balancers
       block:
         - name: Resolve the exact public workload node

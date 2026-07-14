@@ -79,7 +79,12 @@ EndpointSlices and makes the NLB target set exactly the Ready, non-terminating
 local endpoint nodes that are themselves Ready and eligible for load balancing.
 The resulting `healthCheckNodePort` is not probed by InSpace because its NLB API
 has no health-check contract; endpoint and node informer events drive target
-convergence instead. Private Cilium L2 Services must remain `Cluster`.
+convergence instead. For both `Local` and `Cluster`, nodes labeled
+`node-role.kubernetes.io/control-plane` or the legacy
+`node-role.kubernetes.io/master` are excluded from public NLB targets.
+Kubernetes defaults an omitted policy to `Cluster`, so public Services that
+need local-endpoint targeting must set `externalTrafficPolicy: Local`
+explicitly. Private Cilium L2 Services must remain `Cluster`.
 See [`service-private-l2.yaml`](examples/service-private-l2.yaml) and
 [`service-public-nlb.yaml`](examples/service-public-nlb.yaml).
 
@@ -108,16 +113,6 @@ namespaces, so the same existing cloud API Secret contract must then also be
 provisioned in that namespace. The chart never copies secret data.
 
 ## Install
-
-> [!IMPORTANT]
-> Before upgrading an existing selector-based installation, update every
-> NodePool—while the old CRD/controller are still installed—with an explicit
-> `inspace.cloud/host-class` requirement (`intel-scalable`, `amd-epyc`, or both)
-> and verify that Kubernetes stored it. Only then upgrade the CRD followed by
-> this chart. The new CRD removes and prunes
-> `InSpaceNodeClass.spec.hostPoolSelector`; without the NodePool requirement, a
-> formerly AMD-only pool exposes both equal-priced offerings and no longer
-> guarantees AMD. Fresh installations can skip this migration.
 
 ```sh
 export VERSION=0.1.0

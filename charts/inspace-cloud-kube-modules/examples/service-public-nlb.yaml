@@ -10,7 +10,8 @@ metadata:
 spec:
   type: LoadBalancer
   # The InSpace CCM watches EndpointSlices and targets only nodes with a local,
-  # Ready, non-terminating endpoint for this Service.
+  # Ready, non-terminating endpoint for this Service. Kubernetes otherwise
+  # defaults this field to Cluster; CCM does not mutate Service specs.
   externalTrafficPolicy: Local
   # Deliberately omit loadBalancerClass: the generic external CCM handles only
   # classless Services. InSpace public NLB forwarding is TCP-only.

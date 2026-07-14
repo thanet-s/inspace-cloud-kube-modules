@@ -145,9 +145,9 @@ require_toleration "$standalone_karpenter"
 grep -F '            - name: INSPACE_NETWORK_UUID' "$standalone_karpenter" >/dev/null
 grep -F '            - name: INSPACE_CONTROL_PLANE_VIP' "$standalone_karpenter" >/dev/null
 
-for upgrade_document in "$root_readme" "$chart_readme" "$chart_notes"; do
-  grep -F 'inspace.cloud/host-class' "$upgrade_document" >/dev/null
-  grep -F 'spec.hostPoolSelector' "$upgrade_document" >/dev/null
-  grep -F 'equal-priced' "$upgrade_document" >/dev/null
-  grep -F 'guarantees AMD' "$upgrade_document" >/dev/null
+for user_document in "$root_readme" "$chart_readme" "$chart_notes" "$workspace/modules/karpenter-provider/README.md"; do
+  if grep -F 'hostPoolSelector' "$user_document" >/dev/null; then
+    echo "removed hostPoolSelector is still documented in $user_document" >&2
+    exit 1
+  fi
 done

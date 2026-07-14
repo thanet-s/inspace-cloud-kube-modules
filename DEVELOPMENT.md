@@ -114,7 +114,11 @@ Public NLB Services use `externalTrafficPolicy: Local`; CCM watches
 EndpointSlices and keeps targets limited to eligible Ready nodes with a Ready,
 non-terminating local endpoint. InSpace does not probe the allocated
 `healthCheckNodePort`, so node and endpoint events—not an NLB health check—drive
-target convergence.
+target convergence. Shared public-target eligibility excludes both
+`node-role.kubernetes.io/control-plane` and legacy
+`node-role.kubernetes.io/master` labels, including for `Cluster`. Kubernetes
+defaults an omitted policy to `Cluster`; the CCM deliberately does not mutate
+Service specs, so `Local` must be explicit.
 
 Operators must reserve an inclusive 16-256-address RFC1918 range for Cilium LB
 IPAM and exclude it from InSpace VM and NLB allocation. The InSpace API has no

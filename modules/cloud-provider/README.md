@@ -269,8 +269,13 @@ condition changes also trigger target reconciliation. InSpace does not probe
 the Kubernetes `healthCheckNodePort`, so this is control-plane-driven health
 filtering rather than an independent NLB data-plane health check. Public
 Services may still use `Cluster`; unhealthy, deleting, excluded, or disrupting
-nodes are filtered there as well. Private Cilium L2 Services must remain
-`externalTrafficPolicy: Cluster`.
+nodes are filtered there as well. Nodes carrying either
+`node-role.kubernetes.io/control-plane` or the legacy
+`node-role.kubernetes.io/master` label are never public NLB targets in either
+mode; adding or removing either role reconciles targets immediately. Kubernetes
+defaults an omitted `externalTrafficPolicy` to `Cluster` before CCM observes the
+Service, so set `Local` explicitly when local-endpoint targeting is required.
+Private Cilium L2 Services must remain `externalTrafficPolicy: Cluster`.
 
 If either public marker is removed, CCM deletes every deterministically owned
 FIP/NLB before handing the Service to another implementation. Discovery and

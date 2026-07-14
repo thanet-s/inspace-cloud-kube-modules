@@ -102,17 +102,23 @@ One separate class-unset Service opts into the explicit paid, TCP-only InSpace
 NLB using the public scope label and annotation with
 `externalTrafficPolicy: Local`. Its target set must be exactly the Ready worker
 that hosts the Ready local endpoint—never the three control-plane nodes. The
-suite proves Node-event reconciliation by applying the standard external-LB
-exclusion label and observing an empty target set, then removes every serving
-replica and again requires zero targets before restoring the replica and exact
-worker target. It also proves the two private Services own zero InSpace
-NLBs/FIPs, while the public Service owns exactly one of each. It then removes
-only the public scope label (leaving the annotation and Service type intact),
-waits for that NLB/FIP to be deleted and its status cleared, and restores only
-the label to prove label-driven recreation. This directly exercises CCM's
-provider-intent trigger for changes the generic Service controller otherwise
-does not observe. UDP is not tested on the public path because the InSpace NLB
-supports TCP only.
+suite temporarily switches that Service to `externalTrafficPolicy: Cluster`,
+requires exactly three Ready role-labeled control-plane nodes, and proves the
+NLB still targets only the eligible Ready worker before restoring `Local` in an
+unconditional cleanup block. Kubernetes defaults an omitted
+`externalTrafficPolicy` to `Cluster`; the CCM preserves that API default and
+does not mutate the Service spec, so users must request `Local` explicitly.
+The suite also proves Node-event reconciliation by applying the standard
+external-LB exclusion label and observing an empty target set, then removes
+every serving replica and again requires zero targets before restoring the
+replica and exact worker target. It proves the two private Services own zero
+InSpace NLBs/FIPs, while the public Service owns exactly one of each. It then
+removes only the public scope label (leaving the annotation and Service type
+intact), waits for that NLB/FIP to be deleted and its status cleared, and
+restores only the label to prove label-driven recreation. This directly
+exercises CCM's provider-intent trigger for changes the generic Service
+controller otherwise does not observe. UDP is not tested on the public path
+because the InSpace NLB supports TCP only.
 
 ## Safety and cleanup
 
