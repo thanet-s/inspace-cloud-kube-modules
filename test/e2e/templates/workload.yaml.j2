@@ -26,13 +26,13 @@ spec:
         karpenter.sh/nodepool: {{ e2e_nodepool_name }}
       initContainers:
         - name: initialize
-          image: public.ecr.aws/docker/library/busybox:1.36.1@sha256:b7f3d86d6e84fc17718c48bcde1450807faa2d56704205c697b4bd5df7b9e29f
+          image: docker.io/library/busybox:1.36.1@sha256:b7f3d86d6e84fc17718c48bcde1450807faa2d56704205c697b4bd5df7b9e29f
           command: [sh, -ec]
           args: ['test -f /data/index.html || printf "%s\\n" "{{ e2e_marker }}" > /data/index.html']
           volumeMounts: [{name: data, mountPath: /data}]
       containers:
         - name: nginx
-          image: public.ecr.aws/docker/library/nginx:1.27.5-alpine@sha256:62223d644fa234c3a1cc785ee14242ec47a77364226f1c811d2f669f96dc2ac8
+          image: docker.io/library/nginx:1.27.5-alpine@sha256:62223d644fa234c3a1cc785ee14242ec47a77364226f1c811d2f669f96dc2ac8
           ports: [{name: http, containerPort: 80}]
           volumeMounts: [{name: data, mountPath: /usr/share/nginx/html}]
       volumes:
@@ -76,7 +76,7 @@ spec:
         karpenter.sh/nodepool: {{ e2e_nodepool_name }}
       containers:
         - name: nginx
-          image: public.ecr.aws/docker/library/nginx:1.27.5-alpine@sha256:62223d644fa234c3a1cc785ee14242ec47a77364226f1c811d2f669f96dc2ac8
+          image: docker.io/library/nginx:1.27.5-alpine@sha256:62223d644fa234c3a1cc785ee14242ec47a77364226f1c811d2f669f96dc2ac8
           command: [sh, -ec]
           args:
             - 'printf "%s\\n" "{{ e2e_marker }}-private-a" > /usr/share/nginx/html/index.html; exec nginx -g "daemon off;"'
@@ -117,7 +117,7 @@ spec:
         karpenter.sh/nodepool: {{ e2e_nodepool_name }}
       containers:
         - name: nginx
-          image: public.ecr.aws/docker/library/nginx:1.27.5-alpine@sha256:62223d644fa234c3a1cc785ee14242ec47a77364226f1c811d2f669f96dc2ac8
+          image: docker.io/library/nginx:1.27.5-alpine@sha256:62223d644fa234c3a1cc785ee14242ec47a77364226f1c811d2f669f96dc2ac8
           command: [sh, -ec]
           args:
             - 'printf "%s\\n" "{{ e2e_marker }}-private-b" > /usr/share/nginx/html/index.html; exec nginx -g "daemon off;"'

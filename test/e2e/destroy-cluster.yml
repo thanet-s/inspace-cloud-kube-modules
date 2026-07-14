@@ -152,6 +152,23 @@
         e2e_cleanup_state: "{{ lookup('file', e2e_state_file) | from_json }}"
       when: e2e_cleanup_state.kubernetesOwnersPossible | default(false) | bool
 
+    - name: Delete transient registry-egress gate pods before worker teardown
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - --kubeconfig
+          - "{{ e2e_kubeconfig }}"
+          - -n
+          - default
+          - delete
+          - pod
+          - -l
+          - inspace.cloud/e2e-egress-gate=true
+          - --ignore-not-found
+          - --wait=false
+      changed_when: true
+      when: e2e_cleanup_state.kubernetesOwnersPossible | default(false) | bool
+
     - name: Delete workload owners before infrastructure owners
       ansible.builtin.command:
         argv:
@@ -180,6 +197,9 @@
         pods=$(kubectl --kubeconfig "{{ e2e_kubeconfig }}" -n default get pods \
           -l 'app in (inspace-e2e-web,inspace-e2e-trigger,inspace-e2e-private-a,inspace-e2e-private-b)' -o json)
         test "$(jq '.items | length' <<<"$pods")" -eq 0
+        egress_pods=$(kubectl --kubeconfig "{{ e2e_kubeconfig }}" -n default get pods \
+          -l 'inspace.cloud/e2e-egress-gate=true' -o json)
+        test "$(jq '.items | length' <<<"$egress_pods")" -eq 0
         pv={{ e2e_cleanup_state.pvName | default('') | quote }}
         pvc_uid={{ e2e_cleanup_state.pvcUID | default('') | quote }}
         if test -n "$pvc_uid"; then

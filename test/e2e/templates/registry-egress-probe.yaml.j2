@@ -1,0 +1,38 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: inspace-e2e-egress-probe-attempt
+  namespace: default
+  labels:
+    app: inspace-e2e-egress-probe
+    inspace.cloud/e2e-egress-gate: "true"
+  annotations:
+    karpenter.sh/do-not-disrupt: "true"
+spec:
+  restartPolicy: Never
+  terminationGracePeriodSeconds: 0
+  nodeSelector:
+    karpenter.sh/nodepool: {{ e2e_nodepool_name }}
+  initContainers:
+    - name: docker-hub
+      image: docker.io/library/busybox:1.36.1@sha256:b7f3d86d6e84fc17718c48bcde1450807faa2d56704205c697b4bd5df7b9e29f
+      imagePullPolicy: Always
+      command: [sh, -ec]
+      args: ['true']
+      resources:
+        requests: {cpu: 10m, memory: 16Mi}
+    - name: ghcr
+      image: ghcr.io/containerd/busybox:latest@sha256:febcf61cd6e1ac9628f6ac14fa40836d16f3c6ddef3b303ff0321606e55ddd0b
+      imagePullPolicy: Always
+      command: [sh, -ec]
+      args: ['true']
+      resources:
+        requests: {cpu: 10m, memory: 16Mi}
+  containers:
+    - name: hold
+      image: docker.io/library/busybox:1.36.1@sha256:b7f3d86d6e84fc17718c48bcde1450807faa2d56704205c697b4bd5df7b9e29f
+      imagePullPolicy: IfNotPresent
+      command: [sh, -ec]
+      args: ['sleep 86400']
+      resources:
+        requests: {cpu: 10m, memory: 16Mi}
