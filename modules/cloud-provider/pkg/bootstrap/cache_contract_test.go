@@ -257,6 +257,9 @@ func TestCacheBastionCloudInitIsPrivateBoundedAndReadOnly(t *testing.T) {
 		`node_name='unit-bastion'`,
 		`printf '127.0.1.1\t%s\n' "$node_name" >>/etc/hosts`,
 		`getent hosts "$node_name" | grep -Eq '^127\.0\.1\.1[[:space:]]'`,
+		`hostname_attempt=$((hostname_attempt + 1))`,
+		`[ "$hostname_attempt" -ge 30 ]`,
+		`generated hostname did not resolve to 127.0.1.1`,
 		`ip -o -4 addr show to "$vpc_subnet" scope global`,
 		`sed -i "s/__PRIVATE_IP__/$private_ip/g" /etc/inspace-cache/nginx.conf`,
 		`printf '%s %s\n' "$private_ip" "$cache_hostname" >>/etc/hosts`,
@@ -365,14 +368,14 @@ func TestControlPlaneCloudInitUsesPrivateCacheOrDirectUpstreamExclusively(t *tes
 	cacheContractAssertShell(t, directScript)
 }
 
-func TestDirectControlPlaneCloudInitV5OwnershipBytes(t *testing.T) {
+func TestDirectControlPlaneCloudInitV6OwnershipBytes(t *testing.T) {
 	raw, err := RenderCloudInitJSON(cacheContractControlPlaneInput())
 	if err != nil {
 		t.Fatal(err)
 	}
-	const v5DirectHash = "3ec4790bfd7ff348dd2b4d5f19ac6b24a51e272b7f4e4faaba3606981b3ca3ee"
-	if got := fmt.Sprintf("%x", sha256.Sum256([]byte(raw))); got != v5DirectHash {
-		t.Fatalf("direct control-plane cloud-init hash=%s, want frozen v5 hash %s", got, v5DirectHash)
+	const v6DirectHash = "0741235bd77018e4f11ffb6930b1f3e966fdf4f45af276ff96288e40b4873111"
+	if got := fmt.Sprintf("%x", sha256.Sum256([]byte(raw))); got != v6DirectHash {
+		t.Fatalf("direct control-plane cloud-init hash=%s, want frozen v6 hash %s", got, v6DirectHash)
 	}
 }
 

@@ -93,8 +93,9 @@ Kubernetes Node name are live-proven as
 `<clusterResourceName>-karp-general-<Karpenter random suffix>` while its
 separate `general-<random suffix>` NodeClaim remains the ownership identity.
 The suite requires every control plane, worker, and bastion hostname to resolve
-to `127.0.1.1` through its generated `/etc/hosts` entry. Fixed-node ownership
-must be schema v5, and the Karpenter worker must use bootstrap schema v10.
+to `127.0.1.1` through its generated `/etc/hosts` entry after the bounded
+bootstrap readback. Fixed-node ownership must be schema v6, and the Karpenter
+worker must use bootstrap schema v11.
 Managed InSpace cloud firewalls are the only host firewalls; guest UFW must be
 inactive and disabled or masked on the control planes, worker, and bastion.
 

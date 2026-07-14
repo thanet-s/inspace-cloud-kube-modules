@@ -75,7 +75,15 @@ func renderUbuntuRepositoryAndResolverCommands(nodeName string) string {
 	return `node_name=` + shellSingleQuote(nodeName) + `
 sed -Ei '/^[[:space:]]*127\.0\.1\.1([[:space:]]|$)/d' /etc/hosts
 printf '127.0.1.1\t%s\n' "$node_name" >>/etc/hosts
-getent hosts "$node_name" | grep -Eq '^127\.0\.1\.1[[:space:]]'
+hostname_attempt=0
+until getent hosts "$node_name" | grep -Eq '^127\.0\.1\.1[[:space:]]'; do
+  hostname_attempt=$((hostname_attempt + 1))
+  if [ "$hostname_attempt" -ge 30 ]; then
+    echo "generated hostname did not resolve to 127.0.1.1" >&2
+    exit 1
+  fi
+  sleep 1
+done
 install -d -m 0755 /etc/apt/mirrors /etc/apt/sources.list.d
 install -m 0644 /var/lib/inspace/ubuntu-mirrors.list /etc/apt/mirrors/inspace-ubuntu.list
 install -m 0644 /var/lib/inspace/ubuntu.sources /etc/apt/sources.list.d/ubuntu.sources

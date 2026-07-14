@@ -53,8 +53,8 @@ Each component is an independently buildable Go module linked locally by
   calendar years. The audited image seed follows the cluster's disabled RKE2
   addons instead of caching images used only by disabled components.
 - Before package or Kubernetes setup, bootstrap binds each generated guest
-  hostname to `127.0.1.1` and verifies local resolution independently of DHCP
-  and external DNS.
+  hostname to `127.0.1.1` and verifies local resolution with bounded readback
+  retry, independently of DHCP and external DNS.
 - Private `LoadBalancer` Services use Cilium LB IPAM and L2 Announcements.
 - Public `LoadBalancer` Services use an explicit, optional, TCP-only InSpace NLB.
 - InSpace firewalls enforce node policy; guest UFW is disabled.
