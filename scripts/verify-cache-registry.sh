@@ -19,7 +19,7 @@ config_base64=$(printf '%s\n' "$config" | base64 | tr -d '\n')
 container=
 cleanup() {
   if [ -n "$container" ]; then
-    docker rm --force "$container" >/dev/null 2>&1 || true
+    docker rm --force --volumes "$container" >/dev/null 2>&1 || true
   fi
 }
 trap cleanup EXIT INT TERM
@@ -61,7 +61,7 @@ verify_mode() {
     exit 1
   fi
 
-  docker rm --force "$container" >/dev/null
+  docker rm --force --volumes "$container" >/dev/null
   container=
   printf 'cache registry mode=%s upload-status=%s\n' "$mode" "$status"
 }
