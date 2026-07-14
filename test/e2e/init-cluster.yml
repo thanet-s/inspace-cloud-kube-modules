@@ -1006,7 +1006,7 @@
         test -f /var/lib/inspace/kubernetes-node-prepared-v1
         test -z "$(swapon --noheadings)"
         if awk '$0 !~ /^[[:space:]]*#/ && NF >= 3 && $3 == "swap" { found=1 } END { exit found ? 0 : 1 }' /etc/fstab; then exit 1; fi
-        test ! -e /etc/apt/sources.list
+        test ! -s /etc/apt/sources.list
         grep -Fqx $'http://mirror1.totbb.net/ubuntu/\tpriority:1' /etc/apt/mirrors/inspace-ubuntu.list
         grep -Fqx $'https://mirror.kku.ac.th/ubuntu/\tpriority:2' /etc/apt/mirrors/inspace-ubuntu.list
         test "$(grep -Fc 'URIs: mirror+file:/etc/apt/mirrors/inspace-ubuntu.list' /etc/apt/sources.list.d/ubuntu.sources)" -eq 2
@@ -1878,7 +1878,7 @@
         test -f /var/lib/inspace/kubernetes-node-prepared-v1
         test -z "$(swapon --noheadings)"
         if awk '$0 !~ /^[[:space:]]*#/ && NF >= 3 && $3 == "swap" { found=1 } END { exit found ? 0 : 1 }' /etc/fstab; then exit 1; fi
-        test ! -e /etc/apt/sources.list
+        test ! -s /etc/apt/sources.list
         grep -Fqx $'http://mirror1.totbb.net/ubuntu/\tpriority:1' /etc/apt/mirrors/inspace-ubuntu.list
         grep -Fqx $'https://mirror.kku.ac.th/ubuntu/\tpriority:2' /etc/apt/mirrors/inspace-ubuntu.list
         test "$(grep -Fc 'URIs: mirror+file:/etc/apt/mirrors/inspace-ubuntu.list' /etc/apt/sources.list.d/ubuntu.sources)" -eq 2
