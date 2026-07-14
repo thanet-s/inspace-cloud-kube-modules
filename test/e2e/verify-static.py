@@ -746,10 +746,10 @@ def main() -> None:
     require(f"image: {{{{ e2e_state.bootstrapCacheRegistry }}}}/{cached_pause}" in trigger and
             playbook.count(cached_pause) == 2,
             "the Karpenter capacity trigger must use the audited node-bootstrap pause image")
-    require("image: busybox:1.36.1" in workload and
-            workload.count("image: nginx:1.27.5-alpine") == 3 and
+    require("image: public.ecr.aws/docker/library/busybox:1.36.1@sha256:b7f3d86d6e84fc17718c48bcde1450807faa2d56704205c697b4bd5df7b9e29f" in workload and
+            workload.count("image: public.ecr.aws/docker/library/nginx:1.27.5-alpine@sha256:62223d644fa234c3a1cc785ee14242ec47a77364226f1c811d2f669f96dc2ac8") == 3 and
             "bootstrapCacheRegistry" not in workload,
-            "acceptance workloads must remain on their upstream registries")
+            "acceptance workloads must remain direct and digest-pinned outside the bootstrap cache")
     require(playbook.count('.metadata.labels["inspace.cloud/host-class"] == "amd-epyc"') >= 2 and
             playbook.count('.metadata.labels["inspace.cloud/instance-cpu"] == "2"') >= 2 and
             playbook.count('.metadata.labels["inspace.cloud/instance-memory"] == "4096"') >= 2,
