@@ -37,6 +37,21 @@ def load_script_module(name: str, path: pathlib.Path):
     return module
 
 
+def verify_worker_egress_runtime() -> None:
+    """Exercise overlap and cleanup ordering against a stateful fake kubectl."""
+    smoke_test = ROOT / "scripts/test-ensure-worker-egress.py"
+    result = subprocess.run(
+        [sys.executable, str(smoke_test)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    require(
+        result.returncode == 0,
+        f"worker egress runtime smoke failed:\n{result.stdout}{result.stderr}",
+    )
+
+
 def yaml_mapping_scalar(document: str, *path: str) -> str:
     """Read one scalar at an exact indentation-defined YAML mapping path."""
     stack: list[tuple[int, str]] = []
@@ -291,10 +306,12 @@ def main() -> None:
     tunnel = (ROOT / "scripts/api-tunnel.sh").read_text(encoding="utf-8")
     worker_discovery = (ROOT / "scripts/discover-worker.py").read_text(encoding="utf-8")
     service_cloud = (ROOT / "scripts/verify-service-cloud.py").read_text(encoding="utf-8")
+    worker_egress = (ROOT / "scripts/ensure-worker-egress.sh").read_text(encoding="utf-8")
     nodeclass = (ROOT / "templates/karpenter.yaml.j2").read_text(encoding="utf-8")
     cluster = (ROOT / "templates/cluster.yaml.j2").read_text(encoding="utf-8")
     workload = (ROOT / "templates/workload.yaml.j2").read_text(encoding="utf-8")
     trigger = (ROOT / "templates/trigger.yaml.j2").read_text(encoding="utf-8")
+    registry_probe = (ROOT / "templates/registry-egress-probe.yaml.j2").read_text(encoding="utf-8")
     ansible_cfg = (ROOT / "ansible.cfg").read_text(encoding="utf-8")
 
     executable_host = "\n".join(
@@ -303,6 +320,7 @@ def main() -> None:
     )
     verify_host_launcher_external_allow_list()
     verify_retention_state_parser(entrypoint)
+    verify_worker_egress_runtime()
     require("docker build" in executable_host and "docker run" in executable_host, "host launcher must build and run Docker")
     require("runner_platform=${INSPACE_E2E_RUNNER_PLATFORM:-linux/amd64}" in executable_host,
             "E2E runner must default explicitly to linux/amd64")
@@ -746,10 +764,48 @@ def main() -> None:
     require(f"image: {{{{ e2e_state.bootstrapCacheRegistry }}}}/{cached_pause}" in trigger and
             playbook.count(cached_pause) == 2,
             "the Karpenter capacity trigger must use the audited node-bootstrap pause image")
-    require("image: public.ecr.aws/docker/library/busybox:1.36.1@sha256:b7f3d86d6e84fc17718c48bcde1450807faa2d56704205c697b4bd5df7b9e29f" in workload and
-            workload.count("image: public.ecr.aws/docker/library/nginx:1.27.5-alpine@sha256:62223d644fa234c3a1cc785ee14242ec47a77364226f1c811d2f669f96dc2ac8") == 3 and
+    docker_busybox = "docker.io/library/busybox:1.36.1@sha256:b7f3d86d6e84fc17718c48bcde1450807faa2d56704205c697b4bd5df7b9e29f"
+    docker_nginx = "docker.io/library/nginx:1.27.5-alpine@sha256:62223d644fa234c3a1cc785ee14242ec47a77364226f1c811d2f669f96dc2ac8"
+    ghcr_busybox = "ghcr.io/containerd/busybox:latest@sha256:febcf61cd6e1ac9628f6ac14fa40836d16f3c6ddef3b303ff0321606e55ddd0b"
+    require(f"image: {docker_busybox}" in workload and
+            workload.count(f"image: {docker_nginx}") == 3 and
+            "public.ecr.aws" not in workload and
             "bootstrapCacheRegistry" not in workload,
-            "acceptance workloads must remain direct and digest-pinned outside the bootstrap cache")
+            "acceptance workloads must use direct digest-pinned Docker Hub images")
+    require(registry_probe.count(f"image: {docker_busybox}") == 2 and
+            registry_probe.count(f"image: {ghcr_busybox}") == 1 and
+            registry_probe.count("imagePullPolicy: Always") == 2 and
+            'inspace.cloud/e2e-egress-gate: "true"' in registry_probe and
+            'karpenter.sh/do-not-disrupt: "true"' in registry_probe and
+            "nginx" not in registry_probe and
+            "bootstrapCacheRegistry" not in registry_probe,
+            "the worker gate must pull tiny immutable Docker Hub and GHCR blobs directly")
+    egress_gate_call = init_playbook.index("- name: Replace only registry-timeout workers while retaining their FIPs")
+    worker_identity_read = init_playbook.index("- name: Read the exact Karpenter worker identity")
+    require(egress_gate_call < worker_identity_read and
+            "/opt/e2e/scripts/ensure-worker-egress.sh" in init_playbook[egress_gate_call:worker_identity_read] and
+            "worker-egress.json" in init_playbook[egress_gate_call:worker_identity_read],
+            "the blue/green egress gate must finish before persisting one final worker identity")
+    winner_check = worker_egress.index('[[ -n "$winner_node" ]]')
+    old_claim_delete = worker_egress.index("delete nodeclaim")
+    restore_limit = worker_egress.index('"cpu\\":\\"$original_cpu')
+    require("readonly max_attempts=3" in worker_egress and
+            "readonly pull_timeout=5m" in worker_egress and
+            '"cpu\\":\\"$surge_cpu' in worker_egress and
+            '"memory\\":\\"$surge_memory' in worker_egress and
+            '[[ "$public_ip" != "${rejected_ips[$index]}" ]]' in worker_egress and
+            worker_egress.count("reprove_rejected") >= 3 and
+            "refusing pointless FIP rotation" in worker_egress and
+            "refusing speculative FIP rotation" in worker_egress and
+            "i/o timeout|tls handshake timeout" in worker_egress and
+            "trap cleanup EXIT" in worker_egress and
+            "trap 'exit 130' INT" in worker_egress and
+            "trap 'exit 143' TERM" in worker_egress and
+            winner_check < old_claim_delete < restore_limit,
+            "worker replacement must be bounded, timeout-only, overlapping, and delete old FIPs only after a winner")
+    require("Delete transient registry-egress gate pods before worker teardown" in cleanup and
+            cleanup.count("inspace.cloud/e2e-egress-gate=true") >= 2,
+            "destroy must remove retained egress probes before deleting the NodePool")
     require(playbook.count('.metadata.labels["inspace.cloud/host-class"] == "amd-epyc"') >= 2 and
             playbook.count('.metadata.labels["inspace.cloud/instance-cpu"] == "2"') >= 2 and
             playbook.count('.metadata.labels["inspace.cloud/instance-memory"] == "4096"') >= 2,

@@ -1617,6 +1617,36 @@
         executable: /bin/bash
       changed_when: true
 
+    - name: Render the direct public-registry egress probe
+      ansible.builtin.template:
+        src: templates/registry-egress-probe.yaml.j2
+        dest: "{{ e2e_state_dir }}/registry-egress-probe.yaml"
+        mode: "0600"
+
+    - name: Replace only registry-timeout workers while retaining their FIPs
+      ansible.builtin.command:
+        argv:
+          - /opt/e2e/scripts/ensure-worker-egress.sh
+          - --kubeconfig
+          - "{{ e2e_state_dir }}/kubeconfig.yaml"
+          - --nodepool
+          - "{{ e2e_nodepool_name }}"
+          - --probe-template
+          - "{{ e2e_state_dir }}/registry-egress-probe.yaml"
+          - --result
+          - "{{ e2e_state_dir }}/worker-egress.json"
+      register: e2e_worker_egress
+      changed_when: true
+
+    - name: Require a bounded direct-registry egress result
+      ansible.builtin.assert:
+        that:
+          - (e2e_worker_egress.stdout | from_json).attempts | int >= 1
+          - (e2e_worker_egress.stdout | from_json).attempts | int <= 3
+          - (e2e_worker_egress.stdout | from_json).winner.node | length > 0
+          - (e2e_worker_egress.stdout | from_json).winner.nodeClaim | length > 0
+          - (e2e_worker_egress.stdout | from_json).winner.publicIPv4 is match('^[0-9]+(?:\.[0-9]+){3}$')
+
     - name: Read the exact Karpenter worker identity
       ansible.builtin.shell: |
         set -euo pipefail

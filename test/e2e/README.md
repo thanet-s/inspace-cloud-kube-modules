@@ -66,6 +66,14 @@ requires `instance-cpu Gt ["1"]` without an instance-memory selector. This
 excludes every 1-vCPU shape, while the pool limits and live Node/NodeClaim
 assertions prove the selected worker is 2 vCPU / 4 GiB. The explicit family
 requirement excludes every non-`general` shape, including `extra-memory`.
+Before the final worker identity is journaled, the suite pulls immutable amd64
+blobs directly from Docker Hub and GHCR. A recognized registry timeout triggers
+a bounded blue/green retry: the failed worker is cordoned but its NodeClaim, VM,
+and FIP remain allocated while Karpenter creates and proves a distinct FIP on a
+new worker. Rejected FIPs are released only after one replacement passes both
+registries; authentication, image, and other non-network failures stop without
+rotating cloud resources. At most three workers overlap, and the NodePool is
+restored to its normal one-worker limit after convergence.
 The three control-plane cloud names, guest hostnames, and Kubernetes Node names
 are live-proven as `<clusterResourceName>-cp0`, `-cp1`, and `-cp2`.
 Each E2E control plane uses a 60 GiB root disk, and the E2E Karpenter NodeClass
