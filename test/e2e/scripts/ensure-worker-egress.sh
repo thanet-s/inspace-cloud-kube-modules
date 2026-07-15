@@ -33,10 +33,10 @@ readonly schedule_timeout=20m
 readonly pull_timeout=5m
 readonly identity_timeout_seconds=600
 readonly cleanup_timeout_seconds=1200
-readonly original_cpu=2
-readonly original_memory=4Gi
-readonly surge_cpu=$((max_attempts * 2))
-readonly surge_memory="$((max_attempts * 4))Gi"
+readonly candidate_cpu=2
+readonly candidate_memory_gi=4
+readonly overlap_cpu=$((max_attempts * candidate_cpu))
+readonly overlap_memory_gi=$((max_attempts * candidate_memory_gi))
 readonly probe_label='inspace.cloud/e2e-egress-gate=true'
 readonly public_ip_annotation='karpenter.inspace.cloud/public-ipv4'
 readonly floating_ip_annotation='karpenter.inspace.cloud/floating-ip-name'
@@ -99,18 +99,18 @@ wait_for_identity() {
 
 assert_identity() {
   local identity=$1 expected_node=${2:-} node claim node_name claim_name public_ip
-  node=$(jq -c '.node' <<<"$identity")
-  claim=$(jq -c '.claim' <<<"$identity")
-  node_name=$(jq -er '.metadata.name' <<<"$node")
-  claim_name=$(jq -er '.metadata.name' <<<"$claim")
-  public_ip=$(jq -er --arg key "$public_ip_annotation" '.metadata.annotations[$key]' <<<"$claim")
-  [[ -z "$expected_node" || "$node_name" == "$expected_node" ]]
-  jq -e --arg node "$node_name" '.status.nodeName == $node' <<<"$claim" >/dev/null
+  node=$(jq -c '.node' <<<"$identity") || return 1
+  claim=$(jq -c '.claim' <<<"$identity") || return 1
+  node_name=$(jq -er '.metadata.name' <<<"$node") || return 1
+  claim_name=$(jq -er '.metadata.name' <<<"$claim") || return 1
+  public_ip=$(jq -er --arg key "$public_ip_annotation" '.metadata.annotations[$key]' <<<"$claim") || return 1
+  [[ -z "$expected_node" || "$node_name" == "$expected_node" ]] || return 1
+  jq -e --arg node "$node_name" '.status.nodeName == $node' <<<"$claim" >/dev/null || return 1
   jq -e --arg ip "$public_ip" '[.status.addresses[]? | select(.type == "ExternalIP") | .address] == [$ip]' \
-    <<<"$node" >/dev/null
+    <<<"$node" >/dev/null || return 1
   jq -e --arg floating "$floating_ip_annotation" --arg billing "$billing_annotation" '
     (.metadata.annotations[$floating] | length) > 0 and
-    (.metadata.annotations[$billing] | test("^[1-9][0-9]*$"))' <<<"$claim" >/dev/null
+    (.metadata.annotations[$billing] | test("^[1-9][0-9]*$"))' <<<"$claim" >/dev/null || return 1
   printf '%s\t%s\t%s\n' "$node_name" "$claim_name" "$public_ip"
 }
 
@@ -129,8 +129,14 @@ reprove_rejected() {
 }
 
 nodepool_json=$("${kubectl_cluster[@]}" get nodepool "$nodepool" -o json)
-jq -e --arg cpu "$original_cpu" --arg memory "$original_memory" '
-  .spec.limits.cpu == $cpu and .spec.limits.memory == $memory' <<<"$nodepool_json" >/dev/null
+original_cpu=$(jq -er '.spec.limits.cpu | select(test("^[1-9][0-9]*$"))' <<<"$nodepool_json")
+original_memory=$(jq -er '.spec.limits.memory | select(test("^[1-9][0-9]*Gi$"))' <<<"$nodepool_json")
+original_memory_gi=${original_memory%Gi}
+((original_cpu >= candidate_cpu && original_memory_gi >= candidate_memory_gi))
+surge_cpu=$((original_cpu > overlap_cpu ? original_cpu : overlap_cpu))
+surge_memory_gi=$((original_memory_gi > overlap_memory_gi ? original_memory_gi : overlap_memory_gi))
+surge_memory="${surge_memory_gi}Gi"
+readonly original_cpu original_memory original_memory_gi surge_cpu surge_memory_gi surge_memory
 [[ $("${kubectl_cluster[@]}" get nodes -l "karpenter.sh/nodepool=$nodepool" -o json | jq '.items | length') -eq 1 ]]
 [[ $("${kubectl_cluster[@]}" get nodeclaims -l "karpenter.sh/nodepool=$nodepool" -o json | jq '.items | length') -eq 1 ]]
 [[ $("${kubectl_default[@]}" get pods -l "$probe_label" -o json | jq '.items | length') -eq 0 ]] || {
@@ -209,7 +215,8 @@ for ((attempt = 1; attempt <= max_attempts; attempt++)); do
   rejected_count=$((rejected_count + 1))
   log "retaining timed-out node=$node nodeclaim=$claim fip=$public_ip while a replacement is allocated"
 
-  if ((attempt < max_attempts)) && [[ "$surged" == false ]]; then
+  if ((attempt < max_attempts)) && [[ "$surged" == false ]] &&
+     [[ "$surge_cpu" != "$original_cpu" || "$surge_memory" != "$original_memory" ]]; then
     "${kubectl_cluster[@]}" patch nodepool "$nodepool" --type=merge -p \
       "{\"spec\":{\"limits\":{\"cpu\":\"$surge_cpu\",\"memory\":\"$surge_memory\"}}}" >/dev/null
     "${kubectl_cluster[@]}" get nodepool "$nodepool" -o json | jq -e \

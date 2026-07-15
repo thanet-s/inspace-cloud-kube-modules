@@ -751,6 +751,8 @@ def main() -> None:
             "NodeClass must use the private RKE2 registration endpoint")
     require("inspace-rke2-agent-token" in nodeclass, "NodeClass must use the RKE2 token secret")
     require("rootDiskGiB: 100" in nodeclass, "E2E Karpenter workers must use 100 GiB root disks")
+    require('limits:\n    cpu: "8"\n    memory: 16Gi' in nodeclass,
+            "E2E NodePool must retain bounded headroom for scale-out experiments")
     require("bootstrapCache:" in nodeclass and
             "directDownload: false" in nodeclass and
             'address: "{{ e2e_bootstrap_result.bootstrapCacheAddress }}"' in nodeclass and
