@@ -1,0 +1,169 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: inspace-e2e-node-lb
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: inspace-e2e-node-lb
+  template:
+    metadata:
+      labels:
+        app: inspace-e2e-node-lb
+    spec:
+      nodeSelector:
+        karpenter.sh/nodepool: {{ e2e_nodepool_name }}
+      containers:
+        - name: traefik-tcp
+          image: docker.io/library/busybox:1.36.1@sha256:b7f3d86d6e84fc17718c48bcde1450807faa2d56704205c697b4bd5df7b9e29f
+          imagePullPolicy: IfNotPresent
+          command: [sh, -ceu]
+          args:
+            - >-
+              mkdir -p /www-http /www-https &&
+              printf '%s\n' '{{ e2e_marker }}-node-traefik-http' >/www-http/index.html &&
+              printf '%s\n' '{{ e2e_marker }}-node-traefik-https' >/www-https/index.html &&
+              httpd -p 18080 -h /www-http &&
+              exec httpd -f -p 18443 -h /www-https
+          ports:
+            - name: traefik-http
+              containerPort: 18080
+              protocol: TCP
+            - name: traefik-https
+              containerPort: 18443
+              protocol: TCP
+          readinessProbe:
+            exec:
+              command:
+                - sh
+                - -ceu
+                - >-
+                  test "$(wget -qO- http://127.0.0.1:18080/)" =
+                  '{{ e2e_marker }}-node-traefik-http' &&
+                  test "$(wget -qO- http://127.0.0.1:18443/)" =
+                  '{{ e2e_marker }}-node-traefik-https'
+            initialDelaySeconds: 1
+            periodSeconds: 2
+        - name: traefik-http3
+          image: docker.io/library/busybox:1.36.1@sha256:b7f3d86d6e84fc17718c48bcde1450807faa2d56704205c697b4bd5df7b9e29f
+          imagePullPolicy: IfNotPresent
+          command: [sh, -ceu]
+          args:
+            - |
+              printf '%s\n' \
+                '#!/bin/sh' \
+                "printf '%s\\n' '{{ e2e_marker }}-node-traefik-http3'" \
+                >/tmp/udp-echo
+              chmod 0700 /tmp/udp-echo
+              while true; do
+                nc -u -l -p 18443 -e /tmp/udp-echo
+              done
+          ports:
+            - name: traefik-http3
+              containerPort: 18443
+              protocol: UDP
+          readinessProbe:
+            exec:
+              command: [sh, -ceu, "test -x /tmp/udp-echo"]
+            initialDelaySeconds: 1
+            periodSeconds: 2
+        - name: shared-b
+          image: docker.io/library/busybox:1.36.1@sha256:b7f3d86d6e84fc17718c48bcde1450807faa2d56704205c697b4bd5df7b9e29f
+          imagePullPolicy: IfNotPresent
+          command: [sh, -ceu]
+          args:
+            - >-
+              mkdir -p /www &&
+              printf '%s\n' '{{ e2e_marker }}-node-shared-b' >/www/index.html &&
+              exec httpd -f -p 18081 -h /www
+          ports:
+            - name: shared-b
+              containerPort: 18081
+              protocol: TCP
+          readinessProbe:
+            tcpSocket:
+              port: shared-b
+            initialDelaySeconds: 1
+            periodSeconds: 2
+        - name: dedicated
+          image: docker.io/library/busybox:1.36.1@sha256:b7f3d86d6e84fc17718c48bcde1450807faa2d56704205c697b4bd5df7b9e29f
+          imagePullPolicy: IfNotPresent
+          command: [sh, -ceu]
+          args:
+            - >-
+              mkdir -p /www &&
+              printf '%s\n' '{{ e2e_marker }}-node-dedicated' >/www/index.html &&
+              exec httpd -f -p 18082 -h /www
+          ports:
+            - name: dedicated
+              containerPort: 18082
+              protocol: TCP
+          readinessProbe:
+            tcpSocket:
+              port: dedicated
+            initialDelaySeconds: 1
+            periodSeconds: 2
+        - name: shared-conflict
+          image: docker.io/library/busybox:1.36.1@sha256:b7f3d86d6e84fc17718c48bcde1450807faa2d56704205c697b4bd5df7b9e29f
+          imagePullPolicy: IfNotPresent
+          command: [sh, -ceu]
+          args:
+            - >-
+              mkdir -p /www &&
+              printf '%s\n' '{{ e2e_marker }}-node-shared-conflict' >/www/index.html &&
+              exec httpd -f -p 18083 -h /www
+          ports:
+            - name: conflict-target
+              containerPort: 18083
+              protocol: TCP
+          readinessProbe:
+            tcpSocket:
+              port: conflict-target
+            initialDelaySeconds: 1
+            periodSeconds: 2
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: inspace-e2e-node-traefik
+  namespace: default
+spec:
+  type: LoadBalancer
+  loadBalancerClass: inspace.cloud/node
+  allocateLoadBalancerNodePorts: false
+  externalTrafficPolicy: Cluster
+  selector:
+    app: inspace-e2e-node-lb
+  ports:
+    - name: http
+      port: 80
+      targetPort: traefik-http
+      protocol: TCP
+    - name: https
+      port: 443
+      targetPort: traefik-https
+      protocol: TCP
+    - name: http3
+      port: 443
+      targetPort: traefik-http3
+      protocol: UDP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: inspace-e2e-node-shared-b
+  namespace: default
+spec:
+  type: LoadBalancer
+  loadBalancerClass: inspace.cloud/node
+  allocateLoadBalancerNodePorts: false
+  externalTrafficPolicy: Cluster
+  selector:
+    app: inspace-e2e-node-lb
+  ports:
+    - name: http
+      port: 18081
+      targetPort: shared-b
+      protocol: TCP

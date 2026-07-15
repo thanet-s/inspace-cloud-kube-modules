@@ -261,7 +261,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          docker run --rm --entrypoint /bin/bash local/inspace-rke2-e2e:ci -ceu '
+          docker run --rm \
+            --mount "type=bind,src=${PWD},dst=/workspace,readonly" \
+            --env INSPACE_E2E_SOURCE_ROOT=/workspace \
+            --entrypoint /bin/bash local/inspace-rke2-e2e:ci -ceu '
             python3 /opt/e2e/verify-static.py
             for script in /opt/e2e/scripts/*.sh; do bash -n "$script"; done
             ansible-inventory --inventory /opt/e2e/inventory.yml --list >/dev/null

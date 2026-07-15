@@ -133,6 +133,23 @@ outside the two explicit source namespaces are intentionally left unchanged.
 {{- if .Values.ccm.enabled -}}
 {{- $clusterID := required "global.inspace.clusterID is required when ccm.enabled=true" .Values.global.inspace.clusterID -}}
 {{- end -}}
+{{- if .Values.ccm.nodeLoadBalancer.enabled -}}
+{{- if gt (len .Values.global.inspace.clusterID) 38 -}}
+{{- fail "global.inspace.clusterID must be at most 38 characters when ccm.nodeLoadBalancer.enabled=true" -}}
+{{- end -}}
+{{- if ne .Values.karpenter.clusterName .Values.global.inspace.clusterID -}}
+{{- fail "karpenter.clusterName must equal global.inspace.clusterID when ccm.nodeLoadBalancer.enabled=true" -}}
+{{- end -}}
+{{- if not .Values.ccm.enabled -}}
+{{- fail "ccm.enabled must be true when ccm.nodeLoadBalancer.enabled=true" -}}
+{{- end -}}
+{{- if not .Values.karpenter.enabled -}}
+{{- fail "karpenter.enabled must be true when ccm.nodeLoadBalancer.enabled=true" -}}
+{{- end -}}
+{{- if not .Values.karpenter.featureGates.staticCapacity -}}
+{{- fail "karpenter.featureGates.staticCapacity must be true when ccm.nodeLoadBalancer.enabled=true" -}}
+{{- end -}}
+{{- end -}}
 {{- if .Values.karpenter.enabled -}}
 {{- $clusterName := required "karpenter.clusterName is required when karpenter.enabled=true" .Values.karpenter.clusterName -}}
 {{- $defaultNodeClass := required "karpenter.defaultNodeClass is required when karpenter.enabled=true" .Values.karpenter.defaultNodeClass -}}

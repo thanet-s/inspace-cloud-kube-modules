@@ -178,6 +178,7 @@ func (p *CloudProvider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim)
 		PrivateLoadBalancerPoolStart: nodeClass.Spec.PrivateLoadBalancerPool.Start,
 		PrivateLoadBalancerPoolStop:  nodeClass.Spec.PrivateLoadBalancerPool.Stop,
 		FirewallUUID:                 nodeClass.Spec.FirewallUUID,
+		FirewallProfile:              nodeClass.Spec.EffectiveFirewallProfile(),
 		OSName:                       nodeClass.Spec.ImageSelector.OSName,
 		OSVersion:                    nodeClass.Spec.ImageSelector.OSVersion,
 		HostPoolUUID:                 hostPoolUUID,

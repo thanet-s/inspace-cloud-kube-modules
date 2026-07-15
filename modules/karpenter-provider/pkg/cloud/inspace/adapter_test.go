@@ -1690,6 +1690,150 @@ func TestUnusableAutoFloatingIPPreservesOwnedVMForReconciliation(t *testing.T) {
 	}
 }
 
+func TestPublicNodeLoadBalancerAllowsOwnedServiceFirewallAcrossCreateAndReadback(t *testing.T) {
+	serviceFirewall := nodeLoadBalancerServiceFirewall("cluster-a", "service-uid-a")
+	api := &fakeAPI{
+		firewalls:                  []sdk.Firewall{secureFirewall(), serviceFirewall},
+		secondFirewallOnAssignUUID: serviceFirewall.UUID,
+	}
+	adapter, err := New(api)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := testRequest()
+	request.FirewallProfile = inspacev1.FirewallProfilePublicNodeLoadBalancer
+	created, err := adapter.CreateVM(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created.FirewallProfile != inspacev1.FirewallProfilePublicNodeLoadBalancer {
+		t.Fatalf("created VM firewall profile = %q", created.FirewallProfile)
+	}
+	if _, err := adapter.GetVM(context.Background(), request.Location, created.UUID, request.ClusterName); err != nil {
+		t.Fatalf("GetVM with owned Service firewall: %v", err)
+	}
+	if vms, err := adapter.ListVMs(context.Background(), request.Location, request.ClusterName); err != nil || len(vms) != 1 {
+		t.Fatalf("ListVMs with owned Service firewall = %#v, %v", vms, err)
+	}
+}
+
+func TestPublicNodeLoadBalancerAdditionalFirewallContract(t *testing.T) {
+	const vmUUID = "11111111-1111-4111-8111-111111111111"
+	assigned := func(firewall sdk.Firewall) sdk.Firewall {
+		firewall.ResourcesAssigned = []sdk.FirewallResource{{ResourceType: "vm", ResourceUUID: vmUUID}}
+		return firewall
+	}
+	intended := assigned(secureFirewall())
+	valid := assigned(nodeLoadBalancerServiceFirewall("cluster-a", "service-uid-a"))
+	if valid.Description != "" {
+		t.Fatalf("test Service firewall description = %q, want omitted API readback", valid.Description)
+	}
+	if got, want := valid.EffectiveName(), "inlb-34ab3e1c-service-uid-a-886b49b4"; got != want {
+		t.Fatalf("deterministic Service firewall name = %q, want %q", got, want)
+	}
+	if ok, err := validateWorkerFirewallAssignments(
+		[]sdk.Firewall{intended, valid}, intended.UUID, vmUUID, true,
+		inspacev1.FirewallProfilePublicNodeLoadBalancer, "cluster-a",
+	); err != nil || !ok {
+		t.Fatalf("valid public node-LB assignments rejected: ok=%t err=%v", ok, err)
+	}
+	if _, err := validateWorkerFirewallAssignments(
+		[]sdk.Firewall{intended, valid}, intended.UUID, vmUUID, true,
+		inspacev1.FirewallProfilePrivateWorker, "cluster-a",
+	); !errors.Is(err, cloudapi.ErrOwnershipMismatch) {
+		t.Fatalf("private worker accepted second firewall: %v", err)
+	}
+
+	tests := map[string]func(*sdk.Firewall){
+		"wrong cluster hash": func(firewall *sdk.Firewall) {
+			firewall.DisplayName = strings.Replace(firewall.DisplayName, "34ab3e1c", "deadbeef", 1)
+		},
+		"malformed name": func(firewall *sdk.Firewall) {
+			firewall.DisplayName = "inlb-not-a-managed-name"
+		},
+		"wrong billing account": func(firewall *sdk.Firewall) { firewall.BillingAccountID++ },
+		"policy hash mismatch": func(firewall *sdk.Firewall) {
+			port := int32(8443)
+			firewall.Rules[0].PortStart = &port
+			firewall.Rules[0].PortEnd = &port
+		},
+		"outbound rule": func(firewall *sdk.Firewall) { firewall.Rules[0].Direction = "outbound" },
+		"ICMP rule": func(firewall *sdk.Firewall) {
+			firewall.Rules = append(firewall.Rules, sdk.FirewallRule{Protocol: "icmp", Direction: "inbound", EndpointSpecType: "any"})
+		},
+		"no Service ports": func(firewall *sdk.Firewall) { firewall.Rules = nil },
+		"implicit ports": func(firewall *sdk.Firewall) {
+			firewall.Rules[0].PortStart = nil
+			firewall.Rules[0].PortEnd = nil
+		},
+		"port range": func(firewall *sdk.Firewall) {
+			start, end := int32(443), int32(444)
+			firewall.Rules[0].PortStart = &start
+			firewall.Rules[0].PortEnd = &end
+		},
+		"invalid prefix": func(firewall *sdk.Firewall) {
+			firewall.Rules[0].EndpointSpecType = "ip_prefixes"
+			firewall.Rules[0].EndpointSpec = []string{"not-a-prefix"}
+		},
+		"IPv6 prefix": func(firewall *sdk.Firewall) {
+			firewall.Rules[0].EndpointSpecType = "ip_prefixes"
+			firewall.Rules[0].EndpointSpec = []string{"2001:db8::/32"}
+		},
+		"noncanonical prefix": func(firewall *sdk.Firewall) {
+			firewall.Rules[0].EndpointSpecType = "ip_prefixes"
+			firewall.Rules[0].EndpointSpec = []string{"203.0.113.9/24"}
+		},
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			firewall := assigned(nodeLoadBalancerServiceFirewall("cluster-a", "service-uid-a"))
+			mutate(&firewall)
+			if _, err := validateWorkerFirewallAssignments(
+				[]sdk.Firewall{intended, firewall}, intended.UUID, vmUUID, true,
+				inspacev1.FirewallProfilePublicNodeLoadBalancer, "cluster-a",
+			); !errors.Is(err, cloudapi.ErrOwnershipMismatch) {
+				t.Fatalf("invalid additional firewall accepted: %v", err)
+			}
+		})
+	}
+}
+
+func TestPublicNodeLoadBalancerAcceptsOneClusterICMPFirewall(t *testing.T) {
+	const vmUUID = "11111111-1111-4111-8111-111111111111"
+	assigned := func(firewall sdk.Firewall) sdk.Firewall {
+		firewall.ResourcesAssigned = []sdk.FirewallResource{{ResourceType: "vm", ResourceUUID: vmUUID}}
+		return firewall
+	}
+	base := assigned(secureFirewall())
+	service := assigned(nodeLoadBalancerServiceFirewall("cluster-a", "service-uid-a"))
+	icmp := assigned(nodeLoadBalancerClusterICMPFirewall("cluster-a"))
+	if ok, err := validateWorkerFirewallAssignments(
+		[]sdk.Firewall{base, service, icmp}, base.UUID, vmUUID, true,
+		inspacev1.FirewallProfilePublicNodeLoadBalancer, "cluster-a",
+	); err != nil || !ok {
+		t.Fatalf("base + Service + cluster ICMP firewalls rejected: ok=%t err=%v", ok, err)
+	}
+
+	duplicate := icmp
+	duplicate.UUID = "55555555-5555-4555-8555-555555555555"
+	if _, err := validateWorkerFirewallAssignments(
+		[]sdk.Firewall{base, icmp, duplicate}, base.UUID, vmUUID, true,
+		inspacev1.FirewallProfilePublicNodeLoadBalancer, "cluster-a",
+	); !errors.Is(err, cloudapi.ErrOwnershipMismatch) {
+		t.Fatalf("duplicate cluster ICMP firewall was accepted: %v", err)
+	}
+
+	drifted := assigned(nodeLoadBalancerClusterICMPFirewall("cluster-a"))
+	drifted.Rules[0].EndpointSpecType = "ip_prefixes"
+	drifted.Rules[0].EndpointSpec = []string{"203.0.113.0/24"}
+	if _, err := validateWorkerFirewallAssignments(
+		[]sdk.Firewall{base, drifted}, base.UUID, vmUUID, true,
+		inspacev1.FirewallProfilePublicNodeLoadBalancer, "cluster-a",
+	); !errors.Is(err, cloudapi.ErrOwnershipMismatch) {
+		t.Fatalf("drifted cluster ICMP firewall was accepted: %v", err)
+	}
+}
+
 func TestCreatedWorkerUnexpectedFirewallRollsBackAfterVMDeletion(t *testing.T) {
 	extra := secureFirewall()
 	extra.UUID = "44444444-4444-4444-8444-444444444444"
@@ -4091,15 +4235,21 @@ func TestFirewallValidationRejectsUnsupportedProtocol(t *testing.T) {
 
 func TestFirewallValidationRejectsEveryPublicInboundPrefix(t *testing.T) {
 	for _, prefix := range []string{"198.51.100.24/32", "198.51.100.0/24", "2001:db8::1/128"} {
-		firewall := secureFirewall()
-		start, end := int32(22), int32(22)
-		firewall.Rules = append(firewall.Rules, sdk.FirewallRule{
-			UUID: "public-ssh", Protocol: "tcp", Direction: "inbound", PortStart: &start, PortEnd: &end,
-			EndpointSpecType: "ip_prefixes", EndpointSpec: []string{prefix},
-		})
-		err := validateDefaultDenyFirewall(firewall, netip.MustParsePrefix("10.0.0.0/24"))
-		if err == nil || !strings.Contains(err.Error(), "must not allow public inbound prefix") {
-			t.Fatalf("public prefix %s validation error = %v", prefix, err)
+		for _, protocol := range []string{"tcp", "icmp"} {
+			firewall := secureFirewall()
+			rule := sdk.FirewallRule{
+				UUID: "public-" + protocol, Protocol: protocol, Direction: "inbound",
+				EndpointSpecType: "ip_prefixes", EndpointSpec: []string{prefix},
+			}
+			if protocol == "tcp" {
+				start, end := int32(22), int32(22)
+				rule.PortStart, rule.PortEnd = &start, &end
+			}
+			firewall.Rules = append(firewall.Rules, rule)
+			err := validateDefaultDenyFirewall(firewall, netip.MustParsePrefix("10.0.0.0/24"))
+			if err == nil || !strings.Contains(err.Error(), "must not allow public inbound prefix") {
+				t.Fatalf("public %s prefix %s validation error = %v", protocol, prefix, err)
+			}
 		}
 	}
 }
@@ -4620,7 +4770,7 @@ func (f *fakeAPI) ListVMs(context.Context, string) ([]sdk.VM, error) {
 
 func secureFirewall() sdk.Firewall {
 	return sdk.Firewall{
-		UUID: "33333333-3333-4333-8333-333333333333",
+		UUID: "33333333-3333-4333-8333-333333333333", BillingAccountID: 42,
 		Rules: []sdk.FirewallRule{{
 			UUID: "in-vpc-pods-tcp", Protocol: "tcp", Direction: "inbound",
 			EndpointSpecType: "ip_prefixes", EndpointSpec: []string{"10.0.0.0/24", bootstrap.NativeRoutingPodCIDR},
@@ -4630,6 +4780,38 @@ func secureFirewall() sdk.Firewall {
 			{UUID: "out-udp", Protocol: "udp", Direction: "outbound", EndpointSpecType: "any"},
 			{UUID: "out-icmp", Protocol: "icmp", Direction: "outbound", EndpointSpecType: "any"}},
 	}
+}
+
+func nodeLoadBalancerServiceFirewall(cluster, serviceUID string) sdk.Firewall {
+	port := int32(443)
+	firewall := sdk.Firewall{
+		UUID: "44444444-4444-4444-8444-444444444444", BillingAccountID: 42,
+		Rules: []sdk.FirewallRule{{
+			UUID: "public-tcp-443", Protocol: "tcp", Direction: "inbound",
+			PortStart: &port, PortEnd: &port, EndpointSpecType: "any",
+		}},
+	}
+	specHash, err := nodeLoadBalancerFirewallSpecHash(firewall.Rules)
+	if err != nil {
+		panic(err)
+	}
+	firewall.DisplayName = fmt.Sprintf("inlb-%s-%s-%s", shortSHA256(cluster), serviceUID, specHash)
+	return firewall
+}
+
+func nodeLoadBalancerClusterICMPFirewall(cluster string) sdk.Firewall {
+	firewall := sdk.Firewall{
+		UUID: "66666666-6666-4666-8666-666666666666", BillingAccountID: 42,
+		Rules: []sdk.FirewallRule{{
+			UUID: "public-icmp", Protocol: "icmp", Direction: "inbound", EndpointSpecType: "any",
+		}},
+	}
+	name, _, err := sdk.NodeLoadBalancerClusterICMPFirewallName(cluster, firewall.Rules)
+	if err != nil {
+		panic(err)
+	}
+	firewall.DisplayName = name
+	return firewall
 }
 func (f *fakeAPI) GetVM(ctx context.Context, _, uuid string) (*sdk.VM, error) {
 	f.mu.Lock()

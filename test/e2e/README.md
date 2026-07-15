@@ -40,9 +40,13 @@ then removes the leader's static manifest temporarily, proves ownership moves
 to a different control plane without interrupting the API, and restores all
 three pods.
 
-One controller-owned bastion is the sole inbound SSH endpoint. Control planes
-and the Karpenter worker are reached only at private IPs through pinned SSH
-host keys and `ProxyJump`; Kubernetes uses a container-local SSH forward to the
+One controller-owned bastion is the sole public management endpoint. Its
+firewall defaults TCP/22 and portless ICMP to Any (`0.0.0.0/0`); optional
+`INSPACE_MANAGEMENT_CIDR=<public-ip>/32` restricts both. The live suite verifies
+the exact cloud rule and an actual ping. Control planes and the Karpenter worker
+reject public ingress and are reached only at private
+IPs through pinned SSH host keys and `ProxyJump`; Kubernetes uses a
+container-local SSH forward to the
 private VIP with that VIP as the TLS server name. The private registration VIP
 is used by the `inspace-rke2-agent-token` Secret and worker bootstrap. Because
 InSpace has no NAT service, all three control planes, the worker, and bastion
@@ -94,8 +98,9 @@ Kubernetes Node name are live-proven as
 separate `general-<random suffix>` NodeClaim remains the ownership identity.
 The suite requires every control plane, worker, and bastion hostname to resolve
 to `127.0.1.1` through its generated `/etc/hosts` entry after the bounded
-bootstrap readback. Fixed-node ownership must be schema v6, and the Karpenter
-worker must use bootstrap schema v11.
+bootstrap readback. Control-plane ownership must be schema v7, bastion
+ownership must remain v6, and the Karpenter worker must use bootstrap schema
+v11.
 Managed InSpace cloud firewalls are the only host firewalls; guest UFW must be
 inactive and disabled or masked on the control planes, worker, and bastion.
 
@@ -107,8 +112,9 @@ two private Services with the same TCP port, private scope label,
 distinct VIPs inside the operator-reserved range, create one L2 announcement
 Lease for each Service, and advertise both VIPs over the VPC while each returns
 its own response marker. This proves same-port reuse comes from unique LB-IPAM
-VIPs, not node addresses. Cilium Node IPAM and `io.cilium/node` are disabled and
-unsupported.
+VIPs, not node addresses. Users do not create `io.cilium/node` Services
+directly. That class is reserved for exact, owner-referenced shadow Services
+created by the CCM public Node-LB controller.
 
 The suite exercises private L2 lease-holder failover and requires reachability
 to recover through ARP/gratuitous ARP. L2 Announcements remains a Cilium beta
@@ -135,12 +141,41 @@ removes only the public scope label (leaving the annotation and Service type
 intact), waits for that NLB/FIP to be deleted and its status cleared, and
 restores only the label to prove label-driven recreation. This directly
 exercises CCM's provider-intent trigger for changes the generic Service
-controller otherwise does not observe. UDP is not tested on the public path
-because the InSpace NLB supports TCP only. After the final public-path check,
-the suite deletes only this paid public Service and requires both its NLB and
-FIP to be absent before it marks acceptance complete. The deployments, PVC,
-private Services, cluster, and worker remain available to later checks or a
-preserved phased run.
+controller otherwise does not observe. UDP is not tested on the paid public
+path because the InSpace NLB supports TCP only. After the final public-path
+check, the suite deletes only this paid public Service and requires both its
+NLB and FIP to be absent.
+
+The final acceptance block exercises the lower-cost public Node-LB path. Three
+user Services select `loadBalancerClass: inspace.cloud/node`, explicitly set
+`allocateLoadBalancerNodePorts: false`, and omit the mode annotation to prove
+that the CCM defaults them to `public-node-shared`. A Traefik-like Service
+claims TCP/80, TCP/443, and UDP/443 while a non-conflicting TCP Service reuses
+its shard and public IP. Another Service claims TCP/80 and must transparently
+receive a different shard and IP. A fourth Service selects
+`public-node-dedicated`. It omits CPU and memory annotations so the live
+generated capacity proves the 1-vCPU/2-GiB default.
+
+Each of the resulting three static Karpenter NodePools has one Ready AMD EPYC
+Linux/amd64 node, one bounded drift-surge slot, a 30-GiB root disk, a reserved
+public FIP, and the `inspace.cloud/node-lb=true:NoSchedule` taint. The CCM owns
+one `io.cilium/node` shadow per user Service, selects only the exact ready
+shard, copies that shadow's single ExternalIP back to the user Service, and
+assigns one exact TCP/UDP-only per-Service InSpace firewall to the shard VM.
+One 128-bit cluster-owned ICMP firewall contains only inbound ICMP from Any and
+is reused by every and only authoritative Node-LB VM. Acceptance requires an
+ICMP echo response from every unique FIP, distinct markers from all TCP ports,
+and a real UDP echo response through UDP/443. It also proves that no InSpace
+NLB was created. The suite then deletes one shared member and proves its
+Service firewall disappears while the sibling shard, VM, FIP, global ICMP
+firewall, sibling per-Service firewall, and backends retain the same
+identities. An unconditional cleanup block removes the remaining Services,
+shadows, NodePools, NodeClaims, nodes, both firewall types, VMs, FIPs,
+workload, and generated NodeClass. The global
+ICMP firewall must be absent and the complete billable-resource inventory must
+equal its pre-Node-LB snapshot. The deployments, PVC, private Services,
+cluster, and general worker remain available to later checks or a preserved
+phased run.
 
 ## Safety and cleanup
 
@@ -150,6 +185,14 @@ disk and requires all five inventories to be empty. Cleanup must make the full
 account inventory exactly equal that persisted baseline, in addition to its
 deterministic ownership audit. A malformed or unidentifiable active API item
 is fatal rather than silently ignored.
+
+Before a repeat `test` captures its temporary Node-LB baseline, it requires the
+active NLB UUID set to equal the immutable pre-mutation account baseline
+(always empty for this isolated suite). Journaled Service identities and
+deterministic ownership prefixes provide a more specific diagnostic for an
+owned orphan, without attributing an immutable unrelated baseline NLB to
+Node-LB. This ordering prevents any costly orphan from being normalized into a
+new baseline after an interrupted run.
 
 One exclusive lock covers the shared state volume for the full lifetime of
 every phase container. An existing run ID can never be reused by the `init`
@@ -169,11 +212,13 @@ provisioning the cluster again. The `destroy` phase is the explicit cleanup
 path for those preserved runs. A durable `phase-preserved` marker prevents a
 later default `all` run from cleaning them implicitly. Owner removal is ordered:
 
-1. all public/private workloads, Services, and the PVC;
+1. all paid, private, and Node-LB workloads and Services, including
+   controller-owned Node-LB shadows;
 2. pods, PV, and VolumeAttachments must disappear;
 3. both private `cilium-l2announce-*` Leases must disappear and
    `CiliumLoadBalancerIPPool/inspace-private` must report zero used IPs;
-4. NodePool, NodeClaims, worker Nodes, then NodeClass;
+4. managed Node-LB NodePools/NodeClaims/nodes, the general NodePool,
+   NodeClaims and worker Nodes, then NodeClasses;
 5. CSI/CCM/Karpenter-owned disks, workers, floating IPs, and service NLB must
    be absent before controller charts are removed; Karpenter deletes its named
    FIP before deleting the worker VM because VM deletion only leaves that FIP
@@ -238,9 +283,10 @@ make cluster-e2e-destroy
 `init` creates a new run and preserves it. `test` reuses that initialized
 cluster and preserves it whether the tests pass or fail, so test-only changes
 can be exercised repeatedly. A successful `test` removes the paid public
-Service/NLB/FIP after its acceptance checks while retaining the other test
-resources; a later `test` recreates and revalidates that Service through the
-normal manifest apply. `shell` reestablishes the private-API SSH tunnel,
+Service/NLB/FIP and all temporary Node-LB acceptance capacity after their
+checks while retaining the other test resources; a later `test` recreates and
+revalidates both paths through their normal manifest applies. `shell`
+reestablishes the private-API SSH tunnel,
 exports the persisted kubeconfig, and opens an interactive environment where
 commands such as `kubectl get nodes` work directly. Exiting the shell stops its
 local tunnel but leaves the cluster running. Each phase container holds the
@@ -288,7 +334,7 @@ planes, bastion, and Karpenter worker. The control-plane VIP must be one unused
 RFC1918 address inside that VPC subnet. The inclusive private Service range
 must contain 16-256 addresses, be excluded from InSpace VM and NLB allocation
 before the run, and not contain that VIP; the current InSpace API cannot
-reserve the range. Optional values include
+reserve the range. Optional values include `INSPACE_MANAGEMENT_CIDR`,
 `INSPACE_E2E_SSH_USERNAME`, `INSPACE_OS_NAME`, and `INSPACE_OS_VERSION`.
 
 The default `all` workflow normally destroys its resources. To retain that

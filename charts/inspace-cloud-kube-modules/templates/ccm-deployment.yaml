@@ -113,6 +113,12 @@ spec:
                 configMapKeyRef:
                   name: {{ $name }}
                   key: privateLoadBalancerPoolStop
+            - name: INSPACE_NODE_LOAD_BALANCER_ENABLED
+              value: {{ .Values.ccm.nodeLoadBalancer.enabled | quote }}
+            - name: INSPACE_NODE_LOAD_BALANCER_DEFAULT_NODE_CLASS
+              value: {{ .Values.karpenter.defaultNodeClass | quote }}
+            - name: INSPACE_NODE_LOAD_BALANCER_NODES_PER_SHARD
+              value: {{ .Values.ccm.nodeLoadBalancer.nodesPerShard | quote }}
             {{- with .Values.ccm.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

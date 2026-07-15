@@ -76,7 +76,28 @@ in either mode.
 
 ## Public IPv4 and firewall model
 
-InSpace currently has no managed NAT gateway, so each worker must have exactly one provider-owned floating public IPv4 for internet egress. It is reserved in the initial VM create request so cloud-init has internet access from first boot. The guest NIC still exposes exactly one private RFC1918 address. The private address is the Kubernetes `InternalIP`; the CCM publishes the floating address only as `ExternalIP`. The managed firewall blocks public ingress to the floating address.
+InSpace currently has no managed NAT gateway, so each worker must have exactly one provider-owned floating public IPv4 for internet egress. It is reserved in the initial VM create request so cloud-init has internet access from first boot. The guest NIC still exposes exactly one private RFC1918 address. The private address is the Kubernetes `InternalIP`; the CCM publishes the floating address only as `ExternalIP`. The managed base firewall blocks public ingress to the floating address.
+
+`spec.firewallProfile` defaults to `private-worker`, which preserves the
+exact-one-firewall rule. CCM-generated public load-balancer NodeClasses use
+`public-node-load-balancer`: the base firewall remains private, while additional
+firewalls are accepted only under two exact contracts:
+
+- A Service firewall is named
+  `inlb-<cluster-hash>-<Service-UID>-<policy-hash>` and contains only canonical
+  explicit inbound TCP/UDP single-port rules. Its hash covers protocol, port,
+  and canonical IPv4 source ranges; ICMP and outbound rules are forbidden.
+- At most one cluster firewall is named
+  `inlb-<cluster-ownership-hash>-icmp-<policy-hash>` and contains exactly one
+  portless inbound ICMP-from-Any rule. InSpace has no ICMP type/code filter, so
+  it permits all IPv4 ICMP from Any.
+
+The cluster ICMP firewall may be absent during initial VM launch; CCM attaches
+the shared firewall only after the authoritative Kubernetes identity exists and
+does not advertise that node until it and all required Service firewalls are
+visible. Foreign, unowned, malformed, duplicate cluster-ICMP, or hash-drifted
+additional assignments fail the VM audit. Firewall descriptions are not
+ownership authority because InSpace omits them from readback.
 
 The provider uses a fail-closed sequence:
 
@@ -92,8 +113,11 @@ The provider uses a fail-closed sequence:
    to the new VM for immediate cloud-init egress; the VM's `public_ipv4` field
    must remain empty.
 5. As the first post-POST mutation, assign the prevalidated firewall using the
-   returned VM UUID. Require authoritative read-back of the exact policy, sole
-   firewall assignment, and absence of any second firewall.
+   returned VM UUID. Require authoritative read-back of the exact base policy
+   and assignment. Ordinary workers require exactly that one firewall. Public
+   node-load-balancer workers require the base exactly once and permit only
+   audited CCM Service firewalls plus at most one audited cluster ICMP
+   firewall.
 6. Read back the VM until its complete NodeClaim ownership/spec record, exact
    name, capacity, image, host pool, VPC, billing account, and one correctly
    sized primary root disk are persisted.
@@ -127,10 +151,11 @@ error is used only as a protective-attachment anchor; canonical v3 ownership
 is still required for adoption or deletion. A nil/UUID-less response is
 recovered by deterministic reads without issuing a second POST, and the
 firewall is attached as soon as one unique valid UUID becomes visible. An existing owned VM is instead
-fully read and validated before any mutation. Conflicting policy or a second
-firewall fails closed without deleting that established VM; if the VM has no
-firewall and the intended assignment cannot be restored, the canonically owned
-public VM is deleted rather than left exposed. A fresh successful POST whose firewall
+fully read and validated before any mutation. Conflicting policy or a foreign
+firewall outside the effective profile fails closed without deleting that
+established VM; if the VM has no base firewall and the intended assignment
+cannot be restored, the canonically owned public VM is deleted rather than left
+exposed. A fresh successful POST whose firewall
 attachment or canonical ownership cannot be proven is rolled back. Cleanup
 first tries to durably name and delete the exact auto-FIP; if that address
 remains invisible, security takes priority and the fresh public VM is deleted
@@ -170,7 +195,7 @@ remain cluster-independent inventory and are ignored. A schema in the reserved
 unknown version fails closed instead of silently hiding a managed VM. Any other
 read or list/detail identity uncertainty also fails closed. One firewall list,
 one Floating-IP list, and one network read per unique VPC then detect a
-lost/disabled address, a second or public firewall,
+lost/disabled address or an unauthorized second/public firewall,
 membership drift, or a private-IP/supervisor-or-Service-VIP collision without
 mutating resources.
 
@@ -229,10 +254,18 @@ retain pod source addresses in `10.42.0.0/16`. The provider validates the
 operator-managed rules and fails closed before allocating a floating IP or VM;
 it never creates, broadens, or otherwise mutates firewall rules.
 
-Public ingress to workers is always invalid. Administrative access must traverse
-the private VPC through the dedicated bastion; workload traffic reaches private
-targets through the TCP service path. Direct public SSH and NodePort access are
-not part of the worker firewall contract.
+Public ingress to ordinary workers is always invalid. Administrative access
+must traverse the private VPC through the dedicated bastion; direct public SSH
+and NodePort access are not part of either worker profile. Public Node-LB nodes
+accept only the CCM-audited Service TCP/UDP rules and shared cluster ICMP rule
+described above.
+
+The public profile validates cloud assignments; it is not Kubernetes tenant
+isolation. In a multi-tenant cluster, admission and RBAC must reserve direct
+`io.cilium/node` Services, `io.cilium.nodeipam/*` annotations,
+`Service.spec.externalIPs`, and scheduling onto Node-LB nodes through their
+taint/toleration or direct selectors. The generated `NoSchedule` taint is only
+a placement guard.
 
 Worker network policy relies on the validated InSpace cloud firewall. Generated bootstrap does not install or enable UFW. One `set -eu` orchestrator runs every bootstrap stage in order, executes `additionalUserData`, reapplies the required node tuning, then disables and verifies UFW before it can start RKE2. The RKE2 service also has an `ExecStartPre` verifier, so initial launch and later restarts fail unless `ufw status` is inactive and its unit is inactive and disabled (an absent unit is safe). It never flushes or rewrites iptables/nftables, which belong to Cilium and RKE2. The adapter replaces a single strict VPC-subnet placeholder with the exact API-reported prefix before VM creation. Bootstrap then requires exactly one guest address in that prefix and writes it as `node-ip`; it never chooses the default interface or mistakes the floating address for a NIC address. It does not set `node-external-ip` and has no external-address placeholder. The external CCM is authoritative: it reads the VM's private address and exact Floating-IP assignment from the InSpace API and publishes them as `InternalIP` and `ExternalIP`. InSpace service targets use the private node address. Deletion removes the Floating IP first, deletes the VM, and only then removes every stale firewall attachment for that exact VM UUID.
 

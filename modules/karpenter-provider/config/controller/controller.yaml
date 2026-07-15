@@ -202,6 +202,8 @@ spec:
               value: "true"
             - name: LEADER_ELECTION_NAMESPACE
               value: karpenter
+            - name: FEATURE_GATES
+              value: StaticCapacity=true
           ports:
             - name: metrics
               containerPort: 8080

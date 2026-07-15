@@ -82,9 +82,18 @@
     "ccm": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["enabled", "replicaCount", "image", "serviceAccount", "priorityClassName", "hostNetwork", "dnsPolicy", "podAnnotations", "podLabels", "nodeSelector", "tolerations", "affinity", "resources", "extraArgs", "extraEnv"],
+      "required": ["enabled", "nodeLoadBalancer", "replicaCount", "image", "serviceAccount", "priorityClassName", "hostNetwork", "dnsPolicy", "podAnnotations", "podLabels", "nodeSelector", "tolerations", "affinity", "resources", "extraArgs", "extraEnv"],
       "properties": {
         "enabled": {"type": "boolean"},
+        "nodeLoadBalancer": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["enabled", "nodesPerShard"],
+          "properties": {
+            "enabled": {"type": "boolean"},
+            "nodesPerShard": {"type": "integer", "minimum": 1, "maximum": 10, "default": 1}
+          }
+        },
         "replicaCount": {"type": "integer", "minimum": 1, "maximum": 10},
         "image": {"$ref": "#/definitions/image"},
         "serviceAccount": {"$ref": "#/definitions/serviceAccount"},

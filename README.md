@@ -22,7 +22,8 @@ Kubernetes service.
 - Private, bastion-backed bootstrap cache by default, with an explicit
   direct-download mode.
 - Cilium native routing, eBPF masquerading, and full kube-proxy replacement.
-- External cloud-controller-manager for node addresses and TCP load balancers.
+- External cloud-controller-manager for node addresses, paid InSpace NLBs, and
+  shared or dedicated Cilium node load balancers.
 - CSI driver for dynamically provisioned `ReadWriteOnce` block volumes.
 - Karpenter provider for automatic RKE2 worker provisioning and termination.
 - Fail-closed ownership checks and convergent cleanup for cloud resources.
@@ -44,8 +45,8 @@ Each component is an independently buildable Go module linked locally by
 - Node identity, RKE2 registration, and cluster traffic use private VPC addresses.
 - Every VM receives a floating IPv4 for outbound internet access because InSpace
   does not provide shared NAT.
-- Only the bastion accepts public ingress; the Kubernetes API uses a private
-  kube-vip endpoint.
+- The bastion and explicitly requested public load-balancer capacity accept
+  public ingress; the Kubernetes API uses a private kube-vip endpoint.
 - By default the bastion also serves a private, read-only bootstrap cache at
   `cache.<cluster>.inspace.internal:8443`; it uses the bastion's allocated VPC
   address rather than another reserved VIP. Its ECDSA P-256 TLS material starts
@@ -56,7 +57,8 @@ Each component is an independently buildable Go module linked locally by
   hostname to `127.0.1.1` and verifies local resolution with bounded readback
   retry, independently of DHCP and external DNS.
 - Private `LoadBalancer` Services use Cilium LB IPAM and L2 Announcements.
-- Public `LoadBalancer` Services use an explicit, optional, TCP-only InSpace NLB.
+- Public `LoadBalancer` Services can use an explicit TCP-only InSpace NLB or
+  dedicated, tainted AMD EPYC nodes managed jointly by CCM and Karpenter.
 - InSpace firewalls enforce node policy; guest UFW is disabled.
 
 The detailed networking, ownership, and cleanup invariants are documented in the
@@ -103,7 +105,7 @@ system images directly from the upstream hosts.
 | Kubernetes distribution | RKE2 |
 | CNI | Cilium native routing |
 | Persistent storage | Single-node `ReadWriteOnce` block volumes |
-| Public load balancing | TCP through an InSpace NLB |
+| Public load balancing | TCP through an InSpace NLB; TCP/UDP through shared or dedicated Cilium node shards |
 | Private load balancing | Cilium LB IPAM and L2 Announcements |
 
 ## Documentation

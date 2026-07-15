@@ -54,6 +54,7 @@ func (f *Cloud) CreateVM(_ context.Context, request cloud.CreateVMRequest) (*clo
 		MemoryGiB:                    request.MemoryGiB,
 		RootDiskGiB:                  request.RootDiskGiB,
 		FirewallUUID:                 request.FirewallUUID,
+		FirewallProfile:              inspacev1.EffectiveFirewallProfile(request.FirewallProfile),
 		NetworkUUID:                  request.NetworkUUID,
 		ControlPlaneVIP:              request.ControlPlaneVIP,
 		PrivateLoadBalancerPoolStart: request.PrivateLoadBalancerPoolStart,

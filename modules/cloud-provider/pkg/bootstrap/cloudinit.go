@@ -345,7 +345,7 @@ spec:
       enabled: true
     defaultLBServiceIPAM: none
     nodeIPAM:
-      enabled: false
+      enabled: true
     k8sClientRateLimit:
       qps: %d
       burst: %d

@@ -20,6 +20,7 @@ import (
 	discoveryv1 "k8s.io/api/discovery/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	utilvalidation "k8s.io/apimachinery/pkg/util/validation"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	discoverylisters "k8s.io/client-go/listers/discovery/v1"
@@ -64,6 +65,11 @@ type API interface {
 	AssignFloatingIP(context.Context, string, string, string, string) (*inspace.FloatingIP, error)
 	UnassignFloatingIP(context.Context, string, string) (*inspace.FloatingIP, error)
 	DeleteFloatingIP(context.Context, string, string) error
+	ListFirewalls(context.Context, string) ([]inspace.Firewall, error)
+	CreateFirewall(context.Context, string, inspace.CreateFirewallRequest) (*inspace.Firewall, error)
+	DeleteFirewall(context.Context, string, string) error
+	AssignFirewallToVM(context.Context, string, string, string) error
+	UnassignFirewallFromVM(context.Context, string, string, string) error
 }
 
 type Config struct {
@@ -75,6 +81,17 @@ type Config struct {
 	ControlPlaneVIP              string
 	PrivateLoadBalancerPoolStart string
 	PrivateLoadBalancerPoolStop  string
+	NodeLoadBalancer             NodeLoadBalancerConfig
+}
+
+// NodeLoadBalancerConfig controls the optional CCM-managed public node load
+// balancer. The dataplane is Cilium Node IPAM; Karpenter supplies dedicated,
+// tainted nodes and InSpace firewalls restrict every Service to its declared
+// public ports.
+type NodeLoadBalancerConfig struct {
+	Enabled          bool
+	DefaultNodeClass string
+	NodesPerShard    int32
 }
 
 type Provider struct {
@@ -86,6 +103,7 @@ type Provider struct {
 	loadBalancerMu               sync.Mutex
 	stopCh                       <-chan struct{}
 	kubeClient                   kubernetes.Interface
+	dynamicClient                dynamic.Interface
 	endpointSliceLister          discoverylisters.EndpointSliceLister
 	endpointSlicesSynced         cache.InformerSynced
 }
@@ -108,6 +126,30 @@ func New(api API, config Config) (*Provider, error) {
 	}
 	if config.Region == "" {
 		config.Region = config.Location
+	}
+	if config.NodeLoadBalancer.Enabled {
+		if strings.TrimSpace(config.NodeLoadBalancer.DefaultNodeClass) == "" {
+			return nil, errors.New("cloudprovider: node load balancer default NodeClass is required when enabled")
+		}
+		if messages := utilvalidation.IsDNS1123Subdomain(config.NodeLoadBalancer.DefaultNodeClass); len(messages) != 0 {
+			return nil, fmt.Errorf("cloudprovider: node load balancer default NodeClass must be a DNS-1123 subdomain: %s", strings.Join(messages, "; "))
+		}
+		if messages := utilvalidation.IsDNS1123Label(config.ClusterID); len(messages) != 0 {
+			return nil, fmt.Errorf("cloudprovider: cluster ID must be a DNS-1123 label when the node load balancer is enabled: %s", strings.Join(messages, "; "))
+		}
+		if config.NodeLoadBalancer.NodesPerShard == 0 {
+			config.NodeLoadBalancer.NodesPerShard = 1
+		}
+		if config.NodeLoadBalancer.NodesPerShard < 1 || config.NodeLoadBalancer.NodesPerShard > 10 {
+			return nil, errors.New("cloudprovider: node load balancer nodes per shard must be between 1 and 10")
+		}
+		// Generated NodePools are 13 characters and Karpenter appends its
+		// five-character NodeClaim suffix. Keep the provider's
+		// <cluster>-karp-<nodeclaim> VM/hostname contract within DNS-1123's
+		// 63-character limit before any billable static capacity is requested.
+		if len(config.ClusterID) > 38 {
+			return nil, errors.New("cloudprovider: cluster ID must be at most 38 characters when the node load balancer is enabled")
+		}
 	}
 	poolStart, poolStop, err := parsePrivateLoadBalancerPool(config.PrivateLoadBalancerPoolStart, config.PrivateLoadBalancerPoolStop)
 	if err != nil {
@@ -192,6 +234,17 @@ func (p *Provider) Initialize(clientBuilder cloud.ControllerClientBuilder, stopC
 		panic("cloudprovider: controller client builder returned a nil Kubernetes client")
 	}
 	p.kubeClient = client
+	if p.config.NodeLoadBalancer.Enabled {
+		restConfig, err := clientBuilder.Config("inspace-node-load-balancer-controller")
+		if err != nil {
+			panic(fmt.Sprintf("cloudprovider: initialize node load balancer REST config: %v", err))
+		}
+		dynamicClient, err := dynamic.NewForConfig(restConfig)
+		if err != nil {
+			panic(fmt.Sprintf("cloudprovider: initialize node load balancer dynamic client: %v", err))
+		}
+		p.dynamicClient = dynamicClient
+	}
 	p.stopCh = stopCh
 }
 
@@ -210,6 +263,13 @@ func (p *Provider) SetInformers(factory informers.SharedInformerFactory) {
 	p.endpointSliceLister = controller.endpointSlices
 	p.endpointSlicesSynced = controller.endpointSlicesSynced
 	go controller.Run(p.stopCh)
+	if p.config.NodeLoadBalancer.Enabled {
+		nodeController, err := newNodeLoadBalancerController(p, factory)
+		if err != nil {
+			panic(fmt.Sprintf("cloudprovider: initialize node load balancer controller: %v", err))
+		}
+		go nodeController.Run(p.stopCh)
+	}
 }
 
 func (p *Provider) ProviderName() string                     { return ProviderName }

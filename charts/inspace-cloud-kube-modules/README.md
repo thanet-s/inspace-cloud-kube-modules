@@ -10,9 +10,13 @@ controller upgrades.
 The fixed RKE2 control plane uses a private kube-vip address inside the shared
 InSpace VPC for TCP/6443 and TCP/9345; it does not use a control-plane NLB or a
 public API address. Because InSpace has no managed outbound NAT, each control
-plane and Karpenter worker still needs one floating IPv4 for egress. Those node
-addresses must have no public inbound firewall rules. Operator SSH and the
-private API tunnel enter through the separately firewalled bastion only.
+plane and Karpenter worker still needs one floating IPv4 for egress. Ordinary
+node addresses must have no public inbound firewall rules; CCM-managed
+load-balancer nodes retain the private base firewall, receive exact
+per-Service TCP/UDP firewalls, and reuse one cluster-wide portless ICMP-from-Any
+firewall. Bastion SSH and ICMP use Any by default or one explicitly configured
+management `/32`; the private API tunnel enters through the separately
+firewalled bastion only.
 
 Set each `InSpaceNodeClass.spec.rke2.server` to the canonical literal private
 VIP URL on port 9345. Its existing worker firewall must allow all TCP, UDP, and
@@ -24,7 +28,7 @@ Announcements. LB IPAM allocates a unique private VIP per Service, so different
 Services can reuse the same port without creating paid InSpace load balancers.
 This chart does not install the Cilium pool or announcement policy: cluster
 bootstrap renders those resources against RKE2's bundled Cilium CRDs. Bootstrap
-enables `l2announcements`, keeps `nodeIPAM.enabled=false`, and sets
+enables `l2announcements` and Node IPAM, and sets
 `defaultLBServiceIPAM: none`. Consequently, Cilium claims the explicit
 `io.cilium/l2-announcer` class while Kubernetes' generic external CCM can own
 the deliberately classless public InSpace path without two controllers acting
@@ -62,13 +66,101 @@ spec:
   externalTrafficPolicy: Cluster
 ```
 
-Cilium Node IPAM is intentionally disabled and unsupported. Do not use
-`loadBalancerClass: io.cilium/node`; it exposes node addresses rather than a
-unique private VIP per Service. Cilium L2 Announcements is a beta feature and
+Cilium Node IPAM is reserved for CCM-owned public node-load-balancer shadow
+Services. Use `loadBalancerClass: inspace.cloud/node`; CCM creates a
+quarantined `io.cilium/node` shadow Service whose node selector names exactly
+one managed shard. The Node identity and readiness labels use the
+`inspace.cloud.node-restriction.kubernetes.io/*` prefix and therefore require
+the RKE2 NodeRestriction admission plugin.
+
+This is a trusted-administrator contract, not tenant isolation. In a
+multi-tenant cluster, admission and RBAC must reserve direct `io.cilium/node`
+Services, `io.cilium.nodeipam/*` annotations, `Service.spec.externalIPs`, and
+the Node-LB taint/toleration and selector surface for the controllers. The
+`NoSchedule` taint keeps ordinary workloads off LB nodes, but a user allowed to
+tolerate it or select a node directly can bypass that placement guard. Cilium
+L2 Announcements is a beta feature and
 works only if the InSpace VPC accepts ARP and gratuitous ARP for VIPs that are
 not assigned to a VM NIC. Validate this behavior in the target VPC. Keep
 `externalTrafficPolicy: Cluster`; Cilium documents `Local` as incompatible with
 L2 Announcements.
+
+The node-load-balancer class defaults to shared mode when the mode annotation is
+omitted:
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: web
+spec:
+  type: LoadBalancer
+  loadBalancerClass: inspace.cloud/node
+  allocateLoadBalancerNodePorts: false
+  externalTrafficPolicy: Cluster
+  selector:
+    app: web
+  ports:
+    - port: 443
+      targetPort: 8443
+      protocol: TCP
+```
+
+Shared Services reuse a shard whenever their public `(protocol, port)` claims
+do not conflict. A conflict automatically creates another shard. The optional
+`service.inspace.cloud/node-lb-nodes-per-shard` annotation overrides
+`ccm.nodeLoadBalancer.nodesPerShard`; both default to `1`. Each replica has its
+own FIP, so values above one publish multiple addresses rather than one virtual
+IP.
+
+Dedicated mode always creates a separate shard and supports an exact catalog
+shape through Service annotations:
+
+```yaml
+metadata:
+  annotations:
+    service.inspace.cloud/node-lb-mode: public-node-dedicated
+    service.inspace.cloud/node-lb-cpu: "4"
+    service.inspace.cloud/node-lb-memory: 8Gi
+spec:
+  type: LoadBalancer
+  loadBalancerClass: inspace.cloud/node
+  allocateLoadBalancerNodePorts: false
+  externalTrafficPolicy: Cluster
+  selector:
+    app: web
+```
+
+CPU and memory default to `1` core and `2Gi`. Generated static NodePools always
+use AMD EPYC, Linux/amd64, on-demand capacity, a 30 GiB root disk, and the
+`inspace.cloud/node-lb=true:NoSchedule` taint. Application pods stay on private
+workload nodes; Cilium forwards traffic from the LB nodes with
+`externalTrafficPolicy: Cluster`. CCM creates one exact TCP/UDP-only ingress
+firewall per Service and attaches one reusable cluster-wide firewall containing
+exactly one portless inbound ICMP-from-Any rule. `loadBalancerSourceRanges`
+restricts only that Service's TCP/UDP rules; it never restricts ping. InSpace
+does not expose ICMP type/code filtering, so the shared rule permits all IPv4
+ICMP from Any.
+
+A node is advertised only while its full NodePool/NodeClaim/NodeClass identity
+is authoritative, it is Ready with exactly one authoritative FIP, Karpenter's
+private base-firewall contract is valid, and the global ICMP plus every active
+Service firewall assignment are visible. Any drift removes the protected ready
+label. Karpenter may use one temporary surge node during drift replacement;
+steady state remains the configured shard replica count.
+
+Public-node Services require a non-empty selector and explicit
+`allocateLoadBalancerNodePorts: false`. Selectorless Services, allocated
+NodePorts, `externalIPs`, `loadBalancerIP`, and non-IPv4 source ranges fail
+before any node capacity is created. CCM keeps the previous shard advertised
+during migration until replacement capacity and Cilium status both converge.
+
+Disabling Node-LB or uninstalling its CCM/Karpenter controllers is not a
+teardown operation. First delete every `inspace.cloud/node` Service and wait
+for its provider finalizer, shadow Service, managed NodePools/NodeClaims/Nodes,
+FIPs, and both Service and shared ICMP firewalls to disappear. Removing the
+controllers earlier stops authoritative cleanup and can retain billable cloud
+resources.
 
 Public exposure remains an explicit, paid, TCP-only InSpace NLB. A public
 Service deliberately leaves `loadBalancerClass` unset for Kubernetes' generic
@@ -85,8 +177,10 @@ convergence instead. For both `Local` and `Cluster`, nodes labeled
 Kubernetes defaults an omitted policy to `Cluster`, so public Services that
 need local-endpoint targeting must set `externalTrafficPolicy: Local`
 explicitly. Private Cilium L2 Services must remain `Cluster`.
-See [`service-private-l2.yaml`](examples/service-private-l2.yaml) and
-[`service-public-nlb.yaml`](examples/service-public-nlb.yaml).
+See [`service-private-l2.yaml`](examples/service-private-l2.yaml),
+[`service-public-nlb.yaml`](examples/service-public-nlb.yaml),
+[`service-public-node-shared.yaml`](examples/service-public-node-shared.yaml),
+and [`service-public-node-dedicated.yaml`](examples/service-public-node-dedicated.yaml).
 
 ## Secret contracts
 
