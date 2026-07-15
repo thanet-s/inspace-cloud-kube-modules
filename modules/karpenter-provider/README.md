@@ -1,6 +1,6 @@
 # Karpenter Provider for InSpace
 
-This repository implements the InSpace provider for Karpenter `v1.14.0` and RKE2. It includes a production API adapter, `InSpaceNodeClass`, a 31-variant instance catalog, stock-Ubuntu bootstrap, NodeClass readiness reconciliation, and a runnable Karpenter controller command.
+This repository implements the InSpace provider for Karpenter `v1.14.0` and RKE2. It includes a production API adapter, `InSpaceNodeClass`, a 30-variant instance catalog, stock-Ubuntu bootstrap, NodeClass readiness reconciliation, and a runnable Karpenter controller command.
 
 ## Supported contract
 
@@ -9,8 +9,8 @@ This repository implements the InSpace provider for Karpenter `v1.14.0` and RKE2
 - `amd-epyc` host pool `6976fdc8-4492-465b-bd16-9ad5f6b00b03`
 - The original 24-shape matrix: `compute`, `general`, and `memory` families at
   1, 2, and 4 GiB/vCPU for CPU sizes `2, 4, 6, 8, 10, 12, 14, 16`
-- Two additional single-core shapes, `is-general-1c-2g` and
-  `is-memory-1c-4g`
+- One additional single-core standard shape, `is-memory-1c-4g`; this is the
+  smallest advertised Karpenter shape
 - The `extra-memory` family at 8 GiB/vCPU for CPU sizes `1, 2, 4, 6, 8`;
   it stops at 8 vCPU because instances cannot exceed 64 GiB RAM
 - Maximum 16 vCPU / 64 GiB across the catalog
@@ -19,7 +19,10 @@ This repository implements the InSpace provider for Karpenter `v1.14.0` and RKE2
 - One immutable, inclusive 16-to-256-address RFC1918 Service VIP range reserved
   from worker NIC allocation
 
-Variant names describe raw VM capacity, for example `is-general-1c-2g`, `is-memory-1c-4g`, `is-extra-memory-1c-8g`, and `is-extra-memory-8c-64g`. Allocatable disk reserves 8 GiB for Ubuntu/RKE2 plus a 4 GiB eviction threshold.
+Variant names describe raw VM capacity, for example `is-memory-1c-4g`,
+`is-extra-memory-1c-8g`, `is-general-2c-4g`, and
+`is-extra-memory-8c-64g`. Allocatable disk reserves 8 GiB for Ubuntu/RKE2 plus
+a 4 GiB eviction threshold.
 
 Every catalog shape advertises numeric `inspace.cloud/instance-cpu` (cores)
 and `inspace.cloud/instance-memory` (MiB) labels. NodePool requirements can use
@@ -213,12 +216,21 @@ compare canonical VM name, capacity, image, host pool, VPC, billing account,
 and exactly one primary root disk against that record before reporting a worker
 healthy. Complete established v1 and v2 records remain available for compatible
 read and ownership-checked deletion. Both legacy schemas derive capacity from
-the frozen 24-variant set, which intentionally excludes the two added
-single-core shapes and the entire `extra-memory` family, and derive the pool
-UUID from the frozen host-class mapping. A v1 record additionally uses the
-NodeClaim name as its VM/node name. Partial or
+the frozen 24-variant set, which intentionally excludes both v3-era
+single-core ownership shapes and the entire `extra-memory` family, and derive
+the pool UUID from the frozen host-class mapping. Current-schema ownership
+read and deletion remain compatible with the withdrawn `is-general-1c-2g`
+shape even though the catalog no longer advertises it. A v1 record additionally
+uses the NodeClaim name as its VM/node name. Partial or
 contradictory exact fields fail closed; operators should recycle any legacy
 worker whose identity cannot be derived.
+
+Before upgrading an existing cluster, remove any NodePool requirement pinned
+to `is-general-1c-2g` and allow Karpenter to replace that capacity with
+`is-memory-1c-4g` or a larger advertised shape. The withdrawn instance type can
+no longer launch or replace a node, and an existing NodeClaim may be reported
+as drifted once the provider stops advertising it; read and deletion
+compatibility exists only to make that retirement ownership-safe.
 
 `spec.networkUUID` and the literal VIP in `spec.rke2.server` must exactly match
 the controller-wide `INSPACE_NETWORK_UUID` and `INSPACE_CONTROL_PLANE_VIP`.

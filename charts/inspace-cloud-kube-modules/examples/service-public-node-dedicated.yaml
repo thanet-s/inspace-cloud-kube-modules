@@ -4,7 +4,8 @@ metadata:
   name: example-public-dedicated
   annotations:
     service.inspace.cloud/node-lb-mode: public-node-dedicated
-    # These are optional. Dedicated mode defaults to 1 CPU and 2 GiB.
+    # These are optional. Dedicated mode defaults to 1 CPU and 4 GiB.
+    # This is also the enforced minimum.
     service.inspace.cloud/node-lb-cpu: "4"
     service.inspace.cloud/node-lb-memory: 8Gi
 spec:

@@ -19,6 +19,7 @@ import (
 	kubefake "k8s.io/client-go/kubernetes/fake"
 	corelisters "k8s.io/client-go/listers/core/v1"
 	k8stesting "k8s.io/client-go/testing"
+	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
 
 	inspace "github.com/thanet-s/inspace-cloud-kube-modules/modules/client"
@@ -35,7 +36,7 @@ func TestNodeLoadBalancerProfileChangeDoesNotPreserveOldShard(t *testing.T) {
 	service.Annotations[annotationNodeLoadBalancerCPU] = "2"
 	service.Annotations[annotationNodeLoadBalancerMemory] = "4Gi"
 
-	oldProfile := nodeLoadBalancerProfileHash(nodeLoadBalancerModeShared, nodeLoadBalancerDefaultPool, 1, 1, 2048)
+	oldProfile := nodeLoadBalancerProfileHash(nodeLoadBalancerModeShared, nodeLoadBalancerDefaultPool, 1, nodeLoadBalancerDefaultCPU, nodeLoadBalancerDefaultMemoryMiB)
 	nodePool := nodeLoadBalancerSafetyNodePool(oldShard, "unit-test-cluster", oldProfile, 1)
 	provider := newTestProvider(t, &fakeAPI{})
 	provider.config.NodeLoadBalancer = NodeLoadBalancerConfig{Enabled: true, DefaultNodeClass: "workers", NodesPerShard: 1}
@@ -69,6 +70,45 @@ func TestNodeLoadBalancerProfileChangeDoesNotPreserveOldShard(t *testing.T) {
 	}
 }
 
+func TestNodeLoadBalancerDefaultUpgradeMigratesLegacyUnderMinimumShard(t *testing.T) {
+	ctx := context.Background()
+	const oldShard = "inlb-0123abcd"
+
+	service := nodeLoadBalancerTestService("web", "web-uid", corev1.ProtocolTCP, 443)
+	service.Annotations[annotationNodeLoadBalancerShard] = oldShard
+	nodePool := nodeLoadBalancerSafetyLegacyNodePool(oldShard, "unit-test-cluster", nodeLoadBalancerModeShared, nodeLoadBalancerDefaultPool, 1)
+
+	provider := newTestProvider(t, &fakeAPI{})
+	provider.config.NodeLoadBalancer = NodeLoadBalancerConfig{Enabled: true, DefaultNodeClass: "workers", NodesPerShard: 1}
+	provider.dynamicClient = fake.NewSimpleDynamicClient(runtime.NewScheme(), nodePool)
+	provider.kubeClient = kubefake.NewSimpleClientset(
+		service.DeepCopy(),
+		desiredNodeLoadBalancerShadow(service, nodeLoadBalancerShadowName(service), provider.config.ClusterID, oldShard),
+	)
+	serviceIndexer := newNamespacedIndexer()
+	if err := serviceIndexer.Add(service); err != nil {
+		t.Fatal(err)
+	}
+	if err := serviceIndexer.Add(desiredNodeLoadBalancerShadow(service, nodeLoadBalancerShadowName(service), provider.config.ClusterID, oldShard)); err != nil {
+		t.Fatal(err)
+	}
+	controller := &nodeLoadBalancerController{
+		provider: provider,
+		services: corelisters.NewServiceLister(serviceIndexer),
+	}
+
+	intent, plan, _, err := controller.planForService(ctx, service)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if intent.ExistingShard != "" {
+		t.Fatalf("upgraded Service retained legacy under-minimum shard %q", intent.ExistingShard)
+	}
+	if got := plan.Assignments[intent.ServiceID]; got == "" || got == oldShard {
+		t.Fatalf("upgraded Service assignment = %q, want a guarded replacement shard", got)
+	}
+}
+
 func TestNodeLoadBalancerChangedPortCannotEvictStableSharedClaim(t *testing.T) {
 	ctx := context.Background()
 	const oldShard = "inlb-0123abcd"
@@ -80,7 +120,7 @@ func TestNodeLoadBalancerChangedPortCannotEvictStableSharedClaim(t *testing.T) {
 	changedBeforeEdit := changed.DeepCopy()
 	changedBeforeEdit.Spec.Ports[0].Port = 80
 
-	profile := nodeLoadBalancerProfileHash(nodeLoadBalancerModeShared, nodeLoadBalancerDefaultPool, 1, 1, 2048)
+	profile := nodeLoadBalancerProfileHash(nodeLoadBalancerModeShared, nodeLoadBalancerDefaultPool, 1, nodeLoadBalancerDefaultCPU, nodeLoadBalancerDefaultMemoryMiB)
 	nodePool := nodeLoadBalancerSafetyNodePool(oldShard, "unit-test-cluster", profile, 1)
 	provider := newTestProvider(t, &fakeAPI{})
 	provider.config.NodeLoadBalancer = NodeLoadBalancerConfig{Enabled: true, DefaultNodeClass: "workers", NodesPerShard: 1}
@@ -134,7 +174,7 @@ func TestNodeLoadBalancerInactiveMigratingPortEditCannotEvictActiveReplacementCl
 	active := nodeLoadBalancerTestService("active", "z-active-uid", corev1.ProtocolTCP, 443)
 	active.Annotations[annotationNodeLoadBalancerShard] = replacementShard
 
-	profile := nodeLoadBalancerProfileHash(nodeLoadBalancerModeShared, nodeLoadBalancerDefaultPool, 1, 1, 2048)
+	profile := nodeLoadBalancerProfileHash(nodeLoadBalancerModeShared, nodeLoadBalancerDefaultPool, 1, nodeLoadBalancerDefaultCPU, nodeLoadBalancerDefaultMemoryMiB)
 	provider := newTestProvider(t, &fakeAPI{})
 	provider.config.NodeLoadBalancer = NodeLoadBalancerConfig{Enabled: true, DefaultNodeClass: "workers", NodesPerShard: 1}
 	provider.dynamicClient = fake.NewSimpleDynamicClient(
@@ -186,7 +226,7 @@ func TestNodeLoadBalancerSimultaneousPortSwapReservesBothLiveShadows(t *testing.
 	xBeforeSwap := x.DeepCopy()
 	xBeforeSwap.Spec.Ports[0].Port = 443
 
-	profile := nodeLoadBalancerProfileHash(nodeLoadBalancerModeShared, nodeLoadBalancerDefaultPool, 1, 1, 2048)
+	profile := nodeLoadBalancerProfileHash(nodeLoadBalancerModeShared, nodeLoadBalancerDefaultPool, 1, nodeLoadBalancerDefaultCPU, nodeLoadBalancerDefaultMemoryMiB)
 	provider := newTestProvider(t, &fakeAPI{})
 	provider.config.NodeLoadBalancer = NodeLoadBalancerConfig{Enabled: true, DefaultNodeClass: "workers", NodesPerShard: 1}
 	provider.dynamicClient = fake.NewSimpleDynamicClient(
@@ -241,7 +281,7 @@ func TestNodeLoadBalancerDeletingPeerShadowReservesItsPortUntilCleanup(t *testin
 	deleting.DeletionTimestamp = &now
 	deleting.Annotations[annotationNodeLoadBalancerShard] = shard
 
-	profile := nodeLoadBalancerProfileHash(nodeLoadBalancerModeShared, nodeLoadBalancerDefaultPool, 1, 1, 2048)
+	profile := nodeLoadBalancerProfileHash(nodeLoadBalancerModeShared, nodeLoadBalancerDefaultPool, 1, nodeLoadBalancerDefaultCPU, nodeLoadBalancerDefaultMemoryMiB)
 	provider := newTestProvider(t, &fakeAPI{})
 	provider.config.NodeLoadBalancer = NodeLoadBalancerConfig{Enabled: true, DefaultNodeClass: "workers", NodesPerShard: 1}
 	provider.dynamicClient = fake.NewSimpleDynamicClient(
@@ -292,7 +332,7 @@ func TestNodeLoadBalancerPlannerReadsLiveShadowWhenInformerIsStale(t *testing.T)
 	stableShadow := desiredNodeLoadBalancerShadow(stable, nodeLoadBalancerShadowName(stable), "unit-test-cluster", shard)
 	deletingShadow := desiredNodeLoadBalancerShadow(deleting, nodeLoadBalancerShadowName(deleting), "unit-test-cluster", shard)
 
-	profile := nodeLoadBalancerProfileHash(nodeLoadBalancerModeShared, nodeLoadBalancerDefaultPool, 1, 1, 2048)
+	profile := nodeLoadBalancerProfileHash(nodeLoadBalancerModeShared, nodeLoadBalancerDefaultPool, 1, nodeLoadBalancerDefaultCPU, nodeLoadBalancerDefaultMemoryMiB)
 	provider := newTestProvider(t, &fakeAPI{})
 	provider.config.NodeLoadBalancer = NodeLoadBalancerConfig{Enabled: true, DefaultNodeClass: "workers", NodesPerShard: 1}
 	provider.dynamicClient = fake.NewSimpleDynamicClient(
@@ -368,7 +408,7 @@ func TestNodeLoadBalancerDefaultedNodePoolReadbackIsIdempotent(t *testing.T) {
 	const shardName = "inlb-89abcdef"
 	shard := nodeLoadBalancerShardPlan{
 		Name: shardName, Mode: nodeLoadBalancerModeShared, Pool: nodeLoadBalancerDefaultPool,
-		NodesPerShard: 1, CPU: 1, MemoryMiB: 2048,
+		NodesPerShard: 1, CPU: nodeLoadBalancerDefaultCPU, MemoryMiB: nodeLoadBalancerDefaultMemoryMiB,
 	}
 	desired, err := renderNodeLoadBalancerNodePool(shardName, "unit-test-node-lb", shard)
 	if err != nil {
@@ -401,7 +441,7 @@ func TestNodeLoadBalancerNodePoolAuthorizationRequiresFullHardenedProfile(t *tes
 	provider := newTestProvider(t, &fakeAPI{})
 	controller := &nodeLoadBalancerController{provider: provider}
 	nodeClassName := managedNodeLoadBalancerName(provider.config.ClusterID, "node-lb")
-	profile := nodeLoadBalancerProfileHash(nodeLoadBalancerModeShared, nodeLoadBalancerDefaultPool, 1, 1, 2048)
+	profile := nodeLoadBalancerProfileHash(nodeLoadBalancerModeShared, nodeLoadBalancerDefaultPool, 1, nodeLoadBalancerDefaultCPU, nodeLoadBalancerDefaultMemoryMiB)
 	baseline := nodeLoadBalancerSafetyNodePool(shard, provider.config.ClusterID, profile, 1)
 	if !controller.nodeLoadBalancerNodePoolAuthoritative(baseline, shard, nodeClassName) {
 		t.Fatal("exact rendered NodePool was not authoritative")
@@ -428,7 +468,7 @@ func TestNodeLoadBalancerNodePoolAuthorizationRequiresFullHardenedProfile(t *tes
 			for _, raw := range requirements {
 				requirement := raw.(map[string]any)
 				if requirement["key"] == "inspace.cloud/instance-cpu" {
-					requirement["values"] = []any{"2"}
+					requirement["values"] = []any{"4"}
 				}
 			}
 			if err := unstructured.SetNestedSlice(pool.Object, requirements, "spec", "template", "spec", "requirements"); err != nil {
@@ -454,6 +494,73 @@ func TestNodeLoadBalancerNodePoolAuthorizationRequiresFullHardenedProfile(t *tes
 			mutate(t, pool)
 			if controller.nodeLoadBalancerNodePoolAuthoritative(pool, shard, nodeClassName) {
 				t.Fatal("drifted NodePool remained authoritative")
+			}
+		})
+	}
+}
+
+func TestNodeLoadBalancerLegacyNodePoolAuthorizationIsExactAndMigrationOnly(t *testing.T) {
+	const shard = "inlb-89abcdef"
+	provider := newTestProvider(t, &fakeAPI{})
+	controller := &nodeLoadBalancerController{provider: provider}
+	nodeClassName := managedNodeLoadBalancerName(provider.config.ClusterID, "node-lb")
+	legacyPlan := nodeLoadBalancerShardPlan{
+		Name: shard, Mode: nodeLoadBalancerModeShared, Pool: nodeLoadBalancerDefaultPool,
+		NodesPerShard: 1, CPU: 1, MemoryMiB: 2048,
+	}
+	baseline := nodeLoadBalancerSafetyLegacyNodePool(
+		shard,
+		provider.config.ClusterID,
+		legacyPlan.Mode,
+		legacyPlan.Pool,
+		int64(legacyPlan.NodesPerShard),
+	)
+	if controller.nodeLoadBalancerNodePoolAuthoritative(baseline, shard, nodeClassName) {
+		t.Fatal("normal authorization accepted the legacy under-minimum NodePool")
+	}
+	if !controller.legacyNodeLoadBalancerNodePoolAuthoritative(baseline, shard, nodeClassName, legacyPlan) {
+		t.Fatal("exact legacy NodePool was not accepted by the migration-only predicate")
+	}
+	if _, err := renderNodeLoadBalancerNodePool(shard, nodeClassName, legacyPlan); err == nil {
+		t.Fatal("normal renderer accepted the legacy under-minimum shape")
+	}
+
+	tests := map[string]func(*testing.T, *unstructured.Unstructured, *nodeLoadBalancerShardPlan){
+		"wrong profile": func(t *testing.T, pool *unstructured.Unstructured, _ *nodeLoadBalancerShardPlan) {
+			labels := pool.GetLabels()
+			labels[nodeLoadBalancerProfileLabel] = "foreign-profile"
+			pool.SetLabels(labels)
+		},
+		"foreign cluster ownership": func(t *testing.T, pool *unstructured.Unstructured, _ *nodeLoadBalancerShardPlan) {
+			labels := pool.GetLabels()
+			labels[nodeLoadBalancerClusterLabel] = "foreign-cluster"
+			pool.SetLabels(labels)
+		},
+		"missing isolation taint": func(t *testing.T, pool *unstructured.Unstructured, _ *nodeLoadBalancerShardPlan) {
+			unstructured.RemoveNestedField(pool.Object, "spec", "template", "spec", "taints")
+		},
+		"changed disruption policy": func(t *testing.T, pool *unstructured.Unstructured, _ *nodeLoadBalancerShardPlan) {
+			if err := unstructured.SetNestedField(pool.Object, "WhenEmpty", "spec", "disruption", "consolidationPolicy"); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"wrong CPU": func(t *testing.T, pool *unstructured.Unstructured, _ *nodeLoadBalancerShardPlan) {
+			setNodeLoadBalancerSafetyRequirement(t, pool, "inspace.cloud/instance-cpu", "2")
+		},
+		"wrong memory": func(t *testing.T, pool *unstructured.Unstructured, _ *nodeLoadBalancerShardPlan) {
+			setNodeLoadBalancerSafetyRequirement(t, pool, "inspace.cloud/instance-memory", "4096")
+		},
+		"mismatched expected mode": func(_ *testing.T, _ *unstructured.Unstructured, expected *nodeLoadBalancerShardPlan) {
+			expected.Mode = nodeLoadBalancerModeDedicated
+		},
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			pool := baseline.DeepCopy()
+			expected := legacyPlan
+			mutate(t, pool, &expected)
+			if controller.legacyNodeLoadBalancerNodePoolAuthoritative(pool, shard, nodeClassName, expected) {
+				t.Fatal("drifted legacy NodePool remained authoritative")
 			}
 		})
 	}
@@ -598,7 +705,7 @@ func TestNodeLoadBalancerQuarantineDeletesSoleInvalidServiceNodePool(t *testing.
 	const shard = "inlb-0123abcd"
 	service := nodeLoadBalancerSafetyInvalidFinalizedService("invalid", "invalid-uid")
 	service.Annotations[annotationNodeLoadBalancerShard] = shard
-	profile := nodeLoadBalancerProfileHash(nodeLoadBalancerModeShared, nodeLoadBalancerDefaultPool, 1, 1, 2048)
+	profile := nodeLoadBalancerProfileHash(nodeLoadBalancerModeShared, nodeLoadBalancerDefaultPool, 1, nodeLoadBalancerDefaultCPU, nodeLoadBalancerDefaultMemoryMiB)
 	provider := newTestProvider(t, &fakeAPI{})
 	provider.config.NodeLoadBalancer = NodeLoadBalancerConfig{Enabled: true, DefaultNodeClass: "workers", NodesPerShard: 1}
 	provider.kubeClient = kubefake.NewSimpleClientset(service.DeepCopy())
@@ -704,7 +811,7 @@ func TestNodeLoadBalancerCleanupDeletesCurrentAndPreviousMigrationShards(t *test
 	service.Finalizers = []string{nodeLoadBalancerFinalizer}
 	service.Annotations[annotationNodeLoadBalancerShard] = currentShard
 	service.Annotations[annotationNodeLoadBalancerPreviousShard] = previousShard
-	profile := nodeLoadBalancerProfileHash(nodeLoadBalancerModeShared, nodeLoadBalancerDefaultPool, 1, 1, 2048)
+	profile := nodeLoadBalancerProfileHash(nodeLoadBalancerModeShared, nodeLoadBalancerDefaultPool, 1, nodeLoadBalancerDefaultCPU, nodeLoadBalancerDefaultMemoryMiB)
 
 	provider := newTestProvider(t, &fakeAPI{})
 	provider.config.NodeLoadBalancer = NodeLoadBalancerConfig{Enabled: true, DefaultNodeClass: "workers", NodesPerShard: 1}
@@ -1097,6 +1204,14 @@ func TestNodeLoadBalancerMigrationKeepsOldDataplaneUntilReplacementStatusConverg
 	service.Status.LoadBalancer.Ingress = []corev1.LoadBalancerIngress{{IP: oldIP}}
 	shadow := desiredNodeLoadBalancerShadow(service, nodeLoadBalancerShadowName(service), "unit-test-cluster", oldShard)
 	shadow.Status.LoadBalancer.Ingress = []corev1.LoadBalancerIngress{{IP: oldIP}}
+	oldNode := readyNode("lb-old", "inspace://bkk01/"+oldVM)
+	oldNode.Labels = map[string]string{
+		nodeLoadBalancerNodeLabel:        "true",
+		nodeLoadBalancerNodeClusterLabel: "unit-test-cluster",
+		nodeLoadBalancerNodeShardLabel:   oldShard,
+		nodeLoadBalancerReadyLabel:       "true",
+	}
+	oldNode.Status.Addresses = []corev1.NodeAddress{{Type: corev1.NodeExternalIP, Address: oldIP}}
 
 	api := &fakeAPI{}
 	provider := newTestProvider(t, api)
@@ -1114,14 +1229,15 @@ func TestNodeLoadBalancerMigrationKeepsOldDataplaneUntilReplacementStatusConverg
 		BillingAccountID: desired.Request.BillingAccountID, Rules: desired.Request.Rules,
 		ResourcesAssigned: []inspace.FirewallResource{{ResourceType: "vm", ResourceUUID: oldVM}},
 	}}
-	profile := nodeLoadBalancerProfileHash(nodeLoadBalancerModeShared, nodeLoadBalancerDefaultPool, 1, 1, 2048)
+	profile := nodeLoadBalancerProfileHash(nodeLoadBalancerModeShared, nodeLoadBalancerDefaultPool, 1, nodeLoadBalancerDefaultCPU, nodeLoadBalancerDefaultMemoryMiB)
 	base := nodeLoadBalancerSafetyBaseNodeClass()
-	provider.kubeClient = kubefake.NewSimpleClientset(service.DeepCopy(), shadow.DeepCopy())
 	provider.dynamicClient = newNodeLoadBalancerTestDynamicClient(
 		base,
-		nodeLoadBalancerSafetyNodePool(oldShard, provider.config.ClusterID, profile, 1),
+		nodeLoadBalancerSafetyLegacyNodePool(oldShard, provider.config.ClusterID, nodeLoadBalancerModeShared, nodeLoadBalancerDefaultPool, 1),
 		nodeLoadBalancerSafetyNodePool(newShard, provider.config.ClusterID, profile, 1),
 	)
+	installNodeLoadBalancerSafetyIdentity(t, provider, oldNode, oldShard)
+	provider.kubeClient = kubefake.NewSimpleClientset(service.DeepCopy(), shadow.DeepCopy(), oldNode.DeepCopy())
 	serviceIndexer := newNamespacedIndexer()
 	for _, object := range []*corev1.Service{service.DeepCopy(), shadow.DeepCopy()} {
 		if err := serviceIndexer.Add(object); err != nil {
@@ -1129,10 +1245,40 @@ func TestNodeLoadBalancerMigrationKeepsOldDataplaneUntilReplacementStatusConverg
 		}
 	}
 	nodeIndexer := newNamespacedIndexer()
+	if err := nodeIndexer.Add(oldNode.DeepCopy()); err != nil {
+		t.Fatal(err)
+	}
 	controller.services = corelisters.NewServiceLister(serviceIndexer)
 	controller.nodes = corelisters.NewNodeLister(nodeIndexer)
 	controller.queue = workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]())
 	defer controller.queue.ShutDown()
+	legacyShards, err := controller.legacyNodeLoadBalancerMigrationShards(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyPlan, allowed := legacyShards[oldShard]
+	if !allowed {
+		t.Fatalf("active old shard was not identified as a legacy migration: %#v", legacyShards)
+	}
+	legacyPool, err := provider.dynamicClient.Resource(nodePoolGVR).Get(ctx, oldShard, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !controller.legacyNodeLoadBalancerNodePoolAuthoritative(
+		legacyPool,
+		oldShard,
+		managedNodeLoadBalancerName(provider.config.ClusterID, "node-lb"),
+		legacyPlan,
+	) {
+		desiredLegacy, renderErr := renderLegacyNodeLoadBalancerNodePoolForAuthorization(oldShard, managedNodeLoadBalancerName(provider.config.ClusterID, "node-lb"), legacyPlan)
+		if renderErr != nil {
+			t.Fatal(renderErr)
+		}
+		if markErr := markNodeLoadBalancerManaged(desiredLegacy, provider.config.ClusterID, oldShard, nodeLoadBalancerShardProfileHash(legacyPlan)); markErr != nil {
+			t.Fatal(markErr)
+		}
+		t.Fatalf("active old NodePool was not authoritative for migration: plan=%#v actual=%#v desired=%#v", legacyPlan, legacyPool.Object, desiredLegacy.Object)
+	}
 
 	if err := controller.sync(ctx, service.Namespace+"/"+service.Name); err != nil {
 		t.Fatal(err)
@@ -1145,6 +1291,25 @@ func TestNodeLoadBalancerMigrationKeepsOldDataplaneUntilReplacementStatusConverg
 	}
 	if _, err := provider.dynamicClient.Resource(nodePoolGVR).Get(ctx, oldShard, metav1.GetOptions{}); err != nil {
 		t.Fatalf("old NodePool was deleted before cutover: %v", err)
+	}
+	storedOldNode, err := provider.kubeClient.CoreV1().Nodes().Get(ctx, oldNode.Name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if storedOldNode.Labels[nodeLoadBalancerReadyLabel] != "true" {
+		t.Fatal("legacy Node lost its Cilium readiness label before replacement capacity converged")
+	}
+	if !firewallAssignedToVM(*nodeLoadBalancerSafetyFirewallByUUID(t, api.firewalls, firewallUUID), oldVM) {
+		t.Fatal("Service firewall detached from the legacy Node before replacement capacity converged")
+	}
+	nodeClassName := managedNodeLoadBalancerName(provider.config.ClusterID, "node-lb")
+	nodeClass, err := provider.dynamicClient.Resource(nodeClassGVR).Get(ctx, nodeClassName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	icmpUUID := nodeClass.GetAnnotations()[annotationNodeLoadBalancerICMPFirewallUUID]
+	if icmpUUID == "" || !firewallAssignedToVM(*nodeLoadBalancerSafetyFirewallByUUID(t, api.firewalls, icmpUUID), oldVM) {
+		t.Fatal("cluster ICMP firewall detached from the legacy Node before replacement capacity converged")
 	}
 
 	newNode := readyNode("lb-new", "inspace://bkk01/"+newVM)
@@ -1200,8 +1365,20 @@ func TestNodeLoadBalancerMigrationKeepsOldDataplaneUntilReplacementStatusConverg
 	if _, err := provider.dynamicClient.Resource(nodePoolGVR).Get(ctx, oldShard, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
 		t.Fatalf("old NodePool remains after converged cutover: %v", err)
 	}
-	if firewallAssignedToVM(api.firewalls[0], oldVM) || !firewallAssignedToVM(api.firewalls[0], newVM) {
-		t.Fatalf("post-cutover firewall assignments = %#v", api.firewalls[0].ResourcesAssigned)
+	storedOldNode, err = provider.kubeClient.CoreV1().Nodes().Get(ctx, oldNode.Name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := storedOldNode.Labels[nodeLoadBalancerReadyLabel]; exists {
+		t.Fatal("legacy Node retained its Cilium readiness label after cutover")
+	}
+	serviceFirewall := nodeLoadBalancerSafetyFirewallByUUID(t, api.firewalls, firewallUUID)
+	if firewallAssignedToVM(*serviceFirewall, oldVM) || !firewallAssignedToVM(*serviceFirewall, newVM) {
+		t.Fatalf("post-cutover firewall assignments = %#v", serviceFirewall.ResourcesAssigned)
+	}
+	icmpFirewall := nodeLoadBalancerSafetyFirewallByUUID(t, api.firewalls, icmpUUID)
+	if firewallAssignedToVM(*icmpFirewall, oldVM) || !firewallAssignedToVM(*icmpFirewall, newVM) {
+		t.Fatalf("post-cutover ICMP firewall assignments = %#v", icmpFirewall.ResourcesAssigned)
 	}
 }
 
@@ -1312,7 +1489,7 @@ func TestNodeLoadBalancerRepeatedMigrationDeletesAbandonedShardAndPreservesActiv
 	service.Annotations[annotationNodeLoadBalancerPreviousFirewall] = activeFirewall
 	shadow := desiredNodeLoadBalancerShadow(service, nodeLoadBalancerShadowName(service), "unit-test-cluster", activeShard)
 
-	profile := nodeLoadBalancerProfileHash(nodeLoadBalancerModeShared, nodeLoadBalancerDefaultPool, 1, 1, 2048)
+	profile := nodeLoadBalancerProfileHash(nodeLoadBalancerModeShared, nodeLoadBalancerDefaultPool, 1, nodeLoadBalancerDefaultCPU, nodeLoadBalancerDefaultMemoryMiB)
 	provider := newTestProvider(t, &fakeAPI{})
 	provider.config.NodeLoadBalancer = NodeLoadBalancerConfig{Enabled: true, DefaultNodeClass: "workers", NodesPerShard: 1}
 	provider.kubeClient = kubefake.NewSimpleClientset(service.DeepCopy(), shadow.DeepCopy())
@@ -1648,7 +1825,7 @@ func TestNodeLoadBalancerNodePoolRepairErrorFailsShardClosed(t *testing.T) {
 
 	shard := nodeLoadBalancerShardPlan{
 		Name: fixture.shard, Mode: nodeLoadBalancerModeShared, Pool: nodeLoadBalancerDefaultPool,
-		NodesPerShard: 1, CPU: 1, MemoryMiB: 2048,
+		NodesPerShard: 1, CPU: nodeLoadBalancerDefaultCPU, MemoryMiB: nodeLoadBalancerDefaultMemoryMiB,
 	}
 	err = fixture.controller.ensureNodePoolFailClosed(
 		fixture.ctx,
@@ -1794,6 +1971,8 @@ type nodeLoadBalancerFailClosedFixture struct {
 	controller          *nodeLoadBalancerController
 	service             *corev1.Service
 	node                *corev1.Node
+	serviceIndexer      cache.Indexer
+	nodeIndexer         cache.Indexer
 }
 
 func newNodeLoadBalancerFailClosedFixture(t *testing.T) *nodeLoadBalancerFailClosedFixture {
@@ -1864,6 +2043,7 @@ func newNodeLoadBalancerFailClosedFixture(t *testing.T) *nodeLoadBalancerFailClo
 	return &nodeLoadBalancerFailClosedFixture{
 		ctx: ctx, shard: shard, serviceFirewallUUID: serviceFirewallUUID, icmpFirewallUUID: icmpUUID,
 		api: api, provider: provider, controller: controller, service: service, node: node,
+		serviceIndexer: serviceIndexer, nodeIndexer: nodeIndexer,
 	}
 }
 
@@ -1876,6 +2056,27 @@ func (f *nodeLoadBalancerFailClosedFixture) firewall(t *testing.T, uuid string) 
 	}
 	t.Fatalf("fixture firewall %s is absent", uuid)
 	return nil
+}
+
+func (f *nodeLoadBalancerFailClosedFixture) replaceNodePoolWithLegacyDefault(t *testing.T) {
+	t.Helper()
+	resource := f.provider.dynamicClient.Resource(nodePoolGVR)
+	current, err := resource.Get(f.ctx, f.shard, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy := nodeLoadBalancerSafetyLegacyNodePool(
+		f.shard,
+		f.provider.config.ClusterID,
+		nodeLoadBalancerModeShared,
+		nodeLoadBalancerDefaultPool,
+		1,
+	)
+	legacy.SetUID(current.GetUID())
+	legacy.SetResourceVersion(current.GetResourceVersion())
+	if _, err := resource.Update(f.ctx, legacy, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func getNodeLoadBalancerTestService(
@@ -2001,6 +2202,140 @@ func TestNodeLoadBalancerAuthorizesExactNodeClaimNodePoolNodeClassAndFIPChain(t 
 	}
 	if _, exists := current.Labels[nodeLoadBalancerReadyLabel]; exists {
 		t.Fatal("readiness boundary retained advertisement after ExternalIP diverged from authoritative FIP")
+	}
+}
+
+func TestNodeLoadBalancerLegacyAuthorizationRequiresActiveOmittedSizingService(t *testing.T) {
+	assertRejected := func(t *testing.T, mutate func(*testing.T, *nodeLoadBalancerFailClosedFixture)) {
+		t.Helper()
+		fixture := newNodeLoadBalancerFailClosedFixture(t)
+		defer fixture.controller.queue.ShutDown()
+		fixture.replaceNodePoolWithLegacyDefault(t)
+		mutate(t, fixture)
+		authorized, err := fixture.controller.authorizedNodesForShard(fixture.ctx, fixture.shard)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(authorized) != 0 {
+			t.Fatalf("legacy Node remained authorized: %#v", authorized)
+		}
+	}
+
+	fixture := newNodeLoadBalancerFailClosedFixture(t)
+	fixture.replaceNodePoolWithLegacyDefault(t)
+	authorized, err := fixture.controller.authorizedNodesForShard(fixture.ctx, fixture.shard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(authorized) != 1 || authorized[0].Name != fixture.node.Name {
+		t.Fatalf("active legacy shard authorization = %#v", authorized)
+	}
+	clusterAuthorized, err := fixture.controller.authorizedNodesForCluster(fixture.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(clusterAuthorized) != 1 || clusterAuthorized[0].Name != fixture.node.Name {
+		t.Fatalf("cluster-wide active legacy shard authorization = %#v", clusterAuthorized)
+	}
+	fixture.controller.queue.ShutDown()
+
+	t.Run("missing provider finalizer", func(t *testing.T) {
+		assertRejected(t, func(t *testing.T, fixture *nodeLoadBalancerFailClosedFixture) {
+			service := getNodeLoadBalancerTestService(t, fixture.ctx, fixture.provider, fixture.service.Namespace, fixture.service.Name)
+			service.Finalizers = nil
+			if _, err := fixture.provider.kubeClient.CoreV1().Services(service.Namespace).Update(fixture.ctx, service, metav1.UpdateOptions{}); err != nil {
+				t.Fatal(err)
+			}
+		})
+	})
+	t.Run("missing shadow", func(t *testing.T) {
+		assertRejected(t, func(t *testing.T, fixture *nodeLoadBalancerFailClosedFixture) {
+			if err := fixture.provider.kubeClient.CoreV1().Services(fixture.service.Namespace).Delete(
+				fixture.ctx,
+				nodeLoadBalancerShadowName(fixture.service),
+				metav1.DeleteOptions{},
+			); err != nil {
+				t.Fatal(err)
+			}
+		})
+	})
+	t.Run("foreign shadow ownership", func(t *testing.T) {
+		assertRejected(t, func(t *testing.T, fixture *nodeLoadBalancerFailClosedFixture) {
+			shadow := getNodeLoadBalancerTestService(t, fixture.ctx, fixture.provider, fixture.service.Namespace, nodeLoadBalancerShadowName(fixture.service))
+			shadow.Labels[nodeLoadBalancerServiceUIDLabel] = "foreign-uid"
+			if _, err := fixture.provider.kubeClient.CoreV1().Services(shadow.Namespace).Update(fixture.ctx, shadow, metav1.UpdateOptions{}); err != nil {
+				t.Fatal(err)
+			}
+		})
+	})
+	t.Run("explicit legacy sizing", func(t *testing.T) {
+		assertRejected(t, func(t *testing.T, fixture *nodeLoadBalancerFailClosedFixture) {
+			service := getNodeLoadBalancerTestService(t, fixture.ctx, fixture.provider, fixture.service.Namespace, fixture.service.Name)
+			service.Annotations[annotationNodeLoadBalancerMode] = nodeLoadBalancerModeDedicated
+			service.Annotations[annotationNodeLoadBalancerCPU] = "1"
+			service.Annotations[annotationNodeLoadBalancerMemory] = "2Gi"
+			if _, err := fixture.provider.kubeClient.CoreV1().Services(service.Namespace).Update(fixture.ctx, service, metav1.UpdateOptions{}); err != nil {
+				t.Fatal(err)
+			}
+		})
+	})
+	t.Run("previous shard no longer active", func(t *testing.T) {
+		assertRejected(t, func(t *testing.T, fixture *nodeLoadBalancerFailClosedFixture) {
+			const replacement = "inlb-deadbeef"
+			service := getNodeLoadBalancerTestService(t, fixture.ctx, fixture.provider, fixture.service.Namespace, fixture.service.Name)
+			service.Annotations[annotationNodeLoadBalancerPreviousShard] = fixture.shard
+			service.Annotations[annotationNodeLoadBalancerShard] = replacement
+			if _, err := fixture.provider.kubeClient.CoreV1().Services(service.Namespace).Update(fixture.ctx, service, metav1.UpdateOptions{}); err != nil {
+				t.Fatal(err)
+			}
+			shadow := getNodeLoadBalancerTestService(t, fixture.ctx, fixture.provider, fixture.service.Namespace, nodeLoadBalancerShadowName(fixture.service))
+			shadow.Annotations[annotationCiliumNodeIPAMMatchLabels] = nodeLoadBalancerCiliumSelector(fixture.provider.config.ClusterID, replacement)
+			if _, err := fixture.provider.kubeClient.CoreV1().Services(shadow.Namespace).Update(fixture.ctx, shadow, metav1.UpdateOptions{}); err != nil {
+				t.Fatal(err)
+			}
+		})
+	})
+}
+
+func TestNodeLoadBalancerLegacyNodeEventEligibilityPreservesThenDrops(t *testing.T) {
+	fixture := newNodeLoadBalancerFailClosedFixture(t)
+	defer fixture.controller.queue.ShutDown()
+	fixture.replaceNodePoolWithLegacyDefault(t)
+
+	if err := fixture.controller.reconcileShardNodeEligibility(fixture.ctx, fixture.shard); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := fixture.provider.kubeClient.CoreV1().Nodes().Get(fixture.ctx, fixture.node.Name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Labels[nodeLoadBalancerReadyLabel] != "true" {
+		t.Fatal("active legacy shard lost its Cilium readiness label")
+	}
+	if err := fixture.nodeIndexer.Update(stored.DeepCopy()); err != nil {
+		t.Fatal(err)
+	}
+
+	service := getNodeLoadBalancerTestService(t, fixture.ctx, fixture.provider, fixture.service.Namespace, fixture.service.Name)
+	service.Annotations[annotationNodeLoadBalancerMode] = nodeLoadBalancerModeDedicated
+	service.Annotations[annotationNodeLoadBalancerCPU] = "1"
+	service.Annotations[annotationNodeLoadBalancerMemory] = "2Gi"
+	updated, err := fixture.provider.kubeClient.CoreV1().Services(service.Namespace).Update(fixture.ctx, service, metav1.UpdateOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.serviceIndexer.Update(updated.DeepCopy()); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.controller.reconcileShardNodeEligibility(fixture.ctx, fixture.shard); err != nil {
+		t.Fatal(err)
+	}
+	stored, err = fixture.provider.kubeClient.CoreV1().Nodes().Get(fixture.ctx, fixture.node.Name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := stored.Labels[nodeLoadBalancerReadyLabel]; exists {
+		t.Fatal("inactive explicit legacy shape retained its Cilium readiness label")
 	}
 }
 
@@ -2161,7 +2496,7 @@ func TestNodeLoadBalancerDetachesStaleFirewallAssignmentWithReadback(t *testing.
 func nodeLoadBalancerSafetyNodePool(name, cluster, profile string, replicas int64) *unstructured.Unstructured {
 	shard := nodeLoadBalancerShardPlan{
 		Name: name, Mode: nodeLoadBalancerModeShared, Pool: nodeLoadBalancerDefaultPool,
-		NodesPerShard: int32(replicas), CPU: 1, MemoryMiB: 2048,
+		NodesPerShard: int32(replicas), CPU: nodeLoadBalancerDefaultCPU, MemoryMiB: nodeLoadBalancerDefaultMemoryMiB,
 	}
 	pool, err := renderNodeLoadBalancerNodePool(name, managedNodeLoadBalancerName(cluster, "node-lb"), shard)
 	if err != nil {
@@ -2172,6 +2507,56 @@ func nodeLoadBalancerSafetyNodePool(name, cluster, profile string, replicas int6
 	}
 	pool.SetUID(types.UID("nodepool-" + name))
 	return pool
+}
+
+func nodeLoadBalancerSafetyLegacyNodePool(name, cluster, mode, poolName string, replicas int64) *unstructured.Unstructured {
+	shard := nodeLoadBalancerShardPlan{
+		Name: name, Mode: mode, Pool: poolName,
+		NodesPerShard: int32(replicas), CPU: 1, MemoryMiB: 2048,
+	}
+	pool, err := renderLegacyNodeLoadBalancerNodePoolForAuthorization(name, managedNodeLoadBalancerName(cluster, "node-lb"), shard)
+	if err != nil {
+		panic(err)
+	}
+	if err := markNodeLoadBalancerManaged(pool, cluster, name, nodeLoadBalancerShardProfileHash(shard)); err != nil {
+		panic(err)
+	}
+	pool.SetUID(types.UID("nodepool-" + name))
+	return pool
+}
+
+func setNodeLoadBalancerSafetyRequirement(t *testing.T, pool *unstructured.Unstructured, key, value string) {
+	t.Helper()
+	requirements, found, err := unstructured.NestedSlice(pool.Object, "spec", "template", "spec", "requirements")
+	if err != nil || !found {
+		t.Fatalf("read NodePool requirements: found=%t err=%v", found, err)
+	}
+	updated := false
+	for _, raw := range requirements {
+		requirement, ok := raw.(map[string]any)
+		if !ok || requirement["key"] != key {
+			continue
+		}
+		requirement["values"] = []any{value}
+		updated = true
+	}
+	if !updated {
+		t.Fatalf("NodePool requirement %q is absent", key)
+	}
+	if err := unstructured.SetNestedSlice(pool.Object, requirements, "spec", "template", "spec", "requirements"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func nodeLoadBalancerSafetyFirewallByUUID(t *testing.T, firewalls []inspace.Firewall, uuid string) *inspace.Firewall {
+	t.Helper()
+	for index := range firewalls {
+		if firewalls[index].UUID == uuid {
+			return &firewalls[index]
+		}
+	}
+	t.Fatalf("firewall %s is absent", uuid)
+	return nil
 }
 
 func newNodeLoadBalancerTestDynamicClient(objects ...runtime.Object) *fake.FakeDynamicClient {
@@ -2211,7 +2596,7 @@ func installNodeLoadBalancerSafetyIdentity(
 
 	pool, err := provider.dynamicClient.Resource(nodePoolGVR).Get(ctx, shard, metav1.GetOptions{})
 	if apierrors.IsNotFound(err) {
-		profile := nodeLoadBalancerProfileHash(nodeLoadBalancerModeShared, nodeLoadBalancerDefaultPool, 1, 1, 2048)
+		profile := nodeLoadBalancerProfileHash(nodeLoadBalancerModeShared, nodeLoadBalancerDefaultPool, 1, nodeLoadBalancerDefaultCPU, nodeLoadBalancerDefaultMemoryMiB)
 		pool = nodeLoadBalancerSafetyNodePool(shard, provider.config.ClusterID, profile, 1)
 		if _, err = provider.dynamicClient.Resource(nodePoolGVR).Create(ctx, pool, metav1.CreateOptions{}); err != nil {
 			t.Fatal(err)
@@ -2235,11 +2620,17 @@ func installNodeLoadBalancerSafetyIdentity(
 			labels[nodeLoadBalancerProfileLabel] = "test-profile"
 		}
 		copy.SetLabels(labels)
-		if err := unstructured.SetNestedStringMap(copy.Object, map[string]string{
-			nodeLoadBalancerNodeLabel:        "true",
-			nodeLoadBalancerNodeClusterLabel: provider.config.ClusterID,
-			nodeLoadBalancerNodeShardLabel:   shard,
-		}, "spec", "template", "metadata", "labels"); err != nil {
+		templateLabels, _, err := unstructured.NestedStringMap(copy.Object, "spec", "template", "metadata", "labels")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if templateLabels == nil {
+			templateLabels = map[string]string{}
+		}
+		templateLabels[nodeLoadBalancerNodeLabel] = "true"
+		templateLabels[nodeLoadBalancerNodeClusterLabel] = provider.config.ClusterID
+		templateLabels[nodeLoadBalancerNodeShardLabel] = shard
+		if err := unstructured.SetNestedStringMap(copy.Object, templateLabels, "spec", "template", "metadata", "labels"); err != nil {
 			t.Fatal(err)
 		}
 		if err := unstructured.SetNestedStringMap(copy.Object, map[string]string{

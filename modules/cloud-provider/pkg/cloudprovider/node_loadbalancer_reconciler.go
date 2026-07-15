@@ -2029,6 +2029,8 @@ func (c *nodeLoadBalancerController) authorizedNodeLoadBalancerNodes(
 	}
 
 	pools := map[string]*unstructured.Unstructured{}
+	var legacyMigrationShards map[string]nodeLoadBalancerShardPlan
+	legacyMigrationShardsLoaded := false
 	authorized := make([]*corev1.Node, 0, len(raw))
 	for _, cached := range raw {
 		current, getErr := c.provider.kubeClient.CoreV1().Nodes().Get(ctx, cached.Name, metav1.GetOptions{})
@@ -2057,7 +2059,20 @@ func (c *nodeLoadBalancerController) authorizedNodeLoadBalancerNodes(
 			}
 			pools[shard] = pool
 		}
-		if pool == nil || !c.nodeLoadBalancerNodePoolAuthoritative(pool, shard, nodeClassName) {
+		authoritative := pool != nil && c.nodeLoadBalancerNodePoolAuthoritative(pool, shard, nodeClassName)
+		if pool != nil && !authoritative {
+			if !legacyMigrationShardsLoaded {
+				legacyMigrationShards, err = c.legacyNodeLoadBalancerMigrationShards(ctx)
+				if err != nil {
+					return nil, err
+				}
+				legacyMigrationShardsLoaded = true
+			}
+			if legacy, allowed := legacyMigrationShards[shard]; allowed {
+				authoritative = c.legacyNodeLoadBalancerNodePoolAuthoritative(pool, shard, nodeClassName, legacy)
+			}
+		}
+		if !authoritative {
 			klog.InfoS("Ignoring Node without an authoritative Node load balancer NodePool", "node", current.Name, "shard", shard)
 			continue
 		}
@@ -2078,6 +2093,65 @@ func (c *nodeLoadBalancerController) authorizedNodeLoadBalancerNodes(
 	}
 	sort.Slice(authorized, func(i, j int) bool { return authorized[i].Name < authorized[j].Name })
 	return authorized, nil
+}
+
+// legacyNodeLoadBalancerMigrationShards returns only actively advertised
+// pre-v0.5.0 default shards that must remain authorized while their replacement
+// capacity starts. The exception is derived from live Service/shadow readback,
+// never from Node or NodePool labels alone, and disappears as soon as the owned
+// shadow cuts over to the replacement shard.
+func (c *nodeLoadBalancerController) legacyNodeLoadBalancerMigrationShards(ctx context.Context) (map[string]nodeLoadBalancerShardPlan, error) {
+	snapshot, err := c.provider.kubeClient.CoreV1().Services("").List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("node load balancer: list live Services for legacy shard authorization: %w", err)
+	}
+	byKey := make(map[string]*corev1.Service, len(snapshot.Items))
+	for index := range snapshot.Items {
+		service := &snapshot.Items[index]
+		byKey[service.Namespace+"/"+service.Name] = service
+	}
+
+	result := make(map[string]nodeLoadBalancerShardPlan)
+	defaults := nodeLoadBalancerDefaults{NodesPerShard: c.provider.config.NodeLoadBalancer.NodesPerShard}
+	for index := range snapshot.Items {
+		service := &snapshot.Items[index]
+		if !isNodeLoadBalancerService(service) || service.DeletionTimestamp != nil ||
+			!containsString(service.Finalizers, nodeLoadBalancerFinalizer) {
+			continue
+		}
+		annotations := service.GetAnnotations()
+		if _, configured := annotations[annotationNodeLoadBalancerCPU]; configured {
+			continue
+		}
+		if _, configured := annotations[annotationNodeLoadBalancerMemory]; configured {
+			continue
+		}
+		intent, parseErr := parseNodeLoadBalancerService(service, defaults)
+		if parseErr != nil || intent.CPU != nodeLoadBalancerDefaultCPU || intent.MemoryMiB != nodeLoadBalancerDefaultMemoryMiB {
+			continue
+		}
+		shadow := byKey[service.Namespace+"/"+nodeLoadBalancerShadowName(service)]
+		if shadow == nil || !nodeLoadBalancerShadowOwnedByService(shadow, service) {
+			continue
+		}
+		activeShard, valid := nodeLoadBalancerCiliumSelectorShard(
+			shadow.Annotations[annotationCiliumNodeIPAMMatchLabels],
+			c.provider.config.ClusterID,
+		)
+		if !valid || (activeShard != annotations[annotationNodeLoadBalancerShard] &&
+			activeShard != annotations[annotationNodeLoadBalancerPreviousShard]) {
+			continue
+		}
+		legacy := nodeLoadBalancerShardPlan{
+			Name: activeShard, Mode: intent.Mode, Pool: intent.Pool,
+			NodesPerShard: intent.NodesPerShard, CPU: 1, MemoryMiB: 2048,
+		}
+		if existing, exists := result[activeShard]; exists && !reflect.DeepEqual(existing, legacy) {
+			return nil, fmt.Errorf("node load balancer: conflicting legacy migration identity for shard %s", activeShard)
+		}
+		result[activeShard] = legacy
+	}
+	return result, nil
 }
 
 func (c *nodeLoadBalancerController) nodeLoadBalancerFloatingIPAuthoritative(
@@ -2201,6 +2275,58 @@ func (c *nodeLoadBalancerController) nodeLoadBalancerNodePoolAuthoritative(
 		c.provider.config.ClusterID,
 		shard,
 		nodeLoadBalancerShardProfileHash(desiredShard),
+	); err != nil {
+		return false
+	}
+	for key, value := range desired.GetLabels() {
+		if poolLabels[key] != value {
+			return false
+		}
+	}
+	desiredSpec, desiredFound, desiredErr := unstructured.NestedFieldCopy(desired.Object, "spec")
+	actualSpec, actualFound, actualErr := unstructured.NestedFieldCopy(pool.Object, "spec")
+	return desiredErr == nil && actualErr == nil && desiredFound && actualFound && reflect.DeepEqual(actualSpec, desiredSpec)
+}
+
+// legacyNodeLoadBalancerNodePoolAuthoritative accepts only the exact managed
+// 1-vCPU/2-GiB NodePool contract emitted before v0.5.0. Callers must first prove
+// that the shard is still the active shadow target of an omitted-sizing Service;
+// this predicate must never be used by NodePool creation or update paths.
+func (c *nodeLoadBalancerController) legacyNodeLoadBalancerNodePoolAuthoritative(
+	pool *unstructured.Unstructured,
+	shard, nodeClassName string,
+	legacy nodeLoadBalancerShardPlan,
+) bool {
+	if legacy.Name != shard || legacy.CPU != 1 || legacy.MemoryMiB != 2048 ||
+		legacy.NodesPerShard < 1 || pool == nil || pool.GetName() != shard ||
+		pool.GetUID() == "" || pool.GetDeletionTimestamp() != nil {
+		return false
+	}
+	poolLabels := pool.GetLabels()
+	if poolLabels[nodeLoadBalancerManagedLabel] != "true" ||
+		poolLabels[nodeLoadBalancerLabel] != "true" ||
+		poolLabels[nodeLoadBalancerClusterLabel] != c.provider.config.ClusterID ||
+		poolLabels[nodeLoadBalancerShardLabel] != shard ||
+		poolLabels[nodeLoadBalancerModeLabel] != legacy.Mode ||
+		poolLabels[nodeLoadBalancerPoolLabel] != legacy.Pool ||
+		poolLabels[nodeLoadBalancerProfileLabel] != nodeLoadBalancerShardProfileHash(legacy) {
+		return false
+	}
+	if cpu, ok := exactNodeLoadBalancerRequirementValue(pool, "inspace.cloud/instance-cpu"); !ok || cpu != "1" {
+		return false
+	}
+	if memory, ok := exactNodeLoadBalancerRequirementValue(pool, "inspace.cloud/instance-memory"); !ok || memory != "2048" {
+		return false
+	}
+	desired, err := renderLegacyNodeLoadBalancerNodePoolForAuthorization(shard, nodeClassName, legacy)
+	if err != nil {
+		return false
+	}
+	if err := markNodeLoadBalancerManaged(
+		desired,
+		c.provider.config.ClusterID,
+		shard,
+		nodeLoadBalancerShardProfileHash(legacy),
 	); err != nil {
 		return false
 	}

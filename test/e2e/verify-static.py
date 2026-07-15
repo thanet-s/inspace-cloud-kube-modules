@@ -1270,7 +1270,7 @@ def main() -> None:
     require("service.inspace.cloud/node-lb-mode: public-node-dedicated" in dedicated_node_lb_service and
             "service.inspace.cloud/node-lb-cpu:" not in dedicated_node_lb_service and
             "service.inspace.cloud/node-lb-memory:" not in dedicated_node_lb_service,
-            "dedicated live acceptance must exercise the default 1-vCPU/2-GiB shape")
+            "dedicated live acceptance must exercise the default 1-vCPU/4-GiB shape")
     require(node_lb_ports["inspace-e2e-node-traefik"] ==
             {("TCP", 80), ("TCP", 443), ("UDP", 443)} and
             node_lb_ports["inspace-e2e-node-shared-conflict"] == {("TCP", 80)} and
@@ -1438,7 +1438,7 @@ def main() -> None:
         'NODE_LOAD_BALANCER_CLASS = "inspace.cloud/node"',
         'CILIUM_NODE_CLASS = "io.cilium/node"',
         '"inspace.cloud/instance-cpu": ("In", ("1",))',
-        '"inspace.cloud/instance-memory": ("In", ("2048",))',
+        '"inspace.cloud/instance-memory": ("In", ("4096",))',
         '"inspace.cloud/host-class": ("In", ("amd-epyc",))',
         'nodeclass_spec.get("rootDiskGiB") == 30',
         'nodeclass_spec.get("reservePublicIPv4") is True',

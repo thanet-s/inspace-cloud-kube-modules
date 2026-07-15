@@ -373,8 +373,9 @@ An omitted `service.inspace.cloud/node-lb-mode` means
 IPv4 `(protocol, port)` claims are free; otherwise CCM creates another shard.
 Use `public-node-dedicated` for an isolated shard. Dedicated Services can set
 `service.inspace.cloud/node-lb-cpu` and
-`service.inspace.cloud/node-lb-memory`; the defaults are `1` and `2Gi`, and the
-pair must exactly match the finite provider catalog.
+`service.inspace.cloud/node-lb-memory`; the defaults are `1` and `4Gi`.
+Explicit shapes enforce at least 1 CPU and 4 GiB, and the pair must exactly
+match the finite provider catalog.
 
 CCM never exposes application workers directly. It creates static, tainted AMD
 EPYC NodePools with a 30 GiB root disk and a hardened NodeClass cloned from the

@@ -154,7 +154,7 @@ claims TCP/80, TCP/443, and UDP/443 while a non-conflicting TCP Service reuses
 its shard and public IP. Another Service claims TCP/80 and must transparently
 receive a different shard and IP. A fourth Service selects
 `public-node-dedicated`. It omits CPU and memory annotations so the live
-generated capacity proves the 1-vCPU/2-GiB default.
+generated capacity proves the 1-vCPU/4-GiB default.
 
 Each of the resulting three static Karpenter NodePools has one Ready AMD EPYC
 Linux/amd64 node, one bounded drift-surge slot, a 30-GiB root disk, a reserved
