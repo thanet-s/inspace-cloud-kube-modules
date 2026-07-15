@@ -158,8 +158,8 @@ func TestGetInstanceTypesAdvertisesBothHostClassesAndNumericCapacity(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(instanceTypes) != 31 {
-		t.Fatalf("expected 31 instance types, got %d", len(instanceTypes))
+	if len(instanceTypes) != 30 {
+		t.Fatalf("expected 30 instance types, got %d", len(instanceTypes))
 	}
 	for _, instanceType := range instanceTypes {
 		if len(instanceType.Offerings) != 2 {
@@ -182,15 +182,23 @@ func TestSelectInstanceTypeSupportsNumericBoundsAndHostClassOffering(t *testing.
 		wantType     string
 	}{
 		{
+			name: "smallest AMD one-core shape",
+			requirements: []karpv1.NodeSelectorRequirementWithMinValues{
+				{Key: catalog.LabelInstanceCPU, Operator: corev1.NodeSelectorOpIn, Values: []string{"1"}},
+				{Key: catalog.LabelHostClass, Operator: corev1.NodeSelectorOpIn, Values: []string{inspacev1.HostClassAMDEPYC}},
+			},
+			wantType: "is-memory-1c-4g",
+		},
+		{
 			name: "smallest AMD general shape",
 			requirements: []karpv1.NodeSelectorRequirementWithMinValues{
 				{Key: catalog.LabelFamily, Operator: corev1.NodeSelectorOpIn, Values: []string{"general"}},
 				{Key: catalog.LabelHostClass, Operator: corev1.NodeSelectorOpIn, Values: []string{inspacev1.HostClassAMDEPYC}},
 			},
-			wantType: "is-general-1c-2g",
+			wantType: "is-general-2c-4g",
 		},
 		{
-			name: "live AMD general CPU bound excludes mini shape",
+			name: "live AMD general CPU bound selects catalog floor",
 			requirements: []karpv1.NodeSelectorRequirementWithMinValues{
 				{Key: catalog.LabelFamily, Operator: corev1.NodeSelectorOpIn, Values: []string{"general"}},
 				{Key: catalog.LabelInstanceCPU, Operator: corev1.NodeSelectorOpGt, Values: []string{"1"}},

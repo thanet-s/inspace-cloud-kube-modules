@@ -28,7 +28,7 @@ func TestParseNodeLoadBalancerServiceDefaultsToShared(t *testing.T) {
 		t.Fatal(err)
 	}
 	if intent.Mode != nodeLoadBalancerModeShared || intent.Pool != nodeLoadBalancerDefaultPool ||
-		intent.NodesPerShard != 1 || intent.CPU != 1 || intent.MemoryMiB != 2048 {
+		intent.NodesPerShard != 1 || intent.CPU != nodeLoadBalancerDefaultCPU || intent.MemoryMiB != nodeLoadBalancerDefaultMemoryMiB {
 		t.Fatalf("default intent = %#v", intent)
 	}
 	if len(intent.Ports) != 1 || intent.Ports[0] != (nodeLoadBalancerPortClaim{IPFamily: corev1.IPv4Protocol, Protocol: corev1.ProtocolTCP, Port: 443}) {
@@ -281,6 +281,18 @@ func TestNodeLoadBalancerReconcileSmokeCreatesOwnedKarpenterAndShadowResources(t
 	if cluster, _, _ := unstructured.NestedString(nodePool.Object, "spec", "template", "metadata", "labels", nodeLoadBalancerNodeClusterLabel); cluster != provider.config.ClusterID {
 		t.Fatalf("generated NodePool template cluster = %q", cluster)
 	}
+	requirements, _, _ := unstructured.NestedSlice(nodePool.Object, "spec", "template", "spec", "requirements")
+	defaultShape := map[string]string{}
+	for _, raw := range requirements {
+		requirement := raw.(map[string]any)
+		values := requirement["values"].([]any)
+		if len(values) == 1 {
+			defaultShape[requirement["key"].(string)] = values[0].(string)
+		}
+	}
+	if defaultShape["inspace.cloud/instance-cpu"] != "1" || defaultShape["inspace.cloud/instance-memory"] != "4096" {
+		t.Fatalf("generated default NodePool shape = %#v", defaultShape)
+	}
 	if len(api.createdFirewalls) != 2 {
 		t.Fatalf("created firewalls = %#v", api.createdFirewalls)
 	}
@@ -371,7 +383,7 @@ func TestParseNodeLoadBalancerDedicatedSizing(t *testing.T) {
 	delete(service.Annotations, annotationNodeLoadBalancerCPU)
 	delete(service.Annotations, annotationNodeLoadBalancerMemory)
 	defaults, err := parseNodeLoadBalancerService(service, nodeLoadBalancerDefaults{NodesPerShard: 1})
-	if err != nil || defaults.CPU != 1 || defaults.MemoryMiB != 2048 {
+	if err != nil || defaults.CPU != nodeLoadBalancerDefaultCPU || defaults.MemoryMiB != nodeLoadBalancerDefaultMemoryMiB {
 		t.Fatalf("dedicated sizing defaults = %#v, %v", defaults, err)
 	}
 }
@@ -387,10 +399,15 @@ func TestParseNodeLoadBalancerRejectsInvalidShapesAndContracts(t *testing.T) {
 		"sctp": func(service *corev1.Service) {
 			service.Spec.Ports[0].Protocol = corev1.ProtocolSCTP
 		},
-		"invalid catalog shape": func(service *corev1.Service) {
+		"below minimum memory": func(service *corev1.Service) {
 			service.Annotations[annotationNodeLoadBalancerMode] = nodeLoadBalancerModeDedicated
 			service.Annotations[annotationNodeLoadBalancerCPU] = "1"
-			service.Annotations[annotationNodeLoadBalancerMemory] = "1Gi"
+			service.Annotations[annotationNodeLoadBalancerMemory] = "2Gi"
+		},
+		"invalid catalog shape": func(service *corev1.Service) {
+			service.Annotations[annotationNodeLoadBalancerMode] = nodeLoadBalancerModeDedicated
+			service.Annotations[annotationNodeLoadBalancerCPU] = "3"
+			service.Annotations[annotationNodeLoadBalancerMemory] = "6Gi"
 		},
 		"invalid quantity": func(service *corev1.Service) {
 			service.Annotations[annotationNodeLoadBalancerMode] = nodeLoadBalancerModeDedicated
@@ -429,6 +446,26 @@ func TestParseNodeLoadBalancerRejectsInvalidShapesAndContracts(t *testing.T) {
 				t.Fatal("expected validation error")
 			}
 		})
+	}
+}
+
+func TestValidateNodeLoadBalancerShapeEnforcesNodeLBMinimum(t *testing.T) {
+	for name, shape := range map[string]struct {
+		cpu       int32
+		memoryMiB int64
+	}{
+		"legacy one CPU two GiB shape": {cpu: 1, memoryMiB: 2048},
+		"two CPU two GiB shape":        {cpu: 2, memoryMiB: 2048},
+	} {
+		t.Run(name, func(t *testing.T) {
+			err := validateNodeLoadBalancerShape(shape.cpu, shape.memoryMiB)
+			if err == nil || !strings.Contains(err.Error(), "requires at least 1 CPU and 4096Mi memory") {
+				t.Fatalf("minimum validation error = %v", err)
+			}
+		})
+	}
+	if err := validateNodeLoadBalancerShape(nodeLoadBalancerDefaultCPU, nodeLoadBalancerDefaultMemoryMiB); err != nil {
+		t.Fatalf("default RKE2 shape was rejected: %v", err)
 	}
 }
 
@@ -597,7 +634,7 @@ func nodeLoadBalancerTestService(name, uid string, protocol corev1.Protocol, por
 func nodeLoadBalancerTestIntent(serviceID string, protocol corev1.Protocol, port int32) nodeLoadBalancerIntent {
 	return nodeLoadBalancerIntent{
 		ServiceID: serviceID, Mode: nodeLoadBalancerModeShared, Pool: nodeLoadBalancerDefaultPool,
-		NodesPerShard: 1, CPU: 1, MemoryMiB: 2048,
+		NodesPerShard: 1, CPU: nodeLoadBalancerDefaultCPU, MemoryMiB: nodeLoadBalancerDefaultMemoryMiB,
 		Ports: []nodeLoadBalancerPortClaim{{IPFamily: corev1.IPv4Protocol, Protocol: protocol, Port: port}},
 	}
 }

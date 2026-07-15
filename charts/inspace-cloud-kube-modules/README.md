@@ -131,8 +131,9 @@ spec:
     app: web
 ```
 
-CPU and memory default to `1` core and `2Gi`. Generated static NodePools always
-use AMD EPYC, Linux/amd64, on-demand capacity, a 30 GiB root disk, and the
+CPU and memory default to `1` core and `4Gi`; explicit dedicated shapes must
+provide at least `1` core and `4Gi`. Generated static NodePools always use
+AMD EPYC, Linux/amd64, on-demand capacity, a 30 GiB root disk, and the
 `inspace.cloud/node-lb=true:NoSchedule` taint. Application pods stay on private
 workload nodes; Cilium forwards traffic from the LB nodes with
 `externalTrafficPolicy: Cluster`. CCM creates one exact TCP/UDP-only ingress

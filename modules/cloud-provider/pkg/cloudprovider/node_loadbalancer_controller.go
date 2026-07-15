@@ -30,6 +30,11 @@ const (
 	nodeLoadBalancerModeDedicated = "public-node-dedicated"
 	nodeLoadBalancerDefaultPool   = "default"
 
+	nodeLoadBalancerDefaultCPU       = int32(1)
+	nodeLoadBalancerDefaultMemoryMiB = int64(4096)
+	nodeLoadBalancerMinimumCPU       = int32(1)
+	nodeLoadBalancerMinimumMemoryMiB = int64(4096)
+
 	nodeLoadBalancerLabel      = "inspace.cloud/node-lb"
 	nodeLoadBalancerShardLabel = "inspace.cloud/node-lb-shard"
 	nodeLoadBalancerPoolLabel  = "inspace.cloud/node-lb-pool"
@@ -142,8 +147,8 @@ func parseNodeLoadBalancerService(service *corev1.Service, defaults nodeLoadBala
 		nodesPerShard = int32(parsed)
 	}
 
-	cpu := int32(1)
-	memoryMiB := int64(2048)
+	cpu := nodeLoadBalancerDefaultCPU
+	memoryMiB := nodeLoadBalancerDefaultMemoryMiB
 	_, cpuConfigured := annotations[annotationNodeLoadBalancerCPU]
 	_, memoryConfigured := annotations[annotationNodeLoadBalancerMemory]
 	if mode == nodeLoadBalancerModeShared && (cpuConfigured || memoryConfigured) {
@@ -238,10 +243,20 @@ func parseNodeLoadBalancerMemory(value string) (int64, error) {
 	return bytes / mebibyte, nil
 }
 
-// validateNodeLoadBalancerShape mirrors the finite InSpace Karpenter catalog.
-// Keeping this finite prevents a Service from creating a permanently
-// unschedulable static NodePool.
+// validateNodeLoadBalancerShape enforces the NodeLB memory floor before
+// mirroring the finite InSpace Karpenter catalog. Keeping the accepted set
+// finite prevents a Service from creating a permanently unschedulable static
+// NodePool.
 func validateNodeLoadBalancerShape(cpu int32, memoryMiB int64) error {
+	if cpu < nodeLoadBalancerMinimumCPU || memoryMiB < nodeLoadBalancerMinimumMemoryMiB {
+		return fmt.Errorf(
+			"node load balancer: requires at least %d CPU and %dMi memory; got %d CPU and %dMi memory",
+			nodeLoadBalancerMinimumCPU,
+			nodeLoadBalancerMinimumMemoryMiB,
+			cpu,
+			memoryMiB,
+		)
+	}
 	valid := false
 	if memoryMiB%1024 == 0 {
 		memoryGiB := memoryMiB / 1024
@@ -566,6 +581,24 @@ func renderNodeLoadBalancerNodeClass(base *unstructured.Unstructured, name strin
 }
 
 func renderNodeLoadBalancerNodePool(name, nodeClassName string, shard nodeLoadBalancerShardPlan) (*unstructured.Unstructured, error) {
+	if err := validateNodeLoadBalancerShape(shard.CPU, shard.MemoryMiB); err != nil {
+		return nil, err
+	}
+	return renderNodeLoadBalancerNodePoolManifest(name, nodeClassName, shard)
+}
+
+// renderLegacyNodeLoadBalancerNodePoolForAuthorization reconstructs only the
+// exact pre-v0.5.0 default shape. It is intentionally separate from the normal
+// renderer so reconciliation can authorize an already-advertised legacy shard
+// during a zero-downtime upgrade without ever creating new undersized capacity.
+func renderLegacyNodeLoadBalancerNodePoolForAuthorization(name, nodeClassName string, shard nodeLoadBalancerShardPlan) (*unstructured.Unstructured, error) {
+	if shard.CPU != 1 || shard.MemoryMiB != 2048 {
+		return nil, errors.New("node load balancer: legacy authorization requires exactly 1 CPU and 2048 MiB")
+	}
+	return renderNodeLoadBalancerNodePoolManifest(name, nodeClassName, shard)
+}
+
+func renderNodeLoadBalancerNodePoolManifest(name, nodeClassName string, shard nodeLoadBalancerShardPlan) (*unstructured.Unstructured, error) {
 	for field, value := range map[string]string{"NodePool name": name, "NodeClass name": nodeClassName, "shard name": shard.Name} {
 		if messages := utilvalidation.IsDNS1123Subdomain(value); len(messages) != 0 {
 			return nil, fmt.Errorf("node load balancer: %s %q is invalid: %s", field, value, strings.Join(messages, "; "))
@@ -573,9 +606,6 @@ func renderNodeLoadBalancerNodePool(name, nodeClassName string, shard nodeLoadBa
 	}
 	if shard.NodesPerShard < 1 {
 		return nil, errors.New("node load balancer: NodePool replicas must be positive")
-	}
-	if err := validateNodeLoadBalancerShape(shard.CPU, shard.MemoryMiB); err != nil {
-		return nil, err
 	}
 	requirements := []any{
 		nodeLoadBalancerRequirement("inspace.cloud/instance-cpu", strconv.FormatInt(int64(shard.CPU), 10)),
