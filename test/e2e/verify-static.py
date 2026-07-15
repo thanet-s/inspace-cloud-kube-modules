@@ -3,6 +3,7 @@
 
 import importlib.util
 import json
+import os
 import pathlib
 import re
 import subprocess
@@ -11,6 +12,14 @@ import tempfile
 
 
 ROOT = pathlib.Path(__file__).resolve().parent
+
+
+def repository_root() -> pathlib.Path:
+    """Resolve checkout assets when this test runs from the E2E image."""
+    configured = os.environ.get("INSPACE_E2E_SOURCE_ROOT")
+    if configured:
+        return pathlib.Path(configured).resolve()
+    return ROOT.parent.parent
 
 
 def require(condition: bool, message: str) -> None:
@@ -292,7 +301,7 @@ def verify_retention_state_parser(entrypoint: str) -> None:
 
 def verify_node_load_balancer_helm_contract() -> None:
     """Prove chart defaults, rendered wiring, examples, and fail-closed gates."""
-    repository = ROOT.parent.parent
+    repository = repository_root()
     chart = repository / "charts/inspace-cloud-kube-modules"
     values_path = chart / "values.yaml"
     ci_values = chart / "ci/test-values.yaml"
