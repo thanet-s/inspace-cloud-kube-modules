@@ -41,6 +41,8 @@ spec:
   # sshPublicKey: ssh-ed25519 AAAA... operator@example
   rke2:
     version: v1.35.6+rke2r1
+    # Short-lived test nodes may opt in; production defaults to upgrading.
+    # skipOSUpgrade: true
     # Replace with the private RFC1918 supervisor VIP inside networkUUID. It
     # must not be a VM address or overlap 10.42.0.0/16 or 10.43.0.0/16.
     server: https://10.0.0.10:9345

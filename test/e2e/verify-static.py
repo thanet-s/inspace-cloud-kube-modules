@@ -637,6 +637,8 @@ def main() -> None:
             "cluster template spec.controlPlane.replicas must be exactly 3")
     require(yaml_mapping_scalar(cluster, "spec", "bootstrapCache", "directDownload") == "false",
             "cluster template must enable the default bastion cache explicitly")
+    require(yaml_mapping_scalar(cluster, "spec", "rke2", "skipOSUpgrade") == "true",
+            "guarded E2E bootstrap must explicitly skip only the full OS upgrade")
     for marker in (
         'e2e_bootstrap_cache_key_file: "{{ lookup(\'env\', \'E2E_STATE_DIR\') }}/bootstrap-cache-key"',
         "Generate the 256-bit bootstrap cache key inside the runner",
@@ -799,14 +801,14 @@ def main() -> None:
     require("ansible.builtin.systemd_service:" in disable_resolved and
             "name: systemd-resolved.service" in disable_resolved and "masked: true" in disable_resolved,
             "Ansible node preparation must stop and mask systemd-resolved")
-    package_upgrade = named_yaml_sequence_item(
-        control_plane_wait_play, "Update and upgrade every control plane in parallel", 4
+    package_refresh = named_yaml_sequence_item(
+        control_plane_wait_play, "Refresh package indexes without upgrading repaired E2E control planes", 4
     )
-    require("update_cache: true" in package_upgrade and "upgrade: 'yes'" in package_upgrade and
-            "NEEDRESTART_MODE: l" in package_upgrade and
-            "async: 600" in package_upgrade and "poll: 10" in package_upgrade and
-            "when: not e2e_node_preparation.stat.exists" in package_upgrade,
-            "Ansible node preparation upgrade must be noninteractive, bounded, and checkpoint guarded")
+    require("update_cache: true" in package_refresh and "upgrade:" not in package_refresh and
+            "NEEDRESTART_MODE: l" in package_refresh and
+            "async: 600" in package_refresh and "poll: 10" in package_refresh and
+            "when: not e2e_node_preparation.stat.exists" in package_refresh,
+            "E2E repair must refresh indexes without restoring the skipped full OS upgrade")
     repaired_restart = named_yaml_sequence_item(
         control_plane_wait_play, "Restart repaired RKE2 servers one at a time and prove local readiness", 4
     )
@@ -921,7 +923,7 @@ def main() -> None:
         "Configure Ubuntu update and security suites on every control plane in parallel",
         "Configure static Google DNS on every control plane in parallel",
         "Disable systemd-resolved on every control plane in parallel",
-        "Update and upgrade every control plane in parallel",
+        "Refresh package indexes without upgrading repaired E2E control planes",
         "/etc/apt/apt.conf.d/99-inspace-disable-periodic",
         'APT::Periodic::Unattended-Upgrade "0";',
         "/etc/sysctl.d/90-inspace-kubernetes.conf",
@@ -939,6 +941,8 @@ def main() -> None:
             "native routing and kube-proxy replacement must be verified")
     require("rke2:" in nodeclass and "privateRegistrationEndpoint" in nodeclass,
             "NodeClass must use the private RKE2 registration endpoint")
+    require(yaml_mapping_scalar(nodeclass, "spec", "rke2", "skipOSUpgrade") == "true",
+            "guarded E2E NodeClass must explicitly skip only the full OS upgrade")
     require("inspace-rke2-agent-token" in nodeclass, "NodeClass must use the RKE2 token secret")
     require("rootDiskGiB: 100" in nodeclass, "E2E Karpenter workers must use 100 GiB root disks")
     require('limits:\n    cpu: "8"\n    memory: 16Gi' in nodeclass,
@@ -969,6 +973,7 @@ def main() -> None:
             '.operator == "Gt"' in playbook and
             '.values == ["1"]' in playbook and
             '.key == "inspace.cloud/host-class"' in playbook and
+            ".spec.rke2.skipOSUpgrade == true" in playbook and
             'all($requirements[]; .key != "inspace.cloud/instance-memory")' in playbook and
             "INSPACE_AMD_HOST_POOL_UUID" in playbook,
             "live NodeClass and NodePool checks must prove the unpinned-memory AMD general Gt 1 selection")
@@ -977,6 +982,11 @@ def main() -> None:
             ".spec.bootstrapCache.address == $cacheAddress" in init_playbook and
             ".spec.bootstrapCache.caBundle == $cacheCA" in init_playbook,
             "live NodeClass acceptance must prove the complete cached-mode contract")
+    require(init_playbook.count("! grep -Fq 'upgrade -y'") == 3 and
+            "/usr/local/sbin/inspace-bootstrap-cache-bastion" in init_playbook and
+            "/usr/local/sbin/inspace-bootstrap-rke2" in init_playbook and
+            "/usr/local/sbin/inspace-install-prerequisites" in init_playbook,
+            "live bootstrap acceptance must prove the E2E upgrade bypass on bastion, control planes, and workers")
     require('"global.inspace.systemImageRegistry={{ e2e_state.bootstrapCacheRegistry }}"' in init_playbook and
             '"$registry/thanet-s/inspace-cloud-controller-manager:$version"' in init_playbook and
             '"$registry/sig-storage/csi-provisioner:v5.2.0"' in init_playbook,
@@ -1046,10 +1056,15 @@ def main() -> None:
             "deployment/inspace-e2e-private-b" in cleanup_window and
             "deployment/inspace-e2e-trigger" in cleanup_window and
             "pvc/inspace-e2e-rwo" in cleanup_window and
-            "--state \"{{ e2e_state_file }}\" --public absent" in cleanup_window,
+            "--state \"{{ e2e_state_file }}\"" in cleanup_window and
+            "--immutable-baseline \"{{ e2e_baseline_inventory_file }}\"" in cleanup_window and
+            "--public absent" in cleanup_window,
             "live acceptance must delete only the paid public Service, prove cloud cleanup, and preserve every other workload")
     node_lb_baseline = playbook.index("- name: Capture the exact account inventory before Node-LB acceptance")
     stale_paid_service_absent = playbook.index("- name: Wait for the stale paid public Service owner to disappear")
+    stale_paid_nlb_inventory = playbook.index(
+        "- name: Require stale paid NLB inventory to return to the immutable account baseline"
+    )
     node_lb_stale_absent = playbook.index("- name: Wait for stale Node-LB cloud and Kubernetes owners to quiesce")
     node_lb_immutable_anchor = playbook.index("- name: Require the immutable zero-NLB anchor before Node-LB baseline capture")
     node_lb_exercise_start = playbook.index("- name: Exercise shared conflict and dedicated public Node-LB modes")
@@ -1064,18 +1079,41 @@ def main() -> None:
     node_lb_http = playbook.index("- name: Prove every public Node-LB TCP port reaches its exact backend")
     node_lb_partial_delete = playbook.index("- name: Delete one shared Node-LB member without deleting its sibling shard")
     node_lb_partial = playbook.index("- name: Prove partial shared-member cleanup preserves the exact sibling resources")
+    node_lb_partial_identity_assert = playbook.index(
+        "- name: Assert the exact surviving Service firewall identity after partial cleanup"
+    )
     node_lb_partial_http = playbook.index("- name: Prove the retained mixed and other TCP backends after partial cleanup")
     node_lb_delete = playbook.index("- name: Delete every Node-LB acceptance Service and workload owner")
     node_lb_absent = playbook.index("- name: Require Node-LB Services shadows NodePools firewalls VMs and FIPs to disappear")
-    require(stale_paid_service_absent < node_lb_stale_absent < public_delete < node_lb_immutable_anchor < node_lb_baseline < node_lb_exercise_start <
+    require(stale_paid_service_absent < stale_paid_nlb_inventory < node_lb_stale_absent < public_delete < node_lb_immutable_anchor < node_lb_baseline < node_lb_exercise_start <
             node_lb_initial_apply < node_lb_initial_journal < node_lb_shared_pair <
             node_lb_expansion < node_lb_full_journal < node_lb_present < node_lb_http < node_lb_partial_delete <
-            node_lb_partial < node_lb_partial_http < node_lb_delete <
+            node_lb_partial < node_lb_partial_identity_assert < node_lb_partial_http < node_lb_delete <
             node_lb_absent < suite_complete,
             "Node-LB acceptance must run after paid-NLB cleanup and finish before suite completion")
+    stale_paid_nlb_task = named_yaml_sequence_item(
+        test_playbook,
+        "Require stale paid NLB inventory to return to the immutable account baseline",
+        4,
+    )
+    stale_node_lb_task = named_yaml_sequence_item(
+        test_playbook, "Wait for stale Node-LB cloud and Kubernetes owners to quiesce", 4
+    )
+    immutable_node_lb_anchor_task = named_yaml_sequence_item(
+        test_playbook, "Require the immutable zero-NLB anchor before Node-LB baseline capture", 4
+    )
+    for task_name, task in (
+        ("stale paid NLB", stale_paid_nlb_task),
+        ("stale Node-LB", stale_node_lb_task),
+        ("pre-Node-LB anchor", immutable_node_lb_anchor_task),
+    ):
+        require(
+            "--immutable-baseline" in task
+            and '"{{ e2e_baseline_inventory_file }}"' in task,
+            f"{task_name} cleanup proof must use the immutable pre-mutation NLB UUID baseline",
+        )
     require(
-        test_playbook.count("- --immutable-baseline") == 3
-        and test_playbook.count('"{{ e2e_baseline_inventory_file }}"') >= 3
+        "--public\n          - absent" in stale_paid_nlb_task
         and "service/inspace-e2e-web" in named_yaml_sequence_item(
             test_playbook, "Remove stale paid and Node-LB acceptance owners", 4
         )
@@ -1085,6 +1123,16 @@ def main() -> None:
     )
     node_lb_exercise = named_yaml_sequence_item(
         test_playbook, "Exercise shared conflict and dedicated public Node-LB modes", 4
+    )
+    final_node_lb_absent_task = named_yaml_sequence_item(
+        node_lb_exercise,
+        "Require Node-LB Services shadows NodePools firewalls VMs and FIPs to disappear",
+        8,
+    )
+    require(
+        "--immutable-baseline" in final_node_lb_absent_task
+        and '"{{ e2e_baseline_inventory_file }}"' in final_node_lb_absent_task,
+        "final Node-LB absence proof must use the immutable pre-mutation NLB UUID baseline",
     )
     require("\n      always:\n" in node_lb_exercise and
             node_lb_exercise.count("/opt/e2e/scripts/verify-node-load-balancer.py") == 3 and
@@ -1106,6 +1154,28 @@ def main() -> None:
             "e2e_node_lb_expansion_manifest" in node_lb_exercise and
             "use_proxy: false" in node_lb_exercise,
             "Node-LB live acceptance must prove presence/data path and always restore exact inventory")
+    node_lb_partial_task = named_yaml_sequence_item(
+        node_lb_exercise,
+        "Prove partial shared-member cleanup preserves the exact sibling resources",
+        8,
+    )
+    node_lb_partial_assert_task = named_yaml_sequence_item(
+        node_lb_exercise,
+        "Assert the exact surviving Service firewall identity after partial cleanup",
+        8,
+    )
+    retained_service_firewall_reference = (
+        "{{ e2e_node_lb_result.services['inspace-e2e-node-traefik'].firewallUUID }}"
+    )
+    require(
+        "--retained-service-firewall" in node_lb_partial_task
+        and retained_service_firewall_reference in node_lb_partial_task
+        and "e2e_node_lb_partial_result.retainedServiceFirewallUUID =="
+        in node_lb_partial_assert_task
+        and "e2e_node_lb_result.services['inspace-e2e-node-traefik'].firewallUUID"
+        in node_lb_partial_assert_task,
+        "partial Node-LB cleanup must pass and assert the exact surviving Service firewall UUID",
+    )
     node_lb_shared_gate = named_yaml_sequence_item(
         node_lb_exercise,
         "Require the mixed Traefik and sibling Services to establish one shared shadow shard",
@@ -1392,6 +1462,7 @@ def main() -> None:
         'if current_nlb_uuids != immutable_nlb_uuids:',
         'immutable pre-mutation account baseline',
         'retained["firewallUUID"] == retained_service_firewall_uuid',
+        'result["retainedServiceFirewallUUID"] = retained["firewallUUID"]',
         'replaced the retained sibling Service firewall',
         'Cilium Node IPAM acceptance must not create an InSpace NLB',
     ):
@@ -1460,11 +1531,63 @@ def main() -> None:
     require("private Cilium L2 Service unexpectedly owns an InSpace NLB" in service_cloud and
             "private Cilium L2 Service unexpectedly owns an InSpace FIP" in service_cloud and
             'choices=("present", "absent")' in service_cloud and
-            "public Service NLB/FIP cleanup has not completed" in service_cloud,
-            "service cloud verifier must prove private zero ownership and public transition cleanup")
+            "public Service NLB/FIP cleanup has not completed" in service_cloud and
+            "immutable_load_balancer_baseline" in service_cloud and
+            "require_exact_load_balancer_inventory" in service_cloud and
+            "immutable pre-mutation account baseline" in service_cloud,
+            "service cloud verifier must prove private zero ownership, public transition cleanup, and exact immutable NLB inventory")
     service_cloud_module = load_script_module(
         "e2e_verify_service_cloud_static", ROOT / "scripts/verify-service-cloud.py"
     )
+    with tempfile.TemporaryDirectory() as directory:
+        immutable_baseline = pathlib.Path(directory) / "baseline-inventory.json"
+        immutable_baseline.write_text(json.dumps({
+            "vms": [],
+            "firewalls": [],
+            "floatingIPs": [],
+            "loadBalancers": ["baseline-nlb"],
+            "disks": [],
+        }), encoding="utf-8")
+        immutable_baseline.chmod(0o600)
+        service_cloud_module.require_exact_load_balancer_inventory(
+            [{"uuid": "baseline-nlb"}], immutable_baseline
+        )
+        service_cloud_module.require_exact_load_balancer_inventory(
+            [
+                {"uuid": "baseline-nlb"},
+                {"uuid": "paid-service-nlb"},
+                {"uuid": "deleted-nlb", "status": "deleted"},
+            ],
+            immutable_baseline,
+            "paid-service-nlb",
+        )
+        for label, inventory, allowed_paid_nlb in (
+            (
+                "present unrelated NLB",
+                [
+                    {"uuid": "baseline-nlb"},
+                    {"uuid": "paid-service-nlb"},
+                    {"uuid": "unexpected-nlb"},
+                ],
+                "paid-service-nlb",
+            ),
+            (
+                "stale recovery NLB",
+                [{"uuid": "baseline-nlb"}, {"uuid": "stale-nlb"}],
+                None,
+            ),
+        ):
+            try:
+                service_cloud_module.require_exact_load_balancer_inventory(
+                    inventory, immutable_baseline, allowed_paid_nlb
+                )
+            except SystemExit as error:
+                require(
+                    "immutable pre-mutation account baseline" in str(error),
+                    f"service cloud verifier returned the wrong {label} diagnostic",
+                )
+            else:
+                require(False, f"service cloud verifier normalized a {label}")
     for accepted_nonvirtual in (None, False):
         service_cloud_module.require_nonvirtual_flag(accepted_nonvirtual)
     for contradictory_nonvirtual in (True, 0, "false", [], {}):
@@ -1500,9 +1623,18 @@ def main() -> None:
             "Require zero public NLB targets without a ready local endpoint" in playbook and
             playbook.count("--targets") >= 6,
             "live public NLB acceptance must prove Node and EndpointSlice target removal/restoration")
-    require(playbook.count("/opt/e2e/scripts/verify-service-cloud.py") >= 2 and
-            "service.beta.kubernetes.io/inspace-load-balancer-public" in playbook,
-            "playbook must audit cloud ownership before and after removing public opt-in")
+    service_cloud_invocations = test_playbook.split(
+        "/opt/e2e/scripts/verify-service-cloud.py"
+    )[1:]
+    require(
+        len(service_cloud_invocations) == 11
+        and all(
+            "--immutable-baseline" in invocation[:200]
+            and "{{ e2e_baseline_inventory_file }}" in invocation[:200]
+            for invocation in service_cloud_invocations
+        )
+        and "service.beta.kubernetes.io/inspace-load-balancer-public" in playbook,
+            "every paid-Service cloud proof must anchor NLB inventory to the immutable pre-mutation baseline")
     require("Remove only the public scope label while keeping the annotation and Service type" in playbook and
             "Restore only the public scope label to recreate the NLB" in playbook and
             "inspace.cloud/load-balancer-scope-" in playbook,

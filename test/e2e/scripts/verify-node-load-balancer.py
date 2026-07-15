@@ -1086,6 +1086,7 @@ def prove_partial(
     result["phase"] = "partial"
     result["deletedService"] = PARTIAL_DELETED_SERVICE
     result["deletedFirewallUUID"] = deleted_firewall_uuid
+    result["retainedServiceFirewallUUID"] = retained["firewallUUID"]
     return result
 
 

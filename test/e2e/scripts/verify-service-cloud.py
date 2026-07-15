@@ -7,7 +7,11 @@ import json
 import os
 import pathlib
 import ssl
+import stat
 import urllib.request
+
+
+IMMUTABLE_INVENTORY_KEYS = {"vms", "firewalls", "floatingIPs", "loadBalancers", "disks"}
 
 
 def api_get(path: str):
@@ -30,9 +34,74 @@ def require_nonvirtual_flag(value: object) -> None:
         raise SystemExit("public Service FIP must be a non-virtual InSpace address")
 
 
+def active(item: dict) -> bool:
+    return item.get("is_deleted") is not True and str(item.get("status", "")).lower() != "deleted"
+
+
+def immutable_load_balancer_baseline(path: pathlib.Path) -> list[str]:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        raise SystemExit("immutable account baseline inventory is absent")
+    if not stat.S_ISREG(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) != 0o600:
+        raise SystemExit("immutable account baseline inventory must be a mode-0600 regular file")
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise SystemExit(f"immutable account baseline inventory is unreadable: {error}")
+    if not isinstance(value, dict) or set(value) != IMMUTABLE_INVENTORY_KEYS:
+        raise SystemExit("immutable account baseline inventory has an unexpected schema")
+    identities = value.get("loadBalancers")
+    if (
+        not isinstance(identities, list)
+        or any(not isinstance(identity, str) or not identity for identity in identities)
+        or identities != sorted(set(identities))
+    ):
+        raise SystemExit("immutable account NLB baseline is invalid")
+    return identities
+
+
+def require_exact_load_balancer_inventory(
+    load_balancers: list[dict],
+    immutable_baseline_path: pathlib.Path,
+    allowed_paid_nlb_uuid: str | None = None,
+) -> None:
+    baseline = immutable_load_balancer_baseline(immutable_baseline_path)
+    identities = []
+    for load_balancer in load_balancers:
+        if not isinstance(load_balancer, dict):
+            raise SystemExit("load-balancer list contains a non-object")
+        if not active(load_balancer):
+            continue
+        identity = load_balancer.get("uuid")
+        if not isinstance(identity, str) or not identity:
+            raise SystemExit("active load balancer lacks a stable UUID")
+        identities.append(identity)
+    if len(identities) != len(set(identities)):
+        raise SystemExit("active load-balancer inventory contains duplicate UUIDs")
+
+    expected = list(baseline)
+    if allowed_paid_nlb_uuid is not None:
+        if not isinstance(allowed_paid_nlb_uuid, str) or not allowed_paid_nlb_uuid:
+            raise SystemExit("paid public Service NLB lacks a stable UUID")
+        if allowed_paid_nlb_uuid in baseline:
+            raise SystemExit("paid public Service NLB UUID already exists in the immutable account baseline")
+        expected.append(allowed_paid_nlb_uuid)
+    expected.sort()
+    if sorted(identities) != expected:
+        expected_scope = "the immutable pre-mutation account baseline"
+        if allowed_paid_nlb_uuid is not None:
+            expected_scope += " plus the exact paid public Service NLB"
+        raise SystemExit(
+            f"active InSpace NLB UUIDs differ from {expected_scope}: "
+            f"current={sorted(identities)} expected={expected}"
+        )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--state", required=True)
+    parser.add_argument("--immutable-baseline", required=True)
     parser.add_argument("--public", choices=("present", "absent"), required=True)
     parser.add_argument(
         "--targets",
@@ -45,30 +114,51 @@ def main() -> None:
     state = json.loads(pathlib.Path(args.state).read_text(encoding="utf-8"))
     public_lb_name = state.get("serviceLoadBalancerName", "")
     public_fip_name = state.get("serviceFloatingIPName", "")
-    private_lb_names = set(state.get("privateServiceLoadBalancerNames", []))
-    private_fip_names = set(state.get("privateServiceFloatingIPNames", []))
-    if not public_lb_name or not public_fip_name or len(private_lb_names) != 2 or len(private_fip_names) != 2:
-        raise SystemExit("workload ownership journal lacks the exact three Service identities")
+    raw_private_lb_names = state.get("privateServiceLoadBalancerNames", [])
+    raw_private_fip_names = state.get("privateServiceFloatingIPNames", [])
+    if (
+        not isinstance(raw_private_lb_names, list)
+        or any(not isinstance(name, str) or not name for name in raw_private_lb_names)
+        or len(raw_private_lb_names) != len(set(raw_private_lb_names))
+        or not isinstance(raw_private_fip_names, list)
+        or any(not isinstance(name, str) or not name for name in raw_private_fip_names)
+        or len(raw_private_fip_names) != len(set(raw_private_fip_names))
+    ):
+        raise SystemExit("workload ownership journal contains invalid private Service identities")
+    private_lb_names = set(raw_private_lb_names)
+    private_fip_names = set(raw_private_fip_names)
 
-    active_lbs = [lb for lb in api_get("network/load_balancers") if not lb.get("is_deleted", False)]
-    active_fips = [ip for ip in api_get("network/ip_addresses") if not ip.get("is_deleted", False)]
+    all_lbs = api_get("network/load_balancers")
+    active_lbs = [lb for lb in all_lbs if isinstance(lb, dict) and active(lb)]
+    active_fips = [ip for ip in api_get("network/ip_addresses") if isinstance(ip, dict) and active(ip)]
     if any(lb.get("display_name") in private_lb_names for lb in active_lbs):
         raise SystemExit("a private Cilium L2 Service unexpectedly owns an InSpace NLB")
     if any(ip.get("name") in private_fip_names for ip in active_fips):
         raise SystemExit("a private Cilium L2 Service unexpectedly owns an InSpace FIP")
 
-    public_lbs = [lb for lb in active_lbs if lb.get("display_name") == public_lb_name]
-    public_fips = [ip for ip in active_fips if ip.get("name") == public_fip_name]
+    public_lbs = [lb for lb in active_lbs if public_lb_name and lb.get("display_name") == public_lb_name]
+    public_fips = [ip for ip in active_fips if public_fip_name and ip.get("name") == public_fip_name]
     if args.public == "absent":
         if public_lbs or public_fips:
             raise SystemExit("public Service NLB/FIP cleanup has not completed")
+        require_exact_load_balancer_inventory(
+            all_lbs,
+            pathlib.Path(args.immutable_baseline),
+        )
         print(json.dumps({"public": "absent"}, sort_keys=True))
         return
 
+    if not public_lb_name or not public_fip_name or len(private_lb_names) != 2 or len(private_fip_names) != 2:
+        raise SystemExit("workload ownership journal lacks the exact three Service identities")
     if len(public_lbs) != 1 or len(public_fips) != 1:
         raise SystemExit("public Service must own exactly one InSpace NLB and one FIP")
     load_balancer = public_lbs[0]
     floating_ip = public_fips[0]
+    require_exact_load_balancer_inventory(
+        all_lbs,
+        pathlib.Path(args.immutable_baseline),
+        load_balancer.get("uuid"),
+    )
     if load_balancer.get("network_uuid") != os.environ["INSPACE_NETWORK_UUID"]:
         raise SystemExit("public Service NLB is outside the configured VPC")
     worker_records = state.get("workerVMs", [])

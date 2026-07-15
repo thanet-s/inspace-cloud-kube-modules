@@ -146,6 +146,7 @@ func (p *CloudProvider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim)
 		Server:           nodeClass.Spec.RKE2.Server,
 		Token:            token,
 		RKE2Version:      nodeClass.Spec.RKE2.Version,
+		SkipOSUpgrade:    nodeClass.Spec.RKE2.SkipOSUpgrade,
 		Labels:           labels,
 		Taints:           append(append([]corev1.Taint{}, nodeClaim.Spec.Taints...), nodeClaim.Spec.StartupTaints...),
 		AdditionalScript: nodeClass.Spec.AdditionalUserData,

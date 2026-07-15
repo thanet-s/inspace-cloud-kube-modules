@@ -144,6 +144,44 @@ func TestRenderIncludesExactlyOneRegistrationTaint(t *testing.T) {
 	}
 }
 
+func TestSkipOSUpgradePreservesWorkerPackageAndMirrorWork(t *testing.T) {
+	data, err := RenderCloudInit(Config{
+		NodeName: "worker-1", Server: "https://10.0.0.10:9345", Token: "secret-token",
+		RKE2Version: "v1.35.6+rke2r1", SkipOSUpgrade: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc := mustDocument(t, data)
+	prepare := writeFileContent(t, doc, "/usr/local/sbin/inspace-prepare-kubernetes-node")
+	prerequisites := writeFileContent(t, doc, "/usr/local/sbin/inspace-install-prerequisites")
+	for _, required := range []string{
+		"/etc/apt/mirrors/inspace-ubuntu.list",
+		"http://mirror1.totbb.net/ubuntu/",
+		"https://mirror.kku.ac.th/ubuntu/",
+	} {
+		if !strings.Contains(prepare, required) {
+			t.Errorf("skip-upgrade host preparation lacks %q", required)
+		}
+	}
+	for _, required := range []string{
+		"apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 update",
+		"install -y --no-install-recommends ca-certificates curl gzip iproute2 procps tar",
+	} {
+		if !strings.Contains(prerequisites, required) {
+			t.Errorf("skip-upgrade prerequisites lack %q", required)
+		}
+	}
+	if strings.Contains(prerequisites, "upgrade -y") {
+		t.Fatalf("skip-upgrade worker prerequisites retained full OS upgrade:\n%s", prerequisites)
+	}
+	command := exec.Command("sh", "-n")
+	command.Stdin = strings.NewReader(prerequisites)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("skip-upgrade prerequisites are not valid shell: %v\n%s", err, output)
+	}
+}
+
 func TestRenderPrivateBootstrapCacheOnlyRewritesSystemInfrastructure(t *testing.T) {
 	caBundle := bootstrapTestCABundle(t)
 	data, err := RenderCloudInit(Config{

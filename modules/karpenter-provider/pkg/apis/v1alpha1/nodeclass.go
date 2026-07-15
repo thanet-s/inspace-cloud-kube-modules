@@ -185,6 +185,11 @@ type RKE2Config struct {
 	Server string `json:"server"`
 	// TokenSecretRef points to a Secret containing the RKE2 agent token.
 	TokenSecretRef SecretKeySelector `json:"tokenSecretRef"`
+	// SkipOSUpgrade is an explicit bootstrap-time optimization for short-lived
+	// test nodes. Omitted or false keeps the production security-upgrade
+	// behavior; package indexes and required package installation are never
+	// skipped.
+	SkipOSUpgrade bool `json:"skipOSUpgrade,omitempty"`
 }
 
 type SecretKeySelector struct {

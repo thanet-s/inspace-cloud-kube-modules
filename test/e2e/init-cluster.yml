@@ -537,6 +537,10 @@
         grep -Fqx 'APT::Periodic::Enable "0";' /etc/apt/apt.conf.d/99-inspace-disable-periodic
         grep -Fqx 'APT::Periodic::Update-Package-Lists "0";' /etc/apt/apt.conf.d/99-inspace-disable-periodic
         grep -Fqx 'APT::Periodic::Unattended-Upgrade "0";' /etc/apt/apt.conf.d/99-inspace-disable-periodic
+        bastion_bootstrap=/usr/local/sbin/inspace-bootstrap-cache-bastion
+        grep -Fq 'apt-get -o Acquire::Retries=3' "$bastion_bootstrap"
+        grep -Fq 'install -y --no-install-recommends ca-certificates curl e2fsprogs gnupg iproute2 skopeo util-linux' "$bastion_bootstrap"
+        ! grep -Fq 'upgrade -y' "$bastion_bootstrap"
         for apt_unit in apt-daily.service apt-daily-upgrade.service apt-daily.timer apt-daily-upgrade.timer unattended-upgrades.service; do
           ! systemctl is-active --quiet "$apt_unit"
           test "$(systemctl is-enabled "$apt_unit" 2>/dev/null || true)" = masked
@@ -795,10 +799,9 @@
       become: true
       when: not e2e_node_preparation.stat.exists
 
-    - name: Update and upgrade every control plane in parallel
+    - name: Refresh package indexes without upgrading repaired E2E control planes
       ansible.builtin.apt:
         update_cache: true
-        upgrade: 'yes'
         lock_timeout: 300
       environment:
         DEBIAN_FRONTEND: noninteractive
@@ -930,6 +933,10 @@
         test "$(systemctl show rke2-server.service --property=LimitNPROC --value)" = infinity
         test "$(systemctl show rke2-server.service --property=LimitMEMLOCK --value)" = infinity
         test "$(systemctl show rke2-server.service --property=TasksMax --value)" = infinity
+        control_plane_bootstrap=/usr/local/sbin/inspace-bootstrap-rke2
+        grep -Fq 'apt-get -o Acquire::Retries=3' "$control_plane_bootstrap"
+        grep -Fq 'install -y --no-install-recommends ca-certificates curl iproute2 procps tar' "$control_plane_bootstrap"
+        ! grep -Fq 'upgrade -y' "$control_plane_bootstrap"
       args:
         executable: /bin/bash
       become: true
@@ -1652,6 +1659,7 @@
           .spec.bootstrapCache.directDownload == false and
           .spec.bootstrapCache.address == $cacheAddress and
           .spec.bootstrapCache.caBundle == $cacheCA and
+          .spec.rke2.skipOSUpgrade == true and
           (.status.hostPoolUUIDs | sort) == ([$intel, $amd] | sort)'
         kubectl get "nodepool/{{ e2e_nodepool_name }}" -o json | jq -e '
           .spec.template.spec.requirements as $requirements |
@@ -1892,6 +1900,10 @@
         grep -Fqx 'APT::Periodic::Enable "0";' /etc/apt/apt.conf.d/99-inspace-disable-periodic
         grep -Fqx 'APT::Periodic::Update-Package-Lists "0";' /etc/apt/apt.conf.d/99-inspace-disable-periodic
         grep -Fqx 'APT::Periodic::Unattended-Upgrade "0";' /etc/apt/apt.conf.d/99-inspace-disable-periodic
+        worker_prerequisites=/usr/local/sbin/inspace-install-prerequisites
+        grep -Fq 'apt-get -o Acquire::Retries=3' "$worker_prerequisites"
+        grep -Fq 'install -y --no-install-recommends ca-certificates curl gzip iproute2 procps tar' "$worker_prerequisites"
+        ! grep -Fq 'upgrade -y' "$worker_prerequisites"
         for apt_unit in apt-daily.service apt-daily-upgrade.service apt-daily.timer apt-daily-upgrade.timer unattended-upgrades.service; do
           ! systemctl is-active --quiet "$apt_unit"
           test "$(systemctl is-enabled "$apt_unit" 2>/dev/null || true)" = masked

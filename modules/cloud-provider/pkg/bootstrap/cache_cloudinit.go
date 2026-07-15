@@ -22,6 +22,9 @@ type CacheBastionCloudInitInput struct {
 	CACertificate     string
 	ServerCertificate string
 	ServerPrivateKey  string
+	// SkipOSUpgrade removes only apt-get upgrade from the bounded package
+	// stage. Repository setup, apt-get update, and required installs remain.
+	SkipOSUpgrade bool
 }
 
 type cacheCloudInitFile struct {
@@ -361,6 +364,7 @@ func renderCacheBastionBootstrapScript(input CacheBastionCloudInitInput) string 
 		"__PRIVATE_SUBNET__", shellSingleQuote(input.PrivateSubnet),
 		"__CACHE_HOSTNAME__", shellSingleQuote(input.CacheHostname),
 		"__CACHE_BYTES__", fmt.Sprint(BootstrapCacheDiskBytes),
+		"__APT_UPGRADE_CONTINUATION__", renderAPTUpgradeContinuation(input.SkipOSUpgrade, "      "),
 	)
 	return replacer.Replace(`#!/bin/sh
 set -eu
@@ -377,8 +381,7 @@ run_package_command() {
 }
 attempt=0
 until run_package_command apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 update && \
-      run_package_command env NEEDRESTART_MODE=a DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=30 upgrade -y && \
-      run_package_command env NEEDRESTART_MODE=a DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=30 install -y --no-install-recommends ca-certificates curl e2fsprogs gnupg iproute2 skopeo util-linux; do
+__APT_UPGRADE_CONTINUATION__      run_package_command env NEEDRESTART_MODE=a DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=30 install -y --no-install-recommends ca-certificates curl e2fsprogs gnupg iproute2 skopeo util-linux; do
   attempt=$((attempt + 1))
   if [ "$attempt" -ge 60 ] || [ "$(date +%s)" -ge "$package_deadline" ]; then exit 1; fi
   sleep 10

@@ -219,16 +219,18 @@ func TestClusterE2EProvisionsAndWaitsForThreeControlPlanesInParallel(t *testing.
 	requireParallelTask(t, resolved)
 	resolvedConfig := requireTaskMapping(t, resolved, "ansible.builtin.systemd_service")
 	requireMappingString(t, resolvedConfig, "name", "systemd-resolved.service")
-	upgrade := exactAnsibleTask(t, controlPlaneWait, "Update and upgrade every control plane in parallel")
-	requireParallelTask(t, upgrade)
-	upgradeConfig := requireTaskMapping(t, upgrade, "ansible.builtin.apt")
-	requireMappingNumber(t, upgradeConfig, "lock_timeout", 300)
-	if updateCache, ok := upgradeConfig["update_cache"].(bool); !ok || !updateCache {
-		t.Fatalf("Ansible upgrade update_cache=%#v, want true", upgradeConfig["update_cache"])
+	refresh := exactAnsibleTask(t, controlPlaneWait, "Refresh package indexes without upgrading repaired E2E control planes")
+	requireParallelTask(t, refresh)
+	refreshConfig := requireTaskMapping(t, refresh, "ansible.builtin.apt")
+	requireMappingNumber(t, refreshConfig, "lock_timeout", 300)
+	if updateCache, ok := refreshConfig["update_cache"].(bool); !ok || !updateCache {
+		t.Fatalf("Ansible refresh update_cache=%#v, want true", refreshConfig["update_cache"])
 	}
-	requireMappingString(t, upgradeConfig, "upgrade", "yes")
-	requireTaskNumber(t, upgrade, "async", 600)
-	requireTaskNumber(t, upgrade, "poll", 10)
+	if _, found := refreshConfig["upgrade"]; found {
+		t.Fatalf("E2E repair unexpectedly restores the skipped OS upgrade: %#v", refreshConfig)
+	}
+	requireTaskNumber(t, refresh, "async", 600)
+	requireTaskNumber(t, refresh, "poll", 10)
 	sysctls := exactAnsibleTask(t, controlPlaneWait, "Persist Kubernetes sysctls on repaired control planes")
 	requireParallelTask(t, sysctls)
 	sysctlCopy := requireTaskMapping(t, sysctls, "ansible.builtin.copy")

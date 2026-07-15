@@ -103,6 +103,20 @@ test "$(grep -Fc 'URIs: mirror+file:/etc/apt/mirrors/inspace-ubuntu.list' /etc/a
 `
 }
 
+func renderAPTUpgradeContinuation(skip bool, indent string) string {
+	if skip {
+		return ""
+	}
+	return indent + `run_package_command env NEEDRESTART_MODE=a DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=30 upgrade -y && \` + "\n"
+}
+
+func renderAPTUpgradeSuffix(skip bool, indent string) string {
+	if skip {
+		return ""
+	}
+	return " && \\\n" + indent + `run_package_command env NEEDRESTART_MODE=a DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=30 upgrade -y`
+}
+
 type CloudInitInput struct {
 	NodeName                     string
 	NodeExternalIPv4             string
@@ -119,6 +133,9 @@ type CloudInitInput struct {
 	TLSSubjectAltNames           []string
 	Disable                      []string
 	BootstrapCache               *NodeCacheConfig
+	// SkipOSUpgrade removes only apt-get upgrade from the bounded package
+	// stage. Repository setup, apt-get update, and required installs remain.
+	SkipOSUpgrade bool
 }
 
 // RenderCloudInitJSON returns the JSON object expected by InSpace's
@@ -217,10 +234,14 @@ func RenderCloudInitJSON(input CloudInitInput) (string, error) {
 }
 
 // RenderBastionCloudInitJSON sets the deterministic guest hostname, performs
-// one bounded package upgrade, disables automatic APT updates, and disables
-// any image-provided host firewall. All packet policy is enforced by the
-// separately owned InSpace bastion firewall.
+// one bounded package update and upgrade, disables automatic APT updates, and
+// disables any image-provided host firewall. All packet policy is enforced by
+// the separately owned InSpace bastion firewall.
 func RenderBastionCloudInitJSON(nodeName string) (string, error) {
+	return renderBastionCloudInitJSON(nodeName, false)
+}
+
+func renderBastionCloudInitJSON(nodeName string, skipOSUpgrade bool) (string, error) {
 	if !nodeNamePattern.MatchString(nodeName) {
 		return "", errors.New("bootstrap: bastion node name must be a lowercase DNS label of at most 63 characters")
 	}
@@ -245,7 +266,7 @@ func RenderBastionCloudInitJSON(nodeName string) (string, error) {
 			Owner       string `json:"owner"`
 		}{
 			{
-				Path: "/usr/local/sbin/inspace-bootstrap-bastion", Content: base64.StdEncoding.EncodeToString([]byte(renderBastionBootstrapScript(nodeName))),
+				Path: "/usr/local/sbin/inspace-bootstrap-bastion", Content: base64.StdEncoding.EncodeToString([]byte(renderBastionBootstrapScript(nodeName, skipOSUpgrade))),
 				Permissions: "0700", Encoding: "b64", Owner: "root:root",
 			},
 			{
@@ -515,7 +536,7 @@ done
 `
 }
 
-func renderBastionBootstrapScript(nodeName string) string {
+func renderBastionBootstrapScript(nodeName string, skipOSUpgrade bool) string {
 	return `#!/bin/sh
 set -eu
 
@@ -528,8 +549,7 @@ run_package_command() {
   timeout --kill-after=30s "${package_remaining}s" "$@"
 }
 attempt=0
-until run_package_command apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 update && \
-      run_package_command env NEEDRESTART_MODE=a DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=30 upgrade -y; do
+until run_package_command apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 update` + renderAPTUpgradeSuffix(skipOSUpgrade, "      ") + `; do
   attempt=$((attempt + 1))
   if [ "$attempt" -ge 60 ] || [ "$(date +%s)" -ge "$package_deadline" ]; then exit 1; fi
   sleep 10
@@ -576,8 +596,7 @@ run_package_command() {
 }
 attempt=0
 until run_package_command apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 update && \
-	  run_package_command env NEEDRESTART_MODE=a DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=30 upgrade -y && \
-	  run_package_command env NEEDRESTART_MODE=a DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=30 install -y --no-install-recommends ca-certificates curl iproute2 procps tar; do
+%s	  run_package_command env NEEDRESTART_MODE=a DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=30 install -y --no-install-recommends ca-certificates curl iproute2 procps tar; do
   attempt=$((attempt + 1))
   if [ "$attempt" -ge 60 ] || [ "$(date +%%s)" -ge "$package_deadline" ]; then exit 1; fi
   sleep 10
@@ -648,7 +667,7 @@ until systemctl is-active --quiet rke2-server.service && [ -s /etc/rancher/rke2/
   if systemctl is-failed --quiet rke2-server.service || [ "$attempt" -ge 180 ]; then exit 1; fi
   sleep 5
 done
-`, strings.TrimSpace(renderUbuntuRepositoryAndResolverCommands(input.NodeName)), strings.TrimSpace(renderDisableAutomaticAPTUpdatesCommands()), input.PrivateSubnet, input.VirtualIPv4, cacheHostsSetup, strings.TrimSpace(strings.TrimPrefix(renderDisableUFWScript(), "#!/bin/sh\nset -eu\n")), cacheWait, input.RKE2Version, releaseBase)
+`, strings.TrimSpace(renderUbuntuRepositoryAndResolverCommands(input.NodeName)), renderAPTUpgradeContinuation(input.SkipOSUpgrade, "\t  "), strings.TrimSpace(renderDisableAutomaticAPTUpdatesCommands()), input.PrivateSubnet, input.VirtualIPv4, cacheHostsSetup, strings.TrimSpace(strings.TrimPrefix(renderDisableUFWScript(), "#!/bin/sh\nset -eu\n")), cacheWait, input.RKE2Version, releaseBase)
 }
 
 func renderDirectInstallScript(input CloudInitInput) string {
@@ -670,8 +689,7 @@ run_package_command() {
 }
 attempt=0
 until run_package_command apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 update && \
-	  run_package_command env NEEDRESTART_MODE=a DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=30 upgrade -y && \
-	  run_package_command env NEEDRESTART_MODE=a DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=30 install -y --no-install-recommends ca-certificates curl iproute2 procps tar; do
+%s	  run_package_command env NEEDRESTART_MODE=a DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=30 install -y --no-install-recommends ca-certificates curl iproute2 procps tar; do
   attempt=$((attempt + 1))
   if [ "$attempt" -ge 60 ] || [ "$(date +%%s)" -ge "$package_deadline" ]; then exit 1; fi
   sleep 10
@@ -738,7 +756,7 @@ until systemctl is-active --quiet rke2-server.service && [ -s /etc/rancher/rke2/
   if systemctl is-failed --quiet rke2-server.service || [ "$attempt" -ge 180 ]; then exit 1; fi
   sleep 5
 done
-`, strings.TrimSpace(renderUbuntuRepositoryAndResolverCommands(input.NodeName)), strings.TrimSpace(renderDisableAutomaticAPTUpdatesCommands()), input.PrivateSubnet, input.VirtualIPv4, strings.TrimSpace(strings.TrimPrefix(renderDisableUFWScript(), "#!/bin/sh\nset -eu\n")), input.RKE2Version, releaseBase)
+`, strings.TrimSpace(renderUbuntuRepositoryAndResolverCommands(input.NodeName)), renderAPTUpgradeContinuation(input.SkipOSUpgrade, "\t  "), strings.TrimSpace(renderDisableAutomaticAPTUpdatesCommands()), input.PrivateSubnet, input.VirtualIPv4, strings.TrimSpace(strings.TrimPrefix(renderDisableUFWScript(), "#!/bin/sh\nset -eu\n")), input.RKE2Version, releaseBase)
 }
 
 func sortedUniquePorts(ports []int) []int {

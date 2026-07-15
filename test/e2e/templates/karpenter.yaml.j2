@@ -22,6 +22,7 @@ spec:
     caBundle: {{ e2e_bootstrap_result.bootstrapCacheCABundle | to_json }}
   rke2:
     version: v1.35.6+rke2r1
+    skipOSUpgrade: true
     server: {{ e2e_bootstrap_result.privateRegistrationEndpoint }}
     tokenSecretRef:
       name: inspace-rke2-agent-token
