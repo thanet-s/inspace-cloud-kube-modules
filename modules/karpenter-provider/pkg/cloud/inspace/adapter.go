@@ -124,29 +124,30 @@ func newAdapter(api API, passwordGenerator func() (string, error)) (*Adapter, er
 }
 
 type ownership struct {
-	Schema                       string `json:"schema"`
-	Cluster                      string `json:"cluster"`
-	NodeClaim                    string `json:"nodeClaim"`
-	VMName                       string `json:"vmName,omitempty"`
-	KeyHash                      string `json:"keyHash"`
-	HostClass                    string `json:"hostClass"`
-	InstanceType                 string `json:"instanceType"`
-	HostPoolUUID                 string `json:"hostPoolUUID,omitempty"`
-	VCPU                         int    `json:"vCPU,omitempty"`
-	MemoryGiB                    int    `json:"memoryGiB,omitempty"`
-	RootDiskGiB                  int32  `json:"rootDiskGiB"`
-	SpecHash                     string `json:"specHash"`
-	BootstrapHash                string `json:"bootstrapHash"`
-	FirewallUUID                 string `json:"firewallUUID"`
-	NetworkUUID                  string `json:"networkUUID,omitempty"`
-	ControlPlaneVIP              string `json:"controlPlaneVIP,omitempty"`
-	PrivateLoadBalancerPoolStart string `json:"privateLoadBalancerPoolStart,omitempty"`
-	PrivateLoadBalancerPoolStop  string `json:"privateLoadBalancerPoolStop,omitempty"`
-	OSName                       string `json:"osName"`
-	OSVersion                    string `json:"osVersion"`
-	BillingAccountID             int64  `json:"billingAccountID"`
-	FloatingIPName               string `json:"floatingIPName"`
-	PublicIPv4                   string `json:"publicIPv4,omitempty"`
+	Schema                       string                    `json:"schema"`
+	Cluster                      string                    `json:"cluster"`
+	NodeClaim                    string                    `json:"nodeClaim"`
+	VMName                       string                    `json:"vmName,omitempty"`
+	KeyHash                      string                    `json:"keyHash"`
+	HostClass                    string                    `json:"hostClass"`
+	InstanceType                 string                    `json:"instanceType"`
+	HostPoolUUID                 string                    `json:"hostPoolUUID,omitempty"`
+	VCPU                         int                       `json:"vCPU,omitempty"`
+	MemoryGiB                    int                       `json:"memoryGiB,omitempty"`
+	RootDiskGiB                  int32                     `json:"rootDiskGiB"`
+	SpecHash                     string                    `json:"specHash"`
+	BootstrapHash                string                    `json:"bootstrapHash"`
+	FirewallUUID                 string                    `json:"firewallUUID"`
+	FirewallProfile              inspacev1.FirewallProfile `json:"firewallProfile,omitempty"`
+	NetworkUUID                  string                    `json:"networkUUID,omitempty"`
+	ControlPlaneVIP              string                    `json:"controlPlaneVIP,omitempty"`
+	PrivateLoadBalancerPoolStart string                    `json:"privateLoadBalancerPoolStart,omitempty"`
+	PrivateLoadBalancerPoolStop  string                    `json:"privateLoadBalancerPoolStop,omitempty"`
+	OSName                       string                    `json:"osName"`
+	OSVersion                    string                    `json:"osVersion"`
+	BillingAccountID             int64                     `json:"billingAccountID"`
+	FloatingIPName               string                    `json:"floatingIPName"`
+	PublicIPv4                   string                    `json:"publicIPv4,omitempty"`
 }
 
 func newOwnership(request cloudapi.CreateVMRequest) ownership {
@@ -155,7 +156,8 @@ func newOwnership(request cloudapi.CreateVMRequest) ownership {
 		KeyHash: hashKey(request.IdempotencyKey), HostClass: request.HostClass, InstanceType: request.InstanceType,
 		HostPoolUUID: request.HostPoolUUID, VCPU: request.VCPU, MemoryGiB: request.MemoryGiB,
 		RootDiskGiB: request.RootDiskGiB, SpecHash: request.SpecHash, BootstrapHash: request.BootstrapHash,
-		FirewallUUID: request.FirewallUUID, NetworkUUID: request.NetworkUUID, ControlPlaneVIP: request.ControlPlaneVIP,
+		FirewallUUID: request.FirewallUUID, FirewallProfile: inspacev1.EffectiveFirewallProfile(request.FirewallProfile),
+		NetworkUUID: request.NetworkUUID, ControlPlaneVIP: request.ControlPlaneVIP,
 		PrivateLoadBalancerPoolStart: request.PrivateLoadBalancerPoolStart, PrivateLoadBalancerPoolStop: request.PrivateLoadBalancerPoolStop,
 		OSName: request.OSName, OSVersion: request.OSVersion,
 		BillingAccountID: request.BillingAccountID, FloatingIPName: floatingIPName(request.ClusterName, request.NodeClaimName),
@@ -278,7 +280,7 @@ func (a *Adapter) recoverAmbiguousResponseUUID(ctx context.Context, request clou
 	// A UUID returned alongside a transport/retryable error is authority only
 	// for the non-destructive protection mutation. Canonical v3 detail must
 	// still converge before adoption or rollback is authorized.
-	protectionErr := a.ensureFreshFirewall(ctx, request.Location, request.FirewallUUID, vmUUID, networkPrefix)
+	protectionErr := a.ensureFreshFirewall(ctx, request.Location, request.FirewallUUID, vmUUID, networkPrefix, request.FirewallProfile, request.ClusterName)
 	persisted, proofErr := a.ensurePersistedVMIdentity(context.WithoutCancel(ctx), request, vmUUID, expected, nil)
 	if proofErr != nil {
 		return nil, fmt.Errorf("ambiguous VM %s protection/ownership remains uncertain: %w", vmUUID, errors.Join(protectionErr, proofErr))
@@ -329,7 +331,7 @@ func (a *Adapter) findCreate(ctx context.Context, request cloudapi.CreateVMReque
 		// A unique deterministic list identity is sufficient only to apply the
 		// prevalidated firewall. Destructive/adoption authority still requires
 		// canonical v3 detail below.
-		protectionErr := a.ensureFreshFirewall(ctx, request.Location, request.FirewallUUID, summary.UUID, networkPrefix)
+		protectionErr := a.ensureFreshFirewall(ctx, request.Location, request.FirewallUUID, summary.UUID, networkPrefix, request.FirewallProfile, request.ClusterName)
 		vm, actual, proofErr := a.readCanonicalCreateCandidate(context.WithoutCancel(ctx), request, *summary)
 		if proofErr != nil {
 			return nil, fmt.Errorf("ambiguous VM %s protection/ownership remains uncertain: %w", summary.UUID, errors.Join(protectionErr, proofErr))
@@ -915,7 +917,7 @@ func auditEstablishedVMProtection(vm sdk.VM, record ownership, network *sdk.Netw
 	if err := validateDefaultDenyFirewall(*intendedFirewall, networkPrefix); err != nil {
 		return "", err
 	}
-	if _, err := validateWorkerFirewallAssignments(firewalls, record.FirewallUUID, vm.UUID, true); err != nil {
+	if _, err := validateWorkerFirewallAssignments(firewalls, record.FirewallUUID, vm.UUID, true, record.FirewallProfile, record.Cluster); err != nil {
 		return "", err
 	}
 	expectedAddress, err := findFloatingIPInListRaw(addresses, record.FloatingIPName, record.BillingAccountID)
@@ -1388,6 +1390,11 @@ func validateCreateRequest(r cloudapi.CreateVMRequest) error {
 	if err := inspacev1.ValidateSSHAccess(r.SSHUsername, r.SSHPublicKey); err != nil {
 		return fmt.Errorf("invalid worker SSH access: %w", err)
 	}
+	switch r.FirewallProfile {
+	case "", inspacev1.FirewallProfilePrivateWorker, inspacev1.FirewallProfilePublicNodeLoadBalancer:
+	default:
+		return fmt.Errorf("unsupported firewall profile %q", r.FirewallProfile)
+	}
 	if err := bootstrap.ValidateVPCSubnetTemplate(r.CloudInitJSON); err != nil {
 		return err
 	}
@@ -1560,6 +1567,12 @@ func validatePersistedLaunchIdentity(vm sdk.VM, request cloudapi.CreateVMRequest
 
 func normalizeOwnershipLaunchIdentity(record ownership) (normalized ownership, partial bool, err error) {
 	normalized = record
+	switch normalized.FirewallProfile {
+	case "", inspacev1.FirewallProfilePrivateWorker, inspacev1.FirewallProfilePublicNodeLoadBalancer:
+		normalized.FirewallProfile = inspacev1.EffectiveFirewallProfile(normalized.FirewallProfile)
+	default:
+		return ownership{}, false, fmt.Errorf("unsupported recorded firewall profile %q", normalized.FirewallProfile)
+	}
 	// v1 records used the NodeClaim name for the VM, guest hostname, and RKE2
 	// Node name. Normalize that deliberate compatibility contract to v2 before
 	// comparing ownership; a v2 record may never omit its separate VM name.
@@ -1697,6 +1710,7 @@ func ownershipMatchesExpectedWherePresent(actual, expected ownership) bool {
 		fieldMatchesOrIsMissing(actual.SpecHash, expected.SpecHash) &&
 		fieldMatchesOrIsMissing(actual.BootstrapHash, expected.BootstrapHash) &&
 		fieldMatchesOrIsMissing(actual.FirewallUUID, expected.FirewallUUID) &&
+		fieldMatchesOrIsMissing(actual.FirewallProfile, expected.FirewallProfile) &&
 		fieldMatchesOrIsMissing(actual.NetworkUUID, expected.NetworkUUID) &&
 		fieldMatchesOrIsMissing(actual.ControlPlaneVIP, expected.ControlPlaneVIP) &&
 		fieldMatchesOrIsMissing(actual.PrivateLoadBalancerPoolStart, expected.PrivateLoadBalancerPoolStart) &&
@@ -1753,6 +1767,7 @@ func fromSDK(vm *sdk.VM, location string, record ownership) *cloudapi.VM {
 		NodeClaimName: record.NodeClaim, Location: location, OSName: osName, OSVersion: osVersion,
 		HostClass: record.HostClass, InstanceType: record.InstanceType, VCPU: vm.VCPU, MemoryGiB: vm.MemoryMiB / 1024,
 		RootDiskGiB: rootDiskGiB, FirewallUUID: record.FirewallUUID, NetworkUUID: record.NetworkUUID, ControlPlaneVIP: record.ControlPlaneVIP,
+		FirewallProfile:              inspacev1.EffectiveFirewallProfile(record.FirewallProfile),
 		PrivateLoadBalancerPoolStart: record.PrivateLoadBalancerPoolStart, PrivateLoadBalancerPoolStop: record.PrivateLoadBalancerPoolStop, SpecHash: record.SpecHash,
 		BootstrapHash: record.BootstrapHash, PrivateIPv4: vm.PrivateIPv4, PublicIPv4: record.PublicIPv4, FloatingIPName: record.FloatingIPName,
 		State: mapLifecycle(vm.Status), RawState: vm.Status,
@@ -1770,7 +1785,7 @@ func (a *Adapter) ensureProtection(ctx context.Context, request cloudapi.CreateV
 	var persisted *sdk.VM
 	var err error
 	if freshLaunch {
-		if err := a.ensureFreshFirewall(ctx, request.Location, request.FirewallUUID, vmUUID, prevalidatedNetworkPrefix); err != nil {
+		if err := a.ensureFreshFirewall(ctx, request.Location, request.FirewallUUID, vmUUID, prevalidatedNetworkPrefix, request.FirewallProfile, request.ClusterName); err != nil {
 			return nil, nil, true, errors.Join(errEarlyFirewallProtection, err)
 		}
 		persisted, err = a.ensurePersistedVMIdentity(context.WithoutCancel(ctx), request, vmUUID, expected, canonicalHint)
@@ -1782,7 +1797,7 @@ func (a *Adapter) ensureProtection(ctx context.Context, request cloudapi.CreateV
 		if err != nil {
 			return nil, nil, false, err
 		}
-		if err := a.ensureEarlyFirewall(ctx, request.Location, request.FirewallUUID, vmUUID, prevalidatedNetworkPrefix); err != nil {
+		if err := a.ensureEarlyFirewall(ctx, request.Location, request.FirewallUUID, vmUUID, prevalidatedNetworkPrefix, request.FirewallProfile, request.ClusterName); err != nil {
 			return persisted, nil, true, errors.Join(errEarlyFirewallProtection, err)
 		}
 	}
@@ -1848,17 +1863,17 @@ func (a *Adapter) ensurePersistedVMIdentity(ctx context.Context, request cloudap
 	}
 }
 
-func (a *Adapter) ensureEarlyFirewall(ctx context.Context, location, firewallUUID, vmUUID string, networkPrefix netip.Prefix) error {
+func (a *Adapter) ensureEarlyFirewall(ctx context.Context, location, firewallUUID, vmUUID string, networkPrefix netip.Prefix, profile inspacev1.FirewallProfile, clusterName string) error {
 	timeout := a.protectionAuditTimeout
 	if a.networkAttachmentReadbackTimeout < timeout {
 		timeout = a.networkAttachmentReadbackTimeout
 	}
 	protectionCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	return a.ensureFirewall(protectionCtx, location, firewallUUID, vmUUID, networkPrefix)
+	return a.ensureFirewall(protectionCtx, location, firewallUUID, vmUUID, networkPrefix, profile, clusterName)
 }
 
-func (a *Adapter) ensureFreshFirewall(ctx context.Context, location, firewallUUID, vmUUID string, networkPrefix netip.Prefix) error {
+func (a *Adapter) ensureFreshFirewall(ctx context.Context, location, firewallUUID, vmUUID string, networkPrefix netip.Prefix, profile inspacev1.FirewallProfile, clusterName string) error {
 	timeout := a.protectionAuditTimeout
 	if a.networkAttachmentReadbackTimeout < timeout {
 		timeout = a.networkAttachmentReadbackTimeout
@@ -1888,7 +1903,7 @@ func (a *Adapter) ensureFreshFirewall(ctx context.Context, location, firewallUUI
 				validationErr = validateDefaultDenyFirewall(*firewall, networkPrefix)
 			}
 			if validationErr == nil {
-				_, validationErr = validateWorkerFirewallAssignments(firewalls, firewallUUID, vmUUID, true)
+				_, validationErr = validateWorkerFirewallAssignments(firewalls, firewallUUID, vmUUID, true, profile, clusterName)
 			}
 			if validationErr == nil {
 				return nil
@@ -2064,7 +2079,7 @@ func (a *Adapter) ensureCloudProtections(ctx context.Context, request cloudapi.C
 	if err := validateUsableFloatingIP(floatingIP); err != nil {
 		return fmt.Errorf("worker floating IP is unusable: %w", err)
 	}
-	if err := a.ensureFirewall(ctx, request.Location, request.FirewallUUID, vmUUID, networkPrefix); err != nil {
+	if err := a.ensureFirewall(ctx, request.Location, request.FirewallUUID, vmUUID, networkPrefix, request.FirewallProfile, request.ClusterName); err != nil {
 		return err
 	}
 	if err := a.ensureFloatingAssignment(ctx, request.Location, floatingIP, vmUUID); err != nil {
@@ -2280,7 +2295,7 @@ func ipv4AddressValue(address netip.Addr) (uint64, bool) {
 	return uint64(bytes[0])<<24 | uint64(bytes[1])<<16 | uint64(bytes[2])<<8 | uint64(bytes[3]), true
 }
 
-func (a *Adapter) ensureFirewall(ctx context.Context, location, firewallUUID, vmUUID string, networkPrefix netip.Prefix) error {
+func (a *Adapter) ensureFirewall(ctx context.Context, location, firewallUUID, vmUUID string, networkPrefix netip.Prefix, profile inspacev1.FirewallProfile, clusterName string) error {
 	firewalls, err := a.api.ListFirewalls(ctx, location)
 	if err != nil {
 		return fmt.Errorf("listing InSpace firewalls for worker assignment audit: %w", err)
@@ -2292,7 +2307,7 @@ func (a *Adapter) ensureFirewall(ctx context.Context, location, firewallUUID, vm
 	if err := validateDefaultDenyFirewall(*firewall, networkPrefix); err != nil {
 		return err
 	}
-	assigned, err := validateWorkerFirewallAssignments(firewalls, firewallUUID, vmUUID, false)
+	assigned, err := validateWorkerFirewallAssignments(firewalls, firewallUUID, vmUUID, false, profile, clusterName)
 	if err != nil {
 		return err
 	}
@@ -2318,7 +2333,7 @@ func (a *Adapter) ensureFirewall(ctx context.Context, location, firewallUUID, vm
 				err = validateDefaultDenyFirewall(*firewall, networkPrefix)
 			}
 			if err == nil {
-				_, err = validateWorkerFirewallAssignments(firewalls, firewallUUID, vmUUID, true)
+				_, err = validateWorkerFirewallAssignments(firewalls, firewallUUID, vmUUID, true, profile, clusterName)
 			}
 			if err == nil {
 				// An authoritative assignment readback wins over an ambiguous
@@ -2337,25 +2352,97 @@ func (a *Adapter) ensureFirewall(ctx context.Context, location, firewallUUID, vm
 	}
 }
 
-func validateWorkerFirewallAssignments(firewalls []sdk.Firewall, intendedFirewallUUID, vmUUID string, requireIntended bool) (bool, error) {
-	assignments := make([]string, 0, 1)
-	for _, firewall := range firewalls {
-		for _, resource := range firewall.ResourcesAssigned {
-			if strings.EqualFold(resource.ResourceType, "vm") && resource.ResourceUUID == vmUUID {
-				assignments = append(assignments, firewall.UUID)
+func validateWorkerFirewallAssignments(firewalls []sdk.Firewall, intendedFirewallUUID, vmUUID string, requireIntended bool, profile inspacev1.FirewallProfile, clusterName string) (bool, error) {
+	assignments, err := firewallAssignmentsForVM(firewalls, vmUUID)
+	if err != nil {
+		return false, err
+	}
+	profile = inspacev1.EffectiveFirewallProfile(profile)
+	switch profile {
+	case inspacev1.FirewallProfilePrivateWorker:
+		if len(assignments) == 0 && !requireIntended {
+			return false, nil
+		}
+		if len(assignments) == 0 {
+			return false, fmt.Errorf("%w: worker VM %s", errFirewallAssignmentNotVisible, vmUUID)
+		}
+		if len(assignments) != 1 || assignments[0] != intendedFirewallUUID {
+			return false, fmt.Errorf("%w: worker VM %s must be attached exactly once to intended firewall %s, got %v", cloudapi.ErrOwnershipMismatch, vmUUID, intendedFirewallUUID, assignments)
+		}
+		return true, nil
+	case inspacev1.FirewallProfilePublicNodeLoadBalancer:
+	default:
+		return false, fmt.Errorf("%w: worker VM %s has unsupported firewall profile %q", cloudapi.ErrOwnershipMismatch, vmUUID, profile)
+	}
+
+	byUUID := make(map[string]*sdk.Firewall, len(firewalls))
+	for i := range firewalls {
+		byUUID[firewalls[i].UUID] = &firewalls[i]
+	}
+	intendedFirewall := byUUID[intendedFirewallUUID]
+	if intendedFirewall == nil {
+		return false, fmt.Errorf("%w: intended worker firewall %s is absent from the authoritative list", cloudapi.ErrOwnershipMismatch, intendedFirewallUUID)
+	}
+	if intendedFirewall.BillingAccountID < 1 {
+		return false, fmt.Errorf("%w: intended worker firewall %s has no positive billing-account identity", cloudapi.ErrOwnershipMismatch, intendedFirewallUUID)
+	}
+	intendedCount := 0
+	icmpFirewallCount := 0
+	for _, firewallUUID := range assignments {
+		if firewallUUID == intendedFirewallUUID {
+			intendedCount++
+			continue
+		}
+		firewall := byUUID[firewallUUID]
+		if firewall == nil {
+			return false, fmt.Errorf("%w: assigned firewall %s is absent from the authoritative list", cloudapi.ErrOwnershipMismatch, firewallUUID)
+		}
+		if err := validateNodeLoadBalancerClusterICMPFirewall(*firewall, clusterName, intendedFirewall.BillingAccountID); err == nil {
+			icmpFirewallCount++
+			if icmpFirewallCount > 1 {
+				return false, fmt.Errorf("%w: worker VM %s has more than one cluster ICMP firewall", cloudapi.ErrOwnershipMismatch, vmUUID)
 			}
+			continue
+		}
+		if err := validateNodeLoadBalancerServiceFirewall(*firewall, clusterName, intendedFirewall.BillingAccountID); err != nil {
+			return false, fmt.Errorf("%w: worker VM %s additional firewall %s: %v", cloudapi.ErrOwnershipMismatch, vmUUID, firewallUUID, err)
 		}
 	}
-	if len(assignments) == 0 && !requireIntended {
+	if intendedCount > 1 {
+		return false, fmt.Errorf("%w: worker VM %s has duplicate intended firewall %s assignments", cloudapi.ErrOwnershipMismatch, vmUUID, intendedFirewallUUID)
+	}
+	if intendedCount == 0 {
+		if requireIntended {
+			return false, fmt.Errorf("%w: worker VM %s", errFirewallAssignmentNotVisible, vmUUID)
+		}
 		return false, nil
 	}
-	if len(assignments) == 0 {
-		return false, fmt.Errorf("%w: worker VM %s", errFirewallAssignmentNotVisible, vmUUID)
-	}
-	if len(assignments) != 1 || assignments[0] != intendedFirewallUUID {
-		return false, fmt.Errorf("%w: worker VM %s must be attached exactly once to intended firewall %s, got %v", cloudapi.ErrOwnershipMismatch, vmUUID, intendedFirewallUUID, assignments)
-	}
 	return true, nil
+}
+
+func validateNodeLoadBalancerClusterICMPFirewall(firewall sdk.Firewall, clusterName string, billingAccountID int64) error {
+	return sdk.ValidateNodeLoadBalancerClusterICMPFirewall(firewall, clusterName, billingAccountID)
+}
+
+func validateNodeLoadBalancerServiceFirewall(firewall sdk.Firewall, clusterName string, billingAccountID int64) error {
+	return sdk.ValidateNodeLoadBalancerServiceFirewall(firewall, clusterName, billingAccountID)
+}
+
+// nodeLoadBalancerFirewallSpecHash binds a CCM-owned firewall name to the
+// complete public policy that InSpace returns from its authoritative list API.
+// Firewall descriptions are deliberately not part of this identity because
+// the API currently omits them from readback.
+func nodeLoadBalancerFirewallSpecHash(rules []sdk.FirewallRule) (string, error) {
+	return sdk.NodeLoadBalancerServiceFirewallSpecHash(rules)
+}
+
+func nodeLoadBalancerICMPFirewallSpecHash(rules []sdk.FirewallRule) (string, error) {
+	return sdk.NodeLoadBalancerClusterICMPFirewallSpecHash(rules)
+}
+
+func shortSHA256(value string) string {
+	sum := sha256.Sum256([]byte(value))
+	return hex.EncodeToString(sum[:])[:8]
 }
 
 func (a *Adapter) ensureFloatingAssignment(ctx context.Context, location string, floatingIP sdk.FloatingIP, vmUUID string) error {

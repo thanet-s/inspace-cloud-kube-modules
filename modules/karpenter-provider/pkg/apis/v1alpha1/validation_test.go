@@ -44,6 +44,28 @@ func TestHostPoolUUIDForClass(t *testing.T) {
 	}
 }
 
+func TestFirewallProfileDefaultsAndValidation(t *testing.T) {
+	if got := EffectiveFirewallProfile(""); got != FirewallProfilePrivateWorker {
+		t.Fatalf("EffectiveFirewallProfile(empty) = %q, want %q", got, FirewallProfilePrivateWorker)
+	}
+	for _, profile := range []FirewallProfile{"", FirewallProfilePrivateWorker, FirewallProfilePublicNodeLoadBalancer} {
+		nodeClass := validNodeClass()
+		nodeClass.Spec.FirewallProfile = profile
+		if errs := nodeClass.Validate(); len(errs) != 0 {
+			t.Fatalf("firewall profile %q validation errors = %v", profile, errs)
+		}
+		if got := nodeClass.Spec.EffectiveFirewallProfile(); got == "" {
+			t.Fatalf("effective firewall profile is empty for %q", profile)
+		}
+	}
+	nodeClass := validNodeClass()
+	nodeClass.Spec.FirewallProfile = "future-profile"
+	errs := nodeClass.Validate()
+	if len(errs) != 1 || errs[0].Field != "spec.firewallProfile" {
+		t.Fatalf("invalid firewall profile errors = %v, want one firewallProfile error", errs)
+	}
+}
+
 func TestValidateRejectsCloudAPICredentialAsAgentToken(t *testing.T) {
 	nodeClass := validNodeClass()
 	nodeClass.Spec.RKE2.TokenSecretRef = SecretKeySelector{Name: "inspace-api", Key: "token"}

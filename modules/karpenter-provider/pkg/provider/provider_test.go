@@ -298,6 +298,8 @@ func TestHostPoolForOfferingRejectsAmbiguousOrUnknownIdentity(t *testing.T) {
 func TestCreateAndReadbackPreserveOfferingAndNumericIdentity(t *testing.T) {
 	ctx := context.Background()
 	nodeClass := readyProviderNodeClass()
+	nodeClass.Spec.FirewallProfile = inspacev1.FirewallProfilePublicNodeLoadBalancer
+	nodeClass.Status.ObservedSpecHash = NodeClassHash(nodeClass)
 	resolver := NewStaticResolver(nodeClass)
 	resolver.SetToken(inspacev1.RKE2AgentTokenSecretName, inspacev1.RKE2AgentTokenSecretKey, "agent-token")
 	cloud := cloudfake.New()
@@ -332,6 +334,9 @@ func TestCreateAndReadbackPreserveOfferingAndNumericIdentity(t *testing.T) {
 	}
 	if request.HostClass != inspacev1.HostClassAMDEPYC || request.HostPoolUUID != inspacev1.AMDEPYCHostPoolUUID || request.InstanceType != "is-general-4c-8g" {
 		t.Fatalf("launch identity=%s/%s/%s", request.HostClass, request.HostPoolUUID, request.InstanceType)
+	}
+	if request.FirewallProfile != inspacev1.FirewallProfilePublicNodeLoadBalancer {
+		t.Fatalf("launch firewall profile=%q, want %q", request.FirewallProfile, inspacev1.FirewallProfilePublicNodeLoadBalancer)
 	}
 	assertCapacityLabels := func(t *testing.T, labels map[string]string) {
 		t.Helper()

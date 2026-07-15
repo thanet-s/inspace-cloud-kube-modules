@@ -18,9 +18,28 @@ const (
 	HostClassIntelScalable = "intel-scalable"
 	HostClassAMDEPYC       = "amd-epyc"
 
+	FirewallProfilePrivateWorker          FirewallProfile = "private-worker"
+	FirewallProfilePublicNodeLoadBalancer FirewallProfile = "public-node-load-balancer"
+
 	IntelScalableHostPoolUUID = "aac7dd66-f390-4edd-80c0-dd7cae49bd99"
 	AMDEPYCHostPoolUUID       = "6976fdc8-4492-465b-bd16-9ad5f6b00b03"
 )
+
+// FirewallProfile controls which additional firewall assignments are valid
+// for a node. The NodeClass firewall itself is always the same strict private
+// worker firewall; the public load-balancer profile only permits the shared
+// cluster ICMP firewall and separately owned Service firewalls in addition.
+type FirewallProfile string
+
+// EffectiveFirewallProfile preserves the original private-worker behavior for
+// NodeClasses and persisted ownership records created before this optional
+// field existed.
+func EffectiveFirewallProfile(profile FirewallProfile) FirewallProfile {
+	if profile == "" {
+		return FirewallProfilePrivateWorker
+	}
+	return profile
+}
 
 // InSpaceNodeClass describes the immutable infrastructure and RKE2 bootstrap
 // policy shared by one or more Karpenter NodePools.
@@ -73,6 +92,10 @@ type InSpaceNodeClassSpec struct {
 	// Cilium pod CIDR 10.42.0.0/16, plus matching any-destination egress, and
 	// rejects every public inbound rule.
 	FirewallUUID string `json:"firewallUUID"`
+	// FirewallProfile defaults to private-worker. public-node-load-balancer
+	// keeps FirewallUUID private and permits only the CCM-owned cluster ICMP
+	// firewall and Service ingress firewalls that pass provider audit.
+	FirewallProfile FirewallProfile `json:"firewallProfile,omitempty"`
 	// ImageSelector selects a stock operating-system image supported by the VM
 	// create API. The first release supports Ubuntu 24.04 only.
 	ImageSelector ImageSelector `json:"imageSelector"`
@@ -91,6 +114,10 @@ type InSpaceNodeClassSpec struct {
 	SSHPublicKey string `json:"sshPublicKey,omitempty"`
 	// AdditionalUserData runs once through cloud-init-per. It must not contain secrets.
 	AdditionalUserData string `json:"additionalUserData,omitempty"`
+}
+
+func (s InSpaceNodeClassSpec) EffectiveFirewallProfile() FirewallProfile {
+	return EffectiveFirewallProfile(s.FirewallProfile)
 }
 
 type BootstrapCacheSpec struct {

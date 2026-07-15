@@ -115,6 +115,18 @@ def no_ports(rule) -> bool:
     return rule.get("port_start") is None and rule.get("port_end") is None
 
 
+def matches_management_source(rule, management_cidr: str) -> bool:
+    if management_cidr == "0.0.0.0/0":
+        return (
+            rule.get("endpoint_spec_type") == "any"
+            and rule.get("endpoint_spec", []) in ([], None)
+        )
+    return (
+        rule.get("endpoint_spec_type") == "ip_prefixes"
+        and rule.get("endpoint_spec") == [management_cidr]
+    )
+
+
 def validate_node_firewall(firewall, subnet: str, pod_cidr: str, vm_ids: set[str]) -> None:
     assignments = firewall.get("resources_assigned", [])
     if len(assignments) != 3 or {
@@ -152,10 +164,10 @@ def validate_bastion_firewall(
         if len(assignments) != 1 or assignments[0].get("resource_type") != "vm" or assignments[0].get("resource_uuid") != vm_uuid:
             raise SystemExit("bastion firewall must be assigned only to the bastion VM")
     rules = firewall.get("rules", [])
-    expected_rule_count = 5 if cache_enabled else 4
+    expected_rule_count = 6 if cache_enabled else 5
     if len(rules) != expected_rule_count:
         raise SystemExit(
-            "bastion firewall must contain only SSH ingress, optional private cache ingress, and three egress rules"
+            "bastion firewall must contain only management SSH/ICMP ingress, optional private cache ingress, and three egress rules"
         )
     inbound = [rule for rule in rules if rule.get("direction") == "inbound"]
     ssh_ingress = [
@@ -164,8 +176,7 @@ def validate_bastion_firewall(
         if rule.get("protocol") == "tcp"
         and rule.get("port_start") == 22
         and rule.get("port_end") == 22
-        and rule.get("endpoint_spec_type") == "ip_prefixes"
-        and rule.get("endpoint_spec") == [management_cidr]
+        and matches_management_source(rule, management_cidr)
     ]
     cache_ingress = [
         rule
@@ -176,9 +187,16 @@ def validate_bastion_firewall(
         and rule.get("endpoint_spec_type") == "ip_prefixes"
         and rule.get("endpoint_spec") == [private_subnet]
     ]
-    expected_inbound_count = 2 if cache_enabled else 1
-    if len(inbound) != expected_inbound_count or len(ssh_ingress) != 1:
-        raise SystemExit("bastion public ingress must be only management /32 TCP/22")
+    icmp_ingress = [
+        rule
+        for rule in inbound
+        if rule.get("protocol") == "icmp"
+        and no_ports(rule)
+        and matches_management_source(rule, management_cidr)
+    ]
+    expected_inbound_count = 3 if cache_enabled else 2
+    if len(inbound) != expected_inbound_count or len(ssh_ingress) != 1 or len(icmp_ingress) != 1:
+        raise SystemExit("bastion public ingress must be only configured management TCP/22 and portless ICMP")
     if (cache_enabled and len(cache_ingress) != 1) or (not cache_enabled and cache_ingress):
         raise SystemExit("bastion cache ingress must be exactly VPC TCP/8443 when cached bootstrap is enabled")
     for protocol in ("tcp", "udp", "icmp"):
@@ -332,7 +350,7 @@ def main() -> None:
             or vm.get("designated_pool_uuid") != os.environ["INSPACE_AMD_HOST_POOL_UUID"]
             or vm.get("billing_account") != int(os.environ["INSPACE_BILLING_ACCOUNT_ID"])
             or re.fullmatch(
-                rf"inspace-rke2-cp/v6 owner={re.escape(owner)} slot={slot} spec=[0-9a-f]{{64}}",
+                rf"inspace-rke2-cp/v7 owner={re.escape(owner)} slot={slot} spec=[0-9a-f]{{64}}",
                 str(vm.get("description", "")),
             ) is None
             or len(root_disks) != 1

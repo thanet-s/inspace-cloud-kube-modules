@@ -27,7 +27,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      autossh bash ca-certificates curl iproute2 jq openssh-client openssl \
+      autossh bash ca-certificates curl iproute2 iputils-ping jq openssh-client openssl \
       python3 python3-pip python3-venv skopeo tini util-linux xz-utils && \
     rm -rf /var/lib/apt/lists/* && \
     python3 -m venv /opt/ansible

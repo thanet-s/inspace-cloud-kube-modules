@@ -106,6 +106,16 @@ spec:
                     TCP, UDP, and ICMP ingress from both the VPC subnet and
                     Cilium pod CIDR 10.42.0.0/16, plus matching
                     any-destination egress, with no public inbound rule.
+                firewallProfile:
+                  type: string
+                  enum: [private-worker, public-node-load-balancer]
+                  description: >-
+                    Optional firewall-assignment profile. Omitted means
+                    private-worker, which requires exactly the private
+                    firewallUUID assignment. public-node-load-balancer keeps
+                    firewallUUID private and additionally permits only the
+                    provider-validated CCM-owned cluster ICMP firewall and
+                    Service ingress firewalls.
                 imageSelector:
                   type: object
                   required: [osName, osVersion]

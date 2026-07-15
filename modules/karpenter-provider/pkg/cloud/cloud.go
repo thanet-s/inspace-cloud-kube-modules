@@ -3,6 +3,8 @@ package cloud
 import (
 	"context"
 	"errors"
+
+	inspacev1 "github.com/thanet-s/inspace-cloud-kube-modules/modules/karpenter-provider/pkg/apis/v1alpha1"
 )
 
 var (
@@ -44,6 +46,7 @@ type CreateVMRequest struct {
 	PrivateLoadBalancerPoolStart string
 	PrivateLoadBalancerPoolStop  string
 	FirewallUUID                 string
+	FirewallProfile              inspacev1.FirewallProfile
 	OSName                       string
 	OSVersion                    string
 	HostPoolUUID                 string
@@ -79,6 +82,7 @@ type VM struct {
 	MemoryGiB                    int
 	RootDiskGiB                  int32
 	FirewallUUID                 string
+	FirewallProfile              inspacev1.FirewallProfile
 	NetworkUUID                  string
 	ControlPlaneVIP              string
 	PrivateLoadBalancerPoolStart string

@@ -70,7 +70,7 @@ func run() error {
 	flag.StringVar(&output, "output", "text", "result output format: text or json")
 	flag.StringVar(&sshPublicKeyFile, "ssh-public-key-file", "", "path to one OpenSSH public key (never a private key)")
 	flag.StringVar(&sshUsername, "ssh-username", "", "required for creation: bastion SSH username created by InSpace")
-	flag.StringVar(&managementCIDR, "management-cidr", "", "required public IPv4 /32 allowed to reach the bastion")
+	flag.StringVar(&managementCIDR, "management-cidr", bootstrap.DefaultManagementCIDR, "optional public IPv4 /32 allowed to reach the bastion; defaults to Any")
 	flag.StringVar(&managementTCPPorts, "management-tcp-ports", "", "must be exactly 22 for bastion SSH")
 	flag.BoolVar(&deleteOwned, "delete", false, "delete only this cluster's deterministically owned infrastructure, then exit")
 	flag.Parse()

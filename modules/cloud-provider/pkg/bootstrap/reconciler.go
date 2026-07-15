@@ -19,10 +19,11 @@ import (
 )
 
 const (
-	ControlPlaneReplicas = 3
-	BastionVCPU          = 1
-	BastionMemoryMiB     = 2048
-	BastionRootDiskGiB   = 30
+	ControlPlaneReplicas  = 3
+	BastionVCPU           = 1
+	BastionMemoryMiB      = 2048
+	BastionRootDiskGiB    = 30
+	DefaultManagementCIDR = "0.0.0.0/0"
 
 	ownedVMDeletionTransitionTTL             = 5 * time.Minute
 	defaultProtectionAuditTimeout            = 15 * time.Second
@@ -80,8 +81,9 @@ type Reconciler struct {
 	SSHUsername  string
 	SSHPublicKey string
 
-	// ManagementCIDR permits a single public IPv4 /32 to reach only the exact
-	// TCP ports listed here. This is intended for guarded bootstrap/E2E access.
+	// ManagementCIDR permits either Any (the default 0.0.0.0/0) or one explicit
+	// public IPv4 /32 to reach the exact TCP ports listed here and the bastion's
+	// portless ICMP rule.
 	ManagementCIDR     string
 	ManagementTCPPorts []int
 
@@ -155,6 +157,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, cluster *v1alpha1.InSpaceClu
 	if cluster == nil {
 		return Result{}, errors.New("bootstrap: cluster is required")
 	}
+	r.ManagementCIDR = effectiveBastionManagementCIDR(r.ManagementCIDR)
 	if errs := cluster.Validate(); len(errs) != 0 {
 		return Result{}, fmt.Errorf("bootstrap: invalid cluster: %v", errs)
 	}
@@ -501,6 +504,7 @@ func (r *Reconciler) Destroy(ctx context.Context, cluster *v1alpha1.InSpaceClust
 	if cluster == nil {
 		return DestroyResult{}, errors.New("bootstrap: cluster is required")
 	}
+	r.ManagementCIDR = effectiveBastionManagementCIDR(r.ManagementCIDR)
 	// Teardown validates the infrastructure spec but deliberately does not
 	// apply create-time metadata.name constraints. Older clusters may have a
 	// name that cannot form the current guest-hostname convention and must
@@ -588,7 +592,7 @@ func (r *Reconciler) Destroy(ctx context.Context, cluster *v1alpha1.InSpaceClust
 	if err := validateManagedNodeFirewall(nodeFirewall, cluster, network, owner, resourceNames.NodeFirewall); err != nil {
 		return result, err
 	}
-	if err := validateManagedBastionFirewall(bastionFirewall, cluster, network.Subnet, owner, resourceNames.BastionFirewall, r.ManagementCIDR); err != nil {
+	if err := validateManagedBastionFirewallForDestroy(bastionFirewall, cluster, network.Subnet, owner, resourceNames.BastionFirewall, r.ManagementCIDR); err != nil {
 		return result, err
 	}
 	pendingDeletions, err := r.activePendingVMDeletions(owner, cluster.Spec.Location, firewalls)
@@ -734,6 +738,7 @@ func validateDestroyVMOwnership(vms map[string]*inspace.VM, owner, clusterName, 
 	hasControlPlaneV4 := false
 	hasControlPlaneV5 := false
 	hasControlPlaneV6 := false
+	hasControlPlaneV7 := false
 	bastionSchema := 0
 	for name, vm := range vms {
 		if vm == nil || !vmUUIDPattern.MatchString(vm.UUID) {
@@ -755,6 +760,7 @@ func validateDestroyVMOwnership(vms map[string]*inspace.VM, owner, clusterName, 
 			if name == controlPlaneNames[candidate] {
 				slot = candidate
 				if name == controlPlaneName(clusterName, candidate) {
+					prefixes = append(prefixes, fmt.Sprintf("inspace-rke2-cp/v7 owner=%s slot=%d spec=", owner, slot))
 					prefixes = append(prefixes, fmt.Sprintf("inspace-rke2-cp/v6 owner=%s slot=%d spec=", owner, slot))
 					prefixes = append(prefixes, fmt.Sprintf("inspace-rke2-cp/v5 owner=%s slot=%d spec=", owner, slot))
 					prefixes = append(prefixes, fmt.Sprintf("inspace-rke2-cp/v4 owner=%s slot=%d spec=", owner, slot))
@@ -789,6 +795,7 @@ func validateDestroyVMOwnership(vms map[string]*inspace.VM, owner, clusterName, 
 			hasControlPlaneV4 = hasControlPlaneV4 || strings.HasPrefix(matchedPrefix, "inspace-rke2-cp/v4 ")
 			hasControlPlaneV5 = hasControlPlaneV5 || strings.HasPrefix(matchedPrefix, "inspace-rke2-cp/v5 ")
 			hasControlPlaneV6 = hasControlPlaneV6 || strings.HasPrefix(matchedPrefix, "inspace-rke2-cp/v6 ")
+			hasControlPlaneV7 = hasControlPlaneV7 || strings.HasPrefix(matchedPrefix, "inspace-rke2-cp/v7 ")
 		} else {
 			switch {
 			case strings.HasPrefix(matchedPrefix, "inspace-rke2-bastion/v1 "):
@@ -805,7 +812,7 @@ func validateDestroyVMOwnership(vms map[string]*inspace.VM, owner, clusterName, 
 		}
 	}
 	schemaCount := 0
-	for _, present := range []bool{hasControlPlaneV2, hasControlPlaneV3, hasControlPlaneV4, hasControlPlaneV5, hasControlPlaneV6} {
+	for _, present := range []bool{hasControlPlaneV2, hasControlPlaneV3, hasControlPlaneV4, hasControlPlaneV5, hasControlPlaneV6, hasControlPlaneV7} {
 		if present {
 			schemaCount++
 		}
@@ -823,12 +830,16 @@ func validateDestroyVMOwnership(vms map[string]*inspace.VM, owner, clusterName, 
 			controlPlaneSchema = 5
 		} else if hasControlPlaneV6 {
 			controlPlaneSchema = 6
+		} else if hasControlPlaneV7 {
+			controlPlaneSchema = 7
 		}
 		expectedControlPlaneSchema := bastionSchema
 		if bastionSchema == 1 {
 			expectedControlPlaneSchema = 2
 		}
-		if expectedControlPlaneSchema != controlPlaneSchema {
+		compatible := expectedControlPlaneSchema == controlPlaneSchema ||
+			(bastionSchema == 6 && controlPlaneSchema == 7)
+		if !compatible {
 			return errors.New("bootstrap: refusing incoherent teardown ownership schema: bastion and control planes use incompatible schemas")
 		}
 	}
@@ -1402,6 +1413,38 @@ func validateManagedNodeFirewall(firewall *inspace.Firewall, cluster *v1alpha1.I
 }
 
 func validateManagedBastionFirewall(firewall *inspace.Firewall, cluster *v1alpha1.InSpaceCluster, privateSubnet, owner, expectedName, managementCIDR string) error {
+	if err := validateManagedBastionFirewallIdentity(firewall, cluster, owner, expectedName); err != nil {
+		return err
+	}
+	if firewall == nil {
+		return nil
+	}
+	if err := validateBastionFirewallPolicy(firewall, managementCIDR, privateSubnet, !cluster.Spec.BootstrapCache.DirectDownload); err != nil {
+		return fmt.Errorf("bootstrap: bastion firewall policy: %w", err)
+	}
+	return nil
+}
+
+func validateManagedBastionFirewallForDestroy(firewall *inspace.Firewall, cluster *v1alpha1.InSpaceCluster, privateSubnet, owner, expectedName, managementCIDR string) error {
+	if err := validateManagedBastionFirewallIdentity(firewall, cluster, owner, expectedName); err != nil {
+		return err
+	}
+	if firewall == nil {
+		return nil
+	}
+	cacheEnabled := !cluster.Spec.BootstrapCache.DirectDownload
+	currentErr := validateBastionFirewallPolicy(firewall, managementCIDR, privateSubnet, cacheEnabled)
+	if currentErr == nil {
+		return nil
+	}
+	legacyErr := validateLegacyBastionFirewallPolicy(firewall, managementCIDR, privateSubnet, cacheEnabled)
+	if legacyErr == nil {
+		return nil
+	}
+	return fmt.Errorf("bootstrap: bastion firewall policy is neither current nor exact legacy policy: %w", errors.Join(currentErr, legacyErr))
+}
+
+func validateManagedBastionFirewallIdentity(firewall *inspace.Firewall, cluster *v1alpha1.InSpaceCluster, owner, expectedName string) error {
 	if firewall == nil {
 		return nil
 	}
@@ -1411,9 +1454,6 @@ func validateManagedBastionFirewall(firewall *inspace.Firewall, cluster *v1alpha
 	}
 	if firewall.Description != "" && firewall.Description != expectedDescription {
 		return errors.New("bootstrap: bastion firewall has an unexpected description")
-	}
-	if err := validateBastionFirewallPolicy(firewall, managementCIDR, privateSubnet, !cluster.Spec.BootstrapCache.DirectDownload); err != nil {
-		return fmt.Errorf("bootstrap: bastion firewall policy: %w", err)
 	}
 	return nil
 }
@@ -1636,7 +1676,7 @@ func (r *Reconciler) desiredControlPlaneVMRequest(cluster *v1alpha1.InSpaceClust
 		return inspace.CreateVMRequest{}, err
 	}
 	sum := sha256.Sum256(data)
-	request.Description = fmt.Sprintf("inspace-rke2-cp/v6 owner=%s slot=%d spec=%s", owner, slot, hex.EncodeToString(sum[:]))
+	request.Description = fmt.Sprintf("inspace-rke2-cp/v7 owner=%s slot=%d spec=%s", owner, slot, hex.EncodeToString(sum[:]))
 	return request, nil
 }
 
@@ -1976,10 +2016,15 @@ func managedFirewallRules(subnet, podCIDR, managementCIDR string, managementTCPP
 }
 
 func managedBastionFirewallRules(managementCIDR, privateSubnet string, cacheEnabled bool) []inspace.FirewallRule {
+	managementCIDR = effectiveBastionManagementCIDR(managementCIDR)
+	managementEndpointType, managementEndpoints := bastionManagementFirewallEndpoint(managementCIDR)
 	port := int32(22)
 	result := []inspace.FirewallRule{{
 		Protocol: "tcp", Direction: "inbound", PortStart: &port, PortEnd: &port,
-		EndpointSpecType: "ip_prefixes", EndpointSpec: []string{managementCIDR},
+		EndpointSpecType: managementEndpointType, EndpointSpec: append([]string(nil), managementEndpoints...),
+	}, {
+		Protocol: "icmp", Direction: "inbound",
+		EndpointSpecType: managementEndpointType, EndpointSpec: append([]string(nil), managementEndpoints...),
 	}}
 	if cacheEnabled {
 		cachePort := int32(BootstrapCachePort)
@@ -1995,13 +2040,25 @@ func managedBastionFirewallRules(managementCIDR, privateSubnet string, cacheEnab
 }
 
 func validateBastionFirewallPolicy(firewall *inspace.Firewall, managementCIDR, privateSubnet string, cacheEnabled bool) error {
+	return validateBastionFirewallPolicyVersion(firewall, managementCIDR, privateSubnet, cacheEnabled, true)
+}
+
+func validateLegacyBastionFirewallPolicy(firewall *inspace.Firewall, managementCIDR, privateSubnet string, cacheEnabled bool) error {
+	return validateBastionFirewallPolicyVersion(firewall, managementCIDR, privateSubnet, cacheEnabled, false)
+}
+
+func validateBastionFirewallPolicyVersion(firewall *inspace.Firewall, managementCIDR, privateSubnet string, cacheEnabled, requireICMP bool) error {
 	if firewall == nil {
 		return errors.New("bootstrap: bastion firewall is required")
 	}
+	managementCIDR = effectiveBastionManagementCIDR(managementCIDR)
 	if err := validateManagementAccess(managementCIDR, []int{22}); err != nil {
 		return err
 	}
 	expectedRules := 4
+	if requireICMP {
+		expectedRules++
+	}
 	if cacheEnabled {
 		expectedRules++
 	}
@@ -2009,21 +2066,33 @@ func validateBastionFirewallPolicy(firewall *inspace.Firewall, managementCIDR, p
 		return errors.New("bootstrap: bastion firewall has an unexpected rule count")
 	}
 	sshIngress := false
+	icmpIngress := false
 	cacheIngress := false
 	outbound := map[string]bool{"tcp": false, "udp": false, "icmp": false}
 	for _, rule := range firewall.Rules {
 		switch rule.Direction {
 		case "inbound":
-			if rule.Protocol != "tcp" || rule.PortStart == nil || rule.PortEnd == nil || rule.EndpointSpecType != "ip_prefixes" || len(rule.EndpointSpec) != 1 {
-				return errors.New("bootstrap: bastion inbound policy is invalid")
-			}
-			switch {
-			case *rule.PortStart == 22 && *rule.PortEnd == 22 && rule.EndpointSpec[0] == managementCIDR && !sshIngress:
-				sshIngress = true
-			case cacheEnabled && *rule.PortStart == BootstrapCachePort && *rule.PortEnd == BootstrapCachePort && rule.EndpointSpec[0] == privateSubnet && !cacheIngress:
-				cacheIngress = true
+			switch rule.Protocol {
+			case "tcp":
+				if rule.PortStart == nil || rule.PortEnd == nil {
+					return errors.New("bootstrap: bastion inbound TCP policy requires one explicit port")
+				}
+				switch {
+				case *rule.PortStart == 22 && *rule.PortEnd == 22 && bastionManagementFirewallEndpointMatches(rule, managementCIDR) && !sshIngress:
+					sshIngress = true
+				case cacheEnabled && *rule.PortStart == BootstrapCachePort && *rule.PortEnd == BootstrapCachePort &&
+					rule.EndpointSpecType == "ip_prefixes" && len(rule.EndpointSpec) == 1 && rule.EndpointSpec[0] == privateSubnet && !cacheIngress:
+					cacheIngress = true
+				default:
+					return errors.New("bootstrap: bastion inbound TCP policy must contain only management TCP/22 and optional VPC TCP/8443")
+				}
+			case "icmp":
+				if !requireICMP || rule.PortStart != nil || rule.PortEnd != nil || !bastionManagementFirewallEndpointMatches(rule, managementCIDR) || icmpIngress {
+					return errors.New("bootstrap: bastion inbound ICMP policy must be one portless management rule")
+				}
+				icmpIngress = true
 			default:
-				return errors.New("bootstrap: bastion inbound policy must contain only management TCP/22 and optional VPC TCP/8443")
+				return errors.New("bootstrap: bastion inbound policy supports only TCP and ICMP")
 			}
 		case "outbound":
 			if _, ok := outbound[rule.Protocol]; !ok || outbound[rule.Protocol] || rule.PortStart != nil || rule.PortEnd != nil || rule.EndpointSpecType != "any" {
@@ -2034,10 +2103,37 @@ func validateBastionFirewallPolicy(firewall *inspace.Firewall, managementCIDR, p
 			return errors.New("bootstrap: bastion firewall has an invalid direction")
 		}
 	}
-	if !sshIngress || cacheIngress != cacheEnabled || !outbound["tcp"] || !outbound["udp"] || !outbound["icmp"] {
+	if !sshIngress || icmpIngress != requireICMP || cacheIngress != cacheEnabled || !outbound["tcp"] || !outbound["udp"] || !outbound["icmp"] {
 		return errors.New("bootstrap: bastion firewall policy is incomplete")
 	}
 	return nil
+}
+
+func effectiveBastionManagementCIDR(cidr string) string {
+	if cidr == "" {
+		return DefaultManagementCIDR
+	}
+	return cidr
+}
+
+func bastionManagementFirewallEndpoint(cidr string) (string, []string) {
+	if effectiveBastionManagementCIDR(cidr) == DefaultManagementCIDR {
+		return "any", nil
+	}
+	return "ip_prefixes", []string{cidr}
+}
+
+func bastionManagementFirewallEndpointMatches(rule inspace.FirewallRule, cidr string) bool {
+	endpointType, endpoints := bastionManagementFirewallEndpoint(cidr)
+	if rule.EndpointSpecType != endpointType || len(rule.EndpointSpec) != len(endpoints) {
+		return false
+	}
+	for index := range endpoints {
+		if rule.EndpointSpec[index] != endpoints[index] {
+			return false
+		}
+	}
+	return true
 }
 
 func validateOwnedFirewallAssignments(firewall *inspace.Firewall, allowed map[string]bool) error {
@@ -2141,7 +2237,7 @@ func validateFirewallPolicy(firewall *inspace.Firewall, subnet, podCIDR, managem
 					return fmt.Errorf("bootstrap: firewall has unapproved public TCP port %d", *rule.PortStart)
 				}
 				if rule.EndpointSpecType != "ip_prefixes" || len(rule.EndpointSpec) != 1 || rule.EndpointSpec[0] != managementCIDR {
-					return errors.New("bootstrap: management ingress must match the configured public /32 exactly")
+					return errors.New("bootstrap: management ingress must match the configured management CIDR exactly")
 				}
 				seenManagementPorts[*rule.PortStart] = true
 				continue
@@ -2447,8 +2543,9 @@ func (r *Reconciler) validateBastionAccess() error {
 }
 
 func validateBastionFirewallAccess(cidr string, ports []int) error {
-	if cidr == "" || len(ports) != 1 || ports[0] != 22 {
-		return errors.New("bootstrap: bastion requires exactly management public IPv4 /32 TCP/22")
+	cidr = effectiveBastionManagementCIDR(cidr)
+	if len(ports) != 1 || ports[0] != 22 {
+		return errors.New("bootstrap: bastion requires exactly management TCP/22")
 	}
 	return validateManagementAccess(cidr, ports)
 }
@@ -2456,13 +2553,15 @@ func validateBastionFirewallAccess(cidr string, ports []int) error {
 func validateManagementAccess(cidr string, ports []int) error {
 	if cidr == "" {
 		if len(ports) != 0 {
-			return errors.New("bootstrap: management TCP ports require a public IPv4 /32")
+			return errors.New("bootstrap: management TCP ports require Any or a public IPv4 /32")
 		}
 		return nil
 	}
 	prefix, err := netip.ParsePrefix(cidr)
-	if err != nil || !prefix.Addr().Is4() || prefix.Bits() != 32 || prefix.Addr().IsPrivate() || !prefix.Addr().IsGlobalUnicast() {
-		return errors.New("bootstrap: management CIDR must be one public IPv4 /32")
+	validAny := cidr == DefaultManagementCIDR
+	validHost := err == nil && prefix.Addr().Is4() && prefix.Bits() == 32 && !prefix.Addr().IsPrivate() && prefix.Addr().IsGlobalUnicast()
+	if err != nil || prefix.Masked().String() != cidr || (!validAny && !validHost) {
+		return errors.New("bootstrap: management CIDR must be Any (0.0.0.0/0) or one canonical public IPv4 /32")
 	}
 	if len(ports) == 0 {
 		return errors.New("bootstrap: management CIDR requires at least one explicit TCP port")

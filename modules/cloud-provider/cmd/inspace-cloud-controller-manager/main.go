@@ -65,6 +65,14 @@ func initializeCloud(config *cloudconfig.CompletedConfig) cloud.Interface {
 	if err != nil {
 		klog.Fatal(err)
 	}
+	nodeLoadBalancerEnabled, err := strconv.ParseBool(defaultValue(os.Getenv("INSPACE_NODE_LOAD_BALANCER_ENABLED"), "false"))
+	if err != nil {
+		klog.Fatalf("parse INSPACE_NODE_LOAD_BALANCER_ENABLED: %v", err)
+	}
+	nodesPerShard, err := parseInt32WithDefault("INSPACE_NODE_LOAD_BALANCER_NODES_PER_SHARD", 1)
+	if err != nil {
+		klog.Fatal(err)
+	}
 	api, err := inspace.NewClient(inspace.Options{
 		BaseURL: baseURL, APIKey: apiKey, DangerouslyAllowMutations: allowMutations,
 		UserAgent: buildversion.UserAgent("inspace-cloud-controller-manager"),
@@ -81,6 +89,11 @@ func initializeCloud(config *cloudconfig.CompletedConfig) cloud.Interface {
 		ControlPlaneVIP:              os.Getenv("INSPACE_CONTROL_PLANE_VIP"),
 		PrivateLoadBalancerPoolStart: os.Getenv("INSPACE_PRIVATE_LOAD_BALANCER_POOL_START"),
 		PrivateLoadBalancerPoolStop:  os.Getenv("INSPACE_PRIVATE_LOAD_BALANCER_POOL_STOP"),
+		NodeLoadBalancer: inspaceprovider.NodeLoadBalancerConfig{
+			Enabled:          nodeLoadBalancerEnabled,
+			DefaultNodeClass: os.Getenv("INSPACE_NODE_LOAD_BALANCER_DEFAULT_NODE_CLASS"),
+			NodesPerShard:    nodesPerShard,
+		},
 	})
 	if err != nil {
 		klog.Fatalf("initialize InSpace cloud provider: %v", err)
@@ -89,6 +102,18 @@ func initializeCloud(config *cloudconfig.CompletedConfig) cloud.Interface {
 		klog.Warning("remote mutations are disabled; node metadata works but Service LoadBalancers cannot be changed")
 	}
 	return provider
+}
+
+func parseInt32WithDefault(name string, fallback int32) (int32, error) {
+	value := strings.TrimSpace(os.Getenv(name))
+	if value == "" {
+		return fallback, nil
+	}
+	parsed, err := strconv.ParseInt(value, 10, 32)
+	if err != nil {
+		return 0, fmt.Errorf("%s must be an integer", name)
+	}
+	return int32(parsed), nil
 }
 
 func parseRequiredPositiveInt64(name string) (int64, error) {

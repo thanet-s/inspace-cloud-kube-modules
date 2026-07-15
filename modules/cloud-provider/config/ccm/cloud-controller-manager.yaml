@@ -17,13 +17,22 @@ rules:
     verbs: ["get", "patch", "update"]
   - apiGroups: [""]
     resources: ["services"]
-    verbs: ["get", "list", "watch", "patch", "update"]
+    verbs: ["get", "list", "watch", "create", "patch", "update", "delete"]
   - apiGroups: [""]
     resources: ["services/status"]
     verbs: ["get", "patch", "update"]
   - apiGroups: ["discovery.k8s.io"]
     resources: ["endpointslices"]
     verbs: ["get", "list", "watch"]
+  - apiGroups: ["karpenter.sh"]
+    resources: ["nodepools"]
+    verbs: ["get", "list", "create", "update", "delete"]
+  - apiGroups: ["karpenter.sh"]
+    resources: ["nodeclaims"]
+    verbs: ["get", "list"]
+  - apiGroups: ["karpenter.inspace.cloud"]
+    resources: ["inspacenodeclasses"]
+    verbs: ["get", "create", "update"]
   - apiGroups: [""]
     resources: ["events"]
     verbs: ["create", "patch", "update"]
@@ -80,6 +89,7 @@ data:
   controlPlaneVIP: REPLACE_WITH_CONTROL_PLANE_VIP
   privateLoadBalancerPoolStart: REPLACE_WITH_PRIVATE_LOAD_BALANCER_POOL_START
   privateLoadBalancerPoolStop: REPLACE_WITH_PRIVATE_LOAD_BALANCER_POOL_STOP
+  nodeLoadBalancerDefaultNodeClass: REPLACE_WITH_DEFAULT_INSPACE_NODECLASS
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -174,6 +184,15 @@ spec:
                 configMapKeyRef:
                   name: inspace-cloud-config
                   key: privateLoadBalancerPoolStop
+            - name: INSPACE_NODE_LOAD_BALANCER_ENABLED
+              value: "true"
+            - name: INSPACE_NODE_LOAD_BALANCER_DEFAULT_NODE_CLASS
+              valueFrom:
+                configMapKeyRef:
+                  name: inspace-cloud-config
+                  key: nodeLoadBalancerDefaultNodeClass
+            - name: INSPACE_NODE_LOAD_BALANCER_NODES_PER_SHARD
+              value: "1"
           resources:
             requests:
               cpu: 100m

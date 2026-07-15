@@ -23,8 +23,14 @@ Private Services use Cilium LB IPAM + L2 Announcements:
   loadBalancerClass: io.cilium/l2-announcer
   traffic policy:    Cluster
 
-Cilium Node IPAM and loadBalancerClass io.cilium/node are unsupported. Public
-InSpace NLBs are an explicit paid TCP-only path: leave loadBalancerClass unset,
+Cilium Node IPAM is reserved for CCM-owned shadow Services. Public node load
+balancers use loadBalancerClass inspace.cloud/node and default to shared shards;
+dedicated mode is explicit. Generated capacity is static AMD EPYC with
+{{ .Values.ccm.nodeLoadBalancer.nodesPerShard }} node(s) per shard by default.
+These Services require a selector and allocateLoadBalancerNodePorts=false. Do
+not create io.cilium/node Services directly.
+
+Public InSpace NLBs remain an explicit paid TCP-only path: leave loadBalancerClass unset,
 set inspace.cloud/load-balancer-scope=public, and set annotation
 service.beta.kubernetes.io/inspace-load-balancer-public=true.
 Public NLB Services may use externalTrafficPolicy=Local; CCM limits targets to

@@ -30,6 +30,11 @@ global:
 
 ccm:
   enabled: true
+  nodeLoadBalancer:
+    # Public node load balancers use CCM-managed shared/dedicated shards backed
+    # by static Karpenter capacity and Cilium Node IPAM.
+    enabled: true
+    nodesPerShard: 1
   replicaCount: 2
   image:
     repository: ghcr.io/thanet-s/inspace-cloud-controller-manager
@@ -163,7 +168,7 @@ karpenter:
   featureGates:
     reservedCapacity: true
     nodeOverlay: false
-    staticCapacity: false
+    staticCapacity: true
     spotToSpotConsolidation: false
     nodeRepair: false
     capacityBuffer: true

@@ -182,9 +182,15 @@
           - deployment/inspace-e2e-trigger
           - deployment/inspace-e2e-private-a
           - deployment/inspace-e2e-private-b
+          - deployment/inspace-e2e-node-lb
           - service/inspace-e2e-web
           - service/inspace-e2e-private-a
           - service/inspace-e2e-private-b
+          - service/inspace-e2e-node-traefik
+          - service/inspace-e2e-node-shared-a
+          - service/inspace-e2e-node-shared-b
+          - service/inspace-e2e-node-shared-conflict
+          - service/inspace-e2e-node-dedicated
           - pvc/inspace-e2e-rwo
           - --ignore-not-found
           - --wait=false
@@ -195,7 +201,7 @@
       ansible.builtin.shell: |
         set -euo pipefail
         pods=$(kubectl --kubeconfig "{{ e2e_kubeconfig }}" -n default get pods \
-          -l 'app in (inspace-e2e-web,inspace-e2e-trigger,inspace-e2e-private-a,inspace-e2e-private-b)' -o json)
+          -l 'app in (inspace-e2e-web,inspace-e2e-trigger,inspace-e2e-private-a,inspace-e2e-private-b,inspace-e2e-node-lb)' -o json)
         test "$(jq '.items | length' <<<"$pods")" -eq 0
         egress_pods=$(kubectl --kubeconfig "{{ e2e_kubeconfig }}" -n default get pods \
           -l 'inspace.cloud/e2e-egress-gate=true' -o json)
@@ -241,6 +247,42 @@
       retries: 180
       delay: 10
       until: e2e_cleanup_cilium_private_lb_quiesced.rc == 0
+      when: e2e_cleanup_state.kubernetesOwnersPossible | default(false) | bool
+
+    - name: Wait for every managed Node-LB owner to quiesce
+      ansible.builtin.command:
+        argv:
+          - /opt/e2e/scripts/verify-node-load-balancer.py
+          - --state
+          - "{{ e2e_state_file }}"
+          - --kubeconfig
+          - "{{ e2e_kubeconfig }}"
+          - --expect
+          - absent
+          - --immutable-baseline
+          - "{{ e2e_baseline_inventory_file }}"
+      register: e2e_cleanup_node_lb_quiesced
+      changed_when: false
+      retries: 180
+      delay: 10
+      until: e2e_cleanup_node_lb_quiesced.rc == 0
+      no_log: true
+      when: e2e_cleanup_state.kubernetesOwnersPossible | default(false) | bool
+
+    - name: Delete the generated Node-LB NodeClass after its owners are gone
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - --kubeconfig
+          - "{{ e2e_kubeconfig }}"
+          - delete
+          - inspacenodeclass
+          - -l
+          - "inspace.cloud/node-lb-managed=true,inspace.cloud/node-lb-cluster={{ e2e_cleanup_state.clusterName }}"
+          - --ignore-not-found
+          - --wait=true
+          - --timeout=5m
+      changed_when: true
       when: e2e_cleanup_state.kubernetesOwnersPossible | default(false) | bool
 
     - name: Delete the NodePool while Karpenter is still running

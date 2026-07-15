@@ -138,6 +138,119 @@ func TestReconcileBuildsBastionThenExactlyThreeControlPlaneVMs(t *testing.T) {
 	}
 }
 
+func TestManagedBastionFirewallAllowsOnlyManagementICMP(t *testing.T) {
+	const managementCIDR = "203.0.113.10/32"
+	const privateSubnet = "10.20.30.0/24"
+	rules := managedBastionFirewallRules(managementCIDR, privateSubnet, false)
+	if err := validateBastionFirewallPolicy(&inspace.Firewall{Rules: rules}, managementCIDR, privateSubnet, false); err != nil {
+		t.Fatal(err)
+	}
+	icmpIngress := 0
+	for _, rule := range rules {
+		if rule.Direction != "inbound" || rule.Protocol != "icmp" {
+			continue
+		}
+		icmpIngress++
+		if rule.PortStart != nil || rule.PortEnd != nil || rule.EndpointSpecType != "ip_prefixes" ||
+			!reflect.DeepEqual(rule.EndpointSpec, []string{managementCIDR}) {
+			t.Fatalf("bastion ICMP ingress = %#v", rule)
+		}
+	}
+	if icmpIngress != 1 {
+		t.Fatalf("bastion ICMP ingress rule count = %d, want 1", icmpIngress)
+	}
+	defaultRules := managedBastionFirewallRules("", privateSubnet, false)
+	if err := validateBastionFirewallPolicy(&inspace.Firewall{Rules: defaultRules}, "", privateSubnet, false); err != nil {
+		t.Fatalf("default-Any bastion policy rejected: %v", err)
+	}
+	defaultManagementRules := 0
+	for _, rule := range defaultRules {
+		if rule.Direction == "inbound" && (rule.Protocol == "tcp" || rule.Protocol == "icmp") {
+			defaultManagementRules++
+			if rule.EndpointSpecType != "any" || len(rule.EndpointSpec) != 0 {
+				t.Fatalf("default management rule is not canonical Any: %#v", rule)
+			}
+		}
+	}
+	if defaultManagementRules != 2 {
+		t.Fatalf("default management rule count = %d, want SSH and ICMP", defaultManagementRules)
+	}
+
+	findICMP := func(rules []inspace.FirewallRule) int {
+		for index, rule := range rules {
+			if rule.Direction == "inbound" && rule.Protocol == "icmp" {
+				return index
+			}
+		}
+		return -1
+	}
+	invalid := map[string]func(*[]inspace.FirewallRule){
+		"missing": func(rules *[]inspace.FirewallRule) {
+			index := findICMP(*rules)
+			*rules = append((*rules)[:index], (*rules)[index+1:]...)
+		},
+		"public source": func(rules *[]inspace.FirewallRule) {
+			(*rules)[findICMP(*rules)].EndpointSpec = []string{"0.0.0.0/0"}
+		},
+		"port-bearing": func(rules *[]inspace.FirewallRule) {
+			port := int32(8)
+			(*rules)[findICMP(*rules)].PortStart = &port
+		},
+		"duplicate": func(rules *[]inspace.FirewallRule) {
+			*rules = append(*rules, (*rules)[findICMP(*rules)])
+		},
+	}
+	for name, mutate := range invalid {
+		t.Run(name, func(t *testing.T) {
+			rules := managedBastionFirewallRules(managementCIDR, privateSubnet, false)
+			mutate(&rules)
+			if err := validateBastionFirewallPolicy(&inspace.Firewall{Rules: rules}, managementCIDR, privateSubnet, false); err == nil {
+				t.Fatal("invalid bastion ICMP policy was accepted")
+			}
+		})
+	}
+	for _, cacheEnabled := range []bool{false, true} {
+		t.Run(fmt.Sprintf("exact legacy cache=%t", cacheEnabled), func(t *testing.T) {
+			rules := managedBastionFirewallRules(managementCIDR, privateSubnet, cacheEnabled)
+			legacy := make([]inspace.FirewallRule, 0, len(rules)-1)
+			for _, rule := range rules {
+				if rule.Direction != "inbound" || rule.Protocol != "icmp" {
+					legacy = append(legacy, rule)
+				}
+			}
+			firewall := &inspace.Firewall{Rules: legacy}
+			if err := validateLegacyBastionFirewallPolicy(firewall, managementCIDR, privateSubnet, cacheEnabled); err != nil {
+				t.Fatal(err)
+			}
+			if err := validateBastionFirewallPolicy(firewall, managementCIDR, privateSubnet, cacheEnabled); err == nil {
+				t.Fatal("current policy accepted exact legacy rules")
+			}
+		})
+	}
+}
+
+func TestReconcileAndDestroyDefaultOmittedBastionManagementCIDRToAny(t *testing.T) {
+	api := newFakeAPI()
+	cluster := testCluster()
+	reconciler := testReconciler(api)
+	reconciler.ManagementCIDR = ""
+
+	result := reconcileUntilReady(t, reconciler, cluster)
+	if !result.Ready || reconciler.ManagementCIDR != DefaultManagementCIDR {
+		t.Fatalf("omitted management CIDR did not default to Any: result=%#v CIDR=%q", result, reconciler.ManagementCIDR)
+	}
+	bastionFirewall := mustFirewall(t, api.firewalls, currentBootstrapResourceNames(cluster.Metadata.Name, ownerKey(cluster)).BastionFirewall)
+	if err := validateBastionFirewallPolicy(bastionFirewall, DefaultManagementCIDR, api.network.Subnet, false); err != nil {
+		t.Fatalf("reconciled default-Any bastion firewall is invalid: %v", err)
+	}
+
+	reconciler.ManagementCIDR = ""
+	destroyed := destroyUntilDone(t, reconciler, cluster)
+	if !destroyed.Done || len(api.vms) != 0 || len(api.firewalls) != 0 || len(api.floatingIPs) != 0 {
+		t.Fatalf("default-Any teardown leaked resources: result=%#v VMs=%#v firewalls=%#v FIPs=%#v", destroyed, api.vms, api.firewalls, api.floatingIPs)
+	}
+}
+
 func TestBootstrapResourceNamesUseClusterPrefixAndOwnerQualifiedFirewalls(t *testing.T) {
 	cluster := testCluster()
 	owner := ownerKey(cluster)
@@ -266,6 +379,43 @@ func TestReconcileAndDestroyWhenFirewallDescriptionsAreOmitted(t *testing.T) {
 	}
 }
 
+func TestDestroyAcceptsExactPreICMPBastionFirewallPolicy(t *testing.T) {
+	api := newFakeAPI()
+	cluster := testCluster()
+	reconciler := testReconciler(api)
+	reconcileUntilReady(t, reconciler, cluster)
+
+	resourceNames := currentBootstrapResourceNames(cluster.Metadata.Name, ownerKey(cluster))
+	bastionFirewall := mustFirewall(t, api.firewalls, resourceNames.BastionFirewall)
+	legacyRules := make([]inspace.FirewallRule, 0, len(bastionFirewall.Rules)-1)
+	for _, rule := range bastionFirewall.Rules {
+		if rule.Direction == "inbound" && rule.Protocol == "icmp" {
+			continue
+		}
+		legacyRules = append(legacyRules, rule)
+	}
+	bastionFirewall.Rules = legacyRules
+	if err := validateLegacyBastionFirewallPolicy(bastionFirewall, reconciler.ManagementCIDR, api.network.Subnet, false); err != nil {
+		t.Fatalf("exact v0.4.1 bastion policy rejected: %v", err)
+	}
+	if err := validateBastionFirewallPolicy(bastionFirewall, reconciler.ManagementCIDR, api.network.Subnet, false); err == nil {
+		t.Fatal("normal reconciliation accepted a pre-ICMP bastion policy")
+	}
+
+	eventsBefore := len(api.events)
+	if _, err := reconciler.Reconcile(context.Background(), cluster, "unit-test-secret-token"); err == nil {
+		t.Fatal("normal reconciliation did not require the current bastion ICMP policy")
+	}
+	if len(api.events) != eventsBefore {
+		t.Fatalf("failed current-policy reconciliation mutated infrastructure: %v", api.events[eventsBefore:])
+	}
+
+	result := destroyUntilDone(t, reconciler, cluster)
+	if !result.Done || len(api.vms) != 0 || len(api.floatingIPs) != 0 || len(api.firewalls) != 0 {
+		t.Fatalf("legacy-policy teardown leaked resources: result=%#v VMs=%#v FIPs=%#v firewalls=%#v", result, api.vms, api.floatingIPs, api.firewalls)
+	}
+}
+
 func TestReconcileAcceptsSparseFirewallCreateResponsesAfterAuthoritativeReadback(t *testing.T) {
 	api := newFakeAPI()
 	api.sparseFirewallCreateResponses = true
@@ -290,7 +440,7 @@ func TestReconcileAcceptsSparseFirewallCreateResponsesAfterAuthoritativeReadback
 	nodeFirewall := mustFirewall(t, readback, resourceNames.NodeFirewall)
 	bastionFirewall := mustFirewall(t, readback, resourceNames.BastionFirewall)
 	if len(nodeFirewall.Rules) != 6 || len(nodeFirewall.ResourcesAssigned) != ControlPlaneReplicas ||
-		len(bastionFirewall.Rules) != 4 || len(bastionFirewall.ResourcesAssigned) != 1 {
+		len(bastionFirewall.Rules) != 5 || len(bastionFirewall.ResourcesAssigned) != 1 {
 		t.Fatalf("authoritative firewall readback was not fully validated: node=%#v bastion=%#v", nodeFirewall, bastionFirewall)
 	}
 }
@@ -1775,7 +1925,7 @@ func TestDestroyConvergesForV4OwnershipRecords(t *testing.T) {
 	bastion.Description = strings.Replace(bastion.Description, "inspace-rke2-bastion/v6 ", "inspace-rke2-bastion/v4 ", 1)
 	for slot := 0; slot < ControlPlaneReplicas; slot++ {
 		controlPlane := mustVM(t, api.vms, controlPlaneName(cluster.Metadata.Name, slot))
-		controlPlane.Description = strings.Replace(controlPlane.Description, "inspace-rke2-cp/v6 ", "inspace-rke2-cp/v4 ", 1)
+		controlPlane.Description = strings.Replace(controlPlane.Description, "inspace-rke2-cp/v7 ", "inspace-rke2-cp/v4 ", 1)
 	}
 
 	result := destroyUntilDone(t, reconciler, cluster)
@@ -1794,12 +1944,52 @@ func TestDestroyConvergesForV5OwnershipRecords(t *testing.T) {
 	bastion.Description = strings.Replace(bastion.Description, "inspace-rke2-bastion/v6 ", "inspace-rke2-bastion/v5 ", 1)
 	for slot := 0; slot < ControlPlaneReplicas; slot++ {
 		controlPlane := mustVM(t, api.vms, controlPlaneName(cluster.Metadata.Name, slot))
-		controlPlane.Description = strings.Replace(controlPlane.Description, "inspace-rke2-cp/v6 ", "inspace-rke2-cp/v5 ", 1)
+		controlPlane.Description = strings.Replace(controlPlane.Description, "inspace-rke2-cp/v7 ", "inspace-rke2-cp/v5 ", 1)
 	}
 
 	result := destroyUntilDone(t, reconciler, cluster)
 	if !result.Done || len(api.vms) != 0 || len(api.floatingIPs) != 0 || len(api.firewalls) != 0 {
 		t.Fatalf("v5 ownership topology did not converge: result=%#v VMs=%#v FIPs=%#v firewalls=%#v", result, api.vms, api.floatingIPs, api.firewalls)
+	}
+}
+
+func TestDestroyConvergesForV6OwnershipRecords(t *testing.T) {
+	api := newFakeAPI()
+	cluster := testCluster()
+	reconciler := testReconciler(api)
+	reconcileUntilReady(t, reconciler, cluster)
+
+	for slot := 0; slot < ControlPlaneReplicas; slot++ {
+		controlPlane := mustVM(t, api.vms, controlPlaneName(cluster.Metadata.Name, slot))
+		controlPlane.Description = strings.Replace(controlPlane.Description, "inspace-rke2-cp/v7 ", "inspace-rke2-cp/v6 ", 1)
+	}
+
+	result := destroyUntilDone(t, reconciler, cluster)
+	if !result.Done || len(api.vms) != 0 || len(api.floatingIPs) != 0 || len(api.firewalls) != 0 {
+		t.Fatalf("v6 ownership topology did not converge: result=%#v VMs=%#v FIPs=%#v firewalls=%#v", result, api.vms, api.floatingIPs, api.firewalls)
+	}
+}
+
+func TestDestroyConvergesForCurrentV6BastionV7ControlPlanes(t *testing.T) {
+	api := newFakeAPI()
+	cluster := testCluster()
+	reconciler := testReconciler(api)
+	reconcileUntilReady(t, reconciler, cluster)
+
+	bastion := mustVM(t, api.vms, currentBastionName(cluster.Metadata.Name))
+	if !strings.HasPrefix(bastion.Description, "inspace-rke2-bastion/v6 ") {
+		t.Fatalf("current bastion ownership = %q", bastion.Description)
+	}
+	for slot := 0; slot < ControlPlaneReplicas; slot++ {
+		controlPlane := mustVM(t, api.vms, controlPlaneName(cluster.Metadata.Name, slot))
+		if !strings.HasPrefix(controlPlane.Description, "inspace-rke2-cp/v7 ") {
+			t.Fatalf("current control-plane %d ownership = %q", slot, controlPlane.Description)
+		}
+	}
+
+	result := destroyUntilDone(t, reconciler, cluster)
+	if !result.Done || len(api.vms) != 0 || len(api.floatingIPs) != 0 || len(api.firewalls) != 0 {
+		t.Fatalf("current ownership topology did not converge: result=%#v VMs=%#v FIPs=%#v firewalls=%#v", result, api.vms, api.floatingIPs, api.firewalls)
 	}
 }
 
@@ -2866,7 +3056,7 @@ func assertControlPlaneCloudInit(t *testing.T, raw, expectedNodeName string, ini
 		!ciliumValues.BPF.Masquerade {
 		t.Fatalf("generated Cilium native-routing contract=%#v", ciliumValues)
 	}
-	for _, required := range []string{"l2announcements:\n      enabled: true", "defaultLBServiceIPAM: none", "nodeIPAM:\n      enabled: false", "k8sClientRateLimit:\n      qps: 10\n      burst: 20"} {
+	for _, required := range []string{"l2announcements:\n      enabled: true", "defaultLBServiceIPAM: none", "nodeIPAM:\n      enabled: true", "k8sClientRateLimit:\n      qps: 10\n      burst: 20"} {
 		if !strings.Contains(ciliumConfig, required) {
 			t.Errorf("RKE2 Cilium config lacks %q", required)
 		}
@@ -2882,8 +3072,8 @@ func assertControlPlaneCloudInit(t *testing.T, raw, expectedNodeName string, ini
 			t.Errorf("Cilium private load-balancer manifest lacks %q", required)
 		}
 	}
-	if strings.Contains(privateLoadBalancer, "interfaces:") || strings.Contains(privateLoadBalancer, "CiliumNodeConfig") || strings.Contains(ciliumConfig, "nodeIPAM:\n      enabled: true") {
-		t.Errorf("Cilium private load-balancer contract enabled a forbidden interface or Node IPAM path: %s\n%s", privateLoadBalancer, ciliumConfig)
+	if strings.Contains(privateLoadBalancer, "interfaces:") || strings.Contains(privateLoadBalancer, "CiliumNodeConfig") {
+		t.Errorf("Cilium private load-balancer contract enabled a forbidden interface path: %s\n%s", privateLoadBalancer, ciliumConfig)
 	}
 }
 

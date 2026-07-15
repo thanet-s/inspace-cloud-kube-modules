@@ -368,14 +368,14 @@ func TestControlPlaneCloudInitUsesPrivateCacheOrDirectUpstreamExclusively(t *tes
 	cacheContractAssertShell(t, directScript)
 }
 
-func TestDirectControlPlaneCloudInitV6OwnershipBytes(t *testing.T) {
+func TestDirectControlPlaneCloudInitV7OwnershipBytes(t *testing.T) {
 	raw, err := RenderCloudInitJSON(cacheContractControlPlaneInput())
 	if err != nil {
 		t.Fatal(err)
 	}
-	const v6DirectHash = "0741235bd77018e4f11ffb6930b1f3e966fdf4f45af276ff96288e40b4873111"
-	if got := fmt.Sprintf("%x", sha256.Sum256([]byte(raw))); got != v6DirectHash {
-		t.Fatalf("direct control-plane cloud-init hash=%s, want frozen v6 hash %s", got, v6DirectHash)
+	const v7DirectHash = "0e7f5739fbc75d0afe171840dc3e1a11dc276d11dc9675420ab77fa8531c2bd8"
+	if got := fmt.Sprintf("%x", sha256.Sum256([]byte(raw))); got != v7DirectHash {
+		t.Fatalf("direct control-plane cloud-init hash=%s, want frozen v7 hash %s", got, v7DirectHash)
 	}
 }
 

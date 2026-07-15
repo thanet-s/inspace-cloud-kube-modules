@@ -114,6 +114,7 @@
     e2e_state_dir: "{{ lookup('env', 'E2E_STATE_DIR') }}"
     e2e_state_file: "{{ lookup('env', 'E2E_STATE_DIR') }}/state.json"
     e2e_kubeconfig: "{{ lookup('env', 'E2E_STATE_DIR') }}/kubeconfig.yaml"
+    e2e_baseline_inventory_file: "{{ lookup('env', 'E2E_STATE_DIR') }}/baseline-inventory.json"
     e2e_state: "{{ lookup('file', lookup('env', 'E2E_STATE_DIR') + '/state.json') | from_json }}"
   environment:
     KUBECONFIG: "{{ e2e_kubeconfig }}"
@@ -136,10 +137,15 @@
           - "false"
       changed_when: true
 
-    - name: Remove stale pod-replacement scratch state
+    - name: Remove stale acceptance scratch state
       ansible.builtin.file:
-        path: "{{ e2e_state_dir }}/old-pod"
+        path: "{{ e2e_state_dir }}/{{ item }}"
         state: absent
+      loop:
+        - old-pod
+        - node-load-balancer-baseline.json
+        - node-load-balancer.yaml
+        - node-load-balancer-expansion.yaml
 
     - name: Heal state left by an interrupted acceptance run
       ansible.builtin.shell: |
@@ -179,6 +185,68 @@
         - deployment/inspace-karpenter
         - daemonset/cilium
       changed_when: false
+
+    - name: Remove stale paid and Node-LB acceptance owners
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - -n
+          - default
+          - delete
+          - service/inspace-e2e-web
+          - deployment/inspace-e2e-node-lb
+          - service/inspace-e2e-node-traefik
+          - service/inspace-e2e-node-shared-a
+          - service/inspace-e2e-node-shared-b
+          - service/inspace-e2e-node-shared-conflict
+          - service/inspace-e2e-node-dedicated
+          - --ignore-not-found
+          - --wait=false
+      changed_when: true
+
+    - name: Wait for the stale paid public Service owner to disappear
+      ansible.builtin.shell: |
+        set -euo pipefail
+        test -z "$(kubectl -n default get service/inspace-e2e-web --ignore-not-found -o name)"
+      args:
+        executable: /bin/bash
+      register: e2e_stale_paid_service_cleanup
+      changed_when: false
+      retries: 180
+      delay: 10
+      until: e2e_stale_paid_service_cleanup.rc == 0
+
+    - name: Wait for stale Node-LB cloud and Kubernetes owners to quiesce
+      ansible.builtin.command:
+        argv:
+          - /opt/e2e/scripts/verify-node-load-balancer.py
+          - --state
+          - "{{ e2e_state_file }}"
+          - --kubeconfig
+          - "{{ e2e_kubeconfig }}"
+          - --expect
+          - absent
+          - --immutable-baseline
+          - "{{ e2e_baseline_inventory_file }}"
+      register: e2e_stale_node_lb_cleanup
+      changed_when: false
+      retries: 180
+      delay: 10
+      until: e2e_stale_node_lb_cleanup.rc == 0
+      no_log: true
+
+    - name: Delete a stale generated Node-LB NodeClass
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - delete
+          - inspacenodeclass
+          - -l
+          - "inspace.cloud/node-lb-managed=true,inspace.cloud/node-lb-cluster={{ e2e_state.clusterName }}"
+          - --ignore-not-found
+          - --wait=true
+          - --timeout=5m
+      changed_when: true
 
     - name: Require the persisted default bootstrap cache contract
       ansible.builtin.shell: |
@@ -237,6 +305,11 @@
     e2e_state_dir: "{{ lookup('env', 'E2E_STATE_DIR') }}"
     e2e_state_file: "{{ lookup('env', 'E2E_STATE_DIR') }}/state.json"
     e2e_kubeconfig: "{{ lookup('env', 'E2E_STATE_DIR') }}/kubeconfig.yaml"
+    e2e_baseline_inventory_file: "{{ lookup('env', 'E2E_STATE_DIR') }}/baseline-inventory.json"
+    e2e_state: "{{ lookup('file', lookup('env', 'E2E_STATE_DIR') + '/state.json') | from_json }}"
+    e2e_node_lb_baseline: "{{ lookup('env', 'E2E_STATE_DIR') }}/node-load-balancer-baseline.json"
+    e2e_node_lb_manifest: "{{ lookup('env', 'E2E_STATE_DIR') }}/node-load-balancer.yaml"
+    e2e_node_lb_expansion_manifest: "{{ lookup('env', 'E2E_STATE_DIR') }}/node-load-balancer-expansion.yaml"
     e2e_nodepool_name: "general"
     e2e_marker: "inspace-e2e-{{ lookup('env', 'E2E_RUN_ID') }}"
   environment:
@@ -739,7 +812,7 @@
         (e2e_public_cloud_proof.stdout | from_json).publicIPv4 == e2e_service_ip_command.stdout
       no_log: true
 
-    - name: Prove explicit public CCM ownership and no Node IPAM selection
+    - name: Prove explicit paid public CCM ownership before Node-LB acceptance
       ansible.builtin.shell: |
         set -euo pipefail
         kubectl -n default get service inspace-e2e-web -o json | jq -e '
@@ -749,8 +822,6 @@
           .spec.externalTrafficPolicy == "Local" and
           (.spec.healthCheckNodePort | type) == "number" and
           all(.status.conditions[]?; (.type | startswith("cilium.io/")) | not)'
-        kubectl get services --all-namespaces -o json | jq -e '
-          all(.items[]; .spec.loadBalancerClass != "io.cilium/node")'
         kubectl -n kube-system get leases -o json | jq -e '
           all(.items[]; .metadata.name != "cilium-l2announce-default-inspace-e2e-web")'
       args:
@@ -1117,6 +1188,317 @@
       until: e2e_final_public_cleanup.rc == 0
       no_log: true
 
+    - name: Require the immutable zero-NLB anchor before Node-LB baseline capture
+      ansible.builtin.command:
+        argv:
+          - /opt/e2e/scripts/verify-node-load-balancer.py
+          - --state
+          - "{{ e2e_state_file }}"
+          - --kubeconfig
+          - "{{ e2e_kubeconfig }}"
+          - --expect
+          - absent
+          - --immutable-baseline
+          - "{{ e2e_baseline_inventory_file }}"
+      register: e2e_node_lb_immutable_nlb_anchor
+      changed_when: false
+      retries: 180
+      delay: 10
+      until: e2e_node_lb_immutable_nlb_anchor.rc == 0
+      no_log: true
+
+    - name: Capture the exact account inventory before Node-LB acceptance
+      ansible.builtin.command:
+        argv:
+          - /opt/e2e/scripts/account-inventory.py
+          - capture
+          - --output
+          - "{{ e2e_node_lb_baseline }}"
+      changed_when: true
+      no_log: true
+
+    - name: Render the isolated Node-LB acceptance workload
+      ansible.builtin.template:
+        src: templates/node-load-balancer.yaml.j2
+        dest: "{{ e2e_node_lb_manifest }}"
+        mode: "0600"
+
+    - name: Render the conflicting and dedicated Node-LB expansion
+      ansible.builtin.template:
+        src: templates/node-load-balancer-expansion.yaml.j2
+        dest: "{{ e2e_node_lb_expansion_manifest }}"
+        mode: "0600"
+
+    - name: Exercise shared conflict and dedicated public Node-LB modes
+      block:
+        - name: Create the Node-LB workload and established shared pair
+          ansible.builtin.command:
+            argv:
+              - kubectl
+              - apply
+              - --server-side
+              - --field-manager=inspace-e2e
+              - -f
+              - "{{ e2e_node_lb_manifest }}"
+          changed_when: true
+
+        - name: Journal initial Node-LB identities before cloud convergence
+          ansible.builtin.command:
+            argv:
+              - /opt/e2e/scripts/persist-workload.py
+              - --state
+              - "{{ e2e_state_file }}"
+              - --kubeconfig
+              - "{{ e2e_kubeconfig }}"
+          changed_when: true
+          no_log: true
+
+        - name: Wait for the Node-LB data-path workload
+          ansible.builtin.command:
+            argv:
+              - kubectl
+              - -n
+              - default
+              - rollout
+              - status
+              - deployment/inspace-e2e-node-lb
+              - --timeout=10m
+          changed_when: false
+
+        - name: Require the mixed Traefik and sibling Services to establish one shared shadow shard
+          ansible.builtin.shell: |
+            set -euo pipefail
+            services=$(kubectl -n default get services \
+              inspace-e2e-node-traefik inspace-e2e-node-shared-b \
+              inspace-e2e-node-traefik-node-lb inspace-e2e-node-shared-b-node-lb \
+              -o json)
+            jq -e '
+              def named($name):
+                [.items[] | select(.metadata.name == $name)] |
+                if length == 1 then .[0] else error("missing exact Service/" + $name) end;
+              named("inspace-e2e-node-traefik") as $a |
+              named("inspace-e2e-node-shared-b") as $b |
+              named("inspace-e2e-node-traefik-node-lb") as $shadowA |
+              named("inspace-e2e-node-shared-b-node-lb") as $shadowB |
+              ($a.metadata.annotations["service.inspace.cloud/node-lb-shard"] // "") as $shard |
+              ("inspace.cloud.node-restriction.kubernetes.io/node-lb=true," +
+                "inspace.cloud.node-restriction.kubernetes.io/cluster={{ e2e_state.clusterName }}," +
+                "inspace.cloud.node-restriction.kubernetes.io/shard=" + $shard +
+                ",inspace.cloud.node-restriction.kubernetes.io/ready=true") as $selector |
+              ($shard | test("^inlb-[0-9a-f]{8}$")) and
+              $b.metadata.annotations["service.inspace.cloud/node-lb-shard"] == $shard and
+              all([$shadowA, $shadowB][];
+                .spec.loadBalancerClass == "io.cilium/node" and
+                .spec.allocateLoadBalancerNodePorts == false and
+                .metadata.annotations["io.cilium.nodeipam/match-node-labels"] == $selector) and
+              $shadowA.metadata.labels["inspace.cloud/node-lb-service-uid"] == $a.metadata.uid and
+              $shadowB.metadata.labels["inspace.cloud/node-lb-service-uid"] == $b.metadata.uid and
+              $shadowA.metadata.ownerReferences == [{
+                "apiVersion": "v1", "blockOwnerDeletion": true, "controller": true,
+                "kind": "Service", "name": $a.metadata.name, "uid": $a.metadata.uid
+              }] and
+              $shadowB.metadata.ownerReferences == [{
+                "apiVersion": "v1", "blockOwnerDeletion": true, "controller": true,
+                "kind": "Service", "name": $b.metadata.name, "uid": $b.metadata.uid
+              }] and
+              ($shadowA.status.loadBalancer.ingress | length) == 1 and
+              ($shadowB.status.loadBalancer.ingress | length) == 1 and
+              $a.status.loadBalancer == $shadowA.status.loadBalancer and
+              $b.status.loadBalancer == $shadowB.status.loadBalancer' <<<"$services"
+          args:
+            executable: /bin/bash
+          register: e2e_node_lb_shared_pair
+          changed_when: false
+          retries: 180
+          delay: 10
+          until: e2e_node_lb_shared_pair.rc == 0
+
+        - name: Add the conflicting shared and dedicated Node-LB Services
+          ansible.builtin.command:
+            argv:
+              - kubectl
+              - apply
+              - --server-side
+              - --field-manager=inspace-e2e
+              - -f
+              - "{{ e2e_node_lb_expansion_manifest }}"
+          changed_when: true
+
+        - name: Journal every Node-LB identity before the full convergence proof
+          ansible.builtin.command:
+            argv:
+              - /opt/e2e/scripts/persist-workload.py
+              - --state
+              - "{{ e2e_state_file }}"
+              - --kubeconfig
+              - "{{ e2e_kubeconfig }}"
+          changed_when: true
+          no_log: true
+
+        - name: Prove Node-LB Kubernetes cloud and ownership convergence
+          ansible.builtin.command:
+            argv:
+              - /opt/e2e/scripts/verify-node-load-balancer.py
+              - --state
+              - "{{ e2e_state_file }}"
+              - --kubeconfig
+              - "{{ e2e_kubeconfig }}"
+              - --expect
+              - present
+              - --baseline
+              - "{{ e2e_node_lb_baseline }}"
+          register: e2e_node_lb_proof
+          changed_when: false
+          retries: 180
+          delay: 10
+          until: e2e_node_lb_proof.rc == 0
+          no_log: true
+
+        - name: Read the converged Node-LB proof
+          ansible.builtin.set_fact:
+            e2e_node_lb_result: "{{ e2e_node_lb_proof.stdout | from_json }}"
+          no_log: true
+
+        - name: Prove every public Node-LB TCP port reaches its exact backend
+          ansible.builtin.uri:
+            url: "http://{{ item.ip }}:{{ item.port }}/"
+            return_content: true
+            timeout: 10
+            use_proxy: false
+          loop: "{{ e2e_node_lb_result.httpProbes }}"
+          loop_control:
+            label: "{{ item.service }} via {{ item.ip }}:{{ item.port }}"
+          register: e2e_node_lb_http
+          retries: 60
+          delay: 5
+          until: >-
+            e2e_node_lb_http.status == 200 and
+            (e2e_node_lb_http.content | trim) ==
+            (e2e_marker ~ '-' ~ item.markerSuffix)
+
+        - name: Delete one shared Node-LB member without deleting its sibling shard
+          ansible.builtin.command:
+            argv:
+              - kubectl
+              - -n
+              - default
+              - delete
+              - service/inspace-e2e-node-shared-b
+              - --wait=false
+          changed_when: true
+
+        - name: Prove partial shared-member cleanup preserves the exact sibling resources
+          ansible.builtin.command:
+            argv:
+              - /opt/e2e/scripts/verify-node-load-balancer.py
+              - --state
+              - "{{ e2e_state_file }}"
+              - --kubeconfig
+              - "{{ e2e_kubeconfig }}"
+              - --expect
+              - partial
+              - --baseline
+              - "{{ e2e_node_lb_baseline }}"
+              - --deleted-firewall
+              - "{{ e2e_node_lb_result.services['inspace-e2e-node-shared-b'].firewallUUID }}"
+              - --retained-shard
+              - "{{ e2e_node_lb_result.services['inspace-e2e-node-traefik'].shard }}"
+              - --retained-vm
+              - "{{ e2e_node_lb_result.services['inspace-e2e-node-traefik'].vmUUID }}"
+              - --retained-ip
+              - "{{ e2e_node_lb_result.services['inspace-e2e-node-traefik'].ip }}"
+              - --retained-icmp-firewall
+              - "{{ e2e_node_lb_result.icmpFirewallUUID }}"
+              - --retained-service-firewall
+              - "{{ e2e_node_lb_result.services['inspace-e2e-node-traefik'].firewallUUID }}"
+          register: e2e_node_lb_partial_proof
+          changed_when: false
+          retries: 180
+          delay: 10
+          until: e2e_node_lb_partial_proof.rc == 0
+          no_log: true
+
+        - name: Read the partial Node-LB proof
+          ansible.builtin.set_fact:
+            e2e_node_lb_partial_result: "{{ e2e_node_lb_partial_proof.stdout | from_json }}"
+          no_log: true
+
+        - name: Prove the retained mixed and other TCP backends after partial cleanup
+          ansible.builtin.uri:
+            url: "http://{{ item.ip }}:{{ item.port }}/"
+            return_content: true
+            timeout: 10
+            use_proxy: false
+          loop: "{{ e2e_node_lb_partial_result.httpProbes }}"
+          loop_control:
+            label: "{{ item.service }} via {{ item.ip }}:{{ item.port }}"
+          register: e2e_node_lb_partial_http
+          retries: 60
+          delay: 5
+          until: >-
+            e2e_node_lb_partial_http.status == 200 and
+            (e2e_node_lb_partial_http.content | trim) ==
+            (e2e_marker ~ '-' ~ item.markerSuffix)
+      always:
+        - name: Delete every Node-LB acceptance Service and workload owner
+          ansible.builtin.command:
+            argv:
+              - kubectl
+              - delete
+              - -f
+              - "{{ e2e_node_lb_expansion_manifest }}"
+              - -f
+              - "{{ e2e_node_lb_manifest }}"
+              - --ignore-not-found
+              - --wait=false
+          changed_when: true
+
+        - name: Require Node-LB Services shadows NodePools firewalls VMs and FIPs to disappear
+          ansible.builtin.command:
+            argv:
+              - /opt/e2e/scripts/verify-node-load-balancer.py
+              - --state
+              - "{{ e2e_state_file }}"
+              - --kubeconfig
+              - "{{ e2e_kubeconfig }}"
+              - --expect
+              - absent
+              - --immutable-baseline
+              - "{{ e2e_baseline_inventory_file }}"
+          register: e2e_node_lb_absent
+          changed_when: false
+          retries: 180
+          delay: 10
+          until: e2e_node_lb_absent.rc == 0
+          no_log: true
+
+        - name: Delete the generated Node-LB NodeClass after its shards are gone
+          ansible.builtin.command:
+            argv:
+              - kubectl
+              - delete
+              - inspacenodeclass
+              - -l
+              - "inspace.cloud/node-lb-managed=true,inspace.cloud/node-lb-cluster={{ e2e_state.clusterName }}"
+              - --ignore-not-found
+              - --wait=true
+              - --timeout=5m
+          changed_when: true
+
+        - name: Require exact pre-Node-LB account inventory after cleanup
+          ansible.builtin.command:
+            argv:
+              - /opt/e2e/scripts/account-inventory.py
+              - compare
+              - --baseline
+              - "{{ e2e_node_lb_baseline }}"
+          register: e2e_node_lb_inventory_cleanup
+          changed_when: false
+          retries: 30
+          delay: 10
+          until: e2e_node_lb_inventory_cleanup.rc == 0
+          no_log: true
+
     - name: Mark the full RKE2 CCM CSI Karpenter acceptance suite complete
       ansible.builtin.command:
         argv:
@@ -1140,4 +1522,6 @@
         msg: >-
           Full InSpace RKE2/Cilium-native-routing/kube-proxy-replacement,
           CCM, CSI RWO, Karpenter, two same-port private LB-IPAM/L2 VIPs,
-          L2 lease failover, and explicit public TCP NLB E2E passed; cleanup follows.
+          L2 lease failover, explicit paid TCP NLB, and shared/conflict/dedicated
+          Cilium Node IPAM public load-balancer TCP/UDP/ICMP and partial-member
+          cleanup E2E passed; cleanup follows.

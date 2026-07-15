@@ -23,6 +23,7 @@
     e2e_private_lb_pool_start: "{{ lookup('env', 'INSPACE_PRIVATE_LOAD_BALANCER_POOL_START') }}"
     e2e_private_lb_pool_stop: "{{ lookup('env', 'INSPACE_PRIVATE_LOAD_BALANCER_POOL_STOP') }}"
     e2e_ssh_user: "{{ lookup('env', 'INSPACE_E2E_SSH_USERNAME') | default('inspacee2e', true) }}"
+    e2e_management_cidr: "{{ lookup('env', 'INSPACE_MANAGEMENT_CIDR') | default('0.0.0.0/0', true) }}"
     e2e_api_base: "{{ lookup('env', 'INSPACE_API_URL') | regex_replace('/+$', '') }}/v1/{{ lookup('env', 'INSPACE_LOCATION') }}"
   tasks:
     - name: Require an exact released version and isolated-account confirmation
@@ -52,31 +53,20 @@
           - "{{ e2e_private_lb_pool_stop }}"
       changed_when: false
 
-    - name: Detect the runner public IPv4
-      ansible.builtin.uri:
-        url: https://api.ipify.org
-        return_content: true
-        timeout: 30
-      register: e2e_management_ip_response
-      retries: 5
-      delay: 3
-      until: e2e_management_ip_response.status == 200
-
-    - name: Validate the runner public IPv4
+    - name: Validate the optional bastion management CIDR
       ansible.builtin.command:
         argv:
           - python3
           - -c
           - >-
             import ipaddress,sys;
-            a=ipaddress.ip_address(sys.argv[1]);
-            assert a.version == 4 and not a.is_private and not a.is_loopback and not a.is_multicast
-          - "{{ e2e_management_ip_response.content | trim }}"
+            raw=sys.argv[1]; p=ipaddress.ip_network(raw,strict=True);
+            assert p.version == 4 and (raw == '0.0.0.0/0' or (p.prefixlen == 32 and p.network_address.is_global and not p.network_address.is_private))
+          - "{{ e2e_management_cidr }}"
       changed_when: false
 
     - name: Record deterministic lifecycle facts
       ansible.builtin.set_fact:
-        e2e_management_cidr: "{{ e2e_management_ip_response.content | trim }}/32"
         e2e_owner: "{{ ('inspace-e2e/' + e2e_cluster_resource_name) | hash('sha256') | truncate(16, true, '') }}"
         e2e_ssh_public_key: "{{ lookup('file', lookup('env', 'E2E_PUBLIC_KEY')) | trim }}"
 
@@ -484,6 +474,16 @@
   hosts: rke2_bastion
   gather_facts: false
   tasks:
+    - name: Prove the bastion FIP answers ICMP from the management client
+      ansible.builtin.command:
+        argv: [ping, -4, -c, "3", -W, "5", "{{ e2e_public_ip }}"]
+      register: e2e_bastion_ping
+      delegate_to: localhost
+      changed_when: false
+      retries: 12
+      delay: 5
+      until: e2e_bastion_ping.rc == 0
+
     - name: Wait for the bastion public SSH port
       ansible.builtin.wait_for:
         host: "{{ e2e_public_ip }}"
@@ -1195,7 +1195,7 @@
         values=$(kubectl -n kube-system get helmchartconfig rke2-cilium -o jsonpath='{.spec.valuesContent}')
         grep -Eq '^[[:space:]]*defaultLBServiceIPAM:[[:space:]]*none[[:space:]]*$' <<<"$values"
         grep -Eq '^[[:space:]]*nodeIPAM:[[:space:]]*$' <<<"$values"
-        grep -Eq '^[[:space:]]*enabled:[[:space:]]*false[[:space:]]*$' <<<"$values"
+        grep -Eq '^[[:space:]]*enabled:[[:space:]]*true[[:space:]]*$' <<<"$values"
         grep -Eq '^[[:space:]]*l2announcements:[[:space:]]*$' <<<"$values"
         export E2E_CILIUM_VALUES="$values"
         python3 - "$INSPACE_PRIVATE_LOAD_BALANCER_POOL_START" "$INSPACE_PRIVATE_LOAD_BALANCER_POOL_STOP" <<'PY'
@@ -1213,7 +1213,7 @@
         assert values["bpf"]["masquerade"] is True
         assert values["l2announcements"]["enabled"] is True
         assert values["defaultLBServiceIPAM"] == "none"
-        assert values["nodeIPAM"]["enabled"] is False
+        assert values["nodeIPAM"]["enabled"] is True
         assert values["k8sClientRateLimit"] == {"qps": qps, "burst": max(20, 2 * qps)}
         PY
         kubectl get ciliumloadbalancerippool inspace-private -o json | jq -e \

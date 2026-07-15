@@ -67,8 +67,9 @@ guest NIC still has only its private RFC1918 address. RKE2 `node-ip` and
 VIP cannot become Kubernetes `InternalIP`; production cloud-init omits
 `node-external-ip`, and the external CCM publishes the validated FIP as the
 Kubernetes `ExternalIP`. The node firewall admits the exact VPC and pod CIDRs
-but no public ingress. The separate bastion firewall admits only the operator
-IPv4 `/32` on TCP/22. Guest UFW is not installed or configured by bootstrap;
+but no public ingress. The separate bastion firewall defaults TCP/22 and
+portless ICMP to Any; an explicit public IPv4 `/32` restricts both rules.
+Guest UFW is not installed or configured by bootstrap;
 if present, bootstrap must disable it and verify it inactive/disabled without
 issuing raw iptables or nftables flush commands.
 
@@ -172,14 +173,16 @@ go run ./cmd/inspace-cluster-controller \
   --cluster-config ./examples/inspacecluster.yaml \
   --ssh-public-key-file "$HOME/.ssh/id_rsa.pub" \
   --ssh-username inspacee2e \
-  --management-cidr 203.0.113.10/32 \
   --management-tcp-ports 22 \
   --until-ready --output=json
 ```
 
-The SSH username/key and exactly one public management `/32` TCP/22 are
-required because every cluster has the fixed bastion. Private keys are never
-accepted or copied. Broad public prefixes and all-port rules are rejected.
+The SSH username/key and TCP/22 are required because every cluster has the
+fixed bastion. Omitting `--management-cidr` defaults SSH and portless ICMP to
+Any (`0.0.0.0/0`). Set one canonical public IPv4 `/32` to restrict both, and
+reuse that exact value for reconcile and destroy. Private keys are never
+accepted or copied. Other broad prefixes and all-port TCP/UDP rules are
+rejected.
 Control-plane FIPs have no public ingress; API and RKE2 registration use only
 the private VIP. The real InSpace subnet is checked against the RKE2 pod and
 service CIDRs before any mutation.
@@ -192,10 +195,11 @@ an adoption candidate. An uncertain API response is resolved by listing and
 validating the exact deterministic name and owner/spec record on the next loop,
 not by blindly repeating the POST.
 
-New control-plane and bastion owner/spec records use schema v6 because bounded
-local-hostname readback is immutable cloud-init input. Reconciliation does not
-adopt an older fixed VM into v6; use an explicit destroy/recreate lifecycle.
-Owned teardown continues to recognize the supported older fixed-node schemas.
+New control-plane owner/spec records use schema v7 because Cilium Node IPAM is
+part of their immutable RKE2 cloud-init contract. Bastion records remain at v6.
+Reconciliation does not adopt an older fixed VM into v7; use an explicit
+destroy/recreate lifecycle. Owned teardown continues to recognize supported
+older fixed-node schemas, including matched v6 bastion/control-plane records.
 
 New bootstrap FIPs are `<metadata.name>-bastion-ip` and
 `<metadata.name>-cp0-ip` through `-cp2-ip`. The two firewall display names are
@@ -241,7 +245,6 @@ cleared.
 ```sh
 go run ./cmd/inspace-cluster-controller \
   --cluster-config ./examples/inspacecluster.yaml \
-  --management-cidr 203.0.113.10/32 \
   --management-tcp-ports 22 \
   --delete --output=json
 ```
@@ -330,7 +333,92 @@ defaults an omitted `externalTrafficPolicy` to `Cluster` before CCM observes the
 Service, so set `Local` explicitly when local-endpoint targeting is required.
 Private Cilium L2 Services must remain `externalTrafficPolicy: Cluster`.
 
-If either public marker is removed, CCM deletes every deterministically owned
+The CCM can also own public Cilium node load balancers. Enable it with
+`INSPACE_NODE_LOAD_BALANCER_ENABLED=true`, set
+`INSPACE_NODE_LOAD_BALANCER_DEFAULT_NODE_CLASS` to the established worker
+NodeClass that supplies the cluster/VPC/RKE2/cache contract, and optionally set
+`INSPACE_NODE_LOAD_BALANCER_NODES_PER_SHARD` (default `1`). Karpenter must run
+with `StaticCapacity=true`.
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: web
+spec:
+  type: LoadBalancer
+  loadBalancerClass: inspace.cloud/node
+  allocateLoadBalancerNodePorts: false
+  externalTrafficPolicy: Cluster
+  selector:
+    app: web
+  ports:
+    - port: 443
+      targetPort: 8443
+      protocol: TCP
+```
+
+An omitted `service.inspace.cloud/node-lb-mode` means
+`public-node-shared`. Shared Services pack onto an existing shard only when all
+IPv4 `(protocol, port)` claims are free; otherwise CCM creates another shard.
+Use `public-node-dedicated` for an isolated shard. Dedicated Services can set
+`service.inspace.cloud/node-lb-cpu` and
+`service.inspace.cloud/node-lb-memory`; the defaults are `1` and `2Gi`, and the
+pair must exactly match the finite provider catalog.
+
+CCM never exposes application workers directly. It creates static, tainted AMD
+EPYC NodePools with a 30 GiB root disk and a hardened NodeClass cloned from the
+configured base. A controller-owned `io.cilium/node` shadow Service carries an
+exact shard selector. CCM revalidates the complete rendered NodePool profile,
+including its `NoSchedule` taint, and the exact
+Node→NodeClaim→NodePool→NodeClass ownership chain before accepting a node. Only
+healthy nodes with one authoritative FIP, Karpenter's valid private base
+firewall, the shared cluster ICMP firewall, and every active Service firewall
+assignment receive the protected ready label consumed by Cilium. The user
+Service status mirrors the shadow status. TCP and UDP are supported; SCTP and
+`externalTrafficPolicy: Local` are rejected. The static NodePool limit permits
+exactly one temporary surge node so Karpenter drift replacement can converge
+while the steady-state count remains `nodesPerShard`.
+
+Node-LB identity and readiness use
+`inspace.cloud.node-restriction.kubernetes.io/node-lb`, `/cluster`, `/shard`,
+and `/ready` labels, so the RKE2 NodeRestriction admission plugin is part of
+the security boundary. That stops a kubelet from self-advertising; it does not
+constrain a cluster administrator.
+Multi-tenant clusters must use admission and RBAC to reserve direct
+`io.cilium/node` Services, `io.cilium.nodeipam/*` annotations,
+`Service.spec.externalIPs`, protected provider annotations/finalizers, and
+Node-LB tolerations/selectors. The generated `NoSchedule` taint is a placement
+guard, not tenant isolation.
+
+The user Service must have a selector and explicitly set
+`allocateLoadBalancerNodePorts: false`; CCM does not mirror manually managed
+EndpointSlices, and this dataplane does not consume Kubernetes NodePorts.
+`externalIPs`, `loadBalancerIP`, non-zero `nodePort` values, and non-IPv4
+source ranges are rejected before CCM creates Karpenter capacity. During a
+shard migration, the previous shadow status and nodes stay active until the
+replacement replicas are healthy and Cilium publishes their ExternalIPs.
+
+Each Service firewall uses the deterministic name
+`inlb-<cluster-hash>-<Service-UID>-<policy-hash>`. The full Service UID prevents
+cross-Service ownership collisions. Its policy hash covers only the complete
+canonical single-port TCP/UDP rule set and IPv4 source ranges; a per-Service
+firewall contains no ICMP or outbound rule.
+
+All authorized Node-LB VMs also reuse one cluster-owned firewall named
+`inlb-<cluster-ownership-hash>-icmp-<policy-hash>`. It contains exactly one
+portless inbound ICMP-from-Any rule. `loadBalancerSourceRanges` therefore
+restricts only the owning Service's TCP/UDP traffic and never restricts ping.
+InSpace exposes no ICMP type/code filter, so the shared rule permits all IPv4
+ICMP from Any.
+CCM persists this shared identity on the generated NodeClass, verifies every
+assignment before readiness, and removes it only after the last finalized
+Node-LB Service and all managed NodePool/NodeClaim/Node capacity are absent.
+Deterministic ownership and spaced absence readback cover create, replacement,
+crash recovery, and deletion without relying on the firewall description that
+InSpace omits.
+
+For the paid NLB path, if either public marker is removed, CCM deletes every deterministically owned
 FIP/NLB before handing the Service to another implementation. Discovery and
 deletion remain ownership-based even after markers change, preventing legacy
 resources from leaking. Public FIP list/create/assignment responses must match
@@ -341,10 +429,11 @@ NLB's private address is neither the control-plane VIP nor an address in the
 reserved Cilium pool. A collision triggers deterministic owned FIP/NLB cleanup
 and fails the reconciliation.
 
-`Service.spec.loadBalancerSourceRanges` is rejected because the InSpace NLB
-API exposes TCP port forwarding, not source-range filtering. Use InSpace
-firewalls or in-cluster policy where appropriate. UDP and SCTP Services are
-also rejected.
+For that paid NLB path, `Service.spec.loadBalancerSourceRanges` is rejected
+because the InSpace NLB API exposes TCP port forwarding, not source-range
+filtering. Use InSpace firewalls or in-cluster policy where appropriate. UDP
+and SCTP Services are also rejected. The public Node-LB path above accepts
+canonical IPv4 source ranges for its per-Service TCP/UDP firewall only.
 
 ## Development and verification
 

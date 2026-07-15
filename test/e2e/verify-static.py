@@ -290,6 +290,169 @@ def verify_retention_state_parser(entrypoint: str) -> None:
                     f"malformed or non-boolean retention state was accepted: {contents!r}")
 
 
+def verify_node_load_balancer_helm_contract() -> None:
+    """Prove chart defaults, rendered wiring, examples, and fail-closed gates."""
+    repository = ROOT.parent.parent
+    chart = repository / "charts/inspace-cloud-kube-modules"
+    values_path = chart / "values.yaml"
+    ci_values = chart / "ci/test-values.yaml"
+    values = values_path.read_text(encoding="utf-8")
+
+    require(yaml_mapping_scalar(values, "ccm", "nodeLoadBalancer", "enabled") == "true",
+            "chart must enable the CCM node-load-balancer controller by default")
+    require(yaml_mapping_scalar(values, "ccm", "nodeLoadBalancer", "nodesPerShard") == "1",
+            "chart node-load-balancer shards must default to one node")
+    require(yaml_mapping_scalar(values, "karpenter", "featureGates", "staticCapacity") == "true",
+            "chart must enable Karpenter StaticCapacity for managed node-load-balancer shards")
+
+    render_command = [
+        "helm", "template", "verify", str(chart), "--namespace", "kube-system",
+        "--values", str(ci_values),
+    ]
+    rendered_result = subprocess.run(
+        render_command,
+        cwd=repository,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    require(
+        rendered_result.returncode == 0,
+        f"Node-LB Helm render failed:\n{rendered_result.stdout}{rendered_result.stderr}",
+    )
+    rendered = rendered_result.stdout
+    ccm_deployment = manifest_document(
+        rendered, "Deployment", "verify-inspace-cloud-kube-modules-ccm"
+    )
+    for variable, value in (
+        ("INSPACE_NODE_LOAD_BALANCER_ENABLED", "true"),
+        ("INSPACE_NODE_LOAD_BALANCER_DEFAULT_NODE_CLASS", "ci-workers"),
+        ("INSPACE_NODE_LOAD_BALANCER_NODES_PER_SHARD", "1"),
+    ):
+        require(
+            re.search(
+                rf"(?m)^            - name: {re.escape(variable)}\n"
+                rf"              value: \"{re.escape(value)}\"$",
+                ccm_deployment,
+            ) is not None,
+            f"rendered CCM must set {variable}={value}",
+        )
+
+    ccm_role = manifest_document(
+        rendered, "ClusterRole", "verify-inspace-cloud-kube-modules-ccm"
+    )
+    for api_group, resource, verbs in (
+        ("karpenter.sh", "nodepools", '["get", "list", "create", "update", "delete"]'),
+        ("karpenter.sh", "nodeclaims", '["get", "list"]'),
+        ("karpenter.inspace.cloud", "inspacenodeclasses", '["get", "create", "update"]'),
+    ):
+        rule = (
+            f'  - apiGroups: ["{api_group}"]\n'
+            f'    resources: ["{resource}"]\n'
+            f"    verbs: {verbs}"
+        )
+        require(rule in ccm_role,
+                f"rendered CCM RBAC lacks the exact {api_group}/{resource} rule")
+
+    disabled_result = subprocess.run(
+        [*render_command, "--set", "ccm.nodeLoadBalancer.enabled=false"],
+        cwd=repository,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    require(
+        disabled_result.returncode == 0,
+        "Helm must render with the optional CCM Node-LB controller disabled:\n"
+        f"{disabled_result.stdout}{disabled_result.stderr}",
+    )
+    disabled_ccm_role = manifest_document(
+        disabled_result.stdout, "ClusterRole", "verify-inspace-cloud-kube-modules-ccm"
+    )
+    require(
+        'resources: ["nodepools"]' not in disabled_ccm_role
+        and 'resources: ["nodeclaims"]' not in disabled_ccm_role
+        and 'resources: ["inspacenodeclasses"]' not in disabled_ccm_role
+        and 'resources: ["services"]\n    verbs: ["get", "list", "watch", "patch", "update"]'
+        in disabled_ccm_role,
+        "disabled CCM Node-LB mode must remove cloud-capacity RBAC and Service create/delete",
+    )
+
+    karpenter_deployment = manifest_document(
+        rendered, "Deployment", "verify-inspace-cloud-kube-modules-karpenter"
+    )
+    require(
+        'StaticCapacity=true' in karpenter_deployment,
+        "rendered Karpenter feature gates must enable StaticCapacity",
+    )
+
+    chart_crd = (
+        repository
+        / "charts/inspace-cloud-kube-modules-crds/templates/karpenter.inspace.cloud_inspacenodeclasses.yaml"
+    ).read_text(encoding="utf-8")
+    source_crd = (
+        repository
+        / "modules/karpenter-provider/config/crd/bases/karpenter.inspace.cloud_inspacenodeclasses.yaml"
+    ).read_text(encoding="utf-8")
+    firewall_profile_schema = (
+        "                firewallProfile:\n"
+        "                  type: string\n"
+        "                  enum: [private-worker, public-node-load-balancer]"
+    )
+    for name, crd in (("packaged", chart_crd), ("source", source_crd)):
+        require(crd.count(firewall_profile_schema) == 1,
+                f"{name} NodeClass CRD must expose the exact optional firewallProfile enum")
+        required_fields = re.search(
+            r"(?m)^              required:\n((?:                - [A-Za-z0-9]+\n)+)", crd
+        )
+        require(required_fields is not None,
+                f"{name} NodeClass CRD lacks its spec required-fields block")
+        require("- firewallProfile\n" not in required_fields.group(1),
+                f"{name} NodeClass CRD must keep firewallProfile optional")
+    require(chart_crd == source_crd,
+            "packaged and source InSpaceNodeClass CRDs must remain byte-identical")
+
+    shared_example = (chart / "examples/service-public-node-shared.yaml").read_text(encoding="utf-8")
+    dedicated_example = (chart / "examples/service-public-node-dedicated.yaml").read_text(encoding="utf-8")
+    shared_service = manifest_document(shared_example, "Service", "example-public-shared")
+    dedicated_service = manifest_document(dedicated_example, "Service", "example-public-dedicated")
+    shared_config = "\n".join(
+        line for line in shared_service.splitlines()
+        if not line.lstrip().startswith("#")
+    )
+    require("loadBalancerClass: inspace.cloud/node" in shared_config and
+            "externalTrafficPolicy: Cluster" in shared_config and
+            "service.inspace.cloud/node-lb-mode:" not in shared_config,
+            "shared Node-LB example must exercise the omitted-mode shared default")
+    require("loadBalancerClass: inspace.cloud/node" in dedicated_service and
+            "externalTrafficPolicy: Cluster" in dedicated_service and
+            "service.inspace.cloud/node-lb-mode: public-node-dedicated" in dedicated_service and
+            'service.inspace.cloud/node-lb-cpu: "4"' in dedicated_service and
+            "service.inspace.cloud/node-lb-memory: 8Gi" in dedicated_service,
+            "dedicated Node-LB example must carry the mode and exact CPU/memory annotations")
+
+    invalid_combinations = (
+        ("ccm.enabled=false", "ccm.enabled must be true when ccm.nodeLoadBalancer.enabled=true"),
+        ("karpenter.enabled=false", "karpenter.enabled must be true when ccm.nodeLoadBalancer.enabled=true"),
+        (
+            "karpenter.featureGates.staticCapacity=false",
+            "karpenter.featureGates.staticCapacity must be true when ccm.nodeLoadBalancer.enabled=true",
+        ),
+    )
+    for override, diagnostic in invalid_combinations:
+        result = subprocess.run(
+            [*render_command, "--set", override],
+            cwd=repository,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        require(result.returncode != 0,
+                f"Helm accepted inconsistent Node-LB setting {override}")
+        require(diagnostic in result.stderr,
+                f"Helm returned the wrong diagnostic for {override}: {result.stderr}")
+
+
 def main() -> None:
     host = (ROOT / "run.sh").read_text(encoding="utf-8")
     dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
@@ -305,14 +468,28 @@ def main() -> None:
     ssh_config = (ROOT / "scripts/render-ssh-config.py").read_text(encoding="utf-8")
     tunnel = (ROOT / "scripts/api-tunnel.sh").read_text(encoding="utf-8")
     worker_discovery = (ROOT / "scripts/discover-worker.py").read_text(encoding="utf-8")
+    persist_workload = (ROOT / "scripts/persist-workload.py").read_text(encoding="utf-8")
     service_cloud = (ROOT / "scripts/verify-service-cloud.py").read_text(encoding="utf-8")
+    node_load_balancer_cloud = (ROOT / "scripts/verify-node-load-balancer.py").read_text(encoding="utf-8")
     worker_egress = (ROOT / "scripts/ensure-worker-egress.sh").read_text(encoding="utf-8")
     nodeclass = (ROOT / "templates/karpenter.yaml.j2").read_text(encoding="utf-8")
     cluster = (ROOT / "templates/cluster.yaml.j2").read_text(encoding="utf-8")
     workload = (ROOT / "templates/workload.yaml.j2").read_text(encoding="utf-8")
+    node_load_balancer_base = (ROOT / "templates/node-load-balancer.yaml.j2").read_text(encoding="utf-8")
+    node_load_balancer_expansion = (
+        ROOT / "templates/node-load-balancer-expansion.yaml.j2"
+    ).read_text(encoding="utf-8")
+    node_load_balancer_workload = node_load_balancer_base + "\n---\n" + node_load_balancer_expansion
     trigger = (ROOT / "templates/trigger.yaml.j2").read_text(encoding="utf-8")
     registry_probe = (ROOT / "templates/registry-egress-probe.yaml.j2").read_text(encoding="utf-8")
     ansible_cfg = (ROOT / "ansible.cfg").read_text(encoding="utf-8")
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    node_lb_service_names = (
+        "inspace-e2e-node-traefik",
+        "inspace-e2e-node-shared-b",
+        "inspace-e2e-node-shared-conflict",
+        "inspace-e2e-node-dedicated",
+    )
 
     executable_host = "\n".join(
         line.split("#", 1)[0] for line in host.splitlines()
@@ -321,6 +498,7 @@ def main() -> None:
     verify_host_launcher_external_allow_list()
     verify_retention_state_parser(entrypoint)
     verify_worker_egress_runtime()
+    verify_node_load_balancer_helm_contract()
     require("docker build" in executable_host and "docker run" in executable_host, "host launcher must build and run Docker")
     require("runner_platform=${INSPACE_E2E_RUNNER_PLATFORM:-linux/amd64}" in executable_host,
             "E2E runner must default explicitly to linux/amd64")
@@ -341,7 +519,7 @@ def main() -> None:
     require("interactive_arg=-it" in host and "[[ $phase == shell ]]" in host,
             "only the tunneled debug shell phase must request an interactive container")
 
-    for tool in ("kubectl", "helm", "jq", "openssh-client", "autossh", "curl", "skopeo"):
+    for tool in ("kubectl", "helm", "jq", "openssh-client", "autossh", "curl", "skopeo", "iputils-ping"):
         require(tool in dockerfile, f"runner image is missing {tool}")
     require('ENTRYPOINT ["/usr/bin/tini", "-g", "--"' in dockerfile,
             "runner must use one process-group-aware Tini")
@@ -469,6 +647,9 @@ def main() -> None:
         playbook, "Provision the RKE2 control plane through the product bootstrap controller", 0
     )
     require_yaml_key(provision_play, 2, "hosts", "localhost")
+    require("api.ipify.org" not in provision_play and
+            'e2e_management_cidr: "{{ lookup(\'env\', \'INSPACE_MANAGEMENT_CIDR\') | default(\'0.0.0.0/0\', true) }}"' in provision_play,
+            "bootstrap must default bastion management to Any without public-IP discovery")
     launch_task = named_yaml_sequence_item(provision_play, "Run the bootstrap reconciler synchronously to readiness", 4)
     require("\n      ansible.builtin.command:" in launch_task,
             "bootstrap launch task must use ansible.builtin.command")
@@ -858,6 +1039,93 @@ def main() -> None:
             "pvc/inspace-e2e-rwo" in cleanup_window and
             "--state \"{{ e2e_state_file }}\" --public absent" in cleanup_window,
             "live acceptance must delete only the paid public Service, prove cloud cleanup, and preserve every other workload")
+    node_lb_baseline = playbook.index("- name: Capture the exact account inventory before Node-LB acceptance")
+    stale_paid_service_absent = playbook.index("- name: Wait for the stale paid public Service owner to disappear")
+    node_lb_stale_absent = playbook.index("- name: Wait for stale Node-LB cloud and Kubernetes owners to quiesce")
+    node_lb_immutable_anchor = playbook.index("- name: Require the immutable zero-NLB anchor before Node-LB baseline capture")
+    node_lb_exercise_start = playbook.index("- name: Exercise shared conflict and dedicated public Node-LB modes")
+    node_lb_initial_apply = playbook.index("- name: Create the Node-LB workload and established shared pair")
+    node_lb_initial_journal = playbook.index("- name: Journal initial Node-LB identities before cloud convergence")
+    node_lb_shared_pair = playbook.index(
+        "- name: Require the mixed Traefik and sibling Services to establish one shared shadow shard"
+    )
+    node_lb_expansion = playbook.index("- name: Add the conflicting shared and dedicated Node-LB Services")
+    node_lb_full_journal = playbook.index("- name: Journal every Node-LB identity before the full convergence proof")
+    node_lb_present = playbook.index("- name: Prove Node-LB Kubernetes cloud and ownership convergence")
+    node_lb_http = playbook.index("- name: Prove every public Node-LB TCP port reaches its exact backend")
+    node_lb_partial_delete = playbook.index("- name: Delete one shared Node-LB member without deleting its sibling shard")
+    node_lb_partial = playbook.index("- name: Prove partial shared-member cleanup preserves the exact sibling resources")
+    node_lb_partial_http = playbook.index("- name: Prove the retained mixed and other TCP backends after partial cleanup")
+    node_lb_delete = playbook.index("- name: Delete every Node-LB acceptance Service and workload owner")
+    node_lb_absent = playbook.index("- name: Require Node-LB Services shadows NodePools firewalls VMs and FIPs to disappear")
+    require(stale_paid_service_absent < node_lb_stale_absent < public_delete < node_lb_immutable_anchor < node_lb_baseline < node_lb_exercise_start <
+            node_lb_initial_apply < node_lb_initial_journal < node_lb_shared_pair <
+            node_lb_expansion < node_lb_full_journal < node_lb_present < node_lb_http < node_lb_partial_delete <
+            node_lb_partial < node_lb_partial_http < node_lb_delete <
+            node_lb_absent < suite_complete,
+            "Node-LB acceptance must run after paid-NLB cleanup and finish before suite completion")
+    require(
+        test_playbook.count("- --immutable-baseline") == 3
+        and test_playbook.count('"{{ e2e_baseline_inventory_file }}"') >= 3
+        and "service/inspace-e2e-web" in named_yaml_sequence_item(
+            test_playbook, "Remove stale paid and Node-LB acceptance owners", 4
+        )
+        and "--immutable-baseline" in cleanup
+        and '"{{ e2e_baseline_inventory_file }}"' in cleanup,
+        "every absent Node-LB proof must use the immutable pre-mutation NLB UUID baseline",
+    )
+    node_lb_exercise = named_yaml_sequence_item(
+        test_playbook, "Exercise shared conflict and dedicated public Node-LB modes", 4
+    )
+    require("\n      always:\n" in node_lb_exercise and
+            node_lb_exercise.count("/opt/e2e/scripts/verify-node-load-balancer.py") == 3 and
+            "--expect\n              - present" in node_lb_exercise and
+            "--expect\n              - partial" in node_lb_exercise and
+            "--expect\n              - absent" in node_lb_exercise and
+            "/opt/e2e/scripts/account-inventory.py" in node_lb_exercise and
+            "compare" in node_lb_exercise and
+            "--baseline" in node_lb_exercise and
+            "Require the mixed Traefik and sibling Services to establish one shared shadow shard" in node_lb_exercise and
+            '"io.cilium.nodeipam/match-node-labels"' in node_lb_exercise and
+            '"inspace.cloud/node-lb-service-uid"' in node_lb_exercise and
+            "Add the conflicting shared and dedicated Node-LB Services" in node_lb_exercise and
+            "--deleted-firewall" in node_lb_exercise and
+            "--retained-icmp-firewall" in node_lb_exercise and
+            "--retained-service-firewall" in node_lb_exercise and
+            "service/inspace-e2e-node-shared-b" in node_lb_exercise and
+            node_lb_exercise.count("/opt/e2e/scripts/persist-workload.py") == 2 and
+            "e2e_node_lb_expansion_manifest" in node_lb_exercise and
+            "use_proxy: false" in node_lb_exercise,
+            "Node-LB live acceptance must prove presence/data path and always restore exact inventory")
+    node_lb_shared_gate = named_yaml_sequence_item(
+        node_lb_exercise,
+        "Require the mixed Traefik and sibling Services to establish one shared shadow shard",
+        8,
+    )
+    require_yaml_key(node_lb_shared_gate, 10, "retries", "180")
+    require_yaml_key(node_lb_shared_gate, 10, "delay", "10")
+    require("all(.items[]; .spec.loadBalancerClass != \"io.cilium/node\")" not in test_playbook,
+            "live acceptance must not globally reject CCM-owned Cilium Node IPAM shadows")
+    for cleanup_name in node_lb_service_names:
+        require(f"service/{cleanup_name}" in cleanup,
+                f"destroy fallback must remove Node-LB Service/{cleanup_name}")
+    require("deployment/inspace-e2e-node-lb" in cleanup and
+            "Wait for every managed Node-LB owner to quiesce" in cleanup and
+            "Delete the generated Node-LB NodeClass after its owners are gone" in cleanup and
+            "/opt/e2e/scripts/verify-node-load-balancer.py" in cleanup,
+            "destroy fallback must quiesce every Node-LB Kubernetes and cloud owner")
+    require(
+        'state.get("nodeLoadBalancerForbiddenLoadBalancerNames", [])' in persist_workload
+        and 'node_lb_names.add(f"k8s-{sha16(state[\'clusterName\'])}-{sha16(uid)}")'
+        in persist_workload
+        and 'state["nodeLoadBalancerForbiddenLoadBalancerNames"] = sorted(node_lb_names)'
+        in persist_workload,
+        "workload ownership recovery must durably journal every forbidden Node-LB generic NLB identity",
+    )
+    require("Cilium Node IPAM and `io.cilium/node` are disabled" not in readme and
+            "defaults them to `public-node-shared`" in readme and
+            "complete billable-resource" in readme,
+            "E2E documentation must describe the live Node-LB default and exact cleanup proof")
     private_services = [
         manifest_document(workload, "Service", "inspace-e2e-private-a"),
         manifest_document(workload, "Service", "inspace-e2e-private-b"),
@@ -893,10 +1161,238 @@ def main() -> None:
     require(re.search(r"(?m)^\s+protocol: TCP$", public_service) is not None,
             "public InSpace NLB Service must be TCP-only")
 
+    node_lb_services = {
+        name: manifest_document(node_load_balancer_workload, "Service", name)
+        for name in node_lb_service_names
+    }
+    node_lb_ports = {}
+    for name, service in node_lb_services.items():
+        require("loadBalancerClass: inspace.cloud/node" in service,
+                f"{name} must select the user-facing InSpace Node-LB class")
+        require("allocateLoadBalancerNodePorts: false" in service,
+                f"{name} must explicitly disable NodePorts")
+        require("externalTrafficPolicy: Cluster" in service,
+                f"{name} must use Cluster traffic policy")
+        require("loadBalancerIP:" not in service and "externalIPs:" not in service,
+                f"{name} must not bypass CCM address ownership")
+        ports = re.findall(
+            r"(?m)^    - name: [a-z0-9-]+\n"
+            r"^      port: ([0-9]+)\n"
+            r"^      targetPort: [a-z0-9-]+\n"
+            r"^      protocol: (TCP|UDP)$",
+            service,
+        )
+        require(bool(ports), f"{name} must expose an explicit TCP/UDP port contract")
+        node_lb_ports[name] = {(protocol, int(port)) for port, protocol in ports}
+    for name in node_lb_service_names[:3]:
+        require("service.inspace.cloud/node-lb-mode:" not in node_lb_services[name],
+                f"{name} must exercise the omitted-mode public-node-shared default")
+    dedicated_node_lb_service = node_lb_services["inspace-e2e-node-dedicated"]
+    require("service.inspace.cloud/node-lb-mode: public-node-dedicated" in dedicated_node_lb_service and
+            "service.inspace.cloud/node-lb-cpu:" not in dedicated_node_lb_service and
+            "service.inspace.cloud/node-lb-memory:" not in dedicated_node_lb_service,
+            "dedicated live acceptance must exercise the default 1-vCPU/2-GiB shape")
+    require(node_lb_ports["inspace-e2e-node-traefik"] ==
+            {("TCP", 80), ("TCP", 443), ("UDP", 443)} and
+            node_lb_ports["inspace-e2e-node-shared-conflict"] == {("TCP", 80)} and
+            node_lb_ports["inspace-e2e-node-shared-b"] == {("TCP", 18081)} and
+            node_lb_ports["inspace-e2e-node-dedicated"] == {("TCP", 18082)},
+            "live Node-LB Services must prove mixed TCP/UDP, non-conflicting reuse, and TCP/80 auto-sharding")
+    node_lb_deployment = manifest_document(
+        node_load_balancer_workload, "Deployment", "inspace-e2e-node-lb"
+    )
+    require("karpenter.sh/nodepool: {{ e2e_nodepool_name }}" in node_lb_deployment and
+            node_lb_deployment.count("docker.io/library/busybox:1.36.1@sha256:") == 5 and
+            node_lb_deployment.count("exec httpd -f -p") == 4 and
+            "nc -u -l -p 18443 -e /tmp/udp-echo" in node_lb_deployment and
+            "node-traefik-http3" in node_lb_deployment,
+            "Node-LB data-path workload must stay on the general worker and expose exact TCP/UDP markers")
+    require(node_load_balancer_workload.count("loadBalancerClass: inspace.cloud/node") == 4 and
+            "loadBalancerClass: io.cilium/node" not in node_load_balancer_workload,
+            "only the CCM may create Cilium Node IPAM shadow Services")
+
+    node_lb_module = load_script_module(
+        "e2e_verify_node_load_balancer_static",
+        ROOT / "scripts/verify-node-load-balancer.py",
+    )
+    require(node_lb_module.managed_name("cluster-a", "node-lb") == "cluster-a-node-lb",
+            "Node-LB verifier does not mirror the managed NodeClass name")
+    require(node_lb_module.firewall_name(
+        "cluster-a", "01234567-89ab-4def-8123-456789abcdef", "deadbeef"
+    ) == "inlb-34ab3e1c-01234567-89ab-4def-8123-456789abcdef-deadbeef",
+            "Node-LB verifier does not mirror full-Service-UID firewall ownership")
+    require(node_lb_module.cluster_icmp_firewall_name("cluster-a") ==
+            ("inlb-34ab3e1c8c468878c75341efcf8fd3cd-icmp-564fcbd1", "564fcbd1"),
+            "Node-LB verifier does not mirror 128-bit cluster ICMP firewall ownership")
+    mixed_rules = [
+        {
+            "protocol": protocol.lower(), "direction": "inbound",
+            "port_start": port, "port_end": port,
+            "endpoint_spec_type": "any", "endpoint_spec": None,
+        }
+        for protocol, port in (("TCP", 80), ("TCP", 443), ("UDP", 443))
+    ]
+    require(node_lb_module.canonical_service_policy_hash(mixed_rules) == "0023bff0",
+            "Node-LB verifier does not mirror the mixed TCP/UDP Service policy hash")
+
+    cluster = "cluster-a"
+    public_uid = "11111111-1111-4111-8111-111111111111"
+    node_lb_uid = "22222222-2222-4222-8222-222222222222"
+    public_nlb_name = node_lb_module.generic_nlb_name(cluster, public_uid)
+    forbidden_nlb_name = node_lb_module.generic_nlb_name(cluster, node_lb_uid)
+    nlb_state = {
+        "clusterName": cluster,
+        "serviceLoadBalancerName": public_nlb_name,
+        "nodeLoadBalancerForbiddenLoadBalancerNames": [forbidden_nlb_name],
+    }
+    public_services = [{
+        "metadata": {"namespace": "default", "name": "inspace-e2e-web", "uid": public_uid},
+    }]
+    unrelated_and_public_nlbs = [
+        {"uuid": "unrelated", "display_name": "account-owner-nlb"},
+        {"uuid": "paid-public", "display_name": public_nlb_name},
+    ]
+    require(
+        node_lb_module.owned_node_load_balancer_nlbs(
+            nlb_state, public_services, unrelated_and_public_nlbs
+        ) == [],
+        "Node-LB NLB detector attributed an unrelated or exact paid public baseline NLB",
+    )
+    owned_nlb_cases = (
+        ("journaled", forbidden_nlb_name),
+        ("cluster-prefix", f"k8s-{node_lb_module.hash16(cluster)}-aaaaaaaaaaaaaaaa"),
+        ("service-policy-prefix", f"inlb-{node_lb_module.short_hash(cluster)}-unexpected"),
+        ("icmp-policy-prefix", f"inlb-{node_lb_module.ownership_hash(cluster)}-icmp-unexpected"),
+    )
+    for identity, name in owned_nlb_cases:
+        require(
+            node_lb_module.owned_node_load_balancer_nlbs(
+                nlb_state, public_services, [{"uuid": identity, "display_name": name}]
+            ) == [identity],
+            f"Node-LB NLB detector missed {identity}",
+        )
+
+    original_node_lb_api_get = node_lb_module.api_get
+    original_node_lb_kubectl = node_lb_module.kubectl
+    node_lb_module.kubectl = lambda _kubeconfig, *_arguments: {"items": []}
+    node_lb_module.api_get = lambda path: (
+        [{"uuid": "stale-paid", "display_name": forbidden_nlb_name}]
+        if path == "network/load_balancers" else []
+    )
+    try:
+        with tempfile.TemporaryDirectory() as directory:
+            immutable_baseline = pathlib.Path(directory) / "baseline-inventory.json"
+            immutable_baseline.write_text(json.dumps({
+                "vms": [], "firewalls": [], "floatingIPs": [],
+                "loadBalancers": [], "disks": [],
+            }), encoding="utf-8")
+            immutable_baseline.chmod(0o600)
+            try:
+                node_lb_module.prove_absent(
+                    nlb_state, "/unused/kubeconfig", immutable_baseline
+                )
+            except SystemExit as error:
+                require("must not enter a new baseline" in str(error),
+                        "Node-LB absence proof returned the wrong stale paid-NLB diagnostic")
+            else:
+                require(False, "Node-LB absence proof accepted an active owned paid NLB")
+
+            node_lb_module.api_get = lambda path: (
+                [{"uuid": "unexpected-paid", "display_name": "unrelated-name"}]
+                if path == "network/load_balancers" else []
+            )
+            try:
+                node_lb_module.prove_absent(
+                    {"clusterName": cluster}, "/unused/kubeconfig", immutable_baseline
+                )
+            except SystemExit as error:
+                require("immutable pre-mutation account baseline" in str(error),
+                        "Node-LB absence proof returned the wrong immutable NLB diagnostic")
+            else:
+                require(False, "Node-LB absence proof normalized an unjournaled active NLB")
+    finally:
+        node_lb_module.api_get = original_node_lb_api_get
+        node_lb_module.kubectl = original_node_lb_kubectl
+
+    original_prove_present = node_lb_module.prove_present
+    node_lb_module.prove_present = lambda *_arguments: {
+        "firewalls": ["retained-replacement"],
+        "icmpFirewallUUID": "icmp-original",
+        "services": {
+            "inspace-e2e-node-traefik": {
+                "shard": "inlb-deadbeef",
+                "vmUUID": "vm-original",
+                "ip": "203.0.113.10",
+                "firewallUUID": "retained-replacement",
+            },
+        },
+    }
+    try:
+        node_lb_module.prove_partial(
+            {}, "/unused/kubeconfig", pathlib.Path("/unused/baseline"),
+            "33333333-3333-4333-8333-333333333333",
+            "inlb-deadbeef", "vm-original", "203.0.113.10", "icmp-original",
+            "retained-original",
+        )
+    except SystemExit as error:
+        require("replaced the retained sibling Service firewall" in str(error),
+                "partial cleanup proof returned the wrong retained-firewall diagnostic")
+    else:
+        require(False, "partial cleanup proof accepted a replacement sibling Service firewall")
+    finally:
+        node_lb_module.prove_present = original_prove_present
+
+    require(node_lb_module.floating_ip_name("cluster-a", "inlb-deadbeef") ==
+            "karpenter-inlb-deadbeef-fd7cd81d52",
+            "Node-LB verifier does not mirror Karpenter FIP ownership")
+    for accepted_nonvirtual in (None, False):
+        node_lb_module.require_nonvirtual(accepted_nonvirtual, "static")
+    for contradictory_nonvirtual in (True, 0, "false", [], {}):
+        try:
+            node_lb_module.require_nonvirtual(contradictory_nonvirtual, "static")
+        except SystemExit as error:
+            require("non-virtual InSpace address" in str(error),
+                    "Node-LB verifier returned the wrong virtual-FIP diagnostic")
+        else:
+            require(False, f"Node-LB verifier accepted invalid is_virtual={contradictory_nonvirtual!r}")
+    for marker in (
+        'NODE_LOAD_BALANCER_CLASS = "inspace.cloud/node"',
+        'CILIUM_NODE_CLASS = "io.cilium/node"',
+        '"inspace.cloud/instance-cpu": ("In", ("1",))',
+        '"inspace.cloud/instance-memory": ("In", ("2048",))',
+        '"inspace.cloud/host-class": ("In", ("amd-epyc",))',
+        'nodeclass_spec.get("rootDiskGiB") == 30',
+        'nodeclass_spec.get("reservePublicIPv4") is True',
+        '"inspace.cloud/node-lb"',
+        '"inspace.cloud.node-restriction.kubernetes.io/node-lb"',
+        '"inspace.cloud.node-restriction.kubernetes.io/ready"',
+        'nodeclaim_status.get("providerID") == node.get("spec", {}).get("providerID")',
+        '"NoSchedule"',
+        'active_node_lb_vm_uuids == expected_vm_uuids',
+        'active_node_lb_fip_names == expected_fip_names',
+        'expected_service_firewalls | {icmp_firewall_uuid}',
+        'icmp_rules[0].get("port_start") is None',
+        'canonical TCP/UDP-only policy',
+        'cluster ICMP firewall must target every and only authoritative Node-LB VM',
+        'ping_public_ip(address)',
+        'probe_udp(result["ip"], port["port"]',
+        'PARTIAL_DELETED_SERVICE = "inspace-e2e-node-shared-b"',
+        'deleted shared-member Service firewall is still active',
+        'owned_node_load_balancer_nlbs(state, all_services, load_balancers)',
+        'must not enter a new baseline',
+        'if current_nlb_uuids != immutable_nlb_uuids:',
+        'immutable pre-mutation account baseline',
+        'retained["firewallUUID"] == retained_service_firewall_uuid',
+        'replaced the retained sibling Service firewall',
+        'Cilium Node IPAM acceptance must not create an InSpace NLB',
+    ):
+        require(marker in node_load_balancer_cloud,
+                f"Node-LB live verifier is missing contract marker: {marker}")
+
     require('"default-lb-service-ipam"] == "none"' in playbook and
             "nodeIPAM:[[:space:]]*$" in playbook and
-            "enabled:[[:space:]]*false" in playbook,
-            "live Cilium checks must disable default and Node IPAM paths")
+            "enabled:[[:space:]]*true" in playbook,
+            "live Cilium checks must disable default LB claiming and enable explicit Node IPAM")
     require('"cilium.io/IPAMRequestSatisfied"' in playbook and
             'startswith("cilium.io/")' in playbook and
             '"io.cilium/lb-ipam-request-satisfied"' not in playbook and
@@ -1034,7 +1530,7 @@ def main() -> None:
             "VM public_ipv4 must remain empty for an auto-reserved FIP" in bootstrap_discovery and
             "bastion VM public_ipv4 must remain empty for an auto-reserved FIP" in bootstrap_discovery and
             "node firewall must be assigned to exactly the three control-plane VMs" in bootstrap_discovery and
-            "bastion public ingress must be only management /32 TCP/22" in bootstrap_discovery,
+            "bastion public ingress must be only configured management TCP/22 and portless ICMP" in bootstrap_discovery,
             "bootstrap discovery must prove exact VM FIPs, zero control NLBs, and firewall isolation")
     require('test "$(hostname)" = "{{ e2e_node_name }}"' in playbook and
             "[.controlPlanes[].name] | sort" in playbook and
@@ -1042,6 +1538,14 @@ def main() -> None:
             "live E2E must bind cloud, guest-hostname, and Kubernetes control-plane identities")
 
     bastion_play = named_yaml_sequence_item(playbook, "Establish the pinned public bastion", 0)
+    bastion_ping = named_yaml_sequence_item(
+        bastion_play, "Prove the bastion FIP answers ICMP from the management client", 4
+    )
+    require('argv: [ping, -4, -c, "3", -W, "5", "{{ e2e_public_ip }}"]' in bastion_ping and
+            "delegate_to: localhost" in bastion_ping and
+            "retries: 12" in bastion_ping and
+            "until: e2e_bastion_ping.rc == 0" in bastion_ping,
+            "live bootstrap must prove the management-scoped bastion ICMP path")
     bastion_cloud_init = named_yaml_sequence_item(
         bastion_play, "Wait for bounded bastion cloud-init completion", 4
     )
@@ -1118,7 +1622,7 @@ def main() -> None:
         'f"{cluster_resource_name}-bastion-ip"',
         'bastion_name, bastion_firewall_name, bastion_fip_name = bastion_resource_names(',
         'rf"inspace-rke2-bastion/v6 owner={re.escape(owner)} spec=[0-9a-f]{{64}}"',
-        'rf"inspace-rke2-cp/v6 owner={re.escape(owner)} slot={slot} spec=[0-9a-f]{{64}}"',
+        'rf"inspace-rke2-cp/v7 owner={re.escape(owner)} slot={slot} spec=[0-9a-f]{{64}}"',
         'validate_optional_vm_hostname(bastion, bastion_name, "bastion")',
         '"bastionName": bastion_name',
         '"bastionFloatingIPName": bastion_fip["name"]',
@@ -1182,11 +1686,19 @@ def main() -> None:
         "endpoint_spec_type": "ip_prefixes",
         "endpoint_spec": [private_subnet],
     }
+    bastion_icmp_ingress = {
+        "direction": "inbound",
+        "protocol": "icmp",
+        "port_start": None,
+        "port_end": None,
+        "endpoint_spec_type": "ip_prefixes",
+        "endpoint_spec": [management_cidr],
+    }
     bastion_assignments = [{"resource_type": "vm", "resource_uuid": bastion_vm_uuid}]
     bootstrap_discovery_module.validate_bastion_firewall(
         {
             "resources_assigned": bastion_assignments,
-            "rules": bastion_egress + [bastion_ssh_ingress, bastion_cache_ingress],
+            "rules": bastion_egress + [bastion_ssh_ingress, bastion_icmp_ingress, bastion_cache_ingress],
         },
         management_cidr,
         private_subnet,
@@ -1196,19 +1708,61 @@ def main() -> None:
     bootstrap_discovery_module.validate_bastion_firewall(
         {
             "resources_assigned": bastion_assignments,
-            "rules": bastion_egress + [bastion_ssh_ingress],
+            "rules": bastion_egress + [bastion_ssh_ingress, bastion_icmp_ingress],
         },
         management_cidr,
         private_subnet,
         bastion_vm_uuid,
         cache_enabled=False,
     )
+    any_management_cidr = "0.0.0.0/0"
+    any_ssh_ingress = dict(
+        bastion_ssh_ingress,
+        endpoint_spec_type="any",
+        endpoint_spec=None,
+    )
+    any_icmp_ingress = dict(
+        bastion_icmp_ingress,
+        endpoint_spec_type="any",
+        endpoint_spec=None,
+    )
+    bootstrap_discovery_module.validate_bastion_firewall(
+        {
+            "resources_assigned": bastion_assignments,
+            "rules": bastion_egress + [any_ssh_ingress, any_icmp_ingress],
+        },
+        any_management_cidr,
+        private_subnet,
+        bastion_vm_uuid,
+        cache_enabled=False,
+    )
+    wrong_any_icmp = dict(
+        bastion_icmp_ingress,
+        endpoint_spec_type="ip_prefixes",
+        endpoint_spec=[any_management_cidr],
+    )
+    try:
+        bootstrap_discovery_module.validate_bastion_firewall(
+            {
+                "resources_assigned": bastion_assignments,
+                "rules": bastion_egress + [any_ssh_ingress, wrong_any_icmp],
+            },
+            any_management_cidr,
+            private_subnet,
+            bastion_vm_uuid,
+            cache_enabled=False,
+        )
+    except SystemExit as error:
+        require("portless ICMP" in str(error),
+                "bootstrap discovery returned the wrong default-Any ICMP diagnostic")
+    else:
+        require(False, "bootstrap discovery accepted a noncanonical default-Any ICMP source")
     wrong_cache_ingress = dict(bastion_cache_ingress, endpoint_spec=[management_cidr])
     try:
         bootstrap_discovery_module.validate_bastion_firewall(
             {
                 "resources_assigned": bastion_assignments,
-                "rules": bastion_egress + [bastion_ssh_ingress, wrong_cache_ingress],
+                "rules": bastion_egress + [bastion_ssh_ingress, bastion_icmp_ingress, wrong_cache_ingress],
             },
             management_cidr,
             private_subnet,
@@ -1220,6 +1774,23 @@ def main() -> None:
                 "bootstrap discovery returned the wrong cache-ingress diagnostic")
     else:
         require(False, "bootstrap discovery accepted cache ingress from outside the VPC subnet")
+    wrong_icmp_ingress = dict(bastion_icmp_ingress, endpoint_spec=["0.0.0.0/0"])
+    try:
+        bootstrap_discovery_module.validate_bastion_firewall(
+            {
+                "resources_assigned": bastion_assignments,
+                "rules": bastion_egress + [bastion_ssh_ingress, wrong_icmp_ingress],
+            },
+            management_cidr,
+            private_subnet,
+            bastion_vm_uuid,
+            cache_enabled=False,
+        )
+    except SystemExit as error:
+        require("portless ICMP" in str(error),
+                "bootstrap discovery returned the wrong bastion ICMP diagnostic")
+    else:
+        require(False, "bootstrap discovery accepted public bastion ICMP outside managementCIDR")
     for vm_detail in ({}, {"hostname": None}, {"hostname": ""}, {"hostname": bastion_names[0]}):
         bootstrap_discovery_module.validate_optional_vm_hostname(
             vm_detail, bastion_names[0], "unit bastion"

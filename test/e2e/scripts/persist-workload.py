@@ -10,6 +10,15 @@ import subprocess
 import tempfile
 
 
+NODE_LOAD_BALANCER_SERVICE_NAMES = (
+    "inspace-e2e-node-traefik",
+    "inspace-e2e-node-shared-a",  # pre-release E2E rename recovery
+    "inspace-e2e-node-shared-b",
+    "inspace-e2e-node-shared-conflict",
+    "inspace-e2e-node-dedicated",
+)
+
+
 def kubectl(kubeconfig: str, *args: str):
     command = ["kubectl", "--kubeconfig", kubeconfig, *args, "--ignore-not-found=true", "-o", "json"]
     process = subprocess.run(command, check=False, capture_output=True, text=True, timeout=60)
@@ -73,6 +82,22 @@ def main() -> None:
     state["privateServiceLoadBalancerNames"] = sorted(private_load_balancers)
     state["privateServiceFloatingIPNames"] = sorted(private_floating_ips)
     state["privateServiceVIPs"] = sorted(private_service_vips)
+
+    raw_node_lb_names = state.get("nodeLoadBalancerForbiddenLoadBalancerNames", [])
+    if not isinstance(raw_node_lb_names, list) or any(
+        not isinstance(name, str) or not name for name in raw_node_lb_names
+    ):
+        raise SystemExit("Node-LB NLB deny journal is invalid")
+    node_lb_names = set(raw_node_lb_names)
+    for service_name in NODE_LOAD_BALANCER_SERVICE_NAMES:
+        service = kubectl(args.kubeconfig, "-n", "default", "get", "service", service_name)
+        if not service:
+            continue
+        uid = service.get("metadata", {}).get("uid")
+        if not isinstance(uid, str) or not uid:
+            raise SystemExit(f"Service/{service_name} lacks a stable UID")
+        node_lb_names.add(f"k8s-{sha16(state['clusterName'])}-{sha16(uid)}")
+    state["nodeLoadBalancerForbiddenLoadBalancerNames"] = sorted(node_lb_names)
 
     pvc = kubectl(args.kubeconfig, "-n", "default", "get", "pvc", "inspace-e2e-rwo")
     if pvc:

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"testing"
 
+	inspacev1 "github.com/thanet-s/inspace-cloud-kube-modules/modules/karpenter-provider/pkg/apis/v1alpha1"
 	cloudapi "github.com/thanet-s/inspace-cloud-kube-modules/modules/karpenter-provider/pkg/cloud"
 )
 
@@ -22,6 +23,9 @@ func TestCreateAndDeleteDesiredStateIsIdempotent(t *testing.T) {
 	}
 	if first.UUID != second.UUID {
 		t.Fatalf("retry created a different VM: %s != %s", first.UUID, second.UUID)
+	}
+	if first.FirewallProfile != inspacev1.FirewallProfilePrivateWorker {
+		t.Fatalf("default firewall profile = %q, want %q", first.FirewallProfile, inspacev1.FirewallProfilePrivateWorker)
 	}
 	vms, _ := cloud.ListVMs(ctx, "bkk01", "test")
 	if len(vms) != 1 {

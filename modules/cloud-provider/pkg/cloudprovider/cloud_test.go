@@ -10,7 +10,10 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	dynamicfake "k8s.io/client-go/dynamic/fake"
 	cloud "k8s.io/cloud-provider"
 
 	"github.com/thanet-s/inspace-cloud-kube-modules/modules/client"
@@ -45,6 +48,21 @@ func TestInstancesV2MetadataUsesCanonicalProviderID(t *testing.T) {
 	exists, err := provider.InstanceExists(context.Background(), &corev1.Node{Spec: corev1.NodeSpec{ProviderID: "inspace://bkk01/99999999-1111-4222-8333-444444444444"}})
 	if err != nil || exists {
 		t.Fatalf("InstanceExists() = %v, %v", exists, err)
+	}
+}
+
+func TestNodeLoadBalancerConfigDefaultsNodesPerShardToOne(t *testing.T) {
+	provider, err := New(&fakeAPI{}, Config{
+		Location: "bkk01", Region: "thailand", NetworkUUID: testNetworkUUID,
+		BillingAccountID: 42, ClusterID: "unit-test-cluster", ControlPlaneVIP: "10.0.0.10",
+		PrivateLoadBalancerPoolStart: "10.0.0.200", PrivateLoadBalancerPoolStop: "10.0.0.239",
+		NodeLoadBalancer: NodeLoadBalancerConfig{Enabled: true, DefaultNodeClass: "workers"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if provider.config.NodeLoadBalancer.NodesPerShard != 1 {
+		t.Fatalf("nodes per shard = %d, want 1", provider.config.NodeLoadBalancer.NodesPerShard)
 	}
 }
 
@@ -756,6 +774,12 @@ func newTestProvider(t *testing.T, api *fakeAPI) *Provider {
 	if err != nil {
 		t.Fatal(err)
 	}
+	provider.dynamicClient = dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
+		runtime.NewScheme(),
+		map[schema.GroupVersionResource]string{
+			nodePoolGVR: "NodePoolList", nodeClaimGVR: "NodeClaimList",
+		},
+	)
 	return provider
 }
 
@@ -781,8 +805,9 @@ func readyNode(name, providerID string) *corev1.Node {
 }
 
 type fakeAPI struct {
-	vms []inspace.VM
-	lbs []inspace.LoadBalancer
+	vms       []inspace.VM
+	lbs       []inspace.LoadBalancer
+	firewalls []inspace.Firewall
 
 	creates                        []inspace.CreateLoadBalancerRequest
 	deletedLBs                     []string
@@ -793,6 +818,10 @@ type fakeAPI struct {
 	floatingIPs                    []inspace.FloatingIP
 	unassignedIPs                  []string
 	deletedIPs                     []string
+	createdFirewalls               []inspace.CreateFirewallRequest
+	deletedFirewalls               []string
+	assignedFirewalls              []string
+	unassignedFirewalls            []string
 	createPrivateAddress           *string
 	mutateCreateFloatingIPResponse func(*inspace.FloatingIP)
 	mutateAssignFloatingIPResponse func(*inspace.FloatingIP)
@@ -893,6 +922,66 @@ func (f *fakeAPI) DeleteFloatingIP(_ context.Context, _, address string) error {
 		}
 	}
 	return nil
+}
+
+func (f *fakeAPI) ListFirewalls(context.Context, string) ([]inspace.Firewall, error) {
+	return append([]inspace.Firewall(nil), f.firewalls...), nil
+}
+
+func (f *fakeAPI) CreateFirewall(_ context.Context, _ string, request inspace.CreateFirewallRequest) (*inspace.Firewall, error) {
+	f.createdFirewalls = append(f.createdFirewalls, request)
+	item := inspace.Firewall{
+		UUID:        fmt.Sprintf("00000000-0000-4000-8000-%012d", len(f.firewalls)+1),
+		DisplayName: request.DisplayName, Description: request.Description,
+		BillingAccountID: request.BillingAccountID, Rules: request.Rules,
+	}
+	f.firewalls = append(f.firewalls, item)
+	return &item, nil
+}
+
+func (f *fakeAPI) DeleteFirewall(_ context.Context, _, uuid string) error {
+	f.deletedFirewalls = append(f.deletedFirewalls, uuid)
+	for i := range f.firewalls {
+		if f.firewalls[i].UUID == uuid {
+			f.firewalls = append(f.firewalls[:i], f.firewalls[i+1:]...)
+			return nil
+		}
+	}
+	return &inspace.APIError{StatusCode: 404, Method: "DELETE", Path: "/firewall", Message: "not found"}
+}
+
+func (f *fakeAPI) AssignFirewallToVM(_ context.Context, _, firewallUUID, vmUUID string) error {
+	f.assignedFirewalls = append(f.assignedFirewalls, firewallUUID+"/"+vmUUID)
+	for i := range f.firewalls {
+		if f.firewalls[i].UUID == firewallUUID {
+			for _, resource := range f.firewalls[i].ResourcesAssigned {
+				if resource.ResourceType == "vm" && resource.ResourceUUID == vmUUID {
+					return nil
+				}
+			}
+			f.firewalls[i].ResourcesAssigned = append(f.firewalls[i].ResourcesAssigned, inspace.FirewallResource{ResourceType: "vm", ResourceUUID: vmUUID})
+			return nil
+		}
+	}
+	return &inspace.APIError{StatusCode: 404, Method: "POST", Path: "/firewall/vms", Message: "not found"}
+}
+
+func (f *fakeAPI) UnassignFirewallFromVM(_ context.Context, _, firewallUUID, vmUUID string) error {
+	f.unassignedFirewalls = append(f.unassignedFirewalls, firewallUUID+"/"+vmUUID)
+	for i := range f.firewalls {
+		if f.firewalls[i].UUID != firewallUUID {
+			continue
+		}
+		resources := f.firewalls[i].ResourcesAssigned[:0]
+		for _, resource := range f.firewalls[i].ResourcesAssigned {
+			if resource.ResourceType != "vm" || resource.ResourceUUID != vmUUID {
+				resources = append(resources, resource)
+			}
+		}
+		f.firewalls[i].ResourcesAssigned = resources
+		return nil
+	}
+	return &inspace.APIError{StatusCode: 404, Method: "DELETE", Path: "/firewall/vms", Message: "not found"}
 }
 
 var _ API = (*fakeAPI)(nil)
