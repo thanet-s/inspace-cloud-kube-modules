@@ -193,6 +193,7 @@ func TestControlPlaneCRDMatchesMachineValidationContract(t *testing.T) {
 		"required: [location, billingAccountID, credentialsSecretRef, controlPlane, bootstrapCache, rke2, network, firewall, publicIPv4, endpoint]",
 		"bootstrapCache:\n                  type: object",
 		"directDownload:\n                      type: boolean\n                      default: false",
+		"skipOSUpgrade:\n                      type: boolean\n                      default: false",
 	} {
 		if !strings.Contains(crd, required) {
 			t.Errorf("CRD does not contain validation contract fragment %q", required)

@@ -573,6 +573,20 @@ func TestRKE2ConfigChangesNodeClassAndBootstrapHashes(t *testing.T) {
 	}
 }
 
+func TestSkipOSUpgradeChangesNodeClassAndBootstrapHashes(t *testing.T) {
+	nodeClass := providerNodeClass()
+	nodeClassHash := NodeClassHash(nodeClass)
+	bootstrapHash := BootstrapHash(nodeClass)
+
+	nodeClass.Spec.RKE2.SkipOSUpgrade = true
+	if NodeClassHash(nodeClass) == nodeClassHash {
+		t.Fatal("skipOSUpgrade change did not change NodeClass hash")
+	}
+	if BootstrapHash(nodeClass) == bootstrapHash {
+		t.Fatal("skipOSUpgrade change did not change bootstrap hash")
+	}
+}
+
 func TestBootstrapCacheChangesNodeClassAndBootstrapHashes(t *testing.T) {
 	nodeClass := providerNodeClass()
 	nodeClassHash := NodeClassHash(nodeClass)

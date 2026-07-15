@@ -54,6 +54,11 @@ The current immutable bootstrap schema is `stock-ubuntu-rke2-v11`; its bounded
 local-hostname readback change makes workers rendered with older bootstrap
 schemas eligible for normal Karpenter drift replacement.
 
+`spec.rke2.skipOSUpgrade: true` is an explicit short-lived-test optimization.
+It removes only the worker's one-time `apt-get upgrade -y`; mirror and resolver
+setup, `apt-get update`, required package installation, and automatic-update
+shutdown remain mandatory. Omitted or `false` keeps the production default.
+
 `spec.bootstrapCache` makes the worker download path explicit. A cached
 NodeClass sets `directDownload: false`, the bastion's canonical RFC1918
 `address`, and the PEM public `caBundle` produced by control-plane bootstrap.
@@ -281,7 +286,7 @@ Worker network policy relies on the validated InSpace cloud firewall. Generated 
 - disables active swap and idempotently comments persistent swap entries in `/etc/fstab`;
 - configures TOT as the primary Ubuntu mirror and KKU as its request-failure fallback for both regular and security suites;
 - replaces DHCP-provided DNS with static Google resolvers and stops and masks `systemd-resolved`;
-- waits within one hard ten-minute package-preparation budget for floating-IP egress, then intentionally updates and upgrades the image before installing `curl`, CA certificates, `gzip`, `iproute2`, `procps`, and `tar`;
+- waits within one hard ten-minute package-preparation budget for floating-IP egress, then intentionally updates and, unless `spec.rke2.skipOSUpgrade` is explicitly true, upgrades the image before installing `curl`, CA certificates, `gzip`, `iproute2`, `procps`, and `tar`;
 - after that one bootstrap package stage, persists `APT::Periodic` disablement and masks/stops `apt-daily`, `apt-daily-upgrade`, and `unattended-upgrades` systemd units so a Karpenter worker never starts an automatic package update later; this policy is reasserted after `additionalUserData`;
 - persists and applies IPv4 forwarding plus the RKE2-recommended inotify instance/watch limits under `/etc/sysctl.d`;
 - persists a high `nofile` PAM limit and applies `NOFILE`, unlimited process/memory-lock, and unlimited task limits directly to `rke2-agent.service`;

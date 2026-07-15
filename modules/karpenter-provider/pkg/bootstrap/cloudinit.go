@@ -18,8 +18,10 @@ import (
 	inspacev1 "github.com/thanet-s/inspace-cloud-kube-modules/modules/karpenter-provider/pkg/apis/v1alpha1"
 )
 
-// SchemaVersion must be bumped whenever generated bootstrap semantics change.
-// It is included in the provider drift hash so existing nodes are replaced.
+// SchemaVersion must be bumped whenever generated bootstrap semantics change
+// for an unchanged NodeClass spec. Spec-controlled branches such as
+// RKE2.SkipOSUpgrade are already included in both provider drift hashes and do
+// not require a global replacement of nodes whose spec retains the default.
 const (
 	SchemaVersion         = "stock-ubuntu-rke2-v11"
 	VPCSubnetPlaceholder  = "__INSPACE_VPC_SUBNET__"
@@ -35,6 +37,7 @@ type Config struct {
 	Server           string
 	Token            string
 	RKE2Version      string
+	SkipOSUpgrade    bool
 	Labels           map[string]string
 	Taints           []corev1.Taint
 	AdditionalScript string
@@ -307,6 +310,10 @@ until systemctl is-active --quiet rke2-agent.service; do
 	sleep 5
 done
 `
+	aptUpgradeContinuation := ""
+	if !config.SkipOSUpgrade {
+		aptUpgradeContinuation = `     run_package_command env NEEDRESTART_MODE=a DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=30 upgrade -y && \` + "\n"
+	}
 	prerequisites := `#!/bin/sh
 set -eu
 package_deadline=$(( $(date +%s) + 600 ))
@@ -318,9 +325,7 @@ run_package_command() {
 attempt=0
 while [ "$attempt" -lt 60 ]; do
   attempt=$((attempt + 1))
-  if run_package_command apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 update && \
-     run_package_command env NEEDRESTART_MODE=a DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=30 upgrade -y && \
-     run_package_command env NEEDRESTART_MODE=a DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=30 install -y --no-install-recommends ca-certificates curl gzip iproute2 procps tar; then
+  if run_package_command apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 update && \` + "\n" + aptUpgradeContinuation + `     run_package_command env NEEDRESTART_MODE=a DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=30 install -y --no-install-recommends ca-certificates curl gzip iproute2 procps tar; then
     exit 0
   fi
   echo "waiting for floating-IP egress before package installation (attempt $attempt)" >&2

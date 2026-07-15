@@ -87,6 +87,12 @@ patching is an explicit operator action. Node firewalls are
 validated fail-closed for all-port TCP, UDP, and ICMP coverage from both the VPC
 subnet and native-routing pod CIDR, with matching outbound access.
 
+The guarded live E2E templates set `spec.rke2.skipOSUpgrade: true` on both the
+fixed cluster and worker NodeClass to reduce disposable-cluster startup time.
+This bypasses only the one-time full OS upgrade. Mirror selection, package-index
+refresh, required package installation, and automatic-update shutdown are
+still exercised. Production examples omit the field and retain the upgrade.
+
 ### Bastion bootstrap cache
 
 `InSpaceCluster.spec.bootstrapCache` is required. Its `directDownload` switch

@@ -216,6 +216,23 @@
       delay: 10
       until: e2e_stale_paid_service_cleanup.rc == 0
 
+    - name: Require stale paid NLB inventory to return to the immutable account baseline
+      ansible.builtin.command:
+        argv:
+          - /opt/e2e/scripts/verify-service-cloud.py
+          - --state
+          - "{{ e2e_state_file }}"
+          - --immutable-baseline
+          - "{{ e2e_baseline_inventory_file }}"
+          - --public
+          - absent
+      register: e2e_stale_paid_nlb_cleanup
+      changed_when: false
+      retries: 180
+      delay: 10
+      until: e2e_stale_paid_nlb_cleanup.rc == 0
+      no_log: true
+
     - name: Wait for stale Node-LB cloud and Kubernetes owners to quiesce
       ansible.builtin.command:
         argv:
@@ -259,7 +276,8 @@
           (.spec.bootstrapCache | keys | sort) == ["address", "caBundle", "directDownload"] and
           .spec.bootstrapCache.directDownload == false and
           .spec.bootstrapCache.address == $address and
-          .spec.bootstrapCache.caBundle == $ca' <<<"$nodeclass"
+          .spec.bootstrapCache.caBundle == $ca and
+          .spec.rke2.skipOSUpgrade == true' <<<"$nodeclass"
         test "$(helm -n kube-system get values inspace -o json | jq -r '.global.inspace.systemImageRegistry')" = "$cache_registry"
         test "$(kubectl -n default get deployment/inspace-e2e-trigger -o jsonpath='{.spec.template.spec.containers[0].image}')" = \
           "$cache_registry/rancher/mirrored-pause:3.6@sha256:c2280d2f5f56cf9c9a01bb64b2db4651e35efd6d62a54dcfc12049fe6449c5e4"
@@ -801,6 +819,8 @@
           - /opt/e2e/scripts/verify-service-cloud.py
           - --state
           - "{{ e2e_state_file }}"
+          - --immutable-baseline
+          - "{{ e2e_baseline_inventory_file }}"
           - --public
           - present
       register: e2e_public_cloud_proof
@@ -865,6 +885,8 @@
               - /opt/e2e/scripts/verify-service-cloud.py
               - --state
               - "{{ e2e_state_file }}"
+              - --immutable-baseline
+              - "{{ e2e_baseline_inventory_file }}"
               - --public
               - present
               - --targets
@@ -896,6 +918,7 @@
             test "$(kubectl -n default get service inspace-e2e-web -o jsonpath='{.spec.externalTrafficPolicy}')" = Local
             /opt/e2e/scripts/verify-service-cloud.py \
               --state "{{ e2e_state_file }}" \
+              --immutable-baseline "{{ e2e_baseline_inventory_file }}" \
               --public present \
               --targets ready
           args:
@@ -937,6 +960,8 @@
               - /opt/e2e/scripts/verify-service-cloud.py
               - --state
               - "{{ e2e_state_file }}"
+              - --immutable-baseline
+              - "{{ e2e_baseline_inventory_file }}"
               - --public
               - present
               - --targets
@@ -965,6 +990,8 @@
           - /opt/e2e/scripts/verify-service-cloud.py
           - --state
           - "{{ e2e_state_file }}"
+          - --immutable-baseline
+          - "{{ e2e_baseline_inventory_file }}"
           - --public
           - present
           - --targets
@@ -1005,7 +1032,9 @@
         kubectl -n default get service inspace-e2e-web -o json | jq -e '
           ((.status.loadBalancer.ingress // []) | length) == 0'
         /opt/e2e/scripts/verify-service-cloud.py \
-          --state "{{ e2e_state_file }}" --public absent >/dev/null
+          --state "{{ e2e_state_file }}" \
+          --immutable-baseline "{{ e2e_baseline_inventory_file }}" \
+          --public absent >/dev/null
       args:
         executable: /bin/bash
       register: e2e_public_transition_cleanup
@@ -1045,6 +1074,8 @@
           - /opt/e2e/scripts/verify-service-cloud.py
           - --state
           - "{{ e2e_state_file }}"
+          - --immutable-baseline
+          - "{{ e2e_baseline_inventory_file }}"
           - --public
           - present
       register: e2e_recreated_public_cloud
@@ -1091,6 +1122,8 @@
           - /opt/e2e/scripts/verify-service-cloud.py
           - --state
           - "{{ e2e_state_file }}"
+          - --immutable-baseline
+          - "{{ e2e_baseline_inventory_file }}"
           - --public
           - present
           - --targets
@@ -1132,6 +1165,8 @@
           - /opt/e2e/scripts/verify-service-cloud.py
           - --state
           - "{{ e2e_state_file }}"
+          - --immutable-baseline
+          - "{{ e2e_baseline_inventory_file }}"
           - --public
           - present
           - --targets
@@ -1178,7 +1213,9 @@
         kubectl -n default get deployment/inspace-e2e-trigger >/dev/null
         kubectl -n default get pvc/inspace-e2e-rwo >/dev/null
         /opt/e2e/scripts/verify-service-cloud.py \
-          --state "{{ e2e_state_file }}" --public absent >/dev/null
+          --state "{{ e2e_state_file }}" \
+          --immutable-baseline "{{ e2e_baseline_inventory_file }}" \
+          --public absent >/dev/null
       args:
         executable: /bin/bash
       register: e2e_final_public_cleanup
@@ -1422,6 +1459,14 @@
           ansible.builtin.set_fact:
             e2e_node_lb_partial_result: "{{ e2e_node_lb_partial_proof.stdout | from_json }}"
           no_log: true
+
+        - name: Assert the exact surviving Service firewall identity after partial cleanup
+          ansible.builtin.assert:
+            that:
+              - >-
+                e2e_node_lb_partial_result.retainedServiceFirewallUUID ==
+                e2e_node_lb_result.services['inspace-e2e-node-traefik'].firewallUUID
+            fail_msg: The retained shared Service firewall UUID changed during partial cleanup
 
         - name: Prove the retained mixed and other TCP backends after partial cleanup
           ansible.builtin.uri:

@@ -302,6 +302,60 @@ func TestCacheBastionCloudInitIsPrivateBoundedAndReadOnly(t *testing.T) {
 	}
 }
 
+func TestSkipOSUpgradePreservesBootstrapPackageAndMirrorWork(t *testing.T) {
+	controlPlaneInput := cacheContractControlPlaneInput()
+	controlPlaneInput.SkipOSUpgrade = true
+	controlPlaneRaw, err := RenderCloudInitJSON(controlPlaneInput)
+	if err != nil {
+		t.Fatal(err)
+	}
+	controlPlaneScript := cacheContractDecodeCloudInit(t, controlPlaneRaw)["/usr/local/sbin/inspace-bootstrap-rke2"].Content
+	cacheContractAssertShell(t, controlPlaneScript)
+	for _, required := range []string{
+		"/etc/apt/mirrors/inspace-ubuntu.list",
+		"apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 update",
+		"install -y --no-install-recommends ca-certificates curl iproute2 procps tar",
+	} {
+		if !strings.Contains(controlPlaneScript, required) {
+			t.Errorf("skip-upgrade control-plane bootstrap lacks %q", required)
+		}
+	}
+	if strings.Contains(controlPlaneScript, "upgrade -y") {
+		t.Fatalf("skip-upgrade control-plane bootstrap retained full OS upgrade:\n%s", controlPlaneScript)
+	}
+
+	key := []byte("0123456789abcdef0123456789abcdef")
+	hostname := "cache.unit.inspace.internal"
+	material, err := deriveCacheTLS(key, "default/unit:4d7ca80d", hostname, time.Now().UTC().Truncate(time.Second).Add(-time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	bastionRaw, err := RenderCacheBastionCloudInitJSON(CacheBastionCloudInitInput{
+		NodeName: "unit-bastion", PrivateSubnet: "10.20.30.0/24", CacheHostname: hostname,
+		RKE2Version: bootstrapCacheRKE2Version, ModuleVersion: "0.5.0-rc.1",
+		CACertificate: material.CACertificate, ServerCertificate: material.ServerCertificate, ServerPrivateKey: material.ServerPrivateKey,
+		SkipOSUpgrade: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bastionScript := cacheContractDecodeCloudInit(t, bastionRaw)["/usr/local/sbin/inspace-bootstrap-cache-bastion"].Content
+	cacheContractAssertShell(t, bastionScript)
+	for _, required := range []string{
+		"/etc/apt/mirrors/inspace-ubuntu.list",
+		"apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 update",
+		"install -y --no-install-recommends ca-certificates curl e2fsprogs gnupg iproute2 skopeo util-linux",
+		"docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin",
+	} {
+		if !strings.Contains(bastionScript, required) {
+			t.Errorf("skip-upgrade cache-bastion bootstrap lacks %q", required)
+		}
+	}
+	if strings.Contains(bastionScript, "upgrade -y") {
+		t.Fatalf("skip-upgrade cache-bastion bootstrap retained full OS upgrade:\n%s", bastionScript)
+	}
+}
+
 func TestControlPlaneCloudInitUsesPrivateCacheOrDirectUpstreamExclusively(t *testing.T) {
 	key := []byte("0123456789abcdef0123456789abcdef")
 	hostname := "cache.unit.inspace.internal"

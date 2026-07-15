@@ -23,6 +23,8 @@ spec:
     directDownload: false
   rke2:
     version: v1.35.6+rke2r1
+    # Short-lived test clusters may opt in; production defaults to upgrading.
+    # skipOSUpgrade: true
     tokenSecretRef:
       name: example-rke2-token
       key: token

@@ -85,10 +85,15 @@ type BootstrapCacheSpec struct {
 }
 
 type RKE2Spec struct {
-	Version            string             `json:"version"`
-	TokenSecretRef     SecretKeyReference `json:"tokenSecretRef"`
-	Disable            []string           `json:"disable,omitempty"`
-	TLSSubjectAltNames []string           `json:"tlsSubjectAltNames,omitempty"`
+	Version        string             `json:"version"`
+	TokenSecretRef SecretKeyReference `json:"tokenSecretRef"`
+	// SkipOSUpgrade is an explicit bootstrap-time optimization for short-lived
+	// test clusters. Omitted or false keeps the production security-upgrade
+	// behavior; package indexes and required package installation are never
+	// skipped.
+	SkipOSUpgrade      bool     `json:"skipOSUpgrade,omitempty"`
+	Disable            []string `json:"disable,omitempty"`
+	TLSSubjectAltNames []string `json:"tlsSubjectAltNames,omitempty"`
 }
 
 type NetworkSpec struct {

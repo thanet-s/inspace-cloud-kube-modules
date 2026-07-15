@@ -48,9 +48,19 @@ and the fixed three-server RKE2 bootstrap reconciler.
   `rke2-server.service` resource limits. Bastion cloud-init performs the same
   bounded one-time package update/upgrade and automatic-update shutdown before
   proving UFW inactive.
+
+`spec.rke2.skipOSUpgrade: true` is an explicit optimization for short-lived
+test clusters. It removes only the one-time `apt-get upgrade -y` step from all
+three control planes and the bastion, including the default cache bastion. The
+mirror rewrite, `apt-get update`, required package installation, and
+automatic-update shutdown still run. Omit it or set it to `false` for the
+production default.
+
 - RKE2's packaged Cilium CNI in native-routing mode, with direct node routes,
   full kube-proxy replacement, LB-IPAM and L2 announcements. Cilium Node IPAM
-  is explicitly disabled and is never used for Service addressing.
+  is enabled only for CCM-owned public node-load-balancer shadow Services;
+  application manifests use `loadBalancerClass: inspace.cloud/node`, never
+  raw `io.cilium/node`.
 - An operational continuous bootstrap CLI and a standard Kubernetes CCM
   command.
 

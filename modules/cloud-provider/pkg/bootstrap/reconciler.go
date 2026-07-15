@@ -1654,7 +1654,7 @@ func (r *Reconciler) desiredControlPlaneVMRequest(cluster *v1alpha1.InSpaceClust
 		PrivateLoadBalancerPoolStart: cluster.Spec.Network.PrivateLoadBalancerPool.Start,
 		PrivateLoadBalancerPoolStop:  cluster.Spec.Network.PrivateLoadBalancerPool.Stop,
 		TLSSubjectAltNames:           tlsNames, Disable: cluster.Spec.RKE2.Disable,
-		BootstrapCache: cache,
+		BootstrapCache: cache, SkipOSUpgrade: cluster.Spec.RKE2.SkipOSUpgrade,
 	})
 	if err != nil {
 		return inspace.CreateVMRequest{}, err
@@ -1685,13 +1685,14 @@ func (r *Reconciler) desiredBastionVMRequest(cluster *v1alpha1.InSpaceCluster, n
 	cloudInit := ""
 	var err error
 	if cluster.Spec.BootstrapCache.DirectDownload {
-		cloudInit, err = RenderBastionCloudInitJSON(name)
+		cloudInit, err = renderBastionCloudInitJSON(name, cluster.Spec.RKE2.SkipOSUpgrade)
 	} else {
 		cloudInit, err = RenderCacheBastionCloudInitJSON(CacheBastionCloudInitInput{
 			NodeName: name, PrivateSubnet: network.Subnet, CacheHostname: bootstrapCacheHostname(cluster.Metadata.Name),
 			RKE2Version: cluster.Spec.RKE2.Version, ModuleVersion: r.ModuleVersion,
 			Disable:       cluster.Spec.RKE2.Disable,
 			CACertificate: material.CACertificate, ServerCertificate: material.ServerCertificate, ServerPrivateKey: material.ServerPrivateKey,
+			SkipOSUpgrade: cluster.Spec.RKE2.SkipOSUpgrade,
 		})
 	}
 	if err != nil {

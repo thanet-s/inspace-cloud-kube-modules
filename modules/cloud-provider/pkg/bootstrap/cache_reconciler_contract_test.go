@@ -102,6 +102,30 @@ func TestCachedReconcilePublishesBastionAddressAndVPCOnlyRegistry(t *testing.T) 
 	}
 }
 
+func TestCachedReconcilePropagatesSkipOSUpgradeToEveryFixedVM(t *testing.T) {
+	api := newFakeAPI()
+	cluster := testCluster()
+	cluster.Spec.BootstrapCache.DirectDownload = false
+	cluster.Spec.RKE2.SkipOSUpgrade = true
+	reconciler := cacheContractReconciler(api)
+	reconcileUntilReady(t, reconciler, cluster)
+
+	bastionRequest := mustVMRequest(t, api.vmCreates, currentBastionName(cluster.Metadata.Name))
+	bastionScript := cacheContractDecodeCloudInit(t, bastionRequest.CloudInit)["/usr/local/sbin/inspace-bootstrap-cache-bastion"].Content
+	if strings.Contains(bastionScript, "upgrade -y") || !strings.Contains(bastionScript, "apt-get -o Acquire::Retries=3") ||
+		!strings.Contains(bastionScript, "install -y --no-install-recommends ca-certificates curl e2fsprogs gnupg iproute2 skopeo util-linux") {
+		t.Fatalf("reconciled cache bastion did not skip only the OS upgrade:\n%s", bastionScript)
+	}
+	for slot := 0; slot < ControlPlaneReplicas; slot++ {
+		request := mustVMRequest(t, api.vmCreates, controlPlaneName(cluster.Metadata.Name, slot))
+		script := cacheContractDecodeCloudInit(t, request.CloudInit)["/usr/local/sbin/inspace-bootstrap-rke2"].Content
+		if strings.Contains(script, "upgrade -y") || !strings.Contains(script, "apt-get -o Acquire::Retries=3") ||
+			!strings.Contains(script, "install -y --no-install-recommends ca-certificates curl iproute2 procps tar") {
+			t.Fatalf("reconciled control plane %d did not skip only the OS upgrade:\n%s", slot, script)
+		}
+	}
+}
+
 func TestCachedReconcileRequiresPersistedKeyTimestampAndModuleBeforeMutation(t *testing.T) {
 	notBefore := time.Now().UTC().Truncate(time.Second).Add(-time.Hour)
 	key := []byte("0123456789abcdef0123456789abcdef")
