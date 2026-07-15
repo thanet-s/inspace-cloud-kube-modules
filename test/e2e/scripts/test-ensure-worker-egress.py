@@ -82,13 +82,20 @@ def initial_state():
     if scenario == "success":
         nodes = {"node-good": node("node-good", "203.0.113.20")}
         claims = {"claim-good": claim("claim-good", "node-good", "203.0.113.20")}
+    elif scenario == "stale-identity":
+        nodes = {"node-good": node("node-good", "203.0.113.21")}
+        claims = {"claim-good": claim("claim-good", "node-good", "203.0.113.20")}
     elif scenario == "rotate":
         nodes = {"node-bad": node("node-bad", "199.21.172.179")}
         claims = {"claim-bad": claim("claim-bad", "node-bad", "199.21.172.179")}
     else:
         fail(f"unknown scenario {scenario}")
     return {
-        "limits": {"cpu": "2", "memory": "4Gi"},
+        "limits": (
+            {"cpu": "2", "memory": "4Gi"}
+            if scenario == "rotate"
+            else {"cpu": "8", "memory": "16Gi"}
+        ),
         "nodes": nodes,
         "claims": claims,
         "pods": {},
@@ -166,7 +173,7 @@ if verb == "create":
         fail("probe manifest has no concrete attempt name")
     name = match.group(1)
     attempt = int(name.rsplit("-", 1)[1])
-    if scenario == "success":
+    if scenario in ("success", "stale-identity"):
         assigned_node = "node-good"
     elif attempt == 1:
         assigned_node = "node-bad"
@@ -327,7 +334,7 @@ def event_offset(events: list[str], expected: str) -> int:
     return events.index(expected)
 
 
-def run_case(scenario: str) -> tuple[dict, list[str]]:
+def run_case(scenario: str, *, expect_success: bool = True) -> tuple[dict, list[str]]:
     with tempfile.TemporaryDirectory(prefix=f"inspace-egress-{scenario}-") as temporary:
         root = pathlib.Path(temporary)
         bin_dir = root / "bin"
@@ -362,15 +369,22 @@ def run_case(scenario: str) -> tuple[dict, list[str]]:
             timeout=30,
         )
         require(
-            result.returncode == 0,
+            (result.returncode == 0) == expect_success,
             textwrap.dedent(
                 f"""\
-                {scenario} gate smoke test failed with {result.returncode}
+                {scenario} gate smoke test returned unexpected status {result.returncode}
                 stdout:\n{result.stdout}
                 stderr:\n{result.stderr}
                 """
             ),
         )
+        if not expect_success:
+            require(
+                not result_path.exists(),
+                f"{scenario} gate wrote a successful result for inconsistent identity",
+            )
+            events = events_path.read_text(encoding="utf-8").splitlines()
+            return {}, events
         require(
             result_path.is_file(),
             f"{scenario} gate did not write its result\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}",
@@ -393,6 +407,10 @@ def main() -> None:
             "first-attempt success deleted a NodeClaim")
     require("patch-limits:6:12Gi" not in success_events,
             "first-attempt success unnecessarily enabled overlap capacity")
+
+    _, stale_events = run_case("stale-identity", expect_success=False)
+    require("ready-pass:inspace-e2e-egress-probe-1" not in stale_events,
+            "stale NodeClaim FIP identity reached the registry success gate")
 
     rotated, events = run_case("rotate")
     require(rotated["attempts"] == 2, "one timeout and one success must report two attempts")
