@@ -2,7 +2,7 @@ package cloudprovider
 
 import (
 	"context"
-	"encoding/json"
+	"errors"
 	"fmt"
 	"reflect"
 	"time"
@@ -12,7 +12,6 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/informers"
 	corelisters "k8s.io/client-go/listers/core/v1"
@@ -200,42 +199,45 @@ func (c *loadBalancerTargetController) sync(ctx context.Context, key string) err
 // makes label-only opt-in and removal flow through its normal finalizer,
 // EnsureLoadBalancer, and status lifecycle.
 func (c *loadBalancerTargetController) reconcilePublicIntentAnnotation(ctx context.Context, service *corev1.Service) (patched, malformed bool, err error) {
-	annotationRequested, err := publicAnnotationRequested(service)
+	if service == nil || service.UID == "" {
+		return false, false, errors.New("public load-balancer intent reconciliation requires a Service UID")
+	}
+	current, err := c.provider.kubeClient.CoreV1().Services(service.Namespace).Get(ctx, service.Name, metav1.GetOptions{})
+	if err != nil {
+		return false, false, err
+	}
+	if current.UID != service.UID {
+		return false, false, fmt.Errorf("Service %s/%s identity changed before public intent reconciliation", service.Namespace, service.Name)
+	}
+	annotationRequested, err := publicAnnotationRequested(current)
 	if err != nil {
 		// The provider's standard reconciliation reports the malformed public
 		// annotation. Do not rewrite user intent or create a patch loop here.
 		return false, true, nil
 	}
-	desired := service.Spec.Type == corev1.ServiceTypeLoadBalancer &&
-		service.Spec.LoadBalancerClass == nil &&
-		service.Labels[LabelLoadBalancerScope] == LoadBalancerScopePublic &&
+	desired := current.Spec.Type == corev1.ServiceTypeLoadBalancer &&
+		current.Spec.LoadBalancerClass == nil &&
+		current.Labels[LabelLoadBalancerScope] == LoadBalancerScopePublic &&
 		annotationRequested
-	current, exists := service.Annotations[annotationLoadBalancerReconcile]
-	if (desired && exists && current == "true") || (!desired && !exists) {
+	currentValue, exists := current.Annotations[annotationLoadBalancerReconcile]
+	if (desired && exists && currentValue == "true") || (!desired && !exists) {
 		return false, false, nil
 	}
-	if service.ResourceVersion == "" {
-		return false, false, fmt.Errorf("Service %s/%s has no resourceVersion for intent annotation patch", service.Namespace, service.Name)
+	copy := current.DeepCopy()
+	if copy.Annotations == nil {
+		copy.Annotations = map[string]string{}
 	}
-	value := any(nil)
 	if desired {
-		value = "true"
+		copy.Annotations[annotationLoadBalancerReconcile] = "true"
+	} else {
+		delete(copy.Annotations, annotationLoadBalancerReconcile)
 	}
-	patch, err := json.Marshal(map[string]any{
-		"metadata": map[string]any{
-			"resourceVersion": service.ResourceVersion,
-			"annotations": map[string]any{
-				annotationLoadBalancerReconcile: value,
-			},
-		},
-	})
+	updated, err := c.provider.kubeClient.CoreV1().Services(copy.Namespace).Update(ctx, copy, metav1.UpdateOptions{})
 	if err != nil {
-		return false, false, err
+		return false, false, fmt.Errorf("update public load-balancer intent annotation on Service %s/%s: %w", service.Namespace, service.Name, err)
 	}
-	if _, err := c.provider.kubeClient.CoreV1().Services(service.Namespace).Patch(
-		ctx, service.Name, types.MergePatchType, patch, metav1.PatchOptions{},
-	); err != nil {
-		return false, false, fmt.Errorf("patch public load-balancer intent annotation on Service %s/%s: %w", service.Namespace, service.Name, err)
+	if updated.UID != service.UID {
+		return false, false, fmt.Errorf("Service %s/%s identity changed during public intent reconciliation", service.Namespace, service.Name)
 	}
 	return true, false, nil
 }

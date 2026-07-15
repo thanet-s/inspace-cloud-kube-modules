@@ -365,8 +365,6 @@ spec:
     l2announcements:
       enabled: true
     defaultLBServiceIPAM: none
-    nodeIPAM:
-      enabled: true
     k8sClientRateLimit:
       qps: %d
       burst: %d
@@ -440,6 +438,8 @@ spec:
       env:
         - name: vip_arp
           value: "true"
+        - name: vip_arpRate
+          value: "500"
         - name: vip_interface
           value: "__PRIVATE_IFACE__"
         - name: vip_subnet
@@ -456,6 +456,12 @@ spec:
           value: "false"
         - name: vip_leaderelection
           value: "true"
+        - name: vip_leaseduration
+          value: "5"
+        - name: vip_renewdeadline
+          value: "3"
+        - name: vip_retryperiod
+          value: "1"
         - name: vip_leasename
           value: "inspace-control-plane-vip"
         - name: address

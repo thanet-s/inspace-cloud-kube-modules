@@ -23,7 +23,7 @@ import (
 // RKE2.SkipOSUpgrade are already included in both provider drift hashes and do
 // not require a global replacement of nodes whose spec retains the default.
 const (
-	SchemaVersion         = "stock-ubuntu-rke2-v11"
+	SchemaVersion         = "stock-ubuntu-rke2-v12"
 	VPCSubnetPlaceholder  = "__INSPACE_VPC_SUBNET__"
 	NativeRoutingPodCIDR  = "10.42.0.0/16"
 	KubernetesServiceCIDR = "10.43.0.0/16"
@@ -110,6 +110,9 @@ func RenderCloudInit(config Config) (string, error) {
 
 	labelKeys := make([]string, 0, len(config.Labels))
 	for key := range config.Labels {
+		if hasNodeRestrictionPrefix(key) {
+			continue
+		}
 		labelKeys = append(labelKeys, key)
 	}
 	sort.Strings(labelKeys)
@@ -510,6 +513,14 @@ set -eu
 		return "", fmt.Errorf("marshal cloud-init JSON: %w", err)
 	}
 	return string(data), nil
+}
+
+func hasNodeRestrictionPrefix(key string) bool {
+	prefix, _, hasPrefix := strings.Cut(key, "/")
+	if !hasPrefix {
+		return false
+	}
+	return prefix == "node-restriction.kubernetes.io" || strings.HasSuffix(prefix, ".node-restriction.kubernetes.io")
 }
 
 func validateCacheConfig(cache *CacheConfig) error {

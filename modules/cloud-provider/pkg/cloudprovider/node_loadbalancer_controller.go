@@ -39,9 +39,9 @@ const (
 	nodeLoadBalancerShardLabel = "inspace.cloud/node-lb-shard"
 	nodeLoadBalancerPoolLabel  = "inspace.cloud/node-lb-pool"
 	nodeLoadBalancerModeLabel  = "inspace.cloud/node-lb-mode"
-	// These labels are copied to Nodes and consumed by the Cilium Node IPAM
-	// selector. Their namespace is protected by the NodeRestriction admission
-	// plugin, so a kubelet cannot opt itself into public address advertisement.
+	// These labels are copied to Nodes and identify controller-authorized public
+	// load-balancer capacity. Their namespace is protected by the NodeRestriction
+	// admission plugin, so a kubelet cannot opt itself into advertisement.
 	nodeLoadBalancerNodeLabel        = "inspace.cloud.node-restriction.kubernetes.io/node-lb"
 	nodeLoadBalancerNodeClusterLabel = "inspace.cloud.node-restriction.kubernetes.io/cluster"
 	nodeLoadBalancerNodeShardLabel   = "inspace.cloud.node-restriction.kubernetes.io/shard"
@@ -583,17 +583,6 @@ func renderNodeLoadBalancerNodeClass(base *unstructured.Unstructured, name strin
 func renderNodeLoadBalancerNodePool(name, nodeClassName string, shard nodeLoadBalancerShardPlan) (*unstructured.Unstructured, error) {
 	if err := validateNodeLoadBalancerShape(shard.CPU, shard.MemoryMiB); err != nil {
 		return nil, err
-	}
-	return renderNodeLoadBalancerNodePoolManifest(name, nodeClassName, shard)
-}
-
-// renderLegacyNodeLoadBalancerNodePoolForAuthorization reconstructs only the
-// exact pre-v0.5.0 default shape. It is intentionally separate from the normal
-// renderer so reconciliation can authorize an already-advertised legacy shard
-// during a zero-downtime upgrade without ever creating new undersized capacity.
-func renderLegacyNodeLoadBalancerNodePoolForAuthorization(name, nodeClassName string, shard nodeLoadBalancerShardPlan) (*unstructured.Unstructured, error) {
-	if shard.CPU != 1 || shard.MemoryMiB != 2048 {
-		return nil, errors.New("node load balancer: legacy authorization requires exactly 1 CPU and 2048 MiB")
 	}
 	return renderNodeLoadBalancerNodePoolManifest(name, nodeClassName, shard)
 }

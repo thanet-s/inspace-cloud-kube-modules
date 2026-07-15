@@ -139,8 +139,61 @@ func TestRenderIncludesExactlyOneRegistrationTaint(t *testing.T) {
 	if strings.Contains(strings.ToLower(rendered), "k3s") {
 		t.Fatalf("RKE2 bootstrap retained a K3s artifact:\n%s", rendered)
 	}
-	if SchemaVersion != "stock-ubuntu-rke2-v11" {
-		t.Fatalf("bootstrap schema = %q, want bounded hostname readback version v11", SchemaVersion)
+}
+
+func TestRenderOmitsNodeRestrictionProtectedLabelsWithoutMutatingInput(t *testing.T) {
+	labels := map[string]string{
+		"node-restriction.kubernetes.io/root":                    "protected-root",
+		"inspace.cloud.node-restriction.kubernetes.io/subdomain": "protected-subdomain",
+		"node-restriction.kubernetes.io.example.com/near-miss":   "allowed-near-miss",
+		"notnode-restriction.kubernetes.io/near-miss":            "allowed-near-miss-suffix",
+		"node-restriction.kubernetes.io":                         "allowed-unprefixed-name",
+		"example.com/workload":                                   "allowed-ordinary",
+	}
+	wantLabels := make(map[string]string, len(labels))
+	for key, value := range labels {
+		wantLabels[key] = value
+	}
+
+	data, err := RenderCloudInit(Config{
+		NodeName: "worker-1", Server: "https://10.0.0.10:9345", Token: "secret-token",
+		RKE2Version: "v1.35.6+rke2r1", Labels: labels,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rke2Config := writeFileContent(t, mustDocument(t, data), "/etc/rancher/rke2/config.yaml")
+	for _, forbidden := range []string{
+		"node-restriction.kubernetes.io/root=protected-root",
+		"inspace.cloud.node-restriction.kubernetes.io/subdomain=protected-subdomain",
+	} {
+		if strings.Contains(rke2Config, forbidden) {
+			t.Errorf("RKE2 bootstrap config retained protected label %q:\n%s", forbidden, rke2Config)
+		}
+	}
+	for _, allowed := range []string{
+		"node-restriction.kubernetes.io.example.com/near-miss=allowed-near-miss",
+		"notnode-restriction.kubernetes.io/near-miss=allowed-near-miss-suffix",
+		"node-restriction.kubernetes.io=allowed-unprefixed-name",
+		"example.com/workload=allowed-ordinary",
+	} {
+		if !strings.Contains(rke2Config, allowed) {
+			t.Errorf("RKE2 bootstrap config omitted allowed label %q:\n%s", allowed, rke2Config)
+		}
+	}
+	if len(labels) != len(wantLabels) {
+		t.Fatalf("RenderCloudInit changed input label count: got %d, want %d", len(labels), len(wantLabels))
+	}
+	for key, want := range wantLabels {
+		if got, exists := labels[key]; !exists || got != want {
+			t.Errorf("RenderCloudInit mutated input label %q: got %q (exists=%t), want %q", key, got, exists, want)
+		}
+	}
+}
+
+func TestBootstrapSchemaVersion(t *testing.T) {
+	if SchemaVersion != "stock-ubuntu-rke2-v12" {
+		t.Fatalf("bootstrap schema = %q, want protected-label filtering version v12", SchemaVersion)
 	}
 }
 

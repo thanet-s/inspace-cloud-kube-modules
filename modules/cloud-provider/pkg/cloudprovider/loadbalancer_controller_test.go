@@ -2,7 +2,6 @@ package cloudprovider
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -10,8 +9,8 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
@@ -139,29 +138,24 @@ func TestPublicIntentAnnotationNudgesStockServiceControllerOnLabelTransitions(t 
 				t.Fatal(err)
 			}
 			actions := client.Actions()
-			if len(actions) != 1 {
-				t.Fatalf("Kubernetes actions = %#v, want one merge patch", actions)
+			if len(actions) != 2 || actions[0].GetVerb() != "get" {
+				t.Fatalf("Kubernetes actions = %#v, want exact GET then Update", actions)
 			}
-			patchAction, ok := actions[0].(k8stesting.PatchAction)
-			if !ok || patchAction.GetPatchType() != types.MergePatchType {
-				t.Fatalf("action = %#v, want merge patch", actions[0])
+			updateAction, ok := actions[1].(k8stesting.UpdateAction)
+			if !ok {
+				t.Fatalf("action = %#v, want exact Service update", actions[1])
 			}
-			var patch map[string]any
-			if err := json.Unmarshal(patchAction.GetPatch(), &patch); err != nil {
-				t.Fatal(err)
+			updatedService, ok := updateAction.GetObject().(*corev1.Service)
+			if !ok || updatedService.UID != service.UID || updatedService.ResourceVersion != service.ResourceVersion {
+				t.Fatalf("updated Service identity = %#v", updateAction.GetObject())
 			}
-			metadata, _ := patch["metadata"].(map[string]any)
-			if metadata["resourceVersion"] != service.ResourceVersion {
-				t.Fatalf("patch resourceVersion = %#v, want %q", metadata["resourceVersion"], service.ResourceVersion)
-			}
-			annotations, _ := metadata["annotations"].(map[string]any)
-			value, present := annotations[annotationLoadBalancerReconcile]
+			value, present := updatedService.Annotations[annotationLoadBalancerReconcile]
 			if test.wantTrigger {
 				if !present || value != "true" {
-					t.Fatalf("trigger patch = %#v, want true", annotations)
+					t.Fatalf("trigger update = %#v, want true", updatedService.Annotations)
 				}
-			} else if !present || value != nil {
-				t.Fatalf("trigger patch = %#v, want explicit null removal", annotations)
+			} else if present {
+				t.Fatalf("trigger update = %#v, want removal", updatedService.Annotations)
 			}
 			if _, mutated := service.Annotations[annotationLoadBalancerReconcile]; mutated != !test.wantTrigger {
 				t.Fatalf("informer object was mutated: annotations=%v", service.Annotations)
@@ -199,7 +193,7 @@ func TestPublicIntentAnnotationIgnoresMalformedUserAnnotation(t *testing.T) {
 	if err := fixture.controller.sync(context.Background(), "default/web"); err != nil {
 		t.Fatal(err)
 	}
-	if actions := client.Actions(); len(actions) != 0 {
+	if actions := client.Actions(); len(actions) != 1 || actions[0].GetVerb() != "get" {
 		t.Fatalf("malformed annotation caused Kubernetes mutations: %#v", actions)
 	}
 }
@@ -228,7 +222,7 @@ func TestPublicIntentAnnotationDoesNotPatchLoopAfterInformerObservesTrigger(t *t
 	if err := fixture.controller.sync(context.Background(), "default/web"); err != nil {
 		t.Fatal(err)
 	}
-	if actions := client.Actions(); len(actions) != 0 {
+	if actions := client.Actions(); len(actions) != 1 || actions[0].GetVerb() != "get" {
 		t.Fatalf("already mirrored intent caused a patch loop: %#v", actions)
 	}
 }
@@ -748,6 +742,11 @@ func (f *targetControllerFixture) addNode(t *testing.T, node *corev1.Node) {
 
 func (f *targetControllerFixture) addService(t *testing.T, service *corev1.Service) {
 	t.Helper()
+	if client, ok := f.controller.provider.kubeClient.(*fake.Clientset); ok {
+		if err := client.Tracker().Add(service.DeepCopy()); err != nil && !apierrors.IsAlreadyExists(err) {
+			t.Fatal(err)
+		}
+	}
 	if err := f.serviceIndexer.Add(service); err != nil {
 		t.Fatal(err)
 	}

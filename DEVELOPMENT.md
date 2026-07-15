@@ -71,9 +71,11 @@ and bastion removes any stale `127.0.1.1` mapping, writes exactly
 bounded retry accounts for a short NSS readback delay after a successful file
 append; package installation and resolver replacement do not begin until the
 mapping is visible. Current fixed control-plane ownership records use schema
-v7 because enabling Cilium Node IPAM changes their immutable RKE2 cloud-init;
-bastion ownership remains v6. Karpenter's current immutable bootstrap drift
-schema is `stock-ubuntu-rke2-v11`; this is separate from its cloud VM ownership
+v8 because kube-vip's explicit 5/3/1-second election timing and 500-millisecond
+ARP cadence change their immutable RKE2 cloud-init; bastion ownership remains
+v6. Teardown continues to accept schema v7 control planes paired with the same
+v6 bastion. Karpenter's current immutable bootstrap drift
+schema is `stock-ubuntu-rke2-v12`; this is separate from its cloud VM ownership
 record version.
 
 Control planes, workers, and the bastion use TOT as the primary Ubuntu mirror
@@ -181,9 +183,9 @@ spec:
 ```
 
 Bootstrap sets `defaultLBServiceIPAM: none`, so Cilium claims only explicit
-classes and cannot race the generic external CCM. Node IPAM is enabled for
-CCM-owned shadow Services; the supported user contract is
-`loadBalancerClass: inspace.cloud/node`, never raw `io.cilium/node`. The CCM
+classes and cannot race the generic external CCM. The supported user contract
+is `loadBalancerClass: inspace.cloud/node`; the internal datapath class is
+reserved for CCM-generated Services. The CCM
 assigns shared Services by conflict-free `(protocol, port)` claims or gives
 dedicated Services an isolated static Karpenter shard. Generated nodes use AMD
 EPYC, a 30 GiB disk, a `NoSchedule` taint, and the private base firewall.
@@ -192,32 +194,57 @@ owned cluster firewall containing a single portless inbound ICMP-from-Any rule
 is reused by every authorized Node-LB VM. `loadBalancerSourceRanges` affects
 only Service TCP/UDP rules and never restricts ping.
 
-The Cilium readiness gate uses protected
+The CCM eligibility gate uses protected
 `inspace.cloud.node-restriction.kubernetes.io/*` labels. CCM validates the full
 rendered NodePool profile, including its taint, plus the exact
 Node→NodeClaim→NodePool→NodeClass and FIP identity chain. Advertising requires
 Node Ready, Karpenter's valid private base-firewall contract, the shared ICMP
-assignment, and every active Service firewall assignment. A failure in those
-authorization or assignment checks clears the ready label before returning.
+assignment, and the protected CCM readiness label. Each Service firewall is a
+separate activation gate and is never used to bootstrap that shard-wide label.
+A failure in node authorization or a Service edge first detaches the affected
+public firewall and then withdraws public/private status.
 
 This controller contract assumes trusted cluster administrators. For
-multi-tenancy, admission and RBAC must reserve raw `io.cilium/node` Services,
-`io.cilium.nodeipam/*` annotations, `Service.spec.externalIPs`, protected CCM
+multi-tenancy, admission and RBAC must reserve the internal
+`inspace.cloud/node-datapath` class, `Service.spec.externalIPs`, protected CCM
 metadata, and Node-LB tolerations/selectors. NodeRestriction prevents a kubelet
-from forging the protected labels; the `NoSchedule` taint alone is not a
-security boundary.
+from forging the protected labels; those labels are applied through the API
+after registration and are never placed in kubelet bootstrap flags. The
+`NoSchedule` taint alone is not a security boundary.
 
-Every owned live shadow keeps its `(shard, protocol, port)` reservation until
-that shadow is updated or deleted, so simultaneous port swaps and deleting
-peers cannot create a transient duplicate frontend on one public node address.
+Every owned live datapath keeps its `(shard, protocol, port)` reservation until
+that datapath is updated or deleted, so simultaneous port swaps and deleting
+peers cannot create a transient duplicate frontend on one private node address.
 The user Service must have a selector and explicit
 `allocateLoadBalancerNodePorts: false`; unsupported frontends and source ranges
-fail before static capacity is created. Replacement capacity and the Cilium
-shadow status must converge before CCM removes a previous shard or firewall.
+fail before static capacity is created. The generated
+same-namespace `inlb-dp-<service-identity>` Service publishes private Node
+InternalIPs as `ipMode: VIP`; the user Service publishes paired FIPs as
+`ipMode: Proxy`. The identity is the first 52 lowercase hex characters of
+SHA-256 over `namespace NUL name NUL Service-UID`, is repeated in the
+`inspace.cloud/node-lb-service-id` label, and is bound by an exact controller
+owner reference. CCM records
+`service.inspace.cloud/node-lb-datapath-active-shard` before publishing any
+private VIP. Additions then converge in the strict order: exact private VIP,
+persisted firewall-assignment fence, exact Service-firewall assignment readback,
+and finally public Proxy status. Removals reverse the functional edge first:
+CCM detaches and reads back stale Service-firewall assignments before removing
+public or private status. InSpace DNAT therefore lands on Cilium's private
+frontend without NodePorts or `externalIPs`, and no crash boundary leaves a
+Service firewall exposing a host port without its private frontend.
+
+Migration prepares replacement capacity and its firewall while detached, but
+the fixed per-Service child makes final cutover deliberately break-before-make:
+the old edge and statuses are withdrawn before the replacement marker/private
+VIP/firewall/public-status sequence begins. NodeLB migration is fail-closed, not
+hitless.
 Firewall creation persists a deterministic pre-POST intent. Ambiguous or
 eventually consistent readback requires a five-minute grace period followed by
 three absence observations at least 30 seconds apart; visibility resets that
-evidence. Service finalization independently requires three spaced
+evidence. Firewall assignment also persists a pre-mutation fence. An ambiguous
+assignment keeps the marker and private VIP until a five-minute grace and three
+consecutive empty assignment observations pass; any late assignment resets the
+proof. Service finalization independently requires three spaced
 authoritative absence observations, so a transient list omission cannot orphan
 a billable firewall. The cluster ICMP identity is persisted on the generated
 NodeClass and is deleted only after the last finalized Node-LB Service and all

@@ -53,9 +53,10 @@ the exact-VPC private-IP, verified-UFW, and bounded-agent-start contract, so
 existing
 K3s-backed NodeClaims are treated as drifted and replaced through Karpenter's
 normal disruption controls after their NodeClasses are migrated.
-The current immutable bootstrap schema is `stock-ubuntu-rke2-v11`; its bounded
-local-hostname readback change makes workers rendered with older bootstrap
-schemas eligible for normal Karpenter drift replacement.
+The current immutable bootstrap schema is `stock-ubuntu-rke2-v12`; it omits
+NodeRestriction-protected labels from kubelet bootstrap while retaining them
+for Karpenter to apply after registration. Workers rendered with older
+bootstrap schemas are eligible for normal Karpenter drift replacement.
 
 `spec.rke2.skipOSUpgrade: true` is an explicit short-lived-test optimization.
 It removes only the worker's one-time `apt-get upgrade -y`; mirror and resolver
@@ -278,11 +279,10 @@ accept only the CCM-audited Service TCP/UDP rules and shared cluster ICMP rule
 described above.
 
 The public profile validates cloud assignments; it is not Kubernetes tenant
-isolation. In a multi-tenant cluster, admission and RBAC must reserve direct
-`io.cilium/node` Services, `io.cilium.nodeipam/*` annotations,
-`Service.spec.externalIPs`, and scheduling onto Node-LB nodes through their
-taint/toleration or direct selectors. The generated `NoSchedule` taint is only
-a placement guard.
+isolation. In a multi-tenant cluster, admission and RBAC must reserve the
+internal `inspace.cloud/node-datapath` class, `Service.spec.externalIPs`, and
+scheduling onto Node-LB nodes through their taint/toleration or direct
+selectors. The generated `NoSchedule` taint is only a placement guard.
 
 Worker network policy relies on the validated InSpace cloud firewall. Generated bootstrap does not install or enable UFW. One `set -eu` orchestrator runs every bootstrap stage in order, executes `additionalUserData`, reapplies the required node tuning, then disables and verifies UFW before it can start RKE2. The RKE2 service also has an `ExecStartPre` verifier, so initial launch and later restarts fail unless `ufw status` is inactive and its unit is inactive and disabled (an absent unit is safe). It never flushes or rewrites iptables/nftables, which belong to Cilium and RKE2. The adapter replaces a single strict VPC-subnet placeholder with the exact API-reported prefix before VM creation. Bootstrap then requires exactly one guest address in that prefix and writes it as `node-ip`; it never chooses the default interface or mistakes the floating address for a NIC address. It does not set `node-external-ip` and has no external-address placeholder. The external CCM is authoritative: it reads the VM's private address and exact Floating-IP assignment from the InSpace API and publishes them as `InternalIP` and `ExternalIP`. InSpace service targets use the private node address. Deletion removes the Floating IP first, deletes the VM, and only then removes every stale firewall attachment for that exact VM UUID.
 

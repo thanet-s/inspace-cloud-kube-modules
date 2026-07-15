@@ -865,6 +865,14 @@ def main() -> None:
         "grep -Fc '        - \"kubernetes\"'",
         "grep -Fc '        - name: vip_nodename'",
         "grep -Fc '              fieldPath: spec.nodeName'",
+        "grep -Fc '        - name: vip_arpRate'",
+        "grep -Fc '          value: \"500\"'",
+        "grep -Fc '        - name: vip_leaseduration'",
+        "grep -Fc '          value: \"5\"'",
+        "grep -Fc '        - name: vip_renewdeadline'",
+        "grep -Fc '          value: \"3\"'",
+        "grep -Fc '        - name: vip_retryperiod'",
+        "grep -Fc '          value: \"1\"'",
         "grep -Fc '          drop: [\"ALL\"]'",
         "grep -Fc '          add: [\"NET_ADMIN\", \"NET_RAW\"]'",
         "grep -Fc '          mountPath: /etc/kubernetes/admin.conf'",
@@ -893,7 +901,6 @@ def main() -> None:
         "enable-l2-announcements",
         "default-lb-service-ipam",
         "defaultLBServiceIPAM:[[:space:]]*none",
-        "nodeIPAM:[[:space:]]*$",
         "ciliumloadbalancerippool inspace-private",
         "ciliuml2announcementpolicy inspace-private",
         "EnableL2Announcements",
@@ -1071,12 +1078,15 @@ def main() -> None:
     node_lb_initial_apply = playbook.index("- name: Create the Node-LB workload and established shared pair")
     node_lb_initial_journal = playbook.index("- name: Journal initial Node-LB identities before cloud convergence")
     node_lb_shared_pair = playbook.index(
-        "- name: Require the mixed Traefik and sibling Services to establish one shared shadow shard"
+        "- name: Require the mixed Traefik and sibling Services to establish one shared private-VIP datapath shard"
     )
     node_lb_expansion = playbook.index("- name: Add the conflicting shared and dedicated Node-LB Services")
     node_lb_full_journal = playbook.index("- name: Journal every Node-LB identity before the full convergence proof")
     node_lb_present = playbook.index("- name: Prove Node-LB Kubernetes cloud and ownership convergence")
     node_lb_http = playbook.index("- name: Prove every public Node-LB TCP port reaches its exact backend")
+    node_lb_frontend_audit = playbook.index(
+        "- name: Require Cilium to report no duplicate Node-LB frontend ownership"
+    )
     node_lb_partial_delete = playbook.index("- name: Delete one shared Node-LB member without deleting its sibling shard")
     node_lb_partial = playbook.index("- name: Prove partial shared-member cleanup preserves the exact sibling resources")
     node_lb_partial_identity_assert = playbook.index(
@@ -1084,10 +1094,12 @@ def main() -> None:
     )
     node_lb_partial_http = playbook.index("- name: Prove the retained mixed and other TCP backends after partial cleanup")
     node_lb_delete = playbook.index("- name: Delete every Node-LB acceptance Service and workload owner")
-    node_lb_absent = playbook.index("- name: Require Node-LB Services shadows NodePools firewalls VMs and FIPs to disappear")
+    node_lb_absent = playbook.index(
+        "- name: Require Node-LB Services datapaths NodePools firewalls VMs and FIPs to disappear"
+    )
     require(stale_paid_service_absent < stale_paid_nlb_inventory < node_lb_stale_absent < public_delete < node_lb_immutable_anchor < node_lb_baseline < node_lb_exercise_start <
             node_lb_initial_apply < node_lb_initial_journal < node_lb_shared_pair <
-            node_lb_expansion < node_lb_full_journal < node_lb_present < node_lb_http < node_lb_partial_delete <
+            node_lb_expansion < node_lb_full_journal < node_lb_present < node_lb_http < node_lb_frontend_audit < node_lb_partial_delete <
             node_lb_partial < node_lb_partial_identity_assert < node_lb_partial_http < node_lb_delete <
             node_lb_absent < suite_complete,
             "Node-LB acceptance must run after paid-NLB cleanup and finish before suite completion")
@@ -1126,7 +1138,7 @@ def main() -> None:
     )
     final_node_lb_absent_task = named_yaml_sequence_item(
         node_lb_exercise,
-        "Require Node-LB Services shadows NodePools firewalls VMs and FIPs to disappear",
+        "Require Node-LB Services datapaths NodePools firewalls VMs and FIPs to disappear",
         8,
     )
     require(
@@ -1142,9 +1154,17 @@ def main() -> None:
             "/opt/e2e/scripts/account-inventory.py" in node_lb_exercise and
             "compare" in node_lb_exercise and
             "--baseline" in node_lb_exercise and
-            "Require the mixed Traefik and sibling Services to establish one shared shadow shard" in node_lb_exercise and
-            '"io.cilium.nodeipam/match-node-labels"' in node_lb_exercise and
-            '"inspace.cloud/node-lb-service-uid"' in node_lb_exercise and
+            "Require the mixed Traefik and sibling Services to establish one shared private-VIP datapath shard" in node_lb_exercise and
+            '"inspace.cloud/node-datapath"' in node_lb_exercise and
+            '"inspace.cloud/node-lb-datapath"' in node_lb_exercise and
+            '"inspace.cloud/node-lb-service-id"' in node_lb_exercise and
+            '"service.inspace.cloud/node-lb-datapath-shard"' in node_lb_exercise and
+            '"service.inspace.cloud/node-lb-datapath-active-shard"' in node_lb_exercise and
+            '"^inlb-dp-[0-9a-f]{52}$"' in node_lb_exercise and
+            '.status.loadBalancer.ingress[0].ipMode == "VIP"' in node_lb_exercise and
+            '.status.loadBalancer.ingress[0].ipMode == "Proxy"' in node_lb_exercise and
+            "-c cilium-agent" in node_lb_exercise and
+            "frontend already owned by another service" in node_lb_exercise and
             "Add the conflicting shared and dedicated Node-LB Services" in node_lb_exercise and
             "--deleted-firewall" in node_lb_exercise and
             "--retained-icmp-firewall" in node_lb_exercise and
@@ -1178,13 +1198,15 @@ def main() -> None:
     )
     node_lb_shared_gate = named_yaml_sequence_item(
         node_lb_exercise,
-        "Require the mixed Traefik and sibling Services to establish one shared shadow shard",
+        "Require the mixed Traefik and sibling Services to establish one shared private-VIP datapath shard",
         8,
     )
     require_yaml_key(node_lb_shared_gate, 10, "retries", "180")
     require_yaml_key(node_lb_shared_gate, 10, "delay", "10")
-    require("all(.items[]; .spec.loadBalancerClass != \"io.cilium/node\")" not in test_playbook,
-            "live acceptance must not globally reject CCM-owned Cilium Node IPAM shadows")
+    require('def ownedDatapath($parent):' in node_lb_shared_gate and
+            '.metadata.name == ("inlb-dp-" + .metadata.labels["inspace.cloud/node-lb-service-id"])' in node_lb_shared_gate and
+            '"service.inspace.cloud/node-lb-datapath-active-shard"' in node_lb_shared_gate,
+            "live acceptance must select exact-owned canonical datapaths and require durable activation")
     for cleanup_name in node_lb_service_names:
         require(f"service/{cleanup_name}" in cleanup,
                 f"destroy fallback must remove Node-LB Service/{cleanup_name}")
@@ -1192,7 +1214,7 @@ def main() -> None:
             "Wait for every managed Node-LB owner to quiesce" in cleanup and
             "Delete the generated Node-LB NodeClass after its owners are gone" in cleanup and
             "/opt/e2e/scripts/verify-node-load-balancer.py" in cleanup,
-            "destroy fallback must quiesce every Node-LB Kubernetes and cloud owner")
+            "destroy fallback must use journaled dynamic datapath cleanup and quiesce every Node-LB owner")
     require(
         'state.get("nodeLoadBalancerForbiddenLoadBalancerNames", [])' in persist_workload
         and 'node_lb_names.add(f"k8s-{sha16(state[\'clusterName\'])}-{sha16(uid)}")'
@@ -1201,7 +1223,14 @@ def main() -> None:
         in persist_workload,
         "workload ownership recovery must durably journal every forbidden Node-LB generic NLB identity",
     )
-    require("Cilium Node IPAM and `io.cilium/node` are disabled" not in readme and
+    require(
+        'state.get("nodeLoadBalancerDatapathServiceNames", [])' in persist_workload
+        and "datapath_names.add(node_load_balancer_datapath_name(service))" in persist_workload
+        and 'state["nodeLoadBalancerDatapathServiceNames"] = sorted(datapath_names)'
+        in persist_workload,
+        "workload ownership recovery must durably journal every canonical Node-LB datapath Service",
+    )
+    require("public-Proxy/private-VIP" in readme and
             "defaults them to `public-node-shared`" in readme and
             "complete billable-resource" in readme,
             "E2E documentation must describe the live Node-LB default and exact cleanup proof")
@@ -1287,15 +1316,58 @@ def main() -> None:
             "node-traefik-http3" in node_lb_deployment,
             "Node-LB data-path workload must stay on the general worker and expose exact TCP/UDP markers")
     require(node_load_balancer_workload.count("loadBalancerClass: inspace.cloud/node") == 4 and
+            "loadBalancerClass: inspace.cloud/node-datapath" not in node_load_balancer_workload and
             "loadBalancerClass: io.cilium/node" not in node_load_balancer_workload,
-            "only the CCM may create Cilium Node IPAM shadow Services")
+            "only the CCM may create internal private-VIP datapath Services")
 
     node_lb_module = load_script_module(
         "e2e_verify_node_load_balancer_static",
         ROOT / "scripts/verify-node-load-balancer.py",
     )
+    public_proxy = {
+        "metadata": {"name": "public"},
+        "status": {"loadBalancer": {"ingress": [{"ip": "8.8.8.8", "ipMode": "Proxy"}]}},
+    }
+    private_vip = {
+        "metadata": {"name": "datapath"},
+        "status": {"loadBalancer": {"ingress": [{"ip": "10.0.0.10", "ipMode": "VIP"}]}},
+    }
+    require(node_lb_module.service_external_ip(public_proxy) == "8.8.8.8" and
+            node_lb_module.service_private_vip(private_vip) == "10.0.0.10",
+            "Node-LB verifier does not accept the exact public Proxy/private VIP status pair")
+    wrong_mode = json.loads(json.dumps(public_proxy))
+    wrong_mode["status"]["loadBalancer"]["ingress"][0]["ipMode"] = "VIP"
+    try:
+        node_lb_module.service_external_ip(wrong_mode)
+    except SystemExit as error:
+        require("ipMode Proxy" in str(error),
+                "Node-LB verifier returned the wrong public status-mode diagnostic")
+    else:
+        require(False, "Node-LB verifier accepted a public FIP with ipMode VIP")
     require(node_lb_module.managed_name("cluster-a", "node-lb") == "cluster-a-node-lb",
             "Node-LB verifier does not mirror the managed NodeClass name")
+    identity_service = {
+        "metadata": {
+            "namespace": "default",
+            "name": "web",
+            "uid": "12345678-1234-4234-8234-123456789abc",
+        }
+    }
+    expected_identity = "7eb63a7dd612a757e4f3b4ec4e2ab9fbf5c9e81cafb8de6fae13"
+    require(
+        node_lb_module.node_load_balancer_service_identity(identity_service) == expected_identity
+        and node_lb_module.node_load_balancer_datapath_name(identity_service)
+        == "inlb-dp-" + expected_identity,
+        "Node-LB verifier does not mirror the canonical same-namespace Service identity",
+    )
+    persist_module = load_script_module(
+        "e2e_persist_workload_static", ROOT / "scripts/persist-workload.py"
+    )
+    require(
+        persist_module.node_load_balancer_datapath_name(identity_service)
+        == "inlb-dp-" + expected_identity,
+        "workload journal does not mirror the canonical Node-LB datapath name",
+    )
     require(node_lb_module.firewall_name(
         "cluster-a", "01234567-89ab-4def-8123-456789abcdef", "deadbeef"
     ) == "inlb-34ab3e1c-01234567-89ab-4def-8123-456789abcdef-deadbeef",
@@ -1436,7 +1508,15 @@ def main() -> None:
             require(False, f"Node-LB verifier accepted invalid is_virtual={contradictory_nonvirtual!r}")
     for marker in (
         'NODE_LOAD_BALANCER_CLASS = "inspace.cloud/node"',
-        'CILIUM_NODE_CLASS = "io.cilium/node"',
+        'NODE_LOAD_BALANCER_DATAPATH_CLASS = "inspace.cloud/node-datapath"',
+        'NODE_LOAD_BALANCER_DATAPATH_LABEL = "inspace.cloud/node-lb-datapath"',
+        'NODE_LOAD_BALANCER_SERVICE_ID_LABEL = "inspace.cloud/node-lb-service-id"',
+        'service_status_ip(service, "Proxy", True)',
+        'service_status_ip(service, "VIP", False)',
+        '"service.inspace.cloud/node-lb-datapath-shard"',
+        '"service.inspace.cloud/node-lb-datapath-active-shard"',
+        'return "inlb-dp-" + node_load_balancer_service_identity(service)',
+        'floating_ip.get("assigned_to_private_ip") == internal_ips[0]',
         '"inspace.cloud/instance-cpu": ("In", ("1",))',
         '"inspace.cloud/instance-memory": ("In", ("4096",))',
         '"inspace.cloud/host-class": ("In", ("amd-epyc",))',
@@ -1464,15 +1544,15 @@ def main() -> None:
         'retained["firewallUUID"] == retained_service_firewall_uuid',
         'result["retainedServiceFirewallUUID"] = retained["firewallUUID"]',
         'replaced the retained sibling Service firewall',
-        'Cilium Node IPAM acceptance must not create an InSpace NLB',
+        'public NodeLB acceptance must not create an InSpace NLB',
     ):
         require(marker in node_load_balancer_cloud,
                 f"Node-LB live verifier is missing contract marker: {marker}")
 
     require('"default-lb-service-ipam"] == "none"' in playbook and
-            "nodeIPAM:[[:space:]]*$" in playbook and
-            "enabled:[[:space:]]*true" in playbook,
-            "live Cilium checks must disable default LB claiming and enable explicit Node IPAM")
+            "! grep -Eq '^[[:space:]]*nodeIPAM:" in playbook and
+            'assert "nodeIPAM" not in values' in playbook,
+            "live Cilium checks must disable default LB claiming and keep Node IPAM disabled")
     require('"cilium.io/IPAMRequestSatisfied"' in playbook and
             'startswith("cilium.io/")' in playbook and
             '"io.cilium/lb-ipam-request-satisfied"' not in playbook and
@@ -1510,6 +1590,16 @@ def main() -> None:
     require('select(.name == "vip_nodename" and' in kube_vip_ready and
             '.valueFrom.fieldRef.fieldPath == "spec.nodeName")] | length) == 1' in kube_vip_ready,
             "live kube-vip proof must require exactly one downward-API node-name identity")
+    for name, value in (
+        ("vip_arpRate", "500"),
+        ("vip_leaseduration", "5"),
+        ("vip_renewdeadline", "3"),
+        ("vip_retryperiod", "1"),
+    ):
+        require(
+            f'select(.name == "{name}" and .value == "{value}")] | length) == 1' in kube_vip_ready,
+            f"live kube-vip proof must require exactly one {name}={value} environment variable",
+        )
     require('--arg image "{{ e2e_state.bootstrapCacheRegistry }}/kube-vip/kube-vip:v1.2.1@sha256:' in kube_vip_ready and
             '.image == $image' in kube_vip_ready,
             "live kube-vip proof must bind and compare the exact cached image")
@@ -1763,7 +1853,7 @@ def main() -> None:
         'f"{cluster_resource_name}-bastion-ip"',
         'bastion_name, bastion_firewall_name, bastion_fip_name = bastion_resource_names(',
         'rf"inspace-rke2-bastion/v6 owner={re.escape(owner)} spec=[0-9a-f]{{64}}"',
-        'rf"inspace-rke2-cp/v7 owner={re.escape(owner)} slot={slot} spec=[0-9a-f]{{64}}"',
+        'rf"inspace-rke2-cp/v8 owner={re.escape(owner)} slot={slot} spec=[0-9a-f]{{64}}"',
         'validate_optional_vm_hostname(bastion, bastion_name, "bastion")',
         '"bastionName": bastion_name',
         '"bastionFloatingIPName": bastion_fip["name"]',

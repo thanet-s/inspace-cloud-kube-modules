@@ -187,7 +187,6 @@
           - service/inspace-e2e-private-a
           - service/inspace-e2e-private-b
           - service/inspace-e2e-node-traefik
-          - service/inspace-e2e-node-shared-a
           - service/inspace-e2e-node-shared-b
           - service/inspace-e2e-node-shared-conflict
           - service/inspace-e2e-node-dedicated

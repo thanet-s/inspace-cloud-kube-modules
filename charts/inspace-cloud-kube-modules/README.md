@@ -28,7 +28,7 @@ Announcements. LB IPAM allocates a unique private VIP per Service, so different
 Services can reuse the same port without creating paid InSpace load balancers.
 This chart does not install the Cilium pool or announcement policy: cluster
 bootstrap renders those resources against RKE2's bundled Cilium CRDs. Bootstrap
-enables `l2announcements` and Node IPAM, and sets
+enables `l2announcements`, leaves Node IPAM disabled, and sets
 `defaultLBServiceIPAM: none`. Consequently, Cilium claims the explicit
 `io.cilium/l2-announcer` class while Kubernetes' generic external CCM can own
 the deliberately classless public InSpace path without two controllers acting
@@ -66,17 +66,22 @@ spec:
   externalTrafficPolicy: Cluster
 ```
 
-Cilium Node IPAM is reserved for CCM-owned public node-load-balancer shadow
-Services. Use `loadBalancerClass: inspace.cloud/node`; CCM creates a
-quarantined `io.cilium/node` shadow Service whose node selector names exactly
-one managed shard. The Node identity and readiness labels use the
+Use `loadBalancerClass: inspace.cloud/node`; CCM creates an exact-owned,
+same-namespace `inlb-dp-<service-identity>` Service with the internal
+`inspace.cloud/node-datapath` class. The identity is the first 52 lowercase hex
+characters of SHA-256 over `namespace NUL name NUL Service-UID` and is repeated
+in the `inspace.cloud/node-lb-service-id` label. Its status publishes private
+Node InternalIPs as `ipMode: VIP`, while the user Service publishes the paired
+public FIPs as `ipMode: Proxy`. InSpace DNAT therefore reaches Cilium's private
+low-port frontend without Kubernetes NodePorts or `externalIPs`. The Node
+identity and readiness labels use the
 `inspace.cloud.node-restriction.kubernetes.io/*` prefix and therefore require
 the RKE2 NodeRestriction admission plugin.
 
 This is a trusted-administrator contract, not tenant isolation. In a
-multi-tenant cluster, admission and RBAC must reserve direct `io.cilium/node`
-Services, `io.cilium.nodeipam/*` annotations, `Service.spec.externalIPs`, and
-the Node-LB taint/toleration and selector surface for the controllers. The
+multi-tenant cluster, admission and RBAC must reserve the internal
+`inspace.cloud/node-datapath` class, `Service.spec.externalIPs`, and the Node-LB
+taint/toleration and selector surface for the controllers. The
 `NoSchedule` taint keeps ordinary workloads off LB nodes, but a user allowed to
 tolerate it or select a node directly can bypass that placement guard. Cilium
 L2 Announcements is a beta feature and
@@ -145,8 +150,10 @@ ICMP from Any.
 
 A node is advertised only while its full NodePool/NodeClaim/NodeClass identity
 is authoritative, it is Ready with exactly one authoritative FIP, Karpenter's
-private base-firewall contract is valid, and the global ICMP plus every active
-Service firewall assignment are visible. Any drift removes the protected ready
+private base-firewall contract is valid, and the shared ICMP assignment is
+visible. Per-Service firewalls are not part of this shard-wide readiness label;
+CCM audits each one as a separate activation gate after its private VIP exists.
+Any node-identity or shared-infrastructure drift removes the protected ready
 label. Karpenter may use one temporary surge node during drift replacement;
 steady state remains the configured shard replica count.
 
@@ -154,11 +161,17 @@ Public-node Services require a non-empty selector and explicit
 `allocateLoadBalancerNodePorts: false`. Selectorless Services, allocated
 NodePorts, `externalIPs`, `loadBalancerIP`, and non-IPv4 source ranges fail
 before any node capacity is created. CCM keeps the previous shard advertised
-during migration until replacement capacity and Cilium status both converge.
+during replacement-capacity preparation, then performs a fail-closed,
+break-before-make cutover. It withdraws the old Service firewall and status pair
+before storing `service.inspace.cloud/node-lb-datapath-active-shard` for the
+replacement. Activation then proceeds as private VIP, persisted assignment
+fence, exact Service-firewall assignment readback, and public Proxy status.
+Node additions follow that order; removals detach and read back the stale edge
+before either status shrinks.
 
 Disabling Node-LB or uninstalling its CCM/Karpenter controllers is not a
 teardown operation. First delete every `inspace.cloud/node` Service and wait
-for its provider finalizer, shadow Service, managed NodePools/NodeClaims/Nodes,
+for its provider finalizer, datapath Service, managed NodePools/NodeClaims/Nodes,
 FIPs, and both Service and shared ICMP firewalls to disappear. Removing the
 controllers earlier stops authoritative cleanup and can retain billable cloud
 resources.

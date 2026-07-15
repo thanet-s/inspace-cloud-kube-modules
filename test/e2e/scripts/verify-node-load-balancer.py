@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prove the CCM-managed Cilium Node IPAM load-balancer contract end to end."""
+"""Prove the CCM-managed public-Proxy/private-VIP NodeLB contract end to end."""
 
 import argparse
 import hashlib
@@ -50,11 +50,13 @@ SERVICE_SPECS = {
 }
 PARTIAL_DELETED_SERVICE = "inspace-e2e-node-shared-b"
 RETAINED_SHARED_SERVICE = "inspace-e2e-node-traefik"
-LEGACY_SERVICE_NAMES = {"inspace-e2e-node-shared-a"}
 
 NODE_LOAD_BALANCER_CLASS = "inspace.cloud/node"
-CILIUM_NODE_CLASS = "io.cilium/node"
+NODE_LOAD_BALANCER_DATAPATH_CLASS = "inspace.cloud/node-datapath"
+NODE_LOAD_BALANCER_DATAPATH_LABEL = "inspace.cloud/node-lb-datapath"
+NODE_LOAD_BALANCER_SERVICE_ID_LABEL = "inspace.cloud/node-lb-service-id"
 SHARD_PATTERN = re.compile(r"^inlb-[0-9a-f]{8}$")
+DATAPATH_NAME_PATTERN = re.compile(r"^inlb-dp-[0-9a-f]{52}$")
 UUID_PATTERN = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
 )
@@ -68,6 +70,40 @@ def fail(message: str) -> None:
 def require(condition: bool, message: str) -> None:
     if not condition:
         fail(message)
+
+
+def node_load_balancer_service_identity(service: dict) -> str:
+    metadata = service.get("metadata", {})
+    namespace = metadata.get("namespace")
+    name = metadata.get("name")
+    uid = metadata.get("uid")
+    require(
+        all(isinstance(value, str) and value for value in (namespace, name, uid)),
+        "Node-LB Service lacks a stable namespace, name, or UID",
+    )
+    return hashlib.sha256(f"{namespace}\0{name}\0{uid}".encode()).hexdigest()[:52]
+
+
+def node_load_balancer_datapath_name(service: dict) -> str:
+    return "inlb-dp-" + node_load_balancer_service_identity(service)
+
+
+def generated_datapath_owner_name(service: dict) -> str | None:
+    metadata = service.get("metadata", {})
+    if metadata.get("labels", {}).get(NODE_LOAD_BALANCER_DATAPATH_LABEL) != "true":
+        return None
+    owner_references = metadata.get("ownerReferences", [])
+    if len(owner_references) != 1:
+        return None
+    owner = owner_references[0]
+    if (
+        owner.get("apiVersion") != "v1"
+        or owner.get("kind") != "Service"
+        or owner.get("controller") is not True
+    ):
+        return None
+    name = owner.get("name")
+    return name if isinstance(name, str) and name else None
 
 
 def active(item: object) -> bool:
@@ -289,21 +325,35 @@ def addresses(node: dict, address_type: str) -> list[str]:
     ]
 
 
-def service_external_ip(service: dict) -> str:
+def service_status_ip(service: dict, expected_mode: str, public: bool) -> str:
     ingress = service.get("status", {}).get("loadBalancer", {}).get("ingress", [])
-    require(len(ingress) == 1, f"Service/{service['metadata']['name']} must publish exactly one ExternalIP")
+    address_kind = "public FIP" if public else "private VIP"
+    require(len(ingress) == 1, f"Service/{service['metadata']['name']} must publish exactly one {address_kind}")
     require(
         isinstance(ingress[0], dict)
         and isinstance(ingress[0].get("ip"), str)
-        and not ingress[0].get("hostname"),
-        f"Service/{service['metadata']['name']} must publish an IP, not a hostname",
+        and not ingress[0].get("hostname")
+        and ingress[0].get("ipMode") == expected_mode,
+        f"Service/{service['metadata']['name']} must publish one IP with ipMode {expected_mode}, not a hostname",
     )
     try:
         parsed = ipaddress.ip_address(ingress[0]["ip"])
     except ValueError as error:
         fail(f"Service/{service['metadata']['name']} returned an invalid ExternalIP: {error}")
-    require(parsed.version == 4 and parsed.is_global, f"Service/{service['metadata']['name']} ExternalIP must be public IPv4")
+    require(parsed.version == 4, f"Service/{service['metadata']['name']} status must be IPv4")
+    if public:
+        require(parsed.is_global, f"Service/{service['metadata']['name']} Proxy status must be public IPv4")
+    else:
+        require(parsed.is_private, f"Service/{service['metadata']['name']} VIP status must be private IPv4")
     return str(parsed)
+
+
+def service_external_ip(service: dict) -> str:
+    return service_status_ip(service, "Proxy", True)
+
+
+def service_private_vip(service: dict) -> str:
+    return service_status_ip(service, "VIP", False)
 
 
 def requirement_map(nodepool: dict) -> dict[str, tuple[str, tuple[str, ...]]]:
@@ -451,12 +501,20 @@ def prove_absent(state: dict, kubeconfig: str, immutable_baseline_path: pathlib.
     cluster = state["clusterName"]
     immutable_nlb_uuids = immutable_load_balancer_baseline(immutable_baseline_path)
     all_services = kubectl(kubeconfig, "-n", "default", "get", "services").get("items", [])
-    service_names = set(SERVICE_SPECS) | LEGACY_SERVICE_NAMES
-    forbidden_services = service_names | {f"{name}-node-lb" for name in service_names}
+    service_names = set(SERVICE_SPECS)
+    journaled_datapaths = state.get("nodeLoadBalancerDatapathServiceNames", [])
+    require(
+        isinstance(journaled_datapaths, list)
+        and all(isinstance(name, str) and DATAPATH_NAME_PATTERN.fullmatch(name) for name in journaled_datapaths)
+        and journaled_datapaths == sorted(set(journaled_datapaths)),
+        "Node-LB datapath Service journal is invalid",
+    )
+    forbidden_services = service_names | set(journaled_datapaths)
     remaining_services = sorted(
         service.get("metadata", {}).get("name")
         for service in all_services
         if service.get("metadata", {}).get("name") in forbidden_services
+        or service.get("metadata", {}).get("labels", {}).get(NODE_LOAD_BALANCER_DATAPATH_LABEL) == "true"
     )
     require(not remaining_services, f"Node-LB Services still exist: {remaining_services}")
 
@@ -562,7 +620,7 @@ def prove_present(
         item.get("metadata", {}).get("name")
         for item in all_default_services
         if item.get("metadata", {}).get("name") in omitted_services
-        or item.get("metadata", {}).get("name") in {f"{name}-node-lb" for name in omitted_services}
+        or generated_datapath_owner_name(item) in omitted_services
     )
     require(not unexpected_omitted, f"deleted Node-LB Service owners still exist: {unexpected_omitted}")
 
@@ -606,6 +664,10 @@ def prove_present(
         require("service.inspace.cloud/node-lb" in metadata.get("finalizers", []), f"Service/{name} lacks the Node-LB cleanup finalizer")
         shard = annotations.get("service.inspace.cloud/node-lb-shard", "")
         require(SHARD_PATTERN.fullmatch(shard) is not None, f"Service/{name} lacks a managed shard identity")
+        require(
+            annotations.get("service.inspace.cloud/node-lb-datapath-active-shard") == shard,
+            f"Service/{name} lacks the durable active datapath marker",
+        )
         firewall_uuid = annotations.get("service.inspace.cloud/node-lb-firewall-uuid", "")
         firewall_hash = annotations.get("service.inspace.cloud/node-lb-firewall-hash", "")
         require(UUID_PATTERN.fullmatch(firewall_uuid) is not None, f"Service/{name} lacks a valid firewall UUID")
@@ -621,20 +683,38 @@ def prove_present(
             "uid": metadata.get("uid"),
         }
 
-        shadow_name = f"{name}-node-lb"
-        shadow = kubectl(kubeconfig, "-n", "default", "get", "service", shadow_name)
-        shadow_metadata = shadow.get("metadata", {})
-        shadow_spec = shadow.get("spec", {})
-        require(shadow_spec.get("loadBalancerClass") == CILIUM_NODE_CLASS, f"Service/{shadow_name} must select Cilium Node IPAM")
-        require(shadow_spec.get("allocateLoadBalancerNodePorts") is False, f"Service/{shadow_name} must disable NodePorts")
-        require(shadow_spec.get("externalTrafficPolicy") == "Cluster", f"Service/{shadow_name} must use Cluster traffic policy")
-        require(all(port.get("nodePort", 0) == 0 for port in shadow_spec.get("ports", [])), f"Service/{shadow_name} unexpectedly allocated a NodePort")
-        require(shadow_metadata.get("labels", {}).get("inspace.cloud/node-lb-shadow") == "true", f"Service/{shadow_name} lacks the shadow label")
+        datapath_identity = node_load_balancer_service_identity(service)
+        datapath_name = node_load_balancer_datapath_name(service)
+        datapath = kubectl(kubeconfig, "-n", metadata["namespace"], "get", "service", datapath_name)
+        datapath_metadata = datapath.get("metadata", {})
+        datapath_spec = datapath.get("spec", {})
         require(
-            shadow_metadata.get("labels", {}).get("inspace.cloud/node-lb-service-uid") == metadata.get("uid"),
-            f"Service/{shadow_name} lacks the exact owner UID label",
+            DATAPATH_NAME_PATTERN.fullmatch(datapath_name) is not None
+            and datapath_metadata.get("name") == datapath_name
+            and datapath_metadata.get("namespace") == metadata.get("namespace"),
+            f"Service/{datapath_name} does not use the canonical same-namespace datapath identity",
         )
-        owner_references = shadow_metadata.get("ownerReferences", [])
+        require(
+            datapath_spec.get("loadBalancerClass") == NODE_LOAD_BALANCER_DATAPATH_CLASS,
+            f"Service/{datapath_name} must select the CCM-managed private datapath class",
+        )
+        require(datapath_spec.get("allocateLoadBalancerNodePorts") is False, f"Service/{datapath_name} must disable NodePorts")
+        require(datapath_spec.get("externalTrafficPolicy") == "Cluster", f"Service/{datapath_name} must use Cluster traffic policy")
+        require(not datapath_spec.get("externalIPs"), f"Service/{datapath_name} must use status VIPs, not deprecated externalIPs")
+        require(all(port.get("nodePort", 0) == 0 for port in datapath_spec.get("ports", [])), f"Service/{datapath_name} unexpectedly allocated a NodePort")
+        require(
+            datapath_metadata.get("labels", {}).get(NODE_LOAD_BALANCER_DATAPATH_LABEL) == "true",
+            f"Service/{datapath_name} lacks the exact datapath label",
+        )
+        require(
+            datapath_metadata.get("labels", {}).get(NODE_LOAD_BALANCER_SERVICE_ID_LABEL) == datapath_identity,
+            f"Service/{datapath_name} lacks the exact Service identity label",
+        )
+        require(
+            datapath_metadata.get("annotations", {}).get("service.inspace.cloud/node-lb-datapath-shard") == shard,
+            f"Service/{datapath_name} does not record its exact shard",
+        )
+        owner_references = datapath_metadata.get("ownerReferences", [])
         require(
             len(owner_references) == 1
             and owner_references[0].get("apiVersion") == "v1"
@@ -643,23 +723,24 @@ def prove_present(
             and owner_references[0].get("uid") == metadata.get("uid")
             and owner_references[0].get("controller") is True
             and owner_references[0].get("blockOwnerDeletion") is True,
-            f"Service/{shadow_name} lacks exact controller ownership",
-        )
-        selector = (
-            "inspace.cloud.node-restriction.kubernetes.io/node-lb=true,"
-            f"inspace.cloud.node-restriction.kubernetes.io/cluster={cluster},"
-            f"inspace.cloud.node-restriction.kubernetes.io/shard={shard},"
-            "inspace.cloud.node-restriction.kubernetes.io/ready=true"
+            f"Service/{datapath_name} lacks exact controller ownership",
         )
         require(
-            shadow_metadata.get("annotations", {}).get("io.cilium.nodeipam/match-node-labels") == selector,
-            f"Service/{shadow_name} does not select only the ready managed shard",
+            datapath_spec.get("selector") == spec.get("selector")
+            and len(datapath_spec.get("ports", [])) == len(expected_ports)
+            and {
+                (port.get("name"), port.get("protocol"), port.get("port"), port.get("targetPort"))
+                for port in datapath_spec.get("ports", [])
+            } == expected_ports,
+            f"Service/{datapath_name} must mirror the parent selector and ports",
         )
+        private_vip = service_private_vip(datapath)
         require(
-            shadow.get("status", {}).get("loadBalancer", {})
-            == service.get("status", {}).get("loadBalancer", {}),
-            f"Service/{name} status is not the exact owned shadow status",
+            private_vip != external_ip,
+            f"Service/{name} public Proxy FIP and Service/{datapath_name} private VIP must differ",
         )
+        service_results[name]["privateIP"] = private_vip
+        service_results[name]["datapathService"] = datapath_name
 
     traefik = service_results["inspace-e2e-node-traefik"]
     conflict = service_results["inspace-e2e-node-shared-conflict"]
@@ -820,10 +901,16 @@ def prove_present(
             f"Node/{node['metadata']['name']} lost the dedicated Node-LB taint",
         )
         expected_external_ip = service_results[service_names[0]]["ip"]
+        expected_internal_ip = service_results[service_names[0]]["privateIP"]
         require(addresses(node, "ExternalIP") == [expected_external_ip], f"Node/{node['metadata']['name']} ExternalIP differs from its Services")
+        require(addresses(node, "InternalIP") == [expected_internal_ip], f"Node/{node['metadata']['name']} InternalIP differs from its datapath Services")
         require(
-            all(service_results[name]["ip"] == expected_external_ip for name in service_names),
-            f"all Services on shard {shard} must publish its exact Node ExternalIP",
+            all(
+                service_results[name]["ip"] == expected_external_ip
+                and service_results[name]["privateIP"] == expected_internal_ip
+                for name in service_names
+            ),
+            f"all Services on shard {shard} must publish its exact public Proxy FIP and private node VIP",
         )
 
     app_pods = kubectl(kubeconfig, "-n", "default", "get", "pods", "-l", "app=inspace-e2e-node-lb").get("items", [])
@@ -899,8 +986,11 @@ def prove_present(
             and floating_ip.get("assigned_to_resource_type") == "virtual_machine"
             and floating_ip.get("enabled") is True
             and floating_ip.get("type") == "public"
-            and floating_ip.get("address") == service_results[services_by_shard[shard][0]]["ip"],
-            f"VM/{expected_name} floating IP does not match its exact Node and Service ExternalIP",
+            and floating_ip.get("address") == service_results[services_by_shard[shard][0]]["ip"]
+            and floating_ip.get("assigned_to_private_ip") == internal_ips[0]
+            and floating_ip.get("assigned_to_private_ip")
+            == service_results[services_by_shard[shard][0]]["privateIP"],
+            f"VM/{expected_name} floating IP does not match its exact public Proxy and private DNAT/VIP pair",
         )
         require(vm.get("public_ipv4") in (None, ""), f"VM/{expected_name} must not copy the reserved FIP into public_ipv4")
         expected_vm_uuids.add(vm_uuid)
@@ -1039,7 +1129,7 @@ def prove_present(
     require(
         sorted(load_balancer.get("uuid") for load_balancer in active_load_balancers)
         == baseline["loadBalancers"],
-        "Cilium Node IPAM acceptance must not create an InSpace NLB",
+        "public NodeLB acceptance must not create an InSpace NLB",
     )
 
     return {

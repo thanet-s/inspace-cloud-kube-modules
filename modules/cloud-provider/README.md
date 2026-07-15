@@ -57,10 +57,9 @@ automatic-update shutdown still run. Omit it or set it to `false` for the
 production default.
 
 - RKE2's packaged Cilium CNI in native-routing mode, with direct node routes,
-  full kube-proxy replacement, LB-IPAM and L2 announcements. Cilium Node IPAM
-  is enabled only for CCM-owned public node-load-balancer shadow Services;
-  application manifests use `loadBalancerClass: inspace.cloud/node`, never
-  raw `io.cilium/node`.
+  full kube-proxy replacement, LB-IPAM and L2 announcements. Public NodeLB
+  application manifests use `loadBalancerClass: inspace.cloud/node`; CCM
+  generates the separate private-VIP datapath Service.
 - An operational continuous bootstrap CLI and a standard Kubernetes CCM
   command.
 
@@ -205,11 +204,13 @@ an adoption candidate. An uncertain API response is resolved by listing and
 validating the exact deterministic name and owner/spec record on the next loop,
 not by blindly repeating the POST.
 
-New control-plane owner/spec records use schema v7 because Cilium Node IPAM is
-part of their immutable RKE2 cloud-init contract. Bastion records remain at v6.
-Reconciliation does not adopt an older fixed VM into v7; use an explicit
+New control-plane owner/spec records use schema v8 because kube-vip's explicit
+5/3/1-second election timing and 500-millisecond ARP cadence are part of their
+immutable RKE2 cloud-init contract. Bastion records remain at v6.
+Reconciliation does not adopt an older fixed VM into v8; use an explicit
 destroy/recreate lifecycle. Owned teardown continues to recognize supported
-older fixed-node schemas, including matched v6 bastion/control-plane records.
+older fixed-node schemas, including schema v7 control planes paired with the
+unchanged v6 bastion.
 
 New bootstrap FIPs are `<metadata.name>-bastion-ip` and
 `<metadata.name>-cp0-ip` through `-cp2-ip`. The two firewall display names are
@@ -379,14 +380,23 @@ match the finite provider catalog.
 
 CCM never exposes application workers directly. It creates static, tainted AMD
 EPYC NodePools with a 30 GiB root disk and a hardened NodeClass cloned from the
-configured base. A controller-owned `io.cilium/node` shadow Service carries an
-exact shard selector. CCM revalidates the complete rendered NodePool profile,
+configured base. For every user Service it creates an exact-owned
+same-namespace `inlb-dp-<service-identity>` Service with
+`loadBalancerClass: inspace.cloud/node-datapath`. The identity is the first 52
+lowercase hex characters of SHA-256 over
+`namespace NUL name NUL Service-UID`; the child repeats it in the
+`inspace.cloud/node-lb-service-id` label and has an exact controller owner
+reference to that parent. CCM revalidates the complete rendered NodePool profile,
 including its `NoSchedule` taint, and the exact
 Node→NodeClaim→NodePool→NodeClass ownership chain before accepting a node. Only
 healthy nodes with one authoritative FIP, Karpenter's valid private base
-firewall, the shared cluster ICMP firewall, and every active Service firewall
-assignment receive the protected ready label consumed by Cilium. The user
-Service status mirrors the shadow status. TCP and UDP are supported; SCTP and
+firewall, and the shared cluster ICMP firewall are eligible for the protected
+shard-ready label. Each per-Service firewall is audited as a separate ordered
+activation gate after that Service's private VIP exists. The generated Service publishes paired private Node
+InternalIPs with `ipMode: VIP`; the user Service publishes the corresponding
+public FIPs with `ipMode: Proxy`. InSpace DNAT rewrites the public destination
+to the private IP before Cilium, so Cilium programs only the private frontend.
+TCP and UDP are supported; SCTP and
 `externalTrafficPolicy: Local` are rejected. The static NodePool limit permits
 exactly one temporary surge node so Karpenter drift replacement can converge
 while the steady-state count remains `nodesPerShard`.
@@ -396,19 +406,27 @@ Node-LB identity and readiness use
 and `/ready` labels, so the RKE2 NodeRestriction admission plugin is part of
 the security boundary. That stops a kubelet from self-advertising; it does not
 constrain a cluster administrator.
-Multi-tenant clusters must use admission and RBAC to reserve direct
-`io.cilium/node` Services, `io.cilium.nodeipam/*` annotations,
-`Service.spec.externalIPs`, protected provider annotations/finalizers, and
+Multi-tenant clusters must use admission and RBAC to reserve the internal
+`inspace.cloud/node-datapath` class, `Service.spec.externalIPs`, protected
+provider annotations/finalizers, and
 Node-LB tolerations/selectors. The generated `NoSchedule` taint is a placement
 guard, not tenant isolation.
 
 The user Service must have a selector and explicitly set
 `allocateLoadBalancerNodePorts: false`; CCM does not mirror manually managed
-EndpointSlices, and this dataplane does not consume Kubernetes NodePorts.
+EndpointSlices, and this dataplane consumes neither Kubernetes NodePorts nor
+`externalIPs`.
 `externalIPs`, `loadBalancerIP`, non-zero `nodePort` values, and non-IPv4
 source ranges are rejected before CCM creates Karpenter capacity. During a
-shard migration, the previous shadow status and nodes stay active until the
-replacement replicas are healthy and Cilium publishes their ExternalIPs.
+shard migration, the previous datapath stays active while replacement capacity
+is prepared, but final cutover is intentionally fail-closed and
+break-before-make. CCM detaches and reads back the old Service firewall before
+removing its status pair. It then records
+`service.inspace.cloud/node-lb-datapath-active-shard` for the replacement before
+publishing any new private VIP. Activation proceeds as exact private VIP,
+persisted assignment fence, exact firewall assignment readback, then public
+Proxy status. Node removal uses the reverse safety boundary: stale edge detach
+and readback precede public/private status shrink.
 
 Each Service firewall uses the deterministic name
 `inlb-<cluster-hash>-<Service-UID>-<policy-hash>`. The full Service UID prevents
@@ -428,6 +446,12 @@ Node-LB Service and all managed NodePool/NodeClaim/Node capacity are absent.
 Deterministic ownership and spaced absence readback cover create, replacement,
 crash recovery, and deletion without relying on the firewall description that
 InSpace omits.
+An ambiguous Service-firewall assignment retains its durable marker and private
+VIP for a five-minute grace plus three consecutive empty assignment readbacks;
+any late assignment resets that proof. Emergency detach uses the persisted UUID,
+deterministic Service identity, and billing account even if the firewall rules
+have drifted, while normal adoption and deletion still require the exact policy
+hash.
 
 For the paid NLB path, if either public marker is removed, CCM deletes every deterministically owned
 FIP/NLB before handing the Service to another implementation. Discovery and
