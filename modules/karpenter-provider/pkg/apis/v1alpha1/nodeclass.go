@@ -28,7 +28,8 @@ const (
 // FirewallProfile controls which additional firewall assignments are valid
 // for a node. The NodeClass firewall itself is always the same strict private
 // worker firewall; the public load-balancer profile only permits the shared
-// cluster ICMP firewall and separately owned Service firewalls in addition.
+// cluster ICMP firewall and at most one stable, mutable shard firewall in
+// addition.
 type FirewallProfile string
 
 // EffectiveFirewallProfile preserves the original private-worker behavior for
@@ -94,7 +95,8 @@ type InSpaceNodeClassSpec struct {
 	FirewallUUID string `json:"firewallUUID"`
 	// FirewallProfile defaults to private-worker. public-node-load-balancer
 	// keeps FirewallUUID private and permits only the CCM-owned cluster ICMP
-	// firewall and Service ingress firewalls that pass provider audit.
+	// firewall and one CCM-owned aggregate shard firewall that pass provider
+	// audit.
 	FirewallProfile FirewallProfile `json:"firewallProfile,omitempty"`
 	// ImageSelector selects a stock operating-system image supported by the VM
 	// create API. The first release supports Ubuntu 24.04 only.

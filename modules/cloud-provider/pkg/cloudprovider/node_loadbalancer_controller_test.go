@@ -8,7 +8,6 @@ import (
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
@@ -248,12 +247,19 @@ func TestNodeLoadBalancerReconcileSmokeCreatesOwnedKarpenterAndDatapathResources
 		}
 	}
 	stored, _ := provider.kubeClient.CoreV1().Services("default").Get(ctx, "web", metav1.GetOptions{})
-	if !containsString(stored.Finalizers, nodeLoadBalancerFinalizer) || stored.Annotations[annotationNodeLoadBalancerShard] == "" ||
-		stored.Annotations[annotationNodeLoadBalancerFirewallUUID] == "" {
+	if !containsString(stored.Finalizers, nodeLoadBalancerFinalizer) || stored.Annotations[annotationNodeLoadBalancerShard] == "" {
 		t.Fatalf("stored Service metadata = %#v", stored.ObjectMeta)
 	}
-	if _, err := provider.kubeClient.CoreV1().Services("default").Get(ctx, nodeLoadBalancerDatapathName(stored), metav1.GetOptions{}); !apierrors.IsNotFound(err) {
-		t.Fatalf("datapath Service was published before ready capacity: %v", err)
+	if stored.Annotations[annotationNodeLoadBalancerFirewallUUID] != "" ||
+		stored.Annotations[annotationNodeLoadBalancerFirewallHash] != "" {
+		t.Fatalf("stable controller persisted legacy per-Service firewall metadata: %#v", stored.Annotations)
+	}
+	child, err := provider.kubeClient.CoreV1().Services("default").Get(ctx, nodeLoadBalancerDatapathName(stored), metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("closed datapath Service was not staged before firewall creation: %v", err)
+	}
+	if len(child.Status.LoadBalancer.Ingress) != 0 || len(stored.Status.LoadBalancer.Ingress) != 0 {
+		t.Fatalf("datapath was published before ready capacity: child=%#v parent=%#v", child.Status.LoadBalancer, stored.Status.LoadBalancer)
 	}
 	nodeClassName := managedNodeLoadBalancerName(provider.config.ClusterID, "node-lb")
 	nodeClass, err := provider.dynamicClient.Resource(nodeClassGVR).Get(ctx, nodeClassName, metav1.GetOptions{})
@@ -288,20 +294,29 @@ func TestNodeLoadBalancerReconcileSmokeCreatesOwnedKarpenterAndDatapathResources
 	if len(api.createdFirewalls) != 2 {
 		t.Fatalf("created firewalls = %#v", api.createdFirewalls)
 	}
-	createdICMP, createdService := 0, 0
+	createdICMP := 0
+	createdShard := 0
 	for _, request := range api.createdFirewalls {
 		firewall := inspace.Firewall{
-			DisplayName: request.DisplayName, BillingAccountID: request.BillingAccountID, Rules: request.Rules,
+			DisplayName: request.DisplayName, Description: request.Description,
+			BillingAccountID: request.BillingAccountID, Rules: request.Rules,
 		}
 		if inspace.ValidateNodeLoadBalancerClusterICMPFirewall(firewall, provider.config.ClusterID, provider.config.BillingAccountID) == nil {
 			createdICMP++
 		}
-		if inspace.ValidateNodeLoadBalancerServiceFirewall(firewall, provider.config.ClusterID, provider.config.BillingAccountID) == nil {
-			createdService++
+		hash, hashErr := inspace.NodeLoadBalancerShardFirewallSpecHash(request.Rules)
+		if hashErr == nil && inspace.ValidateNodeLoadBalancerShardFirewall(
+			firewall,
+			provider.config.ClusterID,
+			stored.Annotations[annotationNodeLoadBalancerShard],
+			provider.config.BillingAccountID,
+			hash,
+		) == nil {
+			createdShard++
 		}
 	}
-	if createdICMP != 1 || createdService != 1 {
-		t.Fatalf("created firewall contracts: ICMP=%d Service=%d requests=%#v", createdICMP, createdService, api.createdFirewalls)
+	if createdICMP != 1 || createdShard != 1 {
+		t.Fatalf("created firewall contracts: ICMP=%d shard=%d requests=%#v", createdICMP, createdShard, api.createdFirewalls)
 	}
 
 	shard := stored.Annotations[annotationNodeLoadBalancerShard]

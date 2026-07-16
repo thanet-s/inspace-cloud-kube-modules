@@ -189,20 +189,31 @@ reserved for CCM-generated Services. The CCM
 assigns shared Services by conflict-free `(protocol, port)` claims or gives
 dedicated Services an isolated static Karpenter shard. Generated nodes use AMD
 EPYC, a 30 GiB disk, a `NoSchedule` taint, and the private base firewall.
-Per-Service public firewalls contain exact TCP/UDP rules only. One separately
-owned cluster firewall containing a single portless inbound ICMP-from-Any rule
-is reused by every authorized Node-LB VM. `loadBalancerSourceRanges` affects
-only Service TCP/UDP rules and never restricts ping.
+Each shard owns one mutable public firewall with the stable name
+`inlb-<cluster-ownership-hash>-shard-<shard-hash>`. Its policy is the canonical
+union of the shard's unique TCP/UDP `(protocol, port)` claims; each rule carries
+the owning Service's exact canonical IPv4 `loadBalancerSourceRanges`, or Any
+when the field is empty. The policy hash is stored separately from the stable
+firewall name. CCM changes the rules in place with `PUT`, preserves provider
+rule UUIDs for unchanged `(protocol, port)` claims, and requires exact
+authoritative readback before publishing a new edge. One separately owned
+cluster firewall containing a single portless inbound ICMP-from-Any rule is
+reused by every authorized Node-LB VM. Source ranges affect only TCP/UDP rules
+and never restrict ping. An authorized Node-LB VM therefore has exactly its
+private base firewall, the shared cluster ICMP firewall, and at most one shard
+public firewall.
 
 The CCM eligibility gate uses protected
 `inspace.cloud.node-restriction.kubernetes.io/*` labels. CCM validates the full
 rendered NodePool profile, including its taint, plus the exact
 Node→NodeClaim→NodePool→NodeClass and FIP identity chain. Advertising requires
 Node Ready, Karpenter's valid private base-firewall contract, the shared ICMP
-assignment, and the protected CCM readiness label. Each Service firewall is a
-separate activation gate and is never used to bootstrap that shard-wide label.
-A failure in node authorization or a Service edge first detaches the affected
-public firewall and then withdraws public/private status.
+assignment, the exact shard-firewall policy and assignment, and the protected
+CCM readiness label. A node that becomes NotReady loses the protected readiness
+label and is withdrawn from public/private status, but CCM deliberately keeps
+the shard firewall attached. This avoids a cloud firewall detach/reattach loop
+while kubelet reachability recovers. Detachment is reserved for node deletion
+or replacement and last-owner shard cleanup.
 
 This controller contract assumes trusted cluster administrators. For
 multi-tenancy, admission and RBAC must reserve the internal
@@ -225,30 +236,89 @@ SHA-256 over `namespace NUL name NUL Service-UID`, is repeated in the
 `inspace.cloud/node-lb-service-id` label, and is bound by an exact controller
 owner reference. CCM records
 `service.inspace.cloud/node-lb-datapath-active-shard` before publishing any
-private VIP. Additions then converge in the strict order: exact private VIP,
-persisted firewall-assignment fence, exact Service-firewall assignment readback,
-and finally public Proxy status. Removals reverse the functional edge first:
-CCM detaches and reads back stale Service-firewall assignments before removing
-public or private status. InSpace DNAT therefore lands on Cilium's private
-frontend without NodePorts or `externalIPs`, and no crash boundary leaves a
-Service firewall exposing a host port without its private frontend.
+private VIP. A new or edited Service first stages and verifies the exact child
+spec while its VIP status is empty. CCM then persists a pending
+aggregate-policy fence, updates the same shard firewall UUID in place, verifies
+its exact policy and assignment, and only then publishes the private VIP and
+new public Proxy status. Adding or
+removing one member therefore expands or shrinks the aggregate policy while
+preserving sibling NodePool, VM, FIP, private child, public status, and traffic
+identity. Removing a member first commits and verifies the narrower aggregate
+policy, then withdraws that Service's public/private status and child; siblings
+remain active. InSpace DNAT therefore lands on Cilium's private frontend without
+NodePorts or `externalIPs`, and no crash boundary makes a public rule reachable
+before its exact private frontend is safe to publish.
 
-Migration prepares replacement capacity and its firewall while detached, but
-the fixed per-Service child makes final cutover deliberately break-before-make:
-the old edge and statuses are withdrawn before the replacement marker/private
-VIP/firewall/public-status sequence begins. NodeLB migration is fail-closed, not
-hitless.
-Firewall creation persists a deterministic pre-POST intent. Ambiguous or
-eventually consistent readback requires a five-minute grace period followed by
-three absence observations at least 30 seconds apart; visibility resets that
-evidence. Firewall assignment also persists a pre-mutation fence. An ambiguous
-assignment keeps the marker and private VIP until a five-minute grace and three
-consecutive empty assignment observations pass; any late assignment resets the
-proof. Service finalization independently requires three spaced
-authoritative absence observations, so a transient list omission cannot orphan
-a billable firewall. The cluster ICMP identity is persisted on the generated
-NodeClass and is deleted only after the last finalized Node-LB Service and all
-managed NodePool, NodeClaim, and Node capacity are absent.
+The shard NodePool is the durable mutation anchor. It stores the shard firewall
+identity, full SHA-256 applied membership/policy ledger, and pending
+membership/policy fence. The CCM-owned `inspace.cloud/node-lb-state` finalizer
+keeps this anchor alive until cloud cleanup is authoritatively complete.
+After a timeout or controller restart, authoritative readback decides whether a
+pending update reached the cloud; CCM permanently retains the issued fence and
+never repeats an ambiguous rule update merely because time elapsed. It resumes
+only after the pending policy is observable or explicit operator resolution.
+A fresh shard attaches its aggregate firewall once while the node is not
+publicly advertised, verifies assignment and Node recovery, and then enables the
+protected readiness label and statuses. Migration first closes the old
+functional child and removes its UID from the old ledger. It then retires the
+old shard when unused and prepares replacement capacity and its firewall while
+the Service remains detached; cutover is fail-closed and break-before-make.
+
+A port or source-range edit uses the same closed restage fence: the functional
+child and public status read back empty before the new member hash can enter the
+aggregate ledger. The child remains empty through the in-place `PUT`, policy
+promotion, and assignment readback, so an old wider rule cannot reach the
+edited Service after a crash.
+
+Firewall creation persists deterministic staged intent and a separate issued
+marker before the paid POST. If that POST has no authoritative readback, CCM
+keeps the NodePool or NodeClass finalizer and refuses every second create; no
+finite run of empty list responses can prove that the original request did not
+commit later. Reconciliation resumes only when the exact stable-name resource
+becomes observable or an operator resolves the attempt after cloud-side proof.
+Known-resource deletion still requires three absence observations at least 30
+seconds apart, and visibility resets that evidence. Service finalization
+requires the Service UID to be absent from the
+applied shard membership ledger as well as three spaced authoritative absence
+observations for its own exposure. The final Service and deleting NodePool
+remain cleanup anchors: CCM withdraws the Service, deletes node capacity,
+proves the aggregate firewall is unassigned, deletes that firewall, requires
+three spaced absence reads, and only then removes both finalizers. The cluster
+ICMP identity is persisted on the generated NodeClass. Its
+`inspace.cloud/node-lb-cluster-state` finalizer is a separate durable ledger
+anchor: external deletion first fails the cluster closed, drains every shard,
+proves ICMP absence, and records a Service-side handoff before finalizer
+release. Normal last-owner cleanup deletes the generated NodeClass only after
+all managed NodePool, NodeClaim, and Node capacity is absent.
+
+### Recovering a permanently fenced CCM mutation
+
+A retained issued marker is a safety condition, not a retry timer. Pause the
+CCM before operator recovery and save the complete Service, generated NodePool,
+and generated NodeClass YAML. Audit InSpace in the configured location and
+billing account using both the deterministic firewall name and every persisted
+UUID. If the exact resource exists, do not clear state: resume CCM so it can
+adopt, promote, or delete that resource normally.
+
+Repeated empty list responses alone are not proof that an issued POST or PUT
+cannot commit later. Clear a fence only after InSpace or provider support has
+confirmed that the request reached a terminal no-commit result, or after the
+exact resource was deleted and the original operation is known to be terminal.
+For an ambiguous PUT, the observed cloud policy must exactly equal either the
+persisted applied policy or pending policy; any third policy requires manual
+cloud repair or support escalation before controller state is changed.
+
+After that external proof, remove only the transaction annotations. For a
+shard NodePool these are the `node-lb-shard-firewall-pending-*`,
+`node-lb-shard-firewall-issued-at`,
+`node-lb-shard-firewall-create-absence-*`, and
+`node-lb-shard-firewall-cleanup-observed-uuid` annotations. For the generated
+NodeClass they are `node-lb-icmp-pending-firewall-*`,
+and `node-lb-icmp-create-issued-at`. Never remove the applied UUID/hash/ledger,
+ownership labels, or CCM finalizers during
+recovery. Resume CCM and let it perform its normal authoritative readback and
+spaced cleanup proof. Blindly removing a finalizer can orphan a billable
+firewall.
 
 Public exposure also retains the explicit, paid, TCP-only InSpace NLB path documented in the
 [public Service example](charts/inspace-cloud-kube-modules/examples/service-public-nlb.yaml).
@@ -293,10 +363,21 @@ requires exact readback.
 Version 3 ownership records persist the deterministic floating-IP name but omit
 `publicIPv4`; the live assignment remains authoritative. The returned NodeClaim
 stores the exact name, address, and billing account as durable orphan-cleanup
-identity. Deletion unassigns and deletes that floating IP first, deletes the VM
-only after FIP convergence, proves canonical VM absence, and finally removes
-every stale firewall assignment for the exact VM UUID. The shared firewall
-itself is not deleted with an individual worker.
+identity. Deletion always dispatches the exact VM UUID first, proves core
+Get/List/VPC absence, removes only the exact Floating IP, proves VM and
+FIP-assignment absence again, and finally removes every stale firewall
+assignment for the UUID. The shared firewall itself is not deleted with an
+individual worker.
+
+Karpenter VM creation also uses a durable one-POST fence. The SDK response UUID
+is written and exactly read back before protection or materialization; an
+independent rollback CAS prevents a retry from racing successful adoption. The
+provider finalizer tracks an unknown auto-FIP through the original ambiguity
+window, including a pre-existing target/FIP association during adoption. An
+issued UUID-less ambiguous POST is never retried or auto-released from empty
+lists. Use the issue-bound operator resolution protocol in the
+[Karpenter provider runbook](modules/karpenter-provider/README.md#recover-an-unresolved-vm-create-fence);
+never edit the opaque fence JSON or remove its finalizer manually.
 
 Full-cluster acceptance binds the VM UUID to the Kubernetes Node provider ID,
 requires its sole `InternalIP` to belong to the configured VPC, and requires the

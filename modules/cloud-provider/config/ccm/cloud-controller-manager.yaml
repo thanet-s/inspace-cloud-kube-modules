@@ -32,7 +32,7 @@ rules:
     verbs: ["get", "list"]
   - apiGroups: ["karpenter.inspace.cloud"]
     resources: ["inspacenodeclasses"]
-    verbs: ["get", "create", "update"]
+    verbs: ["get", "create", "update", "delete"]
   - apiGroups: [""]
     resources: ["events"]
     verbs: ["create", "patch", "update"]

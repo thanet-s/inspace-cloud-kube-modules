@@ -12,11 +12,11 @@ InSpace VPC for TCP/6443 and TCP/9345; it does not use a control-plane NLB or a
 public API address. Because InSpace has no managed outbound NAT, each control
 plane and Karpenter worker still needs one floating IPv4 for egress. Ordinary
 node addresses must have no public inbound firewall rules; CCM-managed
-load-balancer nodes retain the private base firewall, receive exact
-per-Service TCP/UDP firewalls, and reuse one cluster-wide portless ICMP-from-Any
-firewall. Bastion SSH and ICMP use Any by default or one explicitly configured
-management `/32`; the private API tunnel enters through the separately
-firewalled bastion only.
+load-balancer nodes retain the private base firewall, reuse one cluster-wide
+portless ICMP-from-Any firewall, and receive at most one mutable aggregate
+TCP/UDP firewall for their shard. Bastion SSH and ICMP use Any by default or one
+explicitly configured management `/32`; the private API tunnel enters through
+the separately firewalled bastion only.
 
 Set each `InSpaceNodeClass.spec.rke2.server` to the canonical literal private
 VIP URL on port 9345. Its existing worker firewall must allow all TCP, UDP, and
@@ -141,40 +141,82 @@ provide at least `1` core and `4Gi`. Generated static NodePools always use
 AMD EPYC, Linux/amd64, on-demand capacity, a 30 GiB root disk, and the
 `inspace.cloud/node-lb=true:NoSchedule` taint. Application pods stay on private
 workload nodes; Cilium forwards traffic from the LB nodes with
-`externalTrafficPolicy: Cluster`. CCM creates one exact TCP/UDP-only ingress
-firewall per Service and attaches one reusable cluster-wide firewall containing
-exactly one portless inbound ICMP-from-Any rule. `loadBalancerSourceRanges`
-restricts only that Service's TCP/UDP rules; it never restricts ping. InSpace
-does not expose ICMP type/code filtering, so the shared rule permits all IPv4
-ICMP from Any.
+`externalTrafficPolicy: Cluster`. Every shard owns one mutable public firewall
+named `inlb-<cluster-ownership-hash>-shard-<shard-hash>`. Its policy is the
+canonical union of the shard's unique TCP/UDP `(protocol, port)` claims. Each
+rule uses the owning Service's exact canonical IPv4
+`loadBalancerSourceRanges`, or Any when the field is empty. The stable name and
+UUID do not change with policy updates. CCM also attaches one reusable
+cluster-wide firewall containing exactly one portless inbound ICMP-from-Any
+rule. Source ranges never restrict ping. InSpace does not expose ICMP type/code
+filtering, so the shared rule permits all IPv4 ICMP from Any. A Node-LB VM has
+exactly the private base and cluster ICMP firewalls, plus at most one shard
+aggregate firewall.
 
 A node is advertised only while its full NodePool/NodeClaim/NodeClass identity
 is authoritative, it is Ready with exactly one authoritative FIP, Karpenter's
-private base-firewall contract is valid, and the shared ICMP assignment is
-visible. Per-Service firewalls are not part of this shard-wide readiness label;
-CCM audits each one as a separate activation gate after its private VIP exists.
-Any node-identity or shared-infrastructure drift removes the protected ready
-label. Karpenter may use one temporary surge node during drift replacement;
-steady state remains the configured shard replica count.
+private base-firewall contract is valid, and the shared ICMP and exact aggregate
+assignments are visible. Any node-identity or shared-infrastructure drift
+removes the protected ready label. If the Node becomes NotReady, CCM withdraws
+its readiness and public/private status but leaves the aggregate firewall
+attached while kubelet connectivity recovers. Detachment is reserved for node
+deletion or replacement and last-owner shard cleanup. Karpenter may use one
+temporary surge node during drift replacement; steady state remains the
+configured shard replica count.
 
 Public-node Services require a non-empty selector and explicit
 `allocateLoadBalancerNodePorts: false`. Selectorless Services, allocated
 NodePorts, `externalIPs`, `loadBalancerIP`, and non-IPv4 source ranges fail
-before any node capacity is created. CCM keeps the previous shard advertised
-during replacement-capacity preparation, then performs a fail-closed,
-break-before-make cutover. It withdraws the old Service firewall and status pair
-before storing `service.inspace.cloud/node-lb-datapath-active-shard` for the
-replacement. Activation then proceeds as private VIP, persisted assignment
-fence, exact Service-firewall assignment readback, and public Proxy status.
-Node additions follow that order; removals detach and read back the stale edge
-before either status shrinks.
+before any node capacity is created. Shard migration is fail-closed and
+break-before-make. CCM closes and reads back the functional child, removes the
+Service UID from the old aggregate ledger, and retires the old shard when it has
+no peer. It then creates replacement capacity while the child remains closed,
+proves the exact aggregate policy and assignment, and only then publishes the
+replacement private VIP and public Proxy status.
+
+For a fresh shard, CCM attaches the aggregate once while the node is not
+publicly advertised, verifies assignment and Node recovery, and then enables
+readiness and status. It does not detach and reattach the policy during ordinary
+readiness loss.
+
+For an established shared shard, CCM changes the aggregate in place with
+`PUT`, retaining provider UUIDs for unchanged `(protocol, port)` rules and
+requiring exact cloud readback. Adding a Service stages its child spec with an
+empty VIP status, widens the aggregate, then publishes the private VIP and new
+public status. Removing one
+first narrows the aggregate, then removes only that Service's statuses and
+child. Sibling NodePool, VM, FIP, firewall UUID, status, and traffic identities
+remain unchanged. The last Service anchors cleanup until its exposure and
+capacity are gone, and three spaced authoritative reads prove the aggregate
+firewall is unassigned and deleted. A CCM NodePool finalizer preserves the full
+SHA-256 applied ledger and any pending cloud mutation throughout that cleanup.
+CCM records a Service-side shard-materialization handoff only after an exact
+NodePool/finalizer readback, so lost or drifted state cannot be mistaken for a
+never-created prospective shard. New surge/replacement nodes stay ineligible
+through their firewall-attach pass without withdrawing protected siblings.
+Before either aggregate or shared-ICMP firewall POST, CCM persists a durable
+issued marker. An ambiguous issued create is never retried from empty list
+responses; its state finalizer remains until the exact resource is observable
+or the attempt is manually resolved after cloud-side proof.
+An ambiguous aggregate-policy PUT is likewise never reissued on a timer; CCM
+waits for its exact pending policy or explicit operator resolution so an older
+delayed request cannot overwrite a newer generation.
+The generated NodeClass independently uses the
+`inspace.cloud/node-lb-cluster-state` finalizer to retain the shared ICMP
+firewall ledger. Deleting it triggers a fail-closed drain of every managed
+shard; CCM releases it only after spaced cloud-absence proof and a durable
+Service-side cleanup handoff.
+Port and source-range edits also close the owning child first and keep it empty
+until the replacement member hash, aggregate `PUT`, and assignment readback are
+all authoritative; an old wider rule cannot reach the edited frontend.
 
 Disabling Node-LB or uninstalling its CCM/Karpenter controllers is not a
 teardown operation. First delete every `inspace.cloud/node` Service and wait
 for its provider finalizer, datapath Service, managed NodePools/NodeClaims/Nodes,
-FIPs, and both Service and shared ICMP firewalls to disappear. Removing the
-controllers earlier stops authoritative cleanup and can retain billable cloud
-resources.
+FIPs, shard aggregate firewalls, the shared ICMP firewall, and the generated
+NodeClass to disappear.
+Removing the controllers earlier stops authoritative cleanup and can retain
+billable cloud resources.
 
 Public exposure remains an explicit, paid, TCP-only InSpace NLB. A public
 Service deliberately leaves `loadBalancerClass` unset for Kubernetes' generic

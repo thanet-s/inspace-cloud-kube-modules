@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/netip"
 	"sort"
 	"strconv"
 	"strings"
@@ -50,6 +51,7 @@ type Options struct {
 	NetworkUUID             string
 	ControlPlaneVIP         string
 	PrivateLoadBalancerPool inspacev1.PrivateLoadBalancerPool
+	CreateFenceStore        CreateFenceStore
 	// CacheHealthProber is injectable for deterministic tests. Nil uses the
 	// strict private-HTTPS implementation.
 	CacheHealthProber CacheHealthProber
@@ -60,11 +62,12 @@ type CloudProvider struct {
 	resolver NodeClassResolver
 	opts     Options
 	cache    CacheHealthProber
+	fences   CreateFenceStore
 }
 
 func New(cloud cloudapi.Cloud, resolver NodeClassResolver, opts Options) (*CloudProvider, error) {
-	if cloud == nil || resolver == nil {
-		return nil, fmt.Errorf("cloud and NodeClass resolver are required")
+	if cloud == nil || resolver == nil || opts.CreateFenceStore == nil {
+		return nil, fmt.Errorf("cloud, NodeClass resolver, and durable VM create fence store are required")
 	}
 	if opts.ClusterName == "" || opts.DefaultNodeClassName == "" || opts.NetworkUUID == "" || opts.ControlPlaneVIP == "" {
 		return nil, fmt.Errorf("cluster name, default NodeClass name, network UUID, and control-plane VIP are required")
@@ -90,7 +93,7 @@ func New(cloud cloudapi.Cloud, resolver NodeClassResolver, opts Options) (*Cloud
 	if cache == nil {
 		cache = HTTPSCacheHealthProber{}
 	}
-	return &CloudProvider{cloud: cloud, resolver: resolver, opts: opts, cache: cache}, nil
+	return &CloudProvider{cloud: cloud, resolver: resolver, opts: opts, cache: cache, fences: opts.CreateFenceStore}, nil
 }
 
 func (p *CloudProvider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim) (*karpv1.NodeClaim, error) {
@@ -166,12 +169,17 @@ func (p *CloudProvider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim)
 	if idempotencyKey == "" {
 		idempotencyKey = nodeClaim.Name
 	}
+	nodePoolName := ""
+	if nodeClass.Spec.EffectiveFirewallProfile() == inspacev1.FirewallProfilePublicNodeLoadBalancer {
+		nodePoolName = nodeClaim.Labels[karpv1.NodePoolLabelKey]
+	}
 	memoryGiB := int(instanceType.Capacity.Memory().Value() / (1024 * 1024 * 1024))
 	request := cloudapi.CreateVMRequest{
 		IdempotencyKey:               idempotencyKey,
 		Name:                         workerName,
 		ClusterName:                  p.opts.ClusterName,
 		BillingAccountID:             nodeClass.Spec.BillingAccountID,
+		NodePoolName:                 nodePoolName,
 		NodeClaimName:                nodeClaim.Name,
 		Location:                     nodeClass.Spec.Location,
 		NetworkUUID:                  nodeClass.Spec.NetworkUUID,
@@ -195,11 +203,107 @@ func (p *CloudProvider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim)
 		SpecHash:                     NodeClassHash(nodeClass),
 		BootstrapHash:                BootstrapHash(nodeClass),
 	}
+	requestIdentity, err := json.Marshal(request)
+	if err != nil {
+		return nil, fmt.Errorf("encoding exact VM create-fence identity: %w", err)
+	}
+	binding := createFenceBinding{
+		NodeClaimUID:       string(nodeClaim.UID),
+		IdempotencyKeyHash: createFenceHash(idempotencyKey),
+		RequestHash:        createFenceHash(string(requestIdentity)),
+		SpecHash:           request.SpecHash,
+		BootstrapHash:      request.BootstrapHash,
+	}
+	cleanupIdentity := createFenceCleanupIdentity{
+		ClusterName: request.ClusterName, Location: request.Location, NetworkUUID: request.NetworkUUID,
+		NodePoolName: request.NodePoolName, ControlPlaneVIP: request.ControlPlaneVIP,
+		PrivateLoadBalancerPoolStart: request.PrivateLoadBalancerPoolStart, PrivateLoadBalancerPoolStop: request.PrivateLoadBalancerPoolStop,
+		FirewallUUID: request.FirewallUUID, FirewallProfile: inspacev1.EffectiveFirewallProfile(request.FirewallProfile), NodeClaimName: request.NodeClaimName,
+		VMName: request.Name, BillingAccountID: request.BillingAccountID, OwnershipKeyHash: cloudapi.OwnershipKeyHash(idempotencyKey),
+	}
+	fencedClaim, fence, exists, err := p.fences.Get(ctx, nodeClaim, binding, cleanupIdentity)
+	if err != nil {
+		return nil, fmt.Errorf("reading durable VM create fence: %w", err)
+	}
+	allowPOST := false
+	if exists {
+		allowPOST = !fence.Issued
+	} else {
+		baseline, prepareErr := p.cloud.PrepareCreate(ctx, request)
+		if prepareErr != nil {
+			return nil, fmt.Errorf("preparing bounded pre-POST cloud inventory: %w", prepareErr)
+		}
+		fencedClaim, fence, allowPOST, err = p.fences.Ensure(ctx, nodeClaim, binding, cleanupIdentity, baseline)
+		if err != nil {
+			return nil, fmt.Errorf("establishing durable VM create fence: %w", err)
+		}
+	}
+	if fence.RollbackChosen || fence.HasCleanupHistory {
+		return nil, fmt.Errorf("%w: durable rollback or deletion cleanup already selected for NodeClaim %q", cloudapi.ErrCreateAttemptPending, nodeClaim.Name)
+	}
+	request.CreateAttemptToken = fence.Token
+	request.CreateAttemptStartedAt = fence.StartedAt
+	request.CreateAttemptAllowPOST = allowPOST
+	request.CreateAttemptIntent = fence.Intent
+	request.CreatedVMUUID = fence.CreatedVMUUID
+	request.CreateBaseline = fence.Baseline
+	authorizedIssueID := fence.IssueID
+	createdVMUUID := fence.CreatedVMUUID
+	request.AuthorizeLaunch = func(authorizeCtx context.Context, intent cloudapi.CreateAuthorizationKind) error {
+		issuedClaim, authorizeErr := p.fences.Authorize(authorizeCtx, fencedClaim, binding, fence.Token, intent)
+		if issuedClaim != nil {
+			fencedClaim = issuedClaim
+			if record, decodeErr := decodeCreateFence(issuedClaim.Annotations[AnnotationCreateFence]); decodeErr == nil {
+				authorizedIssueID = record.IssueID
+			}
+		}
+		return authorizeErr
+	}
+	request.RecordCreatedVM = func(anchorCtx context.Context, vmUUID string) error {
+		anchorCtx, cancel := detachedCreateFenceContext(anchorCtx)
+		defer cancel()
+		anchoredClaim, anchorErr := p.fences.RecordCreatedVM(anchorCtx, fencedClaim, binding, fence.Token, authorizedIssueID, vmUUID)
+		if anchorErr == nil {
+			fencedClaim = anchoredClaim
+			createdVMUUID = strings.ToLower(vmUUID)
+		}
+		return anchorErr
+	}
+	request.ChooseRollback = func(rollbackCtx context.Context, vmUUID string, resolution *cloudapi.FencedCreateCleanupResolution) error {
+		rollbackCtx, cancel := detachedCreateFenceContext(rollbackCtx)
+		defer cancel()
+		rollbackClaim, rollbackErr := p.fences.ChooseRollback(rollbackCtx, fencedClaim, binding, fence.Token, authorizedIssueID, vmUUID, resolution)
+		if rollbackErr == nil {
+			fencedClaim = rollbackClaim
+		}
+		return rollbackErr
+	}
 	vm, err := p.cloud.CreateVM(ctx, request)
 	if err != nil {
+		if errors.Is(err, cloudapi.ErrCreateAttemptRejected) && createdVMUUID == "" {
+			terminalCtx, cancel := detachedCreateFenceContext(ctx)
+			rejectedClaim, rejectErr := p.fences.MarkRejected(terminalCtx, fencedClaim, binding, fence.Token, authorizedIssueID)
+			cancel()
+			if rejectErr != nil {
+				return nil, fmt.Errorf("creating InSpace VM was definitively rejected, but persisting that terminal fence state failed: %w", errors.Join(err, rejectErr))
+			}
+			fencedClaim = rejectedClaim
+		}
 		return nil, fmt.Errorf("creating InSpace VM: %w", err)
 	}
-	created := nodeClaim.DeepCopy()
+	if vm != nil {
+		vm.UUID = strings.ToLower(vm.UUID)
+		if publicIP, parseErr := netip.ParseAddr(vm.PublicIPv4); parseErr == nil {
+			vm.PublicIPv4 = publicIP.String()
+		}
+	}
+	terminalCtx, cancel := detachedCreateFenceContext(ctx)
+	fencedClaim, err = p.fences.MarkMaterialized(terminalCtx, fencedClaim, binding, fence.Token, vm)
+	cancel()
+	if err != nil {
+		return nil, fmt.Errorf("persisting exact materialized VM identity before ProviderID: %w", err)
+	}
+	created := fencedClaim.DeepCopy()
 	created.Labels = labels
 	if created.Annotations == nil {
 		created.Annotations = map[string]string{}
@@ -228,15 +332,38 @@ func (p *CloudProvider) Delete(ctx context.Context, nodeClaim *karpv1.NodeClaim)
 	deleteIdentity := cloudapi.DeleteVMIdentity{
 		FloatingIPName: nodeClaim.Annotations[AnnotationFloatingIP],
 		PublicIPv4:     nodeClaim.Annotations[AnnotationPublicIPv4],
+		NetworkUUID:    p.opts.NetworkUUID,
+	}
+	deleteClusterName := p.opts.ClusterName
+	if encodedFence := nodeClaim.Annotations[AnnotationCreateFence]; encodedFence != "" {
+		record, decodeErr := decodeCreateFence(encodedFence)
+		if decodeErr != nil {
+			return fmt.Errorf("decoding retained launch identity for deletion: %w", decodeErr)
+		}
+		if record.Binding.NodeClaimUID != string(nodeClaim.UID) || record.Cleanup.NodeClaimName != nodeClaim.Name ||
+			record.Cleanup.Location != id.Location || record.Phase != createFenceMaterialized ||
+			!strings.EqualFold(record.ObservedVMUUID, id.VMUUID) {
+			return fmt.Errorf("retained launch identity does not match NodeClaim %q ProviderID", nodeClaim.Name)
+		}
+		deleteIdentity = cloudapi.DeleteVMIdentity{
+			FloatingIPName:   record.FloatingIPName,
+			PublicIPv4:       record.PublicIPv4,
+			BillingAccountID: record.Cleanup.BillingAccountID,
+			NetworkUUID:      record.Cleanup.NetworkUUID,
+		}
+		deleteClusterName = record.Cleanup.ClusterName
 	}
 	if value := nodeClaim.Annotations[AnnotationBillingAccount]; value != "" {
 		billingAccountID, parseErr := strconv.ParseInt(value, 10, 64)
 		if parseErr != nil || billingAccountID <= 0 {
 			return fmt.Errorf("durable billing-account annotation for deletion must be a positive decimal integer: %q", value)
 		}
+		if deleteIdentity.BillingAccountID != 0 && deleteIdentity.BillingAccountID != billingAccountID {
+			return fmt.Errorf("durable billing-account annotation does not match retained launch identity")
+		}
 		deleteIdentity.BillingAccountID = billingAccountID
 	}
-	if err := p.cloud.DeleteVM(ctx, id.Location, id.VMUUID, p.opts.ClusterName, nodeClaim.Name, deleteIdentity); err != nil {
+	if err := p.cloud.DeleteVM(ctx, id.Location, id.VMUUID, deleteClusterName, nodeClaim.Name, deleteIdentity); err != nil {
 		if errors.Is(err, cloudapi.ErrNotFound) {
 			return cloudprovider.NewNodeClaimNotFoundError(fmt.Errorf("VM %s no longer exists", id.VMUUID))
 		}
@@ -464,6 +591,9 @@ func nodeClaimFromVM(vm *cloudapi.VM) *karpv1.NodeClaim {
 		catalog.LabelInstanceCPU:       strconv.Itoa(vm.VCPU),
 		catalog.LabelInstanceMemory:    strconv.Itoa(vm.MemoryGiB * 1024),
 		catalog.LabelLocation:          vm.Location,
+	}
+	if vm.NodePoolName != "" {
+		labels[karpv1.NodePoolLabelKey] = vm.NodePoolName
 	}
 	if instanceType, offering := instanceTypeAndOfferingForVM(vm); instanceType != nil && offering != nil {
 		labels = resolvedLabels(labels, instanceType, offering)

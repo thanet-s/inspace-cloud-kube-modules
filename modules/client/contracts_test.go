@@ -109,6 +109,18 @@ func TestDocumentedResourceContracts(t *testing.T) {
 	if err != nil || firewall.UUID != firewallUUID || firewall.Description != "" {
 		t.Fatalf("CreateFirewall() = %#v, %v", firewall, err)
 	}
+	updatedPort := int32(443)
+	updatedFirewall, err := client.UpdateFirewall(ctx, "bkk01", firewallUUID, inspace.UpdateFirewallRequest{
+		Name:        "inlb-owned-shard-deadbeef",
+		Description: "aggregate shard policy",
+		Rules: []inspace.FirewallRule{
+			{UUID: ruleUUID, Protocol: "tcp", Direction: "inbound", PortStart: &port, PortEnd: &port, EndpointSpecType: "ip_prefixes", EndpointSpec: []string{"10.4.200.0/24"}},
+			{Protocol: "udp", Direction: "inbound", PortStart: &updatedPort, PortEnd: &updatedPort, EndpointSpecType: "any"},
+		},
+	})
+	if err != nil || updatedFirewall.EffectiveName() != "server-returned-firewall" || len(updatedFirewall.Rules) != 2 {
+		t.Fatalf("UpdateFirewall() = %#v, %v", updatedFirewall, err)
+	}
 	if items, err := client.ListFirewalls(ctx, "bkk01"); err != nil || len(items) != 1 || items[0].Description != "" {
 		t.Fatalf("ListFirewalls() = %#v, %v", items, err)
 	}
@@ -186,6 +198,23 @@ func TestCreateLoadBalancerNormalizesNilTargets(t *testing.T) {
 	}
 }
 
+func TestUpdateFirewallRequestOmitsEmptyRuleUUID(t *testing.T) {
+	port := int32(443)
+	data, err := json.Marshal(inspace.UpdateFirewallRequest{
+		Name: "inlb-owned-shard-deadbeef",
+		Rules: []inspace.FirewallRule{{
+			Protocol: "tcp", Direction: "inbound", PortStart: &port, PortEnd: &port, EndpointSpecType: "any",
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const want = `{"name":"inlb-owned-shard-deadbeef","description":"","rules":[{"protocol":"tcp","direction":"inbound","port_start":443,"port_end":443,"endpoint_spec_type":"any"}]}`
+	if string(data) != want {
+		t.Fatalf("UpdateFirewallRequest JSON = %s, want %s", data, want)
+	}
+}
+
 func contractHandler(t *testing.T) http.HandlerFunc {
 	t.Helper()
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -244,6 +273,16 @@ func contractHandler(t *testing.T) http.HandlerFunc {
 				t.Errorf("CreateFirewall body = %#v", got)
 			}
 			writeLiteral(w, http.StatusCreated, `{"uuid":"`+firewallUUID+`","display_name":"k8s-firewall","billing_account_id":129673,"rules":[],"resources_assigned":[]}`)
+		case "PUT /v1/bkk01/network/firewalls/" + firewallUUID:
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			const want = `{"name":"inlb-owned-shard-deadbeef","description":"aggregate shard policy","rules":[{"uuid":"` + ruleUUID + `","protocol":"tcp","direction":"inbound","port_start":6443,"port_end":6443,"endpoint_spec_type":"ip_prefixes","endpoint_spec":["10.4.200.0/24"]},{"protocol":"udp","direction":"inbound","port_start":443,"port_end":443,"endpoint_spec_type":"any"}]}`
+			if string(body) != want {
+				t.Errorf("UpdateFirewall body = %s, want %s", body, want)
+			}
+			writeLiteral(w, http.StatusOK, `{"uuid":"`+firewallUUID+`","name":"server-returned-firewall","billing_account_id":129673,"rules":[{"uuid":"`+ruleUUID+`","protocol":"tcp","direction":"inbound","port_start":6443,"port_end":6443,"endpoint_spec_type":"ip_prefixes","endpoint_spec":["10.4.200.0/24"]},{"uuid":"77777777-8888-4999-8aaa-bbbbbbbbbbbb","protocol":"udp","direction":"inbound","port_start":443,"port_end":443,"endpoint_spec_type":"any"}],"resources_assigned":[]}`)
 		case "POST /v1/bkk01/network/firewalls/" + firewallUUID + "/vms":
 			if r.URL.Query().Get("vm_uuid") != vmUUID {
 				t.Errorf("firewall assign query = %s", r.URL.RawQuery)

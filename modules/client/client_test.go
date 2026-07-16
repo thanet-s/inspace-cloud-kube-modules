@@ -167,6 +167,53 @@ func TestUpdateFloatingIPValidatesRequestBeforeTransport(t *testing.T) {
 	}
 }
 
+func TestUpdateFirewallValidatesRequestBeforeTransport(t *testing.T) {
+	client, err := inspace.NewClient(inspace.Options{
+		BaseURL:                   "https://api.example.invalid",
+		APIKey:                    "test-key",
+		HTTPClient:                &http.Client{Transport: &panicTransport{}},
+		DangerouslyAllowMutations: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := int32(443)
+	validRule := inspace.FirewallRule{
+		Protocol: "tcp", Direction: "inbound", PortStart: &port, PortEnd: &port, EndpointSpecType: "any",
+	}
+	tests := []struct {
+		name         string
+		location     string
+		firewallUUID string
+		request      inspace.UpdateFirewallRequest
+	}{
+		{name: "invalid firewall UUID", location: "bkk01", firewallUUID: "not-a-uuid", request: inspace.UpdateFirewallRequest{Name: "owned-firewall", Rules: []inspace.FirewallRule{validRule}}},
+		{name: "missing name", location: "bkk01", firewallUUID: firewallUUID, request: inspace.UpdateFirewallRequest{Rules: []inspace.FirewallRule{validRule}}},
+		{name: "unsafe name", location: "bkk01", firewallUUID: firewallUUID, request: inspace.UpdateFirewallRequest{Name: "Owned Firewall", Rules: []inspace.FirewallRule{validRule}}},
+		{name: "missing rules", location: "bkk01", firewallUUID: firewallUUID, request: inspace.UpdateFirewallRequest{Name: "owned-firewall"}},
+		{name: "invalid rule UUID", location: "bkk01", firewallUUID: firewallUUID, request: inspace.UpdateFirewallRequest{
+			Name: "owned-firewall",
+			Rules: []inspace.FirewallRule{{
+				UUID: "not-a-uuid", Protocol: "tcp", Direction: "inbound", PortStart: &port, PortEnd: &port, EndpointSpecType: "any",
+			}},
+		}},
+		{name: "invalid rule", location: "bkk01", firewallUUID: firewallUUID, request: inspace.UpdateFirewallRequest{
+			Name: "owned-firewall",
+			Rules: []inspace.FirewallRule{{
+				Protocol: "sctp", Direction: "inbound", PortStart: &port, PortEnd: &port, EndpointSpecType: "any",
+			}},
+		}},
+		{name: "invalid location", location: "BKK 01", firewallUUID: firewallUUID, request: inspace.UpdateFirewallRequest{Name: "owned-firewall", Rules: []inspace.FirewallRule{validRule}}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := client.UpdateFirewall(context.Background(), test.location, test.firewallUUID, test.request); err == nil {
+				t.Fatal("UpdateFirewall accepted invalid input")
+			}
+		})
+	}
+}
+
 func TestReadRequestsHaveBoundedContext(t *testing.T) {
 	var observedRemaining time.Duration
 	transport := roundTripFunc(func(req *http.Request) (*http.Response, error) {

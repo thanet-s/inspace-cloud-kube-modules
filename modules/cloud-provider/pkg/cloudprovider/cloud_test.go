@@ -819,6 +819,9 @@ type fakeAPI struct {
 	unassignedIPs                  []string
 	deletedIPs                     []string
 	createdFirewalls               []inspace.CreateFirewallRequest
+	createFirewallErr              error
+	updatedFirewalls               []inspace.UpdateFirewallRequest
+	updateFirewallErr              error
 	deletedFirewalls               []string
 	assignedFirewalls              []string
 	unassignedFirewalls            []string
@@ -930,13 +933,47 @@ func (f *fakeAPI) ListFirewalls(context.Context, string) ([]inspace.Firewall, er
 
 func (f *fakeAPI) CreateFirewall(_ context.Context, _ string, request inspace.CreateFirewallRequest) (*inspace.Firewall, error) {
 	f.createdFirewalls = append(f.createdFirewalls, request)
+	if f.createFirewallErr != nil {
+		return nil, f.createFirewallErr
+	}
+	rules := append([]inspace.FirewallRule(nil), request.Rules...)
+	for index := range rules {
+		if rules[index].UUID == "" {
+			rules[index].UUID = fmt.Sprintf("10000000-0000-4000-8000-%012d", index+1)
+		}
+	}
 	item := inspace.Firewall{
 		UUID:        fmt.Sprintf("00000000-0000-4000-8000-%012d", len(f.firewalls)+1),
 		DisplayName: request.DisplayName, Description: request.Description,
-		BillingAccountID: request.BillingAccountID, Rules: request.Rules,
+		BillingAccountID: request.BillingAccountID, Rules: rules,
 	}
 	f.firewalls = append(f.firewalls, item)
 	return &item, nil
+}
+
+func (f *fakeAPI) UpdateFirewall(_ context.Context, _, uuid string, request inspace.UpdateFirewallRequest) (*inspace.Firewall, error) {
+	f.updatedFirewalls = append(f.updatedFirewalls, request)
+	if f.updateFirewallErr != nil {
+		return nil, f.updateFirewallErr
+	}
+	for i := range f.firewalls {
+		if f.firewalls[i].UUID != uuid {
+			continue
+		}
+		f.firewalls[i].Name = request.Name
+		f.firewalls[i].DisplayName = request.Name
+		f.firewalls[i].Description = request.Description
+		rules := append([]inspace.FirewallRule(nil), request.Rules...)
+		for index := range rules {
+			if rules[index].UUID == "" {
+				rules[index].UUID = fmt.Sprintf("20000000-0000-4000-8000-%012d", index+1)
+			}
+		}
+		f.firewalls[i].Rules = rules
+		copy := f.firewalls[i]
+		return &copy, nil
+	}
+	return nil, &inspace.APIError{StatusCode: 404, Method: "PUT", Path: "/firewall", Message: "not found"}
 }
 
 func (f *fakeAPI) DeleteFirewall(_ context.Context, _, uuid string) error {

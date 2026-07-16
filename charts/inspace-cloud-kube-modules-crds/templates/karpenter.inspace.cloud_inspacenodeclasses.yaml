@@ -115,7 +115,7 @@ spec:
                     firewallUUID assignment. public-node-load-balancer keeps
                     firewallUUID private and additionally permits only the
                     provider-validated CCM-owned cluster ICMP firewall and
-                    Service ingress firewalls.
+                    at most one aggregate shard ingress firewall.
                 imageSelector:
                   type: object
                   required: [osName, osVersion]
