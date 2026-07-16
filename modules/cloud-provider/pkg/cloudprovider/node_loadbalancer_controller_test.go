@@ -11,7 +11,6 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 	kubefake "k8s.io/client-go/kubernetes/fake"
 	corelisters "k8s.io/client-go/listers/core/v1"
@@ -143,64 +142,57 @@ func TestDesiredNodeLoadBalancerClusterICMPFirewallUsesSharedContract(t *testing
 	}
 }
 
-func TestNodeLoadBalancerShadowIsQuarantinedFromFirstCreate(t *testing.T) {
+func TestNodeLoadBalancerDatapathUsesPrivateVIPContractFromFirstCreate(t *testing.T) {
 	service := nodeLoadBalancerTestService("web", "web-uid", corev1.ProtocolTCP, 443)
 	service.Spec.Selector = map[string]string{"app": "web"}
-	shadow := desiredNodeLoadBalancerShadow(service, "web-node-lb", "unit-test-cluster", "shard-a")
-	if shadow.Spec.LoadBalancerClass == nil || *shadow.Spec.LoadBalancerClass != nodeLoadBalancerCiliumClass ||
-		shadow.Spec.ExternalTrafficPolicy != corev1.ServiceExternalTrafficPolicyCluster ||
-		shadow.Spec.AllocateLoadBalancerNodePorts == nil || *shadow.Spec.AllocateLoadBalancerNodePorts {
-		t.Fatalf("shadow spec = %#v", shadow.Spec)
+	const shard = "inlb-0123abcd"
+	datapath := desiredNodeLoadBalancerDatapath(service, nodeLoadBalancerDatapathName(service), shard)
+	if datapath.Spec.LoadBalancerClass == nil || *datapath.Spec.LoadBalancerClass != nodeLoadBalancerDatapathClass ||
+		datapath.Spec.ExternalTrafficPolicy != corev1.ServiceExternalTrafficPolicyCluster ||
+		datapath.Spec.AllocateLoadBalancerNodePorts == nil || *datapath.Spec.AllocateLoadBalancerNodePorts {
+		t.Fatalf("datapath spec = %#v", datapath.Spec)
 	}
-	wantSelector := nodeLoadBalancerCiliumSelector("unit-test-cluster", "shard-a")
-	if shadow.Annotations[annotationCiliumNodeIPAMMatchLabels] != wantSelector {
-		t.Fatalf("Cilium selector = %q, want %q", shadow.Annotations[annotationCiliumNodeIPAMMatchLabels], wantSelector)
+	if datapath.Annotations[annotationNodeLoadBalancerDatapathShard] != shard {
+		t.Fatalf("datapath shard = %q, want %q", datapath.Annotations[annotationNodeLoadBalancerDatapathShard], shard)
 	}
-	selector, err := labels.Parse(wantSelector)
-	if err != nil {
-		t.Fatal(err)
+	if _, exists := datapath.Annotations["io.cilium.nodeipam/match-node-labels"]; exists {
+		t.Fatalf("datapath must not use Cilium Node IPAM: %#v", datapath.Annotations)
 	}
-	nodeLabels := labels.Set{
-		nodeLoadBalancerNodeLabel:        "true",
-		nodeLoadBalancerNodeClusterLabel: "unit-test-cluster",
-		nodeLoadBalancerNodeShardLabel:   "shard-a",
-		nodeLoadBalancerReadyLabel:       "true",
+	if !reflect.DeepEqual(datapath.Spec.Selector, service.Spec.Selector) ||
+		len(datapath.Spec.Ports) != 1 || datapath.Spec.Ports[0].Port != 443 {
+		t.Fatalf("datapath backend contract = %#v", datapath.Spec)
 	}
-	if !selector.Matches(nodeLabels) {
-		t.Fatal("exact managed LB node did not match the Cilium selector")
-	}
-	delete(nodeLabels, nodeLoadBalancerNodeLabel)
-	if selector.Matches(nodeLabels) {
-		t.Fatal("stale ready label kept a node advertised after managed-node label drift")
-	}
-	nodeLabels[nodeLoadBalancerNodeLabel] = "true"
-	nodeLabels[nodeLoadBalancerNodeClusterLabel] = "foreign-cluster"
-	if selector.Matches(nodeLabels) {
-		t.Fatal("stale ready label kept a foreign-cluster node advertised")
-	}
-	if len(shadow.OwnerReferences) != 1 || shadow.OwnerReferences[0].UID != service.UID {
-		t.Fatalf("shadow owner = %#v", shadow.OwnerReferences)
+	if len(datapath.OwnerReferences) != 1 || datapath.OwnerReferences[0].UID != service.UID {
+		t.Fatalf("datapath owner = %#v", datapath.OwnerReferences)
 	}
 }
 
-func TestNodeLoadBalancerHealthRequiresReadyPublicFIP(t *testing.T) {
+func TestNodeLoadBalancerHealthRequiresCanonicalPrivateAndPublicIPv4(t *testing.T) {
 	node := readyNode("lb-a", "inspace://bkk01/aaaaaaaa-1111-4222-8333-bbbbbbbbbbbb")
 	node.Labels = map[string]string{nodeLoadBalancerNodeLabel: "true"}
-	node.Status.Addresses = []corev1.NodeAddress{{Type: corev1.NodeExternalIP, Address: "203.0.113.10"}}
+	node.Status.Addresses = []corev1.NodeAddress{
+		{Type: corev1.NodeInternalIP, Address: "10.0.0.20"},
+		{Type: corev1.NodeExternalIP, Address: "203.0.113.10"},
+	}
 	if !nodeLoadBalancerNodeHealthy(node) {
 		t.Fatal("healthy LB node was rejected")
 	}
+	node.Status.Addresses[0].Address = "203.0.113.20"
+	if nodeLoadBalancerNodeHealthy(node) {
+		t.Fatal("node without a private InternalIP was advertised")
+	}
 	node.Status.Addresses[0].Address = "10.0.0.20"
+	node.Status.Addresses[1].Address = "10.0.0.20"
 	if nodeLoadBalancerNodeHealthy(node) {
 		t.Fatal("private-only LB node was advertised")
 	}
 	for _, invalid := range []string{"169.254.10.20", "224.0.0.1"} {
-		node.Status.Addresses[0].Address = invalid
+		node.Status.Addresses[1].Address = invalid
 		if nodeLoadBalancerNodeHealthy(node) {
 			t.Fatalf("non-global LB address %s was advertised", invalid)
 		}
 	}
-	node.Status.Addresses[0].Address = "203.0.113.10"
+	node.Status.Addresses[1].Address = "203.0.113.10"
 	node.Spec.Taints = append(node.Spec.Taints, corev1.Taint{Key: karpenterDisruptionTaint, Effect: corev1.TaintEffectNoSchedule})
 	if nodeLoadBalancerNodeHealthy(node) {
 		t.Fatal("disrupted LB node was advertised")
@@ -212,7 +204,7 @@ func TestNodeLoadBalancerHealthRequiresReadyPublicFIP(t *testing.T) {
 	}
 }
 
-func TestNodeLoadBalancerReconcileSmokeCreatesOwnedKarpenterAndShadowResources(t *testing.T) {
+func TestNodeLoadBalancerReconcileSmokeCreatesOwnedKarpenterAndDatapathResources(t *testing.T) {
 	ctx := context.Background()
 	service := nodeLoadBalancerTestService("web", "9f5db76f-90c1-4ee5-9067-9a3db48e3c9b", corev1.ProtocolTCP, 443)
 	service.Spec.Selector = map[string]string{"app": "web"}
@@ -260,8 +252,8 @@ func TestNodeLoadBalancerReconcileSmokeCreatesOwnedKarpenterAndShadowResources(t
 		stored.Annotations[annotationNodeLoadBalancerFirewallUUID] == "" {
 		t.Fatalf("stored Service metadata = %#v", stored.ObjectMeta)
 	}
-	if _, err := provider.kubeClient.CoreV1().Services("default").Get(ctx, nodeLoadBalancerShadowName(stored), metav1.GetOptions{}); !apierrors.IsNotFound(err) {
-		t.Fatalf("shadow Service was published before ready capacity: %v", err)
+	if _, err := provider.kubeClient.CoreV1().Services("default").Get(ctx, nodeLoadBalancerDatapathName(stored), metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("datapath Service was published before ready capacity: %v", err)
 	}
 	nodeClassName := managedNodeLoadBalancerName(provider.config.ClusterID, "node-lb")
 	nodeClass, err := provider.dynamicClient.Resource(nodeClassGVR).Get(ctx, nodeClassName, metav1.GetOptions{})
@@ -319,7 +311,10 @@ func TestNodeLoadBalancerReconcileSmokeCreatesOwnedKarpenterAndShadowResources(t
 		nodeLoadBalancerNodeClusterLabel: provider.config.ClusterID,
 		nodeLoadBalancerNodeShardLabel:   shard,
 	}
-	node.Status.Addresses = []corev1.NodeAddress{{Type: corev1.NodeExternalIP, Address: "203.0.113.10"}}
+	node.Status.Addresses = []corev1.NodeAddress{
+		{Type: corev1.NodeInternalIP, Address: "10.0.0.20"},
+		{Type: corev1.NodeExternalIP, Address: "203.0.113.10"},
+	}
 	installNodeLoadBalancerSafetyIdentity(t, provider, node, shard)
 	if _, err := provider.kubeClient.CoreV1().Nodes().Create(ctx, node.DeepCopy(), metav1.CreateOptions{}); err != nil {
 		t.Fatal(err)
@@ -345,21 +340,23 @@ func TestNodeLoadBalancerReconcileSmokeCreatesOwnedKarpenterAndShadowResources(t
 		if err := nodeIndexer.Update(currentNode); err != nil {
 			t.Fatal(err)
 		}
-		shadow, shadowErr := provider.kubeClient.CoreV1().Services("default").Get(ctx, nodeLoadBalancerShadowName(stored), metav1.GetOptions{})
-		if shadowErr == nil && len(shadow.Status.LoadBalancer.Ingress) == 0 {
-			shadow.Status.LoadBalancer.Ingress = []corev1.LoadBalancerIngress{{IP: "203.0.113.10"}}
-			if _, err := provider.kubeClient.CoreV1().Services("default").UpdateStatus(ctx, shadow, metav1.UpdateOptions{}); err != nil {
-				t.Fatal(err)
-			}
-		}
 	}
-	shadow, err := provider.kubeClient.CoreV1().Services("default").Get(ctx, nodeLoadBalancerShadowName(stored), metav1.GetOptions{})
-	if err != nil || shadow.Spec.LoadBalancerClass == nil || *shadow.Spec.LoadBalancerClass != nodeLoadBalancerCiliumClass {
-		t.Fatalf("shadow Service = %#v, %v", shadow, err)
+	datapath, err := provider.kubeClient.CoreV1().Services("default").Get(ctx, nodeLoadBalancerDatapathName(stored), metav1.GetOptions{})
+	if err != nil || datapath.Spec.LoadBalancerClass == nil || *datapath.Spec.LoadBalancerClass != nodeLoadBalancerDatapathClass ||
+		datapath.Annotations[annotationNodeLoadBalancerDatapathShard] != shard {
+		t.Fatalf("datapath Service = %#v, %v", datapath, err)
+	}
+	if len(datapath.Status.LoadBalancer.Ingress) != 1 || datapath.Status.LoadBalancer.Ingress[0].IP != "10.0.0.20" ||
+		datapath.Status.LoadBalancer.Ingress[0].IPMode == nil || *datapath.Status.LoadBalancer.Ingress[0].IPMode != corev1.LoadBalancerIPModeVIP {
+		t.Fatalf("private VIP datapath status = %#v", datapath.Status.LoadBalancer)
 	}
 	stored, _ = provider.kubeClient.CoreV1().Services("default").Get(ctx, "web", metav1.GetOptions{})
-	if len(stored.Status.LoadBalancer.Ingress) != 1 || stored.Status.LoadBalancer.Ingress[0].IP != "203.0.113.10" {
+	if len(stored.Status.LoadBalancer.Ingress) != 1 || stored.Status.LoadBalancer.Ingress[0].IP != "203.0.113.10" ||
+		stored.Status.LoadBalancer.Ingress[0].IPMode == nil || *stored.Status.LoadBalancer.Ingress[0].IPMode != corev1.LoadBalancerIPModeProxy {
 		t.Fatalf("published Service status = %#v", stored.Status.LoadBalancer)
+	}
+	if stored.Annotations[annotationNodeLoadBalancerDatapathActive] != shard {
+		t.Fatalf("active datapath marker = %q, want %q", stored.Annotations[annotationNodeLoadBalancerDatapathActive], shard)
 	}
 }
 

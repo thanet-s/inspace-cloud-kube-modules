@@ -1002,6 +1002,14 @@
         test "$(grep -Fc '        - "kubernetes"' "$kube_vip_manifest")" -eq 1
         test "$(grep -Fc '        - name: vip_nodename' "$kube_vip_manifest")" -eq 1
         test "$(grep -Fc '              fieldPath: spec.nodeName' "$kube_vip_manifest")" -eq 1
+        test "$(grep -Fc '        - name: vip_arpRate' "$kube_vip_manifest")" -eq 1
+        test "$(grep -Fc '          value: "500"' "$kube_vip_manifest")" -eq 1
+        test "$(grep -Fc '        - name: vip_leaseduration' "$kube_vip_manifest")" -eq 1
+        test "$(grep -Fc '          value: "5"' "$kube_vip_manifest")" -eq 1
+        test "$(grep -Fc '        - name: vip_renewdeadline' "$kube_vip_manifest")" -eq 1
+        test "$(grep -Fc '          value: "3"' "$kube_vip_manifest")" -eq 1
+        test "$(grep -Fc '        - name: vip_retryperiod' "$kube_vip_manifest")" -eq 1
+        test "$(grep -Fc '          value: "1"' "$kube_vip_manifest")" -eq 1
         test "$(grep -Fc '          drop: ["ALL"]' "$kube_vip_manifest")" -eq 1
         test "$(grep -Fc '          add: ["NET_ADMIN", "NET_RAW"]' "$kube_vip_manifest")" -eq 1
         test "$(grep -Fc '          mountPath: /etc/kubernetes/admin.conf' "$kube_vip_manifest")" -eq 1
@@ -1201,8 +1209,7 @@
           .data["default-lb-service-ipam"] == "none"'
         values=$(kubectl -n kube-system get helmchartconfig rke2-cilium -o jsonpath='{.spec.valuesContent}')
         grep -Eq '^[[:space:]]*defaultLBServiceIPAM:[[:space:]]*none[[:space:]]*$' <<<"$values"
-        grep -Eq '^[[:space:]]*nodeIPAM:[[:space:]]*$' <<<"$values"
-        grep -Eq '^[[:space:]]*enabled:[[:space:]]*true[[:space:]]*$' <<<"$values"
+        ! grep -Eq '^[[:space:]]*nodeIPAM:[[:space:]]*$' <<<"$values"
         grep -Eq '^[[:space:]]*l2announcements:[[:space:]]*$' <<<"$values"
         export E2E_CILIUM_VALUES="$values"
         python3 - "$INSPACE_PRIVATE_LOAD_BALANCER_POOL_START" "$INSPACE_PRIVATE_LOAD_BALANCER_POOL_STOP" <<'PY'
@@ -1220,7 +1227,7 @@
         assert values["bpf"]["masquerade"] is True
         assert values["l2announcements"]["enabled"] is True
         assert values["defaultLBServiceIPAM"] == "none"
-        assert values["nodeIPAM"]["enabled"] is True
+        assert "nodeIPAM" not in values
         assert values["k8sClientRateLimit"] == {"qps": qps, "burst": max(20, 2 * qps)}
         PY
         kubectl get ciliumloadbalancerippool inspace-private -o json | jq -e \
@@ -1279,6 +1286,10 @@
               ([.env[]? |
                 select(.name == "vip_nodename" and
                   .valueFrom.fieldRef.fieldPath == "spec.nodeName")] | length) == 1 and
+              ([.env[]? | select(.name == "vip_arpRate" and .value == "500")] | length) == 1 and
+              ([.env[]? | select(.name == "vip_leaseduration" and .value == "5")] | length) == 1 and
+              ([.env[]? | select(.name == "vip_renewdeadline" and .value == "3")] | length) == 1 and
+              ([.env[]? | select(.name == "vip_retryperiod" and .value == "1")] | length) == 1 and
               (((.securityContext.capabilities.drop // []) | sort) == ["ALL"]) and
               (((.securityContext.capabilities.add // []) | sort) == ["NET_ADMIN", "NET_RAW"]) and
               ([.volumeMounts[]? |

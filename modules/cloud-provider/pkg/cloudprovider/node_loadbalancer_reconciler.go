@@ -24,6 +24,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/runtime"
 	utilvalidation "k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/client-go/informers"
+	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
 	corelisters "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
@@ -34,32 +35,38 @@ import (
 )
 
 const (
-	nodeLoadBalancerFinalizer                  = "service.inspace.cloud/node-lb"
-	annotationNodeLoadBalancerFirewallUUID     = "service.inspace.cloud/node-lb-firewall-uuid"
-	annotationNodeLoadBalancerFirewallHash     = "service.inspace.cloud/node-lb-firewall-hash"
-	annotationNodeLoadBalancerFirewallAbsent   = "service.inspace.cloud/node-lb-firewall-absence-count"
-	annotationNodeLoadBalancerFirewallChecked  = "service.inspace.cloud/node-lb-firewall-absence-checked-at"
-	annotationNodeLoadBalancerPendingFirewall  = "service.inspace.cloud/node-lb-pending-firewall-uuid"
-	annotationNodeLoadBalancerPendingFWName    = "service.inspace.cloud/node-lb-pending-firewall-name"
-	annotationNodeLoadBalancerPendingFWStarted = "service.inspace.cloud/node-lb-pending-firewall-started-at"
-	annotationNodeLoadBalancerPendingFWDelete  = "service.inspace.cloud/node-lb-pending-firewall-deleting"
-	annotationNodeLoadBalancerPendingFWAbsent  = "service.inspace.cloud/node-lb-pending-firewall-absence-count"
-	annotationNodeLoadBalancerPendingFWChecked = "service.inspace.cloud/node-lb-pending-firewall-absence-checked-at"
-	annotationNodeLoadBalancerCleanupFWAbsent  = "service.inspace.cloud/node-lb-cleanup-firewall-absence-count"
-	annotationNodeLoadBalancerCleanupFWChecked = "service.inspace.cloud/node-lb-cleanup-firewall-absence-checked-at"
-	annotationNodeLoadBalancerPreviousFirewall = "service.inspace.cloud/node-lb-previous-firewall-uuid"
-	annotationNodeLoadBalancerPreviousShard    = "service.inspace.cloud/node-lb-previous-shard"
-	annotationCiliumNodeIPAMMatchLabels        = "io.cilium.nodeipam/match-node-labels"
-	// The ready label is the final Cilium advertisement gate. Keep it under the
-	// NodeRestriction-reserved prefix so a kubelet cannot self-advertise by
-	// copying the otherwise user-visible NodeLoadBalancer identity labels.
+	nodeLoadBalancerFinalizer                   = "service.inspace.cloud/node-lb"
+	annotationNodeLoadBalancerFirewallUUID      = "service.inspace.cloud/node-lb-firewall-uuid"
+	annotationNodeLoadBalancerFirewallHash      = "service.inspace.cloud/node-lb-firewall-hash"
+	annotationNodeLoadBalancerFirewallAbsent    = "service.inspace.cloud/node-lb-firewall-absence-count"
+	annotationNodeLoadBalancerFirewallChecked   = "service.inspace.cloud/node-lb-firewall-absence-checked-at"
+	annotationNodeLoadBalancerPendingFirewall   = "service.inspace.cloud/node-lb-pending-firewall-uuid"
+	annotationNodeLoadBalancerPendingFWName     = "service.inspace.cloud/node-lb-pending-firewall-name"
+	annotationNodeLoadBalancerPendingFWStarted  = "service.inspace.cloud/node-lb-pending-firewall-started-at"
+	annotationNodeLoadBalancerPendingFWDelete   = "service.inspace.cloud/node-lb-pending-firewall-deleting"
+	annotationNodeLoadBalancerPendingFWAbsent   = "service.inspace.cloud/node-lb-pending-firewall-absence-count"
+	annotationNodeLoadBalancerPendingFWChecked  = "service.inspace.cloud/node-lb-pending-firewall-absence-checked-at"
+	annotationNodeLoadBalancerCleanupFWAbsent   = "service.inspace.cloud/node-lb-cleanup-firewall-absence-count"
+	annotationNodeLoadBalancerCleanupFWChecked  = "service.inspace.cloud/node-lb-cleanup-firewall-absence-checked-at"
+	annotationNodeLoadBalancerWithdrawFWAbsent  = "service.inspace.cloud/node-lb-withdraw-firewall-absence-count"
+	annotationNodeLoadBalancerWithdrawFWChecked = "service.inspace.cloud/node-lb-withdraw-firewall-absence-checked-at"
+	annotationNodeLoadBalancerWithdrawFWMissing = "service.inspace.cloud/node-lb-withdraw-firewall-missing-set"
+	annotationNodeLoadBalancerFirewallAssigning = "service.inspace.cloud/node-lb-firewall-assigning-uuid"
+	annotationNodeLoadBalancerFirewallAssignAt  = "service.inspace.cloud/node-lb-firewall-assigning-started-at"
+	annotationNodeLoadBalancerPreviousFirewall  = "service.inspace.cloud/node-lb-previous-firewall-uuid"
+	annotationNodeLoadBalancerPreviousShard     = "service.inspace.cloud/node-lb-previous-shard"
+	annotationNodeLoadBalancerDatapathShard     = "service.inspace.cloud/node-lb-datapath-shard"
+	annotationNodeLoadBalancerDatapathActive    = "service.inspace.cloud/node-lb-datapath-active-shard"
+	// The ready label is the API-owned eligibility gate used to derive private
+	// and public status pairs. Keep it protected so a kubelet cannot
+	// self-advertise.
 	nodeLoadBalancerReadyLabel                = "inspace.cloud.node-restriction.kubernetes.io/ready"
 	nodeLoadBalancerManagedLabel              = "inspace.cloud/node-lb-managed"
 	nodeLoadBalancerClusterLabel              = "inspace.cloud/node-lb-cluster"
 	nodeLoadBalancerProfileLabel              = "inspace.cloud/node-lb-profile"
-	nodeLoadBalancerShadowLabel               = "inspace.cloud/node-lb-shadow"
-	nodeLoadBalancerServiceUIDLabel           = "inspace.cloud/node-lb-service-uid"
-	nodeLoadBalancerCiliumClass               = "io.cilium/node"
+	nodeLoadBalancerDatapathLabel             = "inspace.cloud/node-lb-datapath"
+	nodeLoadBalancerServiceIdentityLabel      = "inspace.cloud/node-lb-service-id"
+	nodeLoadBalancerDatapathClass             = "inspace.cloud/node-datapath"
 	karpenterNodePoolLabel                    = "karpenter.sh/nodepool"
 	nodeLoadBalancerResync                    = 30 * time.Second
 	nodeLoadBalancerRetry                     = 10 * time.Second
@@ -69,6 +76,12 @@ const (
 	nodeLoadBalancerAbsenceConfirmationDelay  = 30 * time.Second
 	nodeLoadBalancerAbsenceConfirmations      = 3
 )
+
+type nodeLoadBalancerAddress struct {
+	Node        *corev1.Node
+	PrivateIPv4 string
+	PublicIPv4  string
+}
 
 var (
 	nodePoolGVR  = schema.GroupVersionResource{Group: "karpenter.sh", Version: "v1", Resource: "nodepools"}
@@ -199,6 +212,13 @@ func (c *nodeLoadBalancerController) sync(ctx context.Context, key string) error
 	if err != nil {
 		return err
 	}
+	service, err = c.getExactParentService(ctx, service)
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("node load balancer: refresh exact parent Service: %w", err)
+	}
 	if service.DeletionTimestamp != nil || !isNodeLoadBalancerService(service) {
 		if containsString(service.Finalizers, nodeLoadBalancerFinalizer) {
 			return c.cleanupService(ctx, service)
@@ -218,18 +238,27 @@ func (c *nodeLoadBalancerController) sync(ctx context.Context, key string) error
 	// Audit the currently advertised shard before any desired-state work. This
 	// guarantees that ownership drift or a persistent create/update error later
 	// in reconciliation cannot leave a previously ready public selector active.
-	if err := c.auditAdvertisedServiceShard(ctx, service); err != nil {
-		// The audit already removed the advertisement gate. Continue so the
-		// normal desired-state path can repair a drifted NodeClass/NodePool;
-		// unrepaired firewall or ownership errors are encountered again below.
-		klog.ErrorS(err, "node load balancer advertised shard failed closed before desired-state repair", "service", key)
+	if waiting, err := c.auditAdvertisedServiceShard(ctx, service); err != nil || waiting {
+		// Repair starts on the next reconciliation. Continuing with the stale
+		// object from before withdrawal could republish in the same pass.
+		if waiting {
+			c.queue.AddAfter(key, nodeLoadBalancerRetry)
+		}
+		return err
+	}
+	service, err = c.getExactParentService(ctx, service)
+	if err != nil {
+		return fmt.Errorf("node load balancer: refresh parent after advertised datapath audit: %w", err)
+	}
+	if handled, err := c.cleanupCompletedPreviousMigration(ctx, service); err != nil || handled {
+		return err
 	}
 
 	intent, plan, shard, err := c.planForService(ctx, service)
 	if err != nil {
 		return err
 	}
-	if err := c.validateShadowServiceName(ctx, service); err != nil {
+	if err := c.validateDatapathServiceName(ctx, service); err != nil {
 		return err
 	}
 	if waiting, err := c.cleanupAbandonedReplacementShard(ctx, service, shard.Name); err != nil || waiting {
@@ -279,6 +308,14 @@ func (c *nodeLoadBalancerController) sync(ctx context.Context, key string) error
 		c.queue.AddAfter(key, nodeLoadBalancerRetry)
 		return nil
 	}
+	if service.Annotations[annotationNodeLoadBalancerDatapathActive] == "" {
+		// A Service-specific firewall is the public activation gate. Keep a newly
+		// staged firewall detached until the durable activation marker and the
+		// generated Cilium Service's private VIP have both read back exactly.
+		if err := c.detachServiceFirewallFromOtherNodes(ctx, service, firewall, nil); err != nil {
+			return c.failNodeLoadBalancerShardsClosed(ctx, service, shard.Name, err)
+		}
+	}
 	if patched, err := c.ensureFirewallMetadata(ctx, service, firewall, previousUUID); err != nil || patched {
 		return err
 	}
@@ -298,80 +335,263 @@ func (c *nodeLoadBalancerController) sync(ctx context.Context, key string) error
 	if err != nil {
 		return c.failClusterNodeLoadBalancerClosed(ctx, err)
 	}
-	firewall, previousUUID, assignmentsReady, err := c.ensureServiceFirewall(ctx, service, nodes)
-	if err != nil {
-		return c.failNodeLoadBalancerShardsClosed(ctx, service, shard.Name, err)
-	}
-	if icmpFirewall == nil || !icmpAssignmentsReady || firewall == nil || !assignmentsReady {
+	if icmpFirewall == nil || !icmpAssignmentsReady {
 		if eligibilityErr := c.reconcileShardNodeEligibility(ctx, shard.Name); eligibilityErr != nil {
 			return eligibilityErr
 		}
 		c.queue.AddAfter(key, nodeLoadBalancerRetry)
 		return nil
 	}
-	if patched, err := c.ensureFirewallMetadata(ctx, service, firewall, previousUUID); err != nil || patched {
-		return err
-	}
 	if err := c.reconcileShardNodeEligibility(ctx, shard.Name); err != nil {
-		return err
+		return c.failNodeLoadBalancerShardsClosed(ctx, service, shard.Name, err)
 	}
-	readyNodes, readyExternalIPs, err := c.readyShardNodes(ctx, shard.Name)
+	readyAddresses, err := c.readyShardAddresses(ctx, shard.Name)
 	if err != nil {
-		return err
+		return c.failNodeLoadBalancerShardsClosed(ctx, service, shard.Name, err)
 	}
-	shadowUsesShard, err := c.shadowServiceUsesShard(ctx, service, shard.Name)
-	if err != nil {
-		return err
+	activeShard := service.Annotations[annotationNodeLoadBalancerDatapathActive]
+	if activeShard != "" && activeShard != shard.Name {
+		cause := fmt.Errorf("node load balancer: withdraw active shard %s before staging replacement %s", activeShard, shard.Name)
+		return errors.Join(cause, c.withdrawServiceDatapath(ctx, service))
 	}
-	if !shadowUsesShard && len(readyNodes) < int(shard.NodesPerShard) {
+	if activeShard != shard.Name && len(readyAddresses) < int(shard.NodesPerShard) {
 		c.queue.AddAfter(key, nodeLoadBalancerRetry)
 		return nil
 	}
-	if _, err := c.ensureShadowService(ctx, service, shard.Name); err != nil {
-		return err
-	}
-	converged, err := c.shadowStatusMatchesExternalIPs(ctx, service, shard.Name, readyExternalIPs)
-	if err != nil {
-		return err
-	}
-	if !converged {
-		c.queue.AddAfter(key, nodeLoadBalancerRetry)
+	if activeShard == shard.Name {
+		// The advertised path was already audited above, including exact firewall
+		// assignment readback. Continue only with non-datapath cleanup and capacity
+		// repair; never tear down and restage an established activation gate here.
+		if err := c.cleanupPreviousFirewall(ctx, service); err != nil {
+			return err
+		}
+		if err := c.cleanupPreviousShard(ctx, service); err != nil {
+			return err
+		}
+		if len(nodes) < int(shard.NodesPerShard) {
+			c.queue.AddAfter(key, nodeLoadBalancerRetry)
+		}
 		return nil
 	}
-	if err := c.copyShadowStatus(ctx, service); err != nil {
-		return err
+	if _, err := c.ensureDatapathService(ctx, service, shard.Name); err != nil {
+		return c.failNodeLoadBalancerShardsClosed(ctx, service, shard.Name, err)
 	}
-	service, err = c.provider.kubeClient.CoreV1().Services(service.Namespace).Get(ctx, service.Name, metav1.GetOptions{})
+	service, err = c.authorizeDatapath(ctx, service, shard.Name, intent)
 	if err != nil {
-		return fmt.Errorf("node load balancer: refresh Service after publishing shadow status: %w", err)
+		return c.failNodeLoadBalancerShardsClosed(ctx, service, shard.Name, err)
 	}
-	if err := c.detachServiceFirewallFromOtherNodes(ctx, service, firewall, readyNodes); err != nil {
-		return err
-	}
-	if err := c.cleanupPreviousFirewall(ctx, service); err != nil {
-		return err
-	}
-	if err := c.cleanupPreviousShard(ctx, service); err != nil {
-		return err
-	}
-	if len(nodes) < int(shard.NodesPerShard) {
-		c.queue.AddAfter(key, nodeLoadBalancerRetry)
-	}
+	// Stop after storing the durable authorization. The next reconciliation's
+	// advertised-path audit performs the remaining ordered transition:
+	// private VIP -> exact firewall assignment -> public Proxy status.
+	c.queue.AddAfter(key, nodeLoadBalancerRetry)
 	return nil
 }
 
-func (c *nodeLoadBalancerController) auditAdvertisedServiceShard(ctx context.Context, service *corev1.Service) error {
-	shard, active, err := c.activeShadowShard(ctx, service)
+func (c *nodeLoadBalancerController) cleanupCompletedPreviousMigration(
+	ctx context.Context,
+	service *corev1.Service,
+) (bool, error) {
+	previousShard := service.Annotations[annotationNodeLoadBalancerPreviousShard]
+	previousFirewall := service.Annotations[annotationNodeLoadBalancerPreviousFirewall]
+	if previousShard == "" && previousFirewall == "" {
+		return false, nil
+	}
+	activeShard := service.Annotations[annotationNodeLoadBalancerDatapathActive]
+	currentShard := service.Annotations[annotationNodeLoadBalancerShard]
+	if activeShard != "" && activeShard != currentShard {
+		// The previous shard is still the established datapath while replacement
+		// capacity is prepared. cleanupAbandonedReplacementShard serializes any
+		// further edit without deleting that active identity.
+		return false, nil
+	}
+	if previousFirewall != "" {
+		if err := c.cleanupPreviousFirewall(ctx, service); err != nil {
+			return true, err
+		}
+	}
+	current, err := c.getExactParentService(ctx, service)
 	if err != nil {
-		return c.failNodeLoadBalancerShardsClosed(ctx, service, "", err)
+		return true, err
+	}
+	if current.Annotations[annotationNodeLoadBalancerPreviousShard] != "" {
+		if err := c.cleanupPreviousShard(ctx, current); err != nil {
+			return true, err
+		}
+	}
+	c.queue.AddAfter(service.Namespace+"/"+service.Name, nodeLoadBalancerRetry)
+	return true, nil
+}
+
+func (c *nodeLoadBalancerController) auditAdvertisedServiceShard(ctx context.Context, service *corev1.Service) (bool, error) {
+	defaults := nodeLoadBalancerDefaults{NodesPerShard: c.provider.config.NodeLoadBalancer.NodesPerShard}
+	expected, err := parseNodeLoadBalancerService(service, defaults)
+	if err != nil {
+		return false, errors.Join(err, c.withdrawServiceDatapath(ctx, service))
+	}
+	datapath, shard, active, err := c.activeDatapathService(ctx, service)
+	if err != nil {
+		return false, c.failNodeLoadBalancerShardsClosed(ctx, service, "", err)
 	}
 	if !active {
-		return nil
+		return false, c.auditUncommittedDatapath(ctx, service)
+	}
+	failClosed := func(cause error) (bool, error) {
+		return false, c.failNodeLoadBalancerShardsClosed(ctx, service, shard, cause)
 	}
 	if err := c.reconcileShardNodeEligibility(ctx, shard); err != nil {
+		return failClosed(err)
+	}
+	if !nodeLoadBalancerDatapathOwnedByService(datapath, service) {
+		return failClosed(errors.New("node load balancer: active generated Service lacks exact ownership"))
+	}
+	addresses, err := c.readyShardAddresses(ctx, shard)
+	if err != nil {
+		return failClosed(err)
+	}
+	readyNodes := make([]*corev1.Node, 0, len(addresses))
+	for _, address := range addresses {
+		readyNodes = append(readyNodes, address.Node)
+	}
+
+	// Resolve and validate the exact firewall while it is still detached from
+	// any stale Nodes. A private Cilium VIP must exist before a new public edge
+	// assignment is permitted, while stale assignments are closed before the
+	// private frontend is changed.
+	firewall, previousUUID, _, err := c.ensureServiceFirewall(ctx, service, nil)
+	if err != nil {
+		return failClosed(err)
+	}
+	if firewall == nil {
+		return failClosed(errors.New("node load balancer: active Service firewall is absent from authoritative readback"))
+	}
+	if patched, metadataErr := c.ensureFirewallMetadata(ctx, service, firewall, previousUUID); metadataErr != nil {
+		return failClosed(metadataErr)
+	} else if patched {
+		return c.waitForServiceFirewallGate(ctx, service)
+	}
+	if err := c.detachServiceFirewallFromOtherNodes(ctx, service, firewall, readyNodes); err != nil {
+		return failClosed(err)
+	}
+	service, err = c.publishDatapathStatus(ctx, service, shard, expected, addresses)
+	if err != nil {
+		return failClosed(err)
+	}
+
+	assignmentsMatch, err := c.serviceFirewallAssignmentsMatch(ctx, service, firewall.UUID, readyNodes)
+	if err != nil {
+		return failClosed(err)
+	}
+	if !assignmentsMatch {
+		var prepared bool
+		service, prepared, err = c.ensureServiceFirewallAssignmentIntent(ctx, service, firewall.UUID)
+		if err != nil {
+			return failClosed(err)
+		}
+		if prepared {
+			return c.waitForServiceFirewallGate(ctx, service)
+		}
+		firewall, previousUUID, assignmentsReady, assignmentErr := c.ensureServiceFirewall(ctx, service, readyNodes)
+		if assignmentErr != nil {
+			return failClosed(assignmentErr)
+		}
+		if firewall == nil || !assignmentsReady {
+			return c.waitForServiceFirewallGate(ctx, service)
+		}
+		if patched, metadataErr := c.ensureFirewallMetadata(ctx, service, firewall, previousUUID); metadataErr != nil {
+			return failClosed(metadataErr)
+		} else if patched {
+			return c.waitForServiceFirewallGate(ctx, service)
+		}
+		assignmentsMatch, err = c.serviceFirewallAssignmentsMatch(ctx, service, firewall.UUID, readyNodes)
+		if err != nil {
+			return failClosed(err)
+		}
+		if !assignmentsMatch {
+			return c.waitForServiceFirewallGate(ctx, service)
+		}
+	}
+	if service.Annotations[annotationNodeLoadBalancerFirewallAssigning] != "" {
+		var cleared bool
+		service, cleared, err = c.clearServiceFirewallAssignmentIntent(ctx, service, firewall.UUID)
+		if err != nil {
+			return failClosed(err)
+		}
+		if cleared {
+			// Publication waits for a separate reconciliation after the assignment
+			// fence is durably cleared.
+			return c.waitForServiceFirewallGate(ctx, service)
+		}
+	}
+	assignmentsMatch, err = c.serviceFirewallAssignmentsMatch(ctx, service, firewall.UUID, readyNodes)
+	if err != nil {
+		return failClosed(err)
+	}
+	if !assignmentsMatch {
+		return failClosed(errors.New("node load balancer: Service firewall assignment changed before public status publication"))
+	}
+	service, err = c.publishPublicProxyStatus(ctx, service, shard, expected, addresses)
+	if err != nil {
+		return failClosed(err)
+	}
+	converged, err := c.datapathStatusesMatch(ctx, service, shard, addresses)
+	if err != nil || !converged {
+		cause := fmt.Errorf("node load balancer: active private VIP/public Proxy pair failed exact audit readback")
+		return failClosed(errors.Join(cause, err))
+	}
+	return false, nil
+}
+
+func (c *nodeLoadBalancerController) waitForServiceFirewallGate(
+	ctx context.Context,
+	service *corev1.Service,
+) (bool, error) {
+	// status.loadBalancer is informational rather than the packet filter, but it
+	// must never claim a public path while the real firewall gate is incomplete.
+	return true, c.clearServiceLoadBalancerStatus(ctx, service)
+}
+
+func (c *nodeLoadBalancerController) auditUncommittedDatapath(ctx context.Context, service *corev1.Service) error {
+	current, err := c.getExactParentService(ctx, service)
+	if err != nil {
 		return err
 	}
-	return nil
+	datapath, err := c.provider.kubeClient.CoreV1().Services(current.Namespace).Get(
+		ctx,
+		nodeLoadBalancerDatapathName(current),
+		metav1.GetOptions{},
+	)
+	if apierrors.IsNotFound(err) {
+		if len(current.Status.LoadBalancer.Ingress) == 0 {
+			return nil
+		}
+		cause := errors.New("node load balancer: parent publishes a public address without an active or staged datapath")
+		return errors.Join(cause, c.withdrawServiceDatapath(ctx, current))
+	}
+	if err != nil {
+		return fmt.Errorf("node load balancer: inspect staged datapath Service: %w", err)
+	}
+	if !nodeLoadBalancerDatapathOwnedByService(datapath, current) {
+		cause := fmt.Errorf("node load balancer: staged datapath Service %s/%s lacks exact ownership", datapath.Namespace, datapath.Name)
+		return errors.Join(cause, c.withdrawServiceDatapath(ctx, current))
+	}
+	shard := datapath.Annotations[annotationNodeLoadBalancerDatapathShard]
+	if !isManagedNodeLoadBalancerShardName(shard) || !nodeLoadBalancerDatapathMatchesDesired(datapath, current, shard) {
+		if len(current.Status.LoadBalancer.Ingress) == 0 && len(datapath.Status.LoadBalancer.Ingress) == 0 {
+			// A completely unadvertised exact-owned child can be repaired safely by
+			// the normal desired-state path.
+			return nil
+		}
+		cause := fmt.Errorf("node load balancer: uncommitted datapath Service %s/%s is terminating or drifted", datapath.Namespace, datapath.Name)
+		return errors.Join(cause, c.withdrawServiceDatapath(ctx, current))
+	}
+	if len(current.Status.LoadBalancer.Ingress) == 0 && len(datapath.Status.LoadBalancer.Ingress) == 0 {
+		return nil
+	}
+	// The activation marker is persisted before the controller publishes any
+	// private VIP. Any status without that durable authorization is therefore an
+	// unsafe or foreign exposure and must be withdrawn rather than adopted.
+	cause := fmt.Errorf("node load balancer: unmarked datapath Service %s/%s publishes a private VIP or public Proxy status", datapath.Namespace, datapath.Name)
+	return errors.Join(cause, c.withdrawServiceDatapath(ctx, current))
 }
 
 func (c *nodeLoadBalancerController) failNodeLoadBalancerShardClosed(ctx context.Context, shard string, cause error) error {
@@ -380,9 +600,9 @@ func (c *nodeLoadBalancerController) failNodeLoadBalancerShardClosed(ctx context
 	}
 	nodes, err := c.rawNodesForShard(shard)
 	if err != nil {
-		return errors.Join(cause, err)
+		return errors.Join(cause, err, c.withdrawShardDatapaths(ctx, shard))
 	}
-	return errors.Join(cause, c.setShardNodesReady(ctx, nodes, nil))
+	return errors.Join(cause, c.setShardNodesReady(ctx, nodes, nil), c.withdrawShardDatapaths(ctx, shard))
 }
 
 func (c *nodeLoadBalancerController) failNodeLoadBalancerShardsClosed(
@@ -399,6 +619,7 @@ func (c *nodeLoadBalancerController) failNodeLoadBalancerShardsClosed(
 		for _, shard := range []string{
 			service.Annotations[annotationNodeLoadBalancerShard],
 			service.Annotations[annotationNodeLoadBalancerPreviousShard],
+			service.Annotations[annotationNodeLoadBalancerDatapathActive],
 		} {
 			if isManagedNodeLoadBalancerShardName(shard) {
 				shards[shard] = struct{}{}
@@ -406,23 +627,214 @@ func (c *nodeLoadBalancerController) failNodeLoadBalancerShardsClosed(
 		}
 	}
 	result := cause
+	result = errors.Join(result, c.withdrawServiceDatapath(ctx, service))
 	for shard := range shards {
 		nodes, err := c.rawNodesForShard(shard)
 		if err != nil {
 			result = errors.Join(result, err)
-			continue
+		} else {
+			result = errors.Join(result, c.setShardNodesReady(ctx, nodes, nil))
 		}
-		result = errors.Join(result, c.setShardNodesReady(ctx, nodes, nil))
+		result = errors.Join(result, c.withdrawShardDatapaths(ctx, shard))
 	}
 	return result
 }
 
 func (c *nodeLoadBalancerController) failClusterNodeLoadBalancerClosed(ctx context.Context, cause error) error {
 	nodes, err := c.rawNodesForCluster()
+	result := cause
 	if err != nil {
-		return errors.Join(cause, err)
+		result = errors.Join(result, err)
+	} else {
+		result = errors.Join(result, c.setShardNodesReady(ctx, nodes, nil))
 	}
-	return errors.Join(cause, c.setShardNodesReady(ctx, nodes, nil))
+	services, listErr := c.servicesForFailureWithdrawal(ctx)
+	result = errors.Join(result, listErr)
+	for _, service := range services {
+		if isNodeLoadBalancerService(service) || containsString(service.Finalizers, nodeLoadBalancerFinalizer) {
+			result = errors.Join(result, c.withdrawServiceDatapath(ctx, service))
+		}
+	}
+	return result
+}
+
+func (c *nodeLoadBalancerController) withdrawShardDatapaths(ctx context.Context, shard string) error {
+	if !isManagedNodeLoadBalancerShardName(shard) {
+		return nil
+	}
+	services, listErr := c.servicesForFailureWithdrawal(ctx)
+	var result error = listErr
+	for _, service := range services {
+		if !isNodeLoadBalancerService(service) && !containsString(service.Finalizers, nodeLoadBalancerFinalizer) {
+			continue
+		}
+		usesShard, inspectErr := c.serviceUsesShardForFailureWithdrawal(ctx, service, shard)
+		result = errors.Join(result, inspectErr)
+		if !usesShard {
+			continue
+		}
+		result = errors.Join(result, c.withdrawServiceDatapath(ctx, service))
+	}
+	return result
+}
+
+func (c *nodeLoadBalancerController) servicesForFailureWithdrawal(ctx context.Context) ([]*corev1.Service, error) {
+	live, liveErr := c.provider.kubeClient.CoreV1().Services("").List(ctx, metav1.ListOptions{})
+	if liveErr == nil {
+		services := make([]*corev1.Service, 0, len(live.Items))
+		for index := range live.Items {
+			services = append(services, &live.Items[index])
+		}
+		return services, nil
+	}
+	if c.services == nil {
+		return nil, fmt.Errorf("node load balancer: live Service List failed and no informer fallback is available: %w", liveErr)
+	}
+	cached, cacheErr := c.services.List(labels.Everything())
+	if cacheErr != nil {
+		return nil, errors.Join(
+			fmt.Errorf("node load balancer: live Service List for withdrawal: %w", liveErr),
+			fmt.Errorf("node load balancer: cached Service List for withdrawal: %w", cacheErr),
+		)
+	}
+	return cached, fmt.Errorf("node load balancer: live Service List for withdrawal: %w", liveErr)
+}
+
+func (c *nodeLoadBalancerController) serviceUsesShardForFailureWithdrawal(
+	ctx context.Context,
+	service *corev1.Service,
+	shard string,
+) (bool, error) {
+	if service == nil {
+		return false, nil
+	}
+	for _, annotated := range []string{
+		service.Annotations[annotationNodeLoadBalancerShard],
+		service.Annotations[annotationNodeLoadBalancerPreviousShard],
+		service.Annotations[annotationNodeLoadBalancerDatapathActive],
+	} {
+		if annotated == shard {
+			return true, nil
+		}
+	}
+	client := c.provider.kubeClient.CoreV1().Services(service.Namespace)
+	datapath, err := client.Get(ctx, nodeLoadBalancerDatapathName(service), metav1.GetOptions{})
+	if err == nil && nodeLoadBalancerDatapathOwnedByService(datapath, service) &&
+		datapath.Annotations[annotationNodeLoadBalancerDatapathShard] == shard {
+		return true, nil
+	}
+	if err != nil && !apierrors.IsNotFound(err) {
+		return false, fmt.Errorf("node load balancer: inspect datapath shard during withdrawal: %w", err)
+	}
+	return false, nil
+}
+
+func (c *nodeLoadBalancerController) withdrawServiceDatapath(ctx context.Context, service *corev1.Service) error {
+	if service == nil {
+		return nil
+	}
+	// The public firewall is the functional edge. Detach and read it back before
+	// touching either status so a crash cannot leave a FIP reaching a host port
+	// after Cilium has removed the matching private VIP frontend.
+	if err := c.detachOwnedServiceFirewallsForFailure(ctx, service); err != nil {
+		return err
+	}
+	detached, err := c.serviceFirewallsDetached(ctx, service)
+	if err != nil {
+		return err
+	}
+	if !detached {
+		return errors.New("node load balancer: waiting for exact Service firewall detachment readback")
+	}
+	if err := c.clearServiceLoadBalancerStatus(ctx, service); err != nil {
+		return err
+	}
+	client := c.provider.kubeClient.CoreV1().Services(service.Namespace)
+	generated, err := client.Get(ctx, nodeLoadBalancerDatapathName(service), metav1.GetOptions{})
+	if err == nil {
+		if !nodeLoadBalancerDatapathOwnedByService(generated, service) {
+			return fmt.Errorf("node load balancer: refusing to withdraw foreign datapath Service %s/%s", service.Namespace, generated.Name)
+		} else if len(generated.Status.LoadBalancer.Ingress) != 0 {
+			copy := generated.DeepCopy()
+			copy.Status.LoadBalancer = corev1.LoadBalancerStatus{}
+			if _, updateErr := client.UpdateStatus(ctx, copy, metav1.UpdateOptions{}); updateErr != nil {
+				return fmt.Errorf("node load balancer: withdraw generated Service %s/%s status: %w", service.Namespace, generated.Name, updateErr)
+			}
+		}
+	} else if !apierrors.IsNotFound(err) {
+		return fmt.Errorf("node load balancer: get generated Service %s/%s for withdrawal: %w", service.Namespace, nodeLoadBalancerDatapathName(service), err)
+	}
+	withdrawn, err := c.serviceExposureWithdrawn(ctx, service)
+	if err != nil {
+		return err
+	}
+	if !withdrawn {
+		return errors.New("node load balancer: refusing to clear datapath activation before exact withdrawal readback")
+	}
+	return c.clearDatapathActivation(ctx, service)
+}
+
+func (c *nodeLoadBalancerController) detachOwnedServiceFirewallsForFailure(ctx context.Context, service *corev1.Service) error {
+	owned, discoveryErr := c.serviceFirewallsForEmergencyDetach(ctx, service)
+	var result error = discoveryErr
+	observedAssignment := false
+	for _, firewall := range owned {
+		for _, resource := range firewall.ResourcesAssigned {
+			observedAssignment = true
+			if !strings.EqualFold(resource.ResourceType, "vm") || resource.ResourceUUID == "" {
+				result = errors.Join(result, fmt.Errorf("node load balancer: owned firewall %s has invalid assigned resource %#v", firewall.UUID, resource))
+				continue
+			}
+			if err := c.provider.api.UnassignFirewallFromVM(ctx, c.provider.config.Location, firewall.UUID, resource.ResourceUUID); err != nil && !inspace.IsNotFound(err) {
+				result = errors.Join(result, fmt.Errorf("node load balancer: detach owned firewall %s from VM %s while failing closed: %w", firewall.UUID, resource.ResourceUUID, err))
+			}
+		}
+	}
+	if observedAssignment {
+		result = errors.Join(result, c.resetServiceFirewallWithdrawalEvidence(ctx, service))
+	}
+	return result
+}
+
+func (c *nodeLoadBalancerController) serviceDatapathWithdrawn(ctx context.Context, service *corev1.Service) (bool, error) {
+	current, err := c.getExactParentService(ctx, service)
+	if apierrors.IsNotFound(err) {
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if current.Annotations[annotationNodeLoadBalancerDatapathActive] != "" {
+		return false, nil
+	}
+	return c.serviceExposureWithdrawn(ctx, current)
+}
+
+func (c *nodeLoadBalancerController) serviceExposureWithdrawn(ctx context.Context, service *corev1.Service) (bool, error) {
+	current, err := c.getExactParentService(ctx, service)
+	if apierrors.IsNotFound(err) {
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if len(current.Status.LoadBalancer.Ingress) != 0 {
+		return false, nil
+	}
+	client := c.provider.kubeClient.CoreV1().Services(current.Namespace)
+	generated, getErr := client.Get(ctx, nodeLoadBalancerDatapathName(current), metav1.GetOptions{})
+	if getErr != nil && !apierrors.IsNotFound(getErr) {
+		return false, getErr
+	}
+	if getErr == nil {
+		if !nodeLoadBalancerDatapathOwnedByService(generated, current) {
+			return false, fmt.Errorf("node load balancer: cannot prove withdrawal while datapath Service %s/%s is foreign", current.Namespace, generated.Name)
+		}
+		if len(generated.Status.LoadBalancer.Ingress) != 0 {
+			return false, nil
+		}
+	}
+	return c.serviceFirewallsDetached(ctx, current)
 }
 
 func (c *nodeLoadBalancerController) cleanupAbandonedReplacementShard(
@@ -434,7 +846,7 @@ func (c *nodeLoadBalancerController) cleanupAbandonedReplacementShard(
 	if currentShard == "" || currentShard == desiredShard {
 		return false, nil
 	}
-	activeShard, active, err := c.activeShadowShard(ctx, service)
+	activeShard, active, err := c.activeDatapathShard(ctx, service)
 	if err != nil {
 		return false, err
 	}
@@ -471,13 +883,46 @@ func (c *nodeLoadBalancerController) cleanupAbandonedReplacementShard(
 }
 
 func (c *nodeLoadBalancerController) planForService(ctx context.Context, target *corev1.Service) (nodeLoadBalancerIntent, nodeLoadBalancerPlan, nodeLoadBalancerShardPlan, error) {
+	currentTarget, err := c.getExactParentService(ctx, target)
+	if err != nil {
+		return nodeLoadBalancerIntent{}, nodeLoadBalancerPlan{}, nodeLoadBalancerShardPlan{}, err
+	}
 	services, err := c.services.List(labels.Everything())
 	if err != nil {
 		return nodeLoadBalancerIntent{}, nodeLoadBalancerPlan{}, nodeLoadBalancerShardPlan{}, err
 	}
-	reservations, err := c.activeShadowPortReservations(ctx, services)
+	targetFound := false
+	for index, service := range services {
+		if service.Namespace == currentTarget.Namespace && service.Name == currentTarget.Name {
+			services[index] = currentTarget
+			targetFound = true
+			break
+		}
+	}
+	if !targetFound {
+		services = append(services, currentTarget)
+	}
+	target = currentTarget
+	reservations, err := c.activeDatapathPortReservations(ctx, services)
 	if err != nil {
 		return nodeLoadBalancerIntent{}, nodeLoadBalancerPlan{}, nodeLoadBalancerShardPlan{}, err
+	}
+	// Reserve every occupied generated-name pattern, including foreign or
+	// malformed NodePools. Existing valid assignments can still use their name,
+	// but a new shard must deterministically advance to the next hash instead of
+	// colliding forever with an object the CCM cannot mutate.
+	occupiedPools, err := c.provider.dynamicClient.Resource(nodePoolGVR).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nodeLoadBalancerIntent{}, nodeLoadBalancerPlan{}, nodeLoadBalancerShardPlan{}, fmt.Errorf("node load balancer: list occupied NodePool names: %w", err)
+	}
+	for index := range occupiedPools.Items {
+		name := occupiedPools.Items[index].GetName()
+		if !isManagedNodeLoadBalancerShardName(name) {
+			continue
+		}
+		if _, exists := reservations[name]; !exists {
+			reservations[name] = make(map[nodeLoadBalancerPortClaim]string)
+		}
 	}
 	defaults := nodeLoadBalancerDefaults{NodesPerShard: c.provider.config.NodeLoadBalancer.NodesPerShard}
 	intents := make([]nodeLoadBalancerIntent, 0)
@@ -505,7 +950,7 @@ func (c *nodeLoadBalancerController) planForService(ctx context.Context, target 
 				}
 			}
 			// A never-established invalid Service owns no public dataplane. A
-			// previously established one is omitted only after its shadow and
+			// previously established one is omitted only after its datapath and
 			// published status are authoritatively absent. Its retained shard and
 			// firewall can then be recovered if the user fixes the Service without
 			// letting malformed claims evict healthy Services.
@@ -539,7 +984,7 @@ func (c *nodeLoadBalancerController) planForService(ctx context.Context, target 
 	return nodeLoadBalancerIntent{}, nodeLoadBalancerPlan{}, nodeLoadBalancerShardPlan{}, errors.New("node load balancer: planner returned no shard")
 }
 
-func (c *nodeLoadBalancerController) activeShadowPortReservations(
+func (c *nodeLoadBalancerController) activeDatapathPortReservations(
 	ctx context.Context,
 	services []*corev1.Service,
 ) (nodeLoadBalancerPortReservations, error) {
@@ -548,34 +993,20 @@ func (c *nodeLoadBalancerController) activeShadowPortReservations(
 		if !isNodeLoadBalancerService(service) && !containsString(service.Finalizers, nodeLoadBalancerFinalizer) {
 			continue
 		}
-		shadow, err := c.provider.kubeClient.CoreV1().Services(service.Namespace).Get(
-			ctx,
-			nodeLoadBalancerShadowName(service),
-			metav1.GetOptions{},
-		)
-		if apierrors.IsNotFound(err) {
+		datapath, shard, found, err := c.activeDatapathService(ctx, service)
+		if !found && err == nil {
 			continue
 		}
 		if err != nil {
-			return nil, fmt.Errorf("node load balancer: inspect active shadow reservation for %s/%s: %w", service.Namespace, service.Name, err)
+			return nil, fmt.Errorf("node load balancer: inspect active datapath reservation for %s/%s: %w", service.Namespace, service.Name, err)
 		}
-		if !nodeLoadBalancerShadowOwnedByService(shadow, service) {
-			return nil, fmt.Errorf("node load balancer: active shadow reservation for %s/%s lacks exact owner identity", service.Namespace, service.Name)
-		}
-		shard, valid := nodeLoadBalancerCiliumSelectorShard(
-			shadow.Annotations[annotationCiliumNodeIPAMMatchLabels],
-			c.provider.config.ClusterID,
-		)
-		if !valid {
-			return nil, fmt.Errorf("node load balancer: active shadow reservation for %s/%s has a foreign node selector", service.Namespace, service.Name)
-		}
-		ports, err := nodeLoadBalancerPortClaims(shadow)
+		ports, err := nodeLoadBalancerPortClaims(datapath)
 		if err != nil {
-			return nil, fmt.Errorf("node load balancer: active shadow reservation for %s/%s has invalid ports: %w", service.Namespace, service.Name, err)
+			return nil, fmt.Errorf("node load balancer: active datapath reservation for %s/%s has invalid ports: %w", service.Namespace, service.Name, err)
 		}
 		owner := string(service.UID)
 		if owner == "" {
-			return nil, fmt.Errorf("node load balancer: active shadow reservation for %s/%s has no Service UID", service.Namespace, service.Name)
+			return nil, fmt.Errorf("node load balancer: active datapath reservation for %s/%s has no Service UID", service.Namespace, service.Name)
 		}
 		if reservations[shard] == nil {
 			reservations[shard] = make(map[nodeLoadBalancerPortClaim]string)
@@ -583,7 +1014,7 @@ func (c *nodeLoadBalancerController) activeShadowPortReservations(
 		for _, port := range ports {
 			if existing, conflict := reservations[shard][port]; conflict && existing != owner {
 				return nil, fmt.Errorf(
-					"node load balancer: active shadows %s and %s collide on shard %s %s/%d",
+					"node load balancer: active datapaths %s and %s collide on shard %s %s/%d",
 					existing, owner, shard, port.Protocol, port.Port,
 				)
 			}
@@ -605,69 +1036,93 @@ func (c *nodeLoadBalancerController) persistedShardAssignmentMatches(ctx context
 	if labels[nodeLoadBalancerManagedLabel] != "true" ||
 		labels[nodeLoadBalancerClusterLabel] != c.provider.config.ClusterID ||
 		labels[nodeLoadBalancerShardLabel] != intent.ExistingShard {
-		return false, fmt.Errorf("node load balancer: persisted shard %s lacks exact cluster ownership", intent.ExistingShard)
+		if service.Annotations[annotationNodeLoadBalancerDatapathActive] != "" || len(service.Status.LoadBalancer.Ingress) != 0 {
+			return false, fmt.Errorf("node load balancer: advertised persisted shard %s lacks exact cluster ownership", intent.ExistingShard)
+		}
+		// An unadvertised stale assignment does not own the occupied NodePool.
+		// Drop the assignment and let the reserved-name planner advance to a
+		// collision-free shard rather than retrying the foreign object forever.
+		return false, nil
 	}
 	if labels[nodeLoadBalancerProfileLabel] != nodeLoadBalancerIntentProfileHash(intent) {
 		return false, nil
 	}
-	shadow, err := c.provider.kubeClient.CoreV1().Services(service.Namespace).Get(
-		ctx,
-		nodeLoadBalancerShadowName(service),
-		metav1.GetOptions{},
-	)
-	if apierrors.IsNotFound(err) {
-		return false, nil
+	datapath, activeShard, found, err := c.activeDatapathService(ctx, service)
+	if !found && err == nil {
+		// A matching persisted NodePool is authoritative even before the first
+		// datapath activation. Port conflicts are still checked against all active
+		// reservations by the planner; dropping this assignment would churn names
+		// merely because the child has not converged yet.
+		return true, nil
 	}
 	if err != nil {
-		return false, fmt.Errorf("node load balancer: get persisted shadow Service for %s/%s: %w", service.Namespace, service.Name, err)
+		return false, fmt.Errorf("node load balancer: get persisted datapath Service for %s/%s: %w", service.Namespace, service.Name, err)
 	}
-	if !nodeLoadBalancerShadowOwnedByService(shadow, service) {
-		return false, fmt.Errorf("node load balancer: persisted shadow Service for %s/%s lacks exact owner identity", service.Namespace, service.Name)
-	}
-	wantSelector := nodeLoadBalancerCiliumSelector(c.provider.config.ClusterID, intent.ExistingShard)
-	if shadow.Annotations[annotationCiliumNodeIPAMMatchLabels] != wantSelector {
+	if activeShard != intent.ExistingShard {
 		previous := service.Annotations[annotationNodeLoadBalancerPreviousShard]
-		previousSelector := nodeLoadBalancerCiliumSelector(c.provider.config.ClusterID, previous)
-		if previous == "" || shadow.Annotations[annotationCiliumNodeIPAMMatchLabels] != previousSelector {
-			return false, fmt.Errorf("node load balancer: persisted shadow Service for %s/%s has a foreign shard selector", service.Namespace, service.Name)
+		if previous == "" || activeShard != previous {
+			return false, fmt.Errorf("node load balancer: persisted datapath Service for %s/%s has a foreign shard identity", service.Namespace, service.Name)
 		}
 		// During a staged migration the persisted assignment already names the
-		// replacement shard while the owned shadow intentionally continues to
+		// replacement shard while the active datapath intentionally continues to
 		// advertise the previous shard. Preserve the replacement assignment only
 		// while the public port claims are unchanged. An edited inactive Service
 		// must not steal a port from a Service already active on the replacement.
 	}
-	shadowPorts, err := nodeLoadBalancerPortClaims(shadow)
+	datapathPorts, err := nodeLoadBalancerPortClaims(datapath)
 	if err != nil {
-		return false, fmt.Errorf("node load balancer: persisted shadow Service for %s/%s has invalid ports: %w", service.Namespace, service.Name, err)
+		return false, fmt.Errorf("node load balancer: persisted datapath Service for %s/%s has invalid ports: %w", service.Namespace, service.Name, err)
 	}
-	return reflect.DeepEqual(shadowPorts, intent.Ports), nil
+	return reflect.DeepEqual(datapathPorts, intent.Ports), nil
 }
 
 func (c *nodeLoadBalancerController) ensureServiceMetadata(ctx context.Context, service *corev1.Service, shard string) (bool, error) {
-	copy := service.DeepCopy()
-	changed := false
-	if !containsString(copy.Finalizers, nodeLoadBalancerFinalizer) {
-		copy.Finalizers = append(copy.Finalizers, nodeLoadBalancerFinalizer)
-		changed = true
+	if !isManagedNodeLoadBalancerShardName(shard) {
+		return false, fmt.Errorf("node load balancer: refusing to persist invalid shard %q", shard)
 	}
-	if copy.Annotations == nil {
-		copy.Annotations = map[string]string{}
-	}
-	if copy.Annotations[annotationNodeLoadBalancerShard] != shard {
+	_, changed, err := c.updateExactParentService(ctx, service, func(copy *corev1.Service) (bool, error) {
+		if copy.DeletionTimestamp != nil || !isNodeLoadBalancerService(copy) {
+			return false, errors.New("node load balancer: parent Service intent changed before metadata persistence")
+		}
+		changed := false
+		if !containsString(copy.Finalizers, nodeLoadBalancerFinalizer) {
+			copy.Finalizers = append(copy.Finalizers, nodeLoadBalancerFinalizer)
+			changed = true
+		}
+		if copy.Annotations == nil {
+			copy.Annotations = map[string]string{}
+		}
+		if copy.Annotations[annotationNodeLoadBalancerShard] == shard {
+			return changed, nil
+		}
 		currentShard := copy.Annotations[annotationNodeLoadBalancerShard]
+		existingPrevious := copy.Annotations[annotationNodeLoadBalancerPreviousShard]
 		previousShard := ""
-		activeShard, active, err := c.activeShadowShard(ctx, service)
-		if err != nil {
-			return false, err
+		activeShard, active, activeErr := c.activeDatapathShard(ctx, copy)
+		if activeErr != nil {
+			return false, activeErr
+		}
+		if existingPrevious != "" && (!active || activeShard != existingPrevious || activeShard == currentShard) {
+			return false, fmt.Errorf(
+				"node load balancer: previous shard %s must finish cleanup before assigning %s",
+				existingPrevious,
+				shard,
+			)
 		}
 		if active {
 			previousShard = activeShard
 			if activeShard == currentShard {
-				// The shadow already cut over, but cleanup of older migration
+				// The datapath already cut over, but cleanup of older migration
 				// metadata has not completed. Its current firewall is now the
 				// dataplane identity that a new migration must preserve.
 				if currentFirewall := copy.Annotations[annotationNodeLoadBalancerFirewallUUID]; currentFirewall != "" {
+					if previousFirewall := copy.Annotations[annotationNodeLoadBalancerPreviousFirewall]; previousFirewall != "" && previousFirewall != currentFirewall {
+						return false, fmt.Errorf(
+							"node load balancer: previous firewall %s must finish cleanup before preserving %s",
+							previousFirewall,
+							currentFirewall,
+						)
+					}
 					copy.Annotations[annotationNodeLoadBalancerPreviousFirewall] = currentFirewall
 				}
 			}
@@ -678,57 +1133,52 @@ func (c *nodeLoadBalancerController) ensureServiceMetadata(ctx context.Context, 
 			delete(copy.Annotations, annotationNodeLoadBalancerPreviousShard)
 		}
 		copy.Annotations[annotationNodeLoadBalancerShard] = shard
-		changed = true
-	}
-	if !changed {
-		return false, nil
-	}
-	_, err := c.provider.kubeClient.CoreV1().Services(copy.Namespace).Update(ctx, copy, metav1.UpdateOptions{})
-	return true, err
-}
-
-func nodeLoadBalancerCiliumSelector(cluster, shard string) string {
-	return strings.Join([]string{
-		nodeLoadBalancerNodeLabel + "=true",
-		nodeLoadBalancerNodeClusterLabel + "=" + cluster,
-		nodeLoadBalancerNodeShardLabel + "=" + shard,
-		nodeLoadBalancerReadyLabel + "=true",
-	}, ",")
-}
-
-func nodeLoadBalancerCiliumSelectorShard(selector, cluster string) (string, bool) {
-	for _, part := range strings.Split(selector, ",") {
-		if !strings.HasPrefix(part, nodeLoadBalancerNodeShardLabel+"=") {
-			continue
-		}
-		shard := strings.TrimPrefix(part, nodeLoadBalancerNodeShardLabel+"=")
-		if !isManagedNodeLoadBalancerShardName(shard) || selector != nodeLoadBalancerCiliumSelector(cluster, shard) {
-			return "", false
-		}
-		return shard, true
-	}
-	return "", false
-}
-
-func (c *nodeLoadBalancerController) activeShadowShard(ctx context.Context, service *corev1.Service) (string, bool, error) {
-	shadow, err := c.provider.kubeClient.CoreV1().Services(service.Namespace).Get(ctx, nodeLoadBalancerShadowName(service), metav1.GetOptions{})
-	if apierrors.IsNotFound(err) {
-		return "", false, nil
-	}
+		return true, nil
+	})
 	if err != nil {
-		return "", false, fmt.Errorf("node load balancer: get active shadow Service for migration: %w", err)
+		return false, fmt.Errorf("node load balancer: persist Service metadata: %w", err)
 	}
-	if !nodeLoadBalancerShadowOwnedByService(shadow, service) {
-		return "", false, fmt.Errorf("node load balancer: active shadow Service for %s/%s lacks exact owner identity", service.Namespace, service.Name)
+	return changed, nil
+}
+
+func (c *nodeLoadBalancerController) activeDatapathShard(ctx context.Context, service *corev1.Service) (string, bool, error) {
+	_, shard, found, err := c.activeDatapathService(ctx, service)
+	return shard, found, err
+}
+
+func (c *nodeLoadBalancerController) activeDatapathService(
+	ctx context.Context,
+	service *corev1.Service,
+) (*corev1.Service, string, bool, error) {
+	current, err := c.getExactParentService(ctx, service)
+	if err != nil {
+		return nil, "", false, fmt.Errorf("node load balancer: get exact parent before active datapath lookup: %w", err)
 	}
-	shard, valid := nodeLoadBalancerCiliumSelectorShard(
-		shadow.Annotations[annotationCiliumNodeIPAMMatchLabels],
-		c.provider.config.ClusterID,
-	)
-	if !valid {
-		return "", false, fmt.Errorf("node load balancer: active shadow Service for %s/%s has a foreign node selector", service.Namespace, service.Name)
+	client := c.provider.kubeClient.CoreV1().Services(current.Namespace)
+	activeShard := current.Annotations[annotationNodeLoadBalancerDatapathActive]
+	datapath, datapathErr := client.Get(ctx, nodeLoadBalancerDatapathName(current), metav1.GetOptions{})
+	if datapathErr != nil && !apierrors.IsNotFound(datapathErr) {
+		return nil, "", false, fmt.Errorf("node load balancer: get active datapath Service: %w", datapathErr)
 	}
-	return shard, true, nil
+	if datapathErr == nil && !nodeLoadBalancerDatapathOwnedByService(datapath, current) {
+		return nil, "", false, fmt.Errorf("node load balancer: datapath Service %s/%s lacks exact owner identity", current.Namespace, datapath.Name)
+	}
+	if activeShard != "" {
+		if !isManagedNodeLoadBalancerShardName(activeShard) {
+			return nil, "", false, fmt.Errorf("node load balancer: parent Service %s/%s has invalid active datapath shard %q", current.Namespace, current.Name, activeShard)
+		}
+		if apierrors.IsNotFound(datapathErr) {
+			return nil, "", false, fmt.Errorf("node load balancer: active datapath Service %s/%s is missing", current.Namespace, nodeLoadBalancerDatapathName(current))
+		}
+		if !nodeLoadBalancerDatapathMatchesDesired(datapath, current, activeShard) {
+			return nil, "", false, fmt.Errorf("node load balancer: active datapath Service %s/%s drifted from its exact parent contract", current.Namespace, datapath.Name)
+		}
+		return datapath, activeShard, true, nil
+	}
+	// An exact-owned child without the durable marker is staged only. It does
+	// not reserve established capacity or become authoritative until both
+	// private VIP and public Proxy statuses pass exact readback.
+	return nil, "", false, nil
 }
 
 func managedNodeLoadBalancerName(clusterID, suffix string) string {
@@ -1092,6 +1542,12 @@ func (c *nodeLoadBalancerController) ensureServiceFirewall(ctx context.Context, 
 		if currentFirewallByUUID != nil {
 			return nil, "", false, fmt.Errorf("node load balancer: current firewall %s no longer matches its deterministic name and policy", currentUUID)
 		}
+		if service.Annotations[annotationNodeLoadBalancerDatapathActive] != "" {
+			// An active path may have an ambiguous or eventually-consistent assignment.
+			// Never clear its durable firewall identity or create a replacement from a
+			// transiently absent List response; fail-closed withdrawal owns that proof.
+			return nil, "", false, nil
+		}
 		if _, confirmErr := c.confirmCurrentFirewallAbsent(ctx, service, time.Now().UTC()); confirmErr != nil {
 			return nil, "", false, confirmErr
 		}
@@ -1109,9 +1565,26 @@ func (c *nodeLoadBalancerController) ensureServiceFirewall(ctx context.Context, 
 		}
 	}
 	if firewall == nil {
-		preparedService, err := c.ensurePendingFirewallCreateIntent(ctx, service, desired.Request.DisplayName)
+		preparedService, prepared, err := c.ensurePendingFirewallCreateIntent(ctx, service, desired.Request.DisplayName)
 		if err != nil {
 			return nil, "", false, err
+		}
+		if !prepared {
+			return nil, "", false, nil
+		}
+		current, err := c.getExactParentService(ctx, preparedService)
+		if err != nil {
+			return nil, "", false, fmt.Errorf("node load balancer: revalidate firewall create attempt: %w", err)
+		}
+		currentDesired, err := c.desiredServiceFirewall(current)
+		if err != nil {
+			return nil, "", false, err
+		}
+		if current.DeletionTimestamp != nil || !isNodeLoadBalancerService(current) ||
+			current.Annotations[annotationNodeLoadBalancerPendingFWName] != desired.Request.DisplayName ||
+			current.Annotations[annotationNodeLoadBalancerPendingFWStarted] != preparedService.Annotations[annotationNodeLoadBalancerPendingFWStarted] ||
+			currentDesired.Hash != desired.Hash || currentDesired.Request.DisplayName != desired.Request.DisplayName {
+			return nil, "", false, errors.New("node load balancer: firewall create attempt became stale before the cloud API call")
 		}
 		created, err := c.provider.api.CreateFirewall(ctx, c.provider.config.Location, desired.Request)
 		if err != nil {
@@ -1125,7 +1598,7 @@ func (c *nodeLoadBalancerController) ensureServiceFirewall(ctx context.Context, 
 		if err := validateCreatedNodeLoadBalancerFirewall(created, desired); err != nil {
 			return nil, "", false, fmt.Errorf("node load balancer: created firewall response: %w", err)
 		}
-		if _, err := c.ensurePendingFirewallMetadata(ctx, preparedService, created.UUID, desired.Request.DisplayName); err != nil {
+		if _, err := c.ensurePendingFirewallMetadata(ctx, current, created.UUID, desired.Request.DisplayName); err != nil {
 			return nil, "", false, err
 		}
 		// InSpace may omit the name, description, billing account, and rules from
@@ -1146,6 +1619,9 @@ func (c *nodeLoadBalancerController) ensureServiceFirewall(ctx context.Context, 
 			continue
 		}
 		if !firewallAssignedToVM(*firewall, vmUUID) {
+			if err := c.validateServiceFirewallAssignmentMutation(ctx, service, *firewall, node); err != nil {
+				return nil, "", false, fmt.Errorf("node load balancer: refuse firewall assignment to VM %s: %w", vmUUID, err)
+			}
 			if err := c.provider.api.AssignFirewallToVM(ctx, c.provider.config.Location, firewall.UUID, vmUUID); err != nil {
 				return nil, "", false, fmt.Errorf("node load balancer: assign firewall %s to VM %s: %w", firewall.UUID, vmUUID, err)
 			}
@@ -1159,6 +1635,82 @@ func (c *nodeLoadBalancerController) ensureServiceFirewall(ctx context.Context, 
 	return firewall, previousUUID, ready, nil
 }
 
+func (c *nodeLoadBalancerController) validateServiceFirewallAssignmentMutation(
+	ctx context.Context,
+	service *corev1.Service,
+	firewall inspace.Firewall,
+	target *corev1.Node,
+) error {
+	current, err := c.getExactParentService(ctx, service)
+	if err != nil {
+		return err
+	}
+	if current.DeletionTimestamp != nil || !isNodeLoadBalancerService(current) {
+		return errors.New("parent Service is deleting or no longer requests the Node load balancer")
+	}
+	activeShard := current.Annotations[annotationNodeLoadBalancerDatapathActive]
+	if !isManagedNodeLoadBalancerShardName(activeShard) {
+		return errors.New("parent Service has no valid active datapath")
+	}
+	assigningUUID := current.Annotations[annotationNodeLoadBalancerFirewallAssigning]
+	assigningStarted := current.Annotations[annotationNodeLoadBalancerFirewallAssignAt]
+	if assigningUUID != firewall.UUID || assigningStarted == "" ||
+		assigningUUID != service.Annotations[annotationNodeLoadBalancerFirewallAssigning] ||
+		assigningStarted != service.Annotations[annotationNodeLoadBalancerFirewallAssignAt] {
+		return errors.New("durable firewall assignment authorization changed")
+	}
+	if _, err := time.Parse(time.RFC3339Nano, assigningStarted); err != nil {
+		return fmt.Errorf("firewall assignment authorization timestamp is invalid: %w", err)
+	}
+	desired, err := c.desiredServiceFirewall(current)
+	if err != nil {
+		return err
+	}
+	if current.Annotations[annotationNodeLoadBalancerFirewallUUID] != firewall.UUID ||
+		current.Annotations[annotationNodeLoadBalancerFirewallHash] != desired.Hash ||
+		!nodeLoadBalancerFirewallMatches(firewall, desired) {
+		return errors.New("current firewall identity or policy no longer matches the live Service")
+	}
+	expected, err := parseNodeLoadBalancerService(
+		current,
+		nodeLoadBalancerDefaults{NodesPerShard: c.provider.config.NodeLoadBalancer.NodesPerShard},
+	)
+	if err != nil {
+		return err
+	}
+	client := c.provider.kubeClient.CoreV1().Services(current.Namespace)
+	datapath, err := client.Get(ctx, nodeLoadBalancerDatapathName(current), metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("read private VIP contract before firewall assignment: %w", err)
+	}
+	if err := c.validatePlannedDatapathContract(current, datapath, activeShard, expected, true); err != nil {
+		return err
+	}
+	if len(current.Status.LoadBalancer.Ingress) != 0 {
+		return errors.New("public Proxy status is not empty while the firewall assignment gate is pending")
+	}
+	addresses, err := c.readyShardAddresses(ctx, activeShard)
+	if err != nil {
+		return err
+	}
+	if !reflect.DeepEqual(datapath.Status.LoadBalancer, nodeLoadBalancerStatus(addresses, false)) {
+		return errors.New("private VIP status no longer matches the authorized ready Nodes")
+	}
+	targetVM, targetOK := nodeLoadBalancerVMUUID(target)
+	foundTarget := false
+	for _, address := range addresses {
+		vmUUID, ok := nodeLoadBalancerVMUUID(address.Node)
+		if ok && targetOK && address.Node.Name == target.Name && vmUUID == targetVM {
+			foundTarget = true
+			break
+		}
+	}
+	if !foundTarget {
+		return fmt.Errorf("target Node %s is no longer an authorized ready member of shard %s", target.Name, activeShard)
+	}
+	return nil
+}
+
 func definitiveNodeLoadBalancerCreateFailure(err error) bool {
 	if err == nil {
 		return false
@@ -1170,65 +1722,94 @@ func definitiveNodeLoadBalancerCreateFailure(err error) bool {
 	return errors.As(err, &apiErr) && !apiErr.Retryable
 }
 
-func (c *nodeLoadBalancerController) ensurePendingFirewallCreateIntent(ctx context.Context, service *corev1.Service, name string) (*corev1.Service, error) {
-	copy := service.DeepCopy()
-	if copy.Annotations == nil {
-		copy.Annotations = map[string]string{}
-	}
-	copy.Annotations[annotationNodeLoadBalancerPendingFWName] = name
-	copy.Annotations[annotationNodeLoadBalancerPendingFWStarted] = time.Now().UTC().Format(time.RFC3339Nano)
-	delete(copy.Annotations, annotationNodeLoadBalancerPendingFirewall)
-	delete(copy.Annotations, annotationNodeLoadBalancerPendingFWDelete)
-	delete(copy.Annotations, annotationNodeLoadBalancerPendingFWAbsent)
-	delete(copy.Annotations, annotationNodeLoadBalancerPendingFWChecked)
-	updated, err := c.provider.kubeClient.CoreV1().Services(copy.Namespace).Update(ctx, copy, metav1.UpdateOptions{})
+func (c *nodeLoadBalancerController) ensurePendingFirewallCreateIntent(ctx context.Context, service *corev1.Service, name string) (*corev1.Service, bool, error) {
+	started := time.Now().UTC().Format(time.RFC3339Nano)
+	updated, changed, err := c.updateExactParentService(ctx, service, func(copy *corev1.Service) (bool, error) {
+		if copy.DeletionTimestamp != nil || !isNodeLoadBalancerService(copy) {
+			return false, errors.New("node load balancer: parent Service intent changed before firewall create")
+		}
+		desired, desiredErr := c.desiredServiceFirewall(copy)
+		if desiredErr != nil {
+			return false, desiredErr
+		}
+		if desired.Request.DisplayName != name {
+			return false, errors.New("node load balancer: firewall create intent is stale for the current Service spec")
+		}
+		if copy.Annotations == nil {
+			copy.Annotations = map[string]string{}
+		}
+		if pendingName := copy.Annotations[annotationNodeLoadBalancerPendingFWName]; pendingName != "" {
+			if pendingName == name && copy.Annotations[annotationNodeLoadBalancerPendingFWStarted] != "" {
+				return false, nil
+			}
+			return false, fmt.Errorf("node load balancer: another firewall create attempt %q is already pending", pendingName)
+		}
+		copy.Annotations[annotationNodeLoadBalancerPendingFWName] = name
+		copy.Annotations[annotationNodeLoadBalancerPendingFWStarted] = started
+		delete(copy.Annotations, annotationNodeLoadBalancerPendingFirewall)
+		delete(copy.Annotations, annotationNodeLoadBalancerPendingFWDelete)
+		delete(copy.Annotations, annotationNodeLoadBalancerPendingFWAbsent)
+		delete(copy.Annotations, annotationNodeLoadBalancerPendingFWChecked)
+		return true, nil
+	})
 	if err != nil {
-		return nil, fmt.Errorf("node load balancer: persist firewall create intent: %w", err)
+		return nil, false, fmt.Errorf("node load balancer: persist firewall create intent: %w", err)
 	}
-	return updated, nil
+	return updated, changed, nil
 }
 
 func (c *nodeLoadBalancerController) ensurePendingFirewallMetadata(ctx context.Context, service *corev1.Service, uuid, name string) (bool, error) {
-	copy := service.DeepCopy()
-	if copy.Annotations == nil {
-		copy.Annotations = map[string]string{}
+	if uuid == "" || name == "" {
+		return false, errors.New("node load balancer: complete provisional firewall identity is required")
 	}
-	if copy.Annotations[annotationNodeLoadBalancerPendingFirewall] == uuid &&
-		copy.Annotations[annotationNodeLoadBalancerPendingFWName] == name &&
-		copy.Annotations[annotationNodeLoadBalancerPendingFWAbsent] == "" &&
-		copy.Annotations[annotationNodeLoadBalancerPendingFWChecked] == "" {
-		return false, nil
-	}
-	copy.Annotations[annotationNodeLoadBalancerPendingFirewall] = uuid
-	copy.Annotations[annotationNodeLoadBalancerPendingFWName] = name
-	delete(copy.Annotations, annotationNodeLoadBalancerPendingFWAbsent)
-	delete(copy.Annotations, annotationNodeLoadBalancerPendingFWChecked)
-	if _, err := c.provider.kubeClient.CoreV1().Services(copy.Namespace).Update(ctx, copy, metav1.UpdateOptions{}); err != nil {
+	expectedStarted := service.Annotations[annotationNodeLoadBalancerPendingFWStarted]
+	_, changed, err := c.updateExactParentService(ctx, service, func(copy *corev1.Service) (bool, error) {
+		if copy.Annotations[annotationNodeLoadBalancerPendingFWName] != name ||
+			expectedStarted == "" || copy.Annotations[annotationNodeLoadBalancerPendingFWStarted] != expectedStarted {
+			return false, errors.New("node load balancer: provisional firewall create attempt changed before identity persistence")
+		}
+		if copy.Annotations[annotationNodeLoadBalancerPendingFirewall] == uuid &&
+			copy.Annotations[annotationNodeLoadBalancerPendingFWAbsent] == "" &&
+			copy.Annotations[annotationNodeLoadBalancerPendingFWChecked] == "" {
+			return false, nil
+		}
+		copy.Annotations[annotationNodeLoadBalancerPendingFirewall] = uuid
+		delete(copy.Annotations, annotationNodeLoadBalancerPendingFWAbsent)
+		delete(copy.Annotations, annotationNodeLoadBalancerPendingFWChecked)
+		return true, nil
+	})
+	if err != nil {
 		return false, fmt.Errorf("node load balancer: persist provisional firewall identity: %w", err)
 	}
-	return true, nil
+	return changed, nil
 }
 
 func (c *nodeLoadBalancerController) clearPendingFirewallMetadata(ctx context.Context, service *corev1.Service) (bool, error) {
-	if service.Annotations[annotationNodeLoadBalancerPendingFirewall] == "" &&
-		service.Annotations[annotationNodeLoadBalancerPendingFWName] == "" &&
-		service.Annotations[annotationNodeLoadBalancerPendingFWStarted] == "" &&
-		service.Annotations[annotationNodeLoadBalancerPendingFWDelete] == "" &&
-		service.Annotations[annotationNodeLoadBalancerPendingFWAbsent] == "" &&
-		service.Annotations[annotationNodeLoadBalancerPendingFWChecked] == "" {
-		return false, nil
-	}
-	copy := service.DeepCopy()
-	delete(copy.Annotations, annotationNodeLoadBalancerPendingFirewall)
-	delete(copy.Annotations, annotationNodeLoadBalancerPendingFWName)
-	delete(copy.Annotations, annotationNodeLoadBalancerPendingFWStarted)
-	delete(copy.Annotations, annotationNodeLoadBalancerPendingFWDelete)
-	delete(copy.Annotations, annotationNodeLoadBalancerPendingFWAbsent)
-	delete(copy.Annotations, annotationNodeLoadBalancerPendingFWChecked)
-	if _, err := c.provider.kubeClient.CoreV1().Services(copy.Namespace).Update(ctx, copy, metav1.UpdateOptions{}); err != nil {
+	expectedName := service.Annotations[annotationNodeLoadBalancerPendingFWName]
+	expectedStarted := service.Annotations[annotationNodeLoadBalancerPendingFWStarted]
+	_, changed, err := c.updateExactParentService(ctx, service, func(copy *corev1.Service) (bool, error) {
+		if copy.Annotations[annotationNodeLoadBalancerPendingFWName] != expectedName ||
+			copy.Annotations[annotationNodeLoadBalancerPendingFWStarted] != expectedStarted {
+			return false, errors.New("node load balancer: provisional firewall create attempt changed before metadata clear")
+		}
+		if copy.Annotations[annotationNodeLoadBalancerPendingFirewall] == "" && expectedName == "" && expectedStarted == "" &&
+			copy.Annotations[annotationNodeLoadBalancerPendingFWDelete] == "" &&
+			copy.Annotations[annotationNodeLoadBalancerPendingFWAbsent] == "" &&
+			copy.Annotations[annotationNodeLoadBalancerPendingFWChecked] == "" {
+			return false, nil
+		}
+		delete(copy.Annotations, annotationNodeLoadBalancerPendingFirewall)
+		delete(copy.Annotations, annotationNodeLoadBalancerPendingFWName)
+		delete(copy.Annotations, annotationNodeLoadBalancerPendingFWStarted)
+		delete(copy.Annotations, annotationNodeLoadBalancerPendingFWDelete)
+		delete(copy.Annotations, annotationNodeLoadBalancerPendingFWAbsent)
+		delete(copy.Annotations, annotationNodeLoadBalancerPendingFWChecked)
+		return true, nil
+	})
+	if err != nil {
 		return false, fmt.Errorf("node load balancer: clear provisional firewall identity: %w", err)
 	}
-	return true, nil
+	return changed, nil
 }
 
 func (c *nodeLoadBalancerController) promotePendingFirewallMetadata(
@@ -1240,55 +1821,82 @@ func (c *nodeLoadBalancerController) promotePendingFirewallMetadata(
 	if firewall == nil || firewall.UUID == "" || policyHash == "" {
 		return false, errors.New("node load balancer: complete pending firewall identity is required for promotion")
 	}
-	copy := service.DeepCopy()
-	if copy.Annotations == nil {
-		copy.Annotations = map[string]string{}
-	}
-	if current := copy.Annotations[annotationNodeLoadBalancerFirewallUUID]; current != "" && current != firewall.UUID &&
-		copy.Annotations[annotationNodeLoadBalancerPreviousFirewall] == "" {
-		copy.Annotations[annotationNodeLoadBalancerPreviousFirewall] = current
-	}
-	copy.Annotations[annotationNodeLoadBalancerFirewallUUID] = firewall.UUID
-	copy.Annotations[annotationNodeLoadBalancerFirewallHash] = policyHash
-	for _, key := range []string{
-		annotationNodeLoadBalancerPendingFirewall,
-		annotationNodeLoadBalancerPendingFWName,
-		annotationNodeLoadBalancerPendingFWStarted,
-		annotationNodeLoadBalancerPendingFWDelete,
-		annotationNodeLoadBalancerPendingFWAbsent,
-		annotationNodeLoadBalancerPendingFWChecked,
-		annotationNodeLoadBalancerFirewallAbsent,
-		annotationNodeLoadBalancerFirewallChecked,
-	} {
-		delete(copy.Annotations, key)
-	}
-	if _, err := c.provider.kubeClient.CoreV1().Services(copy.Namespace).Update(ctx, copy, metav1.UpdateOptions{}); err != nil {
+	expectedName := service.Annotations[annotationNodeLoadBalancerPendingFWName]
+	expectedStarted := service.Annotations[annotationNodeLoadBalancerPendingFWStarted]
+	_, changed, err := c.updateExactParentService(ctx, service, func(copy *corev1.Service) (bool, error) {
+		if copy.DeletionTimestamp != nil || !isNodeLoadBalancerService(copy) {
+			return false, errors.New("node load balancer: parent Service intent changed before firewall promotion")
+		}
+		if expectedName == "" || expectedStarted == "" ||
+			copy.Annotations[annotationNodeLoadBalancerPendingFWName] != expectedName ||
+			copy.Annotations[annotationNodeLoadBalancerPendingFWStarted] != expectedStarted ||
+			copy.Annotations[annotationNodeLoadBalancerPendingFirewall] != firewall.UUID {
+			return false, errors.New("node load balancer: provisional firewall create attempt changed before promotion")
+		}
+		desired, desiredErr := c.desiredServiceFirewall(copy)
+		if desiredErr != nil {
+			return false, desiredErr
+		}
+		if desired.Hash != policyHash || desired.Request.DisplayName != expectedName || !nodeLoadBalancerFirewallMatches(*firewall, desired) {
+			return false, errors.New("node load balancer: provisional firewall no longer matches the current Service policy")
+		}
+		if current := copy.Annotations[annotationNodeLoadBalancerFirewallUUID]; current != "" && current != firewall.UUID &&
+			copy.Annotations[annotationNodeLoadBalancerPreviousFirewall] == "" {
+			copy.Annotations[annotationNodeLoadBalancerPreviousFirewall] = current
+		}
+		copy.Annotations[annotationNodeLoadBalancerFirewallUUID] = firewall.UUID
+		copy.Annotations[annotationNodeLoadBalancerFirewallHash] = policyHash
+		for _, key := range []string{
+			annotationNodeLoadBalancerPendingFirewall,
+			annotationNodeLoadBalancerPendingFWName,
+			annotationNodeLoadBalancerPendingFWStarted,
+			annotationNodeLoadBalancerPendingFWDelete,
+			annotationNodeLoadBalancerPendingFWAbsent,
+			annotationNodeLoadBalancerPendingFWChecked,
+			annotationNodeLoadBalancerFirewallAbsent,
+			annotationNodeLoadBalancerFirewallChecked,
+		} {
+			delete(copy.Annotations, key)
+		}
+		return true, nil
+	})
+	if err != nil {
 		return false, fmt.Errorf("node load balancer: atomically promote provisional firewall identity: %w", err)
 	}
-	return true, nil
+	return changed, nil
 }
 
 func (c *nodeLoadBalancerController) ensurePendingFirewallDeletionMetadata(ctx context.Context, service *corev1.Service) (bool, error) {
-	if service.Annotations[annotationNodeLoadBalancerPendingFWDelete] == "true" &&
-		service.Annotations[annotationNodeLoadBalancerPendingFWAbsent] == "" &&
-		service.Annotations[annotationNodeLoadBalancerPendingFWChecked] == "" {
-		return false, nil
-	}
-	copy := service.DeepCopy()
-	if copy.Annotations == nil {
-		copy.Annotations = map[string]string{}
-	}
-	copy.Annotations[annotationNodeLoadBalancerPendingFWDelete] = "true"
-	delete(copy.Annotations, annotationNodeLoadBalancerPendingFWAbsent)
-	delete(copy.Annotations, annotationNodeLoadBalancerPendingFWChecked)
-	if _, err := c.provider.kubeClient.CoreV1().Services(copy.Namespace).Update(ctx, copy, metav1.UpdateOptions{}); err != nil {
+	expectedName := service.Annotations[annotationNodeLoadBalancerPendingFWName]
+	expectedStarted := service.Annotations[annotationNodeLoadBalancerPendingFWStarted]
+	_, changed, err := c.updateExactParentService(ctx, service, func(copy *corev1.Service) (bool, error) {
+		if expectedName == "" || expectedStarted == "" ||
+			copy.Annotations[annotationNodeLoadBalancerPendingFWName] != expectedName ||
+			copy.Annotations[annotationNodeLoadBalancerPendingFWStarted] != expectedStarted {
+			return false, errors.New("node load balancer: provisional firewall create attempt changed before cleanup")
+		}
+		if copy.Annotations[annotationNodeLoadBalancerPendingFWDelete] == "true" &&
+			copy.Annotations[annotationNodeLoadBalancerPendingFWAbsent] == "" &&
+			copy.Annotations[annotationNodeLoadBalancerPendingFWChecked] == "" {
+			return false, nil
+		}
+		copy.Annotations[annotationNodeLoadBalancerPendingFWDelete] = "true"
+		delete(copy.Annotations, annotationNodeLoadBalancerPendingFWAbsent)
+		delete(copy.Annotations, annotationNodeLoadBalancerPendingFWChecked)
+		return true, nil
+	})
+	if err != nil {
 		return false, fmt.Errorf("node load balancer: persist provisional firewall cleanup state: %w", err)
 	}
-	return true, nil
+	return changed, nil
 }
 
 func (c *nodeLoadBalancerController) confirmPendingFirewallAbsent(ctx context.Context, service *corev1.Service, now time.Time) (bool, error) {
-	started := service.Annotations[annotationNodeLoadBalancerPendingFWStarted]
+	current, err := c.getExactParentService(ctx, service)
+	if err != nil {
+		return false, err
+	}
+	started := current.Annotations[annotationNodeLoadBalancerPendingFWStarted]
 	if started == "" {
 		return false, errors.New("node load balancer: pending firewall name is missing its create-attempt timestamp")
 	}
@@ -1298,7 +1906,7 @@ func (c *nodeLoadBalancerController) confirmPendingFirewallAbsent(ctx context.Co
 	}
 	confirmed, changed, err := c.recordFirewallAbsence(
 		ctx,
-		service,
+		current,
 		annotationNodeLoadBalancerPendingFWAbsent,
 		annotationNodeLoadBalancerPendingFWChecked,
 		now,
@@ -1310,7 +1918,11 @@ func (c *nodeLoadBalancerController) confirmPendingFirewallAbsent(ctx context.Co
 	// Clearing the intent is deliberately its own persisted reconciliation.
 	// The next reconciliation performs a fresh authoritative list before it is
 	// allowed to issue another billable create.
-	_, err = c.clearPendingFirewallMetadata(ctx, service)
+	current, err = c.getExactParentService(ctx, current)
+	if err != nil {
+		return false, err
+	}
+	_, err = c.clearPendingFirewallMetadata(ctx, current)
 	return false, err
 }
 
@@ -1326,12 +1938,24 @@ func (c *nodeLoadBalancerController) confirmCurrentFirewallAbsent(ctx context.Co
 	if err != nil || changed || !confirmed {
 		return false, err
 	}
-	copy := service.DeepCopy()
-	delete(copy.Annotations, annotationNodeLoadBalancerFirewallUUID)
-	delete(copy.Annotations, annotationNodeLoadBalancerFirewallHash)
-	delete(copy.Annotations, annotationNodeLoadBalancerFirewallAbsent)
-	delete(copy.Annotations, annotationNodeLoadBalancerFirewallChecked)
-	if _, err := c.provider.kubeClient.CoreV1().Services(copy.Namespace).Update(ctx, copy, metav1.UpdateOptions{}); err != nil {
+	expectedUUID := service.Annotations[annotationNodeLoadBalancerFirewallUUID]
+	expectedHash := service.Annotations[annotationNodeLoadBalancerFirewallHash]
+	_, _, err = c.updateExactParentService(ctx, service, func(copy *corev1.Service) (bool, error) {
+		if copy.Annotations[annotationNodeLoadBalancerFirewallUUID] != expectedUUID ||
+			copy.Annotations[annotationNodeLoadBalancerFirewallHash] != expectedHash {
+			return false, errors.New("node load balancer: current firewall identity changed during absence confirmation")
+		}
+		count, parseErr := strconv.Atoi(copy.Annotations[annotationNodeLoadBalancerFirewallAbsent])
+		if parseErr != nil || count < nodeLoadBalancerAbsenceConfirmations {
+			return false, errors.New("node load balancer: current firewall absence is no longer confirmed")
+		}
+		delete(copy.Annotations, annotationNodeLoadBalancerFirewallUUID)
+		delete(copy.Annotations, annotationNodeLoadBalancerFirewallHash)
+		delete(copy.Annotations, annotationNodeLoadBalancerFirewallAbsent)
+		delete(copy.Annotations, annotationNodeLoadBalancerFirewallChecked)
+		return true, nil
+	})
+	if err != nil {
 		return false, fmt.Errorf("node load balancer: clear repeatedly absent current firewall identity: %w", err)
 	}
 	return false, nil
@@ -1346,36 +1970,40 @@ func (c *nodeLoadBalancerController) recordFirewallAbsence(
 	if now.Before(notBefore) {
 		return false, false, nil
 	}
-	count := 0
-	if raw := service.Annotations[countAnnotation]; raw != "" {
-		parsed, parseErr := strconv.Atoi(raw)
-		if parseErr != nil || parsed < 0 || parsed > nodeLoadBalancerAbsenceConfirmations {
-			return false, false, fmt.Errorf("node load balancer: invalid firewall absence count %q", raw)
+	confirmed = false
+	_, changed, err = c.updateExactParentService(ctx, service, func(copy *corev1.Service) (bool, error) {
+		count := 0
+		if raw := copy.Annotations[countAnnotation]; raw != "" {
+			parsed, parseErr := strconv.Atoi(raw)
+			if parseErr != nil || parsed < 0 || parsed > nodeLoadBalancerAbsenceConfirmations {
+				return false, fmt.Errorf("node load balancer: invalid firewall absence count %q", raw)
+			}
+			count = parsed
 		}
-		count = parsed
-	}
-	if count >= nodeLoadBalancerAbsenceConfirmations {
-		return true, false, nil
-	}
-	if raw := service.Annotations[checkedAnnotation]; raw != "" {
-		checkedAt, parseErr := time.Parse(time.RFC3339Nano, raw)
-		if parseErr != nil {
-			return false, false, fmt.Errorf("node load balancer: invalid firewall absence timestamp: %w", parseErr)
+		if count >= nodeLoadBalancerAbsenceConfirmations {
+			confirmed = true
+			return false, nil
 		}
-		if now.Before(checkedAt.Add(nodeLoadBalancerAbsenceConfirmationDelay)) {
-			return false, false, nil
+		if raw := copy.Annotations[checkedAnnotation]; raw != "" {
+			checkedAt, parseErr := time.Parse(time.RFC3339Nano, raw)
+			if parseErr != nil {
+				return false, fmt.Errorf("node load balancer: invalid firewall absence timestamp: %w", parseErr)
+			}
+			if now.Before(checkedAt.Add(nodeLoadBalancerAbsenceConfirmationDelay)) {
+				return false, nil
+			}
 		}
-	}
-	copy := service.DeepCopy()
-	if copy.Annotations == nil {
-		copy.Annotations = map[string]string{}
-	}
-	copy.Annotations[countAnnotation] = strconv.Itoa(count + 1)
-	copy.Annotations[checkedAnnotation] = now.UTC().Format(time.RFC3339Nano)
-	if _, err := c.provider.kubeClient.CoreV1().Services(copy.Namespace).Update(ctx, copy, metav1.UpdateOptions{}); err != nil {
+		if copy.Annotations == nil {
+			copy.Annotations = map[string]string{}
+		}
+		copy.Annotations[countAnnotation] = strconv.Itoa(count + 1)
+		copy.Annotations[checkedAnnotation] = now.UTC().Format(time.RFC3339Nano)
+		return true, nil
+	})
+	if err != nil {
 		return false, false, fmt.Errorf("node load balancer: persist firewall absence evidence: %w", err)
 	}
-	return false, true, nil
+	return confirmed, changed, nil
 }
 
 func (c *nodeLoadBalancerController) clearFirewallAbsenceEvidence(
@@ -1383,16 +2011,18 @@ func (c *nodeLoadBalancerController) clearFirewallAbsenceEvidence(
 	service *corev1.Service,
 	countAnnotation, checkedAnnotation string,
 ) (bool, error) {
-	if service.Annotations[countAnnotation] == "" && service.Annotations[checkedAnnotation] == "" {
-		return false, nil
-	}
-	copy := service.DeepCopy()
-	delete(copy.Annotations, countAnnotation)
-	delete(copy.Annotations, checkedAnnotation)
-	if _, err := c.provider.kubeClient.CoreV1().Services(copy.Namespace).Update(ctx, copy, metav1.UpdateOptions{}); err != nil {
+	_, changed, err := c.updateExactParentService(ctx, service, func(copy *corev1.Service) (bool, error) {
+		if copy.Annotations[countAnnotation] == "" && copy.Annotations[checkedAnnotation] == "" {
+			return false, nil
+		}
+		delete(copy.Annotations, countAnnotation)
+		delete(copy.Annotations, checkedAnnotation)
+		return true, nil
+	})
+	if err != nil {
 		return false, fmt.Errorf("node load balancer: clear firewall absence evidence: %w", err)
 	}
-	return true, nil
+	return changed, nil
 }
 
 func nodeLoadBalancerFirewallMatches(firewall inspace.Firewall, desired desiredNodeLoadBalancerFirewall) bool {
@@ -1467,104 +2097,327 @@ func nodeLoadBalancerVMUUID(node *corev1.Node) (string, bool) {
 }
 
 func (c *nodeLoadBalancerController) ensureFirewallMetadata(ctx context.Context, service *corev1.Service, firewall *inspace.Firewall, previousUUID string) (bool, error) {
-	desired, err := c.desiredServiceFirewall(service)
+	if firewall == nil || firewall.UUID == "" {
+		return false, errors.New("node load balancer: complete firewall identity is required")
+	}
+	_, changed, err := c.updateExactParentService(ctx, service, func(copy *corev1.Service) (bool, error) {
+		if copy.DeletionTimestamp != nil || !isNodeLoadBalancerService(copy) {
+			return false, errors.New("node load balancer: parent Service intent changed before firewall metadata persistence")
+		}
+		desired, desiredErr := c.desiredServiceFirewall(copy)
+		if desiredErr != nil {
+			return false, desiredErr
+		}
+		if !nodeLoadBalancerFirewallMatches(*firewall, desired) {
+			return false, errors.New("node load balancer: firewall no longer matches the current Service policy")
+		}
+		if assigning := copy.Annotations[annotationNodeLoadBalancerFirewallAssigning]; assigning != "" && assigning != firewall.UUID {
+			return false, fmt.Errorf("node load balancer: unresolved firewall assignment fence still binds UUID %s", assigning)
+		}
+		if copy.Annotations == nil {
+			copy.Annotations = map[string]string{}
+		}
+		currentBefore := copy.Annotations[annotationNodeLoadBalancerFirewallUUID]
+		changed := false
+		for key, value := range map[string]string{
+			annotationNodeLoadBalancerFirewallUUID: firewall.UUID,
+			annotationNodeLoadBalancerFirewallHash: desired.Hash,
+		} {
+			if copy.Annotations[key] != value {
+				copy.Annotations[key] = value
+				changed = true
+			}
+		}
+		observedPrevious := previousUUID
+		if currentBefore != "" && currentBefore != firewall.UUID {
+			observedPrevious = currentBefore
+		}
+		if observedPrevious != "" && observedPrevious != firewall.UUID && copy.Annotations[annotationNodeLoadBalancerPreviousFirewall] == "" {
+			copy.Annotations[annotationNodeLoadBalancerPreviousFirewall] = observedPrevious
+			changed = true
+		}
+		for _, key := range []string{annotationNodeLoadBalancerFirewallAbsent, annotationNodeLoadBalancerFirewallChecked} {
+			if copy.Annotations[key] != "" {
+				delete(copy.Annotations, key)
+				changed = true
+			}
+		}
+		return changed, nil
+	})
+	if err != nil {
+		return false, fmt.Errorf("node load balancer: persist firewall metadata: %w", err)
+	}
+	return changed, nil
+}
+
+func (c *nodeLoadBalancerController) ensureServiceFirewallAssignmentIntent(
+	ctx context.Context,
+	service *corev1.Service,
+	firewallUUID string,
+) (*corev1.Service, bool, error) {
+	if firewallUUID == "" {
+		return nil, false, errors.New("node load balancer: firewall UUID is required before assignment authorization")
+	}
+	current, err := c.getExactParentService(ctx, service)
+	if err != nil {
+		return nil, false, err
+	}
+	activeShard := current.Annotations[annotationNodeLoadBalancerDatapathActive]
+	if !isManagedNodeLoadBalancerShardName(activeShard) || current.Annotations[annotationNodeLoadBalancerFirewallUUID] != firewallUUID {
+		return nil, false, errors.New("node load balancer: firewall assignment is not bound to the active datapath identity")
+	}
+	datapath, err := c.provider.kubeClient.CoreV1().Services(current.Namespace).Get(
+		ctx,
+		nodeLoadBalancerDatapathName(current),
+		metav1.GetOptions{},
+	)
+	if err != nil {
+		return nil, false, fmt.Errorf("node load balancer: inspect private VIP before firewall assignment authorization: %w", err)
+	}
+	if !nodeLoadBalancerDatapathMatchesDesired(datapath, current, activeShard) || len(datapath.Status.LoadBalancer.Ingress) == 0 {
+		return nil, false, errors.New("node load balancer: exact private VIP must exist before firewall assignment authorization")
+	}
+	started := time.Now().UTC().Format(time.RFC3339Nano)
+	updated, changed, err := c.updateExactParentService(ctx, current, func(copy *corev1.Service) (bool, error) {
+		if copy.Annotations[annotationNodeLoadBalancerDatapathActive] != activeShard ||
+			copy.Annotations[annotationNodeLoadBalancerFirewallUUID] != firewallUUID ||
+			!nodeLoadBalancerDatapathMatchesDesired(datapath, copy, activeShard) {
+			return false, errors.New("node load balancer: datapath changed before firewall assignment authorization")
+		}
+		existingUUID := copy.Annotations[annotationNodeLoadBalancerFirewallAssigning]
+		existingStarted := copy.Annotations[annotationNodeLoadBalancerFirewallAssignAt]
+		if existingUUID != "" || existingStarted != "" {
+			if existingUUID != firewallUUID || existingStarted == "" {
+				return false, errors.New("node load balancer: another or incomplete firewall assignment attempt is already pending")
+			}
+			if _, parseErr := time.Parse(time.RFC3339Nano, existingStarted); parseErr != nil {
+				return false, fmt.Errorf("node load balancer: firewall assignment timestamp is invalid: %w", parseErr)
+			}
+			return false, nil
+		}
+		if copy.Annotations == nil {
+			copy.Annotations = map[string]string{}
+		}
+		copy.Annotations[annotationNodeLoadBalancerFirewallAssigning] = firewallUUID
+		copy.Annotations[annotationNodeLoadBalancerFirewallAssignAt] = started
+		return true, nil
+	})
+	if err != nil {
+		return nil, false, fmt.Errorf("node load balancer: persist firewall assignment authorization: %w", err)
+	}
+	return updated, changed, nil
+}
+
+func (c *nodeLoadBalancerController) clearServiceFirewallAssignmentIntent(
+	ctx context.Context,
+	service *corev1.Service,
+	firewallUUID string,
+) (*corev1.Service, bool, error) {
+	updated, changed, err := c.updateExactParentService(ctx, service, func(copy *corev1.Service) (bool, error) {
+		assigning := copy.Annotations[annotationNodeLoadBalancerFirewallAssigning]
+		started := copy.Annotations[annotationNodeLoadBalancerFirewallAssignAt]
+		if assigning == "" && started == "" {
+			return false, nil
+		}
+		if assigning != firewallUUID || started == "" || copy.Annotations[annotationNodeLoadBalancerFirewallUUID] != firewallUUID {
+			return false, errors.New("node load balancer: firewall assignment authorization changed before exact readback")
+		}
+		delete(copy.Annotations, annotationNodeLoadBalancerFirewallAssigning)
+		delete(copy.Annotations, annotationNodeLoadBalancerFirewallAssignAt)
+		return true, nil
+	})
+	if err != nil {
+		return nil, false, fmt.Errorf("node load balancer: clear firewall assignment authorization: %w", err)
+	}
+	return updated, changed, nil
+}
+
+func (c *nodeLoadBalancerController) serviceFirewallAssignmentsMatch(
+	ctx context.Context,
+	service *corev1.Service,
+	firewallUUID string,
+	nodes []*corev1.Node,
+) (bool, error) {
+	current, err := c.getExactParentService(ctx, service)
 	if err != nil {
 		return false, err
 	}
-	copy := service.DeepCopy()
-	if copy.Annotations == nil {
-		copy.Annotations = map[string]string{}
+	if firewallUUID == "" || current.Annotations[annotationNodeLoadBalancerFirewallUUID] != firewallUUID {
+		return false, errors.New("node load balancer: firewall assignment readback is not bound to current metadata")
 	}
-	changed := false
-	for key, value := range map[string]string{
-		annotationNodeLoadBalancerFirewallUUID: firewall.UUID,
-		annotationNodeLoadBalancerFirewallHash: desired.Hash,
-	} {
-		if copy.Annotations[key] != value {
-			copy.Annotations[key] = value
-			changed = true
+	expectedHash := current.Annotations[annotationNodeLoadBalancerFirewallHash]
+	if expectedHash == "" {
+		return false, errors.New("node load balancer: firewall assignment readback is missing the policy hash")
+	}
+	desiredVMs := make(map[string]struct{}, len(nodes))
+	for _, node := range nodes {
+		vmUUID, ok := nodeLoadBalancerVMUUID(node)
+		if !ok || !nodeLoadBalancerNodeHealthy(node) {
+			return false, fmt.Errorf("node load balancer: selected Node %s is not eligible for firewall assignment", node.Name)
+		}
+		desiredVMs[vmUUID] = struct{}{}
+	}
+	items, err := c.provider.api.ListFirewalls(ctx, c.provider.config.Location)
+	if err != nil {
+		return false, fmt.Errorf("node load balancer: list firewalls for assignment readback: %w", err)
+	}
+	matches := 0
+	for _, firewall := range items {
+		if firewall.UUID != firewallUUID {
+			continue
+		}
+		matches++
+		if !nodeLoadBalancerFirewallOwnedByService(
+			firewall,
+			c.provider.config.ClusterID,
+			string(current.UID),
+			c.provider.config.BillingAccountID,
+		) {
+			return false, errors.New("node load balancer: current firewall lost exact policy ownership during assignment readback")
+		}
+		hash, hashErr := nodeLoadBalancerFirewallSpecHash(firewall.Rules)
+		if hashErr != nil || hash != expectedHash {
+			return false, errors.New("node load balancer: current firewall policy changed during assignment readback")
+		}
+		assigned, assignmentErr := staleNodeLoadBalancerFirewallAssignments(firewall, desiredVMs)
+		if assignmentErr != nil {
+			return false, assignmentErr
+		}
+		if len(assigned) != 0 || len(firewall.ResourcesAssigned) != len(desiredVMs) {
+			return false, nil
 		}
 	}
-	if previousUUID != "" && previousUUID != firewall.UUID && copy.Annotations[annotationNodeLoadBalancerPreviousFirewall] == "" {
-		copy.Annotations[annotationNodeLoadBalancerPreviousFirewall] = previousUUID
-		changed = true
+	if matches > 1 {
+		return false, fmt.Errorf("node load balancer: firewall UUID %s appears multiple times during assignment readback", firewallUUID)
 	}
-	for _, key := range []string{annotationNodeLoadBalancerFirewallAbsent, annotationNodeLoadBalancerFirewallChecked} {
-		if copy.Annotations[key] != "" {
-			delete(copy.Annotations, key)
-			changed = true
-		}
-	}
-	if !changed {
-		return false, nil
-	}
-	_, err = c.provider.kubeClient.CoreV1().Services(copy.Namespace).Update(ctx, copy, metav1.UpdateOptions{})
-	return true, err
+	return matches == 1, nil
 }
 
-func nodeLoadBalancerShadowName(service *corev1.Service) string {
-	base := service.Name + "-node-lb"
-	if len(base) <= 63 {
-		return base
-	}
-	hash := shortNodeLoadBalancerHash(string(service.UID))
-	prefix := strings.TrimRight(service.Name[:min(len(service.Name), 54)], "-")
-	return prefix + "-" + hash
+func nodeLoadBalancerDatapathName(service *corev1.Service) string {
+	return "inlb-dp-" + nodeLoadBalancerServiceIdentity(service)
 }
 
-func (c *nodeLoadBalancerController) validateShadowServiceName(ctx context.Context, service *corev1.Service) error {
-	shadow, err := c.provider.kubeClient.CoreV1().Services(service.Namespace).Get(ctx, nodeLoadBalancerShadowName(service), metav1.GetOptions{})
+// nodeLoadBalancerServiceIdentity is independent of Kubernetes namespace/name
+// length limits while still binding every generated object to the exact parent
+// identity. Fifty-two hex characters retain 208 bits of SHA-256 and keep the
+// canonical Service name at 60 DNS-label characters.
+func nodeLoadBalancerServiceIdentity(service *corev1.Service) string {
+	identity := "nil-service"
+	if service != nil {
+		identity = service.Namespace + "\x00" + service.Name + "\x00" + string(service.UID)
+	}
+	sum := sha256.Sum256([]byte(identity))
+	return hex.EncodeToString(sum[:])[:52]
+}
+
+func (c *nodeLoadBalancerController) validateDatapathServiceName(ctx context.Context, service *corev1.Service) error {
+	client := c.provider.kubeClient.CoreV1().Services(service.Namespace)
+	name := nodeLoadBalancerDatapathName(service)
+	generated, err := client.Get(ctx, name, metav1.GetOptions{})
 	if apierrors.IsNotFound(err) {
 		return nil
 	}
 	if err != nil {
-		return fmt.Errorf("node load balancer: preflight shadow Service name: %w", err)
+		return fmt.Errorf("node load balancer: preflight datapath Service name %s/%s: %w", service.Namespace, name, err)
 	}
-	if !nodeLoadBalancerShadowOwnedByService(shadow, service) {
-		return fmt.Errorf("node load balancer: shadow Service name %s/%s is occupied by another owner", service.Namespace, shadow.Name)
+	if !nodeLoadBalancerDatapathOwnedByService(generated, service) {
+		return fmt.Errorf("node load balancer: datapath Service name %s/%s is occupied by another owner", service.Namespace, name)
 	}
 	return nil
 }
 
-func (c *nodeLoadBalancerController) ensureShadowService(ctx context.Context, service *corev1.Service, shard string) (*corev1.Service, error) {
-	name := nodeLoadBalancerShadowName(service)
+func (c *nodeLoadBalancerController) ensureDatapathService(ctx context.Context, service *corev1.Service, shard string) (*corev1.Service, error) {
+	name := nodeLoadBalancerDatapathName(service)
 	client := c.provider.kubeClient.CoreV1().Services(service.Namespace)
 	existing, err := client.Get(ctx, name, metav1.GetOptions{})
 	if err != nil && !apierrors.IsNotFound(err) {
-		return nil, fmt.Errorf("node load balancer: get shadow Service: %w", err)
+		return nil, fmt.Errorf("node load balancer: get datapath Service: %w", err)
 	}
-	desired := desiredNodeLoadBalancerShadow(service, name, c.provider.config.ClusterID, shard)
+	desired := desiredNodeLoadBalancerDatapath(service, name, shard)
 	if apierrors.IsNotFound(err) {
 		created, createErr := client.Create(ctx, desired, metav1.CreateOptions{})
 		if createErr != nil {
-			return nil, fmt.Errorf("node load balancer: create shadow Service: %w", createErr)
+			return nil, fmt.Errorf("node load balancer: create datapath Service: %w", createErr)
 		}
 		return created, nil
 	}
-	if !nodeLoadBalancerShadowOwnedByService(existing, service) {
-		return nil, fmt.Errorf("node load balancer: shadow Service name %s/%s is occupied by another owner", service.Namespace, name)
+	if !nodeLoadBalancerDatapathOwnedByService(existing, service) {
+		return nil, fmt.Errorf("node load balancer: datapath Service name %s/%s is occupied by another owner", service.Namespace, name)
 	}
-	desired.ResourceVersion = existing.ResourceVersion
-	desired.Spec.ClusterIP = existing.Spec.ClusterIP
-	desired.Spec.ClusterIPs = append([]string(nil), existing.Spec.ClusterIPs...)
-	desired.Spec.IPFamilies = append([]corev1.IPFamily(nil), existing.Spec.IPFamilies...)
-	desired.Spec.IPFamilyPolicy = existing.Spec.IPFamilyPolicy
+	if existing.Spec.LoadBalancerClass == nil || *existing.Spec.LoadBalancerClass != nodeLoadBalancerDatapathClass {
+		if err := deleteServiceWithUIDPrecondition(ctx, client, existing); err != nil && !apierrors.IsNotFound(err) {
+			return nil, fmt.Errorf("node load balancer: replace exact-owned datapath Service with immutable class drift: %w", err)
+		}
+		return nil, fmt.Errorf("node load balancer: deleted exact-owned datapath Service %s/%s with immutable class drift", service.Namespace, name)
+	}
+	desired = normalizedDesiredNodeLoadBalancerDatapath(desired, existing)
 	if reflect.DeepEqual(existing.Labels, desired.Labels) && reflect.DeepEqual(existing.Annotations, desired.Annotations) &&
 		reflect.DeepEqual(existing.OwnerReferences, desired.OwnerReferences) && reflect.DeepEqual(existing.Spec, desired.Spec) {
 		return existing, nil
 	}
 	updated, err := client.Update(ctx, desired, metav1.UpdateOptions{})
 	if err != nil {
-		return nil, fmt.Errorf("node load balancer: update shadow Service: %w", err)
+		return nil, fmt.Errorf("node load balancer: update datapath Service: %w", err)
 	}
 	return updated, nil
 }
 
+func normalizedDesiredNodeLoadBalancerDatapath(desired, existing *corev1.Service) *corev1.Service {
+	copy := desired.DeepCopy()
+	copy.ResourceVersion = existing.ResourceVersion
+	copy.Spec.ClusterIP = existing.Spec.ClusterIP
+	copy.Spec.ClusterIPs = append([]string(nil), existing.Spec.ClusterIPs...)
+	copy.Spec.IPFamilies = append([]corev1.IPFamily(nil), existing.Spec.IPFamilies...)
+	copy.Spec.IPFamilyPolicy = existing.Spec.IPFamilyPolicy
+	return copy
+}
+
+func nodeLoadBalancerDatapathMatchesDesired(datapath, service *corev1.Service, shard string) bool {
+	if datapath == nil || service == nil || datapath.DeletionTimestamp != nil ||
+		datapath.Namespace != service.Namespace || datapath.Name != nodeLoadBalancerDatapathName(service) ||
+		!nodeLoadBalancerDatapathOwnedByService(datapath, service) {
+		return false
+	}
+	desired := normalizedDesiredNodeLoadBalancerDatapath(
+		desiredNodeLoadBalancerDatapath(service, datapath.Name, shard),
+		datapath,
+	)
+	return reflect.DeepEqual(datapath.Labels, desired.Labels) &&
+		reflect.DeepEqual(datapath.Annotations, desired.Annotations) &&
+		reflect.DeepEqual(datapath.OwnerReferences, desired.OwnerReferences) &&
+		reflect.DeepEqual(datapath.Spec, desired.Spec)
+}
+
+func deleteServiceWithUIDPrecondition(
+	ctx context.Context,
+	client corev1client.ServiceInterface,
+	service *corev1.Service,
+) error {
+	if service == nil || service.UID == "" {
+		return errors.New("node load balancer: generated Service UID is required for deletion")
+	}
+	uid := service.UID
+	return client.Delete(ctx, service.Name, metav1.DeleteOptions{
+		Preconditions: &metav1.Preconditions{UID: &uid},
+	})
+}
+
 func (c *nodeLoadBalancerController) quarantineInvalidService(ctx context.Context, service *corev1.Service) error {
-	if err := c.deleteOwnedShadowService(ctx, service); err != nil {
+	if err := c.withdrawServiceDatapath(ctx, service); err != nil {
 		return err
 	}
-	absent, err := c.ownedShadowServiceAbsent(ctx, service)
+	withdrawn, err := c.serviceDatapathWithdrawn(ctx, service)
+	if err != nil {
+		return err
+	}
+	if !withdrawn {
+		c.queue.AddAfter(service.Namespace+"/"+service.Name, nodeLoadBalancerRetry)
+		return nil
+	}
+	if err := c.deleteOwnedDatapathService(ctx, service); err != nil {
+		return err
+	}
+	absent, err := c.ownedDatapathServiceAbsent(ctx, service)
 	if err != nil {
 		return err
 	}
@@ -1613,6 +2466,7 @@ func (c *nodeLoadBalancerController) cleanupInvalidServiceShards(ctx context.Con
 	for _, shard := range []string{
 		service.Annotations[annotationNodeLoadBalancerShard],
 		service.Annotations[annotationNodeLoadBalancerPreviousShard],
+		service.Annotations[annotationNodeLoadBalancerDatapathActive],
 	} {
 		if shard == "" {
 			continue
@@ -1695,12 +2549,14 @@ func (c *nodeLoadBalancerController) preparePendingFirewallTeardown(
 }
 
 func (c *nodeLoadBalancerController) invalidServiceIsQuarantined(ctx context.Context, service *corev1.Service) (bool, error) {
-	if _, err := c.provider.kubeClient.CoreV1().Services(service.Namespace).Get(ctx, nodeLoadBalancerShadowName(service), metav1.GetOptions{}); err == nil {
-		return false, nil
-	} else if !apierrors.IsNotFound(err) {
-		return false, fmt.Errorf("node load balancer: prove invalid shadow Service absence: %w", err)
+	absent, err := c.ownedDatapathServiceAbsent(ctx, service)
+	if err != nil {
+		return false, err
 	}
-	current, err := c.provider.kubeClient.CoreV1().Services(service.Namespace).Get(ctx, service.Name, metav1.GetOptions{})
+	if !absent {
+		return false, nil
+	}
+	current, err := c.getExactParentService(ctx, service)
 	if apierrors.IsNotFound(err) {
 		return true, nil
 	}
@@ -1718,101 +2574,95 @@ func (c *nodeLoadBalancerController) invalidServiceIsQuarantined(ctx context.Con
 }
 
 func (c *nodeLoadBalancerController) clearInvalidServiceFirewallMetadata(ctx context.Context, service *corev1.Service) error {
-	current, err := c.provider.kubeClient.CoreV1().Services(service.Namespace).Get(ctx, service.Name, metav1.GetOptions{})
+	_, _, err := c.updateExactParentService(ctx, service, func(copy *corev1.Service) (bool, error) {
+		changed := false
+		for _, key := range []string{
+			annotationNodeLoadBalancerFirewallUUID,
+			annotationNodeLoadBalancerFirewallHash,
+			annotationNodeLoadBalancerFirewallAbsent,
+			annotationNodeLoadBalancerFirewallChecked,
+			annotationNodeLoadBalancerPreviousFirewall,
+		} {
+			if _, exists := copy.Annotations[key]; exists {
+				delete(copy.Annotations, key)
+				changed = true
+			}
+		}
+		return changed, nil
+	})
 	if apierrors.IsNotFound(err) {
 		return nil
 	}
 	if err != nil {
-		return err
-	}
-	copy := current.DeepCopy()
-	changed := false
-	for _, key := range []string{
-		annotationNodeLoadBalancerFirewallUUID,
-		annotationNodeLoadBalancerFirewallHash,
-		annotationNodeLoadBalancerFirewallAbsent,
-		annotationNodeLoadBalancerFirewallChecked,
-		annotationNodeLoadBalancerPreviousFirewall,
-	} {
-		if _, exists := copy.Annotations[key]; exists {
-			delete(copy.Annotations, key)
-			changed = true
-		}
-	}
-	if !changed {
-		return nil
-	}
-	if _, err := c.provider.kubeClient.CoreV1().Services(copy.Namespace).Update(ctx, copy, metav1.UpdateOptions{}); err != nil {
 		return fmt.Errorf("node load balancer: clear invalid Service firewall metadata: %w", err)
 	}
 	return nil
 }
 
-func (c *nodeLoadBalancerController) deleteOwnedShadowService(ctx context.Context, service *corev1.Service) error {
-	name := nodeLoadBalancerShadowName(service)
+func (c *nodeLoadBalancerController) deleteOwnedDatapathService(ctx context.Context, service *corev1.Service) error {
 	client := c.provider.kubeClient.CoreV1().Services(service.Namespace)
-	shadow, err := client.Get(ctx, name, metav1.GetOptions{})
+	name := nodeLoadBalancerDatapathName(service)
+	datapath, err := client.Get(ctx, name, metav1.GetOptions{})
 	if apierrors.IsNotFound(err) {
 		return nil
 	}
 	if err != nil {
-		return fmt.Errorf("node load balancer: get shadow Service before delete: %w", err)
+		return fmt.Errorf("node load balancer: get datapath Service %s/%s before delete: %w", service.Namespace, name, err)
 	}
-	if !nodeLoadBalancerShadowOwnedByService(shadow, service) {
-		return fmt.Errorf("node load balancer: refusing to delete shadow Service %s/%s without exact owner identity", service.Namespace, name)
+	if !nodeLoadBalancerDatapathOwnedByService(datapath, service) {
+		return fmt.Errorf("node load balancer: refusing to delete datapath Service %s/%s without exact owner identity", service.Namespace, name)
 	}
-	if err := client.Delete(ctx, name, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
-		return fmt.Errorf("node load balancer: delete shadow Service: %w", err)
+	if err := deleteServiceWithUIDPrecondition(ctx, client, datapath); err != nil && !apierrors.IsNotFound(err) {
+		return fmt.Errorf("node load balancer: delete datapath Service %s/%s: %w", service.Namespace, name, err)
 	}
 	return nil
 }
 
-func nodeLoadBalancerShadowOwnedByService(shadow, service *corev1.Service) bool {
-	if shadow == nil || service == nil || shadow.Labels[nodeLoadBalancerShadowLabel] != "true" ||
-		shadow.Labels[nodeLoadBalancerServiceUIDLabel] != string(service.UID) || len(shadow.OwnerReferences) != 1 {
+func nodeLoadBalancerGeneratedServiceOwnedByService(generated, service *corev1.Service, ownershipLabel string) bool {
+	if generated == nil || service == nil || service.UID == "" || generated.Namespace != service.Namespace ||
+		generated.Labels[ownershipLabel] != "true" || len(generated.OwnerReferences) != 1 {
 		return false
 	}
-	reference := shadow.OwnerReferences[0]
+	reference := generated.OwnerReferences[0]
 	return reference.APIVersion == "v1" && reference.Kind == "Service" && reference.UID == service.UID &&
 		reference.Name == service.Name && reference.Controller != nil && *reference.Controller &&
 		reference.BlockOwnerDeletion != nil && *reference.BlockOwnerDeletion
 }
 
-func (c *nodeLoadBalancerController) ownedShadowServiceAbsent(ctx context.Context, service *corev1.Service) (bool, error) {
-	shadow, err := c.provider.kubeClient.CoreV1().Services(service.Namespace).Get(ctx, nodeLoadBalancerShadowName(service), metav1.GetOptions{})
+func nodeLoadBalancerDatapathOwnedByService(datapath, service *corev1.Service) bool {
+	return nodeLoadBalancerGeneratedServiceOwnedByService(datapath, service, nodeLoadBalancerDatapathLabel) &&
+		datapath.Labels[nodeLoadBalancerServiceIdentityLabel] == nodeLoadBalancerServiceIdentity(service)
+}
+
+func (c *nodeLoadBalancerController) ownedDatapathServiceAbsent(ctx context.Context, service *corev1.Service) (bool, error) {
+	client := c.provider.kubeClient.CoreV1().Services(service.Namespace)
+	name := nodeLoadBalancerDatapathName(service)
+	datapath, err := client.Get(ctx, name, metav1.GetOptions{})
 	if apierrors.IsNotFound(err) {
 		return true, nil
 	}
 	if err != nil {
-		return false, fmt.Errorf("node load balancer: prove shadow Service absence: %w", err)
+		return false, fmt.Errorf("node load balancer: prove datapath Service %s/%s absence: %w", service.Namespace, name, err)
 	}
-	if !nodeLoadBalancerShadowOwnedByService(shadow, service) {
-		return false, fmt.Errorf("node load balancer: shadow Service name %s/%s is occupied by another owner", service.Namespace, shadow.Name)
+	if !nodeLoadBalancerDatapathOwnedByService(datapath, service) {
+		return false, fmt.Errorf("node load balancer: datapath Service name %s/%s is occupied by another owner", service.Namespace, name)
 	}
 	return false, nil
 }
 
 func (c *nodeLoadBalancerController) clearServiceLoadBalancerStatus(ctx context.Context, service *corev1.Service) error {
-	current, err := c.provider.kubeClient.CoreV1().Services(service.Namespace).Get(ctx, service.Name, metav1.GetOptions{})
+	_, _, err := c.updateExactParentStatus(ctx, service, corev1.LoadBalancerStatus{})
 	if apierrors.IsNotFound(err) {
 		return nil
 	}
 	if err != nil {
-		return err
-	}
-	if len(current.Status.LoadBalancer.Ingress) == 0 {
-		return nil
-	}
-	copy := current.DeepCopy()
-	copy.Status.LoadBalancer = corev1.LoadBalancerStatus{}
-	if _, err := c.provider.kubeClient.CoreV1().Services(copy.Namespace).UpdateStatus(ctx, copy, metav1.UpdateOptions{}); err != nil {
 		return fmt.Errorf("node load balancer: clear Service load balancer status: %w", err)
 	}
 	return nil
 }
 
-func desiredNodeLoadBalancerShadow(service *corev1.Service, name, cluster, shard string) *corev1.Service {
-	ciliumClass := nodeLoadBalancerCiliumClass
+func desiredNodeLoadBalancerDatapath(service *corev1.Service, name, shard string) *corev1.Service {
+	datapathClass := nodeLoadBalancerDatapathClass
 	allocateNodePorts := false
 	controller := true
 	blockOwnerDeletion := true
@@ -1824,10 +2674,10 @@ func desiredNodeLoadBalancerShadow(service *corev1.Service, name, cluster, shard
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: service.Namespace, Name: name,
 			Labels: map[string]string{
-				nodeLoadBalancerShadowLabel: "true", nodeLoadBalancerServiceUIDLabel: string(service.UID),
+				nodeLoadBalancerDatapathLabel: "true", nodeLoadBalancerServiceIdentityLabel: nodeLoadBalancerServiceIdentity(service),
 			},
 			Annotations: map[string]string{
-				annotationCiliumNodeIPAMMatchLabels: nodeLoadBalancerCiliumSelector(cluster, shard),
+				annotationNodeLoadBalancerDatapathShard: shard,
 			},
 			OwnerReferences: []metav1.OwnerReference{{
 				APIVersion: "v1", Kind: "Service", Name: service.Name, UID: service.UID,
@@ -1835,7 +2685,7 @@ func desiredNodeLoadBalancerShadow(service *corev1.Service, name, cluster, shard
 			}},
 		},
 		Spec: corev1.ServiceSpec{
-			Type: corev1.ServiceTypeLoadBalancer, LoadBalancerClass: &ciliumClass,
+			Type: corev1.ServiceTypeLoadBalancer, LoadBalancerClass: &datapathClass,
 			AllocateLoadBalancerNodePorts: &allocateNodePorts,
 			ExternalTrafficPolicy:         corev1.ServiceExternalTrafficPolicyCluster,
 			Selector:                      copyStringMap(service.Spec.Selector),
@@ -1863,104 +2713,398 @@ func copyStringMap(input map[string]string) map[string]string {
 	return result
 }
 
-func (c *nodeLoadBalancerController) copyShadowStatus(ctx context.Context, service *corev1.Service) error {
-	shadow, err := c.provider.kubeClient.CoreV1().Services(service.Namespace).Get(ctx, nodeLoadBalancerShadowName(service), metav1.GetOptions{})
-	if apierrors.IsNotFound(err) {
-		return nil
+func (c *nodeLoadBalancerController) getExactParentService(
+	ctx context.Context,
+	service *corev1.Service,
+) (*corev1.Service, error) {
+	if service == nil || service.UID == "" {
+		return nil, errors.New("node load balancer: parent Service UID is required")
 	}
+	current, err := c.provider.kubeClient.CoreV1().Services(service.Namespace).Get(ctx, service.Name, metav1.GetOptions{})
+	if err != nil {
+		return nil, err
+	}
+	if current.UID != service.UID {
+		return nil, fmt.Errorf(
+			"node load balancer: parent Service %s/%s identity changed from UID %s to %s",
+			service.Namespace, service.Name, service.UID, current.UID,
+		)
+	}
+	return current, nil
+}
+
+func (c *nodeLoadBalancerController) validatePlannedDatapathContract(
+	service, datapath *corev1.Service,
+	shard string,
+	expected nodeLoadBalancerIntent,
+	requireAuthorization bool,
+) error {
+	if service == nil || service.DeletionTimestamp != nil || !isNodeLoadBalancerService(service) {
+		return errors.New("node load balancer: parent Service is deleting or no longer requests the NodeLB class")
+	}
+	defaults := nodeLoadBalancerDefaults{NodesPerShard: c.provider.config.NodeLoadBalancer.NodesPerShard}
+	currentIntent, err := parseNodeLoadBalancerService(service, defaults)
 	if err != nil {
 		return err
 	}
-	if reflect.DeepEqual(service.Status.LoadBalancer, shadow.Status.LoadBalancer) {
-		return nil
+	if !reflect.DeepEqual(currentIntent, expected) {
+		return fmt.Errorf("node load balancer: parent Service intent changed while reconciling shard %s", shard)
 	}
-	copy := service.DeepCopy()
-	copy.Status.LoadBalancer = *shadow.Status.LoadBalancer.DeepCopy()
-	if _, err := c.provider.kubeClient.CoreV1().Services(copy.Namespace).UpdateStatus(ctx, copy, metav1.UpdateOptions{}); err != nil {
-		return fmt.Errorf("node load balancer: copy shadow status: %w", err)
+	if currentIntent.ExistingShard != shard && service.Annotations[annotationNodeLoadBalancerPreviousShard] != shard {
+		return fmt.Errorf("node load balancer: parent Service records shard %q, not %q", currentIntent.ExistingShard, shard)
+	}
+	activeShard := service.Annotations[annotationNodeLoadBalancerDatapathActive]
+	if requireAuthorization {
+		if activeShard != shard {
+			return fmt.Errorf("node load balancer: parent Service has no activation authorization for shard %s", shard)
+		}
+	} else if activeShard != "" && activeShard != shard {
+		return fmt.Errorf("node load balancer: parent Service authorizes shard %s, not %s", activeShard, shard)
+	}
+	if !nodeLoadBalancerDatapathMatchesDesired(datapath, service, shard) {
+		return fmt.Errorf("node load balancer: datapath is terminating, foreign, or drifted for shard %s", shard)
 	}
 	return nil
 }
 
-func (c *nodeLoadBalancerController) shadowServiceUsesShard(ctx context.Context, service *corev1.Service, shard string) (bool, error) {
-	shadow, err := c.provider.kubeClient.CoreV1().Services(service.Namespace).Get(ctx, nodeLoadBalancerShadowName(service), metav1.GetOptions{})
-	if apierrors.IsNotFound(err) {
-		return false, nil
-	}
+// updateExactParentService performs controller-owned metadata mutations only
+// after a live UID check. The resourceVersion from that live read lets the API
+// server reject a same-name replacement racing the update.
+func (c *nodeLoadBalancerController) updateExactParentService(
+	ctx context.Context,
+	service *corev1.Service,
+	mutate func(*corev1.Service) (bool, error),
+) (*corev1.Service, bool, error) {
+	current, err := c.getExactParentService(ctx, service)
 	if err != nil {
-		return false, fmt.Errorf("node load balancer: get shadow Service for cutover: %w", err)
+		return nil, false, err
 	}
-	if !nodeLoadBalancerShadowOwnedByService(shadow, service) {
-		return false, fmt.Errorf("node load balancer: shadow Service name %s/%s is occupied by another owner", service.Namespace, shadow.Name)
+	copy := current.DeepCopy()
+	if mutate == nil {
+		return current, false, nil
 	}
-	wantSelector := nodeLoadBalancerCiliumSelector(c.provider.config.ClusterID, shard)
-	return shadow.Annotations[annotationCiliumNodeIPAMMatchLabels] == wantSelector, nil
+	changed, err := mutate(copy)
+	if err != nil {
+		return nil, false, err
+	}
+	if !changed {
+		return current, false, nil
+	}
+	updated, err := c.provider.kubeClient.CoreV1().Services(copy.Namespace).Update(ctx, copy, metav1.UpdateOptions{})
+	if err != nil {
+		return nil, false, err
+	}
+	if updated.UID != service.UID {
+		return nil, false, fmt.Errorf(
+			"node load balancer: parent Service %s/%s identity changed during metadata update",
+			service.Namespace, service.Name,
+		)
+	}
+	return updated, true, nil
 }
 
-func (c *nodeLoadBalancerController) readyShardNodes(ctx context.Context, shard string) ([]*corev1.Node, []string, error) {
+func (c *nodeLoadBalancerController) updateExactParentStatus(
+	ctx context.Context,
+	service *corev1.Service,
+	status corev1.LoadBalancerStatus,
+) (*corev1.Service, bool, error) {
+	current, err := c.getExactParentService(ctx, service)
+	if err != nil {
+		return nil, false, err
+	}
+	if reflect.DeepEqual(current.Status.LoadBalancer, status) {
+		return current, false, nil
+	}
+	copy := current.DeepCopy()
+	copy.Status.LoadBalancer = *status.DeepCopy()
+	updated, err := c.provider.kubeClient.CoreV1().Services(copy.Namespace).UpdateStatus(ctx, copy, metav1.UpdateOptions{})
+	if err != nil {
+		return nil, false, err
+	}
+	if updated.UID != service.UID {
+		return nil, false, fmt.Errorf(
+			"node load balancer: parent Service %s/%s identity changed during status update",
+			service.Namespace, service.Name,
+		)
+	}
+	return updated, true, nil
+}
+
+func (c *nodeLoadBalancerController) datapathServiceUsesShard(ctx context.Context, service *corev1.Service, shard string) (bool, error) {
+	_, activeShard, found, err := c.activeDatapathService(ctx, service)
+	return found && activeShard == shard, err
+}
+
+func (c *nodeLoadBalancerController) readyShardAddresses(ctx context.Context, shard string) ([]nodeLoadBalancerAddress, error) {
 	authorized, err := c.authorizedNodesForShard(ctx, shard)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	nodes := make([]*corev1.Node, 0, len(authorized))
-	externalIPs := make([]string, 0, len(authorized))
-	seenIPs := map[string]struct{}{}
+	addresses := make([]nodeLoadBalancerAddress, 0, len(authorized))
+	seenPrivate := map[string]struct{}{}
+	seenPublic := map[string]struct{}{}
 	for _, node := range authorized {
 		if node.Labels[nodeLoadBalancerReadyLabel] != "true" || !nodeLoadBalancerNodeHealthy(node) {
 			continue
 		}
-		externalIP, ok := nodeLoadBalancerNodeExternalIPv4(node)
-		if !ok {
+		privateIP, privateOK := nodeLoadBalancerNodeInternalIPv4(node)
+		publicIP, publicOK := nodeLoadBalancerNodeExternalIPv4(node)
+		if !privateOK || !publicOK {
 			continue
 		}
-		if _, duplicate := seenIPs[externalIP]; duplicate {
-			return nil, nil, fmt.Errorf("node load balancer: shard %s has duplicate ExternalIP %s", shard, externalIP)
+		if _, duplicate := seenPrivate[privateIP]; duplicate {
+			return nil, fmt.Errorf("node load balancer: shard %s has duplicate private IPv4 %s", shard, privateIP)
 		}
-		seenIPs[externalIP] = struct{}{}
-		nodes = append(nodes, node)
-		externalIPs = append(externalIPs, externalIP)
+		if _, duplicate := seenPublic[publicIP]; duplicate {
+			return nil, fmt.Errorf("node load balancer: shard %s has duplicate public IPv4 %s", shard, publicIP)
+		}
+		seenPrivate[privateIP] = struct{}{}
+		seenPublic[publicIP] = struct{}{}
+		addresses = append(addresses, nodeLoadBalancerAddress{Node: node, PrivateIPv4: privateIP, PublicIPv4: publicIP})
 	}
-	sort.Slice(nodes, func(i, j int) bool { return nodes[i].Name < nodes[j].Name })
-	sort.Strings(externalIPs)
-	return nodes, externalIPs, nil
+	sort.Slice(addresses, func(i, j int) bool { return addresses[i].Node.Name < addresses[j].Node.Name })
+	return addresses, nil
 }
 
-func (c *nodeLoadBalancerController) shadowStatusMatchesExternalIPs(
+func nodeLoadBalancerStatus(addresses []nodeLoadBalancerAddress, public bool) corev1.LoadBalancerStatus {
+	mode := corev1.LoadBalancerIPModeVIP
+	if public {
+		mode = corev1.LoadBalancerIPModeProxy
+	}
+	status := corev1.LoadBalancerStatus{}
+	for _, address := range addresses {
+		ip := address.PrivateIPv4
+		if public {
+			ip = address.PublicIPv4
+		}
+		status.Ingress = append(status.Ingress, corev1.LoadBalancerIngress{IP: ip, IPMode: &mode})
+	}
+	return status
+}
+
+func (c *nodeLoadBalancerController) publishDatapathStatus(
 	ctx context.Context,
 	service *corev1.Service,
 	shard string,
-	expected []string,
+	expected nodeLoadBalancerIntent,
+	addresses []nodeLoadBalancerAddress,
+) (*corev1.Service, error) {
+	current, err := c.getExactParentService(ctx, service)
+	if err != nil {
+		return nil, err
+	}
+	client := c.provider.kubeClient.CoreV1().Services(current.Namespace)
+	datapath, err := client.Get(ctx, nodeLoadBalancerDatapathName(current), metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		return nil, fmt.Errorf("node load balancer: datapath Service %s/%s disappeared before private VIP publication", current.Namespace, nodeLoadBalancerDatapathName(current))
+	}
+	if err != nil {
+		return nil, fmt.Errorf("node load balancer: get datapath Service status: %w", err)
+	}
+	if err := c.validatePlannedDatapathContract(current, datapath, shard, expected, true); err != nil {
+		return nil, fmt.Errorf("node load balancer: refuse private VIP publication: %w", err)
+	}
+	desired := nodeLoadBalancerStatus(addresses, false)
+	if !reflect.DeepEqual(datapath.Status.LoadBalancer, desired) {
+		copy := datapath.DeepCopy()
+		copy.Status.LoadBalancer = desired
+		updated, updateErr := client.UpdateStatus(ctx, copy, metav1.UpdateOptions{})
+		if updateErr != nil {
+			return nil, fmt.Errorf("node load balancer: publish private VIP datapath status: %w", updateErr)
+		}
+		if updated.UID != datapath.UID {
+			return nil, fmt.Errorf("node load balancer: datapath Service identity changed during private VIP publication")
+		}
+	}
+	verifiedParent, err := c.getExactParentService(ctx, current)
+	if err != nil {
+		return nil, err
+	}
+	verifiedDatapath, err := client.Get(ctx, nodeLoadBalancerDatapathName(verifiedParent), metav1.GetOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("node load balancer: read back datapath after private VIP publication: %w", err)
+	}
+	if err := c.validatePlannedDatapathContract(verifiedParent, verifiedDatapath, shard, expected, true); err != nil {
+		return nil, fmt.Errorf("node load balancer: private VIP publication lost its parent contract: %w", err)
+	}
+	if !reflect.DeepEqual(verifiedDatapath.Status.LoadBalancer, desired) {
+		return nil, fmt.Errorf("node load balancer: private VIP publication did not read back exactly")
+	}
+	return verifiedParent, nil
+}
+
+func (c *nodeLoadBalancerController) publishPublicProxyStatus(
+	ctx context.Context,
+	service *corev1.Service,
+	shard string,
+	expected nodeLoadBalancerIntent,
+	addresses []nodeLoadBalancerAddress,
+) (*corev1.Service, error) {
+	current, err := c.getExactParentService(ctx, service)
+	if err != nil {
+		return nil, err
+	}
+	client := c.provider.kubeClient.CoreV1().Services(current.Namespace)
+	datapath, err := client.Get(ctx, nodeLoadBalancerDatapathName(current), metav1.GetOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("node load balancer: inspect datapath before public Proxy publication: %w", err)
+	}
+	if err := c.validatePlannedDatapathContract(current, datapath, shard, expected, true); err != nil {
+		return nil, fmt.Errorf("node load balancer: refuse public Proxy publication: %w", err)
+	}
+	desired := nodeLoadBalancerStatus(addresses, true)
+	if !reflect.DeepEqual(current.Status.LoadBalancer, desired) {
+		copy := current.DeepCopy()
+		copy.Status.LoadBalancer = desired
+		updated, updateErr := client.UpdateStatus(ctx, copy, metav1.UpdateOptions{})
+		if updateErr != nil {
+			return nil, fmt.Errorf("node load balancer: publish public Proxy status: %w", updateErr)
+		}
+		if updated.UID != service.UID {
+			return nil, fmt.Errorf("node load balancer: parent Service identity changed during public Proxy publication")
+		}
+		current = updated
+	}
+	verified, err := c.getExactParentService(ctx, current)
+	if err != nil {
+		return nil, err
+	}
+	datapath, err = client.Get(ctx, nodeLoadBalancerDatapathName(verified), metav1.GetOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("node load balancer: read back datapath after public Proxy publication: %w", err)
+	}
+	if err := c.validatePlannedDatapathContract(verified, datapath, shard, expected, true); err != nil {
+		return nil, fmt.Errorf("node load balancer: public Proxy publication lost its parent contract: %w", err)
+	}
+	if !reflect.DeepEqual(verified.Status.LoadBalancer, desired) {
+		return nil, fmt.Errorf("node load balancer: public Proxy publication did not read back exactly")
+	}
+	return verified, nil
+}
+
+func (c *nodeLoadBalancerController) datapathStatusesMatch(
+	ctx context.Context,
+	service *corev1.Service,
+	shard string,
+	addresses []nodeLoadBalancerAddress,
 ) (bool, error) {
-	shadow, err := c.provider.kubeClient.CoreV1().Services(service.Namespace).Get(ctx, nodeLoadBalancerShadowName(service), metav1.GetOptions{})
+	privateMatches, err := c.datapathStatusMatches(ctx, service, shard, addresses)
+	if err != nil || !privateMatches {
+		return privateMatches, err
+	}
+	current, err := c.getExactParentService(ctx, service)
+	if err != nil {
+		return false, fmt.Errorf("node load balancer: verify public Service status: %w", err)
+	}
+	return reflect.DeepEqual(current.Status.LoadBalancer, nodeLoadBalancerStatus(addresses, true)), nil
+}
+
+func (c *nodeLoadBalancerController) datapathStatusMatches(
+	ctx context.Context,
+	service *corev1.Service,
+	shard string,
+	addresses []nodeLoadBalancerAddress,
+) (bool, error) {
+	datapath, err := c.provider.kubeClient.CoreV1().Services(service.Namespace).Get(ctx, nodeLoadBalancerDatapathName(service), metav1.GetOptions{})
 	if apierrors.IsNotFound(err) {
 		return false, nil
 	}
 	if err != nil {
-		return false, fmt.Errorf("node load balancer: get shadow Service status: %w", err)
+		return false, fmt.Errorf("node load balancer: verify datapath Service status: %w", err)
 	}
-	if !nodeLoadBalancerShadowOwnedByService(shadow, service) {
-		return false, fmt.Errorf("node load balancer: shadow Service name %s/%s is occupied by another owner", service.Namespace, shadow.Name)
-	}
-	wantSelector := nodeLoadBalancerCiliumSelector(c.provider.config.ClusterID, shard)
-	if shadow.Annotations[annotationCiliumNodeIPAMMatchLabels] != wantSelector {
+	if !nodeLoadBalancerDatapathMatchesDesired(datapath, service, shard) {
 		return false, nil
 	}
-	want := make(map[string]struct{}, len(expected))
-	for _, value := range expected {
-		want[value] = struct{}{}
+	return reflect.DeepEqual(datapath.Status.LoadBalancer, nodeLoadBalancerStatus(addresses, false)), nil
+}
+
+func (c *nodeLoadBalancerController) authorizeDatapath(
+	ctx context.Context,
+	service *corev1.Service,
+	shard string,
+	expected nodeLoadBalancerIntent,
+) (*corev1.Service, error) {
+	current, err := c.getExactParentService(ctx, service)
+	if err != nil {
+		return nil, err
 	}
-	got := make(map[string]struct{}, len(shadow.Status.LoadBalancer.Ingress))
-	for _, ingress := range shadow.Status.LoadBalancer.Ingress {
-		address, parseErr := netip.ParseAddr(ingress.IP)
-		if parseErr != nil || !address.Is4() || ingress.IP != address.String() || ingress.Hostname != "" {
+	datapath, err := c.provider.kubeClient.CoreV1().Services(current.Namespace).Get(
+		ctx,
+		nodeLoadBalancerDatapathName(current),
+		metav1.GetOptions{},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("node load balancer: inspect datapath before activation authorization: %w", err)
+	}
+	if err := c.validatePlannedDatapathContract(current, datapath, shard, expected, false); err != nil {
+		return nil, fmt.Errorf("node load balancer: refuse datapath activation authorization: %w", err)
+	}
+	activeShard := current.Annotations[annotationNodeLoadBalancerDatapathActive]
+	if activeShard == "" && len(datapath.Status.LoadBalancer.Ingress) != 0 {
+		return nil, fmt.Errorf("node load balancer: refusing to authorize shard %s after an unmarked private VIP was published", shard)
+	}
+	updated, _, err := c.updateExactParentService(ctx, current, func(copy *corev1.Service) (bool, error) {
+		if err := c.validatePlannedDatapathContract(copy, datapath, shard, expected, false); err != nil {
+			return false, err
+		}
+		if copy.Annotations == nil {
+			copy.Annotations = map[string]string{}
+		}
+		if copy.Annotations[annotationNodeLoadBalancerDatapathActive] == shard {
 			return false, nil
 		}
-		if _, duplicate := got[ingress.IP]; duplicate {
-			return false, nil
-		}
-		got[ingress.IP] = struct{}{}
+		copy.Annotations[annotationNodeLoadBalancerDatapathActive] = shard
+		return true, nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("node load balancer: persist datapath activation authorization: %w", err)
 	}
-	return reflect.DeepEqual(got, want), nil
+	verified, err := c.getExactParentService(ctx, updated)
+	if err != nil {
+		return nil, err
+	}
+	if verified.Annotations[annotationNodeLoadBalancerDatapathActive] != shard {
+		return nil, fmt.Errorf("node load balancer: datapath activation authorization for shard %s was not stored exactly", shard)
+	}
+	datapath, err = c.provider.kubeClient.CoreV1().Services(verified.Namespace).Get(
+		ctx,
+		nodeLoadBalancerDatapathName(verified),
+		metav1.GetOptions{},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("node load balancer: re-read datapath after activation authorization: %w", err)
+	}
+	if err := c.validatePlannedDatapathContract(verified, datapath, shard, expected, true); err != nil {
+		return nil, fmt.Errorf("node load balancer: datapath changed while authorizing shard %s: %w", shard, err)
+	}
+	return verified, nil
+}
+
+func (c *nodeLoadBalancerController) clearDatapathActivation(ctx context.Context, service *corev1.Service) error {
+	_, _, err := c.updateExactParentService(ctx, service, func(copy *corev1.Service) (bool, error) {
+		changed := false
+		for _, key := range []string{
+			annotationNodeLoadBalancerDatapathActive,
+			annotationNodeLoadBalancerFirewallAssigning,
+			annotationNodeLoadBalancerFirewallAssignAt,
+			annotationNodeLoadBalancerWithdrawFWAbsent,
+			annotationNodeLoadBalancerWithdrawFWChecked,
+			annotationNodeLoadBalancerWithdrawFWMissing,
+		} {
+			if copy.Annotations[key] != "" {
+				delete(copy.Annotations, key)
+				changed = true
+			}
+		}
+		return changed, nil
+	})
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("node load balancer: clear active datapath marker: %w", err)
+	}
+	return nil
 }
 
 func (c *nodeLoadBalancerController) rawNodesForShard(shard string) ([]*corev1.Node, error) {
@@ -2029,8 +3173,6 @@ func (c *nodeLoadBalancerController) authorizedNodeLoadBalancerNodes(
 	}
 
 	pools := map[string]*unstructured.Unstructured{}
-	var legacyMigrationShards map[string]nodeLoadBalancerShardPlan
-	legacyMigrationShardsLoaded := false
 	authorized := make([]*corev1.Node, 0, len(raw))
 	for _, cached := range raw {
 		current, getErr := c.provider.kubeClient.CoreV1().Nodes().Get(ctx, cached.Name, metav1.GetOptions{})
@@ -2060,18 +3202,6 @@ func (c *nodeLoadBalancerController) authorizedNodeLoadBalancerNodes(
 			pools[shard] = pool
 		}
 		authoritative := pool != nil && c.nodeLoadBalancerNodePoolAuthoritative(pool, shard, nodeClassName)
-		if pool != nil && !authoritative {
-			if !legacyMigrationShardsLoaded {
-				legacyMigrationShards, err = c.legacyNodeLoadBalancerMigrationShards(ctx)
-				if err != nil {
-					return nil, err
-				}
-				legacyMigrationShardsLoaded = true
-			}
-			if legacy, allowed := legacyMigrationShards[shard]; allowed {
-				authoritative = c.legacyNodeLoadBalancerNodePoolAuthoritative(pool, shard, nodeClassName, legacy)
-			}
-		}
 		if !authoritative {
 			klog.InfoS("Ignoring Node without an authoritative Node load balancer NodePool", "node", current.Name, "shard", shard)
 			continue
@@ -2095,65 +3225,6 @@ func (c *nodeLoadBalancerController) authorizedNodeLoadBalancerNodes(
 	return authorized, nil
 }
 
-// legacyNodeLoadBalancerMigrationShards returns only actively advertised
-// pre-v0.5.0 default shards that must remain authorized while their replacement
-// capacity starts. The exception is derived from live Service/shadow readback,
-// never from Node or NodePool labels alone, and disappears as soon as the owned
-// shadow cuts over to the replacement shard.
-func (c *nodeLoadBalancerController) legacyNodeLoadBalancerMigrationShards(ctx context.Context) (map[string]nodeLoadBalancerShardPlan, error) {
-	snapshot, err := c.provider.kubeClient.CoreV1().Services("").List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return nil, fmt.Errorf("node load balancer: list live Services for legacy shard authorization: %w", err)
-	}
-	byKey := make(map[string]*corev1.Service, len(snapshot.Items))
-	for index := range snapshot.Items {
-		service := &snapshot.Items[index]
-		byKey[service.Namespace+"/"+service.Name] = service
-	}
-
-	result := make(map[string]nodeLoadBalancerShardPlan)
-	defaults := nodeLoadBalancerDefaults{NodesPerShard: c.provider.config.NodeLoadBalancer.NodesPerShard}
-	for index := range snapshot.Items {
-		service := &snapshot.Items[index]
-		if !isNodeLoadBalancerService(service) || service.DeletionTimestamp != nil ||
-			!containsString(service.Finalizers, nodeLoadBalancerFinalizer) {
-			continue
-		}
-		annotations := service.GetAnnotations()
-		if _, configured := annotations[annotationNodeLoadBalancerCPU]; configured {
-			continue
-		}
-		if _, configured := annotations[annotationNodeLoadBalancerMemory]; configured {
-			continue
-		}
-		intent, parseErr := parseNodeLoadBalancerService(service, defaults)
-		if parseErr != nil || intent.CPU != nodeLoadBalancerDefaultCPU || intent.MemoryMiB != nodeLoadBalancerDefaultMemoryMiB {
-			continue
-		}
-		shadow := byKey[service.Namespace+"/"+nodeLoadBalancerShadowName(service)]
-		if shadow == nil || !nodeLoadBalancerShadowOwnedByService(shadow, service) {
-			continue
-		}
-		activeShard, valid := nodeLoadBalancerCiliumSelectorShard(
-			shadow.Annotations[annotationCiliumNodeIPAMMatchLabels],
-			c.provider.config.ClusterID,
-		)
-		if !valid || (activeShard != annotations[annotationNodeLoadBalancerShard] &&
-			activeShard != annotations[annotationNodeLoadBalancerPreviousShard]) {
-			continue
-		}
-		legacy := nodeLoadBalancerShardPlan{
-			Name: activeShard, Mode: intent.Mode, Pool: intent.Pool,
-			NodesPerShard: intent.NodesPerShard, CPU: 1, MemoryMiB: 2048,
-		}
-		if existing, exists := result[activeShard]; exists && !reflect.DeepEqual(existing, legacy) {
-			return nil, fmt.Errorf("node load balancer: conflicting legacy migration identity for shard %s", activeShard)
-		}
-		result[activeShard] = legacy
-	}
-	return result, nil
-}
-
 func (c *nodeLoadBalancerController) nodeLoadBalancerFloatingIPAuthoritative(
 	ctx context.Context,
 	node *corev1.Node,
@@ -2161,6 +3232,10 @@ func (c *nodeLoadBalancerController) nodeLoadBalancerFloatingIPAuthoritative(
 	identity, err := providerid.Parse(node.Spec.ProviderID)
 	if err != nil || identity.Location != c.provider.config.Location || identity.String() != node.Spec.ProviderID {
 		return false, "Node providerID is invalid or non-canonical", nil
+	}
+	internalIP, ok := nodeLoadBalancerNodeInternalIPv4(node)
+	if !ok {
+		return false, "Node has no canonical private InternalIP", nil
 	}
 	// Do not filter by billing account here. A second active FIP owned by a
 	// different account still reaches the same VM-wide firewall surface and
@@ -2182,6 +3257,9 @@ func (c *nodeLoadBalancerController) nodeLoadBalancerFloatingIPAuthoritative(
 	if item.BillingAccountID != c.provider.config.BillingAccountID || !item.Enabled || item.IsDeleted || item.IsVirtual ||
 		item.Type != "public" || item.AssignedToResourceType != "virtual_machine" {
 		return false, "floating IP is not one active public assignment owned by the configured billing account", nil
+	}
+	if item.AssignedToPrivateIP != internalIP {
+		return false, "floating IP DNAT private IPv4 does not match the Node InternalIP", nil
 	}
 	address, parseErr := netip.ParseAddr(item.Address)
 	if parseErr != nil || !address.Is4() || !address.IsGlobalUnicast() || address.IsPrivate() || address.String() != item.Address {
@@ -2275,58 +3353,6 @@ func (c *nodeLoadBalancerController) nodeLoadBalancerNodePoolAuthoritative(
 		c.provider.config.ClusterID,
 		shard,
 		nodeLoadBalancerShardProfileHash(desiredShard),
-	); err != nil {
-		return false
-	}
-	for key, value := range desired.GetLabels() {
-		if poolLabels[key] != value {
-			return false
-		}
-	}
-	desiredSpec, desiredFound, desiredErr := unstructured.NestedFieldCopy(desired.Object, "spec")
-	actualSpec, actualFound, actualErr := unstructured.NestedFieldCopy(pool.Object, "spec")
-	return desiredErr == nil && actualErr == nil && desiredFound && actualFound && reflect.DeepEqual(actualSpec, desiredSpec)
-}
-
-// legacyNodeLoadBalancerNodePoolAuthoritative accepts only the exact managed
-// 1-vCPU/2-GiB NodePool contract emitted before v0.5.0. Callers must first prove
-// that the shard is still the active shadow target of an omitted-sizing Service;
-// this predicate must never be used by NodePool creation or update paths.
-func (c *nodeLoadBalancerController) legacyNodeLoadBalancerNodePoolAuthoritative(
-	pool *unstructured.Unstructured,
-	shard, nodeClassName string,
-	legacy nodeLoadBalancerShardPlan,
-) bool {
-	if legacy.Name != shard || legacy.CPU != 1 || legacy.MemoryMiB != 2048 ||
-		legacy.NodesPerShard < 1 || pool == nil || pool.GetName() != shard ||
-		pool.GetUID() == "" || pool.GetDeletionTimestamp() != nil {
-		return false
-	}
-	poolLabels := pool.GetLabels()
-	if poolLabels[nodeLoadBalancerManagedLabel] != "true" ||
-		poolLabels[nodeLoadBalancerLabel] != "true" ||
-		poolLabels[nodeLoadBalancerClusterLabel] != c.provider.config.ClusterID ||
-		poolLabels[nodeLoadBalancerShardLabel] != shard ||
-		poolLabels[nodeLoadBalancerModeLabel] != legacy.Mode ||
-		poolLabels[nodeLoadBalancerPoolLabel] != legacy.Pool ||
-		poolLabels[nodeLoadBalancerProfileLabel] != nodeLoadBalancerShardProfileHash(legacy) {
-		return false
-	}
-	if cpu, ok := exactNodeLoadBalancerRequirementValue(pool, "inspace.cloud/instance-cpu"); !ok || cpu != "1" {
-		return false
-	}
-	if memory, ok := exactNodeLoadBalancerRequirementValue(pool, "inspace.cloud/instance-memory"); !ok || memory != "2048" {
-		return false
-	}
-	desired, err := renderLegacyNodeLoadBalancerNodePoolForAuthorization(shard, nodeClassName, legacy)
-	if err != nil {
-		return false
-	}
-	if err := markNodeLoadBalancerManaged(
-		desired,
-		c.provider.config.ClusterID,
-		shard,
-		nodeLoadBalancerShardProfileHash(legacy),
 	); err != nil {
 		return false
 	}
@@ -2552,13 +3578,7 @@ func (c *nodeLoadBalancerController) reconcileShardNodeEligibility(ctx context.C
 	if err != nil {
 		return errors.Join(err, c.setShardNodesReady(ctx, rawNodes, nil))
 	}
-	type serviceFirewallCandidate struct {
-		service *corev1.Service
-		uuid    string
-		hash    string
-		active  bool
-	}
-	candidates := make([]serviceFirewallCandidate, 0)
+	shardInUse := false
 	defaults := nodeLoadBalancerDefaults{NodesPerShard: c.provider.config.NodeLoadBalancer.NodesPerShard}
 	for _, service := range services {
 		if !isNodeLoadBalancerService(service) || service.DeletionTimestamp != nil {
@@ -2572,32 +3592,20 @@ func (c *nodeLoadBalancerController) reconcileShardNodeEligibility(ctx context.C
 		if _, parseErr := parseNodeLoadBalancerService(service, defaults); parseErr != nil {
 			continue
 		}
-		active, activeErr := c.shadowServiceUsesShard(ctx, service, shard)
+		if current {
+			shardInUse = true
+			break
+		}
+		active, activeErr := c.datapathServiceUsesShard(ctx, service, shard)
 		if activeErr != nil {
 			return errors.Join(activeErr, c.setShardNodesReady(ctx, rawNodes, nil))
 		}
-		if previous && !current && !active {
-			continue
+		if previous && active {
+			shardInUse = true
+			break
 		}
-		uuid := service.Annotations[annotationNodeLoadBalancerFirewallUUID]
-		hash := service.Annotations[annotationNodeLoadBalancerFirewallHash]
-		if previous && !current && active {
-			if previousUUID := service.Annotations[annotationNodeLoadBalancerPreviousFirewall]; previousUUID != "" {
-				uuid = previousUUID
-				// The deterministic firewall name binds the old policy hash to
-				// authoritative readback. The Service stores only the new current
-				// hash during a policy migration.
-				hash = ""
-			}
-		}
-		candidates = append(candidates, serviceFirewallCandidate{
-			service: service,
-			uuid:    uuid,
-			hash:    hash,
-			active:  active,
-		})
 	}
-	if len(candidates) == 0 {
+	if !shardInUse {
 		return c.setShardNodesReady(ctx, rawNodes, nil)
 	}
 	firewalls, err := c.provider.api.ListFirewalls(ctx, c.provider.config.Location)
@@ -2615,72 +3623,13 @@ func (c *nodeLoadBalancerController) reconcileShardNodeEligibility(ctx context.C
 	if icmpFirewall == nil {
 		return c.setShardNodesReady(ctx, rawNodes, nil)
 	}
-	serviceFirewalls := make([]string, 0, len(candidates))
-	for _, candidate := range candidates {
-		if candidate.uuid == "" {
-			if candidate.active {
-				return c.setShardNodesReady(ctx, rawNodes, nil)
-			}
-			// A newly planned or migrating Service is not advertised by this
-			// shard yet. Do not interrupt established shared Services while its
-			// firewall is still being created and assigned.
-			continue
-		}
-		firewall, exists := byUUID[candidate.uuid]
-		valid := exists && nodeLoadBalancerFirewallOwnedByService(
-			firewall,
-			c.provider.config.ClusterID,
-			string(candidate.service.UID),
-			c.provider.config.BillingAccountID,
-		)
-		if valid && candidate.hash != "" {
-			hash, hashErr := nodeLoadBalancerFirewallSpecHash(firewall.Rules)
-			valid = hashErr == nil && hash == candidate.hash
-		}
-		if candidate.active {
-			if !valid {
-				err := fmt.Errorf("node load balancer: active Service %s/%s has no exact current firewall", candidate.service.Namespace, candidate.service.Name)
-				return errors.Join(err, c.setShardNodesReady(ctx, rawNodes, nil))
-			}
-			serviceFirewalls = append(serviceFirewalls, candidate.uuid)
-			continue
-		}
-		if valid && nodeLoadBalancerFirewallAssignedToAllHealthyNodes(firewall, nodes) {
-			serviceFirewalls = append(serviceFirewalls, candidate.uuid)
-		}
-	}
-	if len(serviceFirewalls) == 0 {
-		return c.setShardNodesReady(ctx, rawNodes, nil)
-	}
 	ready := make(map[string]bool, len(nodes))
 	for _, node := range nodes {
 		vmUUID, ok := nodeLoadBalancerVMUUID(node)
 		eligible := ok && nodeLoadBalancerNodeHealthy(node) && firewallAssignedToVM(*icmpFirewall, vmUUID)
-		if eligible {
-			for _, uuid := range serviceFirewalls {
-				firewall, exists := byUUID[uuid]
-				if !exists || !firewallAssignedToVM(firewall, vmUUID) {
-					eligible = false
-					break
-				}
-			}
-		}
 		ready[node.Name] = eligible
 	}
 	return c.setShardNodesReady(ctx, rawNodes, ready)
-}
-
-func nodeLoadBalancerFirewallAssignedToAllHealthyNodes(firewall inspace.Firewall, nodes []*corev1.Node) bool {
-	for _, node := range nodes {
-		if !nodeLoadBalancerNodeHealthy(node) {
-			continue
-		}
-		vmUUID, ok := nodeLoadBalancerVMUUID(node)
-		if !ok || !firewallAssignedToVM(firewall, vmUUID) {
-			return false
-		}
-	}
-	return true
 }
 
 func nodeLoadBalancerNodeHealthy(node *corev1.Node) bool {
@@ -2705,8 +3654,31 @@ func nodeLoadBalancerNodeHealthy(node *corev1.Node) bool {
 	if !ready {
 		return false
 	}
-	_, ok := nodeLoadBalancerNodeExternalIPv4(node)
-	return ok
+	_, internalOK := nodeLoadBalancerNodeInternalIPv4(node)
+	_, externalOK := nodeLoadBalancerNodeExternalIPv4(node)
+	return internalOK && externalOK
+}
+
+func nodeLoadBalancerNodeInternalIPv4(node *corev1.Node) (string, bool) {
+	if node == nil {
+		return "", false
+	}
+	result := ""
+	for _, address := range node.Status.Addresses {
+		if address.Type != corev1.NodeInternalIP {
+			continue
+		}
+		parsed, err := netip.ParseAddr(address.Address)
+		if err != nil || !parsed.Is4() || !parsed.IsGlobalUnicast() || !parsed.IsPrivate() || parsed.String() != address.Address {
+			continue
+		}
+		canonical := parsed.String()
+		if result != "" && result != canonical {
+			return "", false
+		}
+		result = canonical
+	}
+	return result, result != ""
 }
 
 func nodeLoadBalancerNodeExternalIPv4(node *corev1.Node) (string, bool) {
@@ -2778,8 +3750,13 @@ func (c *nodeLoadBalancerController) setShardNodesReady(ctx context.Context, nod
 }
 
 func (c *nodeLoadBalancerController) cleanupPreviousFirewall(ctx context.Context, service *corev1.Service) error {
-	currentUUID := service.Annotations[annotationNodeLoadBalancerFirewallUUID]
-	owned, err := c.ownedServiceFirewalls(ctx, service)
+	current, err := c.getExactParentService(ctx, service)
+	if err != nil {
+		return err
+	}
+	currentUUID := current.Annotations[annotationNodeLoadBalancerFirewallUUID]
+	previousUUID := current.Annotations[annotationNodeLoadBalancerPreviousFirewall]
+	owned, err := c.ownedServiceFirewalls(ctx, current)
 	if err != nil {
 		return err
 	}
@@ -2787,30 +3764,57 @@ func (c *nodeLoadBalancerController) cleanupPreviousFirewall(ctx context.Context
 		if firewall.UUID == currentUUID {
 			continue
 		}
-		done, deleteErr := c.deleteOwnedServiceFirewall(ctx, service, firewall.UUID)
+		latest, latestErr := c.getExactParentService(ctx, current)
+		if latestErr != nil {
+			return latestErr
+		}
+		if firewall.UUID == latest.Annotations[annotationNodeLoadBalancerFirewallUUID] ||
+			firewall.UUID == latest.Annotations[annotationNodeLoadBalancerPendingFirewall] {
+			continue
+		}
+		done, deleteErr := c.deleteOwnedServiceFirewall(ctx, latest, firewall.UUID)
 		if deleteErr != nil {
 			return deleteErr
 		}
 		if !done {
-			c.queue.AddAfter(service.Namespace+"/"+service.Name, nodeLoadBalancerRetry)
+			c.queue.AddAfter(current.Namespace+"/"+current.Name, nodeLoadBalancerRetry)
 			return nil
 		}
 	}
-	if service.Annotations[annotationNodeLoadBalancerPreviousFirewall] == "" {
+	if previousUUID == "" {
 		return nil
 	}
-	copy := service.DeepCopy()
-	delete(copy.Annotations, annotationNodeLoadBalancerPreviousFirewall)
-	_, err = c.provider.kubeClient.CoreV1().Services(copy.Namespace).Update(ctx, copy, metav1.UpdateOptions{})
+	_, _, err = c.updateExactParentService(ctx, current, func(copy *corev1.Service) (bool, error) {
+		if copy.Annotations[annotationNodeLoadBalancerPreviousFirewall] != previousUUID {
+			return false, errors.New("node load balancer: previous firewall identity changed during cleanup")
+		}
+		delete(copy.Annotations, annotationNodeLoadBalancerPreviousFirewall)
+		return true, nil
+	})
 	return err
 }
 
 func (c *nodeLoadBalancerController) cleanupPreviousShard(ctx context.Context, service *corev1.Service) error {
-	previous := service.Annotations[annotationNodeLoadBalancerPreviousShard]
-	if previous == "" || previous == service.Annotations[annotationNodeLoadBalancerShard] {
+	current, err := c.getExactParentService(ctx, service)
+	if err != nil {
+		return err
+	}
+	previous := current.Annotations[annotationNodeLoadBalancerPreviousShard]
+	if previous == "" {
 		return nil
 	}
-	remaining, err := c.servicesForShard(ctx, service, previous)
+	if previous == current.Annotations[annotationNodeLoadBalancerShard] {
+		_, _, err := c.updateExactParentService(ctx, current, func(copy *corev1.Service) (bool, error) {
+			if copy.Annotations[annotationNodeLoadBalancerPreviousShard] != previous ||
+				copy.Annotations[annotationNodeLoadBalancerShard] != previous {
+				return false, errors.New("node load balancer: duplicate previous shard identity changed before metadata clear")
+			}
+			delete(copy.Annotations, annotationNodeLoadBalancerPreviousShard)
+			return true, nil
+		})
+		return err
+	}
+	remaining, err := c.servicesForShard(ctx, current, previous)
 	if err != nil {
 		return err
 	}
@@ -2822,27 +3826,51 @@ func (c *nodeLoadBalancerController) cleanupPreviousShard(ctx context.Context, s
 		if err := c.setShardNodesReady(ctx, nodes, nil); err != nil {
 			return err
 		}
+		latest, latestErr := c.getExactParentService(ctx, current)
+		if latestErr != nil {
+			return latestErr
+		}
+		if latest.Annotations[annotationNodeLoadBalancerPreviousShard] != previous ||
+			latest.Annotations[annotationNodeLoadBalancerShard] == previous ||
+			latest.Annotations[annotationNodeLoadBalancerDatapathActive] == previous {
+			return errors.New("node load balancer: previous shard identity changed during cleanup")
+		}
 		if err := c.deleteManagedNodePool(ctx, previous); err != nil {
 			return err
 		}
 		if _, err := c.provider.dynamicClient.Resource(nodePoolGVR).Get(ctx, previous, metav1.GetOptions{}); err == nil {
-			c.queue.AddAfter(service.Namespace+"/"+service.Name, nodeLoadBalancerRetry)
+			c.queue.AddAfter(current.Namespace+"/"+current.Name, nodeLoadBalancerRetry)
 			return nil
 		} else if !apierrors.IsNotFound(err) {
 			return err
 		}
 	}
-	copy := service.DeepCopy()
-	delete(copy.Annotations, annotationNodeLoadBalancerPreviousShard)
-	_, err = c.provider.kubeClient.CoreV1().Services(copy.Namespace).Update(ctx, copy, metav1.UpdateOptions{})
+	_, _, err = c.updateExactParentService(ctx, current, func(copy *corev1.Service) (bool, error) {
+		if copy.Annotations[annotationNodeLoadBalancerPreviousShard] != previous {
+			return false, errors.New("node load balancer: previous shard identity changed before metadata clear")
+		}
+		delete(copy.Annotations, annotationNodeLoadBalancerPreviousShard)
+		return true, nil
+	})
 	return err
 }
 
 func (c *nodeLoadBalancerController) cleanupService(ctx context.Context, service *corev1.Service) error {
-	if err := c.deleteOwnedShadowService(ctx, service); err != nil {
+	if err := c.withdrawServiceDatapath(ctx, service); err != nil {
 		return err
 	}
-	absent, err := c.ownedShadowServiceAbsent(ctx, service)
+	withdrawn, err := c.serviceDatapathWithdrawn(ctx, service)
+	if err != nil {
+		return err
+	}
+	if !withdrawn {
+		c.queue.AddAfter(service.Namespace+"/"+service.Name, nodeLoadBalancerRetry)
+		return nil
+	}
+	if err := c.deleteOwnedDatapathService(ctx, service); err != nil {
+		return err
+	}
+	absent, err := c.ownedDatapathServiceAbsent(ctx, service)
 	if err != nil {
 		return err
 	}
@@ -2905,7 +3933,7 @@ func (c *nodeLoadBalancerController) cleanupService(ctx context.Context, service
 	if err := c.clearServiceLoadBalancerStatus(ctx, service); err != nil {
 		return err
 	}
-	service, err = c.provider.kubeClient.CoreV1().Services(service.Namespace).Get(ctx, service.Name, metav1.GetOptions{})
+	service, err = c.getExactParentService(ctx, service)
 	if apierrors.IsNotFound(err) {
 		return nil
 	}
@@ -2917,6 +3945,7 @@ func (c *nodeLoadBalancerController) cleanupService(ctx context.Context, service
 	for _, shard := range []string{
 		service.Annotations[annotationNodeLoadBalancerShard],
 		service.Annotations[annotationNodeLoadBalancerPreviousShard],
+		service.Annotations[annotationNodeLoadBalancerDatapathActive],
 	} {
 		if shard == "" {
 			continue
@@ -2973,28 +4002,54 @@ func (c *nodeLoadBalancerController) cleanupService(ctx context.Context, service
 		}
 	}
 
-	copy := service.DeepCopy()
-	copy.Finalizers = removeString(copy.Finalizers, nodeLoadBalancerFinalizer)
-	for _, key := range []string{
-		annotationNodeLoadBalancerFirewallUUID,
-		annotationNodeLoadBalancerFirewallHash,
-		annotationNodeLoadBalancerFirewallAbsent,
-		annotationNodeLoadBalancerFirewallChecked,
-		annotationNodeLoadBalancerPendingFirewall,
-		annotationNodeLoadBalancerPendingFWName,
-		annotationNodeLoadBalancerPendingFWStarted,
-		annotationNodeLoadBalancerPendingFWDelete,
-		annotationNodeLoadBalancerPendingFWAbsent,
-		annotationNodeLoadBalancerPendingFWChecked,
-		annotationNodeLoadBalancerPreviousFirewall,
-		annotationNodeLoadBalancerShard,
-		annotationNodeLoadBalancerPreviousShard,
-		annotationNodeLoadBalancerCleanupFWAbsent,
-		annotationNodeLoadBalancerCleanupFWChecked,
-	} {
-		delete(copy.Annotations, key)
-	}
-	_, err = c.provider.kubeClient.CoreV1().Services(copy.Namespace).Update(ctx, copy, metav1.UpdateOptions{})
+	_, _, err = c.updateExactParentService(ctx, service, func(copy *corev1.Service) (bool, error) {
+		if copy.DeletionTimestamp == nil && isNodeLoadBalancerService(copy) {
+			return false, errors.New("node load balancer: parent Service became active again before finalization")
+		}
+		if len(copy.Status.LoadBalancer.Ingress) != 0 || copy.Annotations[annotationNodeLoadBalancerDatapathActive] != "" {
+			return false, errors.New("node load balancer: refusing finalization while the datapath remains advertised")
+		}
+		if copy.Annotations[annotationNodeLoadBalancerPendingFirewall] != "" ||
+			copy.Annotations[annotationNodeLoadBalancerPendingFWName] != "" ||
+			copy.Annotations[annotationNodeLoadBalancerPendingFWStarted] != "" {
+			return false, errors.New("node load balancer: refusing finalization while firewall creation remains pending")
+		}
+		if copy.Annotations[annotationNodeLoadBalancerFirewallAssigning] != "" ||
+			copy.Annotations[annotationNodeLoadBalancerFirewallAssignAt] != "" {
+			return false, errors.New("node load balancer: refusing finalization while firewall assignment remains fenced")
+		}
+		changed := containsString(copy.Finalizers, nodeLoadBalancerFinalizer)
+		copy.Finalizers = removeString(copy.Finalizers, nodeLoadBalancerFinalizer)
+		for _, key := range []string{
+			annotationNodeLoadBalancerFirewallUUID,
+			annotationNodeLoadBalancerFirewallHash,
+			annotationNodeLoadBalancerFirewallAbsent,
+			annotationNodeLoadBalancerFirewallChecked,
+			annotationNodeLoadBalancerPendingFirewall,
+			annotationNodeLoadBalancerPendingFWName,
+			annotationNodeLoadBalancerPendingFWStarted,
+			annotationNodeLoadBalancerPendingFWDelete,
+			annotationNodeLoadBalancerPendingFWAbsent,
+			annotationNodeLoadBalancerPendingFWChecked,
+			annotationNodeLoadBalancerPreviousFirewall,
+			annotationNodeLoadBalancerShard,
+			annotationNodeLoadBalancerPreviousShard,
+			annotationNodeLoadBalancerDatapathActive,
+			annotationNodeLoadBalancerCleanupFWAbsent,
+			annotationNodeLoadBalancerCleanupFWChecked,
+			annotationNodeLoadBalancerWithdrawFWAbsent,
+			annotationNodeLoadBalancerWithdrawFWChecked,
+			annotationNodeLoadBalancerWithdrawFWMissing,
+			annotationNodeLoadBalancerFirewallAssigning,
+			annotationNodeLoadBalancerFirewallAssignAt,
+		} {
+			if _, exists := copy.Annotations[key]; exists {
+				delete(copy.Annotations, key)
+				changed = true
+			}
+		}
+		return changed, nil
+	})
 	return err
 }
 
@@ -3091,7 +4146,13 @@ func (c *nodeLoadBalancerController) deleteManagedNodePool(ctx context.Context, 
 		nodePool.GetLabels()[nodeLoadBalancerShardLabel] != name {
 		return fmt.Errorf("node load balancer: refusing to delete NodePool %s without exact managed ownership labels", name)
 	}
-	if err := resource.Delete(ctx, name, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+	uid := nodePool.GetUID()
+	if uid == "" {
+		return fmt.Errorf("node load balancer: refusing to delete NodePool %s without an observed UID", name)
+	}
+	if err := resource.Delete(ctx, name, metav1.DeleteOptions{
+		Preconditions: &metav1.Preconditions{UID: &uid},
+	}); err != nil && !apierrors.IsNotFound(err) {
 		return fmt.Errorf("node load balancer: delete NodePool %s: %w", name, err)
 	}
 	return nil
@@ -3118,17 +4179,12 @@ func (c *nodeLoadBalancerController) servicesForShard(ctx context.Context, exclu
 		if !isNodeLoadBalancerService(service) && !containsString(service.Finalizers, nodeLoadBalancerFinalizer) {
 			continue
 		}
-		shadow := byKey[service.Namespace+"/"+nodeLoadBalancerShadowName(service)]
-		if shadow != nil {
-			if !nodeLoadBalancerShadowOwnedByService(shadow, service) {
-				return nil, fmt.Errorf("node load balancer: shard shadow for %s/%s lacks exact owner identity", service.Namespace, service.Name)
-			}
-			activeShard, valid := nodeLoadBalancerCiliumSelectorShard(
-				shadow.Annotations[annotationCiliumNodeIPAMMatchLabels],
-				c.provider.config.ClusterID,
-			)
+		datapath := byKey[service.Namespace+"/"+nodeLoadBalancerDatapathName(service)]
+		if datapath != nil {
+			activeShard := datapath.Annotations[annotationNodeLoadBalancerDatapathShard]
+			valid := nodeLoadBalancerDatapathOwnedByService(datapath, service) && isManagedNodeLoadBalancerShardName(activeShard)
 			if !valid {
-				return nil, fmt.Errorf("node load balancer: shard shadow for %s/%s has a foreign node selector", service.Namespace, service.Name)
+				return nil, fmt.Errorf("node load balancer: generated datapath for %s/%s lacks exact ownership or shard identity", service.Namespace, service.Name)
 			}
 			if activeShard == shard {
 				result = append(result, service)
@@ -3180,6 +4236,210 @@ func (c *nodeLoadBalancerController) deleteOwnedServiceFirewall(ctx context.Cont
 		return false, fmt.Errorf("node load balancer: delete firewall %s: %w", uuid, err)
 	}
 	return false, nil
+}
+
+func (c *nodeLoadBalancerController) serviceFirewallsForEmergencyDetach(
+	ctx context.Context,
+	service *corev1.Service,
+) ([]inspace.Firewall, error) {
+	serviceUID := string(service.UID)
+	if serviceUID == "" {
+		return nil, errors.New("node load balancer: Service UID is required to discover emergency firewall identities")
+	}
+	if err := validateNodeLoadBalancerServiceUID(serviceUID); err != nil {
+		return nil, err
+	}
+	items, err := c.provider.api.ListFirewalls(ctx, c.provider.config.Location)
+	if err != nil {
+		return nil, fmt.Errorf("node load balancer: list firewalls for emergency detach: %w", err)
+	}
+	persisted := nodeLoadBalancerPersistedFirewallUUIDs(service)
+	result := make([]inspace.Firewall, 0)
+	seen := map[string]int{}
+	var resultErr error
+	for _, firewall := range items {
+		_, exactPersisted := persisted[firewall.UUID]
+		strictOwned := nodeLoadBalancerFirewallOwnedByService(
+			firewall,
+			c.provider.config.ClusterID,
+			serviceUID,
+			c.provider.config.BillingAccountID,
+		)
+		if !exactPersisted && !strictOwned {
+			continue
+		}
+		seen[firewall.UUID]++
+		if seen[firewall.UUID] > 1 {
+			resultErr = errors.Join(resultErr, fmt.Errorf("node load balancer: firewall UUID %s appears multiple times during emergency detach", firewall.UUID))
+			continue
+		}
+		if exactPersisted && !nodeLoadBalancerFirewallIdentityOwnedByService(
+			firewall,
+			c.provider.config.ClusterID,
+			serviceUID,
+			c.provider.config.BillingAccountID,
+		) {
+			resultErr = errors.Join(resultErr, fmt.Errorf("node load balancer: persisted firewall %s lost deterministic Service identity", firewall.UUID))
+			continue
+		}
+		result = append(result, firewall)
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].UUID < result[j].UUID })
+	return result, resultErr
+}
+
+func nodeLoadBalancerPersistedFirewallUUIDs(service *corev1.Service) map[string]struct{} {
+	result := map[string]struct{}{}
+	if service == nil {
+		return result
+	}
+	for _, key := range []string{
+		annotationNodeLoadBalancerFirewallUUID,
+		annotationNodeLoadBalancerPreviousFirewall,
+		annotationNodeLoadBalancerPendingFirewall,
+		annotationNodeLoadBalancerFirewallAssigning,
+	} {
+		if uuid := service.Annotations[key]; uuid != "" {
+			result[uuid] = struct{}{}
+		}
+	}
+	return result
+}
+
+func (c *nodeLoadBalancerController) serviceFirewallsDetached(
+	ctx context.Context,
+	service *corev1.Service,
+) (bool, error) {
+	current, err := c.getExactParentService(ctx, service)
+	if apierrors.IsNotFound(err) {
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	items, discoveryErr := c.serviceFirewallsForEmergencyDetach(ctx, current)
+	if discoveryErr != nil {
+		return false, discoveryErr
+	}
+	observed := make(map[string]struct{}, len(items))
+	for _, firewall := range items {
+		observed[firewall.UUID] = struct{}{}
+		for _, resource := range firewall.ResourcesAssigned {
+			if !strings.EqualFold(resource.ResourceType, "vm") || resource.ResourceUUID == "" {
+				return false, fmt.Errorf("node load balancer: firewall %s has invalid assigned resource %#v", firewall.UUID, resource)
+			}
+			if resetErr := c.resetServiceFirewallWithdrawalEvidence(ctx, current); resetErr != nil {
+				return false, resetErr
+			}
+			return false, nil
+		}
+	}
+	missing := make([]string, 0)
+	for uuid := range nodeLoadBalancerPersistedFirewallUUIDs(current) {
+		if _, found := observed[uuid]; !found {
+			missing = append(missing, uuid)
+		}
+	}
+	sort.Strings(missing)
+	notBefore := time.Time{}
+	assigningUUID := current.Annotations[annotationNodeLoadBalancerFirewallAssigning]
+	assigningStarted := current.Annotations[annotationNodeLoadBalancerFirewallAssignAt]
+	if assigningUUID != "" || assigningStarted != "" {
+		if assigningUUID == "" || assigningStarted == "" {
+			return false, errors.New("node load balancer: incomplete firewall assignment authorization during withdrawal")
+		}
+		startedAt, parseErr := time.Parse(time.RFC3339Nano, assigningStarted)
+		if parseErr != nil {
+			return false, fmt.Errorf("node load balancer: invalid firewall assignment timestamp during withdrawal: %w", parseErr)
+		}
+		if _, persisted := nodeLoadBalancerPersistedFirewallUUIDs(current)[assigningUUID]; !persisted {
+			return false, errors.New("node load balancer: firewall assignment authorization is not a persisted Service firewall identity")
+		}
+		notBefore = startedAt.Add(nodeLoadBalancerPendingCreateTimeout)
+		missing = append(missing, "fenced:"+assigningUUID)
+		sort.Strings(missing)
+	}
+	if len(missing) == 0 {
+		if clearErr := c.resetServiceFirewallWithdrawalEvidence(ctx, current); clearErr != nil {
+			return false, clearErr
+		}
+		return true, nil
+	}
+	return c.confirmMissingServiceFirewallsForWithdrawal(ctx, current, missing, notBefore)
+}
+
+func (c *nodeLoadBalancerController) resetServiceFirewallWithdrawalEvidence(
+	ctx context.Context,
+	service *corev1.Service,
+) error {
+	_, _, err := c.updateExactParentService(ctx, service, func(copy *corev1.Service) (bool, error) {
+		changed := false
+		for _, key := range []string{
+			annotationNodeLoadBalancerWithdrawFWAbsent,
+			annotationNodeLoadBalancerWithdrawFWChecked,
+			annotationNodeLoadBalancerWithdrawFWMissing,
+		} {
+			if copy.Annotations[key] != "" {
+				delete(copy.Annotations, key)
+				changed = true
+			}
+		}
+		return changed, nil
+	})
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("node load balancer: reset firewall withdrawal absence evidence: %w", err)
+	}
+	return nil
+}
+
+func (c *nodeLoadBalancerController) confirmMissingServiceFirewallsForWithdrawal(
+	ctx context.Context,
+	service *corev1.Service,
+	missing []string,
+	notBefore time.Time,
+) (bool, error) {
+	now := time.Now().UTC()
+	if now.Before(notBefore) {
+		return false, nil
+	}
+	missingSet := strings.Join(missing, ",")
+	confirmed := false
+	_, _, err := c.updateExactParentService(ctx, service, func(copy *corev1.Service) (bool, error) {
+		if copy.Annotations[annotationNodeLoadBalancerWithdrawFWMissing] != missingSet {
+			if copy.Annotations == nil {
+				copy.Annotations = map[string]string{}
+			}
+			copy.Annotations[annotationNodeLoadBalancerWithdrawFWMissing] = missingSet
+			copy.Annotations[annotationNodeLoadBalancerWithdrawFWAbsent] = "1"
+			copy.Annotations[annotationNodeLoadBalancerWithdrawFWChecked] = now.Format(time.RFC3339Nano)
+			return true, nil
+		}
+		count, parseErr := strconv.Atoi(copy.Annotations[annotationNodeLoadBalancerWithdrawFWAbsent])
+		if parseErr != nil || count < 1 || count > nodeLoadBalancerAbsenceConfirmations {
+			return false, fmt.Errorf("node load balancer: invalid withdrawal firewall absence count %q", copy.Annotations[annotationNodeLoadBalancerWithdrawFWAbsent])
+		}
+		if count >= nodeLoadBalancerAbsenceConfirmations {
+			confirmed = true
+			return false, nil
+		}
+		checkedAt, parseErr := time.Parse(time.RFC3339Nano, copy.Annotations[annotationNodeLoadBalancerWithdrawFWChecked])
+		if parseErr != nil {
+			return false, fmt.Errorf("node load balancer: invalid withdrawal firewall absence timestamp: %w", parseErr)
+		}
+		if now.Before(checkedAt.Add(nodeLoadBalancerAbsenceConfirmationDelay)) {
+			return false, nil
+		}
+		copy.Annotations[annotationNodeLoadBalancerWithdrawFWAbsent] = strconv.Itoa(count + 1)
+		copy.Annotations[annotationNodeLoadBalancerWithdrawFWChecked] = now.Format(time.RFC3339Nano)
+		return true, nil
+	})
+	if err != nil {
+		return false, fmt.Errorf("node load balancer: persist firewall withdrawal absence evidence: %w", err)
+	}
+	return confirmed, nil
 }
 
 func (c *nodeLoadBalancerController) ownedServiceFirewalls(ctx context.Context, service *corev1.Service) ([]inspace.Firewall, error) {
@@ -3246,6 +4506,21 @@ func (c *nodeLoadBalancerController) ownedServiceFirewalls(ctx context.Context, 
 }
 
 func nodeLoadBalancerFirewallOwnedByService(firewall inspace.Firewall, cluster, serviceUID string, billingAccountID int64) bool {
+	if !nodeLoadBalancerFirewallIdentityOwnedByService(firewall, cluster, serviceUID, billingAccountID) {
+		return false
+	}
+	prefix := nodeLoadBalancerFirewallServicePrefix(cluster, serviceUID)
+	name := firewall.EffectiveName()
+	suffix := strings.TrimPrefix(name, prefix)
+	hash, err := nodeLoadBalancerFirewallSpecHash(firewall.Rules)
+	return err == nil && hash == suffix
+}
+
+func nodeLoadBalancerFirewallIdentityOwnedByService(
+	firewall inspace.Firewall,
+	cluster, serviceUID string,
+	billingAccountID int64,
+) bool {
 	if cluster == "" || validateNodeLoadBalancerServiceUID(serviceUID) != nil || firewall.BillingAccountID != billingAccountID {
 		return false
 	}
@@ -3255,11 +4530,7 @@ func nodeLoadBalancerFirewallOwnedByService(firewall inspace.Firewall, cluster, 
 		return false
 	}
 	suffix := strings.TrimPrefix(name, prefix)
-	if len(suffix) != 8 || !isLowerHex(suffix) {
-		return false
-	}
-	hash, err := nodeLoadBalancerFirewallSpecHash(firewall.Rules)
-	return err == nil && hash == suffix
+	return len(suffix) == 8 && isLowerHex(suffix)
 }
 
 func containsString(values []string, target string) bool {

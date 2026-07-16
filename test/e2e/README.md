@@ -98,9 +98,10 @@ Kubernetes Node name are live-proven as
 separate `general-<random suffix>` NodeClaim remains the ownership identity.
 The suite requires every control plane, worker, and bastion hostname to resolve
 to `127.0.1.1` through its generated `/etc/hosts` entry after the bounded
-bootstrap readback. Control-plane ownership must be schema v7, bastion
+bootstrap readback. Control-plane ownership must be schema v8, bastion
 ownership must remain v6, and the Karpenter worker must use bootstrap schema
-v11.
+v12. The live control-plane contract also requires kube-vip's
+explicit 5/3/1-second election timing and 500-millisecond ARP cadence.
 Managed InSpace cloud firewalls are the only host firewalls; guest UFW must be
 inactive and disabled or masked on the control planes, worker, and bastion.
 
@@ -112,9 +113,9 @@ two private Services with the same TCP port, private scope label,
 distinct VIPs inside the operator-reserved range, create one L2 announcement
 Lease for each Service, and advertise both VIPs over the VPC while each returns
 its own response marker. This proves same-port reuse comes from unique LB-IPAM
-VIPs, not node addresses. Users do not create `io.cilium/node` Services
-directly. That class is reserved for exact, owner-referenced shadow Services
-created by the CCM public Node-LB controller.
+VIPs, not node addresses. The separate public Node-LB path uses a
+CCM-owned public-Proxy/private-VIP Service pair and does not use the Cilium Node
+IPAM class or Kubernetes NodePorts.
 
 The suite exercises private L2 lease-holder failover and requires reachability
 to recover through ARP/gratuitous ARP. L2 Announcements remains a Cilium beta
@@ -158,19 +159,33 @@ generated capacity proves the 1-vCPU/4-GiB default.
 
 Each of the resulting three static Karpenter NodePools has one Ready AMD EPYC
 Linux/amd64 node, one bounded drift-surge slot, a 30-GiB root disk, a reserved
-public FIP, and the `inspace.cloud/node-lb=true:NoSchedule` taint. The CCM owns
-one `io.cilium/node` shadow per user Service, selects only the exact ready
-shard, copies that shadow's single ExternalIP back to the user Service, and
-assigns one exact TCP/UDP-only per-Service InSpace firewall to the shard VM.
+public FIP, and the `inspace.cloud/node-lb=true:NoSchedule` taint. For each user
+Service, CCM owns a same-namespace `inlb-dp-<service-identity>` child with
+`loadBalancerClass: inspace.cloud/node-datapath`, the exact
+`inspace.cloud/node-lb-datapath=true` and
+`inspace.cloud/node-lb-service-id=<service-identity>` labels, an exact owner
+reference, and no NodePorts. The 52-hex identity is SHA-256 over
+`namespace NUL name NUL Service-UID`. The child
+publishes the selected Node's private InternalIP with `ipMode: VIP`; the parent
+publishes its paired public FIP with `ipMode: Proxy` and records
+`service.inspace.cloud/node-lb-datapath-active-shard` before the private VIP.
+CCM then requires exact private-VIP, Service-firewall assignment, and public
+Proxy readback in that order. InSpace DNAT changes the
+packet destination to the private IP before Cilium, so Cilium programs only the
+private low-port frontend and cannot race a duplicate public frontend. The live
+proof requires each FIP's authoritative `assigned_to_private_ip` to equal both
+the Node InternalIP and that datapath VIP. The CCM also assigns one exact
+TCP/UDP-only per-Service InSpace firewall to the shard VM.
 One 128-bit cluster-owned ICMP firewall contains only inbound ICMP from Any and
 is reused by every and only authoritative Node-LB VM. Acceptance requires an
-ICMP echo response from every unique FIP, distinct markers from all TCP ports,
-and a real UDP echo response through UDP/443. It also proves that no InSpace
-NLB was created. The suite then deletes one shared member and proves its
+ICMP echo response from every unique FIP, distinct markers through public
+TCP/80 and TCP/443, a real UDP echo response through UDP/443, and no Cilium
+duplicate-frontend log. It also proves that no InSpace NLB was created. The
+suite then deletes one shared member and proves its
 Service firewall disappears while the sibling shard, VM, FIP, global ICMP
 firewall, sibling per-Service firewall, and backends retain the same
 identities. An unconditional cleanup block removes the remaining Services,
-shadows, NodePools, NodeClaims, nodes, both firewall types, VMs, FIPs,
+datapath children, NodePools, NodeClaims, nodes, both firewall types, VMs, FIPs,
 workload, and generated NodeClass. The global
 ICMP firewall must be absent and the complete billable-resource inventory must
 equal its pre-Node-LB snapshot. The deployments, PVC, private Services,
@@ -188,11 +203,11 @@ is fatal rather than silently ignored.
 
 Before a repeat `test` captures its temporary Node-LB baseline, it requires the
 active NLB UUID set to equal the immutable pre-mutation account baseline
-(always empty for this isolated suite). Journaled Service identities and
-deterministic ownership prefixes provide a more specific diagnostic for an
-owned orphan, without attributing an immutable unrelated baseline NLB to
-Node-LB. This ordering prevents any costly orphan from being normalized into a
-new baseline after an interrupted run.
+(always empty for this isolated suite). Journaled Service identities, canonical
+`inlb-dp-*` child names, and deterministic ownership prefixes provide a more
+specific diagnostic for an owned orphan, without attributing an immutable
+unrelated baseline NLB to Node-LB. This ordering prevents any costly orphan from
+being normalized into a new baseline after an interrupted run.
 
 One exclusive lock covers the shared state volume for the full lifetime of
 every phase container. An existing run ID can never be reused by the `init`
@@ -213,7 +228,7 @@ path for those preserved runs. A durable `phase-preserved` marker prevents a
 later default `all` run from cleaning them implicitly. Owner removal is ordered:
 
 1. all paid, private, and Node-LB workloads and Services, including
-   controller-owned Node-LB shadows;
+   controller-owned Node-LB datapaths;
 2. pods, PV, and VolumeAttachments must disappear;
 3. both private `cilium-l2announce-*` Leases must disappear and
    `CiliumLoadBalancerIPPool/inspace-private` must report zero used IPs;

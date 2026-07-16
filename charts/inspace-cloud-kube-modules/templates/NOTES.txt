@@ -23,12 +23,16 @@ Private Services use Cilium LB IPAM + L2 Announcements:
   loadBalancerClass: io.cilium/l2-announcer
   traffic policy:    Cluster
 
-Cilium Node IPAM is reserved for CCM-owned shadow Services. Public node load
-balancers use loadBalancerClass inspace.cloud/node and default to shared shards;
-dedicated mode is explicit. Generated capacity is static AMD EPYC with
+Public node load balancers use loadBalancerClass inspace.cloud/node and default
+to shared shards; dedicated mode is explicit. CCM generates a private-VIP
+Service with loadBalancerClass inspace.cloud/node-datapath and publishes the
+parent FIP with ipMode=Proxy. Generated capacity is static AMD EPYC with
 {{ .Values.ccm.nodeLoadBalancer.nodesPerShard }} node(s) per shard by default.
-These Services require a selector and allocateLoadBalancerNodePorts=false. Do
-not create io.cilium/node Services directly.
+These Services require a selector and allocateLoadBalancerNodePorts=false. The
+generated datapath uses neither NodePorts nor externalIPs.
+CCM activates them in this order: durable marker, private VIP, exact firewall
+assignment readback, then public Proxy status. Removal detaches the firewall
+before shrinking either status; shard migration is fail-closed break-before-make.
 
 Public InSpace NLBs remain an explicit paid TCP-only path: leave loadBalancerClass unset,
 set inspace.cloud/load-balancer-scope=public, and set annotation

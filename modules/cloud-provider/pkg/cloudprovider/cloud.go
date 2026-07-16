@@ -85,9 +85,9 @@ type Config struct {
 }
 
 // NodeLoadBalancerConfig controls the optional CCM-managed public node load
-// balancer. The dataplane is Cilium Node IPAM; Karpenter supplies dedicated,
-// tainted nodes and InSpace firewalls restrict every Service to its declared
-// public ports.
+// balancer. A controller-owned private-VIP Service supplies the Cilium eBPF
+// dataplane; Karpenter supplies dedicated, tainted nodes and InSpace firewalls
+// restrict every Service to its declared public ports.
 type NodeLoadBalancerConfig struct {
 	Enabled          bool
 	DefaultNodeClass string

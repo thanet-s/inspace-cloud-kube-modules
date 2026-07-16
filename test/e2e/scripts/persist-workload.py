@@ -6,17 +6,18 @@ import hashlib
 import json
 import os
 import pathlib
+import re
 import subprocess
 import tempfile
 
 
 NODE_LOAD_BALANCER_SERVICE_NAMES = (
     "inspace-e2e-node-traefik",
-    "inspace-e2e-node-shared-a",  # pre-release E2E rename recovery
     "inspace-e2e-node-shared-b",
     "inspace-e2e-node-shared-conflict",
     "inspace-e2e-node-dedicated",
 )
+DATAPATH_NAME_PATTERN = re.compile(r"^inlb-dp-[0-9a-f]{52}$")
 
 
 def kubectl(kubeconfig: str, *args: str):
@@ -32,6 +33,17 @@ def kubectl(kubeconfig: str, *args: str):
 
 def sha16(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()[:16]
+
+
+def node_load_balancer_datapath_name(service: dict) -> str:
+    metadata = service.get("metadata", {})
+    namespace = metadata.get("namespace")
+    name = metadata.get("name")
+    uid = metadata.get("uid")
+    if not all(isinstance(value, str) and value for value in (namespace, name, uid)):
+        raise SystemExit("Node-LB Service lacks a stable namespace, name, or UID")
+    identity = hashlib.sha256(f"{namespace}\0{name}\0{uid}".encode()).hexdigest()[:52]
+    return "inlb-dp-" + identity
 
 
 def atomic_write(path: pathlib.Path, value) -> None:
@@ -88,7 +100,14 @@ def main() -> None:
         not isinstance(name, str) or not name for name in raw_node_lb_names
     ):
         raise SystemExit("Node-LB NLB deny journal is invalid")
+    raw_datapath_names = state.get("nodeLoadBalancerDatapathServiceNames", [])
+    if not isinstance(raw_datapath_names, list) or any(
+        not isinstance(name, str) or DATAPATH_NAME_PATTERN.fullmatch(name) is None
+        for name in raw_datapath_names
+    ):
+        raise SystemExit("Node-LB datapath Service journal is invalid")
     node_lb_names = set(raw_node_lb_names)
+    datapath_names = set(raw_datapath_names)
     for service_name in NODE_LOAD_BALANCER_SERVICE_NAMES:
         service = kubectl(args.kubeconfig, "-n", "default", "get", "service", service_name)
         if not service:
@@ -97,7 +116,9 @@ def main() -> None:
         if not isinstance(uid, str) or not uid:
             raise SystemExit(f"Service/{service_name} lacks a stable UID")
         node_lb_names.add(f"k8s-{sha16(state['clusterName'])}-{sha16(uid)}")
+        datapath_names.add(node_load_balancer_datapath_name(service))
     state["nodeLoadBalancerForbiddenLoadBalancerNames"] = sorted(node_lb_names)
+    state["nodeLoadBalancerDatapathServiceNames"] = sorted(datapath_names)
 
     pvc = kubectl(args.kubeconfig, "-n", "default", "get", "pvc", "inspace-e2e-rwo")
     if pvc:

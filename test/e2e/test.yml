@@ -196,7 +196,6 @@
           - service/inspace-e2e-web
           - deployment/inspace-e2e-node-lb
           - service/inspace-e2e-node-traefik
-          - service/inspace-e2e-node-shared-a
           - service/inspace-e2e-node-shared-b
           - service/inspace-e2e-node-shared-conflict
           - service/inspace-e2e-node-dedicated
@@ -1302,46 +1301,53 @@
               - --timeout=10m
           changed_when: false
 
-        - name: Require the mixed Traefik and sibling Services to establish one shared shadow shard
+        - name: Require the mixed Traefik and sibling Services to establish one shared private-VIP datapath shard
           ansible.builtin.shell: |
             set -euo pipefail
-            services=$(kubectl -n default get services \
-              inspace-e2e-node-traefik inspace-e2e-node-shared-b \
-              inspace-e2e-node-traefik-node-lb inspace-e2e-node-shared-b-node-lb \
-              -o json)
+            services=$(kubectl -n default get services -o json)
             jq -e '
               def named($name):
                 [.items[] | select(.metadata.name == $name)] |
                 if length == 1 then .[0] else error("missing exact Service/" + $name) end;
+              def ownedDatapath($parent):
+                [.items[] | select(
+                  .metadata.labels["inspace.cloud/node-lb-datapath"] == "true" and
+                  (.metadata.ownerReferences // []) == [{
+                    "apiVersion": "v1", "blockOwnerDeletion": true, "controller": true,
+                    "kind": "Service", "name": $parent.metadata.name, "uid": $parent.metadata.uid
+                  }]
+                )] |
+                if length == 1 then .[0]
+                else error("missing exact owned datapath for Service/" + $parent.metadata.name)
+                end;
               named("inspace-e2e-node-traefik") as $a |
               named("inspace-e2e-node-shared-b") as $b |
-              named("inspace-e2e-node-traefik-node-lb") as $shadowA |
-              named("inspace-e2e-node-shared-b-node-lb") as $shadowB |
+              ownedDatapath($a) as $datapathA |
+              ownedDatapath($b) as $datapathB |
               ($a.metadata.annotations["service.inspace.cloud/node-lb-shard"] // "") as $shard |
-              ("inspace.cloud.node-restriction.kubernetes.io/node-lb=true," +
-                "inspace.cloud.node-restriction.kubernetes.io/cluster={{ e2e_state.clusterName }}," +
-                "inspace.cloud.node-restriction.kubernetes.io/shard=" + $shard +
-                ",inspace.cloud.node-restriction.kubernetes.io/ready=true") as $selector |
               ($shard | test("^inlb-[0-9a-f]{8}$")) and
               $b.metadata.annotations["service.inspace.cloud/node-lb-shard"] == $shard and
-              all([$shadowA, $shadowB][];
-                .spec.loadBalancerClass == "io.cilium/node" and
+              $a.metadata.annotations["service.inspace.cloud/node-lb-datapath-active-shard"] == $shard and
+              $b.metadata.annotations["service.inspace.cloud/node-lb-datapath-active-shard"] == $shard and
+              all([$datapathA, $datapathB][];
+                (.metadata.name | test("^inlb-dp-[0-9a-f]{52}$")) and
+                (.metadata.labels["inspace.cloud/node-lb-service-id"] | test("^[0-9a-f]{52}$")) and
+                .metadata.name == ("inlb-dp-" + .metadata.labels["inspace.cloud/node-lb-service-id"]) and
+                .spec.loadBalancerClass == "inspace.cloud/node-datapath" and
                 .spec.allocateLoadBalancerNodePorts == false and
-                .metadata.annotations["io.cilium.nodeipam/match-node-labels"] == $selector) and
-              $shadowA.metadata.labels["inspace.cloud/node-lb-service-uid"] == $a.metadata.uid and
-              $shadowB.metadata.labels["inspace.cloud/node-lb-service-uid"] == $b.metadata.uid and
-              $shadowA.metadata.ownerReferences == [{
-                "apiVersion": "v1", "blockOwnerDeletion": true, "controller": true,
-                "kind": "Service", "name": $a.metadata.name, "uid": $a.metadata.uid
-              }] and
-              $shadowB.metadata.ownerReferences == [{
-                "apiVersion": "v1", "blockOwnerDeletion": true, "controller": true,
-                "kind": "Service", "name": $b.metadata.name, "uid": $b.metadata.uid
-              }] and
-              ($shadowA.status.loadBalancer.ingress | length) == 1 and
-              ($shadowB.status.loadBalancer.ingress | length) == 1 and
-              $a.status.loadBalancer == $shadowA.status.loadBalancer and
-              $b.status.loadBalancer == $shadowB.status.loadBalancer' <<<"$services"
+                (.spec.externalIPs // []) == [] and
+                all(.spec.ports[]; (.nodePort // 0) == 0) and
+                .metadata.labels["inspace.cloud/node-lb-datapath"] == "true" and
+                .metadata.annotations["service.inspace.cloud/node-lb-datapath-shard"] == $shard) and
+              all([$datapathA, $datapathB][];
+                (.status.loadBalancer.ingress | length) == 1 and
+                .status.loadBalancer.ingress[0].ipMode == "VIP") and
+              all([$a, $b][];
+                (.status.loadBalancer.ingress | length) == 1 and
+                .status.loadBalancer.ingress[0].ipMode == "Proxy") and
+              $a.status.loadBalancer.ingress[0].ip == $b.status.loadBalancer.ingress[0].ip and
+              $datapathA.status.loadBalancer.ingress[0].ip == $datapathB.status.loadBalancer.ingress[0].ip and
+              $a.status.loadBalancer.ingress[0].ip != $datapathA.status.loadBalancer.ingress[0].ip' <<<"$services"
           args:
             executable: /bin/bash
           register: e2e_node_lb_shared_pair
@@ -1412,6 +1418,24 @@
             e2e_node_lb_http.status == 200 and
             (e2e_node_lb_http.content | trim) ==
             (e2e_marker ~ '-' ~ item.markerSuffix)
+
+        - name: Require Cilium to report no duplicate Node-LB frontend ownership
+          ansible.builtin.shell: |
+            set -euo pipefail
+            pods=$(kubectl -n kube-system get pods -l k8s-app=cilium \
+              -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')
+            test -n "$pods"
+            while IFS= read -r pod; do
+              logs=$(kubectl -n kube-system logs "$pod" -c cilium-agent \
+                --since=30m --tail=-1)
+              if grep -Fqi 'frontend already owned by another service' <<<"$logs"; then
+                printf 'Cilium/%s reported duplicate frontend ownership\n' "$pod" >&2
+                exit 1
+              fi
+            done <<<"$pods"
+          args:
+            executable: /bin/bash
+          changed_when: false
 
         - name: Delete one shared Node-LB member without deleting its sibling shard
           ansible.builtin.command:
@@ -1498,7 +1522,7 @@
               - --wait=false
           changed_when: true
 
-        - name: Require Node-LB Services shadows NodePools firewalls VMs and FIPs to disappear
+        - name: Require Node-LB Services datapaths NodePools firewalls VMs and FIPs to disappear
           ansible.builtin.command:
             argv:
               - /opt/e2e/scripts/verify-node-load-balancer.py
@@ -1568,5 +1592,5 @@
           Full InSpace RKE2/Cilium-native-routing/kube-proxy-replacement,
           CCM, CSI RWO, Karpenter, two same-port private LB-IPAM/L2 VIPs,
           L2 lease failover, explicit paid TCP NLB, and shared/conflict/dedicated
-          Cilium Node IPAM public load-balancer TCP/UDP/ICMP and partial-member
-          cleanup E2E passed; cleanup follows.
+          public-Proxy/private-VIP NodeLB TCP/UDP/ICMP and partial-member cleanup
+          E2E passed; cleanup follows.

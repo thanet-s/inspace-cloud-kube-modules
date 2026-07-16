@@ -32,7 +32,7 @@ ccm:
   enabled: true
   nodeLoadBalancer:
     # Public node load balancers use CCM-managed shared/dedicated shards backed
-    # by static Karpenter capacity and Cilium Node IPAM.
+    # by static Karpenter capacity and Cilium private-IP Service frontends.
     enabled: true
     nodesPerShard: 1
   replicaCount: 2

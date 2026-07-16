@@ -3,6 +3,8 @@ package cloudprovider
 import (
 	"context"
 	"errors"
+	"fmt"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -12,9 +14,11 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	utilvalidation "k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/client-go/dynamic/fake"
 	kubefake "k8s.io/client-go/kubernetes/fake"
 	corelisters "k8s.io/client-go/listers/core/v1"
@@ -40,17 +44,17 @@ func TestNodeLoadBalancerProfileChangeDoesNotPreserveOldShard(t *testing.T) {
 	nodePool := nodeLoadBalancerSafetyNodePool(oldShard, "unit-test-cluster", oldProfile, 1)
 	provider := newTestProvider(t, &fakeAPI{})
 	provider.config.NodeLoadBalancer = NodeLoadBalancerConfig{Enabled: true, DefaultNodeClass: "workers", NodesPerShard: 1}
-	provider.dynamicClient = fake.NewSimpleDynamicClient(runtime.NewScheme(), nodePool)
+	provider.dynamicClient = newNodeLoadBalancerTestDynamicClient(nodePool)
 	provider.kubeClient = kubefake.NewSimpleClientset(
 		service.DeepCopy(),
-		desiredNodeLoadBalancerShadow(service, nodeLoadBalancerShadowName(service), provider.config.ClusterID, oldShard),
+		desiredNodeLoadBalancerDatapath(service, nodeLoadBalancerDatapathName(service), oldShard),
 	)
 
 	serviceIndexer := newNamespacedIndexer()
 	if err := serviceIndexer.Add(service); err != nil {
 		t.Fatal(err)
 	}
-	if err := serviceIndexer.Add(desiredNodeLoadBalancerShadow(service, nodeLoadBalancerShadowName(service), "unit-test-cluster", oldShard)); err != nil {
+	if err := serviceIndexer.Add(desiredNodeLoadBalancerDatapath(service, nodeLoadBalancerDatapathName(service), oldShard)); err != nil {
 		t.Fatal(err)
 	}
 	controller := &nodeLoadBalancerController{
@@ -70,45 +74,6 @@ func TestNodeLoadBalancerProfileChangeDoesNotPreserveOldShard(t *testing.T) {
 	}
 }
 
-func TestNodeLoadBalancerDefaultUpgradeMigratesLegacyUnderMinimumShard(t *testing.T) {
-	ctx := context.Background()
-	const oldShard = "inlb-0123abcd"
-
-	service := nodeLoadBalancerTestService("web", "web-uid", corev1.ProtocolTCP, 443)
-	service.Annotations[annotationNodeLoadBalancerShard] = oldShard
-	nodePool := nodeLoadBalancerSafetyLegacyNodePool(oldShard, "unit-test-cluster", nodeLoadBalancerModeShared, nodeLoadBalancerDefaultPool, 1)
-
-	provider := newTestProvider(t, &fakeAPI{})
-	provider.config.NodeLoadBalancer = NodeLoadBalancerConfig{Enabled: true, DefaultNodeClass: "workers", NodesPerShard: 1}
-	provider.dynamicClient = fake.NewSimpleDynamicClient(runtime.NewScheme(), nodePool)
-	provider.kubeClient = kubefake.NewSimpleClientset(
-		service.DeepCopy(),
-		desiredNodeLoadBalancerShadow(service, nodeLoadBalancerShadowName(service), provider.config.ClusterID, oldShard),
-	)
-	serviceIndexer := newNamespacedIndexer()
-	if err := serviceIndexer.Add(service); err != nil {
-		t.Fatal(err)
-	}
-	if err := serviceIndexer.Add(desiredNodeLoadBalancerShadow(service, nodeLoadBalancerShadowName(service), provider.config.ClusterID, oldShard)); err != nil {
-		t.Fatal(err)
-	}
-	controller := &nodeLoadBalancerController{
-		provider: provider,
-		services: corelisters.NewServiceLister(serviceIndexer),
-	}
-
-	intent, plan, _, err := controller.planForService(ctx, service)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if intent.ExistingShard != "" {
-		t.Fatalf("upgraded Service retained legacy under-minimum shard %q", intent.ExistingShard)
-	}
-	if got := plan.Assignments[intent.ServiceID]; got == "" || got == oldShard {
-		t.Fatalf("upgraded Service assignment = %q, want a guarded replacement shard", got)
-	}
-}
-
 func TestNodeLoadBalancerChangedPortCannotEvictStableSharedClaim(t *testing.T) {
 	ctx := context.Background()
 	const oldShard = "inlb-0123abcd"
@@ -117,6 +82,7 @@ func TestNodeLoadBalancerChangedPortCannotEvictStableSharedClaim(t *testing.T) {
 	changed.Annotations[annotationNodeLoadBalancerShard] = oldShard
 	stable := nodeLoadBalancerTestService("stable", "stable-uid", corev1.ProtocolTCP, 443)
 	stable.Annotations[annotationNodeLoadBalancerShard] = oldShard
+	nodeLoadBalancerSafetyMarkDatapathActive(stable, oldShard)
 	changedBeforeEdit := changed.DeepCopy()
 	changedBeforeEdit.Spec.Ports[0].Port = 80
 
@@ -124,19 +90,19 @@ func TestNodeLoadBalancerChangedPortCannotEvictStableSharedClaim(t *testing.T) {
 	nodePool := nodeLoadBalancerSafetyNodePool(oldShard, "unit-test-cluster", profile, 1)
 	provider := newTestProvider(t, &fakeAPI{})
 	provider.config.NodeLoadBalancer = NodeLoadBalancerConfig{Enabled: true, DefaultNodeClass: "workers", NodesPerShard: 1}
-	provider.dynamicClient = fake.NewSimpleDynamicClient(runtime.NewScheme(), nodePool)
+	provider.dynamicClient = newNodeLoadBalancerTestDynamicClient(nodePool)
 	provider.kubeClient = kubefake.NewSimpleClientset(
 		changed.DeepCopy(), stable.DeepCopy(),
-		desiredNodeLoadBalancerShadow(changedBeforeEdit, nodeLoadBalancerShadowName(changed), provider.config.ClusterID, oldShard),
-		desiredNodeLoadBalancerShadow(stable, nodeLoadBalancerShadowName(stable), provider.config.ClusterID, oldShard),
+		desiredNodeLoadBalancerDatapath(changedBeforeEdit, nodeLoadBalancerDatapathName(changed), oldShard),
+		desiredNodeLoadBalancerDatapath(stable, nodeLoadBalancerDatapathName(stable), oldShard),
 	)
 
 	serviceIndexer := newNamespacedIndexer()
 	for _, object := range []*corev1.Service{
 		changed,
 		stable,
-		desiredNodeLoadBalancerShadow(changedBeforeEdit, nodeLoadBalancerShadowName(changed), "unit-test-cluster", oldShard),
-		desiredNodeLoadBalancerShadow(stable, nodeLoadBalancerShadowName(stable), "unit-test-cluster", oldShard),
+		desiredNodeLoadBalancerDatapath(changedBeforeEdit, nodeLoadBalancerDatapathName(changed), oldShard),
+		desiredNodeLoadBalancerDatapath(stable, nodeLoadBalancerDatapathName(stable), oldShard),
 	} {
 		if err := serviceIndexer.Add(object); err != nil {
 			t.Fatal(err)
@@ -173,25 +139,25 @@ func TestNodeLoadBalancerInactiveMigratingPortEditCannotEvictActiveReplacementCl
 	stagedBeforeEdit.Spec.Ports[0].Port = 80
 	active := nodeLoadBalancerTestService("active", "z-active-uid", corev1.ProtocolTCP, 443)
 	active.Annotations[annotationNodeLoadBalancerShard] = replacementShard
+	nodeLoadBalancerSafetyMarkDatapathActive(active, replacementShard)
 
 	profile := nodeLoadBalancerProfileHash(nodeLoadBalancerModeShared, nodeLoadBalancerDefaultPool, 1, nodeLoadBalancerDefaultCPU, nodeLoadBalancerDefaultMemoryMiB)
 	provider := newTestProvider(t, &fakeAPI{})
 	provider.config.NodeLoadBalancer = NodeLoadBalancerConfig{Enabled: true, DefaultNodeClass: "workers", NodesPerShard: 1}
-	provider.dynamicClient = fake.NewSimpleDynamicClient(
-		runtime.NewScheme(),
+	provider.dynamicClient = newNodeLoadBalancerTestDynamicClient(
 		nodeLoadBalancerSafetyNodePool(replacementShard, provider.config.ClusterID, profile, 1),
 	)
 	provider.kubeClient = kubefake.NewSimpleClientset(
 		staged.DeepCopy(), active.DeepCopy(),
-		desiredNodeLoadBalancerShadow(stagedBeforeEdit, nodeLoadBalancerShadowName(staged), provider.config.ClusterID, oldShard),
-		desiredNodeLoadBalancerShadow(active, nodeLoadBalancerShadowName(active), provider.config.ClusterID, replacementShard),
+		desiredNodeLoadBalancerDatapath(stagedBeforeEdit, nodeLoadBalancerDatapathName(staged), oldShard),
+		desiredNodeLoadBalancerDatapath(active, nodeLoadBalancerDatapathName(active), replacementShard),
 	)
 	serviceIndexer := newNamespacedIndexer()
 	for _, object := range []*corev1.Service{
 		staged,
 		active,
-		desiredNodeLoadBalancerShadow(stagedBeforeEdit, nodeLoadBalancerShadowName(staged), provider.config.ClusterID, oldShard),
-		desiredNodeLoadBalancerShadow(active, nodeLoadBalancerShadowName(active), provider.config.ClusterID, replacementShard),
+		desiredNodeLoadBalancerDatapath(stagedBeforeEdit, nodeLoadBalancerDatapathName(staged), oldShard),
+		desiredNodeLoadBalancerDatapath(active, nodeLoadBalancerDatapathName(active), replacementShard),
 	} {
 		if err := serviceIndexer.Add(object); err != nil {
 			t.Fatal(err)
@@ -214,7 +180,7 @@ func TestNodeLoadBalancerInactiveMigratingPortEditCannotEvictActiveReplacementCl
 	}
 }
 
-func TestNodeLoadBalancerSimultaneousPortSwapReservesBothLiveShadows(t *testing.T) {
+func TestNodeLoadBalancerUncommittedPortSwapCanReusePersistedShard(t *testing.T) {
 	ctx := context.Background()
 	const shard = "inlb-89abcdef"
 	a := nodeLoadBalancerTestService("a", "a-service-uid", corev1.ProtocolTCP, 443)
@@ -229,21 +195,20 @@ func TestNodeLoadBalancerSimultaneousPortSwapReservesBothLiveShadows(t *testing.
 	profile := nodeLoadBalancerProfileHash(nodeLoadBalancerModeShared, nodeLoadBalancerDefaultPool, 1, nodeLoadBalancerDefaultCPU, nodeLoadBalancerDefaultMemoryMiB)
 	provider := newTestProvider(t, &fakeAPI{})
 	provider.config.NodeLoadBalancer = NodeLoadBalancerConfig{Enabled: true, DefaultNodeClass: "workers", NodesPerShard: 1}
-	provider.dynamicClient = fake.NewSimpleDynamicClient(
-		runtime.NewScheme(),
+	provider.dynamicClient = newNodeLoadBalancerTestDynamicClient(
 		nodeLoadBalancerSafetyNodePool(shard, provider.config.ClusterID, profile, 1),
 	)
 	provider.kubeClient = kubefake.NewSimpleClientset(
 		a.DeepCopy(), x.DeepCopy(),
-		desiredNodeLoadBalancerShadow(aBeforeSwap, nodeLoadBalancerShadowName(a), provider.config.ClusterID, shard),
-		desiredNodeLoadBalancerShadow(xBeforeSwap, nodeLoadBalancerShadowName(x), provider.config.ClusterID, shard),
+		desiredNodeLoadBalancerDatapath(aBeforeSwap, nodeLoadBalancerDatapathName(a), shard),
+		desiredNodeLoadBalancerDatapath(xBeforeSwap, nodeLoadBalancerDatapathName(x), shard),
 	)
 	serviceIndexer := newNamespacedIndexer()
 	for _, object := range []*corev1.Service{
 		a,
 		x,
-		desiredNodeLoadBalancerShadow(aBeforeSwap, nodeLoadBalancerShadowName(a), provider.config.ClusterID, shard),
-		desiredNodeLoadBalancerShadow(xBeforeSwap, nodeLoadBalancerShadowName(x), provider.config.ClusterID, shard),
+		desiredNodeLoadBalancerDatapath(aBeforeSwap, nodeLoadBalancerDatapathName(a), shard),
+		desiredNodeLoadBalancerDatapath(xBeforeSwap, nodeLoadBalancerDatapathName(x), shard),
 	} {
 		if err := serviceIndexer.Add(object); err != nil {
 			t.Fatal(err)
@@ -260,15 +225,12 @@ func TestNodeLoadBalancerSimultaneousPortSwapReservesBothLiveShadows(t *testing.
 	}
 	aShard := plan.Assignments[string(a.UID)]
 	xShard := plan.Assignments[string(x.UID)]
-	if aShard == "" || xShard == "" || aShard == shard || xShard == shard {
-		t.Fatalf("live-shadow port swap reused unsafe shard: A=%q X=%q", aShard, xShard)
-	}
-	if aShard != xShard {
-		t.Fatalf("conflict-free swapped claims did not share their safe replacement: A=%q X=%q", aShard, xShard)
+	if aShard != shard || xShard != shard {
+		t.Fatalf("uncommitted, conflict-free port swap moved from persisted shard: A=%q X=%q", aShard, xShard)
 	}
 }
 
-func TestNodeLoadBalancerDeletingPeerShadowReservesItsPortUntilCleanup(t *testing.T) {
+func TestNodeLoadBalancerDeletingPeerDatapathReservesItsPortUntilCleanup(t *testing.T) {
 	ctx := context.Background()
 	const shard = "inlb-89abcdef"
 	a := nodeLoadBalancerTestService("a", "a-service-uid", corev1.ProtocolTCP, 443)
@@ -280,25 +242,25 @@ func TestNodeLoadBalancerDeletingPeerShadowReservesItsPortUntilCleanup(t *testin
 	now := metav1.Now()
 	deleting.DeletionTimestamp = &now
 	deleting.Annotations[annotationNodeLoadBalancerShard] = shard
+	nodeLoadBalancerSafetyMarkDatapathActive(deleting, shard)
 
 	profile := nodeLoadBalancerProfileHash(nodeLoadBalancerModeShared, nodeLoadBalancerDefaultPool, 1, nodeLoadBalancerDefaultCPU, nodeLoadBalancerDefaultMemoryMiB)
 	provider := newTestProvider(t, &fakeAPI{})
 	provider.config.NodeLoadBalancer = NodeLoadBalancerConfig{Enabled: true, DefaultNodeClass: "workers", NodesPerShard: 1}
-	provider.dynamicClient = fake.NewSimpleDynamicClient(
-		runtime.NewScheme(),
+	provider.dynamicClient = newNodeLoadBalancerTestDynamicClient(
 		nodeLoadBalancerSafetyNodePool(shard, provider.config.ClusterID, profile, 1),
 	)
 	provider.kubeClient = kubefake.NewSimpleClientset(
 		a.DeepCopy(), deleting.DeepCopy(),
-		desiredNodeLoadBalancerShadow(aBeforeEdit, nodeLoadBalancerShadowName(a), provider.config.ClusterID, shard),
-		desiredNodeLoadBalancerShadow(deleting, nodeLoadBalancerShadowName(deleting), provider.config.ClusterID, shard),
+		desiredNodeLoadBalancerDatapath(aBeforeEdit, nodeLoadBalancerDatapathName(a), shard),
+		desiredNodeLoadBalancerDatapath(deleting, nodeLoadBalancerDatapathName(deleting), shard),
 	)
 	serviceIndexer := newNamespacedIndexer()
 	for _, object := range []*corev1.Service{
 		a,
 		deleting,
-		desiredNodeLoadBalancerShadow(aBeforeEdit, nodeLoadBalancerShadowName(a), provider.config.ClusterID, shard),
-		desiredNodeLoadBalancerShadow(deleting, nodeLoadBalancerShadowName(deleting), provider.config.ClusterID, shard),
+		desiredNodeLoadBalancerDatapath(aBeforeEdit, nodeLoadBalancerDatapathName(a), shard),
+		desiredNodeLoadBalancerDatapath(deleting, nodeLoadBalancerDatapathName(deleting), shard),
 	} {
 		if err := serviceIndexer.Add(object); err != nil {
 			t.Fatal(err)
@@ -318,28 +280,29 @@ func TestNodeLoadBalancerDeletingPeerShadowReservesItsPortUntilCleanup(t *testin
 	}
 }
 
-func TestNodeLoadBalancerPlannerReadsLiveShadowWhenInformerIsStale(t *testing.T) {
+func TestNodeLoadBalancerPlannerReadsLiveDatapathWhenInformerIsStale(t *testing.T) {
 	ctx := context.Background()
 	const shard = "inlb-89abcdef"
 	target := nodeLoadBalancerTestService("target", "a-target-uid", corev1.ProtocolTCP, 443)
 	stable := nodeLoadBalancerTestService("stable", "m-stable-uid", corev1.ProtocolTCP, 80)
 	stable.Annotations[annotationNodeLoadBalancerShard] = shard
+	nodeLoadBalancerSafetyMarkDatapathActive(stable, shard)
 	deleting := nodeLoadBalancerTestService("deleting", "z-deleting-uid", corev1.ProtocolTCP, 443)
 	deleting.Finalizers = []string{nodeLoadBalancerFinalizer}
 	now := metav1.Now()
 	deleting.DeletionTimestamp = &now
 	deleting.Annotations[annotationNodeLoadBalancerShard] = shard
-	stableShadow := desiredNodeLoadBalancerShadow(stable, nodeLoadBalancerShadowName(stable), "unit-test-cluster", shard)
-	deletingShadow := desiredNodeLoadBalancerShadow(deleting, nodeLoadBalancerShadowName(deleting), "unit-test-cluster", shard)
+	nodeLoadBalancerSafetyMarkDatapathActive(deleting, shard)
+	stableShadow := desiredNodeLoadBalancerDatapath(stable, nodeLoadBalancerDatapathName(stable), shard)
+	deletingShadow := desiredNodeLoadBalancerDatapath(deleting, nodeLoadBalancerDatapathName(deleting), shard)
 
 	profile := nodeLoadBalancerProfileHash(nodeLoadBalancerModeShared, nodeLoadBalancerDefaultPool, 1, nodeLoadBalancerDefaultCPU, nodeLoadBalancerDefaultMemoryMiB)
 	provider := newTestProvider(t, &fakeAPI{})
 	provider.config.NodeLoadBalancer = NodeLoadBalancerConfig{Enabled: true, DefaultNodeClass: "workers", NodesPerShard: 1}
-	provider.dynamicClient = fake.NewSimpleDynamicClient(
-		runtime.NewScheme(),
+	provider.dynamicClient = newNodeLoadBalancerTestDynamicClient(
 		nodeLoadBalancerSafetyNodePool(shard, provider.config.ClusterID, profile, 1),
 	)
-	// The authoritative API already contains the deleting peer shadow, while
+	// The authoritative API already contains the deleting peer datapath, while
 	// the deliberately stale informer below has not observed it yet.
 	provider.kubeClient = kubefake.NewSimpleClientset(
 		target.DeepCopy(), stable.DeepCopy(), deleting.DeepCopy(), stableShadow.DeepCopy(), deletingShadow.DeepCopy(),
@@ -360,7 +323,36 @@ func TestNodeLoadBalancerPlannerReadsLiveShadowWhenInformerIsStale(t *testing.T)
 		t.Fatal(err)
 	}
 	if got := plan.Assignments[intent.ServiceID]; got == "" || got == shard {
-		t.Fatalf("stale informer let target claim live shadow port on %s: %q", shard, got)
+		t.Fatalf("stale informer let target claim live datapath port on %s: %q", shard, got)
+	}
+}
+
+func TestNodeLoadBalancerPlannerSplicesLiveTargetIntent(t *testing.T) {
+	ctx := context.Background()
+	cached := nodeLoadBalancerTestService("target", "target-uid", corev1.ProtocolTCP, 443)
+	live := cached.DeepCopy()
+	live.Spec.Ports[0].Port = 8443
+
+	provider := newTestProvider(t, &fakeAPI{})
+	provider.config.NodeLoadBalancer = NodeLoadBalancerConfig{Enabled: true, DefaultNodeClass: "workers", NodesPerShard: 1}
+	provider.dynamicClient = newNodeLoadBalancerTestDynamicClient(nodeLoadBalancerSafetyBaseNodeClass())
+	provider.kubeClient = kubefake.NewSimpleClientset(live.DeepCopy())
+	serviceIndexer := newNamespacedIndexer()
+	if err := serviceIndexer.Add(cached.DeepCopy()); err != nil {
+		t.Fatal(err)
+	}
+	controller := &nodeLoadBalancerController{
+		provider: provider,
+		services: corelisters.NewServiceLister(serviceIndexer),
+	}
+
+	intent, _, _, err := controller.planForService(ctx, cached)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []nodeLoadBalancerPortClaim{{IPFamily: corev1.IPv4Protocol, Protocol: corev1.ProtocolTCP, Port: 8443}}
+	if !reflect.DeepEqual(intent.Ports, want) {
+		t.Fatalf("planned target ports = %#v, want authoritative live %#v", intent.Ports, want)
 	}
 }
 
@@ -499,78 +491,11 @@ func TestNodeLoadBalancerNodePoolAuthorizationRequiresFullHardenedProfile(t *tes
 	}
 }
 
-func TestNodeLoadBalancerLegacyNodePoolAuthorizationIsExactAndMigrationOnly(t *testing.T) {
-	const shard = "inlb-89abcdef"
-	provider := newTestProvider(t, &fakeAPI{})
-	controller := &nodeLoadBalancerController{provider: provider}
-	nodeClassName := managedNodeLoadBalancerName(provider.config.ClusterID, "node-lb")
-	legacyPlan := nodeLoadBalancerShardPlan{
-		Name: shard, Mode: nodeLoadBalancerModeShared, Pool: nodeLoadBalancerDefaultPool,
-		NodesPerShard: 1, CPU: 1, MemoryMiB: 2048,
-	}
-	baseline := nodeLoadBalancerSafetyLegacyNodePool(
-		shard,
-		provider.config.ClusterID,
-		legacyPlan.Mode,
-		legacyPlan.Pool,
-		int64(legacyPlan.NodesPerShard),
-	)
-	if controller.nodeLoadBalancerNodePoolAuthoritative(baseline, shard, nodeClassName) {
-		t.Fatal("normal authorization accepted the legacy under-minimum NodePool")
-	}
-	if !controller.legacyNodeLoadBalancerNodePoolAuthoritative(baseline, shard, nodeClassName, legacyPlan) {
-		t.Fatal("exact legacy NodePool was not accepted by the migration-only predicate")
-	}
-	if _, err := renderNodeLoadBalancerNodePool(shard, nodeClassName, legacyPlan); err == nil {
-		t.Fatal("normal renderer accepted the legacy under-minimum shape")
-	}
-
-	tests := map[string]func(*testing.T, *unstructured.Unstructured, *nodeLoadBalancerShardPlan){
-		"wrong profile": func(t *testing.T, pool *unstructured.Unstructured, _ *nodeLoadBalancerShardPlan) {
-			labels := pool.GetLabels()
-			labels[nodeLoadBalancerProfileLabel] = "foreign-profile"
-			pool.SetLabels(labels)
-		},
-		"foreign cluster ownership": func(t *testing.T, pool *unstructured.Unstructured, _ *nodeLoadBalancerShardPlan) {
-			labels := pool.GetLabels()
-			labels[nodeLoadBalancerClusterLabel] = "foreign-cluster"
-			pool.SetLabels(labels)
-		},
-		"missing isolation taint": func(t *testing.T, pool *unstructured.Unstructured, _ *nodeLoadBalancerShardPlan) {
-			unstructured.RemoveNestedField(pool.Object, "spec", "template", "spec", "taints")
-		},
-		"changed disruption policy": func(t *testing.T, pool *unstructured.Unstructured, _ *nodeLoadBalancerShardPlan) {
-			if err := unstructured.SetNestedField(pool.Object, "WhenEmpty", "spec", "disruption", "consolidationPolicy"); err != nil {
-				t.Fatal(err)
-			}
-		},
-		"wrong CPU": func(t *testing.T, pool *unstructured.Unstructured, _ *nodeLoadBalancerShardPlan) {
-			setNodeLoadBalancerSafetyRequirement(t, pool, "inspace.cloud/instance-cpu", "2")
-		},
-		"wrong memory": func(t *testing.T, pool *unstructured.Unstructured, _ *nodeLoadBalancerShardPlan) {
-			setNodeLoadBalancerSafetyRequirement(t, pool, "inspace.cloud/instance-memory", "4096")
-		},
-		"mismatched expected mode": func(_ *testing.T, _ *unstructured.Unstructured, expected *nodeLoadBalancerShardPlan) {
-			expected.Mode = nodeLoadBalancerModeDedicated
-		},
-	}
-	for name, mutate := range tests {
-		t.Run(name, func(t *testing.T) {
-			pool := baseline.DeepCopy()
-			expected := legacyPlan
-			mutate(t, pool, &expected)
-			if controller.legacyNodeLoadBalancerNodePoolAuthoritative(pool, shard, nodeClassName, expected) {
-				t.Fatal("drifted legacy NodePool remained authoritative")
-			}
-		})
-	}
-}
-
-func TestNodeLoadBalancerForeignShadowNameFailsBeforeFinalizerOrCapacity(t *testing.T) {
+func TestNodeLoadBalancerForeignDatapathNameFailsBeforeFinalizerOrCapacity(t *testing.T) {
 	ctx := context.Background()
 	service := nodeLoadBalancerTestService("web", "web-uid", corev1.ProtocolTCP, 443)
 	foreignOwner := nodeLoadBalancerTestService("foreign", "foreign-uid", corev1.ProtocolTCP, 8443)
-	foreignShadow := desiredNodeLoadBalancerShadow(foreignOwner, nodeLoadBalancerShadowName(service), "unit-test-cluster", "inlb-0123abcd")
+	foreignShadow := desiredNodeLoadBalancerDatapath(foreignOwner, nodeLoadBalancerDatapathName(service), "inlb-0123abcd")
 	provider := newTestProvider(t, &fakeAPI{})
 	provider.config.NodeLoadBalancer = NodeLoadBalancerConfig{Enabled: true, DefaultNodeClass: "workers", NodesPerShard: 1}
 	provider.kubeClient = kubefake.NewSimpleClientset(service.DeepCopy(), foreignShadow.DeepCopy())
@@ -587,21 +512,357 @@ func TestNodeLoadBalancerForeignShadowNameFailsBeforeFinalizerOrCapacity(t *test
 	}
 	err := controller.sync(ctx, service.Namespace+"/"+service.Name)
 	if err == nil || !strings.Contains(err.Error(), "owner") {
-		t.Fatalf("foreign shadow preflight error = %v", err)
+		t.Fatalf("foreign datapath preflight error = %v", err)
 	}
 	stored := getNodeLoadBalancerTestService(t, ctx, provider, service.Namespace, service.Name)
 	if containsString(stored.Finalizers, nodeLoadBalancerFinalizer) || stored.Annotations[annotationNodeLoadBalancerShard] != "" {
-		t.Fatalf("foreign shadow caused managed metadata before preflight: %#v", stored.ObjectMeta)
+		t.Fatalf("foreign datapath caused managed metadata before preflight: %#v", stored.ObjectMeta)
+	}
+}
+
+func TestNodeLoadBalancerDatapathNameBindsExactParentIdentity(t *testing.T) {
+	fixed := nodeLoadBalancerTestService("web", "12345678-1234-4234-8234-123456789abc", corev1.ProtocolTCP, 443)
+	const fixedName = "inlb-dp-7eb63a7dd612a757e4f3b4ec4e2ab9fbf5c9e81cafb8de6fae13"
+	if got := nodeLoadBalancerDatapathName(fixed); got != fixedName {
+		t.Fatalf("canonical fixed-vector datapath name = %q, want %q", got, fixedName)
+	}
+
+	service := nodeLoadBalancerTestService(strings.Repeat("a", 63), strings.Repeat("1", 63), corev1.ProtocolTCP, 443)
+	service.Namespace = strings.Repeat("n", 63)
+	name := nodeLoadBalancerDatapathName(service)
+	if len(name) != 60 || len(utilvalidation.IsDNS1123Label(name)) != 0 {
+		t.Fatalf("canonical datapath name %q has invalid length or DNS syntax", name)
+	}
+	child := desiredNodeLoadBalancerDatapath(service, name, "inlb-0123abcd")
+	if child.Namespace != service.Namespace || child.Name != name || !nodeLoadBalancerDatapathOwnedByService(child, service) {
+		t.Fatalf("generated datapath does not retain exact parent identity: %#v", child.ObjectMeta)
+	}
+
+	otherNamespace := service.DeepCopy()
+	otherNamespace.Namespace = strings.Repeat("m", 63)
+	if nodeLoadBalancerDatapathName(otherNamespace) == name {
+		t.Fatal("same-name Services in different namespaces collided")
+	}
+	otherUID := service.DeepCopy()
+	otherUID.UID = types.UID(strings.Repeat("2", 63))
+	if nodeLoadBalancerDatapathName(otherUID) == name {
+		t.Fatal("same namespace/name replacement Service collided with the old UID")
+	}
+}
+
+func TestNodeLoadBalancerActiveDatapathRequiresMarkerAndExactChild(t *testing.T) {
+	ctx := context.Background()
+	const shard = "inlb-0123abcd"
+	baseService := nodeLoadBalancerTestService("web", "web-uid", corev1.ProtocolTCP, 443)
+	baseChild := nodeLoadBalancerSafetyDatapath(baseService, shard)
+
+	t.Run("exact child without marker is staged", func(t *testing.T) {
+		provider := newTestProvider(t, &fakeAPI{})
+		provider.kubeClient = kubefake.NewSimpleClientset(baseService.DeepCopy(), baseChild.DeepCopy())
+		controller := &nodeLoadBalancerController{provider: provider}
+		if _, _, active, err := controller.activeDatapathService(ctx, baseService); err != nil || active {
+			t.Fatalf("unmarked datapath active=%t err=%v", active, err)
+		}
+	})
+
+	mutations := map[string]func(*corev1.Service){
+		"terminating": func(child *corev1.Service) {
+			now := metav1.Now()
+			child.DeletionTimestamp = &now
+		},
+		"selector drift": func(child *corev1.Service) { child.Spec.Selector = map[string]string{"app": "foreign"} },
+		"port drift":     func(child *corev1.Service) { child.Spec.Ports[0].Port = 8443 },
+		"source range drift": func(child *corev1.Service) {
+			child.Spec.LoadBalancerSourceRanges = []string{"198.51.100.0/24"}
+		},
+		"class drift": func(child *corev1.Service) {
+			class := "example.com/foreign"
+			child.Spec.LoadBalancerClass = &class
+		},
+	}
+	for name, mutate := range mutations {
+		t.Run(name, func(t *testing.T) {
+			service := baseService.DeepCopy()
+			nodeLoadBalancerSafetyMarkDatapathActive(service, shard)
+			child := baseChild.DeepCopy()
+			mutate(child)
+			provider := newTestProvider(t, &fakeAPI{})
+			provider.kubeClient = kubefake.NewSimpleClientset(service, child)
+			controller := &nodeLoadBalancerController{provider: provider}
+			if _, _, active, err := controller.activeDatapathService(ctx, service); err == nil || active {
+				t.Fatalf("drifted datapath active=%t err=%v", active, err)
+			}
+		})
+	}
+
+	t.Run("exact marked child is active", func(t *testing.T) {
+		service := baseService.DeepCopy()
+		nodeLoadBalancerSafetyMarkDatapathActive(service, shard)
+		provider := newTestProvider(t, &fakeAPI{})
+		provider.kubeClient = kubefake.NewSimpleClientset(service, baseChild.DeepCopy())
+		controller := &nodeLoadBalancerController{provider: provider}
+		child, gotShard, active, err := controller.activeDatapathService(ctx, service)
+		if err != nil || !active || gotShard != shard || child.Name != baseChild.Name {
+			t.Fatalf("exact datapath active=%t shard=%q child=%#v err=%v", active, gotShard, child, err)
+		}
+	})
+}
+
+func TestNodeLoadBalancerPrivateVIPPublicationRequiresPriorAuthorization(t *testing.T) {
+	fixture := newNodeLoadBalancerFailClosedFixture(t)
+	defer fixture.controller.queue.ShutDown()
+	parent := getNodeLoadBalancerTestService(
+		t,
+		fixture.ctx,
+		fixture.provider,
+		fixture.service.Namespace,
+		fixture.service.Name,
+	)
+	delete(parent.Annotations, annotationNodeLoadBalancerDatapathActive)
+	parent, err := fixture.provider.kubeClient.CoreV1().Services(parent.Namespace).Update(
+		fixture.ctx,
+		parent,
+		metav1.UpdateOptions{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defaults := nodeLoadBalancerDefaults{NodesPerShard: fixture.provider.config.NodeLoadBalancer.NodesPerShard}
+	expected, err := parseNodeLoadBalancerService(parent, defaults)
+	if err != nil {
+		t.Fatal(err)
+	}
+	addresses := []nodeLoadBalancerAddress{{
+		Node: fixture.node, PrivateIPv4: "10.0.0.20", PublicIPv4: "203.0.113.10",
+	}}
+	if _, err := fixture.controller.publishDatapathStatus(
+		fixture.ctx,
+		parent,
+		fixture.shard,
+		expected,
+		addresses,
+	); err == nil || !strings.Contains(err.Error(), "no activation authorization") {
+		t.Fatalf("unmarked private VIP publication error = %v", err)
+	}
+
+	authorized, err := fixture.controller.authorizeDatapath(fixture.ctx, parent, fixture.shard, expected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientset, ok := fixture.provider.kubeClient.(*kubefake.Clientset)
+	if !ok {
+		t.Fatalf("kube client type = %T", fixture.provider.kubeClient)
+	}
+	markerObserved := false
+	childName := nodeLoadBalancerDatapathName(parent)
+	clientset.PrependReactor("update", "services", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		update, ok := action.(k8stesting.UpdateAction)
+		if !ok || action.GetSubresource() != "status" {
+			return false, nil, nil
+		}
+		child, ok := update.GetObject().(*corev1.Service)
+		if !ok || child.Name != childName {
+			return false, nil, nil
+		}
+		object, trackerErr := clientset.Tracker().Get(
+			corev1.SchemeGroupVersion.WithResource("services"),
+			parent.Namespace,
+			parent.Name,
+		)
+		if trackerErr != nil {
+			return true, nil, trackerErr
+		}
+		stored := object.(*corev1.Service)
+		markerObserved = stored.Annotations[annotationNodeLoadBalancerDatapathActive] == fixture.shard
+		return false, nil, nil
+	})
+	if _, err := fixture.controller.publishDatapathStatus(
+		fixture.ctx,
+		authorized,
+		fixture.shard,
+		expected,
+		addresses,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if !markerObserved {
+		t.Fatal("private VIP status write happened before durable activation authorization")
+	}
+}
+
+func TestNodeLoadBalancerAuthorizationRejectsSameUIDIntentRace(t *testing.T) {
+	fixture := newNodeLoadBalancerFailClosedFixture(t)
+	defer fixture.controller.queue.ShutDown()
+	parent := getNodeLoadBalancerTestService(
+		t,
+		fixture.ctx,
+		fixture.provider,
+		fixture.service.Namespace,
+		fixture.service.Name,
+	)
+	delete(parent.Annotations, annotationNodeLoadBalancerDatapathActive)
+	parent, err := fixture.provider.kubeClient.CoreV1().Services(parent.Namespace).Update(
+		fixture.ctx,
+		parent,
+		metav1.UpdateOptions{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defaults := nodeLoadBalancerDefaults{NodesPerShard: fixture.provider.config.NodeLoadBalancer.NodesPerShard}
+	expected, err := parseNodeLoadBalancerService(parent, defaults)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	clientset := fixture.provider.kubeClient.(*kubefake.Clientset)
+	parentGets := 0
+	clientset.PrependReactor("get", "services", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		get, ok := action.(k8stesting.GetAction)
+		if !ok || get.GetNamespace() != parent.Namespace || get.GetName() != parent.Name {
+			return false, nil, nil
+		}
+		parentGets++
+		if parentGets != 2 {
+			return false, nil, nil
+		}
+		raced := parent.DeepCopy()
+		raced.Spec.Ports[0].Port = 8443
+		return true, raced, nil
+	})
+
+	if _, err := fixture.controller.authorizeDatapath(
+		fixture.ctx,
+		parent,
+		fixture.shard,
+		expected,
+	); err == nil || !strings.Contains(err.Error(), "intent changed") {
+		t.Fatalf("same-UID intent race authorization error = %v", err)
+	}
+	stored := getNodeLoadBalancerTestService(
+		t,
+		fixture.ctx,
+		fixture.provider,
+		parent.Namespace,
+		parent.Name,
+	)
+	if stored.Annotations[annotationNodeLoadBalancerDatapathActive] != "" {
+		t.Fatalf("same-UID intent race persisted activation: %#v", stored.Annotations)
+	}
+}
+
+func TestNodeLoadBalancerGeneratedServiceDeleteUsesUIDPrecondition(t *testing.T) {
+	ctx := context.Background()
+	service := nodeLoadBalancerTestService("web", "web-uid", corev1.ProtocolTCP, 443)
+	child := nodeLoadBalancerSafetyDatapath(service, "inlb-0123abcd")
+	provider := newTestProvider(t, &fakeAPI{})
+	client := kubefake.NewSimpleClientset(service.DeepCopy(), child.DeepCopy())
+	provider.kubeClient = client
+	controller := &nodeLoadBalancerController{provider: provider}
+
+	if err := controller.deleteOwnedDatapathService(ctx, service); err != nil {
+		t.Fatal(err)
+	}
+	actions := client.Actions()
+	if len(actions) != 2 || actions[0].GetVerb() != "get" || actions[1].GetVerb() != "delete" {
+		t.Fatalf("generated Service deletion actions = %#v", actions)
+	}
+	deleteAction, ok := actions[1].(k8stesting.DeleteAction)
+	if !ok || deleteAction.GetDeleteOptions().Preconditions == nil ||
+		deleteAction.GetDeleteOptions().Preconditions.UID == nil ||
+		*deleteAction.GetDeleteOptions().Preconditions.UID != child.UID {
+		t.Fatalf("generated Service delete lacks exact UID precondition: %#v", actions[1])
+	}
+}
+
+func TestNodeLoadBalancerNodePoolDeleteUsesUIDPrecondition(t *testing.T) {
+	ctx := context.Background()
+	const shard = "inlb-0123abcd"
+	pool := nodeLoadBalancerSafetyNodePool(shard, "unit-test-cluster", "0123abcd", 1)
+	provider := newTestProvider(t, &fakeAPI{})
+	dynamicClient := fake.NewSimpleDynamicClient(runtime.NewScheme(), pool.DeepCopy())
+	provider.dynamicClient = dynamicClient
+	controller := &nodeLoadBalancerController{provider: provider}
+
+	if err := controller.deleteManagedNodePool(ctx, shard); err != nil {
+		t.Fatal(err)
+	}
+	actions := dynamicClient.Actions()
+	if len(actions) != 2 || actions[0].GetVerb() != "get" || actions[1].GetVerb() != "delete" {
+		t.Fatalf("NodePool deletion actions = %#v", actions)
+	}
+	deleteAction, ok := actions[1].(k8stesting.DeleteAction)
+	if !ok || deleteAction.GetDeleteOptions().Preconditions == nil ||
+		deleteAction.GetDeleteOptions().Preconditions.UID == nil ||
+		*deleteAction.GetDeleteOptions().Preconditions.UID != pool.GetUID() {
+		t.Fatalf("NodePool delete lacks exact UID precondition: %#v", actions[1])
+	}
+}
+
+func TestNodeLoadBalancerParentReplacementRejectsMetadataAndStatusWrites(t *testing.T) {
+	ctx := context.Background()
+	old := nodeLoadBalancerTestService("web", "old-uid", corev1.ProtocolTCP, 443)
+	replacement := old.DeepCopy()
+	replacement.UID = types.UID("replacement-uid")
+	replacement.Annotations = map[string]string{"user.example/keep": "true"}
+	proxy := corev1.LoadBalancerIPModeProxy
+	replacement.Status.LoadBalancer.Ingress = []corev1.LoadBalancerIngress{{IP: "203.0.113.99", IPMode: &proxy}}
+	provider := newTestProvider(t, &fakeAPI{})
+	provider.kubeClient = kubefake.NewSimpleClientset(replacement.DeepCopy())
+	controller := &nodeLoadBalancerController{provider: provider}
+
+	if _, err := controller.ensureServiceMetadata(ctx, old, "inlb-0123abcd"); err == nil {
+		t.Fatal("metadata writer accepted a same-name replacement UID")
+	}
+	if err := controller.clearServiceLoadBalancerStatus(ctx, old); err == nil {
+		t.Fatal("status writer accepted a same-name replacement UID")
+	}
+	if err := controller.clearInvalidServiceFirewallMetadata(ctx, old); err == nil {
+		t.Fatal("invalid-Service cleanup accepted a same-name replacement UID")
+	}
+	stored, err := provider.kubeClient.CoreV1().Services(replacement.Namespace).Get(ctx, replacement.Name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.UID != replacement.UID || stored.Annotations["user.example/keep"] != "true" ||
+		!reflect.DeepEqual(stored.Status.LoadBalancer, replacement.Status.LoadBalancer) ||
+		containsString(stored.Finalizers, nodeLoadBalancerFinalizer) {
+		t.Fatalf("replacement Service was mutated: %#v", stored)
+	}
+}
+
+func TestNodeLoadBalancerPlannerSkipsOccupiedForeignShardName(t *testing.T) {
+	ctx := context.Background()
+	service := nodeLoadBalancerTestService("web", "web-uid", corev1.ProtocolTCP, 443)
+	first := "inlb-" + nodeLoadBalancerHash("shared/" + nodeLoadBalancerDefaultPool + "/" + string(service.UID))[:8]
+	service.Annotations[annotationNodeLoadBalancerShard] = first
+	foreign := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "karpenter.sh/v1", "kind": "NodePool", "metadata": map[string]any{"name": first},
+	}}
+	provider := newTestProvider(t, &fakeAPI{})
+	provider.dynamicClient = newNodeLoadBalancerTestDynamicClient(foreign)
+	provider.kubeClient = kubefake.NewSimpleClientset(service.DeepCopy())
+	indexer := newNamespacedIndexer()
+	if err := indexer.Add(service); err != nil {
+		t.Fatal(err)
+	}
+	controller := &nodeLoadBalancerController{provider: provider, services: corelisters.NewServiceLister(indexer)}
+	intent, plan, _, err := controller.planForService(ctx, service)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if assigned := plan.Assignments[intent.ServiceID]; assigned == "" || assigned == first {
+		t.Fatalf("planner reused occupied foreign NodePool name %q", assigned)
 	}
 }
 
 func TestNodeLoadBalancerInvalidFinalizedServiceQuarantine(t *testing.T) {
-	t.Run("deletes exact shadow and clears status", func(t *testing.T) {
+	t.Run("deletes exact datapath and clears status", func(t *testing.T) {
 		ctx := context.Background()
 		service := nodeLoadBalancerSafetyInvalidFinalizedService("web", "web-uid")
-		shadow := desiredNodeLoadBalancerShadow(service, nodeLoadBalancerShadowName(service), "unit-test-cluster", "inlb-0123abcd")
+		shadow := nodeLoadBalancerSafetyDatapath(service, "inlb-0123abcd")
 		unrelatedOwner := nodeLoadBalancerTestService("other", "other-uid", corev1.ProtocolTCP, 8443)
-		unrelated := desiredNodeLoadBalancerShadow(unrelatedOwner, nodeLoadBalancerShadowName(unrelatedOwner), "unit-test-cluster", "inlb-89abcdef")
+		unrelated := desiredNodeLoadBalancerDatapath(unrelatedOwner, nodeLoadBalancerDatapathName(unrelatedOwner), "inlb-89abcdef")
 
 		provider := newTestProvider(t, &fakeAPI{})
 		provider.kubeClient = kubefake.NewSimpleClientset(service.DeepCopy(), shadow, unrelated)
@@ -618,10 +879,10 @@ func TestNodeLoadBalancerInvalidFinalizedServiceQuarantine(t *testing.T) {
 			t.Fatal("invalid finalized Service reconciled without an error")
 		}
 		if _, err := provider.kubeClient.CoreV1().Services("default").Get(ctx, shadow.Name, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
-			t.Fatalf("owned shadow still exists: %v", err)
+			t.Fatalf("owned datapath still exists: %v", err)
 		}
 		if _, err := provider.kubeClient.CoreV1().Services("default").Get(ctx, unrelated.Name, metav1.GetOptions{}); err != nil {
-			t.Fatalf("unrelated shadow was deleted: %v", err)
+			t.Fatalf("unrelated datapath was deleted: %v", err)
 		}
 		stored, err := provider.kubeClient.CoreV1().Services("default").Get(ctx, service.Name, metav1.GetOptions{})
 		if err != nil {
@@ -632,11 +893,11 @@ func TestNodeLoadBalancerInvalidFinalizedServiceQuarantine(t *testing.T) {
 		}
 	})
 
-	t.Run("refuses foreign shadow", func(t *testing.T) {
+	t.Run("refuses foreign datapath", func(t *testing.T) {
 		ctx := context.Background()
 		service := nodeLoadBalancerSafetyInvalidFinalizedService("web", "web-uid")
-		shadow := desiredNodeLoadBalancerShadow(service, nodeLoadBalancerShadowName(service), "unit-test-cluster", "inlb-0123abcd")
-		shadow.Labels[nodeLoadBalancerServiceUIDLabel] = "foreign-uid"
+		shadow := nodeLoadBalancerSafetyDatapath(service, "inlb-0123abcd")
+		shadow.Labels[nodeLoadBalancerServiceIdentityLabel] = "foreign-identity"
 		shadow.OwnerReferences[0].UID = types.UID("foreign-uid")
 
 		provider := newTestProvider(t, &fakeAPI{})
@@ -651,18 +912,18 @@ func TestNodeLoadBalancerInvalidFinalizedServiceQuarantine(t *testing.T) {
 		}
 
 		err := controller.sync(ctx, "default/web")
-		if err == nil || !strings.Contains(err.Error(), "refusing to delete shadow Service") {
-			t.Fatalf("foreign shadow quarantine error = %v", err)
+		if err == nil || !strings.Contains(err.Error(), "refusing to withdraw foreign datapath Service") {
+			t.Fatalf("foreign datapath quarantine error = %v", err)
 		}
 		if _, err := provider.kubeClient.CoreV1().Services("default").Get(ctx, shadow.Name, metav1.GetOptions{}); err != nil {
-			t.Fatalf("foreign shadow was deleted: %v", err)
+			t.Fatalf("foreign datapath was deleted: %v", err)
 		}
 		stored, err := provider.kubeClient.CoreV1().Services("default").Get(ctx, service.Name, metav1.GetOptions{})
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(stored.Status.LoadBalancer.Ingress) != 1 {
-			t.Fatalf("status changed despite foreign-shadow refusal: %#v", stored.Status.LoadBalancer)
+		if len(stored.Status.LoadBalancer.Ingress) != 0 {
+			t.Fatalf("foreign datapath prevented fail-closed parent withdrawal: %#v", stored.Status.LoadBalancer)
 		}
 	})
 }
@@ -676,7 +937,7 @@ func TestNodeLoadBalancerQuarantinedInvalidPeerDoesNotBlockHealthyPlanning(t *te
 	provider := newTestProvider(t, &fakeAPI{})
 	provider.config.NodeLoadBalancer = NodeLoadBalancerConfig{Enabled: true, DefaultNodeClass: "workers", NodesPerShard: 1}
 	provider.kubeClient = kubefake.NewSimpleClientset(healthy.DeepCopy(), invalid.DeepCopy())
-	provider.dynamicClient = fake.NewSimpleDynamicClient(runtime.NewScheme())
+	provider.dynamicClient = newNodeLoadBalancerTestDynamicClient()
 	serviceIndexer := newNamespacedIndexer()
 	for _, service := range []*corev1.Service{healthy, invalid} {
 		if err := serviceIndexer.Add(service); err != nil {
@@ -734,6 +995,8 @@ func TestNodeLoadBalancerCleanupDiscoversUnannotatedOwnedFirewallToAbsence(t *te
 	ctx := context.Background()
 	service := nodeLoadBalancerTestService("web", "web-uid", corev1.ProtocolTCP, 443)
 	service.Finalizers = []string{nodeLoadBalancerFinalizer}
+	deletingAt := metav1.Now()
+	service.DeletionTimestamp = &deletingAt
 	if service.Annotations[annotationNodeLoadBalancerFirewallUUID] != "" || service.Annotations[annotationNodeLoadBalancerFirewallHash] != "" {
 		t.Fatal("test Service unexpectedly has firewall identity annotations")
 	}
@@ -762,14 +1025,15 @@ func TestNodeLoadBalancerCleanupDiscoversUnannotatedOwnedFirewallToAbsence(t *te
 	if err := controller.cleanupService(ctx, service); err != nil {
 		t.Fatal(err)
 	}
-	if len(api.unassignedFirewalls) != 1 || api.unassignedFirewalls[0] != firewallUUID+"/"+vmUUID || len(api.deletedFirewalls) != 0 {
+	if len(api.unassignedFirewalls) != 1 || api.unassignedFirewalls[0] != firewallUUID+"/"+vmUUID ||
+		len(api.deletedFirewalls) != 1 || api.deletedFirewalls[0] != firewallUUID {
 		t.Fatalf("unassign phase: unassigned=%#v deleted=%#v", api.unassignedFirewalls, api.deletedFirewalls)
 	}
 
 	if err := controller.cleanupService(ctx, service); err != nil {
 		t.Fatal(err)
 	}
-	if len(api.deletedFirewalls) != 1 || api.deletedFirewalls[0] != firewallUUID || len(api.firewalls) != 0 {
+	if len(api.deletedFirewalls) != 1 || len(api.firewalls) != 0 {
 		t.Fatalf("delete phase: deleted=%#v firewalls=%#v", api.deletedFirewalls, api.firewalls)
 	}
 
@@ -809,6 +1073,8 @@ func TestNodeLoadBalancerCleanupDeletesCurrentAndPreviousMigrationShards(t *test
 	)
 	service := nodeLoadBalancerTestService("web", "web-uid", corev1.ProtocolTCP, 443)
 	service.Finalizers = []string{nodeLoadBalancerFinalizer}
+	deletingAt := metav1.Now()
+	service.DeletionTimestamp = &deletingAt
 	service.Annotations[annotationNodeLoadBalancerShard] = currentShard
 	service.Annotations[annotationNodeLoadBalancerPreviousShard] = previousShard
 	profile := nodeLoadBalancerProfileHash(nodeLoadBalancerModeShared, nodeLoadBalancerDefaultPool, 1, nodeLoadBalancerDefaultCPU, nodeLoadBalancerDefaultMemoryMiB)
@@ -1187,201 +1453,6 @@ func TestNodeLoadBalancerCleanupRetainsFinalizerUntilLatePendingFirewallIsDelete
 	}
 }
 
-func TestNodeLoadBalancerMigrationKeepsOldDataplaneUntilReplacementStatusConverges(t *testing.T) {
-	ctx := context.Background()
-	const (
-		oldShard = "inlb-0123abcd"
-		newShard = "inlb-89abcdef"
-		oldVM    = "aaaaaaaa-1111-4222-8333-bbbbbbbbbbbb"
-		newVM    = "cccccccc-1111-4222-8333-dddddddddddd"
-		oldIP    = "203.0.113.10"
-		newIP    = "203.0.113.20"
-	)
-	service := nodeLoadBalancerTestService("web", "web-uid", corev1.ProtocolTCP, 443)
-	service.Finalizers = []string{nodeLoadBalancerFinalizer}
-	service.Annotations[annotationNodeLoadBalancerShard] = newShard
-	service.Annotations[annotationNodeLoadBalancerPreviousShard] = oldShard
-	service.Status.LoadBalancer.Ingress = []corev1.LoadBalancerIngress{{IP: oldIP}}
-	shadow := desiredNodeLoadBalancerShadow(service, nodeLoadBalancerShadowName(service), "unit-test-cluster", oldShard)
-	shadow.Status.LoadBalancer.Ingress = []corev1.LoadBalancerIngress{{IP: oldIP}}
-	oldNode := readyNode("lb-old", "inspace://bkk01/"+oldVM)
-	oldNode.Labels = map[string]string{
-		nodeLoadBalancerNodeLabel:        "true",
-		nodeLoadBalancerNodeClusterLabel: "unit-test-cluster",
-		nodeLoadBalancerNodeShardLabel:   oldShard,
-		nodeLoadBalancerReadyLabel:       "true",
-	}
-	oldNode.Status.Addresses = []corev1.NodeAddress{{Type: corev1.NodeExternalIP, Address: oldIP}}
-
-	api := &fakeAPI{}
-	provider := newTestProvider(t, api)
-	provider.config.NodeLoadBalancer = NodeLoadBalancerConfig{Enabled: true, DefaultNodeClass: "workers", NodesPerShard: 1}
-	controller := &nodeLoadBalancerController{provider: provider}
-	desired, err := controller.desiredServiceFirewall(service)
-	if err != nil {
-		t.Fatal(err)
-	}
-	const firewallUUID = "eeeeeeee-1111-4222-8333-ffffffffffff"
-	service.Annotations[annotationNodeLoadBalancerFirewallUUID] = firewallUUID
-	service.Annotations[annotationNodeLoadBalancerFirewallHash] = desired.Hash
-	api.firewalls = []inspace.Firewall{{
-		UUID: firewallUUID, DisplayName: desired.Request.DisplayName,
-		BillingAccountID: desired.Request.BillingAccountID, Rules: desired.Request.Rules,
-		ResourcesAssigned: []inspace.FirewallResource{{ResourceType: "vm", ResourceUUID: oldVM}},
-	}}
-	profile := nodeLoadBalancerProfileHash(nodeLoadBalancerModeShared, nodeLoadBalancerDefaultPool, 1, nodeLoadBalancerDefaultCPU, nodeLoadBalancerDefaultMemoryMiB)
-	base := nodeLoadBalancerSafetyBaseNodeClass()
-	provider.dynamicClient = newNodeLoadBalancerTestDynamicClient(
-		base,
-		nodeLoadBalancerSafetyLegacyNodePool(oldShard, provider.config.ClusterID, nodeLoadBalancerModeShared, nodeLoadBalancerDefaultPool, 1),
-		nodeLoadBalancerSafetyNodePool(newShard, provider.config.ClusterID, profile, 1),
-	)
-	installNodeLoadBalancerSafetyIdentity(t, provider, oldNode, oldShard)
-	provider.kubeClient = kubefake.NewSimpleClientset(service.DeepCopy(), shadow.DeepCopy(), oldNode.DeepCopy())
-	serviceIndexer := newNamespacedIndexer()
-	for _, object := range []*corev1.Service{service.DeepCopy(), shadow.DeepCopy()} {
-		if err := serviceIndexer.Add(object); err != nil {
-			t.Fatal(err)
-		}
-	}
-	nodeIndexer := newNamespacedIndexer()
-	if err := nodeIndexer.Add(oldNode.DeepCopy()); err != nil {
-		t.Fatal(err)
-	}
-	controller.services = corelisters.NewServiceLister(serviceIndexer)
-	controller.nodes = corelisters.NewNodeLister(nodeIndexer)
-	controller.queue = workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]())
-	defer controller.queue.ShutDown()
-	legacyShards, err := controller.legacyNodeLoadBalancerMigrationShards(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	legacyPlan, allowed := legacyShards[oldShard]
-	if !allowed {
-		t.Fatalf("active old shard was not identified as a legacy migration: %#v", legacyShards)
-	}
-	legacyPool, err := provider.dynamicClient.Resource(nodePoolGVR).Get(ctx, oldShard, metav1.GetOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !controller.legacyNodeLoadBalancerNodePoolAuthoritative(
-		legacyPool,
-		oldShard,
-		managedNodeLoadBalancerName(provider.config.ClusterID, "node-lb"),
-		legacyPlan,
-	) {
-		desiredLegacy, renderErr := renderLegacyNodeLoadBalancerNodePoolForAuthorization(oldShard, managedNodeLoadBalancerName(provider.config.ClusterID, "node-lb"), legacyPlan)
-		if renderErr != nil {
-			t.Fatal(renderErr)
-		}
-		if markErr := markNodeLoadBalancerManaged(desiredLegacy, provider.config.ClusterID, oldShard, nodeLoadBalancerShardProfileHash(legacyPlan)); markErr != nil {
-			t.Fatal(markErr)
-		}
-		t.Fatalf("active old NodePool was not authoritative for migration: plan=%#v actual=%#v desired=%#v", legacyPlan, legacyPool.Object, desiredLegacy.Object)
-	}
-
-	if err := controller.sync(ctx, service.Namespace+"/"+service.Name); err != nil {
-		t.Fatal(err)
-	}
-	storedShadow := getNodeLoadBalancerTestService(t, ctx, provider, shadow.Namespace, shadow.Name)
-	oldSelector := nodeLoadBalancerCiliumSelector("unit-test-cluster", oldShard)
-	if storedShadow.Annotations[annotationCiliumNodeIPAMMatchLabels] != oldSelector ||
-		len(storedShadow.Status.LoadBalancer.Ingress) != 1 || storedShadow.Status.LoadBalancer.Ingress[0].IP != oldIP {
-		t.Fatalf("old shadow was cut over without replacement capacity: %#v", storedShadow)
-	}
-	if _, err := provider.dynamicClient.Resource(nodePoolGVR).Get(ctx, oldShard, metav1.GetOptions{}); err != nil {
-		t.Fatalf("old NodePool was deleted before cutover: %v", err)
-	}
-	storedOldNode, err := provider.kubeClient.CoreV1().Nodes().Get(ctx, oldNode.Name, metav1.GetOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if storedOldNode.Labels[nodeLoadBalancerReadyLabel] != "true" {
-		t.Fatal("legacy Node lost its Cilium readiness label before replacement capacity converged")
-	}
-	if !firewallAssignedToVM(*nodeLoadBalancerSafetyFirewallByUUID(t, api.firewalls, firewallUUID), oldVM) {
-		t.Fatal("Service firewall detached from the legacy Node before replacement capacity converged")
-	}
-	nodeClassName := managedNodeLoadBalancerName(provider.config.ClusterID, "node-lb")
-	nodeClass, err := provider.dynamicClient.Resource(nodeClassGVR).Get(ctx, nodeClassName, metav1.GetOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	icmpUUID := nodeClass.GetAnnotations()[annotationNodeLoadBalancerICMPFirewallUUID]
-	if icmpUUID == "" || !firewallAssignedToVM(*nodeLoadBalancerSafetyFirewallByUUID(t, api.firewalls, icmpUUID), oldVM) {
-		t.Fatal("cluster ICMP firewall detached from the legacy Node before replacement capacity converged")
-	}
-
-	newNode := readyNode("lb-new", "inspace://bkk01/"+newVM)
-	newNode.Labels = map[string]string{
-		nodeLoadBalancerNodeLabel:        "true",
-		nodeLoadBalancerNodeClusterLabel: provider.config.ClusterID,
-		nodeLoadBalancerNodeShardLabel:   newShard,
-	}
-	newNode.Status.Addresses = []corev1.NodeAddress{{Type: corev1.NodeExternalIP, Address: newIP}}
-	installNodeLoadBalancerSafetyIdentity(t, provider, newNode, newShard)
-	if _, err := provider.kubeClient.CoreV1().Nodes().Create(ctx, newNode.DeepCopy(), metav1.CreateOptions{}); err != nil {
-		t.Fatal(err)
-	}
-	if err := nodeIndexer.Add(newNode.DeepCopy()); err != nil {
-		t.Fatal(err)
-	}
-	for i := 0; i < 10; i++ {
-		if err := controller.sync(ctx, service.Namespace+"/"+service.Name); err != nil {
-			t.Fatalf("migration sync %d: %v", i, err)
-		}
-		storedService := getNodeLoadBalancerTestService(t, ctx, provider, service.Namespace, service.Name)
-		if err := serviceIndexer.Update(storedService); err != nil {
-			t.Fatal(err)
-		}
-		storedShadow = getNodeLoadBalancerTestService(t, ctx, provider, shadow.Namespace, shadow.Name)
-		newSelector := nodeLoadBalancerCiliumSelector("unit-test-cluster", newShard)
-		if storedShadow.Annotations[annotationCiliumNodeIPAMMatchLabels] == newSelector &&
-			(len(storedShadow.Status.LoadBalancer.Ingress) != 1 || storedShadow.Status.LoadBalancer.Ingress[0].IP != newIP) {
-			storedShadow.Status.LoadBalancer.Ingress = []corev1.LoadBalancerIngress{{IP: newIP}}
-			storedShadow, err = provider.kubeClient.CoreV1().Services(storedShadow.Namespace).UpdateStatus(ctx, storedShadow, metav1.UpdateOptions{})
-			if err != nil {
-				t.Fatal(err)
-			}
-		}
-		if err := serviceIndexer.Update(storedShadow); err != nil {
-			t.Fatal(err)
-		}
-		storedNode, err := provider.kubeClient.CoreV1().Nodes().Get(ctx, newNode.Name, metav1.GetOptions{})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := nodeIndexer.Update(storedNode); err != nil {
-			t.Fatal(err)
-		}
-	}
-	storedService := getNodeLoadBalancerTestService(t, ctx, provider, service.Namespace, service.Name)
-	if len(storedService.Status.LoadBalancer.Ingress) != 1 || storedService.Status.LoadBalancer.Ingress[0].IP != newIP {
-		t.Fatalf("replacement status was not published: %#v", storedService.Status.LoadBalancer)
-	}
-	if storedService.Annotations[annotationNodeLoadBalancerPreviousShard] != "" {
-		t.Fatalf("previous shard metadata remains after cutover: %#v", storedService.Annotations)
-	}
-	if _, err := provider.dynamicClient.Resource(nodePoolGVR).Get(ctx, oldShard, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
-		t.Fatalf("old NodePool remains after converged cutover: %v", err)
-	}
-	storedOldNode, err = provider.kubeClient.CoreV1().Nodes().Get(ctx, oldNode.Name, metav1.GetOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, exists := storedOldNode.Labels[nodeLoadBalancerReadyLabel]; exists {
-		t.Fatal("legacy Node retained its Cilium readiness label after cutover")
-	}
-	serviceFirewall := nodeLoadBalancerSafetyFirewallByUUID(t, api.firewalls, firewallUUID)
-	if firewallAssignedToVM(*serviceFirewall, oldVM) || !firewallAssignedToVM(*serviceFirewall, newVM) {
-		t.Fatalf("post-cutover firewall assignments = %#v", serviceFirewall.ResourcesAssigned)
-	}
-	icmpFirewall := nodeLoadBalancerSafetyFirewallByUUID(t, api.firewalls, icmpUUID)
-	if firewallAssignedToVM(*icmpFirewall, oldVM) || !firewallAssignedToVM(*icmpFirewall, newVM) {
-		t.Fatalf("post-cutover ICMP firewall assignments = %#v", icmpFirewall.ResourcesAssigned)
-	}
-}
-
 func TestNodeLoadBalancerPreviousShardCleanupKeepsMigratingPeerDataplane(t *testing.T) {
 	ctx := context.Background()
 	const (
@@ -1392,11 +1463,11 @@ func TestNodeLoadBalancerPreviousShardCleanupKeepsMigratingPeerDataplane(t *test
 	peer := nodeLoadBalancerTestService("peer", "peer-uid", corev1.ProtocolTCP, 8443)
 	peer.Annotations[annotationNodeLoadBalancerShard] = newShard
 	peer.Annotations[annotationNodeLoadBalancerPreviousShard] = oldShard
-	shadow := desiredNodeLoadBalancerShadow(peer, nodeLoadBalancerShadowName(peer), "unit-test-cluster", oldShard)
+	shadow := desiredNodeLoadBalancerDatapath(peer, nodeLoadBalancerDatapathName(peer), oldShard)
 
 	serviceIndexer := newNamespacedIndexer()
 	// Keep the informer deliberately behind the authoritative API: cleanup must
-	// still retain the live previous-shard shadow.
+	// still retain the live previous-shard datapath.
 	for _, object := range []*corev1.Service{exclude, peer} {
 		if err := serviceIndexer.Add(object); err != nil {
 			t.Fatal(err)
@@ -1418,7 +1489,7 @@ func TestNodeLoadBalancerPreviousShardCleanupKeepsMigratingPeerDataplane(t *test
 		t.Fatalf("active previous-shard peers = %#v, want %s", remaining, peer.UID)
 	}
 
-	shadow = desiredNodeLoadBalancerShadow(peer, nodeLoadBalancerShadowName(peer), "unit-test-cluster", newShard)
+	shadow = desiredNodeLoadBalancerDatapath(peer, nodeLoadBalancerDatapathName(peer), newShard)
 	currentShadow, err := provider.kubeClient.CoreV1().Services(shadow.Namespace).Get(ctx, shadow.Name, metav1.GetOptions{})
 	if err != nil {
 		t.Fatal(err)
@@ -1436,7 +1507,7 @@ func TestNodeLoadBalancerPreviousShardCleanupKeepsMigratingPeerDataplane(t *test
 	}
 }
 
-func TestNodeLoadBalancerShardCleanupKeepsDeletingPeerUntilItsShadowIsGone(t *testing.T) {
+func TestNodeLoadBalancerShardCleanupKeepsDeletingPeerUntilItsDatapathIsGone(t *testing.T) {
 	ctx := context.Background()
 	const shard = "inlb-0123abcd"
 	exclude := nodeLoadBalancerTestService("finished", "finished-uid", corev1.ProtocolTCP, 80)
@@ -1445,7 +1516,7 @@ func TestNodeLoadBalancerShardCleanupKeepsDeletingPeerUntilItsShadowIsGone(t *te
 	peer.Annotations[annotationNodeLoadBalancerShard] = shard
 	now := metav1.Now()
 	peer.DeletionTimestamp = &now
-	shadow := desiredNodeLoadBalancerShadow(peer, nodeLoadBalancerShadowName(peer), "unit-test-cluster", shard)
+	shadow := desiredNodeLoadBalancerDatapath(peer, nodeLoadBalancerDatapathName(peer), shard)
 	provider := newTestProvider(t, &fakeAPI{})
 	provider.config.NodeLoadBalancer = NodeLoadBalancerConfig{Enabled: true, DefaultNodeClass: "workers", NodesPerShard: 1}
 	provider.kubeClient = kubefake.NewSimpleClientset(exclude.DeepCopy(), peer.DeepCopy(), shadow.DeepCopy())
@@ -1456,7 +1527,7 @@ func TestNodeLoadBalancerShardCleanupKeepsDeletingPeerUntilItsShadowIsGone(t *te
 		t.Fatal(err)
 	}
 	if len(remaining) != 1 || remaining[0].UID != peer.UID {
-		t.Fatalf("deleting peer with live shadow was not retained: %#v", remaining)
+		t.Fatalf("deleting peer with live datapath was not retained: %#v", remaining)
 	}
 	if err := provider.kubeClient.CoreV1().Services(shadow.Namespace).Delete(ctx, shadow.Name, metav1.DeleteOptions{}); err != nil {
 		t.Fatal(err)
@@ -1466,7 +1537,7 @@ func TestNodeLoadBalancerShardCleanupKeepsDeletingPeerUntilItsShadowIsGone(t *te
 		t.Fatal(err)
 	}
 	if len(remaining) != 0 {
-		t.Fatalf("deleting peer retained shard after shadow removal: %#v", remaining)
+		t.Fatalf("deleting peer retained shard after datapath removal: %#v", remaining)
 	}
 }
 
@@ -1487,7 +1558,8 @@ func TestNodeLoadBalancerRepeatedMigrationDeletesAbandonedShardAndPreservesActiv
 	service.Annotations[annotationNodeLoadBalancerFirewallUUID] = abandonedFirewall
 	service.Annotations[annotationNodeLoadBalancerFirewallHash] = "bbbbbbbb"
 	service.Annotations[annotationNodeLoadBalancerPreviousFirewall] = activeFirewall
-	shadow := desiredNodeLoadBalancerShadow(service, nodeLoadBalancerShadowName(service), "unit-test-cluster", activeShard)
+	nodeLoadBalancerSafetyMarkDatapathActive(service, activeShard)
+	shadow := desiredNodeLoadBalancerDatapath(service, nodeLoadBalancerDatapathName(service), activeShard)
 
 	profile := nodeLoadBalancerProfileHash(nodeLoadBalancerModeShared, nodeLoadBalancerDefaultPool, 1, nodeLoadBalancerDefaultCPU, nodeLoadBalancerDefaultMemoryMiB)
 	provider := newTestProvider(t, &fakeAPI{})
@@ -1526,10 +1598,26 @@ func TestNodeLoadBalancerRepeatedMigrationDeletesAbandonedShardAndPreservesActiv
 		t.Fatalf("repeated migration lost active identities: %#v", stored.Annotations)
 	}
 	storedShadow := getNodeLoadBalancerTestService(t, ctx, provider, shadow.Namespace, shadow.Name)
-	if storedShadow.Annotations[annotationCiliumNodeIPAMMatchLabels] != nodeLoadBalancerCiliumSelector(provider.config.ClusterID, activeShard) {
-		t.Fatalf("active shadow changed during abandoned-shard cleanup: %#v", storedShadow.Annotations)
+	if storedShadow.Annotations[annotationNodeLoadBalancerDatapathShard] != activeShard {
+		t.Fatalf("active datapath changed during abandoned-shard cleanup: %#v", storedShadow.Annotations)
 	}
-	if _, err := controller.promotePendingFirewallMetadata(ctx, stored, &inspace.Firewall{UUID: desiredFirewall}, "dddddddd"); err != nil {
+	desired, err := controller.desiredServiceFirewall(stored)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepared, createdIntent, err := controller.ensurePendingFirewallCreateIntent(ctx, stored, desired.Request.DisplayName)
+	if err != nil || !createdIntent {
+		t.Fatalf("prepare replacement firewall = created %t, err %v", createdIntent, err)
+	}
+	if _, err := controller.ensurePendingFirewallMetadata(ctx, prepared, desiredFirewall, desired.Request.DisplayName); err != nil {
+		t.Fatal(err)
+	}
+	stored = getNodeLoadBalancerTestService(t, ctx, provider, service.Namespace, service.Name)
+	replacementFirewall := &inspace.Firewall{
+		UUID: desiredFirewall, DisplayName: desired.Request.DisplayName, Description: desired.Request.Description,
+		BillingAccountID: desired.Request.BillingAccountID, Rules: desired.Request.Rules,
+	}
+	if _, err := controller.promotePendingFirewallMetadata(ctx, stored, replacementFirewall, desired.Hash); err != nil {
 		t.Fatal(err)
 	}
 	stored = getNodeLoadBalancerTestService(t, ctx, provider, service.Namespace, service.Name)
@@ -1539,105 +1627,90 @@ func TestNodeLoadBalancerRepeatedMigrationDeletesAbandonedShardAndPreservesActiv
 	}
 }
 
-func TestNodeLoadBalancerMigrationAuditsActivePreviousShardWithPreviousFirewall(t *testing.T) {
-	ctx := context.Background()
-	const (
-		oldShard        = "inlb-0123abcd"
-		newShard        = "inlb-89abcdef"
-		oldFirewall     = "aaaaaaaa-1111-4222-8333-bbbbbbbbbbbb"
-		currentFirewall = "cccccccc-1111-4222-8333-dddddddddddd"
-		vmUUID          = "eeeeeeee-1111-4222-8333-ffffffffffff"
-	)
-	service := nodeLoadBalancerTestService("peer", "peer-uid", corev1.ProtocolTCP, 443)
-	service.Annotations[annotationNodeLoadBalancerShard] = newShard
-	service.Annotations[annotationNodeLoadBalancerPreviousShard] = oldShard
-	oldService := service.DeepCopy()
-	oldService.Spec.Ports[0].Port = 80
-	shadow := desiredNodeLoadBalancerShadow(oldService, nodeLoadBalancerShadowName(service), "unit-test-cluster", oldShard)
+func TestNodeLoadBalancerSerializesCompletedMigrationBeforeThirdAssignment(t *testing.T) {
+	for _, active := range []bool{false, true} {
+		t.Run(fmt.Sprintf("current-active-%t", active), func(t *testing.T) {
+			ctx := context.Background()
+			const (
+				oldShard     = "inlb-0123abcd"
+				currentShard = "inlb-4567abcd"
+				desiredShard = "inlb-89abcdef"
+			)
+			service := nodeLoadBalancerTestService("web", "web-uid", corev1.ProtocolTCP, 443)
+			service.Finalizers = []string{nodeLoadBalancerFinalizer}
+			service.Annotations[annotationNodeLoadBalancerShard] = currentShard
+			service.Annotations[annotationNodeLoadBalancerPreviousShard] = oldShard
+			if active {
+				nodeLoadBalancerSafetyMarkDatapathActive(service, currentShard)
+			}
+			child := nodeLoadBalancerSafetyDatapath(service, currentShard)
+			profile := nodeLoadBalancerProfileHash(
+				nodeLoadBalancerModeShared,
+				nodeLoadBalancerDefaultPool,
+				1,
+				nodeLoadBalancerDefaultCPU,
+				nodeLoadBalancerDefaultMemoryMiB,
+			)
 
-	api := &fakeAPI{}
-	provider := newTestProvider(t, api)
-	provider.config.NodeLoadBalancer = NodeLoadBalancerConfig{Enabled: true, DefaultNodeClass: "workers", NodesPerShard: 1}
-	provider.dynamicClient = newNodeLoadBalancerTestDynamicClient()
-	controller := &nodeLoadBalancerController{provider: provider}
-	currentDesired, err := controller.desiredServiceFirewall(service)
-	if err != nil {
-		t.Fatal(err)
-	}
-	oldDesired, err := controller.desiredServiceFirewall(oldService)
-	if err != nil {
-		t.Fatal(err)
-	}
-	service.Annotations[annotationNodeLoadBalancerFirewallUUID] = currentFirewall
-	service.Annotations[annotationNodeLoadBalancerFirewallHash] = currentDesired.Hash
-	service.Annotations[annotationNodeLoadBalancerPreviousFirewall] = oldFirewall
-	api.firewalls = []inspace.Firewall{
-		{
-			UUID: oldFirewall, DisplayName: oldDesired.Request.DisplayName,
-			BillingAccountID: oldDesired.Request.BillingAccountID, Rules: oldDesired.Request.Rules,
-			ResourcesAssigned: []inspace.FirewallResource{{ResourceType: "vm", ResourceUUID: vmUUID}},
-		},
-		{
-			UUID: currentFirewall, DisplayName: currentDesired.Request.DisplayName,
-			BillingAccountID: currentDesired.Request.BillingAccountID, Rules: currentDesired.Request.Rules,
-		},
-	}
-	node := readyNode("lb-old", "inspace://bkk01/"+vmUUID)
-	node.Labels = map[string]string{
-		nodeLoadBalancerNodeLabel:        "true",
-		nodeLoadBalancerNodeClusterLabel: provider.config.ClusterID,
-		nodeLoadBalancerNodeShardLabel:   oldShard,
-		nodeLoadBalancerReadyLabel:       "true",
-	}
-	node.Status.Addresses = []corev1.NodeAddress{{Type: corev1.NodeExternalIP, Address: "203.0.113.10"}}
-	installNodeLoadBalancerSafetyIdentity(t, provider, node, oldShard)
-	provider.kubeClient = kubefake.NewSimpleClientset(service.DeepCopy(), shadow.DeepCopy(), node.DeepCopy())
+			provider := newTestProvider(t, &fakeAPI{})
+			provider.config.NodeLoadBalancer = NodeLoadBalancerConfig{Enabled: true, DefaultNodeClass: "workers", NodesPerShard: 1}
+			provider.kubeClient = kubefake.NewSimpleClientset(service.DeepCopy(), child.DeepCopy())
+			provider.dynamicClient = newNodeLoadBalancerTestDynamicClient(
+				nodeLoadBalancerSafetyBaseNodeClass(),
+				nodeLoadBalancerSafetyNodePool(oldShard, provider.config.ClusterID, profile, 1),
+				nodeLoadBalancerSafetyNodePool(currentShard, provider.config.ClusterID, profile, 1),
+			)
+			serviceIndexer := newNamespacedIndexer()
+			for _, object := range []*corev1.Service{service.DeepCopy(), child.DeepCopy()} {
+				if err := serviceIndexer.Add(object); err != nil {
+					t.Fatal(err)
+				}
+			}
+			controller := &nodeLoadBalancerController{
+				provider: provider,
+				services: corelisters.NewServiceLister(serviceIndexer),
+				nodes:    corelisters.NewNodeLister(newNamespacedIndexer()),
+				queue:    workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]()),
+			}
+			defer controller.queue.ShutDown()
 
-	serviceIndexer := newNamespacedIndexer()
-	for _, object := range []*corev1.Service{service.DeepCopy(), shadow.DeepCopy()} {
-		if err := serviceIndexer.Add(object); err != nil {
-			t.Fatal(err)
-		}
-	}
-	nodeIndexer := newNamespacedIndexer()
-	if err := nodeIndexer.Add(node.DeepCopy()); err != nil {
-		t.Fatal(err)
-	}
-	controller.services = corelisters.NewServiceLister(serviceIndexer)
-	controller.nodes = corelisters.NewNodeLister(nodeIndexer)
+			handled, err := controller.cleanupCompletedPreviousMigration(ctx, service)
+			if err != nil || !handled {
+				t.Fatalf("completed migration cleanup = handled %t, err %v", handled, err)
+			}
+			if _, err := provider.dynamicClient.Resource(nodePoolGVR).Get(ctx, oldShard, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+				t.Fatalf("older previous NodePool survived serialization: %v", err)
+			}
+			stored := getNodeLoadBalancerTestService(t, ctx, provider, service.Namespace, service.Name)
+			if stored.Annotations[annotationNodeLoadBalancerPreviousShard] != "" {
+				t.Fatalf("older previous identity was not cleared after deletion: %#v", stored.Annotations)
+			}
 
-	if err := controller.reconcileShardNodeEligibility(ctx, oldShard); err != nil {
-		t.Fatal(err)
-	}
-	stored, err := provider.kubeClient.CoreV1().Nodes().Get(ctx, node.Name, metav1.GetOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if stored.Labels[nodeLoadBalancerReadyLabel] != "true" {
-		t.Fatal("active previous shard was disabled even though its old firewall remained assigned")
-	}
+			if !active {
+				waiting, err := controller.cleanupAbandonedReplacementShard(ctx, stored, desiredShard)
+				if err != nil || waiting {
+					t.Fatalf("inactive current shard cleanup = waiting %t, err %v", waiting, err)
+				}
+				if _, err := provider.dynamicClient.Resource(nodePoolGVR).Get(ctx, currentShard, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+					t.Fatalf("inactive intermediate NodePool survived serialization: %v", err)
+				}
+			}
 
-	for index := range stored.Status.Conditions {
-		if stored.Status.Conditions[index].Type == corev1.NodeReady {
-			stored.Status.Conditions[index].Status = corev1.ConditionFalse
-		}
-	}
-	stored, err = provider.kubeClient.CoreV1().Nodes().UpdateStatus(ctx, stored, metav1.UpdateOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := nodeIndexer.Update(stored.DeepCopy()); err != nil {
-		t.Fatal(err)
-	}
-	if err := controller.reconcileShardNodeEligibility(ctx, oldShard); err != nil {
-		t.Fatal(err)
-	}
-	stored, err = provider.kubeClient.CoreV1().Nodes().Get(ctx, node.Name, metav1.GetOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, exists := stored.Labels[nodeLoadBalancerReadyLabel]; exists {
-		t.Fatal("NotReady node retained its previous-shard Cilium eligibility")
+			if patched, err := controller.ensureServiceMetadata(ctx, stored, desiredShard); err != nil || !patched {
+				t.Fatalf("third assignment = patched %t, err %v", patched, err)
+			}
+			stored = getNodeLoadBalancerTestService(t, ctx, provider, service.Namespace, service.Name)
+			if stored.Annotations[annotationNodeLoadBalancerShard] != desiredShard {
+				t.Fatalf("third assignment did not persist desired shard: %#v", stored.Annotations)
+			}
+			wantPrevious := ""
+			if active {
+				wantPrevious = currentShard
+			}
+			if stored.Annotations[annotationNodeLoadBalancerPreviousShard] != wantPrevious {
+				t.Fatalf("third assignment previous shard = %q, want %q", stored.Annotations[annotationNodeLoadBalancerPreviousShard], wantPrevious)
+			}
+		})
 	}
 }
 
@@ -1649,9 +1722,10 @@ func TestNodeLoadBalancerPendingSharedServiceDoesNotInterruptActiveShard(t *test
 	)
 	stable := nodeLoadBalancerTestService("stable", "stable-uid", corev1.ProtocolTCP, 443)
 	stable.Annotations[annotationNodeLoadBalancerShard] = shard
+	nodeLoadBalancerSafetyMarkDatapathActive(stable, shard)
 	pending := nodeLoadBalancerTestService("pending", "pending-uid", corev1.ProtocolTCP, 8443)
 	pending.Annotations[annotationNodeLoadBalancerShard] = shard
-	shadow := desiredNodeLoadBalancerShadow(stable, nodeLoadBalancerShadowName(stable), "unit-test-cluster", shard)
+	shadow := desiredNodeLoadBalancerDatapath(stable, nodeLoadBalancerDatapathName(stable), shard)
 	node := readyNode("lb-0", "inspace://bkk01/"+vmUUID)
 	node.Labels = map[string]string{
 		nodeLoadBalancerNodeLabel:        "true",
@@ -1659,7 +1733,10 @@ func TestNodeLoadBalancerPendingSharedServiceDoesNotInterruptActiveShard(t *test
 		nodeLoadBalancerNodeShardLabel:   shard,
 		nodeLoadBalancerReadyLabel:       "true",
 	}
-	node.Status.Addresses = []corev1.NodeAddress{{Type: corev1.NodeExternalIP, Address: "203.0.113.10"}}
+	node.Status.Addresses = []corev1.NodeAddress{
+		{Type: corev1.NodeInternalIP, Address: "10.0.0.20"},
+		{Type: corev1.NodeExternalIP, Address: "203.0.113.10"},
+	}
 
 	api := &fakeAPI{}
 	provider := newTestProvider(t, api)
@@ -1788,7 +1865,7 @@ func TestNodeLoadBalancerEstablishedShardFailsClosedOnAuthoritativeDrift(t *test
 				t.Fatal(getErr)
 			}
 			if _, advertised := current.Labels[nodeLoadBalancerReadyLabel]; advertised {
-				t.Fatalf("authoritative drift retained the protected Cilium ready label: error=%v labels=%#v", err, current.Labels)
+				t.Fatalf("authoritative drift retained the protected datapath-ready label: error=%v labels=%#v", err, current.Labels)
 			}
 		})
 	}
@@ -1848,6 +1925,657 @@ func TestNodeLoadBalancerNodePoolRepairErrorFailsShardClosed(t *testing.T) {
 	}
 }
 
+func TestNodeLoadBalancerWithdrawalClearsPrivateVIPAndPublicProxyStatuses(t *testing.T) {
+	fixture := newNodeLoadBalancerFailClosedFixture(t)
+	defer fixture.controller.queue.ShutDown()
+	nodeLoadBalancerSeedAdvertisedStatuses(t, fixture)
+
+	if err := fixture.controller.withdrawServiceDatapath(fixture.ctx, fixture.service); err != nil {
+		t.Fatal(err)
+	}
+	nodeLoadBalancerAssertWithdrawn(t, fixture)
+}
+
+func TestNodeLoadBalancerFirewallAssignmentFollowsMarkerAndPrivateVIP(t *testing.T) {
+	fixture := newNodeLoadBalancerFailClosedFixture(t)
+	defer fixture.controller.queue.ShutDown()
+	fixture.firewall(t, fixture.serviceFirewallUUID).ResourcesAssigned = nil
+
+	assignmentChecks := 0
+	fixture.provider.api = &nodeLoadBalancerAssignmentOrderAPI{
+		fakeAPI: fixture.api,
+		beforeAssign: func(firewallUUID, vmUUID string) error {
+			assignmentChecks++
+			if firewallUUID != fixture.serviceFirewallUUID {
+				return fmt.Errorf("unexpected firewall %s", firewallUUID)
+			}
+			wantVM, ok := nodeLoadBalancerVMUUID(fixture.node)
+			if !ok || vmUUID != wantVM {
+				return fmt.Errorf("unexpected VM %s", vmUUID)
+			}
+			parent := getNodeLoadBalancerTestService(
+				t, fixture.ctx, fixture.provider, fixture.service.Namespace, fixture.service.Name,
+			)
+			if parent.Annotations[annotationNodeLoadBalancerDatapathActive] != fixture.shard ||
+				parent.Annotations[annotationNodeLoadBalancerFirewallAssigning] != fixture.serviceFirewallUUID ||
+				parent.Annotations[annotationNodeLoadBalancerFirewallAssignAt] == "" {
+				return fmt.Errorf("durable activation/assignment fence is absent: %#v", parent.Annotations)
+			}
+			if len(parent.Status.LoadBalancer.Ingress) != 0 {
+				return fmt.Errorf("public status was published before firewall assignment: %#v", parent.Status.LoadBalancer)
+			}
+			child := getNodeLoadBalancerTestService(
+				t, fixture.ctx, fixture.provider, fixture.service.Namespace, nodeLoadBalancerDatapathName(parent),
+			)
+			if len(child.Status.LoadBalancer.Ingress) != 1 || child.Status.LoadBalancer.Ingress[0].IP != "10.0.0.20" ||
+				child.Status.LoadBalancer.Ingress[0].IPMode == nil || *child.Status.LoadBalancer.Ingress[0].IPMode != corev1.LoadBalancerIPModeVIP {
+				return fmt.Errorf("private VIP was not established before firewall assignment: %#v", child.Status.LoadBalancer)
+			}
+			return nil
+		},
+	}
+
+	audit := func() bool {
+		t.Helper()
+		service := getNodeLoadBalancerTestService(
+			t, fixture.ctx, fixture.provider, fixture.service.Namespace, fixture.service.Name,
+		)
+		waiting, err := fixture.controller.auditAdvertisedServiceShard(fixture.ctx, service)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return waiting
+	}
+	if !audit() {
+		t.Fatal("first audit did not persist the assignment fence")
+	}
+	if assignmentChecks != 0 {
+		t.Fatalf("firewall assignment ran before its persisted fence: %d calls", assignmentChecks)
+	}
+	if !audit() {
+		t.Fatal("assignment audit did not wait for authoritative assignment readback")
+	}
+	if assignmentChecks != 1 {
+		t.Fatalf("firewall assignment checks = %d, want 1", assignmentChecks)
+	}
+	if !audit() {
+		t.Fatal("assignment readback did not durably clear its fence before publication")
+	}
+	parent := getNodeLoadBalancerTestService(
+		t, fixture.ctx, fixture.provider, fixture.service.Namespace, fixture.service.Name,
+	)
+	if len(parent.Status.LoadBalancer.Ingress) != 0 {
+		t.Fatalf("public status was published in the fence-clear reconciliation: %#v", parent.Status.LoadBalancer)
+	}
+	if audit() {
+		t.Fatal("fully converged firewall gate still reported waiting")
+	}
+	parent = getNodeLoadBalancerTestService(
+		t, fixture.ctx, fixture.provider, fixture.service.Namespace, fixture.service.Name,
+	)
+	nodeLoadBalancerAssertStatusIngress(t, parent.Status.LoadBalancer, "203.0.113.10", corev1.LoadBalancerIPModeProxy)
+}
+
+func TestNodeLoadBalancerFirewallAssignmentRevalidatesLiveServiceImmediatelyBeforeMutation(t *testing.T) {
+	fixture := newNodeLoadBalancerFailClosedFixture(t)
+	defer fixture.controller.queue.ShutDown()
+	fixture.firewall(t, fixture.serviceFirewallUUID).ResourcesAssigned = nil
+
+	child := getNodeLoadBalancerTestService(
+		t,
+		fixture.ctx,
+		fixture.provider,
+		fixture.service.Namespace,
+		nodeLoadBalancerDatapathName(fixture.service),
+	)
+	vip := corev1.LoadBalancerIPModeVIP
+	child.Status.LoadBalancer.Ingress = []corev1.LoadBalancerIngress{{IP: "10.0.0.20", IPMode: &vip}}
+	if _, err := fixture.provider.kubeClient.CoreV1().Services(child.Namespace).UpdateStatus(
+		fixture.ctx, child, metav1.UpdateOptions{},
+	); err != nil {
+		t.Fatal(err)
+	}
+	parent := getNodeLoadBalancerTestService(
+		t, fixture.ctx, fixture.provider, fixture.service.Namespace, fixture.service.Name,
+	)
+	parent.Annotations[annotationNodeLoadBalancerFirewallAssigning] = fixture.serviceFirewallUUID
+	parent.Annotations[annotationNodeLoadBalancerFirewallAssignAt] = time.Now().UTC().Format(time.RFC3339Nano)
+	parent, err := fixture.provider.kubeClient.CoreV1().Services(parent.Namespace).Update(
+		fixture.ctx, parent, metav1.UpdateOptions{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mutated := false
+	fixture.provider.api = &nodeLoadBalancerFirewallListHookAPI{
+		fakeAPI: fixture.api,
+		afterList: func() error {
+			if mutated {
+				return nil
+			}
+			mutated = true
+			live := getNodeLoadBalancerTestService(
+				t, fixture.ctx, fixture.provider, fixture.service.Namespace, fixture.service.Name,
+			)
+			live.Spec.LoadBalancerSourceRanges = []string{"198.51.100.0/24"}
+			_, updateErr := fixture.provider.kubeClient.CoreV1().Services(live.Namespace).Update(
+				fixture.ctx, live, metav1.UpdateOptions{},
+			)
+			return updateErr
+		},
+	}
+	_, _, _, err = fixture.controller.ensureServiceFirewall(
+		fixture.ctx,
+		parent,
+		[]*corev1.Node{fixture.node},
+	)
+	if err == nil {
+		t.Fatal("same-UID Service policy race reached cloud assignment")
+	}
+	if !mutated {
+		t.Fatal("test did not inject the live Service race")
+	}
+	if len(fixture.api.assignedFirewalls) != 0 {
+		t.Fatalf("stale firewall was assigned after a live Service change: %#v", fixture.api.assignedFirewalls)
+	}
+}
+
+func TestNodeLoadBalancerNodeRemovalDetachesEdgeBeforeRemovingVIP(t *testing.T) {
+	fixture := newNodeLoadBalancerFailClosedFixture(t)
+	defer fixture.controller.queue.ShutDown()
+	nodeLoadBalancerSeedAdvertisedStatuses(t, fixture)
+
+	node := getNodeLoadBalancerTestNode(t, fixture.ctx, fixture.provider, fixture.node.Name)
+	for index := range node.Status.Conditions {
+		if node.Status.Conditions[index].Type == corev1.NodeReady {
+			node.Status.Conditions[index].Status = corev1.ConditionFalse
+		}
+	}
+	if _, err := fixture.provider.kubeClient.CoreV1().Nodes().UpdateStatus(fixture.ctx, node, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	detachChecks := 0
+	fixture.provider.api = &nodeLoadBalancerUnassignmentOrderAPI{
+		fakeAPI: fixture.api,
+		beforeUnassign: func(firewallUUID, _ string) error {
+			if firewallUUID != fixture.serviceFirewallUUID {
+				return nil
+			}
+			detachChecks++
+			parent := getNodeLoadBalancerTestService(
+				t, fixture.ctx, fixture.provider, fixture.service.Namespace, fixture.service.Name,
+			)
+			child := getNodeLoadBalancerTestService(
+				t, fixture.ctx, fixture.provider, fixture.service.Namespace, nodeLoadBalancerDatapathName(parent),
+			)
+			if len(parent.Status.LoadBalancer.Ingress) != 1 || parent.Status.LoadBalancer.Ingress[0].IP != "203.0.113.10" {
+				return fmt.Errorf("public status shrank before stale edge detach: %#v", parent.Status.LoadBalancer)
+			}
+			if len(child.Status.LoadBalancer.Ingress) != 1 || child.Status.LoadBalancer.Ingress[0].IP != "10.0.0.20" {
+				return fmt.Errorf("private VIP shrank before stale edge detach: %#v", child.Status.LoadBalancer)
+			}
+			return nil
+		},
+	}
+	service := getNodeLoadBalancerTestService(
+		t, fixture.ctx, fixture.provider, fixture.service.Namespace, fixture.service.Name,
+	)
+	waiting, err := fixture.controller.auditAdvertisedServiceShard(fixture.ctx, service)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if waiting {
+		t.Fatal("node removal unexpectedly waited after exact edge detachment")
+	}
+	if detachChecks != 1 {
+		t.Fatalf("stale edge detach checks = %d, want 1", detachChecks)
+	}
+	parent := getNodeLoadBalancerTestService(
+		t, fixture.ctx, fixture.provider, fixture.service.Namespace, fixture.service.Name,
+	)
+	if len(parent.Status.LoadBalancer.Ingress) != 0 {
+		t.Fatalf("public status retained removed Node: %#v", parent.Status.LoadBalancer)
+	}
+	child := getNodeLoadBalancerTestService(
+		t, fixture.ctx, fixture.provider, fixture.service.Namespace, nodeLoadBalancerDatapathName(parent),
+	)
+	if len(child.Status.LoadBalancer.Ingress) != 0 {
+		t.Fatalf("private VIP retained removed Node: %#v", child.Status.LoadBalancer)
+	}
+}
+
+func TestNodeLoadBalancerWithdrawalDetachesPersistedFirewallAfterPolicyDrift(t *testing.T) {
+	fixture := newNodeLoadBalancerFailClosedFixture(t)
+	defer fixture.controller.queue.ShutDown()
+	nodeLoadBalancerSeedAdvertisedStatuses(t, fixture)
+	port := int32(22)
+	fixture.firewall(t, fixture.serviceFirewallUUID).Rules[0].PortStart = &port
+	fixture.firewall(t, fixture.serviceFirewallUUID).Rules[0].PortEnd = &port
+
+	if err := fixture.controller.withdrawServiceDatapath(fixture.ctx, fixture.service); err != nil {
+		t.Fatal(err)
+	}
+	nodeLoadBalancerAssertWithdrawn(t, fixture)
+}
+
+func TestNodeLoadBalancerWithdrawalDoesNotTrustTransientFirewallOmission(t *testing.T) {
+	fixture := newNodeLoadBalancerFailClosedFixture(t)
+	defer fixture.controller.queue.ShutDown()
+	nodeLoadBalancerSeedAdvertisedStatuses(t, fixture)
+	parent := getNodeLoadBalancerTestService(
+		t, fixture.ctx, fixture.provider, fixture.service.Namespace, fixture.service.Name,
+	)
+	parent.Annotations[annotationNodeLoadBalancerFirewallAssigning] = fixture.serviceFirewallUUID
+	parent.Annotations[annotationNodeLoadBalancerFirewallAssignAt] = time.Now().UTC().Format(time.RFC3339Nano)
+	parent, err := fixture.provider.kubeClient.CoreV1().Services(parent.Namespace).Update(
+		fixture.ctx, parent, metav1.UpdateOptions{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	omitting := &nodeLoadBalancerFirewallOmissionAPI{fakeAPI: fixture.api, omitUUID: fixture.serviceFirewallUUID}
+	fixture.provider.api = omitting
+	err = fixture.controller.withdrawServiceDatapath(fixture.ctx, parent)
+	if err == nil || !strings.Contains(err.Error(), "waiting for exact Service firewall detachment readback") {
+		t.Fatalf("withdrawal during transient omission error = %v", err)
+	}
+	if len(fixture.api.unassignedFirewalls) != 0 {
+		t.Fatalf("hidden firewall unexpectedly reported a detachment: %#v", fixture.api.unassignedFirewalls)
+	}
+	stored := getNodeLoadBalancerTestService(
+		t, fixture.ctx, fixture.provider, fixture.service.Namespace, fixture.service.Name,
+	)
+	if stored.Annotations[annotationNodeLoadBalancerDatapathActive] != fixture.shard ||
+		len(stored.Status.LoadBalancer.Ingress) != 1 {
+		t.Fatalf("transient omission cleared durable/public state: annotations=%#v status=%#v", stored.Annotations, stored.Status.LoadBalancer)
+	}
+	child := getNodeLoadBalancerTestService(
+		t, fixture.ctx, fixture.provider, fixture.service.Namespace, nodeLoadBalancerDatapathName(stored),
+	)
+	if len(child.Status.LoadBalancer.Ingress) != 1 {
+		t.Fatalf("transient omission cleared private VIP: %#v", child.Status.LoadBalancer)
+	}
+
+	omitting.omitUUID = ""
+	err = fixture.controller.withdrawServiceDatapath(fixture.ctx, stored)
+	if err == nil || !strings.Contains(err.Error(), "waiting for exact Service firewall detachment readback") {
+		t.Fatalf("late assignment became trusted immediately after visibility: %v", err)
+	}
+	if len(fixture.api.unassignedFirewalls) != 1 {
+		t.Fatalf("visible late assignment was not detached exactly once: %#v", fixture.api.unassignedFirewalls)
+	}
+	stored = getNodeLoadBalancerTestService(
+		t, fixture.ctx, fixture.provider, fixture.service.Namespace, fixture.service.Name,
+	)
+	stored.Annotations[annotationNodeLoadBalancerFirewallAssignAt] = time.Now().Add(
+		-nodeLoadBalancerPendingCreateTimeout - time.Minute,
+	).UTC().Format(time.RFC3339Nano)
+	if _, err := fixture.provider.kubeClient.CoreV1().Services(stored.Namespace).Update(
+		fixture.ctx, stored, metav1.UpdateOptions{},
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	withdraw := func() error {
+		t.Helper()
+		current := getNodeLoadBalancerTestService(
+			t, fixture.ctx, fixture.provider, fixture.service.Namespace, fixture.service.Name,
+		)
+		return fixture.controller.withdrawServiceDatapath(fixture.ctx, current)
+	}
+	for confirmation := 1; confirmation <= nodeLoadBalancerAbsenceConfirmations; confirmation++ {
+		err = withdraw()
+		if err == nil || !strings.Contains(err.Error(), "waiting for exact Service firewall detachment readback") {
+			t.Fatalf("withdrawal confirmation %d error = %v", confirmation, err)
+		}
+		if confirmation < nodeLoadBalancerAbsenceConfirmations {
+			current := getNodeLoadBalancerTestService(
+				t, fixture.ctx, fixture.provider, fixture.service.Namespace, fixture.service.Name,
+			)
+			ageNodeLoadBalancerAbsenceEvidence(
+				t,
+				fixture.ctx,
+				fixture.provider,
+				current,
+				annotationNodeLoadBalancerWithdrawFWChecked,
+			)
+		}
+	}
+	if err := withdraw(); err != nil {
+		t.Fatal(err)
+	}
+	nodeLoadBalancerAssertWithdrawn(t, fixture)
+}
+
+func TestNodeLoadBalancerLateAssignmentResetsConsecutiveWithdrawalProof(t *testing.T) {
+	fixture := newNodeLoadBalancerFailClosedFixture(t)
+	defer fixture.controller.queue.ShutDown()
+	nodeLoadBalancerSeedAdvertisedStatuses(t, fixture)
+	fixture.firewall(t, fixture.serviceFirewallUUID).ResourcesAssigned = nil
+
+	parent := getNodeLoadBalancerTestService(
+		t, fixture.ctx, fixture.provider, fixture.service.Namespace, fixture.service.Name,
+	)
+	parent.Annotations[annotationNodeLoadBalancerFirewallAssigning] = fixture.serviceFirewallUUID
+	parent.Annotations[annotationNodeLoadBalancerFirewallAssignAt] = time.Now().Add(
+		-nodeLoadBalancerPendingCreateTimeout - time.Minute,
+	).UTC().Format(time.RFC3339Nano)
+	if _, err := fixture.provider.kubeClient.CoreV1().Services(parent.Namespace).Update(
+		fixture.ctx, parent, metav1.UpdateOptions{},
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	withdraw := func() error {
+		t.Helper()
+		current := getNodeLoadBalancerTestService(
+			t, fixture.ctx, fixture.provider, fixture.service.Namespace, fixture.service.Name,
+		)
+		return fixture.controller.withdrawServiceDatapath(fixture.ctx, current)
+	}
+	if err := withdraw(); err == nil {
+		t.Fatal("first empty assignment observation cleared the datapath")
+	}
+	current := getNodeLoadBalancerTestService(
+		t, fixture.ctx, fixture.provider, fixture.service.Namespace, fixture.service.Name,
+	)
+	if current.Annotations[annotationNodeLoadBalancerWithdrawFWAbsent] != "1" {
+		t.Fatalf("first proof count = %q, want 1", current.Annotations[annotationNodeLoadBalancerWithdrawFWAbsent])
+	}
+	ageNodeLoadBalancerAbsenceEvidence(
+		t,
+		fixture.ctx,
+		fixture.provider,
+		current,
+		annotationNodeLoadBalancerWithdrawFWChecked,
+	)
+	if err := withdraw(); err == nil {
+		t.Fatal("second empty assignment observation cleared the datapath")
+	}
+	current = getNodeLoadBalancerTestService(
+		t, fixture.ctx, fixture.provider, fixture.service.Namespace, fixture.service.Name,
+	)
+	if current.Annotations[annotationNodeLoadBalancerWithdrawFWAbsent] != "2" {
+		t.Fatalf("second proof count = %q, want 2", current.Annotations[annotationNodeLoadBalancerWithdrawFWAbsent])
+	}
+
+	vmUUID, ok := nodeLoadBalancerVMUUID(fixture.node)
+	if !ok {
+		t.Fatal("fixture Node has no VM UUID")
+	}
+	fixture.firewall(t, fixture.serviceFirewallUUID).ResourcesAssigned = []inspace.FirewallResource{{
+		ResourceType: "vm", ResourceUUID: vmUUID,
+	}}
+	if err := withdraw(); err == nil {
+		t.Fatal("late assignment cleared the datapath after resetting proof")
+	}
+	current = getNodeLoadBalancerTestService(
+		t, fixture.ctx, fixture.provider, fixture.service.Namespace, fixture.service.Name,
+	)
+	if current.Annotations[annotationNodeLoadBalancerWithdrawFWAbsent] != "1" {
+		t.Fatalf("late assignment did not reset proof count: %#v", current.Annotations)
+	}
+	if current.Annotations[annotationNodeLoadBalancerDatapathActive] != fixture.shard ||
+		len(current.Status.LoadBalancer.Ingress) != 1 {
+		t.Fatalf("late assignment cleared durable/public state: annotations=%#v status=%#v", current.Annotations, current.Status.LoadBalancer)
+	}
+	child := getNodeLoadBalancerTestService(
+		t, fixture.ctx, fixture.provider, fixture.service.Namespace, nodeLoadBalancerDatapathName(current),
+	)
+	if len(child.Status.LoadBalancer.Ingress) != 1 {
+		t.Fatalf("late assignment cleared private VIP before consecutive proof: %#v", child.Status.LoadBalancer)
+	}
+}
+
+func TestNodeLoadBalancerIncompleteWithdrawalRetainsActivationMarker(t *testing.T) {
+	fixture := newNodeLoadBalancerFailClosedFixture(t)
+	defer fixture.controller.queue.ShutDown()
+	nodeLoadBalancerSeedAdvertisedStatuses(t, fixture)
+
+	detachErr := errors.New("injected firewall detach failure")
+	statusErr := errors.New("injected private VIP withdrawal failure")
+	fixture.provider.api = &nodeLoadBalancerFailingUnassignAPI{fakeAPI: fixture.api, err: detachErr}
+	clientset, ok := fixture.provider.kubeClient.(*kubefake.Clientset)
+	if !ok {
+		t.Fatalf("kube client type = %T", fixture.provider.kubeClient)
+	}
+	childName := nodeLoadBalancerDatapathName(fixture.service)
+	childStatusUpdates := 0
+	clientset.PrependReactor("update", "services", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		update, ok := action.(k8stesting.UpdateAction)
+		if !ok || action.GetSubresource() != "status" {
+			return false, nil, nil
+		}
+		service, ok := update.GetObject().(*corev1.Service)
+		if !ok || service.Name != childName {
+			return false, nil, nil
+		}
+		childStatusUpdates++
+		return true, nil, statusErr
+	})
+
+	err := fixture.controller.withdrawServiceDatapath(fixture.ctx, fixture.service)
+	if !errors.Is(err, detachErr) || errors.Is(err, statusErr) {
+		t.Fatalf("withdrawal error = %v, want only the edge-detach failure", err)
+	}
+	if childStatusUpdates != 0 {
+		t.Fatalf("private VIP withdrawal ran %d times before the firewall detached", childStatusUpdates)
+	}
+	stored := getNodeLoadBalancerTestService(
+		t,
+		fixture.ctx,
+		fixture.provider,
+		fixture.service.Namespace,
+		fixture.service.Name,
+	)
+	if stored.Annotations[annotationNodeLoadBalancerDatapathActive] != fixture.shard {
+		t.Fatalf("incomplete withdrawal cleared durable activation marker: %#v", stored.Annotations)
+	}
+	datapath := getNodeLoadBalancerTestService(
+		t,
+		fixture.ctx,
+		fixture.provider,
+		fixture.service.Namespace,
+		childName,
+	)
+	nodeLoadBalancerAssertStatusIngress(t, datapath.Status.LoadBalancer, "10.0.0.20", corev1.LoadBalancerIPModeVIP)
+}
+
+func TestNodeLoadBalancerForeignDatapathWithdrawalPreservesChildButWithdrawsParentAndFirewall(t *testing.T) {
+	fixture := newNodeLoadBalancerFailClosedFixture(t)
+	defer fixture.controller.queue.ShutDown()
+	nodeLoadBalancerSeedAdvertisedStatuses(t, fixture)
+
+	datapath := getNodeLoadBalancerTestService(
+		t,
+		fixture.ctx,
+		fixture.provider,
+		fixture.service.Namespace,
+		nodeLoadBalancerDatapathName(fixture.service),
+	)
+	datapath.Labels[nodeLoadBalancerServiceIdentityLabel] = "foreign-identity"
+	datapath.OwnerReferences[0].UID = types.UID("foreign-uid")
+	if _, err := fixture.provider.kubeClient.CoreV1().Services(datapath.Namespace).Update(
+		fixture.ctx,
+		datapath,
+		metav1.UpdateOptions{},
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	err := fixture.controller.withdrawServiceDatapath(fixture.ctx, fixture.service)
+	if err == nil || !strings.Contains(err.Error(), "refusing to withdraw foreign datapath Service") {
+		t.Fatalf("foreign datapath withdrawal error = %v", err)
+	}
+	storedDatapath := getNodeLoadBalancerTestService(
+		t,
+		fixture.ctx,
+		fixture.provider,
+		fixture.service.Namespace,
+		nodeLoadBalancerDatapathName(fixture.service),
+	)
+	nodeLoadBalancerAssertStatusIngress(t, storedDatapath.Status.LoadBalancer, "10.0.0.20", corev1.LoadBalancerIPModeVIP)
+	nodeLoadBalancerAssertParentAndFirewallWithdrawn(t, fixture)
+}
+
+func TestNodeLoadBalancerNodeListerFailureStillWithdrawsShardDatapaths(t *testing.T) {
+	fixture := newNodeLoadBalancerFailClosedFixture(t)
+	defer fixture.controller.queue.ShutDown()
+	nodeLoadBalancerSeedAdvertisedStatuses(t, fixture)
+
+	listerErr := errors.New("injected Node lister failure")
+	fixture.controller.nodes = nodeLoadBalancerFailingNodeLister{err: listerErr}
+	cause := errors.New("injected shard failure")
+	err := fixture.controller.failNodeLoadBalancerShardClosed(fixture.ctx, fixture.shard, cause)
+	if !errors.Is(err, cause) || !errors.Is(err, listerErr) {
+		t.Fatalf("fail-closed error = %v, want both injected errors", err)
+	}
+	nodeLoadBalancerAssertWithdrawn(t, fixture)
+}
+
+func TestNodeLoadBalancerLiveServiceListFailureUsesInformerForWithdrawal(t *testing.T) {
+	fixture := newNodeLoadBalancerFailClosedFixture(t)
+	defer fixture.controller.queue.ShutDown()
+	nodeLoadBalancerSeedAdvertisedStatuses(t, fixture)
+
+	injected := errors.New("injected live Service List failure")
+	clientset, ok := fixture.provider.kubeClient.(*kubefake.Clientset)
+	if !ok {
+		t.Fatalf("kube client type = %T", fixture.provider.kubeClient)
+	}
+	clientset.PrependReactor("list", "services", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, injected
+	})
+
+	err := fixture.controller.withdrawShardDatapaths(fixture.ctx, fixture.shard)
+	if !errors.Is(err, injected) {
+		t.Fatalf("withdrawal error = %v, want live List failure", err)
+	}
+	nodeLoadBalancerAssertWithdrawn(t, fixture)
+}
+
+func TestNodeLoadBalancerInterruptedActivationContract(t *testing.T) {
+	tests := map[string]struct {
+		seedParent bool
+		seedChild  bool
+		childIP    string
+		wantError  bool
+	}{
+		"unadvertised staged child": {},
+		"private VIP only": {
+			seedChild: true,
+			childIP:   "10.0.0.20",
+			wantError: true,
+		},
+		"exact private VIP and public Proxy pair": {
+			seedParent: true,
+			seedChild:  true,
+			childIP:    "10.0.0.20",
+			wantError:  true,
+		},
+		"public Proxy without private VIP": {
+			seedParent: true,
+			wantError:  true,
+		},
+		"mismatched private VIP and public Proxy pair": {
+			seedParent: true,
+			seedChild:  true,
+			childIP:    "10.0.0.99",
+			wantError:  true,
+		},
+	}
+
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			fixture := newNodeLoadBalancerFailClosedFixture(t)
+			defer fixture.controller.queue.ShutDown()
+
+			parent := getNodeLoadBalancerTestService(
+				t,
+				fixture.ctx,
+				fixture.provider,
+				fixture.service.Namespace,
+				fixture.service.Name,
+			)
+			delete(parent.Annotations, annotationNodeLoadBalancerDatapathActive)
+			if _, err := fixture.provider.kubeClient.CoreV1().Services(parent.Namespace).Update(
+				fixture.ctx,
+				parent,
+				metav1.UpdateOptions{},
+			); err != nil {
+				t.Fatal(err)
+			}
+
+			if test.seedParent {
+				proxy := corev1.LoadBalancerIPModeProxy
+				parent = getNodeLoadBalancerTestService(
+					t,
+					fixture.ctx,
+					fixture.provider,
+					fixture.service.Namespace,
+					fixture.service.Name,
+				)
+				parent.Status.LoadBalancer.Ingress = []corev1.LoadBalancerIngress{{
+					IP: "203.0.113.10", IPMode: &proxy,
+				}}
+				if _, err := fixture.provider.kubeClient.CoreV1().Services(parent.Namespace).UpdateStatus(
+					fixture.ctx,
+					parent,
+					metav1.UpdateOptions{},
+				); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			if test.seedChild {
+				vip := corev1.LoadBalancerIPModeVIP
+				child := getNodeLoadBalancerTestService(
+					t,
+					fixture.ctx,
+					fixture.provider,
+					fixture.service.Namespace,
+					nodeLoadBalancerDatapathName(fixture.service),
+				)
+				child.Status.LoadBalancer.Ingress = []corev1.LoadBalancerIngress{{
+					IP: test.childIP, IPMode: &vip,
+				}}
+				if _, err := fixture.provider.kubeClient.CoreV1().Services(child.Namespace).UpdateStatus(
+					fixture.ctx,
+					child,
+					metav1.UpdateOptions{},
+				); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			err := fixture.controller.auditUncommittedDatapath(fixture.ctx, fixture.service)
+			if test.wantError {
+				if err == nil {
+					t.Fatal("unsafe interrupted activation was accepted")
+				}
+				nodeLoadBalancerAssertWithdrawn(t, fixture)
+				return
+			}
+			if err != nil {
+				t.Fatalf("safe interrupted activation audit failed: %v", err)
+			}
+			stored := getNodeLoadBalancerTestService(
+				t,
+				fixture.ctx,
+				fixture.provider,
+				fixture.service.Namespace,
+				fixture.service.Name,
+			)
+			if stored.Annotations[annotationNodeLoadBalancerDatapathActive] != "" {
+				t.Fatalf("audit persisted activation marker unexpectedly: %#v", stored.Annotations)
+			}
+		})
+	}
+}
+
 func TestNodeLoadBalancerInvalidUnfinalizedServiceDoesNotOwnSharedCleanup(t *testing.T) {
 	ctx := context.Background()
 	lastOwner := nodeLoadBalancerTestService("last", "last-owner-uid", corev1.ProtocolTCP, 443)
@@ -1884,6 +2612,8 @@ func TestNodeLoadBalancerLastOwnerCleansSharedICMPDespiteInvalidUnfinalizedServi
 	ctx := context.Background()
 	lastOwner := nodeLoadBalancerTestService("last", "last-owner-uid", corev1.ProtocolTCP, 443)
 	lastOwner.Finalizers = []string{nodeLoadBalancerFinalizer}
+	deletingAt := metav1.Now()
+	lastOwner.DeletionTimestamp = &deletingAt
 	lastOwner.Annotations[annotationNodeLoadBalancerCleanupFWAbsent] = strconv.Itoa(nodeLoadBalancerAbsenceConfirmations)
 	invalid := nodeLoadBalancerTestService("invalid", "invalid-owner-uid", corev1.ProtocolTCP, 8443)
 	invalid.Annotations[annotationNodeLoadBalancerMode] = "invalid"
@@ -1975,6 +2705,84 @@ type nodeLoadBalancerFailClosedFixture struct {
 	nodeIndexer         cache.Indexer
 }
 
+type nodeLoadBalancerFailingUnassignAPI struct {
+	*fakeAPI
+	err error
+}
+
+type nodeLoadBalancerAssignmentOrderAPI struct {
+	*fakeAPI
+	beforeAssign func(firewallUUID, vmUUID string) error
+}
+
+func (a *nodeLoadBalancerAssignmentOrderAPI) AssignFirewallToVM(
+	ctx context.Context,
+	location, firewallUUID, vmUUID string,
+) error {
+	if a.beforeAssign != nil {
+		if err := a.beforeAssign(firewallUUID, vmUUID); err != nil {
+			return err
+		}
+	}
+	return a.fakeAPI.AssignFirewallToVM(ctx, location, firewallUUID, vmUUID)
+}
+
+type nodeLoadBalancerUnassignmentOrderAPI struct {
+	*fakeAPI
+	beforeUnassign func(firewallUUID, vmUUID string) error
+}
+
+func (a *nodeLoadBalancerUnassignmentOrderAPI) UnassignFirewallFromVM(
+	ctx context.Context,
+	location, firewallUUID, vmUUID string,
+) error {
+	if a.beforeUnassign != nil {
+		if err := a.beforeUnassign(firewallUUID, vmUUID); err != nil {
+			return err
+		}
+	}
+	return a.fakeAPI.UnassignFirewallFromVM(ctx, location, firewallUUID, vmUUID)
+}
+
+type nodeLoadBalancerFirewallOmissionAPI struct {
+	*fakeAPI
+	omitUUID string
+}
+
+type nodeLoadBalancerFirewallListHookAPI struct {
+	*fakeAPI
+	afterList func() error
+}
+
+func (a *nodeLoadBalancerFirewallListHookAPI) ListFirewalls(ctx context.Context, location string) ([]inspace.Firewall, error) {
+	items, err := a.fakeAPI.ListFirewalls(ctx, location)
+	if err != nil || a.afterList == nil {
+		return items, err
+	}
+	if hookErr := a.afterList(); hookErr != nil {
+		return nil, hookErr
+	}
+	return items, nil
+}
+
+func (a *nodeLoadBalancerFirewallOmissionAPI) ListFirewalls(ctx context.Context, location string) ([]inspace.Firewall, error) {
+	items, err := a.fakeAPI.ListFirewalls(ctx, location)
+	if err != nil || a.omitUUID == "" {
+		return items, err
+	}
+	filtered := make([]inspace.Firewall, 0, len(items))
+	for _, firewall := range items {
+		if firewall.UUID != a.omitUUID {
+			filtered = append(filtered, firewall)
+		}
+	}
+	return filtered, nil
+}
+
+func (f *nodeLoadBalancerFailingUnassignAPI) UnassignFirewallFromVM(context.Context, string, string, string) error {
+	return f.err
+}
+
 func newNodeLoadBalancerFailClosedFixture(t *testing.T) *nodeLoadBalancerFailClosedFixture {
 	t.Helper()
 	ctx := context.Background()
@@ -1986,7 +2794,8 @@ func newNodeLoadBalancerFailClosedFixture(t *testing.T) *nodeLoadBalancerFailClo
 	service := nodeLoadBalancerTestService("web", "web-uid", corev1.ProtocolTCP, 443)
 	service.Finalizers = []string{nodeLoadBalancerFinalizer}
 	service.Annotations[annotationNodeLoadBalancerShard] = shard
-	shadow := desiredNodeLoadBalancerShadow(service, nodeLoadBalancerShadowName(service), "unit-test-cluster", shard)
+	nodeLoadBalancerSafetyMarkDatapathActive(service, shard)
+	shadow := nodeLoadBalancerSafetyDatapath(service, shard)
 	node := readyNode("lb-0", "inspace://bkk01/"+vmUUID)
 	node.Labels = map[string]string{
 		nodeLoadBalancerNodeLabel:        "true",
@@ -1994,7 +2803,10 @@ func newNodeLoadBalancerFailClosedFixture(t *testing.T) *nodeLoadBalancerFailClo
 		nodeLoadBalancerNodeShardLabel:   shard,
 		nodeLoadBalancerReadyLabel:       "true",
 	}
-	node.Status.Addresses = []corev1.NodeAddress{{Type: corev1.NodeExternalIP, Address: "203.0.113.10"}}
+	node.Status.Addresses = []corev1.NodeAddress{
+		{Type: corev1.NodeInternalIP, Address: "10.0.0.20"},
+		{Type: corev1.NodeExternalIP, Address: "203.0.113.10"},
+	}
 
 	api := &fakeAPI{}
 	provider := newTestProvider(t, api)
@@ -2058,26 +2870,116 @@ func (f *nodeLoadBalancerFailClosedFixture) firewall(t *testing.T, uuid string) 
 	return nil
 }
 
-func (f *nodeLoadBalancerFailClosedFixture) replaceNodePoolWithLegacyDefault(t *testing.T) {
+func nodeLoadBalancerSeedAdvertisedStatuses(t *testing.T, fixture *nodeLoadBalancerFailClosedFixture) {
 	t.Helper()
-	resource := f.provider.dynamicClient.Resource(nodePoolGVR)
-	current, err := resource.Get(f.ctx, f.shard, metav1.GetOptions{})
-	if err != nil {
+	proxy := corev1.LoadBalancerIPModeProxy
+	service := getNodeLoadBalancerTestService(
+		t,
+		fixture.ctx,
+		fixture.provider,
+		fixture.service.Namespace,
+		fixture.service.Name,
+	)
+	service.Status.LoadBalancer.Ingress = []corev1.LoadBalancerIngress{{
+		IP: "203.0.113.10", IPMode: &proxy,
+	}}
+	if _, err := fixture.provider.kubeClient.CoreV1().Services(service.Namespace).UpdateStatus(
+		fixture.ctx,
+		service,
+		metav1.UpdateOptions{},
+	); err != nil {
 		t.Fatal(err)
 	}
-	legacy := nodeLoadBalancerSafetyLegacyNodePool(
-		f.shard,
-		f.provider.config.ClusterID,
-		nodeLoadBalancerModeShared,
-		nodeLoadBalancerDefaultPool,
-		1,
+
+	vip := corev1.LoadBalancerIPModeVIP
+	datapath := getNodeLoadBalancerTestService(
+		t,
+		fixture.ctx,
+		fixture.provider,
+		fixture.service.Namespace,
+		nodeLoadBalancerDatapathName(fixture.service),
 	)
-	legacy.SetUID(current.GetUID())
-	legacy.SetResourceVersion(current.GetResourceVersion())
-	if _, err := resource.Update(f.ctx, legacy, metav1.UpdateOptions{}); err != nil {
+	datapath.Status.LoadBalancer.Ingress = []corev1.LoadBalancerIngress{{
+		IP: "10.0.0.20", IPMode: &vip,
+	}}
+	if _, err := fixture.provider.kubeClient.CoreV1().Services(datapath.Namespace).UpdateStatus(
+		fixture.ctx,
+		datapath,
+		metav1.UpdateOptions{},
+	); err != nil {
 		t.Fatal(err)
 	}
 }
+
+func nodeLoadBalancerAssertWithdrawn(t *testing.T, fixture *nodeLoadBalancerFailClosedFixture) {
+	t.Helper()
+	datapath := getNodeLoadBalancerTestService(
+		t,
+		fixture.ctx,
+		fixture.provider,
+		fixture.service.Namespace,
+		nodeLoadBalancerDatapathName(fixture.service),
+	)
+	if len(datapath.Status.LoadBalancer.Ingress) != 0 {
+		t.Fatalf("private VIP datapath status was not withdrawn: %#v", datapath.Status.LoadBalancer)
+	}
+	nodeLoadBalancerAssertParentAndFirewallWithdrawn(t, fixture)
+}
+
+func nodeLoadBalancerAssertParentAndFirewallWithdrawn(t *testing.T, fixture *nodeLoadBalancerFailClosedFixture) {
+	t.Helper()
+	service := getNodeLoadBalancerTestService(
+		t,
+		fixture.ctx,
+		fixture.provider,
+		fixture.service.Namespace,
+		fixture.service.Name,
+	)
+	if len(service.Status.LoadBalancer.Ingress) != 0 {
+		t.Fatalf("public Proxy status was not withdrawn: %#v", service.Status.LoadBalancer)
+	}
+	vmUUID, ok := nodeLoadBalancerVMUUID(fixture.node)
+	if !ok {
+		t.Fatalf("fixture Node has no InSpace VM identity: %#v", fixture.node.Spec.ProviderID)
+	}
+	want := fixture.serviceFirewallUUID + "/" + vmUUID
+	if len(fixture.api.unassignedFirewalls) != 1 || fixture.api.unassignedFirewalls[0] != want {
+		t.Fatalf("fail-closed firewall detachments = %#v, want [%q]", fixture.api.unassignedFirewalls, want)
+	}
+	if assigned := fixture.firewall(t, fixture.serviceFirewallUUID).ResourcesAssigned; len(assigned) != 0 {
+		t.Fatalf("exact-owned Service firewall remained assigned: %#v", assigned)
+	}
+	if !firewallAssignedToVM(*fixture.firewall(t, fixture.icmpFirewallUUID), vmUUID) {
+		t.Fatal("fail-closed Service withdrawal detached the shared cluster ICMP firewall")
+	}
+}
+
+func nodeLoadBalancerAssertStatusIngress(
+	t *testing.T,
+	status corev1.LoadBalancerStatus,
+	wantIP string,
+	wantMode corev1.LoadBalancerIPMode,
+) {
+	t.Helper()
+	if len(status.Ingress) != 1 || status.Ingress[0].IP != wantIP ||
+		status.Ingress[0].IPMode == nil || *status.Ingress[0].IPMode != wantMode {
+		t.Fatalf("load balancer status = %#v, want %s with mode %s", status, wantIP, wantMode)
+	}
+}
+
+type nodeLoadBalancerFailingNodeLister struct {
+	err error
+}
+
+func (l nodeLoadBalancerFailingNodeLister) List(labels.Selector) ([]*corev1.Node, error) {
+	return nil, l.err
+}
+
+func (l nodeLoadBalancerFailingNodeLister) Get(string) (*corev1.Node, error) {
+	return nil, l.err
+}
+
+var _ corelisters.NodeLister = nodeLoadBalancerFailingNodeLister{}
 
 func getNodeLoadBalancerTestService(
 	t *testing.T,
@@ -2091,6 +2993,20 @@ func getNodeLoadBalancerTestService(
 		t.Fatal(err)
 	}
 	return service
+}
+
+func getNodeLoadBalancerTestNode(
+	t *testing.T,
+	ctx context.Context,
+	provider *Provider,
+	name string,
+) *corev1.Node {
+	t.Helper()
+	node, err := provider.kubeClient.CoreV1().Nodes().Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return node
 }
 
 func ageNodeLoadBalancerAbsenceEvidence(
@@ -2152,7 +3068,10 @@ func TestNodeLoadBalancerAuthorizesExactNodeClaimNodePoolNodeClassAndFIPChain(t 
 		nodeLoadBalancerNodeShardLabel:   shard,
 		nodeLoadBalancerReadyLabel:       "true",
 	}
-	node.Status.Addresses = []corev1.NodeAddress{{Type: corev1.NodeExternalIP, Address: "203.0.113.10"}}
+	node.Status.Addresses = []corev1.NodeAddress{
+		{Type: corev1.NodeInternalIP, Address: "10.0.0.20"},
+		{Type: corev1.NodeExternalIP, Address: "203.0.113.10"},
+	}
 	api := &fakeAPI{}
 	provider := newTestProvider(t, api)
 	provider.dynamicClient = newNodeLoadBalancerTestDynamicClient()
@@ -2178,18 +3097,22 @@ func TestNodeLoadBalancerAuthorizesExactNodeClaimNodePoolNodeClassAndFIPChain(t 
 	if len(clusterAuthorized) != 1 || clusterAuthorized[0].Name != node.Name {
 		t.Fatalf("authorized cluster Nodes = %#v", clusterAuthorized)
 	}
-	ready, externalIPs, err := controller.readyShardNodes(ctx, shard)
+	addresses, err := controller.readyShardAddresses(ctx, shard)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(ready) != 1 || len(externalIPs) != 1 || externalIPs[0] != "203.0.113.10" {
-		t.Fatalf("ready Nodes = %#v, external IPs = %#v", ready, externalIPs)
+	if len(addresses) != 1 || addresses[0].Node.Name != node.Name ||
+		addresses[0].PrivateIPv4 != "10.0.0.20" || addresses[0].PublicIPv4 != "203.0.113.10" {
+		t.Fatalf("ready address pairs = %#v", addresses)
 	}
 	current, err := provider.kubeClient.CoreV1().Nodes().Get(ctx, node.Name, metav1.GetOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	current.Status.Addresses = []corev1.NodeAddress{{Type: corev1.NodeExternalIP, Address: "203.0.113.11"}}
+	current.Status.Addresses = []corev1.NodeAddress{
+		{Type: corev1.NodeInternalIP, Address: "10.0.0.20"},
+		{Type: corev1.NodeExternalIP, Address: "203.0.113.11"},
+	}
 	if _, err := provider.kubeClient.CoreV1().Nodes().UpdateStatus(ctx, current, metav1.UpdateOptions{}); err != nil {
 		t.Fatal(err)
 	}
@@ -2205,140 +3128,6 @@ func TestNodeLoadBalancerAuthorizesExactNodeClaimNodePoolNodeClassAndFIPChain(t 
 	}
 }
 
-func TestNodeLoadBalancerLegacyAuthorizationRequiresActiveOmittedSizingService(t *testing.T) {
-	assertRejected := func(t *testing.T, mutate func(*testing.T, *nodeLoadBalancerFailClosedFixture)) {
-		t.Helper()
-		fixture := newNodeLoadBalancerFailClosedFixture(t)
-		defer fixture.controller.queue.ShutDown()
-		fixture.replaceNodePoolWithLegacyDefault(t)
-		mutate(t, fixture)
-		authorized, err := fixture.controller.authorizedNodesForShard(fixture.ctx, fixture.shard)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if len(authorized) != 0 {
-			t.Fatalf("legacy Node remained authorized: %#v", authorized)
-		}
-	}
-
-	fixture := newNodeLoadBalancerFailClosedFixture(t)
-	fixture.replaceNodePoolWithLegacyDefault(t)
-	authorized, err := fixture.controller.authorizedNodesForShard(fixture.ctx, fixture.shard)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(authorized) != 1 || authorized[0].Name != fixture.node.Name {
-		t.Fatalf("active legacy shard authorization = %#v", authorized)
-	}
-	clusterAuthorized, err := fixture.controller.authorizedNodesForCluster(fixture.ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(clusterAuthorized) != 1 || clusterAuthorized[0].Name != fixture.node.Name {
-		t.Fatalf("cluster-wide active legacy shard authorization = %#v", clusterAuthorized)
-	}
-	fixture.controller.queue.ShutDown()
-
-	t.Run("missing provider finalizer", func(t *testing.T) {
-		assertRejected(t, func(t *testing.T, fixture *nodeLoadBalancerFailClosedFixture) {
-			service := getNodeLoadBalancerTestService(t, fixture.ctx, fixture.provider, fixture.service.Namespace, fixture.service.Name)
-			service.Finalizers = nil
-			if _, err := fixture.provider.kubeClient.CoreV1().Services(service.Namespace).Update(fixture.ctx, service, metav1.UpdateOptions{}); err != nil {
-				t.Fatal(err)
-			}
-		})
-	})
-	t.Run("missing shadow", func(t *testing.T) {
-		assertRejected(t, func(t *testing.T, fixture *nodeLoadBalancerFailClosedFixture) {
-			if err := fixture.provider.kubeClient.CoreV1().Services(fixture.service.Namespace).Delete(
-				fixture.ctx,
-				nodeLoadBalancerShadowName(fixture.service),
-				metav1.DeleteOptions{},
-			); err != nil {
-				t.Fatal(err)
-			}
-		})
-	})
-	t.Run("foreign shadow ownership", func(t *testing.T) {
-		assertRejected(t, func(t *testing.T, fixture *nodeLoadBalancerFailClosedFixture) {
-			shadow := getNodeLoadBalancerTestService(t, fixture.ctx, fixture.provider, fixture.service.Namespace, nodeLoadBalancerShadowName(fixture.service))
-			shadow.Labels[nodeLoadBalancerServiceUIDLabel] = "foreign-uid"
-			if _, err := fixture.provider.kubeClient.CoreV1().Services(shadow.Namespace).Update(fixture.ctx, shadow, metav1.UpdateOptions{}); err != nil {
-				t.Fatal(err)
-			}
-		})
-	})
-	t.Run("explicit legacy sizing", func(t *testing.T) {
-		assertRejected(t, func(t *testing.T, fixture *nodeLoadBalancerFailClosedFixture) {
-			service := getNodeLoadBalancerTestService(t, fixture.ctx, fixture.provider, fixture.service.Namespace, fixture.service.Name)
-			service.Annotations[annotationNodeLoadBalancerMode] = nodeLoadBalancerModeDedicated
-			service.Annotations[annotationNodeLoadBalancerCPU] = "1"
-			service.Annotations[annotationNodeLoadBalancerMemory] = "2Gi"
-			if _, err := fixture.provider.kubeClient.CoreV1().Services(service.Namespace).Update(fixture.ctx, service, metav1.UpdateOptions{}); err != nil {
-				t.Fatal(err)
-			}
-		})
-	})
-	t.Run("previous shard no longer active", func(t *testing.T) {
-		assertRejected(t, func(t *testing.T, fixture *nodeLoadBalancerFailClosedFixture) {
-			const replacement = "inlb-deadbeef"
-			service := getNodeLoadBalancerTestService(t, fixture.ctx, fixture.provider, fixture.service.Namespace, fixture.service.Name)
-			service.Annotations[annotationNodeLoadBalancerPreviousShard] = fixture.shard
-			service.Annotations[annotationNodeLoadBalancerShard] = replacement
-			if _, err := fixture.provider.kubeClient.CoreV1().Services(service.Namespace).Update(fixture.ctx, service, metav1.UpdateOptions{}); err != nil {
-				t.Fatal(err)
-			}
-			shadow := getNodeLoadBalancerTestService(t, fixture.ctx, fixture.provider, fixture.service.Namespace, nodeLoadBalancerShadowName(fixture.service))
-			shadow.Annotations[annotationCiliumNodeIPAMMatchLabels] = nodeLoadBalancerCiliumSelector(fixture.provider.config.ClusterID, replacement)
-			if _, err := fixture.provider.kubeClient.CoreV1().Services(shadow.Namespace).Update(fixture.ctx, shadow, metav1.UpdateOptions{}); err != nil {
-				t.Fatal(err)
-			}
-		})
-	})
-}
-
-func TestNodeLoadBalancerLegacyNodeEventEligibilityPreservesThenDrops(t *testing.T) {
-	fixture := newNodeLoadBalancerFailClosedFixture(t)
-	defer fixture.controller.queue.ShutDown()
-	fixture.replaceNodePoolWithLegacyDefault(t)
-
-	if err := fixture.controller.reconcileShardNodeEligibility(fixture.ctx, fixture.shard); err != nil {
-		t.Fatal(err)
-	}
-	stored, err := fixture.provider.kubeClient.CoreV1().Nodes().Get(fixture.ctx, fixture.node.Name, metav1.GetOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if stored.Labels[nodeLoadBalancerReadyLabel] != "true" {
-		t.Fatal("active legacy shard lost its Cilium readiness label")
-	}
-	if err := fixture.nodeIndexer.Update(stored.DeepCopy()); err != nil {
-		t.Fatal(err)
-	}
-
-	service := getNodeLoadBalancerTestService(t, fixture.ctx, fixture.provider, fixture.service.Namespace, fixture.service.Name)
-	service.Annotations[annotationNodeLoadBalancerMode] = nodeLoadBalancerModeDedicated
-	service.Annotations[annotationNodeLoadBalancerCPU] = "1"
-	service.Annotations[annotationNodeLoadBalancerMemory] = "2Gi"
-	updated, err := fixture.provider.kubeClient.CoreV1().Services(service.Namespace).Update(fixture.ctx, service, metav1.UpdateOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := fixture.serviceIndexer.Update(updated.DeepCopy()); err != nil {
-		t.Fatal(err)
-	}
-	if err := fixture.controller.reconcileShardNodeEligibility(fixture.ctx, fixture.shard); err != nil {
-		t.Fatal(err)
-	}
-	stored, err = fixture.provider.kubeClient.CoreV1().Nodes().Get(fixture.ctx, fixture.node.Name, metav1.GetOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, exists := stored.Labels[nodeLoadBalancerReadyLabel]; exists {
-		t.Fatal("inactive explicit legacy shape retained its Cilium readiness label")
-	}
-}
-
 func TestNodeLoadBalancerExactLabelAndProviderIDSpoofCannotAttachFirewallOrAdvertise(t *testing.T) {
 	ctx := context.Background()
 	const shard = "inlb-0123abcd"
@@ -2348,7 +3137,10 @@ func TestNodeLoadBalancerExactLabelAndProviderIDSpoofCannotAttachFirewallOrAdver
 		nodeLoadBalancerNodeClusterLabel: "unit-test-cluster",
 		nodeLoadBalancerNodeShardLabel:   shard,
 	}
-	legitimate.Status.Addresses = []corev1.NodeAddress{{Type: corev1.NodeExternalIP, Address: "203.0.113.10"}}
+	legitimate.Status.Addresses = []corev1.NodeAddress{
+		{Type: corev1.NodeInternalIP, Address: "10.0.0.20"},
+		{Type: corev1.NodeExternalIP, Address: "203.0.113.10"},
+	}
 	api := &fakeAPI{}
 	provider := newTestProvider(t, api)
 	provider.dynamicClient = newNodeLoadBalancerTestDynamicClient()
@@ -2365,7 +3157,10 @@ func TestNodeLoadBalancerExactLabelAndProviderIDSpoofCannotAttachFirewallOrAdver
 	// Even copying the real NodeClaim owner reference cannot satisfy the
 	// authoritative status.providerID/status.nodeName pair.
 	spoofed.OwnerReferences = append([]metav1.OwnerReference(nil), legitimate.OwnerReferences...)
-	spoofed.Status.Addresses = []corev1.NodeAddress{{Type: corev1.NodeExternalIP, Address: "203.0.113.99"}}
+	spoofed.Status.Addresses = []corev1.NodeAddress{
+		{Type: corev1.NodeInternalIP, Address: "10.0.0.99"},
+		{Type: corev1.NodeExternalIP, Address: "203.0.113.99"},
+	}
 	provider.kubeClient = kubefake.NewSimpleClientset(spoofed.DeepCopy())
 	nodeIndexer := newNamespacedIndexer()
 	if err := nodeIndexer.Add(spoofed.DeepCopy()); err != nil {
@@ -2400,12 +3195,12 @@ func TestNodeLoadBalancerExactLabelAndProviderIDSpoofCannotAttachFirewallOrAdver
 	if len(api.assignedFirewalls) != 0 {
 		t.Fatalf("spoofed Node received a public firewall: %#v", api.assignedFirewalls)
 	}
-	ready, externalIPs, err := controller.readyShardNodes(ctx, shard)
+	addresses, err := controller.readyShardAddresses(ctx, shard)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(ready) != 0 || len(externalIPs) != 0 {
-		t.Fatalf("spoofed Node was advertised: Nodes=%#v IPs=%#v", ready, externalIPs)
+	if len(addresses) != 0 {
+		t.Fatalf("spoofed Node was advertised: %#v", addresses)
 	}
 	if err := controller.reconcileShardNodeEligibility(ctx, shard); err != nil {
 		t.Fatal(err)
@@ -2415,7 +3210,7 @@ func TestNodeLoadBalancerExactLabelAndProviderIDSpoofCannotAttachFirewallOrAdver
 		t.Fatal(err)
 	}
 	if _, exists := stored.Labels[nodeLoadBalancerReadyLabel]; exists {
-		t.Fatal("spoofed Node retained the protected Cilium readiness label")
+		t.Fatal("spoofed Node retained the protected datapath readiness label")
 	}
 }
 
@@ -2428,19 +3223,31 @@ func TestNodeLoadBalancerRejectsNodeWhenFIPDoesNotMatchExternalIP(t *testing.T) 
 		nodeLoadBalancerNodeClusterLabel: "unit-test-cluster",
 		nodeLoadBalancerNodeShardLabel:   shard,
 	}
-	node.Status.Addresses = []corev1.NodeAddress{{Type: corev1.NodeExternalIP, Address: "203.0.113.10"}}
+	node.Status.Addresses = []corev1.NodeAddress{
+		{Type: corev1.NodeInternalIP, Address: "10.0.0.20"},
+		{Type: corev1.NodeExternalIP, Address: "203.0.113.10"},
+	}
 	api := &fakeAPI{}
 	provider := newTestProvider(t, api)
 	provider.dynamicClient = newNodeLoadBalancerTestDynamicClient()
 	installNodeLoadBalancerSafetyIdentity(t, provider, node, shard)
-	api.floatingIPs[0].Address = "203.0.113.11"
 	provider.kubeClient = kubefake.NewSimpleClientset(node.DeepCopy())
 	nodeIndexer := newNamespacedIndexer()
 	if err := nodeIndexer.Add(node.DeepCopy()); err != nil {
 		t.Fatal(err)
 	}
 	controller := &nodeLoadBalancerController{provider: provider, nodes: corelisters.NewNodeLister(nodeIndexer)}
+	api.floatingIPs[0].AssignedToPrivateIP = "10.0.0.99"
 	authorized, err := controller.authorizedNodesForShard(ctx, shard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(authorized) != 0 {
+		t.Fatalf("Node with a mismatched FIP DNAT private IPv4 was authorized: %#v", authorized)
+	}
+	api.floatingIPs[0].AssignedToPrivateIP = "10.0.0.20"
+	api.floatingIPs[0].Address = "203.0.113.11"
+	authorized, err = controller.authorizedNodesForShard(ctx, shard)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2503,22 +3310,6 @@ func nodeLoadBalancerSafetyNodePool(name, cluster, profile string, replicas int6
 		panic(err)
 	}
 	if err := markNodeLoadBalancerManaged(pool, cluster, name, profile); err != nil {
-		panic(err)
-	}
-	pool.SetUID(types.UID("nodepool-" + name))
-	return pool
-}
-
-func nodeLoadBalancerSafetyLegacyNodePool(name, cluster, mode, poolName string, replicas int64) *unstructured.Unstructured {
-	shard := nodeLoadBalancerShardPlan{
-		Name: name, Mode: mode, Pool: poolName,
-		NodesPerShard: int32(replicas), CPU: 1, MemoryMiB: 2048,
-	}
-	pool, err := renderLegacyNodeLoadBalancerNodePoolForAuthorization(name, managedNodeLoadBalancerName(cluster, "node-lb"), shard)
-	if err != nil {
-		panic(err)
-	}
-	if err := markNodeLoadBalancerManaged(pool, cluster, name, nodeLoadBalancerShardProfileHash(shard)); err != nil {
 		panic(err)
 	}
 	pool.SetUID(types.UID("nodepool-" + name))
@@ -2686,13 +3477,18 @@ func installNodeLoadBalancerSafetyIdentity(
 		if err != nil {
 			t.Fatal(err)
 		}
+		internalIP, ok := nodeLoadBalancerNodeInternalIPv4(node)
+		if !ok {
+			t.Fatalf("Node %s has no private InternalIP for its test identity", node.Name)
+		}
 		externalIP, ok := nodeLoadBalancerNodeExternalIPv4(node)
 		if !ok {
 			t.Fatalf("Node %s has no public ExternalIP for its test identity", node.Name)
 		}
 		found := false
-		for _, item := range api.floatingIPs {
-			if item.AssignedTo == identity.UUID {
+		for index := range api.floatingIPs {
+			if api.floatingIPs[index].AssignedTo == identity.UUID {
+				api.floatingIPs[index].AssignedToPrivateIP = internalIP
 				found = true
 				break
 			}
@@ -2701,7 +3497,7 @@ func installNodeLoadBalancerSafetyIdentity(
 			api.floatingIPs = append(api.floatingIPs, inspace.FloatingIP{
 				Name: "karpenter-" + claimName, Address: externalIP,
 				BillingAccountID: provider.config.BillingAccountID, Type: "public", Enabled: true,
-				AssignedTo: identity.UUID, AssignedToResourceType: "virtual_machine",
+				AssignedTo: identity.UUID, AssignedToResourceType: "virtual_machine", AssignedToPrivateIP: internalIP,
 			})
 		}
 		icmpDesired, err := desiredNodeLoadBalancerClusterICMPFirewall(provider.config.ClusterID, provider.config.BillingAccountID)
@@ -2758,6 +3554,19 @@ func nodeLoadBalancerSafetyBaseNodeClass() *unstructured.Unstructured {
 			"rootDiskGiB":             int64(100), "reservePublicIPv4": true,
 		},
 	}}
+}
+
+func nodeLoadBalancerSafetyMarkDatapathActive(service *corev1.Service, shard string) {
+	if service.Annotations == nil {
+		service.Annotations = map[string]string{}
+	}
+	service.Annotations[annotationNodeLoadBalancerDatapathActive] = shard
+}
+
+func nodeLoadBalancerSafetyDatapath(service *corev1.Service, shard string) *corev1.Service {
+	datapath := desiredNodeLoadBalancerDatapath(service, nodeLoadBalancerDatapathName(service), shard)
+	datapath.UID = types.UID("datapath-" + shortNodeLoadBalancerHash(nodeLoadBalancerServiceIdentity(service)))
+	return datapath
 }
 
 func nodeLoadBalancerSafetyInvalidFinalizedService(name, uid string) *corev1.Service {

@@ -1925,7 +1925,7 @@ func TestDestroyConvergesForV4OwnershipRecords(t *testing.T) {
 	bastion.Description = strings.Replace(bastion.Description, "inspace-rke2-bastion/v6 ", "inspace-rke2-bastion/v4 ", 1)
 	for slot := 0; slot < ControlPlaneReplicas; slot++ {
 		controlPlane := mustVM(t, api.vms, controlPlaneName(cluster.Metadata.Name, slot))
-		controlPlane.Description = strings.Replace(controlPlane.Description, "inspace-rke2-cp/v7 ", "inspace-rke2-cp/v4 ", 1)
+		controlPlane.Description = strings.Replace(controlPlane.Description, "inspace-rke2-cp/v8 ", "inspace-rke2-cp/v4 ", 1)
 	}
 
 	result := destroyUntilDone(t, reconciler, cluster)
@@ -1944,7 +1944,7 @@ func TestDestroyConvergesForV5OwnershipRecords(t *testing.T) {
 	bastion.Description = strings.Replace(bastion.Description, "inspace-rke2-bastion/v6 ", "inspace-rke2-bastion/v5 ", 1)
 	for slot := 0; slot < ControlPlaneReplicas; slot++ {
 		controlPlane := mustVM(t, api.vms, controlPlaneName(cluster.Metadata.Name, slot))
-		controlPlane.Description = strings.Replace(controlPlane.Description, "inspace-rke2-cp/v7 ", "inspace-rke2-cp/v5 ", 1)
+		controlPlane.Description = strings.Replace(controlPlane.Description, "inspace-rke2-cp/v8 ", "inspace-rke2-cp/v5 ", 1)
 	}
 
 	result := destroyUntilDone(t, reconciler, cluster)
@@ -1961,7 +1961,7 @@ func TestDestroyConvergesForV6OwnershipRecords(t *testing.T) {
 
 	for slot := 0; slot < ControlPlaneReplicas; slot++ {
 		controlPlane := mustVM(t, api.vms, controlPlaneName(cluster.Metadata.Name, slot))
-		controlPlane.Description = strings.Replace(controlPlane.Description, "inspace-rke2-cp/v7 ", "inspace-rke2-cp/v6 ", 1)
+		controlPlane.Description = strings.Replace(controlPlane.Description, "inspace-rke2-cp/v8 ", "inspace-rke2-cp/v6 ", 1)
 	}
 
 	result := destroyUntilDone(t, reconciler, cluster)
@@ -1970,7 +1970,24 @@ func TestDestroyConvergesForV6OwnershipRecords(t *testing.T) {
 	}
 }
 
-func TestDestroyConvergesForCurrentV6BastionV7ControlPlanes(t *testing.T) {
+func TestDestroyConvergesForV7OwnershipRecords(t *testing.T) {
+	api := newFakeAPI()
+	cluster := testCluster()
+	reconciler := testReconciler(api)
+	reconcileUntilReady(t, reconciler, cluster)
+
+	for slot := 0; slot < ControlPlaneReplicas; slot++ {
+		controlPlane := mustVM(t, api.vms, controlPlaneName(cluster.Metadata.Name, slot))
+		controlPlane.Description = strings.Replace(controlPlane.Description, "inspace-rke2-cp/v8 ", "inspace-rke2-cp/v7 ", 1)
+	}
+
+	result := destroyUntilDone(t, reconciler, cluster)
+	if !result.Done || len(api.vms) != 0 || len(api.floatingIPs) != 0 || len(api.firewalls) != 0 {
+		t.Fatalf("v7 ownership topology did not converge: result=%#v VMs=%#v FIPs=%#v firewalls=%#v", result, api.vms, api.floatingIPs, api.firewalls)
+	}
+}
+
+func TestDestroyConvergesForCurrentV6BastionV8ControlPlanes(t *testing.T) {
 	api := newFakeAPI()
 	cluster := testCluster()
 	reconciler := testReconciler(api)
@@ -1982,7 +1999,7 @@ func TestDestroyConvergesForCurrentV6BastionV7ControlPlanes(t *testing.T) {
 	}
 	for slot := 0; slot < ControlPlaneReplicas; slot++ {
 		controlPlane := mustVM(t, api.vms, controlPlaneName(cluster.Metadata.Name, slot))
-		if !strings.HasPrefix(controlPlane.Description, "inspace-rke2-cp/v7 ") {
+		if !strings.HasPrefix(controlPlane.Description, "inspace-rke2-cp/v8 ") {
 			t.Fatalf("current control-plane %d ownership = %q", slot, controlPlane.Description)
 		}
 	}
@@ -1995,13 +2012,13 @@ func TestDestroyConvergesForCurrentV6BastionV7ControlPlanes(t *testing.T) {
 
 func TestDestroyRejectsIncoherentOwnershipSchemaTopology(t *testing.T) {
 	tests := map[string]func(*testing.T, *fakeAPI, *v1alpha1.InSpaceCluster){
-		"v3 bastion with v2 control planes": func(t *testing.T, api *fakeAPI, cluster *v1alpha1.InSpaceCluster) {
+		"v6 bastion with v2 control planes": func(t *testing.T, api *fakeAPI, cluster *v1alpha1.InSpaceCluster) {
 			convertControlPlaneOwnershipToV2(t, api, cluster)
 		},
-		"v1 bastion with v3 control planes": func(t *testing.T, api *fakeAPI, cluster *v1alpha1.InSpaceCluster) {
+		"v1 bastion with v8 control planes": func(t *testing.T, api *fakeAPI, cluster *v1alpha1.InSpaceCluster) {
 			convertBastionToLegacy(t, api, cluster)
 		},
-		"mixed v2 and v3 control planes without bastion": func(t *testing.T, api *fakeAPI, cluster *v1alpha1.InSpaceCluster) {
+		"mixed v2 and v8 control planes without bastion": func(t *testing.T, api *fakeAPI, cluster *v1alpha1.InSpaceCluster) {
 			api.removeVMFromReadback(mustVM(t, api.vms, currentBastionName(cluster.Metadata.Name)).UUID)
 			vm := mustVM(t, api.vms, controlPlaneName(cluster.Metadata.Name, 1))
 			hash := vm.Description[strings.LastIndex(vm.Description, "=")+1:]
@@ -3020,7 +3037,7 @@ func assertControlPlaneCloudInit(t *testing.T, raw, expectedNodeName string, ini
 		t.Error("join does not use private VIP registration endpoint")
 	}
 	staticPod := files["/var/lib/inspace/rke2-kube-vip"]
-	for _, required := range []string{kubeVIPImage, "vip_interface", "__PRIVATE_IFACE__", "vip_arp", "cp_enable", "svc_enable", `value: "false"`, "vip_leaderelection", "inspace-control-plane-vip", "hostNetwork: true", "type: File", "app.kubernetes.io/component: control-plane-vip"} {
+	for _, required := range []string{kubeVIPImage, "vip_interface", "__PRIVATE_IFACE__", "vip_arp", "vip_arpRate", "cp_enable", "svc_enable", `value: "false"`, "vip_leaderelection", "vip_leaseduration", "vip_renewdeadline", "vip_retryperiod", "inspace-control-plane-vip", "hostNetwork: true", "type: File", "app.kubernetes.io/component: control-plane-vip"} {
 		if !strings.Contains(staticPod, required) {
 			t.Errorf("kube-vip static Pod lacks %q", required)
 		}
@@ -3056,10 +3073,13 @@ func assertControlPlaneCloudInit(t *testing.T, raw, expectedNodeName string, ini
 		!ciliumValues.BPF.Masquerade {
 		t.Fatalf("generated Cilium native-routing contract=%#v", ciliumValues)
 	}
-	for _, required := range []string{"l2announcements:\n      enabled: true", "defaultLBServiceIPAM: none", "nodeIPAM:\n      enabled: true", "k8sClientRateLimit:\n      qps: 10\n      burst: 20"} {
+	for _, required := range []string{"l2announcements:\n      enabled: true", "defaultLBServiceIPAM: none", "k8sClientRateLimit:\n      qps: 10\n      burst: 20"} {
 		if !strings.Contains(ciliumConfig, required) {
 			t.Errorf("RKE2 Cilium config lacks %q", required)
 		}
+	}
+	if strings.Contains(ciliumConfig, "nodeIPAM:") {
+		t.Error("RKE2 Cilium config unexpectedly enables the retired Node IPAM controller")
 	}
 	privateLoadBalancer := files["/var/lib/inspace/rke2-cilium-private-load-balancer"]
 	for _, required := range []string{
@@ -3102,6 +3122,7 @@ func assertKubeVIPStaticPodContract(t *testing.T, manifest string) {
 		t.Fatalf("generated kube-vip container name=%q", container.Name)
 	}
 	vipNodeNameEnvs := make([]corev1.EnvVar, 0, 1)
+	plainEnvs := make(map[string][]corev1.EnvVar)
 	for _, env := range container.Env {
 		if env.Name == "k8s_config_file" {
 			t.Fatalf("generated kube-vip Pod sets ignored k8s_config_file environment variable to %q", env.Value)
@@ -3109,6 +3130,7 @@ func assertKubeVIPStaticPodContract(t *testing.T, manifest string) {
 		if env.Name == "vip_nodename" {
 			vipNodeNameEnvs = append(vipNodeNameEnvs, env)
 		}
+		plainEnvs[env.Name] = append(plainEnvs[env.Name], env)
 	}
 	wantVIPNodeNameEnv := corev1.EnvVar{
 		Name: "vip_nodename",
@@ -3118,6 +3140,17 @@ func assertKubeVIPStaticPodContract(t *testing.T, manifest string) {
 	}
 	if len(vipNodeNameEnvs) != 1 || !reflect.DeepEqual(vipNodeNameEnvs[0], wantVIPNodeNameEnv) {
 		t.Fatalf("generated kube-vip vip_nodename env=%#v, want exactly %#v", vipNodeNameEnvs, wantVIPNodeNameEnv)
+	}
+	for name, value := range map[string]string{
+		"vip_arpRate":       "500",
+		"vip_leaseduration": "5",
+		"vip_renewdeadline": "3",
+		"vip_retryperiod":   "1",
+	} {
+		want := corev1.EnvVar{Name: name, Value: value}
+		if len(plainEnvs[name]) != 1 || !reflect.DeepEqual(plainEnvs[name][0], want) {
+			t.Fatalf("generated kube-vip %s env=%#v, want exactly %#v", name, plainEnvs[name], want)
+		}
 	}
 	wantCapabilities := &corev1.Capabilities{
 		Add:  []corev1.Capability{"NET_ADMIN", "NET_RAW"},
