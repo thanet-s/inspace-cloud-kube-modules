@@ -1815,6 +1815,119 @@ func TestPublicNodeLoadBalancerAllowsOwnedShardFirewallAcrossCreateAndReadback(t
 	}
 }
 
+func TestPublicNodeLoadBalancerWaitsForDuplicateIntendedFirewallReadbackToConverge(t *testing.T) {
+	const vmUUID = "11111111-1111-4111-8111-111111111111"
+	duplicate := secureFirewall()
+	duplicate.ResourcesAssigned = []sdk.FirewallResource{
+		{ResourceType: "vm", ResourceUUID: vmUUID},
+		{ResourceType: "vm", ResourceUUID: vmUUID},
+	}
+	api := &fakeAPI{firewallListSnapshots: map[int][]sdk.Firewall{3: {duplicate}}}
+	adapter, err := New(api)
+	if err != nil {
+		t.Fatal(err)
+	}
+	configureFastNetworkReadback(adapter, boundedReadbackTestTimeout)
+	request := testRequest()
+	request.FirewallProfile = inspacev1.FirewallProfilePublicNodeLoadBalancer
+	request.NodePoolName = "inlb-7255785b"
+	request.NodeClaimName = "inlb-7255785b-abcde"
+	request.Name = request.ClusterName + "-karp-" + request.NodeClaimName
+
+	created, err := adapter.CreateVM(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created.UUID == "" || api.firewallListCalls < 4 || api.firewallAssignCalls != 1 || api.floatingIPUpdateCalls != 1 {
+		t.Fatalf("duplicate intended readback did not converge safely: created=%#v lists=%d assigns=%d FIP PATCHes=%d", created, api.firewallListCalls, api.firewallAssignCalls, api.floatingIPUpdateCalls)
+	}
+	if !reflect.DeepEqual(api.operations, []string{"assign-firewall", "update-floating-ip"}) {
+		t.Fatalf("duplicate intended readback changed protection order: %v", api.operations)
+	}
+}
+
+func TestPublicNodeLoadBalancerPersistentDuplicateIntendedFirewallRollsBack(t *testing.T) {
+	base := secureFirewall()
+	api := &fakeAPI{
+		firewalls:                  []sdk.Firewall{base},
+		secondFirewallOnAssignUUID: base.UUID,
+	}
+	adapter, err := New(api)
+	if err != nil {
+		t.Fatal(err)
+	}
+	configureFastNetworkReadback(adapter, 60*time.Millisecond)
+	request := testRequest()
+	request.FirewallProfile = inspacev1.FirewallProfilePublicNodeLoadBalancer
+	request.NodePoolName = "inlb-7255785b"
+	request.NodeClaimName = "inlb-7255785b-abcde"
+	request.Name = request.ClusterName + "-karp-" + request.NodeClaimName
+
+	_, err = adapter.CreateVM(context.Background(), request)
+	if !errors.Is(err, cloudapi.ErrOwnershipMismatch) || !errors.Is(err, errFirewallAssignmentReadbackDuplicate) || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("CreateVM() error = %v, want bounded persistent-duplicate rejection", err)
+	}
+	if api.firewallAssignCalls != 1 || api.floatingIPUpdateCalls != 1 || api.deleteVMCalls != 1 || countOperation(api.operations, "unassign-firewall") != 2 || len(api.vms) != 0 || len(api.floatingIPs) != 0 {
+		t.Fatalf("persistent duplicate did not roll back safely: assigns=%d FIP PATCHes=%d deletes=%d VMs=%#v FIPs=%#v operations=%v", api.firewallAssignCalls, api.floatingIPUpdateCalls, api.deleteVMCalls, api.vms, api.floatingIPs, api.operations)
+	}
+}
+
+func TestEstablishedWorkerDuplicateIntendedFirewallFailsClosedWithoutMutation(t *testing.T) {
+	api := &fakeAPI{}
+	adapter, err := New(api)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := testRequest()
+	created, err := adapter.CreateVM(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	api.firewalls[0].ResourcesAssigned = append(api.firewalls[0].ResourcesAssigned, sdk.FirewallResource{ResourceType: "vm", ResourceUUID: created.UUID})
+	api.operations = nil
+
+	_, err = adapter.CreateVM(context.Background(), request)
+	if !errors.Is(err, cloudapi.ErrOwnershipMismatch) || !errors.Is(err, errFirewallAssignmentReadbackDuplicate) {
+		t.Fatalf("established duplicate error = %v, want strict ownership rejection", err)
+	}
+	if len(api.operations) != 0 || api.firewallAssignCalls != 1 || api.deleteVMCalls != 0 || len(api.vms) != 1 || len(api.floatingIPs) != 1 {
+		t.Fatalf("established duplicate mutated cloud state: operations=%v assigns=%d deletes=%d VMs=%#v FIPs=%#v", api.operations, api.firewallAssignCalls, api.deleteVMCalls, api.vms, api.floatingIPs)
+	}
+}
+
+func TestWorkerFirewallDuplicateReadbackClassificationExcludesForeignAssignments(t *testing.T) {
+	const vmUUID = "11111111-1111-4111-8111-111111111111"
+	base := secureFirewall()
+	base.ResourcesAssigned = []sdk.FirewallResource{
+		{ResourceType: "vm", ResourceUUID: vmUUID},
+		{ResourceType: "vm", ResourceUUID: vmUUID},
+	}
+	foreign := secureFirewall()
+	foreign.UUID = "44444444-4444-4444-8444-444444444444"
+	foreign.ResourcesAssigned = []sdk.FirewallResource{{ResourceType: "vm", ResourceUUID: vmUUID}}
+	for name, profile := range map[string]inspacev1.FirewallProfile{
+		"private":                 inspacev1.FirewallProfilePrivateWorker,
+		"public NodeLoadBalancer": inspacev1.FirewallProfilePublicNodeLoadBalancer,
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, duplicateErr := validateWorkerFirewallAssignments(
+				[]sdk.Firewall{base}, base.UUID, vmUUID, true, profile,
+				"cluster-a", "inlb-7255785b", "inlb-7255785b-abcde",
+			)
+			if !errors.Is(duplicateErr, cloudapi.ErrOwnershipMismatch) || !errors.Is(duplicateErr, errFirewallAssignmentReadbackDuplicate) {
+				t.Fatalf("exact intended duplicate classification = %v", duplicateErr)
+			}
+			_, foreignErr := validateWorkerFirewallAssignments(
+				[]sdk.Firewall{base, foreign}, base.UUID, vmUUID, true, profile,
+				"cluster-a", "inlb-7255785b", "inlb-7255785b-abcde",
+			)
+			if !errors.Is(foreignErr, cloudapi.ErrOwnershipMismatch) || errors.Is(foreignErr, errFirewallAssignmentReadbackDuplicate) {
+				t.Fatalf("duplicate plus foreign assignment was marked retryable: %v", foreignErr)
+			}
+		})
+	}
+}
+
 func TestEstablishedPublicNodeLoadBalancerAuditRejectsCrossShardFirewall(t *testing.T) {
 	const ownedShard = "inlb-7255785b"
 	shardFirewall := nodeLoadBalancerShardFirewall("cluster-a", ownedShard)
