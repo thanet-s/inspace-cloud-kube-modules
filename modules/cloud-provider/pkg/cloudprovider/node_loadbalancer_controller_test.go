@@ -288,7 +288,7 @@ func TestNodeLoadBalancerReconcileSmokeCreatesOwnedKarpenterAndDatapathResources
 			defaultShape[requirement["key"].(string)] = values[0].(string)
 		}
 	}
-	if defaultShape["inspace.cloud/instance-cpu"] != "1" || defaultShape["inspace.cloud/instance-memory"] != "4096" {
+	if defaultShape["inspace.cloud/instance-cpu"] != "1" || defaultShape["inspace.cloud/instance-memory"] != "2048" {
 		t.Fatalf("generated default NodePool shape = %#v", defaultShape)
 	}
 	if len(api.createdFirewalls) != 2 {
@@ -414,7 +414,7 @@ func TestParseNodeLoadBalancerRejectsInvalidShapesAndContracts(t *testing.T) {
 		"below minimum memory": func(service *corev1.Service) {
 			service.Annotations[annotationNodeLoadBalancerMode] = nodeLoadBalancerModeDedicated
 			service.Annotations[annotationNodeLoadBalancerCPU] = "1"
-			service.Annotations[annotationNodeLoadBalancerMemory] = "2Gi"
+			service.Annotations[annotationNodeLoadBalancerMemory] = "1Gi"
 		},
 		"invalid catalog shape": func(service *corev1.Service) {
 			service.Annotations[annotationNodeLoadBalancerMode] = nodeLoadBalancerModeDedicated
@@ -466,12 +466,12 @@ func TestValidateNodeLoadBalancerShapeEnforcesNodeLBMinimum(t *testing.T) {
 		cpu       int32
 		memoryMiB int64
 	}{
-		"legacy one CPU two GiB shape": {cpu: 1, memoryMiB: 2048},
-		"two CPU two GiB shape":        {cpu: 2, memoryMiB: 2048},
+		"one CPU one GiB shape": {cpu: 1, memoryMiB: 1024},
+		"two CPU one GiB shape": {cpu: 2, memoryMiB: 1024},
 	} {
 		t.Run(name, func(t *testing.T) {
 			err := validateNodeLoadBalancerShape(shape.cpu, shape.memoryMiB)
-			if err == nil || !strings.Contains(err.Error(), "requires at least 1 CPU and 4096Mi memory") {
+			if err == nil || !strings.Contains(err.Error(), "requires at least 1 CPU and 2048Mi memory") {
 				t.Fatalf("minimum validation error = %v", err)
 			}
 		})

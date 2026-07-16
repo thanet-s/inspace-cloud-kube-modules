@@ -374,8 +374,8 @@ An omitted `service.inspace.cloud/node-lb-mode` means
 IPv4 `(protocol, port)` claims are free; otherwise CCM creates another shard.
 Use `public-node-dedicated` for an isolated shard. Dedicated Services can set
 `service.inspace.cloud/node-lb-cpu` and
-`service.inspace.cloud/node-lb-memory`; the defaults are `1` and `4Gi`.
-Explicit shapes enforce at least 1 CPU and 4 GiB, and the pair must exactly
+`service.inspace.cloud/node-lb-memory`; the defaults are `1` and `2Gi`.
+Explicit shapes enforce at least 1 CPU and 2 GiB, and the pair must exactly
 match the finite provider catalog.
 
 CCM never exposes application workers directly. It creates static, tainted AMD
@@ -442,6 +442,14 @@ observed. The aggregate contains no ICMP or outbound rule.
 CCM stores the applied membership/policy ledger, a separate full SHA-256
 canonical policy hash, and any pending mutation fence on the shard NodePool. A
 CCM finalizer makes that NodePool the durable state anchor through deletion. It
+requests foreground NodePool deletion, allowing Kubernetes to terminate owned
+NodeClaims while the CCM finalizer retains the ledger for final firewall
+cleanup. Background deletion is not used because it cannot start dependent
+garbage collection until that same state finalizer is released. If a user or
+another controller already started background deletion, CCM reissues an exact
+UID-fenced foreground delete only while managed NodeClaims remain. It does not
+re-add `foregroundDeletion` after those direct dependents drain; the separate
+capacity proof still waits for every managed Node and other finalizer. CCM
 reads back that exact finalizer/spec before recording the shard in the owning
 Service's `node-lb-shard-state-materialized` handoff. A missing or drifted
 anchor can therefore never be downgraded to a fresh prospective assignment;

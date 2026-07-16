@@ -776,7 +776,7 @@ func TestNodeLoadBalancerGeneratedServiceDeleteUsesUIDPrecondition(t *testing.T)
 	}
 }
 
-func TestNodeLoadBalancerNodePoolDeleteUsesUIDPrecondition(t *testing.T) {
+func TestNodeLoadBalancerNodePoolDeleteUsesUIDPreconditionAndForegroundPropagation(t *testing.T) {
 	ctx := context.Background()
 	const shard = "inlb-0123abcd"
 	pool := nodeLoadBalancerSafetyNodePool(shard, "unit-test-cluster", "0123abcd", 1)
@@ -795,8 +795,105 @@ func TestNodeLoadBalancerNodePoolDeleteUsesUIDPrecondition(t *testing.T) {
 	deleteAction, ok := actions[1].(k8stesting.DeleteAction)
 	if !ok || deleteAction.GetDeleteOptions().Preconditions == nil ||
 		deleteAction.GetDeleteOptions().Preconditions.UID == nil ||
-		*deleteAction.GetDeleteOptions().Preconditions.UID != pool.GetUID() {
-		t.Fatalf("NodePool delete lacks exact UID precondition: %#v", actions[1])
+		*deleteAction.GetDeleteOptions().Preconditions.UID != pool.GetUID() ||
+		deleteAction.GetDeleteOptions().PropagationPolicy == nil ||
+		*deleteAction.GetDeleteOptions().PropagationPolicy != metav1.DeletePropagationForeground {
+		t.Fatalf("NodePool delete lacks exact UID/foreground contract: %#v", actions[1])
+	}
+}
+
+func TestNodeLoadBalancerDeletingNodePoolIsUpgradedToForegroundPropagation(t *testing.T) {
+	ctx := context.Background()
+	const shard = "inlb-0123abcd"
+	pool := nodeLoadBalancerSafetyNodePool(shard, "unit-test-cluster", "0123abcd", 1)
+	deletingAt := metav1.Now()
+	pool.SetDeletionTimestamp(&deletingAt)
+	claim := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "karpenter.sh/v1",
+		"kind":       "NodeClaim",
+		"metadata": map[string]any{
+			"name": "claim",
+			"ownerReferences": []any{map[string]any{
+				"apiVersion":         "karpenter.sh/v1",
+				"kind":               "NodePool",
+				"name":               shard,
+				"uid":                string(pool.GetUID()),
+				"blockOwnerDeletion": true,
+			}},
+			"labels": map[string]any{
+				karpenterNodePoolLabel:           shard,
+				nodeLoadBalancerNodeLabel:        "true",
+				nodeLoadBalancerNodeClusterLabel: "unit-test-cluster",
+				nodeLoadBalancerNodeShardLabel:   shard,
+			},
+		},
+	}}
+	claim.SetUID(types.UID("claim-uid"))
+	provider := newTestProvider(t, &fakeAPI{})
+	dynamicClient := newNodeLoadBalancerTestDynamicClient(pool.DeepCopy(), claim)
+	provider.dynamicClient = dynamicClient
+	controller := &nodeLoadBalancerController{provider: provider}
+
+	deleting, err := controller.reconcileDeletingAggregateNodePool(ctx, shard)
+	if err != nil || !deleting {
+		t.Fatalf("reconcile deleting NodePool = %t, %v; want true, nil", deleting, err)
+	}
+	var deleteAction k8stesting.DeleteAction
+	for _, action := range dynamicClient.Actions() {
+		if action.GetVerb() == "delete" && action.GetResource().Resource == nodePoolGVR.Resource {
+			deleteAction = action.(k8stesting.DeleteAction)
+			break
+		}
+	}
+	if deleteAction == nil || deleteAction.GetDeleteOptions().Preconditions == nil ||
+		deleteAction.GetDeleteOptions().Preconditions.UID == nil ||
+		*deleteAction.GetDeleteOptions().Preconditions.UID != pool.GetUID() ||
+		deleteAction.GetDeleteOptions().PropagationPolicy == nil ||
+		*deleteAction.GetDeleteOptions().PropagationPolicy != metav1.DeletePropagationForeground {
+		t.Fatalf("deleting NodePool was not upgraded with exact UID/foreground contract: %#v", dynamicClient.Actions())
+	}
+}
+
+func TestNodeLoadBalancerDrainedDeletingNodePoolDoesNotReaddForegroundFinalizer(t *testing.T) {
+	ctx := context.Background()
+	const shard = "inlb-0123abcd"
+	pool := nodeLoadBalancerSafetyNodePool(shard, "unit-test-cluster", "0123abcd", 1)
+	deletingAt := metav1.Now()
+	pool.SetDeletionTimestamp(&deletingAt)
+	provider := newTestProvider(t, &fakeAPI{})
+	dynamicClient := newNodeLoadBalancerTestDynamicClient(pool.DeepCopy())
+	provider.dynamicClient = dynamicClient
+	controller := &nodeLoadBalancerController{provider: provider}
+
+	if err := controller.deleteManagedNodePool(ctx, shard); err != nil {
+		t.Fatal(err)
+	}
+	for _, action := range dynamicClient.Actions() {
+		if action.GetVerb() == "delete" && action.GetResource().Resource == nodePoolGVR.Resource {
+			t.Fatalf("drained deleting NodePool received another foreground delete: %#v", dynamicClient.Actions())
+		}
+	}
+}
+
+func TestNodeLoadBalancerInFlightForegroundDeleteIsNotReissued(t *testing.T) {
+	ctx := context.Background()
+	const shard = "inlb-0123abcd"
+	pool := nodeLoadBalancerSafetyNodePool(shard, "unit-test-cluster", "0123abcd", 1)
+	deletingAt := metav1.Now()
+	pool.SetDeletionTimestamp(&deletingAt)
+	pool.SetFinalizers(append(pool.GetFinalizers(), metav1.FinalizerDeleteDependents))
+	provider := newTestProvider(t, &fakeAPI{})
+	dynamicClient := newNodeLoadBalancerTestDynamicClient(pool.DeepCopy())
+	provider.dynamicClient = dynamicClient
+	controller := &nodeLoadBalancerController{provider: provider}
+
+	if err := controller.deleteManagedNodePool(ctx, shard); err != nil {
+		t.Fatal(err)
+	}
+	for _, action := range dynamicClient.Actions() {
+		if action.GetVerb() == "delete" && action.GetResource().Resource == nodePoolGVR.Resource {
+			t.Fatalf("in-flight foreground NodePool delete was reissued: %#v", dynamicClient.Actions())
+		}
 	}
 }
 

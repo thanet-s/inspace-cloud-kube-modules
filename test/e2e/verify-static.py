@@ -1112,6 +1112,12 @@ def main() -> None:
     node_lb_continuity_stop = playbook.index(
         "- name: Require every retained Traefik continuity probe to have succeeded"
     )
+    node_lb_background_delete = playbook.index(
+        "- name: Start a user-style background deletion of the dedicated NodePool"
+    )
+    node_lb_background_upgrade = playbook.index(
+        "- name: Require CCM to upgrade the same live owner to foreground deletion"
+    )
     node_lb_delete = playbook.index("- name: Delete every Node-LB acceptance Service and workload owner")
     node_lb_absent = playbook.index(
         "- name: Require Node-LB Services datapaths NodePools firewalls VMs and FIPs to disappear"
@@ -1120,7 +1126,8 @@ def main() -> None:
             node_lb_initial_apply < node_lb_initial_journal < node_lb_initial_capture < node_lb_continuity_start <
             node_lb_shared_add < node_lb_expanded < node_lb_shared_delete < node_lb_shrunk <
             node_lb_shared_recreate < node_lb_recreated < node_lb_expansion < node_lb_full_journal <
-            node_lb_present < node_lb_http < node_lb_frontend_audit < node_lb_continuity_stop < node_lb_delete <
+            node_lb_present < node_lb_http < node_lb_frontend_audit < node_lb_continuity_stop <
+            node_lb_background_delete < node_lb_background_upgrade < node_lb_delete <
             node_lb_absent < suite_complete,
             "Node-LB acceptance must run after paid-NLB cleanup and finish before suite completion")
     stale_paid_nlb_task = named_yaml_sequence_item(
@@ -1186,6 +1193,10 @@ def main() -> None:
             "service/inspace-e2e-node-shared-b" in node_lb_exercise and
             node_lb_exercise.count("/opt/e2e/scripts/persist-workload.py") == 4 and
             "e2e_node_lb_expansion_manifest" in node_lb_exercise and
+            "--cascade=background" in node_lb_exercise and
+            "foregroundDeletion" in node_lb_exercise and
+            "e2e_node_lb_background_pool_uid.stdout" in node_lb_exercise and
+            "e2e_node_lb_background_claim_uid.stdout" in node_lb_exercise and
             "use_proxy: false" in node_lb_exercise,
             "Node-LB live acceptance must prove presence/data path and always restore exact inventory")
     node_lb_expanded_task = named_yaml_sequence_item(
@@ -1296,6 +1307,9 @@ def main() -> None:
                 f"{name} must use Cluster traffic policy")
         require("loadBalancerIP:" not in service and "externalIPs:" not in service,
                 f"{name} must not bypass CCM address ownership")
+        require("service.inspace.cloud/node-lb-cpu:" not in service and
+                "service.inspace.cloud/node-lb-memory:" not in service,
+                f"{name} must exercise the default 1-vCPU/2-GiB Node-LB shape")
         ports = re.findall(
             r"(?m)^    - name: [a-z0-9-]+\n"
             r"^      port: ([0-9]+)\n"
@@ -1309,10 +1323,8 @@ def main() -> None:
         require("service.inspace.cloud/node-lb-mode:" not in node_lb_services[name],
                 f"{name} must exercise the omitted-mode public-node-shared default")
     dedicated_node_lb_service = node_lb_services["inspace-e2e-node-dedicated"]
-    require("service.inspace.cloud/node-lb-mode: public-node-dedicated" in dedicated_node_lb_service and
-            "service.inspace.cloud/node-lb-cpu:" not in dedicated_node_lb_service and
-            "service.inspace.cloud/node-lb-memory:" not in dedicated_node_lb_service,
-            "dedicated live acceptance must exercise the default 1-vCPU/4-GiB shape")
+    require("service.inspace.cloud/node-lb-mode: public-node-dedicated" in dedicated_node_lb_service,
+            "dedicated live acceptance must exercise the default 1-vCPU/2-GiB shape")
     require(node_lb_ports["inspace-e2e-node-traefik"] ==
             {("TCP", 80), ("TCP", 443), ("UDP", 443)} and
             node_lb_ports["inspace-e2e-node-shared-conflict"] == {("TCP", 80)} and
@@ -1530,8 +1542,14 @@ def main() -> None:
         'return "inlb-dp-" + node_load_balancer_service_identity(service)',
         'floating_ip.get("assigned_to_private_ip") == internal_ips[0]',
         '"inspace.cloud/instance-cpu": ("In", ("1",))',
-        '"inspace.cloud/instance-memory": ("In", ("4096",))',
+        '"inspace.cloud/instance-memory": ("In", ("2048",))',
         '"inspace.cloud/host-class": ("In", ("amd-epyc",))',
+        'record.get("vCPU") == 1',
+        'record.get("memoryGiB") == 2',
+        'nodeclaim_labels.get("inspace.cloud/instance-cpu") == "1"',
+        'nodeclaim_labels.get("inspace.cloud/instance-memory") == "2048"',
+        'vm.get("vcpu") == 1',
+        'vm.get("memory") == 2048',
         'nodeclass_spec.get("rootDiskGiB") == 30',
         'nodeclass_spec.get("reservePublicIPv4") is True',
         '"inspace.cloud/node-lb"',

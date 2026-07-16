@@ -558,6 +558,13 @@ func (c *nodeLoadBalancerController) reconcileDeletingAggregateNodePool(
 		!containsString(pool.GetFinalizers(), nodeLoadBalancerNodePoolFinalizer) {
 		return true, fmt.Errorf("node load balancer: deleting NodePool %s lost its exact state-anchor identity", shard)
 	}
+	// A user or another controller may have started deletion with background
+	// propagation. Reissue the exact UID-fenced delete as foreground before
+	// waiting for capacity: blockOwnerDeletion NodeClaims otherwise cannot be
+	// collected while our durable state finalizer retains the NodePool.
+	if err := c.deleteManagedNodePool(ctx, shard); err != nil {
+		return true, err
+	}
 	absent, err := c.managedShardCapacityAbsent(ctx, shard)
 	if err != nil || !absent {
 		return true, err

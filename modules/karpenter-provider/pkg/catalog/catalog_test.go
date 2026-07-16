@@ -13,13 +13,13 @@ import (
 	inspacev1 "github.com/thanet-s/inspace-cloud-kube-modules/modules/karpenter-provider/pkg/apis/v1alpha1"
 )
 
-func TestCatalogHasAll30BoundedVariants(t *testing.T) {
+func TestCatalogHasAll31BoundedVariants(t *testing.T) {
 	types, err := New(Options{Location: inspacev1.LocationBangkok, RootDiskGiB: 40})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(types) != 30 {
-		t.Fatalf("expected 30 instance types, got %d", len(types))
+	if len(types) != 31 {
+		t.Fatalf("expected 31 instance types, got %d", len(types))
 	}
 
 	expected := map[string]bool{}
@@ -29,8 +29,8 @@ func TestCatalogHasAll30BoundedVariants(t *testing.T) {
 			expected[name] = true
 		}
 	}
-	if len(expected) != 30 {
-		t.Fatalf("test catalog definition has %d unique variants, want 30", len(expected))
+	if len(expected) != 31 {
+		t.Fatalf("test catalog definition has %d unique variants, want 31", len(expected))
 	}
 
 	seen := map[string]bool{}
@@ -50,8 +50,8 @@ func TestCatalogHasAll30BoundedVariants(t *testing.T) {
 		if memoryGiB > 64 {
 			t.Fatalf("%s exceeds the 64 GiB limit", instanceType.Name)
 		}
-		if cores == 1 && memoryGiB < 4 {
-			t.Fatalf("%s is below the 1-vCPU/4-GiB catalog floor", instanceType.Name)
+		if cores == 1 && memoryGiB < 2 {
+			t.Fatalf("%s is below the 1-vCPU/2-GiB catalog floor", instanceType.Name)
 		}
 		family := instanceType.Requirements.Get(LabelFamily).Any()
 		ratio := map[string]int{"compute": 1, "general": 2, "memory": 4, "extra-memory": 8}[family]
@@ -121,6 +121,7 @@ func TestCatalogHasOnlySupportedOneCoreAndExtraMemoryShapes(t *testing.T) {
 	}
 
 	specialPrices := map[string]float64{
+		"is-general-1c-2g":       120,
 		"is-memory-1c-4g":        180,
 		"is-extra-memory-1c-8g":  300,
 		"is-extra-memory-2c-16g": 600,
@@ -153,7 +154,6 @@ func TestCatalogHasOnlySupportedOneCoreAndExtraMemoryShapes(t *testing.T) {
 
 	unsupported := []string{
 		"is-compute-1c-1g",
-		"is-general-1c-2g",
 		"is-extra-memory-3c-24g",
 		"is-extra-memory-5c-40g",
 		"is-extra-memory-7c-56g",

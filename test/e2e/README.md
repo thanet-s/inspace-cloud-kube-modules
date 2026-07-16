@@ -155,11 +155,16 @@ claims TCP/80, TCP/443, and UDP/443 while a non-conflicting TCP Service reuses
 its shard and public IP. Another Service claims TCP/80 and must transparently
 receive a different shard and IP. A fourth Service selects
 `public-node-dedicated`. It omits CPU and memory annotations so the live
-generated capacity proves the 1-vCPU/4-GiB default.
+generated capacity proves the 1-vCPU/2-GiB default.
 
 Each of the resulting three static Karpenter NodePools has one Ready AMD EPYC
 Linux/amd64 node, one bounded drift-surge slot, a 30-GiB root disk, a reserved
-public FIP, and the `inspace.cloud/node-lb=true:NoSchedule` taint. For each user
+public FIP, the exact 1-vCPU/2-GiB VM shape, and the
+`inspace.cloud/node-lb=true:NoSchedule` taint. After all traffic and firewall
+mutation checks, the suite starts background deletion on the dedicated
+NodePool and requires CCM to upgrade that same live owner to foreground while
+its exact NodeClaim remains. Normal Service cleanup must then remove that shard
+and the untouched shared shards with zero account residue. For each user
 Service, CCM owns a same-namespace `inlb-dp-<service-identity>` child with
 `loadBalancerClass: inspace.cloud/node-datapath`, the exact
 `inspace.cloud/node-lb-datapath=true` and
