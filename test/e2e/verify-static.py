@@ -353,7 +353,7 @@ def verify_node_load_balancer_helm_contract() -> None:
     for api_group, resource, verbs in (
         ("karpenter.sh", "nodepools", '["get", "list", "create", "update", "delete"]'),
         ("karpenter.sh", "nodeclaims", '["get", "list"]'),
-        ("karpenter.inspace.cloud", "inspacenodeclasses", '["get", "create", "update"]'),
+        ("karpenter.inspace.cloud", "inspacenodeclasses", '["get", "create", "update", "delete"]'),
     ):
         rule = (
             f'  - apiGroups: ["{api_group}"]\n'
@@ -488,7 +488,14 @@ def main() -> None:
     node_load_balancer_expansion = (
         ROOT / "templates/node-load-balancer-expansion.yaml.j2"
     ).read_text(encoding="utf-8")
-    node_load_balancer_workload = node_load_balancer_base + "\n---\n" + node_load_balancer_expansion
+    node_load_balancer_shared_expansion = (
+        ROOT / "templates/node-load-balancer-shared-expansion.yaml.j2"
+    ).read_text(encoding="utf-8")
+    node_load_balancer_workload = "\n---\n".join((
+        node_load_balancer_base,
+        node_load_balancer_shared_expansion,
+        node_load_balancer_expansion,
+    ))
     trigger = (ROOT / "templates/trigger.yaml.j2").read_text(encoding="utf-8")
     registry_probe = (ROOT / "templates/registry-egress-probe.yaml.j2").read_text(encoding="utf-8")
     ansible_cfg = (ROOT / "ansible.cfg").read_text(encoding="utf-8")
@@ -1075,10 +1082,25 @@ def main() -> None:
     node_lb_stale_absent = playbook.index("- name: Wait for stale Node-LB cloud and Kubernetes owners to quiesce")
     node_lb_immutable_anchor = playbook.index("- name: Require the immutable zero-NLB anchor before Node-LB baseline capture")
     node_lb_exercise_start = playbook.index("- name: Exercise shared conflict and dedicated public Node-LB modes")
-    node_lb_initial_apply = playbook.index("- name: Create the Node-LB workload and established shared pair")
+    node_lb_initial_apply = playbook.index("- name: Create the Node-LB workload and establish Traefik first")
     node_lb_initial_journal = playbook.index("- name: Journal initial Node-LB identities before cloud convergence")
-    node_lb_shared_pair = playbook.index(
-        "- name: Require the mixed Traefik and sibling Services to establish one shared private-VIP datapath shard"
+    node_lb_initial_capture = playbook.index(
+        "- name: Capture the established Traefik shard firewall and readiness identities"
+    )
+    node_lb_continuity_start = playbook.index(
+        "- name: Continuously probe retained Traefik traffic across every shard policy mutation"
+    )
+    node_lb_shared_add = playbook.index("- name: Add the non-conflicting shared Node-LB sibling")
+    node_lb_expanded = playbook.index(
+        "- name: Prove in-place aggregate firewall expansion without a Node readiness flap"
+    )
+    node_lb_shared_delete = playbook.index("- name: Delete the shared sibling while retaining Traefik")
+    node_lb_shrunk = playbook.index(
+        "- name: Prove in-place aggregate firewall shrink without a Node readiness flap"
+    )
+    node_lb_shared_recreate = playbook.index("- name: Recreate the same shared sibling Service name")
+    node_lb_recreated = playbook.index(
+        "- name: Prove same-name new-UID recreation reuses the aggregate shard firewall safely"
     )
     node_lb_expansion = playbook.index("- name: Add the conflicting shared and dedicated Node-LB Services")
     node_lb_full_journal = playbook.index("- name: Journal every Node-LB identity before the full convergence proof")
@@ -1087,20 +1109,18 @@ def main() -> None:
     node_lb_frontend_audit = playbook.index(
         "- name: Require Cilium to report no duplicate Node-LB frontend ownership"
     )
-    node_lb_partial_delete = playbook.index("- name: Delete one shared Node-LB member without deleting its sibling shard")
-    node_lb_partial = playbook.index("- name: Prove partial shared-member cleanup preserves the exact sibling resources")
-    node_lb_partial_identity_assert = playbook.index(
-        "- name: Assert the exact surviving Service firewall identity after partial cleanup"
+    node_lb_continuity_stop = playbook.index(
+        "- name: Require every retained Traefik continuity probe to have succeeded"
     )
-    node_lb_partial_http = playbook.index("- name: Prove the retained mixed and other TCP backends after partial cleanup")
     node_lb_delete = playbook.index("- name: Delete every Node-LB acceptance Service and workload owner")
     node_lb_absent = playbook.index(
         "- name: Require Node-LB Services datapaths NodePools firewalls VMs and FIPs to disappear"
     )
     require(stale_paid_service_absent < stale_paid_nlb_inventory < node_lb_stale_absent < public_delete < node_lb_immutable_anchor < node_lb_baseline < node_lb_exercise_start <
-            node_lb_initial_apply < node_lb_initial_journal < node_lb_shared_pair <
-            node_lb_expansion < node_lb_full_journal < node_lb_present < node_lb_http < node_lb_frontend_audit < node_lb_partial_delete <
-            node_lb_partial < node_lb_partial_identity_assert < node_lb_partial_http < node_lb_delete <
+            node_lb_initial_apply < node_lb_initial_journal < node_lb_initial_capture < node_lb_continuity_start <
+            node_lb_shared_add < node_lb_expanded < node_lb_shared_delete < node_lb_shrunk <
+            node_lb_shared_recreate < node_lb_recreated < node_lb_expansion < node_lb_full_journal <
+            node_lb_present < node_lb_http < node_lb_frontend_audit < node_lb_continuity_stop < node_lb_delete <
             node_lb_absent < suite_complete,
             "Node-LB acceptance must run after paid-NLB cleanup and finish before suite completion")
     stale_paid_nlb_task = named_yaml_sequence_item(
@@ -1147,66 +1167,59 @@ def main() -> None:
         "final Node-LB absence proof must use the immutable pre-mutation NLB UUID baseline",
     )
     require("\n      always:\n" in node_lb_exercise and
-            node_lb_exercise.count("/opt/e2e/scripts/verify-node-load-balancer.py") == 3 and
+            node_lb_exercise.count("/opt/e2e/scripts/verify-node-load-balancer.py") == 6 and
             "--expect\n              - present" in node_lb_exercise and
-            "--expect\n              - partial" in node_lb_exercise and
             "--expect\n              - absent" in node_lb_exercise and
             "/opt/e2e/scripts/account-inventory.py" in node_lb_exercise and
             "compare" in node_lb_exercise and
             "--baseline" in node_lb_exercise and
-            "Require the mixed Traefik and sibling Services to establish one shared private-VIP datapath shard" in node_lb_exercise and
-            '"inspace.cloud/node-datapath"' in node_lb_exercise and
-            '"inspace.cloud/node-lb-datapath"' in node_lb_exercise and
-            '"inspace.cloud/node-lb-service-id"' in node_lb_exercise and
-            '"service.inspace.cloud/node-lb-datapath-shard"' in node_lb_exercise and
-            '"service.inspace.cloud/node-lb-datapath-active-shard"' in node_lb_exercise and
-            '"^inlb-dp-[0-9a-f]{52}$"' in node_lb_exercise and
-            '.status.loadBalancer.ingress[0].ipMode == "VIP"' in node_lb_exercise and
-            '.status.loadBalancer.ingress[0].ipMode == "Proxy"' in node_lb_exercise and
+            "continuous-http-probe.py" in node_lb_exercise and
+            "--policy-change\n              - expanded" in node_lb_exercise and
+            "--policy-change\n              - shrunk" in node_lb_exercise and
+            "--require-new-uid\n              - inspace-e2e-node-shared-b" in node_lb_exercise and
+            "e2e_node_lb_initial_snapshot" in node_lb_exercise and
+            "e2e_node_lb_expanded_snapshot" in node_lb_exercise and
+            "e2e_node_lb_recreated_snapshot" in node_lb_exercise and
             "-c cilium-agent" in node_lb_exercise and
             "frontend already owned by another service" in node_lb_exercise and
             "Add the conflicting shared and dedicated Node-LB Services" in node_lb_exercise and
-            "--deleted-firewall" in node_lb_exercise and
-            "--retained-icmp-firewall" in node_lb_exercise and
-            "--retained-service-firewall" in node_lb_exercise and
             "service/inspace-e2e-node-shared-b" in node_lb_exercise and
-            node_lb_exercise.count("/opt/e2e/scripts/persist-workload.py") == 2 and
+            node_lb_exercise.count("/opt/e2e/scripts/persist-workload.py") == 4 and
             "e2e_node_lb_expansion_manifest" in node_lb_exercise and
             "use_proxy: false" in node_lb_exercise,
             "Node-LB live acceptance must prove presence/data path and always restore exact inventory")
-    node_lb_partial_task = named_yaml_sequence_item(
+    node_lb_expanded_task = named_yaml_sequence_item(
         node_lb_exercise,
-        "Prove partial shared-member cleanup preserves the exact sibling resources",
+        "Prove in-place aggregate firewall expansion without a Node readiness flap",
         8,
     )
-    node_lb_partial_assert_task = named_yaml_sequence_item(
+    node_lb_shrunk_task = named_yaml_sequence_item(
         node_lb_exercise,
-        "Assert the exact surviving Service firewall identity after partial cleanup",
+        "Prove in-place aggregate firewall shrink without a Node readiness flap",
         8,
     )
-    retained_service_firewall_reference = (
-        "{{ e2e_node_lb_result.services['inspace-e2e-node-traefik'].firewallUUID }}"
+    node_lb_recreated_task = named_yaml_sequence_item(
+        node_lb_exercise,
+        "Prove same-name new-UID recreation reuses the aggregate shard firewall safely",
+        8,
     )
     require(
-        "--retained-service-firewall" in node_lb_partial_task
-        and retained_service_firewall_reference in node_lb_partial_task
-        and "e2e_node_lb_partial_result.retainedServiceFirewallUUID =="
-        in node_lb_partial_assert_task
-        and "e2e_node_lb_result.services['inspace-e2e-node-traefik'].firewallUUID"
-        in node_lb_partial_assert_task,
-        "partial Node-LB cleanup must pass and assert the exact surviving Service firewall UUID",
+        "--policy-change\n              - expanded" in node_lb_expanded_task
+        and "e2e_node_lb_initial_snapshot" in node_lb_expanded_task
+        and "--policy-change\n              - shrunk" in node_lb_shrunk_task
+        and "e2e_node_lb_expanded_snapshot" in node_lb_shrunk_task
+        and "--require-new-uid\n              - inspace-e2e-node-shared-b" in node_lb_recreated_task,
+        "shared Node-LB mutation proofs must bind expansion, shrink, and same-name new-UID recreation",
     )
-    node_lb_shared_gate = named_yaml_sequence_item(
+    node_lb_initial_gate = named_yaml_sequence_item(
         node_lb_exercise,
-        "Require the mixed Traefik and sibling Services to establish one shared private-VIP datapath shard",
+        "Capture the established Traefik shard firewall and readiness identities",
         8,
     )
-    require_yaml_key(node_lb_shared_gate, 10, "retries", "180")
-    require_yaml_key(node_lb_shared_gate, 10, "delay", "10")
-    require('def ownedDatapath($parent):' in node_lb_shared_gate and
-            '.metadata.name == ("inlb-dp-" + .metadata.labels["inspace.cloud/node-lb-service-id"])' in node_lb_shared_gate and
-            '"service.inspace.cloud/node-lb-datapath-active-shard"' in node_lb_shared_gate,
-            "live acceptance must select exact-owned canonical datapaths and require durable activation")
+    require_yaml_key(node_lb_initial_gate, 10, "retries", "180")
+    require_yaml_key(node_lb_initial_gate, 10, "delay", "10")
+    require("--service\n              - inspace-e2e-node-traefik" in node_lb_initial_gate,
+            "live acceptance must establish and snapshot Traefik before adding a shared sibling")
     for cleanup_name in node_lb_service_names:
         require(f"service/{cleanup_name}" in cleanup,
                 f"destroy fallback must remove Node-LB Service/{cleanup_name}")
@@ -1368,10 +1381,9 @@ def main() -> None:
         == "inlb-dp-" + expected_identity,
         "workload journal does not mirror the canonical Node-LB datapath name",
     )
-    require(node_lb_module.firewall_name(
-        "cluster-a", "01234567-89ab-4def-8123-456789abcdef", "deadbeef"
-    ) == "inlb-34ab3e1c-01234567-89ab-4def-8123-456789abcdef-deadbeef",
-            "Node-LB verifier does not mirror full-Service-UID firewall ownership")
+    require(node_lb_module.shard_firewall_name("cluster-a", "inlb-deadbeef") ==
+            "inlb-34ab3e1c8c468878c75341efcf8fd3cd-shard-deadbeef",
+            "Node-LB verifier does not mirror stable aggregate shard-firewall ownership")
     require(node_lb_module.cluster_icmp_firewall_name("cluster-a") ==
             ("inlb-34ab3e1c8c468878c75341efcf8fd3cd-icmp-564fcbd1", "564fcbd1"),
             "Node-LB verifier does not mirror 128-bit cluster ICMP firewall ownership")
@@ -1383,7 +1395,8 @@ def main() -> None:
         }
         for protocol, port in (("TCP", 80), ("TCP", 443), ("UDP", 443))
     ]
-    require(node_lb_module.canonical_service_policy_hash(mixed_rules) == "0023bff0",
+    require(node_lb_module.canonical_service_policy_hash(mixed_rules) ==
+            "0023bff0b14655c79553fc672aa656ce61ee34cdf9d4ac22b963a0eaaa44b30b",
             "Node-LB verifier does not mirror the mixed TCP/UDP Service policy hash")
 
     cluster = "cluster-a"
@@ -1412,7 +1425,7 @@ def main() -> None:
     owned_nlb_cases = (
         ("journaled", forbidden_nlb_name),
         ("cluster-prefix", f"k8s-{node_lb_module.hash16(cluster)}-aaaaaaaaaaaaaaaa"),
-        ("service-policy-prefix", f"inlb-{node_lb_module.short_hash(cluster)}-unexpected"),
+        ("service-policy-prefix", f"inlb-{node_lb_module.ownership_hash(cluster)}-shard-deadbeef"),
         ("icmp-policy-prefix", f"inlb-{node_lb_module.ownership_hash(cluster)}-icmp-unexpected"),
     )
     for identity, name in owned_nlb_cases:
@@ -1465,33 +1478,32 @@ def main() -> None:
         node_lb_module.api_get = original_node_lb_api_get
         node_lb_module.kubectl = original_node_lb_kubectl
 
-    original_prove_present = node_lb_module.prove_present
-    node_lb_module.prove_present = lambda *_arguments: {
-        "firewalls": ["retained-replacement"],
-        "icmpFirewallUUID": "icmp-original",
-        "services": {
-            "inspace-e2e-node-traefik": {
-                "shard": "inlb-deadbeef",
-                "vmUUID": "vm-original",
-                "ip": "203.0.113.10",
-                "firewallUUID": "retained-replacement",
-            },
-        },
+    anchor_shard = {
+        "nodePool": "inlb-deadbeef", "nodePoolUID": "pool-uid", "node": "node-a",
+        "vmUUID": "vm-original", "ip": "203.0.113.10", "privateIP": "10.0.0.10",
+        "firewallUUID": "firewall-original",
+        "assignedFirewallUUIDs": ["base", "firewall-original", "icmp-original"],
+        "readyTransitionTime": "2026-07-16T01:02:03Z",
+        "policyKeys": ["tcp|80|any|"],
     }
+    anchor = {
+        "phase": "present",
+        "icmpFirewallUUID": "icmp-original",
+        "services": {"inspace-e2e-node-traefik": {"uid": "old-uid"}},
+        "shardDetails": {"inlb-deadbeef": anchor_shard},
+    }
+    expanded = json.loads(json.dumps(anchor))
+    expanded["shardDetails"]["inlb-deadbeef"]["policyKeys"].append("tcp|18081|any|")
+    node_lb_module.compare_anchor(expanded, anchor, "expanded", ())
+    replaced = json.loads(json.dumps(expanded))
+    replaced["shardDetails"]["inlb-deadbeef"]["firewallUUID"] = "firewall-replaced"
     try:
-        node_lb_module.prove_partial(
-            {}, "/unused/kubeconfig", pathlib.Path("/unused/baseline"),
-            "33333333-3333-4333-8333-333333333333",
-            "inlb-deadbeef", "vm-original", "203.0.113.10", "icmp-original",
-            "retained-original",
-        )
+        node_lb_module.compare_anchor(replaced, anchor, "expanded", ())
     except SystemExit as error:
-        require("replaced the retained sibling Service firewall" in str(error),
-                "partial cleanup proof returned the wrong retained-firewall diagnostic")
+        require("changed NodePool, VM, FIP, VIP, firewall assignment, or Ready transition" in str(error),
+                "aggregate snapshot proof returned the wrong stable-identity diagnostic")
     else:
-        require(False, "partial cleanup proof accepted a replacement sibling Service firewall")
-    finally:
-        node_lb_module.prove_present = original_prove_present
+        require(False, "aggregate snapshot proof accepted a replaced shard firewall")
 
     require(node_lb_module.floating_ip_name("cluster-a", "inlb-deadbeef") ==
             "karpenter-inlb-deadbeef-fd7cd81d52",
@@ -1529,21 +1541,23 @@ def main() -> None:
         '"NoSchedule"',
         'active_node_lb_vm_uuids == expected_vm_uuids',
         'active_node_lb_fip_names == expected_fip_names',
-        'expected_service_firewalls | {icmp_firewall_uuid}',
+        'expected_shard_firewalls | {icmp_firewall_uuid}',
         'icmp_rules[0].get("port_start") is None',
-        'canonical TCP/UDP-only policy',
+        'canonical union of its Services',
         'cluster ICMP firewall must target every and only authoritative Node-LB VM',
         'ping_public_ip(address)',
         'probe_udp(result["ip"], port["port"]',
-        'PARTIAL_DELETED_SERVICE = "inspace-e2e-node-shared-b"',
-        'deleted shared-member Service firewall is still active',
+        '"readyTransitionTime": ready_transition_time(node)',
+        '"assignedFirewallUUIDs": assigned',
+        'def compare_anchor(',
+        'current_policy > previous_policy',
+        'Service/{name} was not recreated with a new UID',
         'owned_node_load_balancer_nlbs(state, all_services, load_balancers)',
         'must not enter a new baseline',
         'if current_nlb_uuids != immutable_nlb_uuids:',
         'immutable pre-mutation account baseline',
-        'retained["firewallUUID"] == retained_service_firewall_uuid',
-        'result["retainedServiceFirewallUUID"] = retained["firewallUUID"]',
-        'replaced the retained sibling Service firewall',
+        'shard_firewall_name(cluster, shard)',
+        'one aggregate policy per shard plus one cluster ICMP policy',
         'public NodeLB acceptance must not create an InSpace NLB',
     ):
         require(marker in node_load_balancer_cloud,

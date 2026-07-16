@@ -7,6 +7,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"math/big"
 	"strings"
@@ -127,9 +128,45 @@ func TestDeleteThreadsDurableFloatingIPIdentityFromNodeClaimAnnotations(t *testi
 	if err := provider.Delete(context.Background(), claim); err != nil {
 		t.Fatal(err)
 	}
-	want := cloudapi.DeleteVMIdentity{FloatingIPName: vm.FloatingIPName, PublicIPv4: vm.PublicIPv4, BillingAccountID: 42}
+	want := cloudapi.DeleteVMIdentity{
+		FloatingIPName: vm.FloatingIPName, PublicIPv4: vm.PublicIPv4, BillingAccountID: 42,
+		NetworkUUID: "11111111-1111-4111-8111-111111111111",
+	}
 	if cloud.lastDeleteIdentity != want {
 		t.Fatalf("DeleteVM identity = %#v, want %#v", cloud.lastDeleteIdentity, want)
+	}
+}
+
+func TestDeleteUsesRetainedLaunchNetworkAfterControllerConfigChanges(t *testing.T) {
+	ctx := context.Background()
+	nodeClass := readyProviderNodeClass()
+	resolver := NewStaticResolver(nodeClass)
+	resolver.SetToken(inspacev1.RKE2AgentTokenSecretName, inspacev1.RKE2AgentTokenSecretKey, "agent-token")
+	cloud := &recordingDeleteCloud{Cloud: cloudfake.New()}
+	providerA, err := New(cloud, resolver, providerOptions(nodeClass))
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim := &karpv1.NodeClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: "general-net01", UID: types.UID("network-drift-claim"), Labels: map[string]string{karpv1.NodePoolLabelKey: "general"}},
+		Spec:       karpv1.NodeClaimSpec{NodeClassRef: &karpv1.NodeClassReference{Group: inspacev1.Group, Kind: inspacev1.Kind, Name: nodeClass.Name}},
+	}
+	created, err := providerA.Create(ctx, claim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	launchNetwork := nodeClass.Spec.NetworkUUID
+	optsB := providerOptions(nodeClass)
+	optsB.NetworkUUID = "99999999-9999-4999-8999-999999999999"
+	providerB, err := New(cloud, resolver, optsB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := providerB.Delete(ctx, created); err != nil {
+		t.Fatal(err)
+	}
+	if cloud.lastDeleteIdentity.NetworkUUID != launchNetwork {
+		t.Fatalf("DeleteVM network = %q, want retained launch network %q rather than current config %q", cloud.lastDeleteIdentity.NetworkUUID, launchNetwork, optsB.NetworkUUID)
 	}
 }
 
@@ -316,7 +353,7 @@ func TestCreateAndReadbackPreserveOfferingAndNumericIdentity(t *testing.T) {
 		t.Fatal(err)
 	}
 	claim := &karpv1.NodeClaim{
-		ObjectMeta: metav1.ObjectMeta{Name: "general-ab12c", UID: types.UID("claim-uid"), Labels: map[string]string{karpv1.NodePoolLabelKey: "general"}},
+		ObjectMeta: metav1.ObjectMeta{Name: "inlb-7255785b-ab12c", UID: types.UID("claim-uid"), Labels: map[string]string{karpv1.NodePoolLabelKey: "inlb-7255785b"}},
 		Spec: karpv1.NodeClaimSpec{
 			NodeClassRef: &karpv1.NodeClassReference{Group: inspacev1.Group, Kind: inspacev1.Kind, Name: nodeClass.Name},
 			Requirements: []karpv1.NodeSelectorRequirementWithMinValues{
@@ -332,6 +369,13 @@ func TestCreateAndReadbackPreserveOfferingAndNumericIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	fenceRecord, err := decodeCreateFence(created.Annotations[AnnotationCreateFence])
+	if err != nil || fenceRecord.Phase != createFenceMaterialized || fenceRecord.ObservedVMUUID == "" || fenceRecord.IssuedAt == nil {
+		t.Fatalf("Create() returned stale pre-authorize fence: record=%#v err=%v", fenceRecord, err)
+	}
+	if !containsString(created.Finalizers, CreateFenceFinalizer) {
+		t.Fatalf("Create() dropped provider create-protection finalizer: %v", created.Finalizers)
+	}
 	id, err := providerid.Parse(created.Status.ProviderID)
 	if err != nil {
 		t.Fatal(err)
@@ -346,9 +390,13 @@ func TestCreateAndReadbackPreserveOfferingAndNumericIdentity(t *testing.T) {
 	if request.FirewallProfile != inspacev1.FirewallProfilePublicNodeLoadBalancer {
 		t.Fatalf("launch firewall profile=%q, want %q", request.FirewallProfile, inspacev1.FirewallProfilePublicNodeLoadBalancer)
 	}
+	if request.NodePoolName != "inlb-7255785b" || request.NodeClaimName != "inlb-7255785b-ab12c" {
+		t.Fatalf("launch NodePool/NodeClaim identity=%q/%q", request.NodePoolName, request.NodeClaimName)
+	}
 	assertCapacityLabels := func(t *testing.T, labels map[string]string) {
 		t.Helper()
 		want := map[string]string{
+			karpv1.NodePoolLabelKey:     "inlb-7255785b",
 			catalog.LabelHostClass:      inspacev1.HostClassAMDEPYC,
 			catalog.LabelInstanceCPU:    "4",
 			catalog.LabelInstanceMemory: "8192",
@@ -375,6 +423,163 @@ func TestCreateAndReadbackPreserveOfferingAndNumericIdentity(t *testing.T) {
 		t.Fatalf("List() returned %d NodeClaims", len(listed))
 	}
 	assertCapacityLabels(t, listed[0].Labels)
+}
+
+func TestConcurrentCreateUsesOneImmutableCloudLaunch(t *testing.T) {
+	ctx := context.Background()
+	nodeClass := readyProviderNodeClass()
+	resolver := NewStaticResolver(nodeClass)
+	resolver.SetToken(inspacev1.RKE2AgentTokenSecretName, inspacev1.RKE2AgentTokenSecretKey, "agent-token")
+	cloud := cloudfake.New()
+	provider, err := New(cloud, resolver, providerOptions(nodeClass))
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim := &karpv1.NodeClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: "general-race1", UID: types.UID("race-claim"), Labels: map[string]string{karpv1.NodePoolLabelKey: "general"}},
+		Spec:       karpv1.NodeClaimSpec{NodeClassRef: &karpv1.NodeClassReference{Group: inspacev1.Group, Kind: inspacev1.Kind, Name: nodeClass.Name}},
+	}
+	type result struct {
+		claim *karpv1.NodeClaim
+		err   error
+	}
+	start := make(chan struct{})
+	results := make(chan result, 2)
+	for range 2 {
+		go func() {
+			<-start
+			created, createErr := provider.Create(ctx, claim.DeepCopy())
+			results <- result{claim: created, err: createErr}
+		}()
+	}
+	close(start)
+	successes := 0
+	for range 2 {
+		got := <-results
+		if got.err == nil {
+			successes++
+			record, decodeErr := decodeCreateFence(got.claim.Annotations[AnnotationCreateFence])
+			if decodeErr != nil || record.Phase != createFenceMaterialized {
+				t.Fatalf("concurrent success carried stale fence: %#v, %v", record, decodeErr)
+			}
+		}
+	}
+	if successes == 0 {
+		t.Fatal("both concurrent Create() calls failed")
+	}
+	vms, err := cloud.ListVMs(ctx, nodeClass.Spec.Location, nodeClass.Spec.ClusterName)
+	if err != nil || len(vms) != 1 {
+		t.Fatalf("concurrent Create() materialized %d VMs, want exactly one (err=%v)", len(vms), err)
+	}
+}
+
+func TestCreatePropagatesDurableCreatedVMAnchorAfterProviderRestart(t *testing.T) {
+	ctx := context.Background()
+	nodeClass := readyProviderNodeClass()
+	resolver := NewStaticResolver(nodeClass)
+	resolver.SetToken(inspacev1.RKE2AgentTokenSecretName, inspacev1.RKE2AgentTokenSecretKey, "agent-token")
+	store := NewMemoryCreateFenceStore()
+	cloud := &recordingCreateRequestCloud{Cloud: cloudfake.New(), failAfterAnchor: true}
+	opts := providerOptions(nodeClass)
+	opts.CreateFenceStore = store
+	providerA, err := New(cloud, resolver, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim := &karpv1.NodeClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: "general-restart1", UID: types.UID("restart-anchor-claim"), Labels: map[string]string{karpv1.NodePoolLabelKey: "general"}},
+		Spec:       karpv1.NodeClaimSpec{NodeClassRef: &karpv1.NodeClassReference{Group: inspacev1.Group, Kind: inspacev1.Kind, Name: nodeClass.Name}},
+	}
+	if created, err := providerA.Create(ctx, claim); created != nil || !errors.Is(err, cloudapi.ErrCreateAttemptPending) {
+		t.Fatalf("first Create() = %#v, %v; want simulated crash after UUID anchor", created, err)
+	}
+	memory := store.(*memoryCreateFenceStore)
+	memory.mu.Lock()
+	anchored := memory.records[claim.UID]
+	memory.mu.Unlock()
+	if anchored.Phase != createFenceIssued || anchored.CreatedVMUUID == "" || anchored.ObservedVMUUID != "" {
+		t.Fatalf("post-crash fence = %#v, want issued exact UUID without materialization", anchored)
+	}
+	providerB, err := New(cloud, resolver, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := providerB.Create(ctx, claim.DeepCopy())
+	if err != nil {
+		t.Fatalf("Create() after provider restart = %v", err)
+	}
+	id, err := providerid.Parse(created.Status.ProviderID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cloud.requests) != 2 {
+		t.Fatalf("cloud CreateVM requests = %d, want initial launch plus restart adoption", len(cloud.requests))
+	}
+	retry := cloud.requests[1]
+	if retry.CreatedVMUUID != id.VMUUID || retry.CreateAttemptAllowPOST {
+		t.Fatalf("restart request anchor/POST authority = %q/%t, want %q/false", retry.CreatedVMUUID, retry.CreateAttemptAllowPOST, id.VMUUID)
+	}
+	vms, err := cloud.ListVMs(ctx, nodeClass.Spec.Location, nodeClass.Spec.ClusterName)
+	if err != nil || len(vms) != 1 {
+		t.Fatalf("restart materialized %d VMs, want one (err=%v)", len(vms), err)
+	}
+}
+
+type recordingCreateRequestCloud struct {
+	*cloudfake.Cloud
+	requests        []cloudapi.CreateVMRequest
+	failAfterAnchor bool
+}
+
+func (c *recordingCreateRequestCloud) CreateVM(ctx context.Context, request cloudapi.CreateVMRequest) (*cloudapi.VM, error) {
+	c.requests = append(c.requests, request)
+	vm, err := c.Cloud.CreateVM(ctx, request)
+	if err == nil && c.failAfterAnchor {
+		c.failAfterAnchor = false
+		return nil, fmt.Errorf("%w: simulated process loss after durable created-VM anchor", cloudapi.ErrCreateAttemptPending)
+	}
+	return vm, err
+}
+
+func TestProviderPersistsDefinitiveCreateRejection(t *testing.T) {
+	ctx := context.Background()
+	nodeClass := readyProviderNodeClass()
+	resolver := NewStaticResolver(nodeClass)
+	resolver.SetToken(inspacev1.RKE2AgentTokenSecretName, inspacev1.RKE2AgentTokenSecretKey, "agent-token")
+	store := NewMemoryCreateFenceStore()
+	opts := providerOptions(nodeClass)
+	opts.CreateFenceStore = store
+	cloud := &definitiveRejectCloud{Cloud: cloudfake.New()}
+	provider, err := New(cloud, resolver, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim := &karpv1.NodeClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: "general-reject1", UID: types.UID("rejected-claim"), Labels: map[string]string{karpv1.NodePoolLabelKey: "general"}},
+		Spec:       karpv1.NodeClaimSpec{NodeClassRef: &karpv1.NodeClassReference{Group: inspacev1.Group, Kind: inspacev1.Kind, Name: nodeClass.Name}},
+	}
+	if _, err := provider.Create(ctx, claim); !errors.Is(err, cloudapi.ErrCreateAttemptRejected) {
+		t.Fatalf("Create() error = %v, want definitive rejection", err)
+	}
+	memory := store.(*memoryCreateFenceStore)
+	memory.mu.Lock()
+	record, ok := memory.records[claim.UID]
+	memory.mu.Unlock()
+	if !ok || record.Phase != createFenceRejected || record.IssuedAt == nil {
+		t.Fatalf("persisted rejected fence = %#v, exists=%t", record, ok)
+	}
+}
+
+type definitiveRejectCloud struct{ *cloudfake.Cloud }
+
+func (c *definitiveRejectCloud) CreateVM(ctx context.Context, request cloudapi.CreateVMRequest) (*cloudapi.VM, error) {
+	if request.AuthorizeLaunch == nil {
+		return nil, fmt.Errorf("missing create authorization")
+	}
+	if err := request.AuthorizeLaunch(ctx, cloudapi.CreateAuthorizationPost); err != nil {
+		return nil, err
+	}
+	return nil, fmt.Errorf("%w: fixture rejected the SDK request", cloudapi.ErrCreateAttemptRejected)
 }
 
 func TestCreateGatesCachedWorkersOnHealthWithoutProbingDirectMode(t *testing.T) {
@@ -435,6 +640,12 @@ func TestCreateGatesCachedWorkersOnHealthWithoutProbingDirectMode(t *testing.T) 
 			if listErr != nil || len(vms) != test.wantVMs {
 				t.Fatalf("VMs after probe = %d, want %d (err=%v)", len(vms), test.wantVMs, listErr)
 			}
+			if len(vms) == 1 {
+				request, found := cloud.Request(vms[0].UUID)
+				if !found || request.NodePoolName != "" {
+					t.Fatalf("private worker request persisted NodePool identity: found=%t NodePool=%q", found, request.NodePoolName)
+				}
+			}
 		})
 	}
 }
@@ -463,6 +674,7 @@ func TestGetInstanceTypesRejectsNodeClassServicePoolDifferentFromController(t *t
 		NetworkUUID:             nodeClass.Spec.NetworkUUID,
 		ControlPlaneVIP:         "10.0.0.10",
 		PrivateLoadBalancerPool: inspacev1.PrivateLoadBalancerPool{Start: "10.0.0.220", Stop: "10.0.0.235"},
+		CreateFenceStore:        NewMemoryCreateFenceStore(),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -650,6 +862,7 @@ func providerOptions(nodeClass *inspacev1.InSpaceNodeClass) Options {
 		ClusterName: nodeClass.Spec.ClusterName, DefaultNodeClassName: nodeClass.Name,
 		NetworkUUID: nodeClass.Spec.NetworkUUID, ControlPlaneVIP: vip.String(),
 		PrivateLoadBalancerPool: nodeClass.Spec.PrivateLoadBalancerPool,
+		CreateFenceStore:        NewMemoryCreateFenceStore(),
 	}
 }
 

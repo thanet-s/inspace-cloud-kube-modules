@@ -57,6 +57,37 @@ func (c *Client) CreateFirewall(ctx context.Context, location string, input Crea
 	return &result, err
 }
 
+// UpdateFirewall replaces a firewall's mutable name, description, and rules.
+// Existing rule UUIDs are sent back to the API when supplied by the caller.
+func (c *Client) UpdateFirewall(ctx context.Context, location, firewallUUID string, input UpdateFirewallRequest) (*Firewall, error) {
+	if err := validateUUID("firewall", firewallUUID); err != nil {
+		return nil, err
+	}
+	if !locationPattern.MatchString(input.Name) {
+		return nil, errors.New("inspace: firewall name must be a non-empty lowercase DNS label")
+	}
+	if len(input.Rules) == 0 {
+		return nil, errors.New("inspace: firewall must have at least one rule")
+	}
+	for _, rule := range input.Rules {
+		if rule.UUID != "" {
+			if err := validateUUID("firewall rule", rule.UUID); err != nil {
+				return nil, err
+			}
+		}
+		if err := validateFirewallRule(rule); err != nil {
+			return nil, err
+		}
+	}
+	path, err := c.locationPath(location, "network/firewalls/"+firewallUUID)
+	if err != nil {
+		return nil, err
+	}
+	var result Firewall
+	err = c.doJSON(ctx, http.MethodPut, path, nil, input, &result)
+	return &result, err
+}
+
 func (c *Client) DeleteFirewall(ctx context.Context, location, firewallUUID string) error {
 	if err := validateUUID("firewall", firewallUUID); err != nil {
 		return err

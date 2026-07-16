@@ -75,9 +75,14 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	createFences, err := provider.NewKubernetesCreateFenceStore(op.GetClient(), op.GetAPIReader())
+	if err != nil {
+		return err
+	}
 	undecorated, err := provider.New(cloud, resolver, provider.Options{
 		ClusterName: cfg.clusterName, DefaultNodeClassName: cfg.defaultNodeClass, Location: cfg.location,
 		NetworkUUID: cfg.networkUUID, ControlPlaneVIP: cfg.controlPlaneVIP, PrivateLoadBalancerPool: cfg.privateLoadBalancerPool,
+		CreateFenceStore: createFences,
 	})
 	if err != nil {
 		return err
@@ -90,11 +95,15 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	createFenceController, err := provider.NewCreateFenceController(op.GetClient(), op.GetAPIReader(), cloud)
+	if err != nil {
+		return err
+	}
 	allControllers := controllers.NewControllers(
 		ctx, op.Manager, op.Clock, op.GetClient(), op.EventRecorder, cloudProvider,
 		undecorated, clusterState, op.InstanceTypeStore,
 	)
-	allControllers = append(allControllers, nodeClassController)
+	allControllers = append(allControllers, nodeClassController, createFenceController)
 	op.WithControllers(ctx, allControllers...).Start(ctx)
 	return nil
 }

@@ -326,7 +326,13 @@
     e2e_state: "{{ lookup('file', lookup('env', 'E2E_STATE_DIR') + '/state.json') | from_json }}"
     e2e_node_lb_baseline: "{{ lookup('env', 'E2E_STATE_DIR') }}/node-load-balancer-baseline.json"
     e2e_node_lb_manifest: "{{ lookup('env', 'E2E_STATE_DIR') }}/node-load-balancer.yaml"
+    e2e_node_lb_shared_expansion_manifest: "{{ lookup('env', 'E2E_STATE_DIR') }}/node-load-balancer-shared-expansion.yaml"
     e2e_node_lb_expansion_manifest: "{{ lookup('env', 'E2E_STATE_DIR') }}/node-load-balancer-expansion.yaml"
+    e2e_node_lb_initial_snapshot: "{{ lookup('env', 'E2E_STATE_DIR') }}/node-load-balancer-initial.json"
+    e2e_node_lb_expanded_snapshot: "{{ lookup('env', 'E2E_STATE_DIR') }}/node-load-balancer-expanded.json"
+    e2e_node_lb_recreated_snapshot: "{{ lookup('env', 'E2E_STATE_DIR') }}/node-load-balancer-recreated.json"
+    e2e_node_lb_probe_stop: "{{ lookup('env', 'E2E_STATE_DIR') }}/node-load-balancer-probe.stop"
+    e2e_node_lb_probe_ready: "{{ lookup('env', 'E2E_STATE_DIR') }}/node-load-balancer-probe.ready"
     e2e_nodepool_name: "general"
     e2e_marker: "inspace-e2e-{{ lookup('env', 'E2E_RUN_ID') }}"
   environment:
@@ -1265,9 +1271,15 @@
         dest: "{{ e2e_node_lb_expansion_manifest }}"
         mode: "0600"
 
+    - name: Render the non-conflicting shared Node-LB expansion
+      ansible.builtin.template:
+        src: templates/node-load-balancer-shared-expansion.yaml.j2
+        dest: "{{ e2e_node_lb_shared_expansion_manifest }}"
+        mode: "0600"
+
     - name: Exercise shared conflict and dedicated public Node-LB modes
       block:
-        - name: Create the Node-LB workload and established shared pair
+        - name: Create the Node-LB workload and establish Traefik first
           ansible.builtin.command:
             argv:
               - kubectl
@@ -1301,60 +1313,217 @@
               - --timeout=10m
           changed_when: false
 
-        - name: Require the mixed Traefik and sibling Services to establish one shared private-VIP datapath shard
-          ansible.builtin.shell: |
-            set -euo pipefail
-            services=$(kubectl -n default get services -o json)
-            jq -e '
-              def named($name):
-                [.items[] | select(.metadata.name == $name)] |
-                if length == 1 then .[0] else error("missing exact Service/" + $name) end;
-              def ownedDatapath($parent):
-                [.items[] | select(
-                  .metadata.labels["inspace.cloud/node-lb-datapath"] == "true" and
-                  (.metadata.ownerReferences // []) == [{
-                    "apiVersion": "v1", "blockOwnerDeletion": true, "controller": true,
-                    "kind": "Service", "name": $parent.metadata.name, "uid": $parent.metadata.uid
-                  }]
-                )] |
-                if length == 1 then .[0]
-                else error("missing exact owned datapath for Service/" + $parent.metadata.name)
-                end;
-              named("inspace-e2e-node-traefik") as $a |
-              named("inspace-e2e-node-shared-b") as $b |
-              ownedDatapath($a) as $datapathA |
-              ownedDatapath($b) as $datapathB |
-              ($a.metadata.annotations["service.inspace.cloud/node-lb-shard"] // "") as $shard |
-              ($shard | test("^inlb-[0-9a-f]{8}$")) and
-              $b.metadata.annotations["service.inspace.cloud/node-lb-shard"] == $shard and
-              $a.metadata.annotations["service.inspace.cloud/node-lb-datapath-active-shard"] == $shard and
-              $b.metadata.annotations["service.inspace.cloud/node-lb-datapath-active-shard"] == $shard and
-              all([$datapathA, $datapathB][];
-                (.metadata.name | test("^inlb-dp-[0-9a-f]{52}$")) and
-                (.metadata.labels["inspace.cloud/node-lb-service-id"] | test("^[0-9a-f]{52}$")) and
-                .metadata.name == ("inlb-dp-" + .metadata.labels["inspace.cloud/node-lb-service-id"]) and
-                .spec.loadBalancerClass == "inspace.cloud/node-datapath" and
-                .spec.allocateLoadBalancerNodePorts == false and
-                (.spec.externalIPs // []) == [] and
-                all(.spec.ports[]; (.nodePort // 0) == 0) and
-                .metadata.labels["inspace.cloud/node-lb-datapath"] == "true" and
-                .metadata.annotations["service.inspace.cloud/node-lb-datapath-shard"] == $shard) and
-              all([$datapathA, $datapathB][];
-                (.status.loadBalancer.ingress | length) == 1 and
-                .status.loadBalancer.ingress[0].ipMode == "VIP") and
-              all([$a, $b][];
-                (.status.loadBalancer.ingress | length) == 1 and
-                .status.loadBalancer.ingress[0].ipMode == "Proxy") and
-              $a.status.loadBalancer.ingress[0].ip == $b.status.loadBalancer.ingress[0].ip and
-              $datapathA.status.loadBalancer.ingress[0].ip == $datapathB.status.loadBalancer.ingress[0].ip and
-              $a.status.loadBalancer.ingress[0].ip != $datapathA.status.loadBalancer.ingress[0].ip' <<<"$services"
-          args:
-            executable: /bin/bash
-          register: e2e_node_lb_shared_pair
+        - name: Capture the established Traefik shard firewall and readiness identities
+          ansible.builtin.command:
+            argv:
+              - /opt/e2e/scripts/verify-node-load-balancer.py
+              - --state
+              - "{{ e2e_state_file }}"
+              - --kubeconfig
+              - "{{ e2e_kubeconfig }}"
+              - --expect
+              - present
+              - --baseline
+              - "{{ e2e_node_lb_baseline }}"
+              - --service
+              - inspace-e2e-node-traefik
+          register: e2e_node_lb_initial_proof
           changed_when: false
           retries: 180
           delay: 10
-          until: e2e_node_lb_shared_pair.rc == 0
+          until: e2e_node_lb_initial_proof.rc == 0
+          no_log: true
+
+        - name: Persist the immutable established Traefik shard snapshot
+          ansible.builtin.copy:
+            content: "{{ e2e_node_lb_initial_proof.stdout }}\n"
+            dest: "{{ e2e_node_lb_initial_snapshot }}"
+            mode: "0600"
+          no_log: true
+
+        - name: Reset the retained Traefik continuity probe fence
+          ansible.builtin.file:
+            path: "{{ item }}"
+            state: absent
+          loop:
+            - "{{ e2e_node_lb_probe_stop }}"
+            - "{{ e2e_node_lb_probe_ready }}"
+
+        - name: Continuously probe retained Traefik traffic across every shard policy mutation
+          ansible.builtin.command:
+            argv:
+              - /opt/e2e/scripts/continuous-http-probe.py
+              - --url
+              - "http://{{ (e2e_node_lb_initial_proof.stdout | from_json).services['inspace-e2e-node-traefik'].ip }}:80/"
+              - --expected
+              - "{{ e2e_marker }}-node-traefik-http"
+              - --stop-file
+              - "{{ e2e_node_lb_probe_stop }}"
+              - --ready-file
+              - "{{ e2e_node_lb_probe_ready }}"
+              - --overall-timeout
+              - "7200"
+          async: 7500
+          poll: 0
+          register: e2e_node_lb_continuity_job
+          changed_when: false
+          no_log: true
+
+        - name: Require retained Traefik continuity monitoring before mutation
+          ansible.builtin.wait_for:
+            path: "{{ e2e_node_lb_probe_ready }}"
+            state: present
+            timeout: 30
+
+        - name: Add the non-conflicting shared Node-LB sibling
+          ansible.builtin.command:
+            argv:
+              - kubectl
+              - apply
+              - --server-side
+              - --field-manager=inspace-e2e
+              - -f
+              - "{{ e2e_node_lb_shared_expansion_manifest }}"
+          changed_when: true
+
+        - name: Journal the first shared sibling identity
+          ansible.builtin.command:
+            argv:
+              - /opt/e2e/scripts/persist-workload.py
+              - --state
+              - "{{ e2e_state_file }}"
+              - --kubeconfig
+              - "{{ e2e_kubeconfig }}"
+          changed_when: true
+          no_log: true
+
+        - name: Prove in-place aggregate firewall expansion without a Node readiness flap
+          ansible.builtin.command:
+            argv:
+              - /opt/e2e/scripts/verify-node-load-balancer.py
+              - --state
+              - "{{ e2e_state_file }}"
+              - --kubeconfig
+              - "{{ e2e_kubeconfig }}"
+              - --expect
+              - present
+              - --baseline
+              - "{{ e2e_node_lb_baseline }}"
+              - --service
+              - inspace-e2e-node-traefik
+              - --service
+              - inspace-e2e-node-shared-b
+              - --anchor
+              - "{{ e2e_node_lb_initial_snapshot }}"
+              - --policy-change
+              - expanded
+          register: e2e_node_lb_expanded_proof
+          changed_when: false
+          retries: 180
+          delay: 10
+          until: e2e_node_lb_expanded_proof.rc == 0
+          no_log: true
+
+        - name: Persist the first expanded aggregate firewall snapshot
+          ansible.builtin.copy:
+            content: "{{ e2e_node_lb_expanded_proof.stdout }}\n"
+            dest: "{{ e2e_node_lb_expanded_snapshot }}"
+            mode: "0600"
+          no_log: true
+
+        - name: Delete the shared sibling while retaining Traefik
+          ansible.builtin.command:
+            argv:
+              - kubectl
+              - -n
+              - default
+              - delete
+              - service/inspace-e2e-node-shared-b
+              - --wait=false
+          changed_when: true
+
+        - name: Prove in-place aggregate firewall shrink without a Node readiness flap
+          ansible.builtin.command:
+            argv:
+              - /opt/e2e/scripts/verify-node-load-balancer.py
+              - --state
+              - "{{ e2e_state_file }}"
+              - --kubeconfig
+              - "{{ e2e_kubeconfig }}"
+              - --expect
+              - present
+              - --baseline
+              - "{{ e2e_node_lb_baseline }}"
+              - --service
+              - inspace-e2e-node-traefik
+              - --anchor
+              - "{{ e2e_node_lb_expanded_snapshot }}"
+              - --policy-change
+              - shrunk
+          register: e2e_node_lb_shrunk_proof
+          changed_when: false
+          retries: 180
+          delay: 10
+          until: e2e_node_lb_shrunk_proof.rc == 0
+          no_log: true
+
+        - name: Recreate the same shared sibling Service name
+          ansible.builtin.command:
+            argv:
+              - kubectl
+              - apply
+              - --server-side
+              - --field-manager=inspace-e2e
+              - -f
+              - "{{ e2e_node_lb_shared_expansion_manifest }}"
+          changed_when: true
+
+        - name: Journal the recreated shared sibling UID
+          ansible.builtin.command:
+            argv:
+              - /opt/e2e/scripts/persist-workload.py
+              - --state
+              - "{{ e2e_state_file }}"
+              - --kubeconfig
+              - "{{ e2e_kubeconfig }}"
+          changed_when: true
+          no_log: true
+
+        - name: Prove same-name new-UID recreation reuses the aggregate shard firewall safely
+          ansible.builtin.command:
+            argv:
+              - /opt/e2e/scripts/verify-node-load-balancer.py
+              - --state
+              - "{{ e2e_state_file }}"
+              - --kubeconfig
+              - "{{ e2e_kubeconfig }}"
+              - --expect
+              - present
+              - --baseline
+              - "{{ e2e_node_lb_baseline }}"
+              - --service
+              - inspace-e2e-node-traefik
+              - --service
+              - inspace-e2e-node-shared-b
+              - --anchor
+              - "{{ e2e_node_lb_expanded_snapshot }}"
+              - --policy-change
+              - same
+              - --require-new-uid
+              - inspace-e2e-node-shared-b
+          register: e2e_node_lb_recreated_proof
+          changed_when: false
+          retries: 180
+          delay: 10
+          until: e2e_node_lb_recreated_proof.rc == 0
+          no_log: true
+
+        - name: Persist the recreated shared aggregate firewall snapshot
+          ansible.builtin.copy:
+            content: "{{ e2e_node_lb_recreated_proof.stdout }}\n"
+            dest: "{{ e2e_node_lb_recreated_snapshot }}"
+            mode: "0600"
+          no_log: true
 
         - name: Add the conflicting shared and dedicated Node-LB Services
           ansible.builtin.command:
@@ -1390,6 +1559,10 @@
               - present
               - --baseline
               - "{{ e2e_node_lb_baseline }}"
+              - --anchor
+              - "{{ e2e_node_lb_recreated_snapshot }}"
+              - --policy-change
+              - same
           register: e2e_node_lb_proof
           changed_when: false
           retries: 180
@@ -1437,78 +1610,27 @@
             executable: /bin/bash
           changed_when: false
 
-        - name: Delete one shared Node-LB member without deleting its sibling shard
-          ansible.builtin.command:
-            argv:
-              - kubectl
-              - -n
-              - default
-              - delete
-              - service/inspace-e2e-node-shared-b
-              - --wait=false
-          changed_when: true
+        - name: Stop the retained Traefik continuity probe after all mutations
+          ansible.builtin.file:
+            path: "{{ e2e_node_lb_probe_stop }}"
+            state: touch
 
-        - name: Prove partial shared-member cleanup preserves the exact sibling resources
-          ansible.builtin.command:
-            argv:
-              - /opt/e2e/scripts/verify-node-load-balancer.py
-              - --state
-              - "{{ e2e_state_file }}"
-              - --kubeconfig
-              - "{{ e2e_kubeconfig }}"
-              - --expect
-              - partial
-              - --baseline
-              - "{{ e2e_node_lb_baseline }}"
-              - --deleted-firewall
-              - "{{ e2e_node_lb_result.services['inspace-e2e-node-shared-b'].firewallUUID }}"
-              - --retained-shard
-              - "{{ e2e_node_lb_result.services['inspace-e2e-node-traefik'].shard }}"
-              - --retained-vm
-              - "{{ e2e_node_lb_result.services['inspace-e2e-node-traefik'].vmUUID }}"
-              - --retained-ip
-              - "{{ e2e_node_lb_result.services['inspace-e2e-node-traefik'].ip }}"
-              - --retained-icmp-firewall
-              - "{{ e2e_node_lb_result.icmpFirewallUUID }}"
-              - --retained-service-firewall
-              - "{{ e2e_node_lb_result.services['inspace-e2e-node-traefik'].firewallUUID }}"
-          register: e2e_node_lb_partial_proof
+        - name: Require every retained Traefik continuity probe to have succeeded
+          ansible.builtin.async_status:
+            jid: "{{ e2e_node_lb_continuity_job.ansible_job_id }}"
+          register: e2e_node_lb_continuity_result
           changed_when: false
-          retries: 180
-          delay: 10
-          until: e2e_node_lb_partial_proof.rc == 0
+          retries: 30
+          delay: 1
+          until: e2e_node_lb_continuity_result.finished
           no_log: true
-
-        - name: Read the partial Node-LB proof
-          ansible.builtin.set_fact:
-            e2e_node_lb_partial_result: "{{ e2e_node_lb_partial_proof.stdout | from_json }}"
-          no_log: true
-
-        - name: Assert the exact surviving Service firewall identity after partial cleanup
-          ansible.builtin.assert:
-            that:
-              - >-
-                e2e_node_lb_partial_result.retainedServiceFirewallUUID ==
-                e2e_node_lb_result.services['inspace-e2e-node-traefik'].firewallUUID
-            fail_msg: The retained shared Service firewall UUID changed during partial cleanup
-
-        - name: Prove the retained mixed and other TCP backends after partial cleanup
-          ansible.builtin.uri:
-            url: "http://{{ item.ip }}:{{ item.port }}/"
-            return_content: true
-            timeout: 10
-            use_proxy: false
-          loop: "{{ e2e_node_lb_partial_result.httpProbes }}"
-          loop_control:
-            label: "{{ item.service }} via {{ item.ip }}:{{ item.port }}"
-          register: e2e_node_lb_partial_http
-          retries: 60
-          delay: 5
-          until: >-
-            e2e_node_lb_partial_http.status == 200 and
-            (e2e_node_lb_partial_http.content | trim) ==
-            (e2e_marker ~ '-' ~ item.markerSuffix)
       always:
+        - name: Stop any retained Node-LB continuity probe before cleanup
+          ansible.builtin.file:
+            path: "{{ e2e_node_lb_probe_stop }}"
+            state: touch
+          when: e2e_node_lb_continuity_job is defined
+
         - name: Delete every Node-LB acceptance Service and workload owner
           ansible.builtin.command:
             argv:
@@ -1516,6 +1638,8 @@
               - delete
               - -f
               - "{{ e2e_node_lb_expansion_manifest }}"
+              - -f
+              - "{{ e2e_node_lb_shared_expansion_manifest }}"
               - -f
               - "{{ e2e_node_lb_manifest }}"
               - --ignore-not-found
@@ -1592,5 +1716,5 @@
           Full InSpace RKE2/Cilium-native-routing/kube-proxy-replacement,
           CCM, CSI RWO, Karpenter, two same-port private LB-IPAM/L2 VIPs,
           L2 lease failover, explicit paid TCP NLB, and shared/conflict/dedicated
-          public-Proxy/private-VIP NodeLB TCP/UDP/ICMP and partial-member cleanup
+          public-Proxy/private-VIP NodeLB TCP/UDP/ICMP and aggregate-firewall mutation safety
           E2E passed; cleanup follows.

@@ -92,21 +92,34 @@ exact-one-firewall rule. CCM-generated public load-balancer NodeClasses use
 `public-node-load-balancer`: the base firewall remains private, while additional
 firewalls are accepted only under two exact contracts:
 
-- A Service firewall is named
-  `inlb-<cluster-hash>-<Service-UID>-<policy-hash>` and contains only canonical
-  explicit inbound TCP/UDP single-port rules. Its hash covers protocol, port,
-  and canonical IPv4 source ranges; ICMP and outbound rules are forbidden.
+- At most one shard firewall is named
+  `inlb-<cluster-ownership-hash>-shard-<shard-hash>`. Its stable name does not
+  include the mutable policy hash. It contains the canonical aggregate of
+  unique inbound TCP/UDP single-port rules for that shard; each rule contains
+  either the owning Service's exact canonical IPv4 source ranges or Any. ICMP,
+  outbound rules, and duplicate `(protocol, port)` claims are forbidden.
 - At most one cluster firewall is named
   `inlb-<cluster-ownership-hash>-icmp-<policy-hash>` and contains exactly one
   portless inbound ICMP-from-Any rule. InSpace has no ICMP type/code filter, so
   it permits all IPv4 ICMP from Any.
 
 The cluster ICMP firewall may be absent during initial VM launch; CCM attaches
-the shared firewall only after the authoritative Kubernetes identity exists and
-does not advertise that node until it and all required Service firewalls are
-visible. Foreign, unowned, malformed, duplicate cluster-ICMP, or hash-drifted
-additional assignments fail the VM audit. Firewall descriptions are not
-ownership authority because InSpace omits them from readback.
+the shared firewall and at most one aggregate shard firewall only after the
+authoritative Kubernetes identity exists. It attaches the aggregate once while
+the node is not publicly advertised and requires exact readback before enabling
+readiness and status. An authorized Node-LB VM therefore has exactly its private
+base firewall, the shared cluster ICMP firewall, and at most one shard firewall.
+Foreign, unowned, malformed, duplicate cluster-ICMP, or multiple-shard
+assignments fail the VM audit. Firewall descriptions are not ownership
+authority because InSpace omits them from readback.
+
+CCM owns aggregate policy convergence: it stores the applied and pending policy
+hashes outside the stable firewall name and updates the same UUID in place with
+`PUT`. The Karpenter audit validates stable shard ownership and canonical rule
+shape; it never mutates the public policy. A transient NotReady condition causes
+CCM to withdraw readiness and Service status while retaining the firewall
+assignment. The assignment is detached only for node deletion or replacement
+and last-owner shard cleanup.
 
 The provider uses a fail-closed sequence:
 
@@ -124,9 +137,8 @@ The provider uses a fail-closed sequence:
 5. As the first post-POST mutation, assign the prevalidated firewall using the
    returned VM UUID. Require authoritative read-back of the exact base policy
    and assignment. Ordinary workers require exactly that one firewall. Public
-   node-load-balancer workers require the base exactly once and permit only
-   audited CCM Service firewalls plus at most one audited cluster ICMP
-   firewall.
+   node-load-balancer workers require the base exactly once and permit only one
+   audited CCM shard aggregate plus at most one audited cluster ICMP firewall.
 6. Read back the VM until its complete NodeClaim ownership/spec record, exact
    name, capacity, image, host pool, VPC, billing account, and one correctly
    sized primary root disk are persisted.
@@ -156,8 +168,10 @@ the provider does not issue another VM or Floating-IP create request. A fresh
 POST uses the preflight-validated firewall UUID for immediate protective
 attachment before canonical VM convergence. Cancellation after the POST does
 not cancel this bounded safety read-back. A valid UUID returned alongside any
-error is used only as a protective-attachment anchor; canonical v3 ownership
-is still required for adoption or deletion. A nil/UUID-less response is
+error is persisted before further cloud work and is authority only to protect
+or security-roll back that exact VM. Canonical v3 ownership is still required
+for adoption and normal ProviderID deletion; fenced rollback never treats the
+UUID as authority over an uncorrelated Floating IP. A nil/UUID-less response is
 recovered by deterministic reads without issuing a second POST, and the
 firewall is attached as soon as one unique valid UUID becomes visible. An existing owned VM is instead
 fully read and validated before any mutation. Conflicting policy or a foreign
@@ -166,20 +180,25 @@ established VM; if the VM has no base firewall and the intended assignment
 cannot be restored, the canonically owned public VM is deleted rather than left
 exposed. A fresh successful POST whose firewall
 attachment or canonical ownership cannot be proven is rolled back. Cleanup
-first tries to durably name and delete the exact auto-FIP; if that address
+first tries to retain the exact auto-FIP identity, then deletes the exact VM,
+proves Get/List/VPC absence, deletes only the correlated FIP, proves both VM
+and FIP-assignment absence, and finally detaches firewalls. If the address
 remains invisible, security takes priority and the fresh public VM is deleted
-without guessing at a nameless FIP. Cleanup uncertainty is joined to the
+without guessing at a nameless FIP; its create-protection finalizer continues
+tracking every post-baseline dependent through the original ambiguity window.
+Cleanup uncertainty is joined to the
 launch error, and the firewall stays attached if VM deletion is uncertain. A temporary adoption
 read-back failure is returned for reconciliation without destroying that VM. A
 fresh or late-ambiguously-committed VM whose private address equals its
 ownership-recorded supervisor VIP or falls inside its ownership-recorded
 Service VIP range is unsafe and is rolled back. The same drift on an
 established VM fails closed without destructive mutation; generic ownership
-mismatches are never deleted. Delete removes the
-named Floating IP before deleting the VM. One VM-detail 404 never authorizes
-cleanup: an already-missing VM must be absent from both `GetVM` and `ListVMs`
-in two consecutive bounded observations before its orphan floating IP or
-firewall assignments are changed.
+mismatches are never deleted. Normal deletion preflights exact ownership,
+always dispatches the idempotent ProviderID UUID delete, proves core VM
+absence, cleans the exact named Floating IP, proves VM and assignment absence
+again, and only then detaches firewalls. One VM-detail 404 never authorizes
+dependent cleanup: an already-missing VM must be absent from `GetVM`,
+`ListVMs`, and the configured VPC in repeated bounded observations.
 A later owned detail resumes the normal ownership-checked delete path; any
 presence uncertainty fails without mutation. Create POSTs are never blindly
 retried; read-before-create ownership records recover ambiguous responses.
@@ -284,7 +303,7 @@ internal `inspace.cloud/node-datapath` class, `Service.spec.externalIPs`, and
 scheduling onto Node-LB nodes through their taint/toleration or direct
 selectors. The generated `NoSchedule` taint is only a placement guard.
 
-Worker network policy relies on the validated InSpace cloud firewall. Generated bootstrap does not install or enable UFW. One `set -eu` orchestrator runs every bootstrap stage in order, executes `additionalUserData`, reapplies the required node tuning, then disables and verifies UFW before it can start RKE2. The RKE2 service also has an `ExecStartPre` verifier, so initial launch and later restarts fail unless `ufw status` is inactive and its unit is inactive and disabled (an absent unit is safe). It never flushes or rewrites iptables/nftables, which belong to Cilium and RKE2. The adapter replaces a single strict VPC-subnet placeholder with the exact API-reported prefix before VM creation. Bootstrap then requires exactly one guest address in that prefix and writes it as `node-ip`; it never chooses the default interface or mistakes the floating address for a NIC address. It does not set `node-external-ip` and has no external-address placeholder. The external CCM is authoritative: it reads the VM's private address and exact Floating-IP assignment from the InSpace API and publishes them as `InternalIP` and `ExternalIP`. InSpace service targets use the private node address. Deletion removes the Floating IP first, deletes the VM, and only then removes every stale firewall attachment for that exact VM UUID.
+Worker network policy relies on the validated InSpace cloud firewall. Generated bootstrap does not install or enable UFW. One `set -eu` orchestrator runs every bootstrap stage in order, executes `additionalUserData`, reapplies the required node tuning, then disables and verifies UFW before it can start RKE2. The RKE2 service also has an `ExecStartPre` verifier, so initial launch and later restarts fail unless `ufw status` is inactive and its unit is inactive and disabled (an absent unit is safe). It never flushes or rewrites iptables/nftables, which belong to Cilium and RKE2. The adapter replaces a single strict VPC-subnet placeholder with the exact API-reported prefix before VM creation. Bootstrap then requires exactly one guest address in that prefix and writes it as `node-ip`; it never chooses the default interface or mistakes the floating address for a NIC address. It does not set `node-external-ip` and has no external-address placeholder. The external CCM is authoritative: it reads the VM's private address and exact Floating-IP assignment from the InSpace API and publishes them as `InternalIP` and `ExternalIP`. InSpace service targets use the private node address. Deletion dispatches the exact VM UUID first, proves core absence, removes the exact Floating IP, proves full dependent absence, and only then removes every stale firewall attachment for that UUID.
 
 ## RKE2 agent bootstrap
 
@@ -335,6 +354,97 @@ ownership and deletion remain bound to the original NodeClaim name; Node
 registration binds through the canonical `inspace://<location>/<vm-uuid>`
 provider ID.
 
+## Recover an unresolved VM create fence
+
+An issued VM POST with neither a response UUID nor a provable cloud result is
+intentionally permanent: empty lists cannot prove that a timed-out server-side
+operation will never commit. The provider keeps
+`karpenter.inspace.cloud/create-protection` and returns
+`ErrCreateAttemptUnresolved`. Never delete that finalizer or edit the opaque
+`karpenter.inspace.cloud/create-fence` JSON by hand; either action can orphan a
+billable VM or Floating IP.
+
+Recovery is an explicit, issue-bound protocol:
+
+1. Pause the provider, save the complete NodeClaim, and extract its exact
+   immutable attempt. Replace the namespace if the chart uses another one.
+
+   ```sh
+   NODECLAIM=general-example
+   KARPENTER_NAMESPACE=karpenter
+   REPLICAS=$(kubectl -n "$KARPENTER_NAMESPACE" get deploy \
+     -l app.kubernetes.io/component=karpenter \
+     -o jsonpath='{.items[0].spec.replicas}')
+   kubectl -n "$KARPENTER_NAMESPACE" scale deploy \
+     -l app.kubernetes.io/component=karpenter --replicas=0
+   kubectl get nodeclaim "$NODECLAIM" -o json >"$NODECLAIM.before-recovery.json"
+   jq -r '.metadata.annotations["karpenter.inspace.cloud/create-fence"] | fromjson' \
+     "$NODECLAIM.before-recovery.json"
+   ```
+
+2. Perform read-only inventory in the fence's exact `location`, `networkUUID`,
+   `billingAccountID`, VM name, and issue time. Save all four views; do not rely
+   on only the dashboard or VM list.
+
+   ```sh
+   LOCATION=$(jq -r '.metadata.annotations["karpenter.inspace.cloud/create-fence"] | fromjson | .cleanup.location' "$NODECLAIM.before-recovery.json")
+   NETWORK_UUID=$(jq -r '.metadata.annotations["karpenter.inspace.cloud/create-fence"] | fromjson | .cleanup.networkUUID' "$NODECLAIM.before-recovery.json")
+   BILLING_ID=$(jq -r '.metadata.annotations["karpenter.inspace.cloud/create-fence"] | fromjson | .cleanup.billingAccountID' "$NODECLAIM.before-recovery.json")
+   curl -fsS -H "apikey: $INSPACE_API_TOKEN" "https://api.inspace.cloud/v1/$LOCATION/user-resource/vm/list" >vm-list.json
+   curl -fsS -H "apikey: $INSPACE_API_TOKEN" "https://api.inspace.cloud/v1/$LOCATION/network/network/$NETWORK_UUID" >vpc.json
+   curl -fsS -H "apikey: $INSPACE_API_TOKEN" "https://api.inspace.cloud/v1/$LOCATION/network/ip_addresses?billing_account_id=$BILLING_ID" >floating-ips.json
+   # Run this for every candidate UUID found in any of those three views.
+   curl -fsS -G -H "apikey: $INSPACE_API_TOKEN" \
+     --data-urlencode "uuid=$VM_UUID" \
+     "https://api.inspace.cloud/v1/$LOCATION/user-resource/vm" >"vm-$VM_UUID.json"
+   ```
+
+   A VM result is acceptable only when one exact UUID has complete v3
+   ownership matching cluster, NodeClaim, VM name, ownership key hash, spec and
+   bootstrap hashes, network, firewall, billing account, VPC membership, and
+   its sole Floating-IP assignment. If there is no candidate, ask InSpace
+   support to confirm that the exact account/location/name/issue-time request
+   has no queued or delayed server-side result. Three empty client reads alone
+   are not that confirmation.
+
+3. Bind the decision to the fence's `issueID`; the controller rejects stale or
+   malformed resolutions. For an exact VM:
+
+   ```sh
+   ISSUE_ID=$(jq -r '.metadata.annotations["karpenter.inspace.cloud/create-fence"] | fromjson | .issueID' "$NODECLAIM.before-recovery.json")
+   RESOLUTION=$(jq -cn --arg issue "$ISSUE_ID" --arg vm "$VM_UUID" \
+     '{schema:"karpenter.inspace.cloud/create-fence-resolution-v1",issueID:$issue,result:"vm",vmUUID:$vm}')
+   kubectl annotate nodeclaim "$NODECLAIM" \
+     karpenter.inspace.cloud/create-fence-resolution="$RESOLUTION" --overwrite
+   ```
+
+   Only after support-confirmed terminal no-commit, use `no-result`:
+
+   ```sh
+   RESOLUTION=$(jq -cn --arg issue "$ISSUE_ID" \
+     '{schema:"karpenter.inspace.cloud/create-fence-resolution-v1",issueID:$issue,result:"no-result"}')
+   kubectl annotate nodeclaim "$NODECLAIM" \
+     karpenter.inspace.cloud/create-fence-resolution="$RESOLUTION" --overwrite
+   ```
+
+4. Resume the original replica count. The controller independently validates
+   and protects an exact VM before anchoring it. For `no-result`, it still
+   requires three authoritative empty List/Get/VPC/FIP observations before
+   marking the attempt rejected. It consumes the resolution annotation only
+   after the durable transition succeeds.
+
+   ```sh
+   kubectl -n "$KARPENTER_NAMESPACE" scale deploy \
+     -l app.kubernetes.io/component=karpenter --replicas="$REPLICAS"
+   kubectl get nodeclaim "$NODECLAIM" -w
+   ```
+
+   An exact VM resumes normal adoption. A `no-result` claim is not granted a
+   second POST; after its fence reports phase `rejected`, delete that NodeClaim
+   normally and let Karpenter create a replacement with a new UID. Leave both
+   finalizers in place so the controller can prove cloud absence and remove
+   only its own create-protection state.
+
 ## Run the controller
 
 Install the upstream Karpenter CRDs, then install the InSpace CRD and controller resources. The controller manifest contains the Karpenter v1.14 core RBAC, provider RBAC, leader-election permissions, and fixed-control-plane scheduling rules for its own service account.
@@ -375,8 +485,8 @@ The real lifecycle test is separately gated and uses resource names beginning
 with `inspace-e2e-`. It creates a VM with `reserve_public_ip=true`, discovers
 and deterministically renames its exact auto-assigned Floating IP, verifies the
 empty VM `public_ipv4` field and existing firewall, exercises get/list/delete,
-audits Floating-IP-before-VM cleanup, and fails if a prefixed VM or Floating IP
-remains:
+audits VM-core-before-Floating-IP and firewall-last cleanup, and fails if a
+prefixed VM or Floating IP remains:
 
 ```sh
 INSPACE_RUN_LIVE_TESTS=true \

@@ -36,6 +36,8 @@ import (
 
 const (
 	nodeLoadBalancerFinalizer                    = "service.inspace.cloud/node-lb"
+	nodeLoadBalancerNodePoolFinalizer            = "inspace.cloud/node-lb-state"
+	nodeLoadBalancerNodeClassFinalizer           = "inspace.cloud/node-lb-cluster-state"
 	annotationNodeLoadBalancerFirewallUUID       = "service.inspace.cloud/node-lb-firewall-uuid"
 	annotationNodeLoadBalancerFirewallHash       = "service.inspace.cloud/node-lb-firewall-hash"
 	annotationNodeLoadBalancerFirewallAbsent     = "service.inspace.cloud/node-lb-firewall-absence-count"
@@ -100,6 +102,61 @@ type nodeLoadBalancerController struct {
 	nodesSynced    cache.InformerSynced
 	servicesSynced cache.InformerSynced
 	queue          workqueue.TypedRateLimitingInterface[string]
+}
+
+// nodeLoadBalancerPlanningServiceError proves that a planning failure belongs
+// to one exact parent Service. Aggregate reconciliation may quarantine that
+// Service without withdrawing healthy siblings.
+type nodeLoadBalancerPlanningServiceError struct {
+	Service *corev1.Service
+	Cause   error
+}
+
+func (err *nodeLoadBalancerPlanningServiceError) Error() string {
+	if err == nil || err.Cause == nil {
+		return "node load balancer: Service planning fault"
+	}
+	return err.Cause.Error()
+}
+
+func (err *nodeLoadBalancerPlanningServiceError) Unwrap() error {
+	if err == nil {
+		return nil
+	}
+	return err.Cause
+}
+
+// nodeLoadBalancerPlanningShardError identifies a fault that cannot safely be
+// assigned to one Service, such as two active children claiming one public
+// port. The whole shard must close until the conflict is repaired.
+type nodeLoadBalancerPlanningShardError struct {
+	Shard string
+	Cause error
+}
+
+func (err *nodeLoadBalancerPlanningShardError) Error() string {
+	if err == nil || err.Cause == nil {
+		return "node load balancer: shard planning fault"
+	}
+	return err.Cause.Error()
+}
+
+func (err *nodeLoadBalancerPlanningShardError) Unwrap() error {
+	if err == nil {
+		return nil
+	}
+	return err.Cause
+}
+
+func planningServiceFault(service *corev1.Service, cause error) error {
+	if service == nil {
+		return cause
+	}
+	return &nodeLoadBalancerPlanningServiceError{Service: service.DeepCopy(), Cause: cause}
+}
+
+func planningShardFault(shard string, cause error) error {
+	return &nodeLoadBalancerPlanningShardError{Shard: shard, Cause: cause}
 }
 
 func newNodeLoadBalancerController(provider *Provider, factory informers.SharedInformerFactory) (*nodeLoadBalancerController, error) {
@@ -203,7 +260,10 @@ func isNodeLoadBalancerService(service *corev1.Service) bool {
 		service.Spec.LoadBalancerClass != nil && *service.Spec.LoadBalancerClass == nodeLoadBalancerClass
 }
 
-func (c *nodeLoadBalancerController) sync(ctx context.Context, key string) error {
+// syncLegacyServiceFirewall is retained temporarily for focused compatibility
+// tests while the stable controller uses the aggregate shard-firewall path.
+// Per-Service firewalls existed only in pre-stable release candidates.
+func (c *nodeLoadBalancerController) syncLegacyServiceFirewall(ctx context.Context, key string) error {
 	namespace, name, err := cache.SplitMetaNamespaceKey(key)
 	if err != nil {
 		return err
@@ -613,7 +673,7 @@ func (c *nodeLoadBalancerController) failNodeLoadBalancerShardClosed(ctx context
 	if !isManagedNodeLoadBalancerShardName(shard) {
 		return cause
 	}
-	nodes, err := c.rawNodesForShard(shard)
+	nodes, err := c.rawNodesForShard(ctx, shard)
 	if err != nil {
 		return errors.Join(cause, err, c.withdrawShardDatapaths(ctx, shard))
 	}
@@ -644,7 +704,7 @@ func (c *nodeLoadBalancerController) failNodeLoadBalancerShardsClosed(
 	result := cause
 	result = errors.Join(result, c.withdrawServiceDatapath(ctx, service))
 	for shard := range shards {
-		nodes, err := c.rawNodesForShard(shard)
+		nodes, err := c.rawNodesForShard(ctx, shard)
 		if err != nil {
 			result = errors.Join(result, err)
 		} else {
@@ -656,7 +716,7 @@ func (c *nodeLoadBalancerController) failNodeLoadBalancerShardsClosed(
 }
 
 func (c *nodeLoadBalancerController) failClusterNodeLoadBalancerClosed(ctx context.Context, cause error) error {
-	nodes, err := c.rawNodesForCluster()
+	nodes, err := c.rawNodesForCluster(ctx)
 	result := cause
 	if err != nil {
 		result = errors.Join(result, err)
@@ -1055,7 +1115,7 @@ func (c *nodeLoadBalancerController) cleanupAbandonedReplacementShard(
 	if len(remaining) != 0 {
 		return false, nil
 	}
-	nodes, err := c.rawNodesForShard(currentShard)
+	nodes, err := c.rawNodesForShard(ctx, currentShard)
 	if err != nil {
 		return false, err
 	}
@@ -1070,7 +1130,7 @@ func (c *nodeLoadBalancerController) cleanupAbandonedReplacementShard(
 	} else if !apierrors.IsNotFound(err) {
 		return false, fmt.Errorf("node load balancer: prove abandoned NodePool %s deletion: %w", currentShard, err)
 	}
-	nodes, err = c.rawNodesForShard(currentShard)
+	nodes, err = c.rawNodesForShard(ctx, currentShard)
 	if err != nil {
 		return false, err
 	}
@@ -1082,9 +1142,15 @@ func (c *nodeLoadBalancerController) planForService(ctx context.Context, target 
 	if err != nil {
 		return nodeLoadBalancerIntent{}, nodeLoadBalancerPlan{}, nodeLoadBalancerShardPlan{}, err
 	}
-	services, err := c.services.List(labels.Everything())
+	liveServices, err := c.provider.kubeClient.CoreV1().Services("").List(ctx, metav1.ListOptions{})
 	if err != nil {
-		return nodeLoadBalancerIntent{}, nodeLoadBalancerPlan{}, nodeLoadBalancerShardPlan{}, err
+		return nodeLoadBalancerIntent{}, nodeLoadBalancerPlan{}, nodeLoadBalancerShardPlan{}, fmt.Errorf(
+			"node load balancer: list authoritative Services for planning: %w", err,
+		)
+	}
+	services := make([]*corev1.Service, 0, len(liveServices.Items))
+	for index := range liveServices.Items {
+		services = append(services, &liveServices.Items[index])
 	}
 	targetFound := false
 	for index, service := range services {
@@ -1129,19 +1195,17 @@ func (c *nodeLoadBalancerController) planForService(ctx context.Context, target 
 		intent, parseErr := parseNodeLoadBalancerService(service, defaults)
 		if parseErr != nil {
 			if containsString(service.Finalizers, nodeLoadBalancerFinalizer) {
-				if quarantineErr := c.quarantineInvalidService(ctx, service); quarantineErr != nil {
-					return nodeLoadBalancerIntent{}, nodeLoadBalancerPlan{}, nodeLoadBalancerShardPlan{}, errors.Join(parseErr, quarantineErr)
-				}
 				quarantined, quarantineErr := c.invalidServiceIsQuarantined(ctx, service)
 				if quarantineErr != nil {
-					return nodeLoadBalancerIntent{}, nodeLoadBalancerPlan{}, nodeLoadBalancerShardPlan{}, errors.Join(parseErr, quarantineErr)
+					return nodeLoadBalancerIntent{}, nodeLoadBalancerPlan{}, nodeLoadBalancerShardPlan{}, planningServiceFault(
+						service, errors.Join(parseErr, quarantineErr),
+					)
 				}
 				if !quarantined {
-					c.queue.AddAfter(service.Namespace+"/"+service.Name, nodeLoadBalancerRetry)
-					return nodeLoadBalancerIntent{}, nodeLoadBalancerPlan{}, nodeLoadBalancerShardPlan{}, fmt.Errorf(
+					return nodeLoadBalancerIntent{}, nodeLoadBalancerPlan{}, nodeLoadBalancerShardPlan{}, planningServiceFault(service, fmt.Errorf(
 						"node load balancer: waiting for invalid Service %s/%s to become non-advertised: %w",
 						service.Namespace, service.Name, parseErr,
-					)
+					))
 				}
 			}
 			// A never-established invalid Service owns no public dataplane. A
@@ -1153,7 +1217,7 @@ func (c *nodeLoadBalancerController) planForService(ctx context.Context, target 
 			continue
 		}
 		if intent.ExistingShard != "" {
-			preserve, preserveErr := c.persistedShardAssignmentMatches(ctx, service, intent)
+			preserve, preserveErr := c.persistedShardAssignmentMatches(ctx, service, intent, reservations)
 			if preserveErr != nil {
 				return nodeLoadBalancerIntent{}, nodeLoadBalancerPlan{}, nodeLoadBalancerShardPlan{}, preserveErr
 			}
@@ -1188,30 +1252,36 @@ func (c *nodeLoadBalancerController) activeDatapathPortReservations(
 		if !isNodeLoadBalancerService(service) && !containsString(service.Finalizers, nodeLoadBalancerFinalizer) {
 			continue
 		}
-		datapath, shard, found, err := c.activeDatapathService(ctx, service)
+		datapath, shard, found, err := c.activeDatapathReservationService(ctx, service)
 		if !found && err == nil {
 			continue
 		}
 		if err != nil {
-			return nil, fmt.Errorf("node load balancer: inspect active datapath reservation for %s/%s: %w", service.Namespace, service.Name, err)
+			return nil, err
 		}
 		ports, err := nodeLoadBalancerPortClaims(datapath)
 		if err != nil {
-			return nil, fmt.Errorf("node load balancer: active datapath reservation for %s/%s has invalid ports: %w", service.Namespace, service.Name, err)
+			return nil, planningServiceFault(service, fmt.Errorf(
+				"node load balancer: active datapath reservation for %s/%s has invalid ports: %w",
+				service.Namespace, service.Name, err,
+			))
 		}
 		owner := string(service.UID)
 		if owner == "" {
-			return nil, fmt.Errorf("node load balancer: active datapath reservation for %s/%s has no Service UID", service.Namespace, service.Name)
+			return nil, planningServiceFault(service, fmt.Errorf(
+				"node load balancer: active datapath reservation for %s/%s has no Service UID",
+				service.Namespace, service.Name,
+			))
 		}
 		if reservations[shard] == nil {
 			reservations[shard] = make(map[nodeLoadBalancerPortClaim]string)
 		}
 		for _, port := range ports {
 			if existing, conflict := reservations[shard][port]; conflict && existing != owner {
-				return nil, fmt.Errorf(
+				return nil, planningShardFault(shard, fmt.Errorf(
 					"node load balancer: active datapaths %s and %s collide on shard %s %s/%d",
 					existing, owner, shard, port.Protocol, port.Port,
-				)
+				))
 			}
 			reservations[shard][port] = owner
 		}
@@ -1219,9 +1289,81 @@ func (c *nodeLoadBalancerController) activeDatapathPortReservations(
 	return reservations, nil
 }
 
-func (c *nodeLoadBalancerController) persistedShardAssignmentMatches(ctx context.Context, service *corev1.Service, intent nodeLoadBalancerIntent) (bool, error) {
+// activeDatapathReservationService validates the immutable ownership and
+// routing identity of an active child, but deliberately reads the child's own
+// ports instead of requiring its full spec to equal the live parent. A parent
+// edit necessarily leaves the old child behind until the controller closes it;
+// those old ports must remain reserved throughout that transition.
+func (c *nodeLoadBalancerController) activeDatapathReservationService(
+	ctx context.Context,
+	service *corev1.Service,
+) (*corev1.Service, string, bool, error) {
+	if service == nil || service.UID == "" {
+		return nil, "", false, planningServiceFault(service, errors.New("node load balancer: reservation parent Service identity is required"))
+	}
+	current, err := c.provider.kubeClient.CoreV1().Services(service.Namespace).Get(ctx, service.Name, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		return nil, "", false, nil
+	}
+	if err != nil {
+		return nil, "", false, fmt.Errorf("node load balancer: read parent Service for active reservation: %w", err)
+	}
+	if current.UID != service.UID {
+		// The informer entry belongs to a deleted generation. It owns no live
+		// reservation for the replacement Service.
+		return nil, "", false, nil
+	}
+	activeShard := current.Annotations[annotationNodeLoadBalancerDatapathActive]
+	child, childErr := c.provider.kubeClient.CoreV1().Services(current.Namespace).Get(
+		ctx, nodeLoadBalancerDatapathName(current), metav1.GetOptions{},
+	)
+	if childErr != nil && !apierrors.IsNotFound(childErr) {
+		return nil, "", false, fmt.Errorf("node load balancer: read active datapath reservation: %w", childErr)
+	}
+	if activeShard == "" {
+		return nil, "", false, nil
+	}
+	if !isManagedNodeLoadBalancerShardName(activeShard) {
+		return nil, activeShard, false, planningServiceFault(current, fmt.Errorf(
+			"node load balancer: parent Service %s/%s has invalid active reservation shard %q",
+			current.Namespace, current.Name, activeShard,
+		))
+	}
+	if apierrors.IsNotFound(childErr) {
+		return nil, activeShard, false, planningServiceFault(current, fmt.Errorf(
+			"node load balancer: active datapath Service %s/%s is missing",
+			current.Namespace, nodeLoadBalancerDatapathName(current),
+		))
+	}
+	classOK := child.Spec.LoadBalancerClass != nil && *child.Spec.LoadBalancerClass == nodeLoadBalancerDatapathClass
+	allocateOK := child.Spec.AllocateLoadBalancerNodePorts != nil && !*child.Spec.AllocateLoadBalancerNodePorts
+	if child.DeletionTimestamp != nil || !nodeLoadBalancerDatapathOwnedByService(child, current) ||
+		child.Annotations[annotationNodeLoadBalancerDatapathShard] != activeShard ||
+		child.Spec.Type != corev1.ServiceTypeLoadBalancer || !classOK || !allocateOK ||
+		child.Spec.ExternalTrafficPolicy != corev1.ServiceExternalTrafficPolicyCluster {
+		return nil, activeShard, false, planningServiceFault(current, fmt.Errorf(
+			"node load balancer: active datapath Service %s/%s lost its immutable reservation identity",
+			current.Namespace, child.Name,
+		))
+	}
+	return child, activeShard, true, nil
+}
+
+func (c *nodeLoadBalancerController) persistedShardAssignmentMatches(
+	ctx context.Context,
+	service *corev1.Service,
+	intent nodeLoadBalancerIntent,
+	reservations nodeLoadBalancerPortReservations,
+) (bool, error) {
 	nodePool, err := c.provider.dynamicClient.Resource(nodePoolGVR).Get(ctx, intent.ExistingShard, metav1.GetOptions{})
 	if apierrors.IsNotFound(err) {
+		if aggregateShardStateWasMaterialized(service.Annotations[annotationNodeLoadBalancerShardStateMaterial], intent.ExistingShard) &&
+			!aggregateShardCleanupWasProven(service.Annotations[annotationNodeLoadBalancerShardCleanupProven], intent.ExistingShard) {
+			return false, planningShardFault(intent.ExistingShard, fmt.Errorf(
+				"node load balancer: materialized persisted shard %s disappeared without cleanup proof",
+				intent.ExistingShard,
+			))
+		}
 		return false, nil
 	}
 	if err != nil {
@@ -1231,18 +1373,34 @@ func (c *nodeLoadBalancerController) persistedShardAssignmentMatches(ctx context
 	if labels[nodeLoadBalancerManagedLabel] != "true" ||
 		labels[nodeLoadBalancerClusterLabel] != c.provider.config.ClusterID ||
 		labels[nodeLoadBalancerShardLabel] != intent.ExistingShard {
+		if aggregateShardStateWasMaterialized(service.Annotations[annotationNodeLoadBalancerShardStateMaterial], intent.ExistingShard) &&
+			!aggregateShardCleanupWasProven(service.Annotations[annotationNodeLoadBalancerShardCleanupProven], intent.ExistingShard) {
+			return false, planningShardFault(intent.ExistingShard, fmt.Errorf(
+				"node load balancer: materialized persisted shard %s lost exact state-anchor ownership",
+				intent.ExistingShard,
+			))
+		}
 		if service.Annotations[annotationNodeLoadBalancerDatapathActive] != "" || len(service.Status.LoadBalancer.Ingress) != 0 {
-			return false, fmt.Errorf("node load balancer: advertised persisted shard %s lacks exact cluster ownership", intent.ExistingShard)
+			return false, planningShardFault(intent.ExistingShard, fmt.Errorf(
+				"node load balancer: advertised persisted shard %s lacks exact cluster ownership",
+				intent.ExistingShard,
+			))
 		}
 		// An unadvertised stale assignment does not own the occupied NodePool.
 		// Drop the assignment and let the reserved-name planner advance to a
 		// collision-free shard rather than retrying the foreign object forever.
 		return false, nil
 	}
+	if !containsString(nodePool.GetFinalizers(), nodeLoadBalancerNodePoolFinalizer) {
+		return false, planningShardFault(intent.ExistingShard, fmt.Errorf(
+			"node load balancer: persisted shard %s lost its state finalizer",
+			intent.ExistingShard,
+		))
+	}
 	if labels[nodeLoadBalancerProfileLabel] != nodeLoadBalancerIntentProfileHash(intent) {
 		return false, nil
 	}
-	datapath, activeShard, found, err := c.activeDatapathService(ctx, service)
+	datapath, activeShard, found, err := c.activeDatapathReservationService(ctx, service)
 	if !found && err == nil {
 		// A matching persisted NodePool is authoritative even before the first
 		// datapath activation. Port conflicts are still checked against all active
@@ -1251,12 +1409,15 @@ func (c *nodeLoadBalancerController) persistedShardAssignmentMatches(ctx context
 		return true, nil
 	}
 	if err != nil {
-		return false, fmt.Errorf("node load balancer: get persisted datapath Service for %s/%s: %w", service.Namespace, service.Name, err)
+		return false, err
 	}
 	if activeShard != intent.ExistingShard {
 		previous := service.Annotations[annotationNodeLoadBalancerPreviousShard]
 		if previous == "" || activeShard != previous {
-			return false, fmt.Errorf("node load balancer: persisted datapath Service for %s/%s has a foreign shard identity", service.Namespace, service.Name)
+			return false, planningServiceFault(service, fmt.Errorf(
+				"node load balancer: persisted datapath Service for %s/%s has a foreign shard identity",
+				service.Namespace, service.Name,
+			))
 		}
 		// During a staged migration the persisted assignment already names the
 		// replacement shard while the active datapath intentionally continues to
@@ -1266,9 +1427,18 @@ func (c *nodeLoadBalancerController) persistedShardAssignmentMatches(ctx context
 	}
 	datapathPorts, err := nodeLoadBalancerPortClaims(datapath)
 	if err != nil {
-		return false, fmt.Errorf("node load balancer: persisted datapath Service for %s/%s has invalid ports: %w", service.Namespace, service.Name, err)
+		return false, planningServiceFault(service, fmt.Errorf(
+			"node load balancer: persisted datapath Service for %s/%s has invalid ports: %w",
+			service.Namespace, service.Name, err,
+		))
 	}
-	return reflect.DeepEqual(datapathPorts, intent.Ports), nil
+	_ = datapathPorts // Validation above protects reservations; the live claims are already recorded.
+	for _, port := range intent.Ports {
+		if owner, occupied := reservations[intent.ExistingShard][port]; occupied && owner != intent.ServiceID {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 func (c *nodeLoadBalancerController) ensureServiceMetadata(ctx context.Context, service *corev1.Service, shard string) (bool, error) {
@@ -1287,13 +1457,23 @@ func (c *nodeLoadBalancerController) ensureServiceMetadata(ctx context.Context, 
 		if copy.Annotations == nil {
 			copy.Annotations = map[string]string{}
 		}
+		cleanupProof := copy.Annotations[annotationNodeLoadBalancerShardCleanupProven]
+		clearAggregateShardCleanupProof(copy.Annotations, shard)
+		if copy.Annotations[annotationNodeLoadBalancerShardCleanupProven] != cleanupProof {
+			// A proof belongs only to the retired generation of this shard. It
+			// must never authorize cleanup recovery after live ownership resumes.
+			// Reset its matching materialization handoff at the same time; the
+			// exact NodePool ensure will establish a new generation and re-add it.
+			clearAggregateShardMaterialization(copy.Annotations, shard)
+			changed = true
+		}
 		if copy.Annotations[annotationNodeLoadBalancerShard] == shard {
 			return changed, nil
 		}
 		currentShard := copy.Annotations[annotationNodeLoadBalancerShard]
 		existingPrevious := copy.Annotations[annotationNodeLoadBalancerPreviousShard]
 		previousShard := ""
-		activeShard, active, activeErr := c.activeDatapathShard(ctx, copy)
+		_, activeShard, active, activeErr := c.activeDatapathReservationService(ctx, copy)
 		if activeErr != nil {
 			return false, activeErr
 		}
@@ -1319,6 +1499,58 @@ func (c *nodeLoadBalancerController) ensureServiceMetadata(ctx context.Context, 
 						)
 					}
 					copy.Annotations[annotationNodeLoadBalancerPreviousFirewall] = currentFirewall
+				}
+			}
+		}
+		if previousShard == "" && currentShard != "" && currentShard != shard {
+			pool, poolErr := c.provider.dynamicClient.Resource(nodePoolGVR).Get(ctx, currentShard, metav1.GetOptions{})
+			materialized := aggregateShardStateWasMaterialized(copy.Annotations[annotationNodeLoadBalancerShardStateMaterial], currentShard)
+			cleanupProven := aggregateShardCleanupWasProven(copy.Annotations[annotationNodeLoadBalancerShardCleanupProven], currentShard)
+			switch {
+			case apierrors.IsNotFound(poolErr):
+				if materialized && !cleanupProven {
+					return false, fmt.Errorf("node load balancer: prior materialized shard %s disappeared without cleanup proof", currentShard)
+				}
+				// The old value was either only a prospective metadata assignment,
+				// or its paid state was durably proven absent. Retire any completed
+				// handoff before assigning the replacement.
+				if cleanupProven {
+					clearAggregateShardCleanupProof(copy.Annotations, currentShard)
+					clearAggregateShardMaterialization(copy.Annotations, currentShard)
+					changed = true
+				}
+			case poolErr != nil:
+				return false, fmt.Errorf("node load balancer: inspect prior shard anchor %s before reassignment: %w", currentShard, poolErr)
+			default:
+				labels := pool.GetLabels()
+				exact := labels[nodeLoadBalancerManagedLabel] == "true" &&
+					labels[nodeLoadBalancerClusterLabel] == c.provider.config.ClusterID &&
+					labels[nodeLoadBalancerShardLabel] == currentShard
+				if !exact && materialized && !cleanupProven {
+					return false, fmt.Errorf("node load balancer: prior materialized shard %s lost exact state-anchor ownership", currentShard)
+				}
+				if exact && !containsString(pool.GetFinalizers(), nodeLoadBalancerNodePoolFinalizer) {
+					return false, fmt.Errorf("node load balancer: prior materialized shard %s lost its state finalizer", currentShard)
+				}
+				if exact {
+					if !materialized {
+						copy.Annotations[annotationNodeLoadBalancerShardStateMaterial] = appendAggregateShardSet(
+							copy.Annotations[annotationNodeLoadBalancerShardStateMaterial], currentShard,
+						)
+						changed = true
+					}
+					if cleanupProven {
+						clearAggregateShardCleanupProof(copy.Annotations, currentShard)
+						changed = true
+					}
+					// Even before datapath activation, a created NodePool may already
+					// own a billed VM. Preserve it as previous until full aggregate
+					// firewall/capacity cleanup proves retirement.
+					previousShard = currentShard
+				} else if cleanupProven {
+					clearAggregateShardCleanupProof(copy.Annotations, currentShard)
+					clearAggregateShardMaterialization(copy.Annotations, currentShard)
+					changed = true
 				}
 			}
 		}
@@ -1407,7 +1639,23 @@ func (c *nodeLoadBalancerController) ensureNodeClass(ctx context.Context, name s
 	if err := markNodeLoadBalancerManaged(desired, c.provider.config.ClusterID, "", ""); err != nil {
 		return err
 	}
-	return c.ensureDynamicObject(ctx, nodeClassGVR, desired)
+	if err := c.ensureDynamicObject(ctx, nodeClassGVR, desired); err != nil {
+		return err
+	}
+	current, err := c.provider.dynamicClient.Resource(nodeClassGVR).Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("node load balancer: read back managed NodeClass %s: %w", name, err)
+	}
+	if current.GetDeletionTimestamp() != nil ||
+		current.GetLabels()[nodeLoadBalancerManagedLabel] != "true" ||
+		current.GetLabels()[nodeLoadBalancerClusterLabel] != c.provider.config.ClusterID ||
+		!containsString(current.GetFinalizers(), nodeLoadBalancerNodeClassFinalizer) {
+		return fmt.Errorf("node load balancer: generated NodeClass %s lacks exact cluster-state identity", name)
+	}
+	if err := c.markAggregateClusterStateMaterializedForReferences(ctx); err != nil {
+		return err
+	}
+	return c.clearAggregateClusterCleanupProofs(ctx)
 }
 
 func (c *nodeLoadBalancerController) validateBaseNodeClass(base *unstructured.Unstructured) error {
@@ -1446,7 +1694,45 @@ func (c *nodeLoadBalancerController) ensureNodePool(ctx context.Context, nodeCla
 	if err := markNodeLoadBalancerManaged(desired, c.provider.config.ClusterID, shard.Name, nodeLoadBalancerShardProfileHash(shard)); err != nil {
 		return err
 	}
-	return c.ensureDynamicObject(ctx, nodePoolGVR, desired)
+	if err := c.ensureDynamicObject(ctx, nodePoolGVR, desired); err != nil {
+		return err
+	}
+	current, err := c.provider.dynamicClient.Resource(nodePoolGVR).Get(ctx, shard.Name, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("node load balancer: read back managed NodePool %s: %w", shard.Name, err)
+	}
+	if err := c.validateEnsuredNodeLoadBalancerNodePool(current, desired, shard.Name); err != nil {
+		return err
+	}
+	// Persist the Service-side handoff only after the exact API readback proves
+	// that the NodePool finalizer really exists. This marker prevents a later
+	// force-removal of that anchor from being mistaken for a never-materialized
+	// prospective shard during Service deletion.
+	return c.markAggregateShardStateMaterializedForReferences(ctx, shard.Name)
+}
+
+func (c *nodeLoadBalancerController) validateEnsuredNodeLoadBalancerNodePool(
+	current, desired *unstructured.Unstructured,
+	shard string,
+) error {
+	if current == nil || desired == nil || current.GetName() != shard || current.GetDeletionTimestamp() != nil {
+		return fmt.Errorf("node load balancer: generated NodePool %s is absent, renamed, or deleting after ensure", shard)
+	}
+	currentLabels := current.GetLabels()
+	for key, value := range desired.GetLabels() {
+		if currentLabels[key] != value {
+			return fmt.Errorf("node load balancer: generated NodePool %s lost exact label %s=%q", shard, key, value)
+		}
+	}
+	if !containsString(current.GetFinalizers(), nodeLoadBalancerNodePoolFinalizer) {
+		return fmt.Errorf("node load balancer: generated NodePool %s lacks the durable shard-state finalizer after ensure", shard)
+	}
+	desiredSpec, desiredFound, desiredErr := unstructured.NestedFieldCopy(desired.Object, "spec")
+	currentSpec, currentFound, currentErr := unstructured.NestedFieldCopy(current.Object, "spec")
+	if desiredErr != nil || currentErr != nil || !desiredFound || !currentFound || !reflect.DeepEqual(currentSpec, desiredSpec) {
+		return fmt.Errorf("node load balancer: generated NodePool %s failed exact spec readback", shard)
+	}
+	return nil
 }
 
 func (c *nodeLoadBalancerController) ensureNodePoolFailClosed(
@@ -1474,7 +1760,15 @@ func markNodeLoadBalancerManaged(object *unstructured.Unstructured, cluster, sha
 		labels[nodeLoadBalancerProfileLabel] = profile
 	}
 	object.SetLabels(labels)
-	if shard != "" {
+	finalizers := object.GetFinalizers()
+	if shard == "" {
+		if !containsString(finalizers, nodeLoadBalancerNodeClassFinalizer) {
+			object.SetFinalizers(append(finalizers, nodeLoadBalancerNodeClassFinalizer))
+		}
+	} else {
+		if !containsString(finalizers, nodeLoadBalancerNodePoolFinalizer) {
+			object.SetFinalizers(append(finalizers, nodeLoadBalancerNodePoolFinalizer))
+		}
 		templateLabels, _, err := unstructured.NestedStringMap(object.Object, "spec", "template", "metadata", "labels")
 		if err != nil {
 			return fmt.Errorf("node load balancer: read NodePool template labels: %w", err)
@@ -1531,7 +1825,16 @@ func (c *nodeLoadBalancerController) ensureDynamicObject(ctx context.Context, gv
 			break
 		}
 	}
-	if reflect.DeepEqual(existingSpec, desiredSpec) && labelsMatch {
+	desiredFinalizers := desired.GetFinalizers()
+	existingFinalizers := existing.GetFinalizers()
+	finalizersMatch := true
+	for _, finalizer := range desiredFinalizers {
+		if !containsString(existingFinalizers, finalizer) {
+			finalizersMatch = false
+			break
+		}
+	}
+	if reflect.DeepEqual(existingSpec, desiredSpec) && labelsMatch && finalizersMatch {
 		return nil
 	}
 	updated := existing.DeepCopy()
@@ -1546,6 +1849,13 @@ func (c *nodeLoadBalancerController) ensureDynamicObject(ctx context.Context, gv
 		labels[key] = value
 	}
 	updated.SetLabels(labels)
+	finalizers := updated.GetFinalizers()
+	for _, finalizer := range desiredFinalizers {
+		if !containsString(finalizers, finalizer) {
+			finalizers = append(finalizers, finalizer)
+		}
+	}
+	updated.SetFinalizers(finalizers)
 	if _, err := resource.Update(ctx, updated, metav1.UpdateOptions{}); err != nil {
 		return fmt.Errorf("node load balancer: update %s %q: %w", desired.GetKind(), desired.GetName(), err)
 	}
@@ -2677,7 +2987,7 @@ func (c *nodeLoadBalancerController) cleanupInvalidServiceShards(ctx context.Con
 		if len(remaining) != 0 {
 			continue
 		}
-		nodes, err := c.rawNodesForShard(shard)
+		nodes, err := c.rawNodesForShard(ctx, shard)
 		if err != nil {
 			return err
 		}
@@ -3386,19 +3696,37 @@ func (c *nodeLoadBalancerController) clearServiceFirewallWithdrawalEvidenceAfter
 	return changed, nil
 }
 
-func (c *nodeLoadBalancerController) rawNodesForShard(shard string) ([]*corev1.Node, error) {
-	return c.nodes.List(labels.SelectorFromSet(labels.Set{
+func (c *nodeLoadBalancerController) rawNodesForShard(ctx context.Context, shard string) ([]*corev1.Node, error) {
+	selector := labels.SelectorFromSet(labels.Set{
 		nodeLoadBalancerNodeLabel:        "true",
 		nodeLoadBalancerNodeClusterLabel: c.provider.config.ClusterID,
 		nodeLoadBalancerNodeShardLabel:   shard,
-	}))
+	}).String()
+	list, err := c.provider.kubeClient.CoreV1().Nodes().List(ctx, metav1.ListOptions{LabelSelector: selector})
+	if err != nil {
+		return nil, fmt.Errorf("node load balancer: list live Nodes for shard %s: %w", shard, err)
+	}
+	result := make([]*corev1.Node, 0, len(list.Items))
+	for index := range list.Items {
+		result = append(result, &list.Items[index])
+	}
+	return result, nil
 }
 
-func (c *nodeLoadBalancerController) rawNodesForCluster() ([]*corev1.Node, error) {
-	return c.nodes.List(labels.SelectorFromSet(labels.Set{
+func (c *nodeLoadBalancerController) rawNodesForCluster(ctx context.Context) ([]*corev1.Node, error) {
+	selector := labels.SelectorFromSet(labels.Set{
 		nodeLoadBalancerNodeLabel:        "true",
 		nodeLoadBalancerNodeClusterLabel: c.provider.config.ClusterID,
-	}))
+	}).String()
+	list, err := c.provider.kubeClient.CoreV1().Nodes().List(ctx, metav1.ListOptions{LabelSelector: selector})
+	if err != nil {
+		return nil, fmt.Errorf("node load balancer: list live cluster Nodes: %w", err)
+	}
+	result := make([]*corev1.Node, 0, len(list.Items))
+	for index := range list.Items {
+		result = append(result, &list.Items[index])
+	}
+	return result, nil
 }
 
 // authorizedNodesForShard returns only Nodes whose kubelet-visible labels and
@@ -3406,7 +3734,7 @@ func (c *nodeLoadBalancerController) rawNodesForCluster() ([]*corev1.Node, error
 // attach public firewalls or publish addresses must use this helper, never the
 // raw label selector.
 func (c *nodeLoadBalancerController) authorizedNodesForShard(ctx context.Context, shard string) ([]*corev1.Node, error) {
-	raw, err := c.rawNodesForShard(shard)
+	raw, err := c.rawNodesForShard(ctx, shard)
 	if err != nil {
 		return nil, err
 	}
@@ -3416,7 +3744,7 @@ func (c *nodeLoadBalancerController) authorizedNodesForShard(ctx context.Context
 // authorizedNodesForCluster is the cluster-wide equivalent used for shared
 // infrastructure that is attached to every managed Node load balancer VM.
 func (c *nodeLoadBalancerController) authorizedNodesForCluster(ctx context.Context) ([]*corev1.Node, error) {
-	raw, err := c.rawNodesForCluster()
+	raw, err := c.rawNodesForCluster(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -3594,6 +3922,9 @@ func (c *nodeLoadBalancerController) nodeLoadBalancerNodePoolAuthoritative(
 		poolLabels[nodeLoadBalancerModeLabel] == "" ||
 		poolLabels[nodeLoadBalancerPoolLabel] == "" ||
 		poolLabels[nodeLoadBalancerProfileLabel] == "" {
+		return false
+	}
+	if !containsString(pool.GetFinalizers(), nodeLoadBalancerNodePoolFinalizer) {
 		return false
 	}
 	replicas, found, err := unstructured.NestedInt64(pool.Object, "spec", "replicas")
@@ -3845,7 +4176,7 @@ func staleNodeLoadBalancerFirewallAssignments(firewall inspace.Firewall, desired
 }
 
 func (c *nodeLoadBalancerController) reconcileShardNodeEligibility(ctx context.Context, shard string) error {
-	rawNodes, err := c.rawNodesForShard(shard)
+	rawNodes, err := c.rawNodesForShard(ctx, shard)
 	if err != nil {
 		return err
 	}
@@ -4098,7 +4429,7 @@ func (c *nodeLoadBalancerController) cleanupPreviousShard(ctx context.Context, s
 		return err
 	}
 	if len(remaining) == 0 {
-		nodes, err := c.rawNodesForShard(previous)
+		nodes, err := c.rawNodesForShard(ctx, previous)
 		if err != nil {
 			return err
 		}
@@ -4238,7 +4569,7 @@ func (c *nodeLoadBalancerController) cleanupService(ctx context.Context, service
 			return err
 		}
 		if len(remaining) == 0 {
-			nodes, err := c.rawNodesForShard(shard)
+			nodes, err := c.rawNodesForShard(ctx, shard)
 			if err != nil {
 				return err
 			}
@@ -4271,7 +4602,18 @@ func (c *nodeLoadBalancerController) cleanupService(ctx context.Context, service
 			return nil
 		}
 		nodeClassName := managedNodeLoadBalancerName(c.provider.config.ClusterID, "node-lb")
-		done, err := c.cleanupClusterICMPFirewall(ctx, nodeClassName)
+		// Legacy per-Service reconciler compatibility: releases before the
+		// aggregate design never created a cluster NodeClass/ICMP anchor. The
+		// active aggregate sync uses cleanupAggregateClusterState and never takes
+		// this unanchored path.
+		done := false
+		if _, getErr := c.provider.dynamicClient.Resource(nodeClassGVR).Get(ctx, nodeClassName, metav1.GetOptions{}); apierrors.IsNotFound(getErr) {
+			done = true
+		} else if getErr != nil {
+			return getErr
+		} else {
+			done, err = c.cleanupClusterICMPFirewall(ctx, nodeClassName)
+		}
 		if err != nil {
 			return err
 		}
@@ -4369,11 +4711,23 @@ func (c *nodeLoadBalancerController) cleanupRemainingClusterNodeLoadBalancerCapa
 	}
 	if len(pools.Items) != 0 {
 		for i := range pools.Items {
-			name := pools.Items[i].GetName()
-			if !isManagedNodeLoadBalancerShardName(name) || pools.Items[i].GetLabels()[nodeLoadBalancerShardLabel] != name {
+			pool := &pools.Items[i]
+			name := pool.GetName()
+			if !isManagedNodeLoadBalancerShardName(name) || pool.GetLabels()[nodeLoadBalancerShardLabel] != name {
 				return false, fmt.Errorf("node load balancer: refusing cluster cleanup for malformed managed NodePool %q", name)
 			}
-			nodes, listErr := c.rawNodesForShard(name)
+			if !containsString(pool.GetFinalizers(), nodeLoadBalancerNodePoolFinalizer) {
+				if pool.GetDeletionTimestamp() != nil {
+					return false, fmt.Errorf("node load balancer: deleting orphan NodePool %s lost its shard-state finalizer", name)
+				}
+				if _, _, err := c.updateManagedNodePoolAnnotations(ctx, name, func(map[string]string) (bool, error) {
+					return false, nil
+				}); err != nil {
+					return false, err
+				}
+				return true, nil
+			}
+			nodes, listErr := c.rawNodesForShard(ctx, name)
 			if listErr != nil {
 				return false, listErr
 			}
@@ -4381,6 +4735,29 @@ func (c *nodeLoadBalancerController) cleanupRemainingClusterNodeLoadBalancerCapa
 				return false, err
 			}
 			if err := c.deleteManagedNodePool(ctx, name); err != nil {
+				return false, err
+			}
+			absent, err := c.managedShardCapacityAbsent(ctx, name)
+			if err != nil {
+				return false, err
+			}
+			if !absent {
+				continue
+			}
+			firewallAbsent, err := c.deleteAggregateShardFirewall(ctx, name)
+			if err != nil {
+				return false, err
+			}
+			if !firewallAbsent {
+				continue
+			}
+			if err := c.resetAggregateShardAfterAnchorDeletion(ctx, name); err != nil {
+				return false, err
+			}
+			if err := c.markAggregateShardCleanupProvenForReferences(ctx, name); err != nil {
+				return false, err
+			}
+			if err := c.removeManagedNodePoolStateFinalizer(ctx, name); err != nil {
 				return false, err
 			}
 		}
@@ -4427,6 +4804,9 @@ func (c *nodeLoadBalancerController) deleteManagedNodePool(ctx context.Context, 
 		nodePool.GetLabels()[nodeLoadBalancerShardLabel] != name {
 		return fmt.Errorf("node load balancer: refusing to delete NodePool %s without exact managed ownership labels", name)
 	}
+	if !containsString(nodePool.GetFinalizers(), nodeLoadBalancerNodePoolFinalizer) {
+		return fmt.Errorf("node load balancer: refusing to delete NodePool %s without the durable shard-state finalizer", name)
+	}
 	uid := nodePool.GetUID()
 	if uid == "" {
 		return fmt.Errorf("node load balancer: refusing to delete NodePool %s without an observed UID", name)
@@ -4435,6 +4815,98 @@ func (c *nodeLoadBalancerController) deleteManagedNodePool(ctx context.Context, 
 		Preconditions: &metav1.Preconditions{UID: &uid},
 	}); err != nil && !apierrors.IsNotFound(err) {
 		return fmt.Errorf("node load balancer: delete NodePool %s: %w", name, err)
+	}
+	return nil
+}
+
+// removeManagedNodePoolStateFinalizer releases the CCM's durable shard-state anchor
+// only after deletion has started and every other controller has finished its
+// NodePool teardown. Cloud firewall cleanup must be proved separately by the
+// caller before invoking this helper.
+func (c *nodeLoadBalancerController) removeManagedNodePoolStateFinalizer(ctx context.Context, name string) error {
+	if !isManagedNodeLoadBalancerShardName(name) {
+		return fmt.Errorf("node load balancer: refusing to finalize invalid managed NodePool name %q", name)
+	}
+	resource := c.provider.dynamicClient.Resource(nodePoolGVR)
+	nodePool, err := resource.Get(ctx, name, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("node load balancer: get NodePool %s before finalizer removal: %w", name, err)
+	}
+	labels := nodePool.GetLabels()
+	if labels[nodeLoadBalancerManagedLabel] != "true" ||
+		labels[nodeLoadBalancerClusterLabel] != c.provider.config.ClusterID ||
+		labels[nodeLoadBalancerShardLabel] != name {
+		return fmt.Errorf("node load balancer: refusing to finalize NodePool %s without exact managed ownership labels", name)
+	}
+	if nodePool.GetDeletionTimestamp() == nil {
+		return fmt.Errorf("node load balancer: refusing to remove the state finalizer from live NodePool %s", name)
+	}
+	finalizers := nodePool.GetFinalizers()
+	if !containsString(finalizers, nodeLoadBalancerNodePoolFinalizer) {
+		return nil
+	}
+	if len(finalizers) != 1 {
+		return fmt.Errorf("node load balancer: refusing to remove the state finalizer from NodePool %s while other finalizers remain", name)
+	}
+	updated := nodePool.DeepCopy()
+	updated.SetFinalizers(removeString(finalizers, nodeLoadBalancerNodePoolFinalizer))
+	if _, err := resource.Update(ctx, updated, metav1.UpdateOptions{}); err != nil {
+		return fmt.Errorf("node load balancer: remove state finalizer from NodePool %s: %w", name, err)
+	}
+	return nil
+}
+
+func (c *nodeLoadBalancerController) deleteManagedNodeClass(ctx context.Context, name string) error {
+	if name != managedNodeLoadBalancerName(c.provider.config.ClusterID, "node-lb") {
+		return fmt.Errorf("node load balancer: refusing to delete unexpected managed NodeClass %q", name)
+	}
+	resource := c.provider.dynamicClient.Resource(nodeClassGVR)
+	object, err := resource.Get(ctx, name, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("node load balancer: get NodeClass %s before delete: %w", name, err)
+	}
+	labels := object.GetLabels()
+	if labels[nodeLoadBalancerManagedLabel] != "true" ||
+		labels[nodeLoadBalancerClusterLabel] != c.provider.config.ClusterID ||
+		!containsString(object.GetFinalizers(), nodeLoadBalancerNodeClassFinalizer) {
+		return fmt.Errorf("node load balancer: refusing to delete NodeClass %s without exact cluster-state identity", name)
+	}
+	uid := object.GetUID()
+	if uid == "" {
+		return fmt.Errorf("node load balancer: refusing to delete NodeClass %s without an observed UID", name)
+	}
+	if err := resource.Delete(ctx, name, metav1.DeleteOptions{Preconditions: &metav1.Preconditions{UID: &uid}}); err != nil && !apierrors.IsNotFound(err) {
+		return fmt.Errorf("node load balancer: delete NodeClass %s: %w", name, err)
+	}
+	return nil
+}
+
+func (c *nodeLoadBalancerController) removeManagedNodeClassStateFinalizer(ctx context.Context, name string) error {
+	resource := c.provider.dynamicClient.Resource(nodeClassGVR)
+	object, err := resource.Get(ctx, name, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("node load balancer: get NodeClass %s before finalizer removal: %w", name, err)
+	}
+	labels := object.GetLabels()
+	if labels[nodeLoadBalancerManagedLabel] != "true" ||
+		labels[nodeLoadBalancerClusterLabel] != c.provider.config.ClusterID ||
+		object.GetDeletionTimestamp() == nil ||
+		!containsString(object.GetFinalizers(), nodeLoadBalancerNodeClassFinalizer) {
+		return fmt.Errorf("node load balancer: refusing to finalize NodeClass %s without exact deleting cluster-state identity", name)
+	}
+	updated := object.DeepCopy()
+	updated.SetFinalizers(removeString(object.GetFinalizers(), nodeLoadBalancerNodeClassFinalizer))
+	if _, err := resource.Update(ctx, updated, metav1.UpdateOptions{}); err != nil {
+		return fmt.Errorf("node load balancer: remove cluster-state finalizer from NodeClass %s: %w", name, err)
 	}
 	return nil
 }

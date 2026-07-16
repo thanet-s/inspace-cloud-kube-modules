@@ -923,8 +923,8 @@ func TestNodeLoadBalancerInvalidFinalizedServiceQuarantine(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(stored.Status.LoadBalancer.Ingress) != 0 {
-			t.Fatalf("foreign datapath prevented fail-closed parent withdrawal: %#v", stored.Status.LoadBalancer)
+		if len(stored.Status.LoadBalancer.Ingress) == 0 {
+			t.Fatalf("parent falsely reported closed while a foreign functional datapath could not be withdrawn: %#v", stored.Status.LoadBalancer)
 		}
 	})
 }
@@ -1338,7 +1338,8 @@ func TestNodeLoadBalancerClusterICMPPendingPreventsDuplicateCreateDuringDelayedR
 	annotations := nodeClass.GetAnnotations()
 	if annotations[annotationNodeLoadBalancerICMPPendingUUID] == "" ||
 		annotations[annotationNodeLoadBalancerICMPPendingName] == "" ||
-		annotations[annotationNodeLoadBalancerICMPPendingStarted] == "" {
+		annotations[annotationNodeLoadBalancerICMPPendingStarted] == "" ||
+		annotations[annotationNodeLoadBalancerICMPCreateIssued] == "" {
 		t.Fatalf("cluster ICMP pending identity was not persisted: %#v", annotations)
 	}
 
@@ -1346,11 +1347,21 @@ func TestNodeLoadBalancerClusterICMPPendingPreventsDuplicateCreateDuringDelayedR
 	// intent must suppress a duplicate create, including after controller restart.
 	api.firewalls = nil
 	restarted := &nodeLoadBalancerController{provider: provider}
-	if firewall, ready, err := restarted.ensureClusterICMPFirewall(ctx, nodeClassName, nil); err != nil || firewall != nil || ready {
-		t.Fatalf("delayed cluster ICMP readback = %#v, ready=%t, err=%v", firewall, ready, err)
-	}
-	if len(api.createdFirewalls) != 1 {
-		t.Fatalf("delayed cluster ICMP readback issued %d creates, want one", len(api.createdFirewalls))
+	for attempt := 1; attempt <= nodeLoadBalancerAbsenceConfirmations+2; attempt++ {
+		firewall, ready, err := restarted.ensureClusterICMPFirewall(ctx, nodeClassName, nil)
+		if err == nil || !strings.Contains(err.Error(), "remains ambiguous") || firewall != nil || ready {
+			t.Fatalf("delayed cluster ICMP readback %d = %#v, ready=%t, err=%v", attempt, firewall, ready, err)
+		}
+		if len(api.createdFirewalls) != 1 {
+			t.Fatalf("delayed cluster ICMP readback %d issued %d creates, want one", attempt, len(api.createdFirewalls))
+		}
+		stored, getErr := provider.dynamicClient.Resource(nodeClassGVR).Get(ctx, nodeClassName, metav1.GetOptions{})
+		if getErr != nil {
+			t.Fatal(getErr)
+		}
+		if stored.GetAnnotations()[annotationNodeLoadBalancerICMPCreateIssued] == "" {
+			t.Fatalf("delayed cluster ICMP readback %d cleared the durable issued fence", attempt)
+		}
 	}
 }
 
@@ -1900,25 +1911,6 @@ func TestNodeLoadBalancerEstablishedShardFailsClosedOnAuthoritativeDrift(t *test
 		mutate    func(*testing.T, *nodeLoadBalancerFailClosedFixture)
 		wantError bool
 	}{
-		"Service firewall policy drift": {
-			mutate: func(t *testing.T, fixture *nodeLoadBalancerFailClosedFixture) {
-				t.Helper()
-				firewall := fixture.firewall(t, fixture.serviceFirewallUUID)
-				port := int32(8443)
-				firewall.Rules[0].PortStart = &port
-				firewall.Rules[0].PortEnd = &port
-			},
-			wantError: true,
-		},
-		"duplicate managed Service firewall row": {
-			mutate: func(t *testing.T, fixture *nodeLoadBalancerFailClosedFixture) {
-				t.Helper()
-				duplicate := *fixture.firewall(t, fixture.serviceFirewallUUID)
-				duplicate.UUID = "77777777-1111-4222-8333-444444444444"
-				fixture.api.firewalls = append(fixture.api.firewalls, duplicate)
-			},
-			wantError: true,
-		},
 		"NodePool ownership drift": {
 			mutate: func(t *testing.T, fixture *nodeLoadBalancerFailClosedFixture) {
 				t.Helper()
@@ -1966,6 +1958,7 @@ func TestNodeLoadBalancerEstablishedShardFailsClosedOnAuthoritativeDrift(t *test
 		t.Run(name, func(t *testing.T) {
 			fixture := newNodeLoadBalancerFailClosedFixture(t)
 			defer fixture.controller.queue.ShutDown()
+			fixture.installAggregateShardState(t)
 			test.mutate(t, fixture)
 
 			err := fixture.controller.sync(fixture.ctx, fixture.service.Namespace+"/"+fixture.service.Name)
@@ -1982,6 +1975,75 @@ func TestNodeLoadBalancerEstablishedShardFailsClosedOnAuthoritativeDrift(t *test
 				t.Fatalf("authoritative drift retained the protected datapath-ready label: error=%v labels=%#v", err, current.Labels)
 			}
 		})
+	}
+}
+
+func (f *nodeLoadBalancerFailClosedFixture) installAggregateShardState(t *testing.T) {
+	t.Helper()
+	service, err := f.provider.kubeClient.CoreV1().Services(f.service.Namespace).Get(
+		f.ctx, f.service.Name, metav1.GetOptions{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	policyHash, err := desiredNodeLoadBalancerServicePolicyHash(service)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service.Annotations[annotationNodeLoadBalancerDatapathStaged] = f.shard
+	service.Annotations[annotationNodeLoadBalancerDatapathStagedPolicy] = policyHash
+	updated, err := f.provider.kubeClient.CoreV1().Services(service.Namespace).Update(f.ctx, service, metav1.UpdateOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.serviceIndexer.Update(updated.DeepCopy()); err != nil {
+		t.Fatal(err)
+	}
+	f.service = updated.DeepCopy()
+
+	plan := nodeLoadBalancerShardPlan{
+		Name:   f.shard,
+		Claims: []string{string(updated.UID)},
+		Ports:  nodeLoadBalancerPortClaimsOrFatal(t, updated),
+	}
+	policy, err := desiredNodeLoadBalancerShardFirewall(
+		f.provider.config.ClusterID,
+		f.provider.config.BillingAccountID,
+		plan,
+		[]*corev1.Service{updated},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ledger, err := nodeLoadBalancerShardFirewallPolicyLedger(policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	aggregate := aggregateTestFirewall(policy, f.serviceFirewallUUID)
+	aggregate.ResourcesAssigned = []inspace.FirewallResource{{ResourceType: "vm", ResourceUUID: "aaaaaaaa-1111-4222-8333-bbbbbbbbbbbb"}}
+	kept := make([]inspace.Firewall, 0, len(f.api.firewalls)+1)
+	for _, firewall := range f.api.firewalls {
+		if firewall.UUID != f.serviceFirewallUUID {
+			kept = append(kept, firewall)
+		}
+	}
+	f.api.firewalls = append(kept, aggregate)
+
+	resource := f.provider.dynamicClient.Resource(nodePoolGVR)
+	pool, err := resource.Get(f.ctx, f.shard, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	annotations := pool.GetAnnotations()
+	if annotations == nil {
+		annotations = map[string]string{}
+	}
+	annotations[annotationNodeLoadBalancerShardFirewallUUID] = aggregate.UUID
+	annotations[annotationNodeLoadBalancerShardFirewallHash] = policy.Hash
+	annotations[annotationNodeLoadBalancerShardFirewallLedger] = ledger
+	pool.SetAnnotations(annotations)
+	if _, err := resource.Update(f.ctx, pool, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -2907,16 +2969,22 @@ func TestNodeLoadBalancerForeignDatapathWithdrawalPreservesChildButWithdrawsPare
 	nodeLoadBalancerAssertParentAndFirewallWithdrawn(t, fixture)
 }
 
-func TestNodeLoadBalancerNodeListerFailureStillWithdrawsShardDatapaths(t *testing.T) {
+func TestNodeLoadBalancerLiveNodeListFailureStillWithdrawsShardDatapaths(t *testing.T) {
 	fixture := newNodeLoadBalancerFailClosedFixture(t)
 	defer fixture.controller.queue.ShutDown()
 	nodeLoadBalancerSeedAdvertisedStatuses(t, fixture)
 
-	listerErr := errors.New("injected Node lister failure")
-	fixture.controller.nodes = nodeLoadBalancerFailingNodeLister{err: listerErr}
+	listErr := errors.New("injected live Node List failure")
+	clientset, ok := fixture.provider.kubeClient.(*kubefake.Clientset)
+	if !ok {
+		t.Fatalf("kube client type = %T", fixture.provider.kubeClient)
+	}
+	clientset.PrependReactor("list", "nodes", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, listErr
+	})
 	cause := errors.New("injected shard failure")
 	err := fixture.controller.failNodeLoadBalancerShardClosed(fixture.ctx, fixture.shard, cause)
-	if !errors.Is(err, cause) || !errors.Is(err, listerErr) {
+	if !errors.Is(err, cause) || !errors.Is(err, listErr) {
 		t.Fatalf("fail-closed error = %v, want both injected errors", err)
 	}
 	nodeLoadBalancerAssertWithdrawn(t, fixture)
@@ -3538,6 +3606,7 @@ func ageNodeLoadBalancerAbsenceEvidence(
 }
 
 func TestNodeLoadBalancerRawShardSelectorRequiresAllVisibleIdentityLabels(t *testing.T) {
+	ctx := context.Background()
 	good := readyNode("lb", "inspace://bkk01/aaaaaaaa-1111-4222-8333-bbbbbbbbbbbb")
 	good.Labels = map[string]string{
 		nodeLoadBalancerNodeLabel:        "true",
@@ -3552,15 +3621,15 @@ func TestNodeLoadBalancerRawShardSelectorRequiresAllVisibleIdentityLabels(t *tes
 		nodeLoadBalancerNodeClusterLabel: "foreign-cluster",
 		nodeLoadBalancerNodeShardLabel:   "inlb-0123abcd",
 	}
-	indexer := newNamespacedIndexer()
+	provider := newTestProvider(t, &fakeAPI{})
+	provider.kubeClient = kubefake.NewSimpleClientset()
 	for _, node := range []*corev1.Node{good, spoofed, wrongCluster} {
-		if err := indexer.Add(node); err != nil {
+		if _, err := provider.kubeClient.CoreV1().Nodes().Create(ctx, node, metav1.CreateOptions{}); err != nil {
 			t.Fatal(err)
 		}
 	}
-	provider := newTestProvider(t, &fakeAPI{})
-	controller := &nodeLoadBalancerController{provider: provider, nodes: corelisters.NewNodeLister(indexer)}
-	nodes, err := controller.rawNodesForShard("inlb-0123abcd")
+	controller := &nodeLoadBalancerController{provider: provider}
+	nodes, err := controller.rawNodesForShard(ctx, "inlb-0123abcd")
 	if err != nil {
 		t.Fatal(err)
 	}

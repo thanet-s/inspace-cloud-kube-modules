@@ -48,9 +48,6 @@ SERVICE_SPECS = {
         "mode_annotation": True,
     },
 }
-PARTIAL_DELETED_SERVICE = "inspace-e2e-node-shared-b"
-RETAINED_SHARED_SERVICE = "inspace-e2e-node-traefik"
-
 NODE_LOAD_BALANCER_CLASS = "inspace.cloud/node"
 NODE_LOAD_BALANCER_DATAPATH_CLASS = "inspace.cloud/node-datapath"
 NODE_LOAD_BALANCER_DATAPATH_LABEL = "inspace.cloud/node-lb-datapath"
@@ -190,8 +187,9 @@ def floating_ip_name(cluster: str, nodeclaim: str) -> str:
     return f"{base}-{suffix}"
 
 
-def firewall_name(cluster: str, service_uid: str, policy_hash: str) -> str:
-    return f"inlb-{short_hash(cluster)}-{service_uid}-{policy_hash}"
+def shard_firewall_name(cluster: str, shard: str) -> str:
+    require(SHARD_PATTERN.fullmatch(shard) is not None, f"invalid managed shard identity {shard!r}")
+    return f"inlb-{ownership_hash(cluster)}-shard-{shard.removeprefix('inlb-')}"
 
 
 def generic_nlb_name(cluster: str, service_uid: str) -> str:
@@ -251,7 +249,7 @@ def canonical_service_policy_keys(rules: list[dict]) -> tuple[str, ...]:
 
 
 def canonical_service_policy_hash(rules: list[dict]) -> str:
-    return short_hash("\n".join(canonical_service_policy_keys(rules)))
+    return hashlib.sha256("\n".join(canonical_service_policy_keys(rules)).encode()).hexdigest()
 
 
 def expected_service_firewall_rules(service: dict) -> list[dict]:
@@ -278,6 +276,23 @@ def expected_service_firewall_rules(service: dict) -> list[dict]:
             "endpoint_spec": canonical_ranges or None,
         }
         rules.append(rule)
+    return rules
+
+
+def expected_shard_firewall_rules(services: list[dict]) -> list[dict]:
+    rules = []
+    owners = {}
+    for service in sorted(services, key=lambda item: item["metadata"]["name"]):
+        for rule in expected_service_firewall_rules(service):
+            key = (rule["protocol"], rule["port_start"])
+            previous = owners.get(key)
+            require(
+                previous is None,
+                f"Services/{previous} and {service['metadata']['name']} collide on {key[0]}/{key[1]}",
+            )
+            owners[key] = service["metadata"]["name"]
+            rules.append(rule)
+    canonical_service_policy_keys(rules)
     return rules
 
 
@@ -315,6 +330,22 @@ def ready(node: dict) -> bool:
         condition.get("type") == "Ready" and condition.get("status") == "True"
         for condition in node.get("status", {}).get("conditions", [])
     )
+
+
+def ready_transition_time(node: dict) -> str:
+    conditions = [
+        condition
+        for condition in node.get("status", {}).get("conditions", [])
+        if condition.get("type") == "Ready"
+    ]
+    require(
+        len(conditions) == 1
+        and conditions[0].get("status") == "True"
+        and isinstance(conditions[0].get("lastTransitionTime"), str)
+        and conditions[0]["lastTransitionTime"],
+        f"Node/{node.get('metadata', {}).get('name')} lacks one Ready=True transition anchor",
+    )
+    return conditions[0]["lastTransitionTime"]
 
 
 def addresses(node: dict, address_type: str) -> list[str]:
@@ -429,7 +460,10 @@ def owned_node_load_balancer_nlbs(
         require(isinstance(uid, str) and uid, "live paid public Service lacks a UID")
         allowed_generic_names.add(generic_nlb_name(cluster, uid))
 
-    service_policy_prefix = f"inlb-{short_hash(cluster)}-"
+    service_policy_prefixes = (
+        f"inlb-{ownership_hash(cluster)}-shard-",
+        f"inlb-{short_hash(cluster)}-",
+    )
     icmp_policy_prefix = f"inlb-{ownership_hash(cluster)}-icmp-"
     owned = []
     for load_balancer in load_balancers:
@@ -440,7 +474,7 @@ def owned_node_load_balancer_nlbs(
         require(isinstance(name, str) and name, "active load balancer lacks a deterministic display name")
         is_owned = (
             name in forbidden_names
-            or str(name).startswith(service_policy_prefix)
+            or any(str(name).startswith(prefix) for prefix in service_policy_prefixes)
             or str(name).startswith(icmp_policy_prefix)
             or (generic_pattern.fullmatch(str(name)) is not None and name not in allowed_generic_names)
         )
@@ -572,14 +606,20 @@ def prove_absent(state: dict, kubeconfig: str, immutable_baseline_path: pathlib.
 
     firewalls = api_get("network/firewalls")
     require(isinstance(firewalls, list), "firewall list did not return an array")
-    service_prefix = f"inlb-{short_hash(cluster)}-"
+    service_prefixes = (
+        f"inlb-{ownership_hash(cluster)}-shard-",
+        f"inlb-{short_hash(cluster)}-",
+    )
     icmp_prefix = f"inlb-{ownership_hash(cluster)}-icmp-"
     node_lb_firewalls = [
         firewall.get("uuid")
         for firewall in firewalls
         if active(firewall)
         and (
-            str(firewall.get("display_name") or firewall.get("name") or "").startswith(service_prefix)
+            any(
+                str(firewall.get("display_name") or firewall.get("name") or "").startswith(prefix)
+                for prefix in service_prefixes
+            )
             or str(firewall.get("display_name") or firewall.get("name") or "").startswith(icmp_prefix)
         )
     ]
@@ -662,24 +702,40 @@ def prove_present(
                 f"Service/{name} must exercise the omitted-mode shared default",
             )
         require("service.inspace.cloud/node-lb" in metadata.get("finalizers", []), f"Service/{name} lacks the Node-LB cleanup finalizer")
+        require(
+            "service.inspace.cloud/node-lb-cluster-cleanup-proven" not in annotations,
+            f"Service/{name} retained a stale cluster cleanup handoff",
+        )
+        require(
+            annotations.get("service.inspace.cloud/node-lb-cluster-state-materialized") == "true",
+            f"Service/{name} lacks the durable generated-NodeClass materialization marker",
+        )
         shard = annotations.get("service.inspace.cloud/node-lb-shard", "")
         require(SHARD_PATTERN.fullmatch(shard) is not None, f"Service/{name} lacks a managed shard identity")
+        materialized_shards = {
+            value
+            for value in annotations.get("service.inspace.cloud/node-lb-shard-state-materialized", "").split(",")
+            if value
+        }
+        cleanup_proven_shards = {
+            value
+            for value in annotations.get("service.inspace.cloud/node-lb-shard-cleanup-proven", "").split(",")
+            if value
+        }
+        require(
+            shard in materialized_shards and shard not in cleanup_proven_shards,
+            f"Service/{name} lacks the durable live NodePool materialization handoff for {shard}",
+        )
         require(
             annotations.get("service.inspace.cloud/node-lb-datapath-active-shard") == shard,
             f"Service/{name} lacks the durable active datapath marker",
         )
-        firewall_uuid = annotations.get("service.inspace.cloud/node-lb-firewall-uuid", "")
-        firewall_hash = annotations.get("service.inspace.cloud/node-lb-firewall-hash", "")
-        require(UUID_PATTERN.fullmatch(firewall_uuid) is not None, f"Service/{name} lacks a valid firewall UUID")
-        require(re.fullmatch(r"[0-9a-f]{8}", firewall_hash or "") is not None, f"Service/{name} lacks a valid firewall policy hash")
         external_ip = service_external_ip(service)
         services_by_shard.setdefault(shard, []).append(name)
         service_results[name] = {
             "ip": external_ip,
             "ports": [dict(port) for port in contract["ports"]],
             "shard": shard,
-            "firewallUUID": firewall_uuid,
-            "firewallHash": firewall_hash,
             "uid": metadata.get("uid"),
         }
 
@@ -742,22 +798,56 @@ def prove_present(
         service_results[name]["privateIP"] = private_vip
         service_results[name]["datapathService"] = datapath_name
 
+    expected_datapaths = {
+        result["datapathService"]
+        for result in service_results.values()
+    }
+    actual_datapaths = {
+        item.get("metadata", {}).get("name")
+        for item in all_default_services
+        if item.get("metadata", {}).get("labels", {}).get(NODE_LOAD_BALANCER_DATAPATH_LABEL) == "true"
+    }
+    require(
+        actual_datapaths == expected_datapaths,
+        "live generated Node-LB datapaths differ from the exact current Service UIDs",
+    )
+
+    require("inspace-e2e-node-traefik" in service_results, "present proof requires the retained Traefik Service")
     traefik = service_results["inspace-e2e-node-traefik"]
-    conflict = service_results["inspace-e2e-node-shared-conflict"]
-    dedicated = service_results["inspace-e2e-node-dedicated"]
     if "inspace-e2e-node-shared-b" in service_results:
         shared_b = service_results["inspace-e2e-node-shared-b"]
         require(traefik["shard"] == shared_b["shard"] and traefik["ip"] == shared_b["ip"], "non-conflicting shared Services must reuse one shard and FIP")
-    require(conflict["shard"] != traefik["shard"] and conflict["ip"] != traefik["ip"], "a conflicting shared TCP/80 port must allocate a new shard and FIP")
-    require(dedicated["shard"] not in {traefik["shard"], conflict["shard"]}, "dedicated mode must own a distinct shard")
-    require(len(services_by_shard) == 3, "the live Services must converge to exactly three Node-LB shards")
+    if "inspace-e2e-node-shared-conflict" in service_results:
+        conflict = service_results["inspace-e2e-node-shared-conflict"]
+        require(conflict["shard"] != traefik["shard"] and conflict["ip"] != traefik["ip"], "a conflicting shared TCP/80 port must allocate a new shard and FIP")
+    if "inspace-e2e-node-dedicated" in service_results:
+        dedicated = service_results["inspace-e2e-node-dedicated"]
+        require(
+            dedicated["shard"] != traefik["shard"]
+            and (
+                "inspace-e2e-node-shared-conflict" not in service_results
+                or dedicated["shard"] != service_results["inspace-e2e-node-shared-conflict"]["shard"]
+            ),
+            "dedicated mode must own a distinct shard",
+        )
+    require(
+        len(services_by_shard) == 1
+        + int("inspace-e2e-node-shared-conflict" in service_results)
+        + int("inspace-e2e-node-dedicated" in service_results),
+        "live Services did not converge to the expected shared, collision, and dedicated shards",
+    )
 
     nodeclass_name = managed_name(cluster, "node-lb")
     nodeclass = kubectl(kubeconfig, "get", "inspacenodeclass", nodeclass_name)
     nodeclass_labels = nodeclass.get("metadata", {}).get("labels", {})
+    nodeclass_finalizers = nodeclass.get("metadata", {}).get("finalizers", [])
     nodeclass_annotations = nodeclass.get("metadata", {}).get("annotations", {})
     nodeclass_spec = nodeclass.get("spec", {})
     require(nodeclass_labels.get("inspace.cloud/node-lb-managed") == "true" and nodeclass_labels.get("inspace.cloud/node-lb-cluster") == cluster, "generated NodeClass lacks exact managed ownership")
+    require(
+        "inspace.cloud/node-lb-cluster-state" in nodeclass_finalizers,
+        "generated NodeClass lacks the durable CCM cluster-state finalizer",
+    )
     require(
         nodeclass_spec.get("firewallProfile") == "public-node-load-balancer"
         and nodeclass_spec.get("rootDiskGiB") == 30
@@ -770,13 +860,31 @@ def prove_present(
     )
     icmp_firewall_uuid = nodeclass_annotations.get("service.inspace.cloud/node-lb-icmp-firewall-uuid", "")
     require(UUID_PATTERN.fullmatch(icmp_firewall_uuid) is not None, "generated NodeClass lacks the durable cluster ICMP firewall identity")
+    require(
+        all(
+            key not in nodeclass_annotations
+            for key in (
+                "service.inspace.cloud/node-lb-icmp-pending-firewall-uuid",
+                "service.inspace.cloud/node-lb-icmp-pending-firewall-name",
+                "service.inspace.cloud/node-lb-icmp-pending-firewall-started-at",
+                "service.inspace.cloud/node-lb-icmp-firewall-absence-count",
+                "service.inspace.cloud/node-lb-icmp-firewall-absence-checked-at",
+                "service.inspace.cloud/node-lb-icmp-cleanup-absence-count",
+                "service.inspace.cloud/node-lb-icmp-cleanup-absence-checked-at",
+            )
+        ),
+        "generated NodeClass retained an unresolved cluster ICMP transaction fence",
+    )
 
     nodes_by_shard = {}
     nodeclaims_by_shard = {}
+    nodepools_by_shard = {}
     for shard, service_names in services_by_shard.items():
         mode = SERVICE_SPECS[service_names[0]]["mode"]
         nodepool = kubectl(kubeconfig, "get", "nodepool", shard)
+        nodepools_by_shard[shard] = nodepool
         labels = nodepool.get("metadata", {}).get("labels", {})
+        finalizers = nodepool.get("metadata", {}).get("finalizers", [])
         template = nodepool.get("spec", {}).get("template", {})
         template_labels = template.get("metadata", {}).get("labels", {})
         template_spec = template.get("spec", {})
@@ -786,6 +894,7 @@ def prove_present(
             and labels.get("inspace.cloud/node-lb-shard") == shard,
             f"NodePool/{shard} lacks exact managed ownership",
         )
+        require("inspace.cloud/node-lb-state" in finalizers, f"NodePool/{shard} lacks the durable CCM shard-state finalizer")
         require(nodepool.get("spec", {}).get("replicas") == 1, f"NodePool/{shard} must default to one replica")
         require(nodepool.get("spec", {}).get("limits", {}).get("nodes") == "2", f"NodePool/{shard} must allow exactly one drift surge")
         require(
@@ -932,7 +1041,7 @@ def prove_present(
 
     expected_vm_uuids = set()
     expected_fip_names = set()
-    expected_service_firewalls = set()
+    expected_shard_firewalls = set()
     vm_by_shard = {}
     for shard, node in nodes_by_shard.items():
         provider_id = node.get("spec", {}).get("providerID", "")
@@ -999,19 +1108,23 @@ def prove_present(
         for service_name in services_by_shard[shard]:
             service_results[service_name]["vmUUID"] = vm_uuid
 
-    require(len(expected_vm_uuids) == 3 and len(expected_fip_names) == 3, "three shards must own exactly three VMs and three FIPs")
+    require(
+        len(expected_vm_uuids) == len(services_by_shard)
+        and len(expected_fip_names) == len(services_by_shard),
+        "every live Node-LB shard must own exactly one VM and one FIP",
+    )
     active_node_lb_vm_uuids = {
         vm.get("uuid")
         for vm in listed_vms
         if active(vm) and str(vm.get("name", "")).startswith(f"{cluster}-karp-inlb-")
     }
-    require(active_node_lb_vm_uuids == expected_vm_uuids, "active Node-LB VM inventory differs from the three live shards")
+    require(active_node_lb_vm_uuids == expected_vm_uuids, "active Node-LB VM inventory differs from the live shards")
     active_node_lb_fip_names = {
         address.get("name")
         for address in floating_ips
         if str(address.get("name", "")).startswith("karpenter-inlb-")
     }
-    require(active_node_lb_fip_names == expected_fip_names, "active Node-LB FIP inventory differs from the three live shards")
+    require(active_node_lb_fip_names == expected_fip_names, "active Node-LB FIP inventory differs from the live shards")
 
     icmp_name, icmp_hash = cluster_icmp_firewall_name(cluster)
     icmp_firewall = firewall_by_uuid.get(icmp_firewall_uuid)
@@ -1051,58 +1164,116 @@ def prove_present(
         vm_uuid: {base_firewall_uuid, icmp_firewall_uuid}
         for vm_uuid in expected_vm_uuids
     }
-    for name, result in service_results.items():
-        firewall_uuid = result["firewallUUID"]
-        expected_service_firewalls.add(firewall_uuid)
-        firewall = firewall_by_uuid.get(firewall_uuid)
-        require(firewall is not None, f"Service/{name} firewall is absent")
-        expected_name = firewall_name(cluster, result["uid"], result["firewallHash"])
-        actual_name = firewall.get("display_name") or firewall.get("name")
-        require(actual_name == expected_name, f"Service/{name} firewall name is not deterministic")
+    shard_results = {}
+    for shard, names in services_by_shard.items():
+        expected_name = shard_firewall_name(cluster, shard)
+        matching = [
+            firewall
+            for firewall in firewalls
+            if (firewall.get("display_name") or firewall.get("name")) == expected_name
+        ]
+        require(len(matching) == 1, f"Node-LB shard {shard} must own one stable aggregate firewall")
+        firewall = matching[0]
+        firewall_uuid = firewall.get("uuid", "")
+        require(UUID_PATTERN.fullmatch(firewall_uuid) is not None, f"Node-LB shard {shard} firewall lacks a UUID")
+        expected_shard_firewalls.add(firewall_uuid)
         require(
             firewall.get("billing_account_id") == billing_account
-            and firewall.get("description", "") in ("", "Managed InSpace node load balancer Service firewall"),
-            f"Service/{name} firewall ownership is invalid",
+            and firewall.get("description", "")
+            in ("", "Managed InSpace node load balancer shard firewall"),
+            f"Node-LB shard {shard} firewall ownership is invalid",
         )
         rules = firewall.get("rules", [])
-        expected_rules = expected_service_firewall_rules(services[name])
+        expected_rules = expected_shard_firewall_rules([services[name] for name in names])
         actual_policy_keys = canonical_service_policy_keys(rules)
         expected_policy_keys = canonical_service_policy_keys(expected_rules)
-        actual_policy_hash = canonical_service_policy_hash(rules)
         require(
             len(rules) == len(expected_rules)
-            and actual_policy_keys == expected_policy_keys
-            and actual_policy_hash == result["firewallHash"]
-            and actual_policy_hash == canonical_service_policy_hash(expected_rules),
-            f"Service/{name} firewall must contain exactly its canonical TCP/UDP-only policy",
+            and actual_policy_keys == expected_policy_keys,
+            f"Node-LB shard {shard} firewall must equal the canonical union of its Services",
         )
+        expected_vm_uuid = vm_by_shard[shard]
         assignments = firewall.get("resources_assigned", [])
-        expected_vm_uuid = vm_by_shard[result["shard"]]
         require(
             len(assignments) == 1
             and assignments[0].get("resource_type") == "vm"
             and assignments[0].get("resource_uuid") == expected_vm_uuid,
-            f"Service/{name} firewall must target exactly its one shard VM",
+            f"Node-LB shard {shard} firewall must target exactly its one shard VM",
         )
         expected_firewalls_by_vm[expected_vm_uuid].add(firewall_uuid)
+        node = nodes_by_shard[shard]
+        nodepool = nodepools_by_shard[shard]
+        nodepool_annotations = nodepool.get("metadata", {}).get("annotations", {})
+        nodepool_uid = nodepool.get("metadata", {}).get("uid", "")
+        require(UUID_PATTERN.fullmatch(nodepool_uid) is not None, f"NodePool/{shard} lacks a stable UID")
+        assigned = sorted(assigned_firewalls(firewalls, expected_vm_uuid))
+        applied_hash = nodepool_annotations.get("service.inspace.cloud/node-lb-shard-firewall-hash", "")
+        applied_ledger = nodepool_annotations.get("service.inspace.cloud/node-lb-shard-firewall-ledger", "")
+        expected_ledger = ",".join(
+            sorted(
+                f"{service_results[name]['uid']}={canonical_service_policy_hash(expected_service_firewall_rules(services[name]))}"
+                for name in names
+            )
+        )
+        require(
+            nodepool_annotations.get("service.inspace.cloud/node-lb-shard-firewall-uuid") == firewall_uuid
+            and applied_hash == canonical_service_policy_hash(rules)
+            and len(applied_hash) == 64
+            and applied_ledger == expected_ledger,
+            f"NodePool/{shard} durable aggregate UUID/hash/ledger does not match cloud policy",
+        )
+        require(
+            all(
+                key not in nodepool_annotations
+                for key in (
+                    "service.inspace.cloud/node-lb-shard-firewall-pending-hash",
+                    "service.inspace.cloud/node-lb-shard-firewall-pending-ledger",
+                    "service.inspace.cloud/node-lb-shard-firewall-pending-at",
+                    "service.inspace.cloud/node-lb-shard-firewall-issued-at",
+                    "service.inspace.cloud/node-lb-shard-firewall-pending-uuid",
+                )
+            ),
+            f"NodePool/{shard} retained an unresolved aggregate mutation fence",
+        )
+        shard_results[shard] = {
+            "nodePool": shard,
+            "nodePoolUID": nodepool_uid,
+            "node": node.get("metadata", {}).get("name"),
+            "vmUUID": expected_vm_uuid,
+            "ip": service_results[names[0]]["ip"],
+            "privateIP": service_results[names[0]]["privateIP"],
+            "firewallUUID": firewall_uuid,
+            "assignedFirewallUUIDs": assigned,
+            "readyTransitionTime": ready_transition_time(node),
+            "policyKeys": list(actual_policy_keys),
+            "services": sorted(names),
+        }
+        for name in names:
+            service_results[name]["firewallUUID"] = firewall_uuid
 
-    firewall_prefix = f"inlb-{short_hash(cluster)}-"
+    firewall_prefixes = (
+        f"inlb-{ownership_hash(cluster)}-shard-",
+        f"inlb-{short_hash(cluster)}-",
+    )
     icmp_firewall_prefix = f"inlb-{ownership_hash(cluster)}-icmp-"
     active_node_lb_firewalls = {
         firewall.get("uuid")
         for firewall in firewalls
-        if str(firewall.get("display_name") or firewall.get("name") or "").startswith(firewall_prefix)
+        if any(
+            str(firewall.get("display_name") or firewall.get("name") or "").startswith(prefix)
+            for prefix in firewall_prefixes
+        )
         or str(firewall.get("display_name") or firewall.get("name") or "").startswith(icmp_firewall_prefix)
     }
     require(
-        active_node_lb_firewalls == expected_service_firewalls | {icmp_firewall_uuid},
-        "active Node-LB firewall inventory differs from the live Service policies plus one cluster ICMP policy",
+        active_node_lb_firewalls == expected_shard_firewalls | {icmp_firewall_uuid},
+        "active Node-LB firewall inventory differs from one aggregate policy per shard plus one cluster ICMP policy",
     )
     for vm_uuid, expected in expected_firewalls_by_vm.items():
         require(assigned_firewalls(firewalls, vm_uuid) == expected, f"VM/{vm_uuid} has unexpected cloud firewall assignments")
 
     unique_public_ips = sorted({result["ip"] for result in service_results.values()})
-    require(len(unique_public_ips) == 3, "three live Node-LB shards must publish three unique FIPs")
+    require(len(unique_public_ips) == len(services_by_shard), "live Node-LB shards must publish unique FIPs")
     for address in unique_public_ips:
         ping_public_ip(address)
 
@@ -1139,91 +1310,126 @@ def prove_present(
         "shards": sorted(services_by_shard),
         "vms": sorted(expected_vm_uuids),
         "floatingIPs": sorted(expected_fip_names),
-        "firewalls": sorted(expected_service_firewalls | {icmp_firewall_uuid}),
+        "firewalls": sorted(expected_shard_firewalls | {icmp_firewall_uuid}),
+        "shardDetails": shard_results,
         "services": service_results,
         "httpProbes": http_probes,
         "udpProbes": udp_probes,
     }
 
 
-def prove_partial(
-    state: dict,
-    kubeconfig: str,
-    baseline_path: pathlib.Path,
-    deleted_firewall_uuid: str,
-    retained_shard: str,
-    retained_vm: str,
-    retained_ip: str,
-    retained_icmp_firewall_uuid: str,
-    retained_service_firewall_uuid: str,
-) -> dict:
-    service_names = tuple(name for name in SERVICE_SPECS if name != PARTIAL_DELETED_SERVICE)
-    result = prove_present(state, kubeconfig, baseline_path, service_names)
-    require(UUID_PATTERN.fullmatch(deleted_firewall_uuid) is not None, "partial proof lacks the deleted Service firewall UUID")
-    require(deleted_firewall_uuid not in result["firewalls"], "deleted shared-member Service firewall is still active")
-    retained = result["services"][RETAINED_SHARED_SERVICE]
+def read_snapshot(path: pathlib.Path) -> dict:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        fail(f"Node-LB anchor snapshot is unreadable: {error}")
     require(
-        retained["shard"] == retained_shard
-        and retained["vmUUID"] == retained_vm
-        and retained["ip"] == retained_ip
-        and result["icmpFirewallUUID"] == retained_icmp_firewall_uuid,
-        "partial shared-member deletion replaced the sibling shard, VM, FIP, or cluster ICMP firewall",
+        isinstance(value, dict)
+        and value.get("phase") == "present"
+        and isinstance(value.get("shardDetails"), dict)
+        and isinstance(value.get("services"), dict),
+        "Node-LB anchor snapshot has an unexpected schema",
     )
+    return value
+
+
+def compare_anchor(
+    result: dict,
+    anchor: dict,
+    expected_policy_change: str,
+    require_new_uids: tuple[str, ...],
+) -> None:
     require(
-        retained["firewallUUID"] == retained_service_firewall_uuid,
-        "partial shared-member deletion replaced the retained sibling Service firewall",
+        result["icmpFirewallUUID"] == anchor.get("icmpFirewallUUID"),
+        "Node-LB policy mutation replaced the cluster ICMP firewall",
     )
-    result["phase"] = "partial"
-    result["deletedService"] = PARTIAL_DELETED_SERVICE
-    result["deletedFirewallUUID"] = deleted_firewall_uuid
-    result["retainedServiceFirewallUUID"] = retained["firewallUUID"]
-    return result
+    current_shards = result["shardDetails"]
+    anchor_shards = anchor["shardDetails"]
+    common_shards = sorted(set(current_shards) & set(anchor_shards))
+    require(common_shards, "Node-LB policy mutation retained no shard identity")
+    identity_fields = (
+        "nodePool", "nodePoolUID", "node", "vmUUID", "ip", "privateIP",
+        "firewallUUID", "assignedFirewallUUIDs", "readyTransitionTime",
+    )
+    policy_relations = []
+    for shard in common_shards:
+        current = current_shards[shard]
+        previous = anchor_shards[shard]
+        require(
+            all(current.get(field) == previous.get(field) for field in identity_fields),
+            f"Node-LB shard {shard} changed NodePool, VM, FIP, VIP, firewall assignment, or Ready transition",
+        )
+        current_policy = set(current.get("policyKeys", []))
+        previous_policy = set(previous.get("policyKeys", []))
+        require(current_policy and previous_policy, f"Node-LB shard {shard} lacks canonical policy anchors")
+        if current_policy == previous_policy:
+            policy_relations.append("same")
+        elif current_policy > previous_policy:
+            policy_relations.append("expanded")
+        elif current_policy < previous_policy:
+            policy_relations.append("shrunk")
+        else:
+            policy_relations.append("replaced")
+    if expected_policy_change != "any":
+        require(
+            expected_policy_change in policy_relations
+            and all(relation in (expected_policy_change, "same") for relation in policy_relations),
+            f"aggregate shard firewall policy did not {expected_policy_change}: {policy_relations}",
+        )
+    for name in require_new_uids:
+        require(name in result["services"], f"recreated Service/{name} is absent")
+        require(name in anchor["services"], f"anchor lacks prior Service/{name} UID")
+        current_uid = result["services"][name].get("uid")
+        previous_uid = anchor["services"][name].get("uid")
+        require(
+            isinstance(current_uid, str)
+            and isinstance(previous_uid, str)
+            and current_uid
+            and previous_uid
+            and current_uid != previous_uid,
+            f"Service/{name} was not recreated with a new UID",
+        )
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--state", required=True)
     parser.add_argument("--kubeconfig", required=True)
-    parser.add_argument("--expect", choices=("present", "partial", "absent"), required=True)
+    parser.add_argument("--expect", choices=("present", "absent"), required=True)
     parser.add_argument("--baseline")
     parser.add_argument("--immutable-baseline")
-    parser.add_argument("--deleted-firewall")
-    parser.add_argument("--retained-shard")
-    parser.add_argument("--retained-vm")
-    parser.add_argument("--retained-ip")
-    parser.add_argument("--retained-icmp-firewall")
-    parser.add_argument("--retained-service-firewall")
+    parser.add_argument("--service", action="append", choices=tuple(SERVICE_SPECS))
+    parser.add_argument("--anchor")
+    parser.add_argument(
+        "--policy-change",
+        choices=("any", "expanded", "shrunk", "same"),
+        default="any",
+    )
+    parser.add_argument("--require-new-uid", action="append", choices=tuple(SERVICE_SPECS), default=[])
     args = parser.parse_args()
     state = json.loads(pathlib.Path(args.state).read_text(encoding="utf-8"))
     require(isinstance(state, dict) and isinstance(state.get("clusterName"), str), "ownership journal lacks clusterName")
     if args.expect == "absent":
         require(bool(args.immutable_baseline), "--immutable-baseline is required for the absent proof")
         result = prove_absent(state, args.kubeconfig, pathlib.Path(args.immutable_baseline))
-    elif args.expect == "present":
-        require(bool(args.baseline), "--baseline is required for the present proof")
-        result = prove_present(state, args.kubeconfig, pathlib.Path(args.baseline), tuple(SERVICE_SPECS))
     else:
-        required = {
-            "--baseline": args.baseline,
-            "--deleted-firewall": args.deleted_firewall,
-            "--retained-shard": args.retained_shard,
-            "--retained-vm": args.retained_vm,
-            "--retained-ip": args.retained_ip,
-            "--retained-icmp-firewall": args.retained_icmp_firewall,
-            "--retained-service-firewall": args.retained_service_firewall,
-        }
-        require(all(required.values()), "partial proof requires " + ", ".join(required))
-        result = prove_partial(
-            state,
-            args.kubeconfig,
-            pathlib.Path(args.baseline),
-            args.deleted_firewall,
-            args.retained_shard,
-            args.retained_vm,
-            args.retained_ip,
-            args.retained_icmp_firewall,
-            args.retained_service_firewall,
+        require(bool(args.baseline), "--baseline is required for the present proof")
+        service_names = tuple(args.service or SERVICE_SPECS)
+        require(
+            len(service_names) == len(set(service_names)),
+            "--service must not repeat a Node-LB Service",
         )
+        result = prove_present(state, args.kubeconfig, pathlib.Path(args.baseline), service_names)
+        if args.anchor:
+            compare_anchor(
+                result,
+                read_snapshot(pathlib.Path(args.anchor)),
+                args.policy_change,
+                tuple(args.require_new_uid),
+            )
+        else:
+            require(args.policy_change == "any", "--policy-change requires --anchor")
+            require(not args.require_new_uid, "--require-new-uid requires --anchor")
     print(json.dumps(result, sort_keys=True))
 
 

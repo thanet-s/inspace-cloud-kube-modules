@@ -67,6 +67,7 @@ type API interface {
 	DeleteFloatingIP(context.Context, string, string) error
 	ListFirewalls(context.Context, string) ([]inspace.Firewall, error)
 	CreateFirewall(context.Context, string, inspace.CreateFirewallRequest) (*inspace.Firewall, error)
+	UpdateFirewall(context.Context, string, string, inspace.UpdateFirewallRequest) (*inspace.Firewall, error)
 	DeleteFirewall(context.Context, string, string) error
 	AssignFirewallToVM(context.Context, string, string, string) error
 	UnassignFirewallFromVM(context.Context, string, string, string) error

@@ -167,26 +167,38 @@ Service, CCM owns a same-namespace `inlb-dp-<service-identity>` child with
 reference, and no NodePorts. The 52-hex identity is SHA-256 over
 `namespace NUL name NUL Service-UID`. The child
 publishes the selected Node's private InternalIP with `ipMode: VIP`; the parent
-publishes its paired public FIP with `ipMode: Proxy` and records
-`service.inspace.cloud/node-lb-datapath-active-shard` before the private VIP.
-CCM then requires exact private-VIP, Service-firewall assignment, and public
-Proxy readback in that order. InSpace DNAT changes the
+publishes its paired public FIP with `ipMode: Proxy`. Before either status is
+published, CCM proves the exact child spec with empty status, the aggregate
+shard-firewall policy, and its assignment. It then records
+`service.inspace.cloud/node-lb-datapath-active-shard`, publishes and reads back
+the private VIP, and finally publishes the public Proxy status. InSpace DNAT changes the
 packet destination to the private IP before Cilium, so Cilium programs only the
 private low-port frontend and cannot race a duplicate public frontend. The live
 proof requires each FIP's authoritative `assigned_to_private_ip` to equal both
 the Node InternalIP and that datapath VIP. The CCM also assigns one exact
-TCP/UDP-only per-Service InSpace firewall to the shard VM.
+TCP/UDP-only aggregate InSpace firewall to each shard VM. Its stable UUID and
+name do not change as non-conflicting Services join or leave; its rules are the
+canonical union of the shard's current Service policies. Acceptance also
+requires the NodePool's CCM state finalizer, full SHA-256 applied policy hash,
+exact per-Service membership ledger, and no unresolved pending mutation fence.
 One 128-bit cluster-owned ICMP firewall contains only inbound ICMP from Any and
-is reused by every and only authoritative Node-LB VM. Acceptance requires an
+is reused by every and only authoritative Node-LB VM. Its generated NodeClass
+must carry the CCM `inspace.cloud/node-lb-cluster-state` finalizer and an exact
+durable ICMP UUID with no unresolved transaction fence. Acceptance requires an
 ICMP echo response from every unique FIP, distinct markers through public
 TCP/80 and TCP/443, a real UDP echo response through UDP/443, and no Cilium
 duplicate-frontend log. It also proves that no InSpace NLB was created. The
-suite then deletes one shared member and proves its
-Service firewall disappears while the sibling shard, VM, FIP, global ICMP
-firewall, sibling per-Service firewall, and backends retain the same
-identities. An unconditional cleanup block removes the remaining Services,
-datapath children, NodePools, NodeClaims, nodes, both firewall types, VMs, FIPs,
-workload, and generated NodeClass. The global
+suite establishes Traefik alone and captures the shard firewall UUID, complete
+VM firewall assignment set, NodePool UID, VM, FIP, private VIP, and Node Ready
+`lastTransitionTime`. A continuous public TCP/80 probe then spans aggregate
+rule expansion, sibling deletion/rule shrink, and same-name/new-UID sibling
+recreation. Every phase must keep those identities and the Ready transition
+unchanged while the aggregate rules change exactly as expected. The later
+TCP/80 collision must receive another shard/firewall, and dedicated mode must
+remain separate. An unconditional cleanup block removes the Services,
+datapath children, NodePools, NodeClaims, nodes, aggregate and ICMP firewalls,
+VMs, FIPs, workload, and generated NodeClass through that finalizer-safe
+cleanup path. The global
 ICMP firewall must be absent and the complete billable-resource inventory must
 equal its pre-Node-LB snapshot. The deployments, PVC, private Services,
 cluster, and general worker remain available to later checks or a preserved

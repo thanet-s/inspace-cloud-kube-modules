@@ -30,6 +30,7 @@ func TestFakeProvisioningLifecycleMakesNoNetworkCalls(t *testing.T) {
 	cloudProvider, err := provider.New(cloud, resolver, provider.Options{
 		ClusterName: "smoke-cluster", DefaultNodeClassName: nodeClass.Name,
 		NetworkUUID: nodeClass.Spec.NetworkUUID, ControlPlaneVIP: "10.0.0.10", PrivateLoadBalancerPool: nodeClass.Spec.PrivateLoadBalancerPool,
+		CreateFenceStore: provider.NewMemoryCreateFenceStore(),
 	})
 	if err != nil {
 		t.Fatal(err)

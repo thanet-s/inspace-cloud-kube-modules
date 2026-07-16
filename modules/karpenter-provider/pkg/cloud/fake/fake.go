@@ -27,15 +27,69 @@ func New() *Cloud {
 	}
 }
 
-func (f *Cloud) CreateVM(_ context.Context, request cloud.CreateVMRequest) (*cloud.VM, error) {
+func (f *Cloud) PrepareCreate(_ context.Context, _ cloud.CreateVMRequest) (cloud.CreateInventory, error) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	inventory := cloud.CreateInventory{VMs: make([]string, 0, len(f.byID))}
+	for id := range f.byID {
+		inventory.VMs = append(inventory.VMs, id)
+	}
+	sort.Strings(inventory.VMs)
+	return inventory, nil
+}
+
+func (f *Cloud) CreateVM(ctx context.Context, request cloud.CreateVMRequest) (*cloud.VM, error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	if request.IdempotencyKey == "" {
+		f.mu.Unlock()
 		return nil, fmt.Errorf("idempotency key is required")
 	}
 	if id, ok := f.byKey[request.IdempotencyKey]; ok {
 		if vm, exists := f.byID[id]; exists {
-			return cloneVM(vm), nil
+			existing := cloneVM(vm)
+			f.mu.Unlock()
+			if request.CreateAttemptToken != "" && request.CreateAttemptAllowPOST {
+				if request.AuthorizeLaunch == nil {
+					return nil, cloud.ErrCreateAttemptPending
+				}
+				if err := request.AuthorizeLaunch(ctx, cloud.CreateAuthorizationAdoption); err != nil {
+					return nil, err
+				}
+			}
+			if request.CreateAttemptToken != "" {
+				if request.RecordCreatedVM == nil {
+					return nil, fmt.Errorf("missing durable created-VM anchor writer")
+				}
+				if err := request.RecordCreatedVM(ctx, existing.UUID); err != nil {
+					return nil, err
+				}
+			}
+			return existing, nil
+		}
+	}
+	f.mu.Unlock()
+	if request.CreateAttemptToken != "" {
+		if !request.CreateAttemptAllowPOST || request.AuthorizeLaunch == nil {
+			return nil, cloud.ErrCreateAttemptPending
+		}
+		if err := request.AuthorizeLaunch(ctx, cloud.CreateAuthorizationPost); err != nil {
+			return nil, err
+		}
+	}
+	f.mu.Lock()
+	if id, ok := f.byKey[request.IdempotencyKey]; ok {
+		if vm, exists := f.byID[id]; exists {
+			existing := cloneVM(vm)
+			f.mu.Unlock()
+			if request.CreateAttemptToken != "" {
+				if request.RecordCreatedVM == nil {
+					return nil, fmt.Errorf("missing durable created-VM anchor writer")
+				}
+				if err := request.RecordCreatedVM(ctx, existing.UUID); err != nil {
+					return nil, err
+				}
+			}
+			return existing, nil
 		}
 	}
 	id := deterministicUUID(request.IdempotencyKey)
@@ -44,6 +98,7 @@ func (f *Cloud) CreateVM(_ context.Context, request cloud.CreateVMRequest) (*clo
 		Name:                         request.Name,
 		ClusterName:                  request.ClusterName,
 		BillingAccountID:             request.BillingAccountID,
+		NodePoolName:                 request.NodePoolName,
 		NodeClaimName:                request.NodeClaimName,
 		Location:                     request.Location,
 		OSName:                       request.OSName,
@@ -70,7 +125,54 @@ func (f *Cloud) CreateVM(_ context.Context, request cloud.CreateVMRequest) (*clo
 	f.byID[id] = vm
 	f.byKey[request.IdempotencyKey] = id
 	f.requests[id] = cloneRequest(request)
+	f.mu.Unlock()
+	if request.CreateAttemptToken != "" {
+		if request.RecordCreatedVM == nil {
+			return nil, fmt.Errorf("missing durable created-VM anchor writer")
+		}
+		if err := request.RecordCreatedVM(ctx, id); err != nil {
+			return nil, err
+		}
+	}
 	return cloneVM(vm), nil
+}
+
+func (f *Cloud) ProtectFencedCreate(_ context.Context, request cloud.FencedCreateCleanupRequest) error {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	vm, ok := f.byID[request.CreatedVMUUID]
+	if !ok {
+		return cloud.ErrNotFound
+	}
+	if vm.Location != request.Location || vm.ClusterName != request.ClusterName || vm.NodeClaimName != request.NodeClaimName {
+		return cloud.ErrOwnershipMismatch
+	}
+	return nil
+}
+
+func (f *Cloud) CleanupFencedCreate(_ context.Context, request cloud.FencedCreateCleanupRequest) (cloud.FencedCreateCleanupResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, resolution := range request.Resolutions {
+		delete(f.byID, resolution.VMUUID)
+	}
+	for id, vm := range f.byID {
+		if vm.Location == request.Location && vm.ClusterName == request.ClusterName && vm.NodeClaimName == request.NodeClaimName && vm.Name == request.VMName {
+			return cloud.FencedCreateCleanupResult{Resolution: &cloud.FencedCreateCleanupResolution{
+				VMUUID: id, FloatingIPName: vm.FloatingIPName, PublicIPv4: vm.PublicIPv4,
+			}}, nil
+		}
+	}
+	if len(request.Resolutions) != 0 {
+		return cloud.FencedCreateCleanupResult{}, nil
+	}
+	if request.POSTRejected {
+		return cloud.FencedCreateCleanupResult{}, cloud.ErrNotFound
+	}
+	if request.POSTIssued {
+		return cloud.FencedCreateCleanupResult{}, cloud.ErrCreateAttemptUnresolved
+	}
+	return cloud.FencedCreateCleanupResult{}, cloud.ErrNotFound
 }
 
 func (f *Cloud) DeleteVM(_ context.Context, location, id, clusterName, nodeClaimName string, _ cloud.DeleteVMIdentity) error {
@@ -148,5 +250,15 @@ func cloneVM(vm *cloud.VM) *cloud.VM {
 }
 
 func cloneRequest(request cloud.CreateVMRequest) cloud.CreateVMRequest {
+	request.CreateBaseline = cloud.CreateInventory{
+		VMs:               append([]string(nil), request.CreateBaseline.VMs...),
+		PotentialVMs:      append([]string(nil), request.CreateBaseline.PotentialVMs...),
+		TargetVMs:         append([]string(nil), request.CreateBaseline.TargetVMs...),
+		FloatingIPs:       append([]string(nil), request.CreateBaseline.FloatingIPs...),
+		TargetFloatingIPs: append([]cloud.CreateFloatingIPAssignment(nil), request.CreateBaseline.TargetFloatingIPs...),
+	}
+	request.AuthorizeLaunch = nil
+	request.RecordCreatedVM = nil
+	request.ChooseRollback = nil
 	return request
 }
