@@ -50,23 +50,24 @@ const (
 )
 
 var (
-	errWorkerSupervisorVIPCollision      = errors.New("worker private IPv4 collides with the private RKE2 supervisor VIP")
-	errWorkerServiceVIPPoolCollision     = errors.New("worker private IPv4 collides with the reserved private Service VIP pool")
-	errFirewallAssignmentNotVisible      = errors.New("intended worker firewall assignment is not visible")
-	errEarlyFirewallProtection           = errors.New("early worker firewall protection failed")
-	errFreshOwnershipProof               = errors.New("fresh worker canonical ownership proof failed")
-	errPersistedOwnershipIncomplete      = errors.New("persisted VM ownership record is incomplete")
-	errVMAbsenceUncertain                = errors.New("VM absence could not be established")
-	errFloatingIPCleanupUncertain        = errors.New("floating IP cleanup did not converge")
-	errFirewallCleanupUncertain          = errors.New("firewall cleanup did not converge")
-	vmUUIDPattern                        = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
-	ownedInstanceTypePattern             = regexp.MustCompile(`^is-(compute|general|memory|extra-memory)-([0-9]+)c-([0-9]+)g$`)
-	nodeLoadBalancerShardPattern         = regexp.MustCompile(`^inlb-[0-9a-f]{8}$`)
-	nodeLoadBalancerShardFirewallPattern = regexp.MustCompile(`^inlb-[0-9a-f]{32}-shard-([0-9a-f]{8})$`)
-	createAttemptTokenPattern            = regexp.MustCompile(`^[0-9a-f]{32}$`)
-	karpenterOwnershipPrefixPattern      = regexp.MustCompile(`^\s*\{\s*"schema"\s*:\s*"(karpenter\.inspace\.cloud/[^"\s]+)"(?:\s*[,}]|\s*$)`)
-	karpenterClusterPattern              = regexp.MustCompile(`"cluster"\s*:\s*"([^"]*)"`)
-	fixedClusterNetworks                 = [...]struct {
+	errWorkerSupervisorVIPCollision        = errors.New("worker private IPv4 collides with the private RKE2 supervisor VIP")
+	errWorkerServiceVIPPoolCollision       = errors.New("worker private IPv4 collides with the reserved private Service VIP pool")
+	errFirewallAssignmentNotVisible        = errors.New("intended worker firewall assignment is not visible")
+	errFirewallAssignmentReadbackDuplicate = errors.New("intended worker firewall assignment appears more than once during readback")
+	errEarlyFirewallProtection             = errors.New("early worker firewall protection failed")
+	errFreshOwnershipProof                 = errors.New("fresh worker canonical ownership proof failed")
+	errPersistedOwnershipIncomplete        = errors.New("persisted VM ownership record is incomplete")
+	errVMAbsenceUncertain                  = errors.New("VM absence could not be established")
+	errFloatingIPCleanupUncertain          = errors.New("floating IP cleanup did not converge")
+	errFirewallCleanupUncertain            = errors.New("firewall cleanup did not converge")
+	vmUUIDPattern                          = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
+	ownedInstanceTypePattern               = regexp.MustCompile(`^is-(compute|general|memory|extra-memory)-([0-9]+)c-([0-9]+)g$`)
+	nodeLoadBalancerShardPattern           = regexp.MustCompile(`^inlb-[0-9a-f]{8}$`)
+	nodeLoadBalancerShardFirewallPattern   = regexp.MustCompile(`^inlb-[0-9a-f]{32}-shard-([0-9a-f]{8})$`)
+	createAttemptTokenPattern              = regexp.MustCompile(`^[0-9a-f]{32}$`)
+	karpenterOwnershipPrefixPattern        = regexp.MustCompile(`^\s*\{\s*"schema"\s*:\s*"(karpenter\.inspace\.cloud/[^"\s]+)"(?:\s*[,}]|\s*$)`)
+	karpenterClusterPattern                = regexp.MustCompile(`"cluster"\s*:\s*"([^"]*)"`)
+	fixedClusterNetworks                   = [...]struct {
 		description string
 		prefix      netip.Prefix
 	}{
@@ -3200,7 +3201,7 @@ func (a *Adapter) ensureFreshFirewall(ctx context.Context, location, firewallUUI
 				return nil
 			}
 			lastObservation = validationErr
-			if !errors.Is(validationErr, errFirewallAssignmentNotVisible) {
+			if !isRetryableFirewallAssignmentReadback(validationErr) {
 				return errors.Join(mutationErr, validationErr)
 			}
 		}
@@ -3632,7 +3633,7 @@ func (a *Adapter) ensureFirewall(ctx context.Context, location, firewallUUID, vm
 				return nil
 			}
 			lastObservation = err
-			if !errors.Is(err, errFirewallAssignmentNotVisible) {
+			if !isRetryableFirewallAssignmentReadback(err) {
 				return errors.Join(mutationErr, err)
 			}
 		}
@@ -3657,6 +3658,15 @@ func validateWorkerFirewallAssignments(firewalls []sdk.Firewall, intendedFirewal
 		}
 		if len(assignments) == 0 {
 			return false, fmt.Errorf("%w: worker VM %s", errFirewallAssignmentNotVisible, vmUUID)
+		}
+		intendedCount := 0
+		for _, firewallUUID := range assignments {
+			if firewallUUID == intendedFirewallUUID {
+				intendedCount++
+			}
+		}
+		if intendedCount > 1 && intendedCount == len(assignments) {
+			return false, fmt.Errorf("%w: %w: worker VM %s has duplicate intended firewall %s assignments", cloudapi.ErrOwnershipMismatch, errFirewallAssignmentReadbackDuplicate, vmUUID, intendedFirewallUUID)
 		}
 		if len(assignments) != 1 || assignments[0] != intendedFirewallUUID {
 			return false, fmt.Errorf("%w: worker VM %s must be attached exactly once to intended firewall %s, got %v", cloudapi.ErrOwnershipMismatch, vmUUID, intendedFirewallUUID, assignments)
@@ -3710,7 +3720,7 @@ func validateWorkerFirewallAssignments(firewalls []sdk.Firewall, intendedFirewal
 		}
 	}
 	if intendedCount > 1 {
-		return false, fmt.Errorf("%w: worker VM %s has duplicate intended firewall %s assignments", cloudapi.ErrOwnershipMismatch, vmUUID, intendedFirewallUUID)
+		return false, fmt.Errorf("%w: %w: worker VM %s has duplicate intended firewall %s assignments", cloudapi.ErrOwnershipMismatch, errFirewallAssignmentReadbackDuplicate, vmUUID, intendedFirewallUUID)
 	}
 	if intendedCount == 0 {
 		if requireIntended {
@@ -3719,6 +3729,16 @@ func validateWorkerFirewallAssignments(firewalls []sdk.Firewall, intendedFirewal
 		return false, nil
 	}
 	return true, nil
+}
+
+// Only a duplicate observation of the exact intended firewall is safe to
+// retry after an assignment mutation: at least one default-deny attachment is
+// already visible, and the bounded readback may converge to the canonical
+// single resource row. Established-state audits call the validator directly
+// and remain strict, while any foreign or malformed assignment still fails
+// immediately.
+func isRetryableFirewallAssignmentReadback(err error) bool {
+	return errors.Is(err, errFirewallAssignmentNotVisible) || errors.Is(err, errFirewallAssignmentReadbackDuplicate)
 }
 
 // nodeLoadBalancerShardFromOwnedNodeClaim returns the exact durable NodePool
