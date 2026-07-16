@@ -1815,6 +1815,76 @@ func TestPublicNodeLoadBalancerAllowsOwnedShardFirewallAcrossCreateAndReadback(t
 	}
 }
 
+func TestPublicNodeLocalAllowsOwnedServiceFirewallAcrossCreateAndReadback(t *testing.T) {
+	serviceFirewall := nodeLoadBalancerServiceFirewall("cluster-a", "service-uid-a")
+	api := &fakeAPI{
+		firewalls:                  []sdk.Firewall{secureFirewall(), serviceFirewall},
+		secondFirewallOnAssignUUID: serviceFirewall.UUID,
+	}
+	adapter, err := New(api)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := testRequest()
+	request.FirewallProfile = inspacev1.FirewallProfilePublicNodeLocal
+	request.NodePoolName = "edge"
+	request.NodeClaimName = "edge-abcde"
+	request.Name = request.ClusterName + "-karp-" + request.NodeClaimName
+	created, err := adapter.CreateVM(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created.FirewallProfile != inspacev1.FirewallProfilePublicNodeLocal {
+		t.Fatalf("created VM firewall profile = %q", created.FirewallProfile)
+	}
+	if _, err := adapter.GetVM(context.Background(), request.Location, created.UUID, request.ClusterName); err != nil {
+		t.Fatalf("GetVM with owned Service firewall: %v", err)
+	}
+	if vms, err := adapter.ListVMs(context.Background(), request.Location, request.ClusterName); err != nil || len(vms) != 1 {
+		t.Fatalf("ListVMs with owned Service firewall = %#v, %v", vms, err)
+	}
+}
+
+func TestCreateRejectsInvalidPublicNodeLocalNodePoolIdentityBeforeMutation(t *testing.T) {
+	tests := map[string]struct {
+		nodePool  string
+		nodeClaim string
+		want      string
+	}{
+		"missing durable NodePool": {
+			nodeClaim: "nodeclaim-a",
+			want:      `NodePool name "" is not a DNS-1123 label`,
+		},
+		"invalid NodePool": {
+			nodePool:  "EDGE",
+			nodeClaim: "edge-abcde",
+			want:      `NodePool name "EDGE" is not a DNS-1123 label`,
+		},
+		"NodeClaim belongs to another NodePool": {
+			nodePool:  "edge",
+			nodeClaim: "other-abcde",
+			want:      `must use exact NodePool-generated prefix "edge-"`,
+		},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			api := &fakeAPI{}
+			adapter, _ := New(api)
+			request := testRequest()
+			request.FirewallProfile = inspacev1.FirewallProfilePublicNodeLocal
+			request.NodePoolName = test.nodePool
+			request.NodeClaimName = test.nodeClaim
+			request.Name = request.ClusterName + "-karp-" + request.NodeClaimName
+			if _, err := adapter.CreateVM(context.Background(), request); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("CreateVM() error = %v, want %q", err, test.want)
+			}
+			if api.createCalls != 0 || api.firewallAssignCalls != 0 || len(api.operations) != 0 {
+				t.Fatalf("invalid public-local identity reached mutation: VMPOSTs=%d firewall=%d operations=%v", api.createCalls, api.firewallAssignCalls, api.operations)
+			}
+		})
+	}
+}
+
 func TestPublicNodeLoadBalancerWaitsForDuplicateIntendedFirewallReadbackToConverge(t *testing.T) {
 	const vmUUID = "11111111-1111-4111-8111-111111111111"
 	duplicate := secureFirewall()
@@ -1908,6 +1978,7 @@ func TestWorkerFirewallDuplicateReadbackClassificationExcludesForeignAssignments
 	for name, profile := range map[string]inspacev1.FirewallProfile{
 		"private":                 inspacev1.FirewallProfilePrivateWorker,
 		"public NodeLoadBalancer": inspacev1.FirewallProfilePublicNodeLoadBalancer,
+		"public node local":       inspacev1.FirewallProfilePublicNodeLocal,
 	} {
 		t.Run(name, func(t *testing.T) {
 			_, duplicateErr := validateWorkerFirewallAssignments(
@@ -1925,6 +1996,57 @@ func TestWorkerFirewallDuplicateReadbackClassificationExcludesForeignAssignments
 				t.Fatalf("duplicate plus foreign assignment was marked retryable: %v", foreignErr)
 			}
 		})
+	}
+}
+
+func TestPublicNodeLocalAdditionalFirewallContract(t *testing.T) {
+	const vmUUID = "11111111-1111-4111-8111-111111111111"
+	assigned := func(firewall sdk.Firewall) sdk.Firewall {
+		firewall.ResourcesAssigned = []sdk.FirewallResource{{ResourceType: "vm", ResourceUUID: vmUUID}}
+		return firewall
+	}
+	base := assigned(secureFirewall())
+	first := assigned(nodeLoadBalancerServiceFirewall("cluster-a", "service-uid-a"))
+	second := assigned(nodeLoadBalancerServiceFirewall("cluster-a", "service-uid-b"))
+	second.UUID = "55555555-5555-4555-8555-555555555555"
+	port := int32(8443)
+	second.Rules[0].PortStart = &port
+	second.Rules[0].PortEnd = &port
+	name, _, err := sdk.NodeLoadBalancerServiceFirewallName("cluster-a", "service-uid-b", second.Rules)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second.DisplayName = name
+
+	if ok, err := validateWorkerFirewallAssignments(
+		[]sdk.Firewall{base, first, second}, base.UUID, vmUUID, true,
+		inspacev1.FirewallProfilePublicNodeLocal, "cluster-a", "", "nodeclaim-a",
+	); err != nil || !ok {
+		t.Fatalf("valid public-node-local firewall set rejected: ok=%t err=%v", ok, err)
+	}
+
+	for name, additional := range map[string]sdk.Firewall{
+		"aggregate shard": assigned(nodeLoadBalancerShardFirewall("cluster-a", "inlb-7255785b")),
+		"cluster ICMP":    assigned(nodeLoadBalancerClusterICMPFirewall("cluster-a")),
+		"foreign cluster": assigned(nodeLoadBalancerServiceFirewall("cluster-b", "service-uid-a")),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := validateWorkerFirewallAssignments(
+				[]sdk.Firewall{base, additional}, base.UUID, vmUUID, true,
+				inspacev1.FirewallProfilePublicNodeLocal, "cluster-a", "", "nodeclaim-a",
+			); !errors.Is(err, cloudapi.ErrOwnershipMismatch) {
+				t.Fatalf("invalid public-node-local additional firewall accepted: %v", err)
+			}
+		})
+	}
+
+	duplicate := first
+	duplicate.ResourcesAssigned = append(duplicate.ResourcesAssigned, duplicate.ResourcesAssigned[0])
+	if _, err := validateWorkerFirewallAssignments(
+		[]sdk.Firewall{base, duplicate}, base.UUID, vmUUID, true,
+		inspacev1.FirewallProfilePublicNodeLocal, "cluster-a", "", "nodeclaim-a",
+	); !errors.Is(err, cloudapi.ErrOwnershipMismatch) || !strings.Contains(err.Error(), "duplicate Service firewall") {
+		t.Fatalf("duplicate public-node-local Service firewall assignment accepted: %v", err)
 	}
 }
 
@@ -2109,7 +2231,7 @@ func TestPublicNodeLoadBalancerAdditionalFirewallContract(t *testing.T) {
 		})
 	}
 
-	legacy := assigned(legacyNodeLoadBalancerServiceFirewall("cluster-a", "service-uid-a"))
+	legacy := assigned(nodeLoadBalancerServiceFirewall("cluster-a", "service-uid-a"))
 	if _, err := validateWorkerFirewallAssignments(
 		[]sdk.Firewall{intended, legacy}, intended.UUID, vmUUID, true,
 		inspacev1.FirewallProfilePublicNodeLoadBalancer, "cluster-a", "inlb-7255785b", "inlb-7255785b-abcde",
@@ -5170,7 +5292,7 @@ func nodeLoadBalancerShardFirewall(cluster, shard string) sdk.Firewall {
 	return firewall
 }
 
-func legacyNodeLoadBalancerServiceFirewall(cluster, serviceUID string) sdk.Firewall {
+func nodeLoadBalancerServiceFirewall(cluster, serviceUID string) sdk.Firewall {
 	port := int32(443)
 	firewall := sdk.Firewall{
 		UUID: "44444444-4444-4444-8444-444444444444", BillingAccountID: 42,

@@ -146,6 +146,9 @@
         - node-load-balancer-baseline.json
         - node-load-balancer.yaml
         - node-load-balancer-expansion.yaml
+        - public-node-local-capacity.yaml
+        - public-node-local-service.yaml
+        - public-node-local-present.json
 
     - name: Heal state left by an interrupted acceptance run
       ansible.builtin.shell: |
@@ -195,13 +198,27 @@
           - delete
           - service/inspace-e2e-web
           - deployment/inspace-e2e-node-lb
+          - deployment/inspace-e2e-public-local
           - service/inspace-e2e-node-traefik
           - service/inspace-e2e-node-shared-b
           - service/inspace-e2e-node-shared-conflict
           - service/inspace-e2e-node-dedicated
+          - service/inspace-e2e-public-local
           - --ignore-not-found
           - --wait=false
       changed_when: true
+
+    - name: Wait for the stale public-node-local Service firewall owner to disappear
+      ansible.builtin.shell: |
+        set -euo pipefail
+        test -z "$(kubectl -n default get service/inspace-e2e-public-local --ignore-not-found -o name)"
+      args:
+        executable: /bin/bash
+      register: e2e_stale_public_local_service_cleanup
+      changed_when: false
+      retries: 180
+      delay: 10
+      until: e2e_stale_public_local_service_cleanup.rc == 0
 
     - name: Wait for the stale paid public Service owner to disappear
       ansible.builtin.shell: |
@@ -259,6 +276,44 @@
           - inspacenodeclass
           - -l
           - "inspace.cloud/node-lb-managed=true,inspace.cloud/node-lb-cluster={{ e2e_state.clusterName }}"
+          - --ignore-not-found
+          - --wait=true
+          - --timeout=5m
+      changed_when: true
+
+    - name: Delete stale public-node-local static capacity after Service cleanup
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - delete
+          - nodepool
+          - "{{ e2e_state.publicLocalNodePoolName }}"
+          - --ignore-not-found
+          - --wait=false
+      changed_when: true
+
+    - name: Wait for stale public-node-local NodeClaims and Nodes to disappear
+      ansible.builtin.shell: |
+        set -euo pipefail
+        pool={{ e2e_state.publicLocalNodePoolName | quote }}
+        test "$(kubectl get nodeclaims -l "karpenter.sh/nodepool=$pool" -o json | jq '.items | length')" -eq 0
+        test "$(kubectl get nodes -l "karpenter.sh/nodepool=$pool" -o json | jq '.items | length')" -eq 0
+        test -z "$(kubectl get nodepool "$pool" --ignore-not-found -o name)"
+      args:
+        executable: /bin/bash
+      register: e2e_stale_public_local_capacity_cleanup
+      changed_when: false
+      retries: 180
+      delay: 10
+      until: e2e_stale_public_local_capacity_cleanup.rc == 0
+
+    - name: Delete the stale public-node-local NodeClass
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - delete
+          - inspacenodeclass
+          - "{{ e2e_state.publicLocalNodeClassName }}"
           - --ignore-not-found
           - --wait=true
           - --timeout=5m
@@ -333,6 +388,12 @@
     e2e_node_lb_recreated_snapshot: "{{ lookup('env', 'E2E_STATE_DIR') }}/node-load-balancer-recreated.json"
     e2e_node_lb_probe_stop: "{{ lookup('env', 'E2E_STATE_DIR') }}/node-load-balancer-probe.stop"
     e2e_node_lb_probe_ready: "{{ lookup('env', 'E2E_STATE_DIR') }}/node-load-balancer-probe.ready"
+    e2e_public_local_capacity_manifest: "{{ lookup('env', 'E2E_STATE_DIR') }}/public-node-local-capacity.yaml"
+    e2e_public_local_service_manifest: "{{ lookup('env', 'E2E_STATE_DIR') }}/public-node-local-service.yaml"
+    e2e_public_local_snapshot: "{{ lookup('env', 'E2E_STATE_DIR') }}/public-node-local-present.json"
+    e2e_public_local_nodeclass_name: "{{ e2e_state.publicLocalNodeClassName }}"
+    e2e_public_local_nodepool_name: "{{ e2e_state.publicLocalNodePoolName }}"
+    e2e_public_local_pool: "{{ e2e_state.publicLocalPool }}"
     e2e_nodepool_name: "general"
     e2e_marker: "inspace-e2e-{{ lookup('env', 'E2E_RUN_ID') }}"
   environment:
@@ -1757,6 +1818,456 @@
           retries: 30
           delay: 10
           until: e2e_node_lb_inventory_cleanup.rc == 0
+          no_log: true
+
+    - name: Render the public-node-local static edge capacity
+      ansible.builtin.template:
+        src: templates/public-node-local-capacity.yaml.j2
+        dest: "{{ e2e_public_local_capacity_manifest }}"
+        mode: "0600"
+
+    - name: Render the public-node-local Service
+      ansible.builtin.template:
+        src: templates/public-node-local-service.yaml.j2
+        dest: "{{ e2e_public_local_service_manifest }}"
+        mode: "0600"
+
+    - name: Exercise user-owned endpoint-local public capacity
+      block:
+        - name: Create the public-node-local NodeClass NodePool and workload
+          ansible.builtin.command:
+            argv:
+              - kubectl
+              - apply
+              - --server-side
+              - --field-manager=inspace-e2e
+              - -f
+              - "{{ e2e_public_local_capacity_manifest }}"
+          changed_when: true
+
+        - name: Wait for static public-node-local capacity before Service authorization
+          ansible.builtin.shell: |
+            set -euo pipefail
+            pool={{ e2e_public_local_nodepool_name | quote }}
+            label={{ ('karpenter.sh/nodepool=' + e2e_public_local_nodepool_name) | quote }}
+            nodes=$(kubectl get nodes -l "$label" -o json)
+            test "$(jq '.items | length' <<<"$nodes")" -eq 1
+            jq -e 'all(.items[];
+              any(.status.conditions[]?; .type == "Ready" and .status == "True"))' <<<"$nodes"
+            test "$(kubectl get nodeclaims -l "$label" -o json | jq '.items | length')" -eq 1
+          args:
+            executable: /bin/bash
+          register: e2e_public_local_capacity_ready
+          changed_when: false
+          retries: 60
+          delay: 10
+          until: e2e_public_local_capacity_ready.rc == 0
+
+        - name: Create the public-node-local Service
+          ansible.builtin.command:
+            argv:
+              - kubectl
+              - apply
+              - --server-side
+              - --field-manager=inspace-e2e
+              - -f
+              - "{{ e2e_public_local_service_manifest }}"
+          changed_when: true
+
+        - name: Journal the public-node-local Service UID before cloud convergence
+          ansible.builtin.shell: |
+            set -euo pipefail
+            uid=$(kubectl -n default get service/inspace-e2e-public-local -o jsonpath='{.metadata.uid}')
+            test -n "$uid"
+            /opt/e2e/scripts/state-update.py \
+              "{{ e2e_state_file }}" publicLocalServiceUID \
+              "$(jq -cn --arg value "$uid" '$value')"
+          args:
+            executable: /bin/bash
+          register: e2e_public_local_uid_journal
+          changed_when: true
+
+        - name: Wait for CCM to authorize the edge Node and schedule its local Pod
+          ansible.builtin.shell: |
+            set -euo pipefail
+            label={{ ('karpenter.sh/nodepool=' + e2e_public_local_nodepool_name) | quote }}
+            pool={{ e2e_public_local_pool | quote }}
+            nodes=$(kubectl get nodes -l "$label" -o json)
+            test "$(jq '.items | length' <<<"$nodes")" -eq 1
+            jq -e --arg pool "$pool" 'all(.items[];
+              .metadata.labels["inspace.cloud.node-restriction.kubernetes.io/public-local-pool"] == $pool)' <<<"$nodes"
+            kubectl -n default rollout status deployment/inspace-e2e-public-local --timeout=30s
+          args:
+            executable: /bin/bash
+          register: e2e_public_local_authorized
+          changed_when: false
+          retries: 180
+          delay: 10
+          until: e2e_public_local_authorized.rc == 0
+
+        - name: Prove public-node-local TCP UDP status firewall FIP identity and client source
+          ansible.builtin.command:
+            argv:
+              - /opt/e2e/scripts/verify-public-node-local.py
+              - --state
+              - "{{ e2e_state_file }}"
+              - --kubeconfig
+              - "{{ e2e_kubeconfig }}"
+              - --baseline
+              - "{{ e2e_node_lb_baseline }}"
+              - --expect
+              - present
+              - --probe-public
+          register: e2e_public_local_present
+          changed_when: false
+          retries: 180
+          delay: 10
+          until: e2e_public_local_present.rc == 0
+          no_log: true
+
+        - name: Persist the established public-node-local VM and FIP identity
+          ansible.builtin.copy:
+            content: "{{ e2e_public_local_present.stdout }}\n"
+            dest: "{{ e2e_public_local_snapshot }}"
+            mode: "0600"
+          no_log: true
+
+        - name: Remove every local endpoint while retaining static edge capacity
+          ansible.builtin.command:
+            argv:
+              - kubectl
+              - -n
+              - default
+              - scale
+              - deployment/inspace-e2e-public-local
+              - --replicas=0
+          changed_when: true
+
+        - name: Prove endpoint loss withdraws status and firewall but preserves the FIP
+          ansible.builtin.command:
+            argv:
+              - /opt/e2e/scripts/verify-public-node-local.py
+              - --state
+              - "{{ e2e_state_file }}"
+              - --kubeconfig
+              - "{{ e2e_kubeconfig }}"
+              - --baseline
+              - "{{ e2e_node_lb_baseline }}"
+              - --expect
+              - withdrawn
+              - --anchor
+              - "{{ e2e_public_local_snapshot }}"
+          register: e2e_public_local_withdrawn
+          changed_when: false
+          retries: 180
+          delay: 10
+          until: e2e_public_local_withdrawn.rc == 0
+          no_log: true
+
+        - name: Restore the endpoint-local workload
+          ansible.builtin.command:
+            argv:
+              - kubectl
+              - -n
+              - default
+              - scale
+              - deployment/inspace-e2e-public-local
+              - --replicas=1
+          changed_when: true
+
+        - name: Wait for the restored endpoint-local workload
+          ansible.builtin.command:
+            argv:
+              - kubectl
+              - -n
+              - default
+              - rollout
+              - status
+              - deployment/inspace-e2e-public-local
+              - --timeout=10m
+          changed_when: false
+
+        - name: Prove the same public-node-local FIP is republished
+          ansible.builtin.command:
+            argv:
+              - /opt/e2e/scripts/verify-public-node-local.py
+              - --state
+              - "{{ e2e_state_file }}"
+              - --kubeconfig
+              - "{{ e2e_kubeconfig }}"
+              - --baseline
+              - "{{ e2e_node_lb_baseline }}"
+              - --expect
+              - present
+          register: e2e_public_local_restored
+          changed_when: false
+          retries: 180
+          delay: 10
+          until: >-
+            e2e_public_local_restored.rc == 0 and
+            (e2e_public_local_restored.stdout | from_json).statusIPs ==
+            (lookup('file', e2e_public_local_snapshot) | from_json).statusIPs
+          no_log: true
+
+        - name: Delete the established edge NodeClaim to force static replacement
+          ansible.builtin.shell: |
+            set -euo pipefail
+            claim=$(jq -er '.nodes[0].nodeClaim' {{ e2e_public_local_snapshot | quote }})
+            kubectl delete nodeclaim "$claim" --wait=false
+          args:
+            executable: /bin/bash
+          changed_when: true
+
+        - name: Prove replacement rotates capacity and reconverges the live Service
+          ansible.builtin.command:
+            argv:
+              - /opt/e2e/scripts/verify-public-node-local.py
+              - --state
+              - "{{ e2e_state_file }}"
+              - --kubeconfig
+              - "{{ e2e_kubeconfig }}"
+              - --baseline
+              - "{{ e2e_node_lb_baseline }}"
+              - --expect
+              - present
+              - --anchor
+              - "{{ e2e_public_local_snapshot }}"
+              - --probe-public
+          register: e2e_public_local_replaced
+          changed_when: false
+          retries: 240
+          delay: 10
+          until: e2e_public_local_replaced.rc == 0
+          no_log: true
+
+        - name: Persist the replacement VM and FIP identity for cleanup proof
+          ansible.builtin.copy:
+            content: "{{ e2e_public_local_replaced.stdout }}\n"
+            dest: "{{ e2e_public_local_snapshot }}"
+            mode: "0600"
+          no_log: true
+
+        - name: Delete the public-node-local Service immediately after exposure checks
+          ansible.builtin.command:
+            argv:
+              - kubectl
+              - -n
+              - default
+              - delete
+              - service/inspace-e2e-public-local
+              - --wait=false
+          changed_when: true
+
+        - name: Prove Service cleanup preserves its user-owned VM and FIP
+          ansible.builtin.command:
+            argv:
+              - /opt/e2e/scripts/verify-public-node-local.py
+              - --state
+              - "{{ e2e_state_file }}"
+              - --kubeconfig
+              - "{{ e2e_kubeconfig }}"
+              - --baseline
+              - "{{ e2e_node_lb_baseline }}"
+              - --expect
+              - service-absent
+              - --anchor
+              - "{{ e2e_public_local_snapshot }}"
+          register: e2e_public_local_service_absent
+          changed_when: false
+          retries: 180
+          delay: 10
+          until: e2e_public_local_service_absent.rc == 0
+          no_log: true
+
+        - name: Delete the public-node-local workload before static capacity
+          ansible.builtin.command:
+            argv:
+              - kubectl
+              - -n
+              - default
+              - delete
+              - deployment/inspace-e2e-public-local
+              - --ignore-not-found
+              - --wait=false
+          changed_when: true
+
+        - name: Delete the public-node-local static NodePool
+          ansible.builtin.command:
+            argv:
+              - kubectl
+              - delete
+              - nodepool
+              - "{{ e2e_public_local_nodepool_name }}"
+              - --ignore-not-found
+              - --wait=false
+          changed_when: true
+
+        - name: Wait for public-node-local static capacity cleanup
+          ansible.builtin.shell: |
+            set -euo pipefail
+            pool={{ e2e_public_local_nodepool_name | quote }}
+            test "$(kubectl get nodeclaims -l "karpenter.sh/nodepool=$pool" -o json | jq '.items | length')" -eq 0
+            test "$(kubectl get nodes -l "karpenter.sh/nodepool=$pool" -o json | jq '.items | length')" -eq 0
+            test -z "$(kubectl get nodepool "$pool" --ignore-not-found -o name)"
+          args:
+            executable: /bin/bash
+          register: e2e_public_local_capacity_absent
+          changed_when: false
+          retries: 180
+          delay: 10
+          until: e2e_public_local_capacity_absent.rc == 0
+
+        - name: Delete the public-node-local NodeClass after capacity is gone
+          ansible.builtin.command:
+            argv:
+              - kubectl
+              - delete
+              - inspacenodeclass
+              - "{{ e2e_public_local_nodeclass_name }}"
+              - --ignore-not-found
+              - --wait=true
+              - --timeout=5m
+          changed_when: true
+
+        - name: Require complete public-node-local capacity and cloud cleanup
+          ansible.builtin.command:
+            argv:
+              - /opt/e2e/scripts/verify-public-node-local.py
+              - --state
+              - "{{ e2e_state_file }}"
+              - --kubeconfig
+              - "{{ e2e_kubeconfig }}"
+              - --baseline
+              - "{{ e2e_node_lb_baseline }}"
+              - --expect
+              - absent
+          register: e2e_public_local_absent
+          changed_when: false
+          retries: 180
+          delay: 10
+          until: e2e_public_local_absent.rc == 0
+          no_log: true
+
+        - name: Require exact pre-public-node-local account inventory
+          ansible.builtin.command:
+            argv:
+              - /opt/e2e/scripts/account-inventory.py
+              - compare
+              - --baseline
+              - "{{ e2e_node_lb_baseline }}"
+          register: e2e_public_local_inventory_cleanup
+          changed_when: false
+          retries: 30
+          delay: 10
+          until: e2e_public_local_inventory_cleanup.rc == 0
+          no_log: true
+      always:
+        - name: Delete the public-node-local Service before fallback capacity cleanup
+          ansible.builtin.command:
+            argv:
+              - kubectl
+              - -n
+              - default
+              - delete
+              - service/inspace-e2e-public-local
+              - --ignore-not-found
+              - --wait=false
+          changed_when: true
+
+        - name: Wait for the public-node-local firewall finalizer before capacity cleanup
+          ansible.builtin.shell: |
+            set -euo pipefail
+            test -z "$(kubectl -n default get service/inspace-e2e-public-local --ignore-not-found -o name)"
+          args:
+            executable: /bin/bash
+          register: e2e_public_local_fallback_service_absent
+          changed_when: false
+          retries: 180
+          delay: 10
+          until: e2e_public_local_fallback_service_absent.rc == 0
+
+        - name: Delete the fallback public-node-local workload
+          ansible.builtin.command:
+            argv:
+              - kubectl
+              - -n
+              - default
+              - delete
+              - deployment/inspace-e2e-public-local
+              - --ignore-not-found
+              - --wait=false
+          changed_when: true
+
+        - name: Delete the fallback public-node-local NodePool
+          ansible.builtin.command:
+            argv:
+              - kubectl
+              - delete
+              - nodepool
+              - "{{ e2e_public_local_nodepool_name }}"
+              - --ignore-not-found
+              - --wait=false
+          changed_when: true
+
+        - name: Wait for fallback public-node-local capacity cleanup
+          ansible.builtin.shell: |
+            set -euo pipefail
+            pool={{ e2e_public_local_nodepool_name | quote }}
+            test "$(kubectl get nodeclaims -l "karpenter.sh/nodepool=$pool" -o json | jq '.items | length')" -eq 0
+            test "$(kubectl get nodes -l "karpenter.sh/nodepool=$pool" -o json | jq '.items | length')" -eq 0
+            test -z "$(kubectl get nodepool "$pool" --ignore-not-found -o name)"
+          args:
+            executable: /bin/bash
+          register: e2e_public_local_fallback_capacity_absent
+          changed_when: false
+          retries: 180
+          delay: 10
+          until: e2e_public_local_fallback_capacity_absent.rc == 0
+
+        - name: Delete the fallback public-node-local NodeClass
+          ansible.builtin.command:
+            argv:
+              - kubectl
+              - delete
+              - inspacenodeclass
+              - "{{ e2e_public_local_nodeclass_name }}"
+              - --ignore-not-found
+              - --wait=true
+              - --timeout=5m
+          changed_when: true
+
+        - name: Reprove complete public-node-local cleanup after fallback
+          ansible.builtin.command:
+            argv:
+              - /opt/e2e/scripts/verify-public-node-local.py
+              - --state
+              - "{{ e2e_state_file }}"
+              - --kubeconfig
+              - "{{ e2e_kubeconfig }}"
+              - --baseline
+              - "{{ e2e_node_lb_baseline }}"
+              - --expect
+              - absent
+          register: e2e_public_local_fallback_absent
+          changed_when: false
+          retries: 180
+          delay: 10
+          until: e2e_public_local_fallback_absent.rc == 0
+          no_log: true
+          when: e2e_public_local_uid_journal is defined and e2e_public_local_uid_journal.rc == 0
+
+        - name: Restore exact pre-public-node-local account inventory after fallback
+          ansible.builtin.command:
+            argv:
+              - /opt/e2e/scripts/account-inventory.py
+              - compare
+              - --baseline
+              - "{{ e2e_node_lb_baseline }}"
+          register: e2e_public_local_fallback_inventory
+          changed_when: false
+          retries: 30
+          delay: 10
+          until: e2e_public_local_fallback_inventory.rc == 0
           no_log: true
 
     - name: Mark the full RKE2 CCM CSI Karpenter acceptance suite complete

@@ -297,6 +297,61 @@ proves ICMP absence, and records a Service-side handoff before finalizer
 release. Normal last-owner cleanup deletes the generated NodeClass only after
 all managed NodePool, NodeClaim, and Node capacity is absent.
 
+### Endpoint-local edge contract
+
+`public-node-local` is an explicit branch of the user-facing
+`inspace.cloud/node` class. It requires `externalTrafficPolicy: Local`, explicit
+`allocateLoadBalancerNodePorts: false`, a non-empty selector, and the DNS-label
+pool annotation `service.inspace.cloud/node-lb-pool`. Eligible Nodes must carry
+the matching protected
+`inspace.cloud.node-restriction.kubernetes.io/public-local-pool` label. They
+must also be Ready, non-deleting, non-control-plane, not excluded from external
+load balancers, and host a Ready, non-terminating EndpointSlice endpoint for
+that exact Service. `publishNotReadyAddresses: true` is rejected because it can
+make an unready backend appear Ready in EndpointSlice data.
+
+This mode owns no capacity or address lifecycle. A Karpenter-backed Node must
+resolve through the exact Node-to-NodeClaim-to-NodePool-to-NodeClass chain. Its
+NodePool template carries the protected pool label and its NodeClass uses
+`firewallProfile: public-node-local`. Karpenter normally synchronizes that
+template label after registration; CCM independently proves the chain and
+ensures the label is present before exposure. The NodeClass must reserve a
+public IPv4 and use the exact configured private base-firewall UUID; CCM also
+audits the VM's complete base-plus-Service assignment set before publication.
+A non-Karpenter Node instead requires an administrator to apply the protected
+label directly; a kubelet cannot self-apply that label. In both paths CCM still
+verifies the exact providerID, VM, private address, and FIP before eligibility.
+Karpenter or the administrator—not CCM—owns VM/FIP lifecycle. The administrator
+is responsible for an equivalent default-deny base firewall on a manual node.
+CCM publishes the sorted FIPs as public `ipMode: Proxy` status and owns one
+deterministic per-Service TCP/UDP firewall. The firewall is attached to exactly
+the eligible endpoint VMs and uses the Service's canonical IPv4
+`loadBalancerSourceRanges`, or Any when omitted. The provider's NodeClass audit
+permits only that exact class of additional firewall alongside the private base
+firewall.
+
+CCM also owns a same-namespace `inlb-dp-<service-identity>` child with the
+exact parent owner reference, `loadBalancerClass: inspace.cloud/node-datapath`,
+Local policy, no data-port NodePorts, and the same selector/ports. Kubernetes
+still allocates one `healthCheckNodePort` for each Local LoadBalancer Service;
+CCM does not publish that port in the InSpace firewall. The child publishes
+eligible private Node InternalIPs with `ipMode: VIP`; the parent publishes the
+paired public FIPs with `ipMode: Proxy` only after the private status and
+firewall assignments read back exactly.
+
+Readiness, endpoint, label, identity, conflict, or cloud-readback failure is
+fail-closed: CCM detaches the Service firewall and requires authoritative
+readback before shrinking either public or private status. First publication
+keeps a durable assignment fence through activation and public-status
+readback, then clears it last. Deleting the Service removes only the
+deterministic firewall and finalizer; it must not move or delete a FIP or delete
+user capacity. Every `(protocol, port)` claim is exclusive across the entire
+named pool, independent of the current endpoint-node overlap. The lowest
+lexicographic Service UID wins; CCM withdraws and detaches the loser and emits
+`PublicNodeLocalPortConflict`. A Karpenter roll may change the published
+address, so operators needing stable membership should use a static NodePool,
+`expireAfter: Never`, disruption budgets, and short DNS TTLs.
+
 ### Recovering a permanently fenced CCM mutation
 
 A retained issued marker is a safety condition, not a retry timer. Pause the

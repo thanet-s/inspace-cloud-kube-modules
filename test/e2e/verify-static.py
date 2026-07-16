@@ -38,6 +38,16 @@ def manifest_document(text: str, kind: str, name: str) -> str:
     return matches[0]
 
 
+def single_kind_document(text: str, kind: str) -> str:
+    matches = [
+        document
+        for document in text.split("\n---\n")
+        if re.search(rf"(?m)^kind: {re.escape(kind)}$", document)
+    ]
+    require(len(matches) == 1, f"expected one {kind} manifest, found {len(matches)}")
+    return matches[0]
+
+
 def load_script_module(name: str, path: pathlib.Path):
     spec = importlib.util.spec_from_file_location(name, path)
     require(spec is not None and spec.loader is not None, f"cannot load {path.name}")
@@ -406,7 +416,7 @@ def verify_node_load_balancer_helm_contract() -> None:
     firewall_profile_schema = (
         "                firewallProfile:\n"
         "                  type: string\n"
-        "                  enum: [private-worker, public-node-load-balancer]"
+        "                  enum: [private-worker, public-node-load-balancer, public-node-local]"
     )
     for name, crd in (("packaged", chart_crd), ("source", source_crd)):
         require(crd.count(firewall_profile_schema) == 1,
@@ -423,8 +433,13 @@ def verify_node_load_balancer_helm_contract() -> None:
 
     shared_example = (chart / "examples/service-public-node-shared.yaml").read_text(encoding="utf-8")
     dedicated_example = (chart / "examples/service-public-node-dedicated.yaml").read_text(encoding="utf-8")
+    local_example = (chart / "examples/service-public-node-local.yaml").read_text(encoding="utf-8")
     shared_service = manifest_document(shared_example, "Service", "example-public-shared")
     dedicated_service = manifest_document(dedicated_example, "Service", "example-public-dedicated")
+    local_nodeclass = manifest_document(local_example, "InSpaceNodeClass", "ubuntu-public-edge")
+    local_nodepool = manifest_document(local_example, "NodePool", "public-edge")
+    local_deployment = manifest_document(local_example, "Deployment", "example-public-local")
+    local_service = manifest_document(local_example, "Service", "example-public-local")
     shared_config = "\n".join(
         line for line in shared_service.splitlines()
         if not line.lstrip().startswith("#")
@@ -439,6 +454,32 @@ def verify_node_load_balancer_helm_contract() -> None:
             'service.inspace.cloud/node-lb-cpu: "4"' in dedicated_service and
             "service.inspace.cloud/node-lb-memory: 8Gi" in dedicated_service,
             "dedicated Node-LB example must carry the mode and exact CPU/memory annotations")
+    require("firewallProfile: public-node-local" in local_nodeclass and
+            "reservePublicIPv4: true" in local_nodeclass and
+            "directDownload: true" in local_nodeclass,
+            "public-node-local example must use a separate valid edge NodeClass profile")
+    require("replicas: 2" in local_nodepool and
+            "nodes: 3" in local_nodepool and
+            "inspace.cloud.node-restriction.kubernetes.io/public-local-pool: edge" in local_nodepool and
+            "inspace.cloud/public-local-pool" not in local_nodepool and
+            "key: inspace.cloud/public-local" in local_nodepool and
+            "values: [amd-epyc]" in local_nodepool and
+            'values: ["1"]' in local_nodepool and
+            'values: ["2048"]' in local_nodepool and
+            "consolidateAfter: Never" in local_nodepool,
+            "public-node-local example must define exact protected static AMD edge capacity")
+    require("replicas: 2" in local_deployment and
+            "inspace.cloud.node-restriction.kubernetes.io/public-local-pool: edge" in local_deployment and
+            "topologySpreadConstraints:" in local_deployment and
+            "key: inspace.cloud/public-local" in local_deployment,
+            "public-node-local workload must select tolerate and spread over the edge pool")
+    require("service.inspace.cloud/node-lb-mode: public-node-local" in local_service and
+            "service.inspace.cloud/node-lb-pool: edge" in local_service and
+            "loadBalancerClass: inspace.cloud/node" in local_service and
+            "allocateLoadBalancerNodePorts: false" in local_service and
+            "externalTrafficPolicy: Local" in local_service and
+            "publishNotReadyAddresses: false" in local_service,
+            "public-node-local Service example must carry the exact explicit Local contract")
 
     invalid_combinations = (
         ("ccm.enabled=false", "ccm.enabled must be true when ccm.nodeLoadBalancer.enabled=true"),
@@ -460,6 +501,245 @@ def verify_node_load_balancer_helm_contract() -> None:
                 f"Helm accepted inconsistent Node-LB setting {override}")
         require(diagnostic in result.stderr,
                 f"Helm returned the wrong diagnostic for {override}: {result.stderr}")
+
+
+def verify_public_node_local_e2e_contract(
+    init_playbook: str,
+    test_playbook: str,
+    cleanup: str,
+    capacity_template: str,
+    service_template: str,
+    verifier: str,
+    readme: str,
+) -> None:
+    """Prove the endpoint-local test is exact, destructive-safe, and NLB-free."""
+    nodeclass = single_kind_document(capacity_template, "InSpaceNodeClass")
+    nodepool = single_kind_document(capacity_template, "NodePool")
+    deployment = manifest_document(
+        capacity_template, "Deployment", "inspace-e2e-public-local"
+    )
+    service = manifest_document(
+        service_template, "Service", "inspace-e2e-public-local"
+    )
+    require(
+        "firewallProfile: public-node-local" in nodeclass
+        and "firewallUUID: {{ e2e_state.firewallUUID }}" in nodeclass
+        and "reservePublicIPv4: true" in nodeclass
+        and "rootDiskGiB: 30" in nodeclass,
+        "live public-node-local capacity must use a separate protected 30-GiB NodeClass",
+    )
+    expected_requirements = {
+        "inspace.cloud/instance-family": "values: [general]",
+        "inspace.cloud/instance-cpu": 'values: ["1"]',
+        "inspace.cloud/instance-memory": 'values: ["2048"]',
+        "inspace.cloud/host-class": "values: [amd-epyc]",
+        "karpenter.sh/capacity-type": "values: [on-demand]",
+        "kubernetes.io/arch": "values: [amd64]",
+        "kubernetes.io/os": "values: [linux]",
+    }
+    requirement_section = nodepool.split("      requirements:\n", 1)[1].split(
+        "  disruption:", 1
+    )[0]
+    requirement_keys = re.findall(
+        r"(?m)^        - key: ([^\n]+)$", requirement_section
+    )
+    require(
+        requirement_keys == list(expected_requirements)
+        and all(
+            re.search(
+                rf"(?m)^        - key: {re.escape(key)}\n"
+                rf"^          operator: In\n"
+                rf"^          {re.escape(value)}$",
+                nodepool,
+            )
+            is not None
+            for key, value in expected_requirements.items()
+        ),
+        "live edge NodePool must pin the exact general 1-core/2-GiB AMD on-demand shape",
+    )
+    require(
+        re.search(r"(?m)^  replicas: 1$", nodepool) is not None
+        and re.search(r"(?m)^    nodes: 2$", nodepool) is not None
+        and "inspace.cloud.node-restriction.kubernetes.io/public-local-pool: {{ e2e_public_local_pool }}"
+        in nodepool
+        and "inspace.cloud/public-local-pool" not in nodepool
+        and "expireAfter: Never" in nodepool
+        and "consolidateAfter: Never" in nodepool
+        and 'nodes: "0"' in nodepool
+        and re.search(
+            r"(?m)^        - key: inspace\.cloud/public-local\n"
+            r"^          value: \"true\"\n"
+            r"^          effect: NoSchedule$",
+            nodepool,
+        )
+        is not None,
+        "live edge NodePool must be static protected tainted and disruption-disabled",
+    )
+    require(
+        re.search(r"(?m)^  replicas: 1$", deployment) is not None
+        and "inspace.cloud.node-restriction.kubernetes.io/public-local-pool: {{ e2e_public_local_pool }}"
+        in deployment
+        and "key: inspace.cloud/public-local" in deployment
+        and "topologySpreadConstraints:" in deployment
+        and "REMOTE_ADDR" in deployment
+        and "nc -u -l -p 18443 -e /tmp/udp-echo" in deployment
+        and "{{ e2e_marker }}-public-local-udp" in deployment,
+        "live endpoint workload must select/tolerate the edge pool and serve HTTP plus UDP",
+    )
+    require(
+        "service.inspace.cloud/node-lb-mode: public-node-local" in service
+        and "service.inspace.cloud/node-lb-pool: {{ e2e_public_local_pool }}" in service
+        and "loadBalancerClass: inspace.cloud/node" in service
+        and "allocateLoadBalancerNodePorts: false" in service
+        and "externalTrafficPolicy: Local" in service
+        and "publishNotReadyAddresses: false" in service
+        and "selector:\n    app: inspace-e2e-public-local" in service
+        and re.search(
+            r"(?ms)^    - name: http\n"
+            r"^      protocol: TCP\n"
+            r"^      port: 80\n"
+            r"^      targetPort: http$",
+            service,
+        ) is not None
+        and re.search(
+            r"(?ms)^    - name: http3\n"
+            r"^      protocol: UDP\n"
+            r"^      port: 443\n"
+            r"^      targetPort: http3$",
+            service,
+        ) is not None
+        and "loadBalancerIP:" not in service
+        and "externalIPs:" not in service,
+        "live public-node-local Service must use the exact selector-backed Local/no-NodePort contract",
+    )
+
+    for state_key in (
+        "publicLocalNodeClassName",
+        "publicLocalNodePoolName",
+        "publicLocalPool",
+        "publicLocalServiceUID",
+    ):
+        require(state_key in init_playbook, f"ownership journal lacks {state_key}")
+    for marker in (
+        'POOL_LABEL = "inspace.cloud.node-restriction.kubernetes.io/public-local-pool"',
+        'DATAPATH_CLASS = "inspace.cloud/node-datapath"',
+        'DATAPATH_POOL_ANNOTATION = "service.inspace.cloud/public-node-local-pool"',
+        "def require_datapath_contract(",
+        '"ipMode": "VIP"',
+        '"ipMode": "Proxy"',
+        "def require_datapath_absent(",
+        'record.get("nodePool") == pool_name',
+        'record.get("firewallProfile") == "public-node-local"',
+        'record.get("firewallUUID") == state["firewallUUID"]',
+        'record.get("networkUUID") == network_uuid',
+        'record.get("billingAccountID") == billing_account',
+        'record.get("floatingIPName") == fip_name',
+        'vm.get("designated_pool_uuid") == amd_pool_uuid',
+        'list(network.get("vm_uuids", [])).count(vm_uuid) == 1',
+        'len(assigned_addresses) == 1 and assigned_addresses[0] == fip',
+        'spec.get("publishNotReadyAddresses") in (None, False)',
+        'canonical = "tcp|80|any|\\nudp|443|any|"',
+        "def udp_probe(",
+        'client.sendto(payload, (address, 443))',
+        "def require_single_owner_reference(",
+        "def require_nodeclass_reference(",
+        "def require_replacement(",
+        '"old edge FIP remains active or assigned after NodeClaim replacement"',
+        'spec.get("healthCheckNodePort")',
+        "require_nlb_baseline(baseline)",
+        '"Service cleanup moved or deleted a user-owned edge FIP/VM"',
+    ):
+        require(marker in verifier, f"public-node-local verifier lacks proof marker: {marker}")
+
+    exercise = named_yaml_sequence_item(
+        test_playbook, "Exercise user-owned endpoint-local public capacity", 4
+    )
+    ordered_tasks = (
+        "Create the public-node-local NodeClass NodePool and workload",
+        "Wait for static public-node-local capacity before Service authorization",
+        "Create the public-node-local Service",
+        "Journal the public-node-local Service UID before cloud convergence",
+        "Wait for CCM to authorize the edge Node and schedule its local Pod",
+        "Prove public-node-local TCP UDP status firewall FIP identity and client source",
+        "Persist the established public-node-local VM and FIP identity",
+        "Remove every local endpoint while retaining static edge capacity",
+        "Prove endpoint loss withdraws status and firewall but preserves the FIP",
+        "Restore the endpoint-local workload",
+        "Prove the same public-node-local FIP is republished",
+        "Delete the established edge NodeClaim to force static replacement",
+        "Prove replacement rotates capacity and reconverges the live Service",
+        "Persist the replacement VM and FIP identity for cleanup proof",
+        "Delete the public-node-local Service immediately after exposure checks",
+        "Prove Service cleanup preserves its user-owned VM and FIP",
+        "Delete the public-node-local workload before static capacity",
+        "Delete the public-node-local static NodePool",
+        "Wait for public-node-local static capacity cleanup",
+        "Delete the public-node-local NodeClass after capacity is gone",
+        "Require complete public-node-local capacity and cloud cleanup",
+        "Require exact pre-public-node-local account inventory",
+    )
+    positions = [exercise.index(f"- name: {name}") for name in ordered_tasks]
+    require(
+        positions == sorted(positions)
+        and "\n      always:\n" in exercise
+        and exercise.count("/opt/e2e/scripts/verify-public-node-local.py") >= 7
+        and "--probe-public" in exercise
+        and "kubectl delete nodeclaim" in exercise
+        and "--anchor" in exercise
+        and "--expect\n              - withdrawn" in exercise
+        and "--expect\n              - service-absent" in exercise
+        and "--expect\n              - absent" in exercise,
+        "endpoint-local live flow must prove present/withdraw/restore/Service cleanup before capacity cleanup",
+    )
+    require(
+        '.metadata.labels["inspace.cloud.node-restriction.kubernetes.io/public-local-pool"] == $pool'
+        in exercise
+        and "Wait for CCM to authorize the edge Node and schedule its local Pod" in exercise,
+        "endpoint-local live flow must prove the protected label before exposure without assuming which controller synchronized it",
+    )
+    fallback_service = exercise.index(
+        "- name: Wait for the public-node-local firewall finalizer before capacity cleanup"
+    )
+    fallback_pool = exercise.index(
+        "- name: Delete the fallback public-node-local NodePool"
+    )
+    fallback_capacity = exercise.index(
+        "- name: Wait for fallback public-node-local capacity cleanup"
+    )
+    fallback_class = exercise.index(
+        "- name: Delete the fallback public-node-local NodeClass"
+    )
+    require(
+        fallback_service < fallback_pool < fallback_capacity < fallback_class,
+        "endpoint-local fallback must finalize the Service before NodePool and NodeClass cleanup",
+    )
+
+    destroy_service = cleanup.index(
+        "- name: Wait for the public-node-local Service firewall owner to disappear"
+    )
+    destroy_pool = cleanup.index(
+        "- name: Delete the public-node-local static NodePool while Karpenter is running"
+    )
+    destroy_capacity = cleanup.index(
+        "- name: Wait for public-node-local NodeClaims and Nodes to disappear"
+    )
+    destroy_class = cleanup.index(
+        "- name: Delete the public-node-local NodeClass after edge capacity is gone"
+    )
+    require(
+        destroy_service < destroy_pool < destroy_capacity < destroy_class
+        and "deployment/inspace-e2e-public-local" in cleanup
+        and "service/inspace-e2e-public-local" in cleanup,
+        "destroy fallback must finalize endpoint-local exposure before deleting its capacity",
+    )
+    require(
+        "one per-Service firewall containing only TCP/80 and" in readme
+        and "UDP/443" in readme
+        and "proves its child and firewall are gone while its user-owned NodePool, VM, and"
+        in readme
+        and "InSpace NLB UUID set to remain unchanged" in readme,
+        "E2E documentation must describe endpoint-local datapath, ownership, and zero-NLB proof",
+    )
 
 
 def main() -> None:
@@ -498,6 +778,15 @@ def main() -> None:
     ))
     trigger = (ROOT / "templates/trigger.yaml.j2").read_text(encoding="utf-8")
     registry_probe = (ROOT / "templates/registry-egress-probe.yaml.j2").read_text(encoding="utf-8")
+    public_node_local_capacity = (
+        ROOT / "templates/public-node-local-capacity.yaml.j2"
+    ).read_text(encoding="utf-8")
+    public_node_local_service = (
+        ROOT / "templates/public-node-local-service.yaml.j2"
+    ).read_text(encoding="utf-8")
+    public_node_local_verifier = (
+        ROOT / "scripts/verify-public-node-local.py"
+    ).read_text(encoding="utf-8")
     ansible_cfg = (ROOT / "ansible.cfg").read_text(encoding="utf-8")
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     node_lb_service_names = (
@@ -515,6 +804,15 @@ def main() -> None:
     verify_retention_state_parser(entrypoint)
     verify_worker_egress_runtime()
     verify_node_load_balancer_helm_contract()
+    verify_public_node_local_e2e_contract(
+        init_playbook,
+        test_playbook,
+        cleanup,
+        public_node_local_capacity,
+        public_node_local_service,
+        public_node_local_verifier,
+        readme,
+    )
     require("docker build" in executable_host and "docker run" in executable_host, "host launcher must build and run Docker")
     require("runner_platform=${INSPACE_E2E_RUNNER_PLATFORM:-linux/amd64}" in executable_host,
             "E2E runner must default explicitly to linux/amd64")

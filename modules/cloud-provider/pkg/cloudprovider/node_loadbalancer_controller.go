@@ -28,6 +28,7 @@ const (
 
 	nodeLoadBalancerModeShared    = "public-node-shared"
 	nodeLoadBalancerModeDedicated = "public-node-dedicated"
+	nodeLoadBalancerModeLocal     = "public-node-local"
 	nodeLoadBalancerDefaultPool   = "default"
 
 	nodeLoadBalancerDefaultCPU       = int32(1)
@@ -45,7 +46,11 @@ const (
 	nodeLoadBalancerNodeLabel        = "inspace.cloud.node-restriction.kubernetes.io/node-lb"
 	nodeLoadBalancerNodeClusterLabel = "inspace.cloud.node-restriction.kubernetes.io/cluster"
 	nodeLoadBalancerNodeShardLabel   = "inspace.cloud.node-restriction.kubernetes.io/shard"
-	nodeLoadBalancerFirewallMode     = "public-node-load-balancer"
+	// publicNodeLocalPoolLabel is protected by NodeRestriction. Cluster admins
+	// may set it on manually managed Nodes, while Karpenter Nodes receive it only
+	// after the CCM proves their NodeClaim -> NodePool -> NodeClass chain.
+	publicNodeLocalPoolLabel     = "inspace.cloud.node-restriction.kubernetes.io/public-local-pool"
+	nodeLoadBalancerFirewallMode = "public-node-load-balancer"
 )
 
 type nodeLoadBalancerDefaults struct {
@@ -103,9 +108,6 @@ func parseNodeLoadBalancerService(service *corev1.Service, defaults nodeLoadBala
 	if service.Spec.LoadBalancerClass == nil || *service.Spec.LoadBalancerClass != nodeLoadBalancerClass {
 		return nodeLoadBalancerIntent{}, fmt.Errorf("node load balancer: loadBalancerClass must be %q", nodeLoadBalancerClass)
 	}
-	if service.Spec.ExternalTrafficPolicy != "" && service.Spec.ExternalTrafficPolicy != corev1.ServiceExternalTrafficPolicyCluster {
-		return nodeLoadBalancerIntent{}, errors.New("node load balancer: externalTrafficPolicy must be Cluster")
-	}
 	if service.Spec.AllocateLoadBalancerNodePorts == nil || *service.Spec.AllocateLoadBalancerNodePorts {
 		return nodeLoadBalancerIntent{}, errors.New("node load balancer: allocateLoadBalancerNodePorts must be explicitly false")
 	}
@@ -130,7 +132,20 @@ func parseNodeLoadBalancerService(service *corev1.Service, defaults nodeLoadBala
 	if err != nil {
 		return nodeLoadBalancerIntent{}, err
 	}
+	if mode == nodeLoadBalancerModeLocal {
+		if service.Spec.ExternalTrafficPolicy != corev1.ServiceExternalTrafficPolicyLocal {
+			return nodeLoadBalancerIntent{}, errors.New("node load balancer: externalTrafficPolicy must be Local in public-node-local mode")
+		}
+		if service.Spec.PublishNotReadyAddresses {
+			return nodeLoadBalancerIntent{}, errors.New("node load balancer: publishNotReadyAddresses must be false in public-node-local mode")
+		}
+	} else if service.Spec.ExternalTrafficPolicy != "" && service.Spec.ExternalTrafficPolicy != corev1.ServiceExternalTrafficPolicyCluster {
+		return nodeLoadBalancerIntent{}, errors.New("node load balancer: externalTrafficPolicy must be Cluster")
+	}
 	pool := strings.TrimSpace(annotations[annotationNodeLoadBalancerPool])
+	if pool == "" && mode == nodeLoadBalancerModeLocal {
+		return nodeLoadBalancerIntent{}, fmt.Errorf("node load balancer: annotation %s is required in public-node-local mode", annotationNodeLoadBalancerPool)
+	}
 	if pool == "" {
 		pool = nodeLoadBalancerDefaultPool
 	}
@@ -139,6 +154,17 @@ func parseNodeLoadBalancerService(service *corev1.Service, defaults nodeLoadBala
 	}
 
 	nodesPerShard := defaults.NodesPerShard
+	if mode == nodeLoadBalancerModeLocal {
+		for _, annotation := range []string{
+			annotationNodeLoadBalancerNodesPerShard,
+			annotationNodeLoadBalancerCPU,
+			annotationNodeLoadBalancerMemory,
+		} {
+			if _, exists := annotations[annotation]; exists {
+				return nodeLoadBalancerIntent{}, fmt.Errorf("node load balancer: annotation %s is unsupported in public-node-local mode", annotation)
+			}
+		}
+	}
 	if value, exists := annotations[annotationNodeLoadBalancerNodesPerShard]; exists {
 		parsed, parseErr := strconv.ParseInt(strings.TrimSpace(value), 10, 32)
 		if parseErr != nil || parsed < 1 || parsed > 10 {
@@ -170,8 +196,10 @@ func parseNodeLoadBalancerService(service *corev1.Service, defaults nodeLoadBala
 			}
 		}
 	}
-	if err := validateNodeLoadBalancerShape(cpu, memoryMiB); err != nil {
-		return nodeLoadBalancerIntent{}, err
+	if mode != nodeLoadBalancerModeLocal {
+		if err := validateNodeLoadBalancerShape(cpu, memoryMiB); err != nil {
+			return nodeLoadBalancerIntent{}, err
+		}
 	}
 
 	ports, err := nodeLoadBalancerPortClaims(service)
@@ -179,6 +207,9 @@ func parseNodeLoadBalancerService(service *corev1.Service, defaults nodeLoadBala
 		return nodeLoadBalancerIntent{}, err
 	}
 	existingShard := strings.TrimSpace(annotations[annotationNodeLoadBalancerShard])
+	if mode == nodeLoadBalancerModeLocal && existingShard != "" {
+		return nodeLoadBalancerIntent{}, errors.New("node load balancer: public-node-local mode cannot retain a managed shard assignment")
+	}
 	if existingShard != "" {
 		if messages := utilvalidation.IsDNS1123Label(existingShard); len(messages) != 0 {
 			return nodeLoadBalancerIntent{}, fmt.Errorf("node load balancer: persisted shard %q is invalid: %s", existingShard, strings.Join(messages, "; "))
@@ -225,8 +256,10 @@ func canonicalNodeLoadBalancerMode(value string) (string, error) {
 		return nodeLoadBalancerModeShared, nil
 	case "dedicated", nodeLoadBalancerModeDedicated:
 		return nodeLoadBalancerModeDedicated, nil
+	case nodeLoadBalancerModeLocal:
+		return nodeLoadBalancerModeLocal, nil
 	default:
-		return "", fmt.Errorf("node load balancer: annotation %s must be %q or %q", annotationNodeLoadBalancerMode, nodeLoadBalancerModeShared, nodeLoadBalancerModeDedicated)
+		return "", fmt.Errorf("node load balancer: annotation %s must be %q, %q, or %q", annotationNodeLoadBalancerMode, nodeLoadBalancerModeShared, nodeLoadBalancerModeDedicated, nodeLoadBalancerModeLocal)
 	}
 }
 

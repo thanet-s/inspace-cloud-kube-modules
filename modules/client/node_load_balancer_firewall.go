@@ -37,8 +37,8 @@ func NodeLoadBalancerShardFirewallSpecHash(rules []FirewallRule) (string, error)
 // intentionally limited to one or more inbound TCP/UDP port rules; the
 // cluster-wide ICMP rule has a separate identity and validator.
 //
-// Deprecated: use NodeLoadBalancerShardFirewallSpecHash. Per-Service NodeLB
-// firewalls existed only in release-candidate builds.
+// Public-node-local mode uses one firewall per Service so it can attach and
+// withdraw the exact ingress policy independently on user-managed edge nodes.
 func NodeLoadBalancerServiceFirewallSpecHash(rules []FirewallRule) (string, error) {
 	canonical, err := canonicalNodeLoadBalancerPortFirewallPolicy("Service", rules)
 	if err != nil {
@@ -147,8 +147,8 @@ func NodeLoadBalancerShardFirewallName(cluster, shard string) (string, error) {
 // NodeLoadBalancerServiceFirewallName returns the deterministic CCM-owned
 // name and policy hash for one Service firewall.
 //
-// Deprecated: use NodeLoadBalancerShardFirewallName. Per-Service NodeLB
-// firewalls existed only in release-candidate builds.
+// Public-node-local mode uses this stable identity for its independently
+// attached per-Service policy.
 func NodeLoadBalancerServiceFirewallName(cluster, serviceUID string, rules []FirewallRule) (string, string, error) {
 	if cluster == "" || !validNodeLoadBalancerServiceUID(serviceUID) {
 		return "", "", errors.New("cluster identity and a lowercase DNS Service UID of at most 36 characters are required")
@@ -201,8 +201,8 @@ func ValidateNodeLoadBalancerShardFirewall(firewall Firewall, cluster, shard str
 	return nil
 }
 
-// Deprecated: use ValidateNodeLoadBalancerShardFirewall. Per-Service NodeLB
-// firewalls existed only in release-candidate builds.
+// ValidateNodeLoadBalancerServiceFirewall authenticates the independent policy
+// used by public-node-local edge nodes.
 func ValidateNodeLoadBalancerServiceFirewall(firewall Firewall, cluster string, billingAccountID int64) error {
 	if cluster == "" || billingAccountID < 1 || firewall.BillingAccountID != billingAccountID {
 		return errors.New("Service firewall cluster and billing identity do not match")

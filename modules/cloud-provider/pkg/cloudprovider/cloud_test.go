@@ -763,7 +763,7 @@ func TestEnsureLoadBalancerDeletedCleansOwnedResourcesWithoutMarkers(t *testing.
 	}
 }
 
-func newTestProvider(t *testing.T, api *fakeAPI) *Provider {
+func newTestProvider(t *testing.T, api API) *Provider {
 	t.Helper()
 	provider, err := New(api, Config{
 		Location: "bkk01", Region: "thailand", NetworkUUID: testNetworkUUID,
@@ -828,6 +828,10 @@ type fakeAPI struct {
 	createPrivateAddress           *string
 	mutateCreateFloatingIPResponse func(*inspace.FloatingIP)
 	mutateAssignFloatingIPResponse func(*inspace.FloatingIP)
+}
+
+func (f *fakeAPI) GetNetwork(_ context.Context, _, uuid string) (*inspace.Network, error) {
+	return &inspace.Network{UUID: uuid, Subnet: "10.0.0.0/24"}, nil
 }
 
 func (f *fakeAPI) ListVMs(context.Context, string) ([]inspace.VM, error) { return f.vms, nil }

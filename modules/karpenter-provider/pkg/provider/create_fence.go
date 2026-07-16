@@ -705,8 +705,13 @@ func decodeCreateFence(value string) (createFenceRecord, error) {
 		return createFenceRecord{}, fmt.Errorf("durable VM create fence has incomplete launch identity")
 	}
 	if (record.Cleanup.FirewallProfile == inspacev1.FirewallProfilePrivateWorker && record.Cleanup.NodePoolName != "") ||
-		(record.Cleanup.FirewallProfile == inspacev1.FirewallProfilePublicNodeLoadBalancer && record.Cleanup.NodePoolName == "") {
+		((record.Cleanup.FirewallProfile == inspacev1.FirewallProfilePublicNodeLoadBalancer || record.Cleanup.FirewallProfile == inspacev1.FirewallProfilePublicNodeLocal) && record.Cleanup.NodePoolName == "") {
 		return createFenceRecord{}, fmt.Errorf("durable VM create fence has invalid firewall-profile/NodePool binding")
+	}
+	if record.Cleanup.FirewallProfile == inspacev1.FirewallProfilePublicNodeLoadBalancer || record.Cleanup.FirewallProfile == inspacev1.FirewallProfilePublicNodeLocal {
+		if err := validateNodePoolClaimIdentity(record.Cleanup.NodePoolName, record.Cleanup.NodeClaimName); err != nil {
+			return createFenceRecord{}, fmt.Errorf("durable VM create fence has invalid NodePool/NodeClaim binding: %w", err)
+		}
 	}
 	if err := validateCreateInventory(record.Baseline); err != nil {
 		return createFenceRecord{}, fmt.Errorf("durable VM create fence baseline: %w", err)

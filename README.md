@@ -23,7 +23,7 @@ Kubernetes service.
   direct-download mode.
 - Cilium native routing, eBPF masquerading, and full kube-proxy replacement.
 - External cloud-controller-manager for node addresses, paid InSpace NLBs, and
-  shared or dedicated Cilium node load balancers.
+  managed-shard or endpoint-local Cilium node load balancers.
 - CSI driver for dynamically provisioned `ReadWriteOnce` block volumes.
 - Karpenter provider for automatic RKE2 worker provisioning and termination.
 - Fail-closed ownership checks and convergent cleanup for cloud resources.
@@ -57,8 +57,8 @@ Each component is an independently buildable Go module linked locally by
   hostname to `127.0.1.1` and verifies local resolution with bounded readback
   retry, independently of DHCP and external DNS.
 - Private `LoadBalancer` Services use Cilium LB IPAM and L2 Announcements.
-- Public `LoadBalancer` Services can use an explicit TCP-only InSpace NLB or
-  dedicated, tainted AMD EPYC nodes managed jointly by CCM and Karpenter.
+- Public `LoadBalancer` Services can use an explicit TCP-only InSpace NLB,
+  CCM-managed shards, or selected endpoint-local edge nodes.
 - InSpace firewalls enforce node policy; guest UFW is disabled.
 
 The detailed networking, ownership, and cleanup invariants are documented in the
@@ -105,7 +105,7 @@ system images directly from the upstream hosts.
 | Kubernetes distribution | RKE2 |
 | CNI | Cilium native routing |
 | Persistent storage | Single-node `ReadWriteOnce` block volumes |
-| Public load balancing | TCP through an InSpace NLB; TCP/UDP through shared or dedicated Cilium node shards |
+| Public load balancing | TCP through an InSpace NLB; TCP/UDP through managed shards or selected endpoint-local nodes |
 | Private load balancing | Cilium LB IPAM and L2 Announcements |
 
 ## Documentation

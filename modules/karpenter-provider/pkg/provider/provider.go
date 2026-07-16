@@ -170,7 +170,7 @@ func (p *CloudProvider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim)
 		idempotencyKey = nodeClaim.Name
 	}
 	nodePoolName := ""
-	if nodeClass.Spec.EffectiveFirewallProfile() == inspacev1.FirewallProfilePublicNodeLoadBalancer {
+	if profile := nodeClass.Spec.EffectiveFirewallProfile(); profile == inspacev1.FirewallProfilePublicNodeLoadBalancer || profile == inspacev1.FirewallProfilePublicNodeLocal {
 		nodePoolName = nodeClaim.Labels[karpv1.NodePoolLabelKey]
 	}
 	memoryGiB := int(instanceType.Capacity.Memory().Value() / (1024 * 1024 * 1024))
@@ -636,21 +636,28 @@ func workerNodeName(clusterName string, nodeClaim *karpv1.NodeClaim) (string, er
 	if messages := k8svalidation.IsDNS1123Label(clusterName); len(messages) != 0 {
 		return "", fmt.Errorf("cluster name %q is not a DNS-1123 hostname label: %s", clusterName, strings.Join(messages, "; "))
 	}
-	if messages := k8svalidation.IsDNS1123Label(nodePoolName); len(messages) != 0 {
-		return "", fmt.Errorf("NodePool name %q is not a DNS-1123 hostname label: %s", nodePoolName, strings.Join(messages, "; "))
-	}
-	if messages := k8svalidation.IsDNS1123Label(nodeClaim.Name); len(messages) != 0 {
-		return "", fmt.Errorf("NodeClaim name %q is not a DNS-1123 hostname label: %s", nodeClaim.Name, strings.Join(messages, "; "))
-	}
-	nodePoolPrefix := nodePoolName + "-"
-	if !strings.HasPrefix(nodeClaim.Name, nodePoolPrefix) || len(nodeClaim.Name) == len(nodePoolPrefix) {
-		return "", fmt.Errorf("NodeClaim name %q must use the NodePool-generated prefix %q followed by a nonempty random suffix", nodeClaim.Name, nodePoolPrefix)
+	if err := validateNodePoolClaimIdentity(nodePoolName, nodeClaim.Name); err != nil {
+		return "", err
 	}
 	name := clusterName + "-karp-" + nodeClaim.Name
 	if messages := k8svalidation.IsDNS1123Label(name); len(messages) != 0 {
 		return "", fmt.Errorf("derived worker name %q is not a DNS-1123 hostname label: %s", name, strings.Join(messages, "; "))
 	}
 	return name, nil
+}
+
+func validateNodePoolClaimIdentity(nodePoolName, nodeClaimName string) error {
+	if messages := k8svalidation.IsDNS1123Label(nodePoolName); len(messages) != 0 {
+		return fmt.Errorf("NodePool name %q is not a DNS-1123 hostname label: %s", nodePoolName, strings.Join(messages, "; "))
+	}
+	if messages := k8svalidation.IsDNS1123Label(nodeClaimName); len(messages) != 0 {
+		return fmt.Errorf("NodeClaim name %q is not a DNS-1123 hostname label: %s", nodeClaimName, strings.Join(messages, "; "))
+	}
+	nodePoolPrefix := nodePoolName + "-"
+	if !strings.HasPrefix(nodeClaimName, nodePoolPrefix) || len(nodeClaimName) == len(nodePoolPrefix) {
+		return fmt.Errorf("NodeClaim name %q must use the NodePool-generated prefix %q followed by a nonempty random suffix", nodeClaimName, nodePoolPrefix)
+	}
+	return nil
 }
 
 func resourcesForVM(vm *cloudapi.VM) (corev1.ResourceList, corev1.ResourceList) {

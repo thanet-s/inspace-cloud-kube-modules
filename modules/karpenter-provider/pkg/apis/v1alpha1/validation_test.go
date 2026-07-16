@@ -48,7 +48,7 @@ func TestFirewallProfileDefaultsAndValidation(t *testing.T) {
 	if got := EffectiveFirewallProfile(""); got != FirewallProfilePrivateWorker {
 		t.Fatalf("EffectiveFirewallProfile(empty) = %q, want %q", got, FirewallProfilePrivateWorker)
 	}
-	for _, profile := range []FirewallProfile{"", FirewallProfilePrivateWorker, FirewallProfilePublicNodeLoadBalancer} {
+	for _, profile := range []FirewallProfile{"", FirewallProfilePrivateWorker, FirewallProfilePublicNodeLoadBalancer, FirewallProfilePublicNodeLocal} {
 		nodeClass := validNodeClass()
 		nodeClass.Spec.FirewallProfile = profile
 		if errs := nodeClass.Validate(); len(errs) != 0 {

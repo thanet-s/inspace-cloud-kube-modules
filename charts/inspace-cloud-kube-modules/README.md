@@ -14,9 +14,11 @@ plane and Karpenter worker still needs one floating IPv4 for egress. Ordinary
 node addresses must have no public inbound firewall rules; CCM-managed
 load-balancer nodes retain the private base firewall, reuse one cluster-wide
 portless ICMP-from-Any firewall, and receive at most one mutable aggregate
-TCP/UDP firewall for their shard. Bastion SSH and ICMP use Any by default or one
-explicitly configured management `/32`; the private API tunnel enters through
-the separately firewalled bastion only.
+TCP/UDP firewall for their shard. Endpoint-local edge nodes instead use a
+separate `public-node-local` NodeClass profile that permits only exact
+CCM-owned per-Service TCP/UDP firewalls. Bastion SSH and ICMP use Any by
+default or one explicitly configured management `/32`; the private API tunnel
+enters through the separately firewalled bastion only.
 
 Set each `InSpaceNodeClass.spec.rke2.server` to the canonical literal private
 VIP URL on port 9345. Its existing worker firewall must allow all TCP, UDP, and
@@ -164,7 +166,7 @@ deletion or replacement and last-owner shard cleanup. Karpenter may use one
 temporary surge node during drift replacement; steady state remains the
 configured shard replica count.
 
-Public-node Services require a non-empty selector and explicit
+Managed-shard public-node Services require a non-empty selector and explicit
 `allocateLoadBalancerNodePorts: false`. Selectorless Services, allocated
 NodePorts, `externalIPs`, `loadBalancerIP`, and non-IPv4 source ranges fail
 before any node capacity is created. Shard migration is fail-closed and
@@ -218,9 +220,81 @@ NodeClass to disappear.
 Removing the controllers earlier stops authoritative cleanup and can retain
 billable cloud resources.
 
-Public exposure remains an explicit, paid, TCP-only InSpace NLB. A public
-Service deliberately leaves `loadBalancerClass` unset for Kubernetes' generic
-cloud service controller and sets both the public scope label and
+### Endpoint-local public nodes
+
+`public-node-local` exposes only selected nodes that currently host a Ready,
+non-terminating local endpoint. The user owns the node capacity; CCM never
+creates, moves, or deletes its floating IPs. A static Karpenter NodePool is a
+good fit when the edge count should be operator-controlled:
+
+```yaml
+metadata:
+  annotations:
+    service.inspace.cloud/node-lb-mode: public-node-local
+    service.inspace.cloud/node-lb-pool: edge
+spec:
+  type: LoadBalancer
+  loadBalancerClass: inspace.cloud/node
+  allocateLoadBalancerNodePorts: false
+  externalTrafficPolicy: Local
+  publishNotReadyAddresses: false
+  selector:
+    app: web
+```
+
+The selected NodePool must apply the protected
+`inspace.cloud.node-restriction.kubernetes.io/public-local-pool=edge` label
+through `spec.template.metadata.labels` and reference a separate
+`InSpaceNodeClass` with `spec.firewallProfile: public-node-local`. Taint the
+pool and constrain the application so unrelated pods cannot occupy its public
+edge. For multiple nodes, spread one serving replica per node. The Service
+status contains the sorted public FIP of every selected eligible endpoint node
+with `ipMode: Proxy`; DNS clients must be able to use multiple A records.
+
+Manual non-Karpenter nodes are also supported: an administrator must apply the
+same protected pool label directly. Kubelets cannot self-apply it. CCM still
+requires the Node's providerID, VM, private address, and assigned FIP to match
+authoritative cloud metadata. Karpenter-backed nodes use the stricter exact
+Node→NodeClaim→NodePool→NodeClass proof above. Karpenter normally synchronizes
+the template label after registration; CCM independently proves that chain and
+ensures the label is present before exposure. Karpenter-backed nodes must also
+use the configured trusted private base firewall with `reservePublicIPv4: true`;
+CCM audits the VM's complete base-plus-Service firewall assignment set before
+publication. For a manual node, the administrator is explicitly responsible
+for an equivalent default-deny base firewall.
+
+For the Cilium datapath, CCM owns a same-namespace
+`inlb-dp-<service-identity>` child Service. It has
+`loadBalancerClass: inspace.cloud/node-datapath`, the same selector and ports,
+`externalTrafficPolicy: Local`, no data-port NodePorts, and publishes the eligible
+nodes' private InternalIPs with `ipMode: VIP`. The user-facing parent publishes
+only the paired public FIPs. This keeps the public address in Kubernetes
+status while programming Cilium against the post-DNAT private node address.
+Kubernetes still allocates one `healthCheckNodePort` on both Local
+LoadBalancer Services; those ports are not included in the public InSpace
+firewall and CCM does not depend on them. `publishNotReadyAddresses: true` is
+rejected because Kubernetes can otherwise mark unready endpoints ready in
+EndpointSlices, defeating this mode's readiness gate.
+
+CCM creates one deterministic Service firewall containing only its TCP/UDP
+ports and canonical IPv4 `loadBalancerSourceRanges` (Any when omitted), then
+attaches it to exactly the eligible endpoint VMs. Losing readiness, the pool
+label, or the local endpoint withdraws that node's status and firewall
+assignment. Deleting the Service deletes only this firewall; the NodePool,
+VMs, and their Karpenter-owned FIPs remain. Because addresses belong to nodes,
+node replacement may change the published address and terminates connections
+to the old node. Use a static NodePool, `expireAfter: Never`, disruption
+budgets, and short DNS TTLs according to the availability contract you need.
+
+Within one named pool, every `(protocol, port)` is an exclusive claim across
+all `public-node-local` Services, even when their current endpoint-node sets do
+not overlap. The lowest lexicographic Service UID wins deterministically. CCM
+withdraws the losing Service and emits `PublicNodeLocalPortConflict`; it does
+not let two Cilium Services program the same node frontend.
+
+The generic public-NLB path remains an explicit, paid, TCP-only InSpace NLB. A
+Service using that path deliberately leaves `loadBalancerClass` unset for
+Kubernetes' cloud service controller and sets both the public scope label and
 `service.beta.kubernetes.io/inspace-load-balancer-public: "true"` annotation.
 Public Services may use `externalTrafficPolicy: Local`; the CCM watches
 EndpointSlices and makes the NLB target set exactly the Ready, non-terminating
@@ -236,7 +310,8 @@ explicitly. Private Cilium L2 Services must remain `Cluster`.
 See [`service-private-l2.yaml`](examples/service-private-l2.yaml),
 [`service-public-nlb.yaml`](examples/service-public-nlb.yaml),
 [`service-public-node-shared.yaml`](examples/service-public-node-shared.yaml),
-and [`service-public-node-dedicated.yaml`](examples/service-public-node-dedicated.yaml).
+[`service-public-node-dedicated.yaml`](examples/service-public-node-dedicated.yaml),
+and [`service-public-node-local.yaml`](examples/service-public-node-local.yaml).
 
 ## Secret contracts
 

@@ -113,6 +113,21 @@ Foreign, unowned, malformed, duplicate cluster-ICMP, or multiple-shard
 assignments fail the VM audit. Firewall descriptions are not ownership
 authority because InSpace omits them from readback.
 
+User-owned endpoint-local edge capacity uses a separate
+`public-node-local` profile. Its base `spec.firewallUUID` must still be present
+exactly once. The only permitted additional assignments are zero or more
+CCM-owned per-Service firewalls named
+`inlb-<cluster-hash8>-<Service-UID>-<policy-hash8>`. Each firewall must use the
+NodeClass billing account and contain at least one canonical, unique inbound
+TCP or UDP single-port rule. A rule permits either Any or a non-empty sorted
+set of canonical IPv4 CIDRs; outbound rules, ICMP, port ranges, duplicate
+`(protocol, port)` claims, and non-canonical source ranges are rejected. The
+policy hash in the name must equal the hash of the complete canonical rule
+set. Duplicate assignments, foreign firewalls, the shared cluster ICMP
+firewall, and managed aggregate shard firewalls all fail this profile's VM
+audit. This lets CCM attach or withdraw each Service policy independently
+without granting it authority over the VM or its floating IP.
+
 CCM owns aggregate policy convergence: it stores the applied and pending policy
 hashes outside the stable firewall name and updates the same UUID in place with
 `PUT`. The Karpenter audit validates stable shard ownership and canonical rule

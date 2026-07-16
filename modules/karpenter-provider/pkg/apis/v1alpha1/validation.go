@@ -58,12 +58,12 @@ func (n *InSpaceNodeClass) Validate() field.ErrorList {
 		errs = append(errs, field.Invalid(p.Child("firewallUUID"), n.Spec.FirewallUUID, "must be a UUID"))
 	}
 	switch n.Spec.FirewallProfile {
-	case "", FirewallProfilePrivateWorker, FirewallProfilePublicNodeLoadBalancer:
+	case "", FirewallProfilePrivateWorker, FirewallProfilePublicNodeLoadBalancer, FirewallProfilePublicNodeLocal:
 	default:
 		errs = append(errs, field.NotSupported(
 			p.Child("firewallProfile"),
 			n.Spec.FirewallProfile,
-			[]string{string(FirewallProfilePrivateWorker), string(FirewallProfilePublicNodeLoadBalancer)},
+			[]string{string(FirewallProfilePrivateWorker), string(FirewallProfilePublicNodeLoadBalancer), string(FirewallProfilePublicNodeLocal)},
 		))
 	}
 	if n.Spec.ImageSelector.OSName != OSNameUbuntu {
