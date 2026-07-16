@@ -928,13 +928,13 @@ def prove_present(
             requirements
             == {
                 "inspace.cloud/instance-cpu": ("In", ("1",)),
-                "inspace.cloud/instance-memory": ("In", ("4096",)),
+                "inspace.cloud/instance-memory": ("In", ("2048",)),
                 "inspace.cloud/host-class": ("In", ("amd-epyc",)),
                 "karpenter.sh/capacity-type": ("In", ("on-demand",)),
                 "kubernetes.io/arch": ("In", ("amd64",)),
                 "kubernetes.io/os": ("In", ("linux",)),
             },
-            f"NodePool/{shard} must select exactly AMD 1-vCPU/4-GiB on-demand Linux amd64",
+            f"NodePool/{shard} must select exactly AMD 1-vCPU/2-GiB on-demand Linux amd64",
         )
 
         nodeclaims = kubectl(kubeconfig, "get", "nodeclaims", "-l", f"karpenter.sh/nodepool={shard}").get("items", [])
@@ -972,8 +972,10 @@ def prove_present(
             and nodeclaim_labels.get("inspace.cloud.node-restriction.kubernetes.io/node-lb") == "true"
             and nodeclaim_labels.get("inspace.cloud.node-restriction.kubernetes.io/cluster") == cluster
             and nodeclaim_labels.get("inspace.cloud.node-restriction.kubernetes.io/shard") == shard
+            and nodeclaim_labels.get("inspace.cloud/instance-cpu") == "1"
+            and nodeclaim_labels.get("inspace.cloud/instance-memory") == "2048"
             and nodeclaim_ref == node_class_ref,
-            f"NodeClaim/{nodeclaim_metadata.get('name')} lacks the protected managed NodeClass chain",
+            f"NodeClaim/{nodeclaim_metadata.get('name')} lacks the protected managed 1-vCPU/2-GiB NodeClass chain",
         )
         require(
             len(nodeclaim_pool_owners) == 1
@@ -997,7 +999,7 @@ def prove_present(
             node_labels.get("inspace.cloud.node-restriction.kubernetes.io/ready") == "true"
             and node_labels.get("inspace.cloud/host-class") == "amd-epyc"
             and node_labels.get("inspace.cloud/instance-cpu") == "1"
-            and node_labels.get("inspace.cloud/instance-memory") == "4096",
+            and node_labels.get("inspace.cloud/instance-memory") == "2048",
             f"Node/{node['metadata']['name']} lacks the exact ready AMD shape labels",
         )
         require(
@@ -1065,7 +1067,7 @@ def prove_present(
             and record.get("hostClass") == "amd-epyc"
             and record.get("hostPoolUUID") == amd_pool_uuid
             and record.get("vCPU") == 1
-            and record.get("memoryGiB") == 4
+            and record.get("memoryGiB") == 2
             and record.get("rootDiskGiB") == 30
             and record.get("firewallUUID") == base_firewall_uuid
             and record.get("firewallProfile") == "public-node-load-balancer"
@@ -1073,8 +1075,10 @@ def prove_present(
             and record.get("billingAccountID") == billing_account
             and record.get("floatingIPName") == expected_fip_name
             and record.get("publicIPv4") in (None, "")
+            and vm.get("vcpu") == 1
+            and vm.get("memory") == 2048
             and vm.get("designated_pool_uuid") == amd_pool_uuid,
-            f"VM/{expected_name} lacks the exact AMD 1-vCPU/4-GiB/30-GiB public ownership contract",
+            f"VM/{expected_name} lacks the exact AMD 1-vCPU/2-GiB/30-GiB public ownership contract",
         )
         storage = vm.get("storage", [])
         root_disks = [disk for disk in storage if isinstance(disk, dict) and disk.get("primary") is True]

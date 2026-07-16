@@ -38,7 +38,7 @@ var CoreCounts = []int{2, 4, 6, 8, 10, 12, 14, 16}
 
 var Families = []Family{
 	{Name: "compute", MemoryGiBPerVCPU: 1, CoreCounts: CoreCounts},
-	{Name: "general", MemoryGiBPerVCPU: 2, CoreCounts: CoreCounts},
+	{Name: "general", MemoryGiBPerVCPU: 2, CoreCounts: append([]int{1}, CoreCounts...)},
 	{Name: "memory", MemoryGiBPerVCPU: 4, CoreCounts: append([]int{1}, CoreCounts...)},
 	{Name: "extra-memory", MemoryGiBPerVCPU: 8, CoreCounts: []int{1, 2, 4, 6, 8}},
 }
@@ -53,7 +53,7 @@ func init() {
 	karpv1.WellKnownLabelsForOfferings.Insert(LabelHostClass)
 }
 
-// New returns the complete, finite 30-variant InSpace catalog. Prices are
+// New returns the complete, finite 31-variant InSpace catalog. Prices are
 // deterministic relative scheduling weights, not a representation of a bill.
 func New(opts Options) ([]*cloudprovider.InstanceType, error) {
 	if opts.Location == "" {
@@ -69,7 +69,7 @@ func New(opts Options) ([]*cloudprovider.InstanceType, error) {
 		return nil, fmt.Errorf("root disk must be between 30 and 2000 GiB")
 	}
 
-	result := make([]*cloudprovider.InstanceType, 0, 30)
+	result := make([]*cloudprovider.InstanceType, 0, 31)
 	for _, family := range Families {
 		for _, cores := range family.CoreCounts {
 			memoryGiB := cores * family.MemoryGiBPerVCPU

@@ -283,7 +283,13 @@ applied shard membership ledger as well as three spaced authoritative absence
 observations for its own exposure. The final Service and deleting NodePool
 remain cleanup anchors: CCM withdraws the Service, deletes node capacity,
 proves the aggregate firewall is unassigned, deletes that firewall, requires
-three spaced absence reads, and only then removes both finalizers. The cluster
+three spaced absence reads, and only then removes both finalizers. NodePool
+deletion uses foreground propagation so Kubernetes can terminate its
+`blockOwnerDeletion` NodeClaims while the CCM state finalizer retains the
+firewall ledger; background deletion would deadlock those two requirements.
+If another actor starts background deletion, CCM safely reissues the exact
+UID-fenced request as foreground only while managed NodeClaims remain; it never
+re-adds `foregroundDeletion` after those direct dependents drain. The cluster
 ICMP identity is persisted on the generated NodeClass. Its
 `inspace.cloud/node-lb-cluster-state` finalizer is a separate durable ledger
 anchor: external deletion first fails the cluster closed, drains every shard,

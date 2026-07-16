@@ -239,8 +239,8 @@ func TestManagedShardCapacityAbsentIgnoresOnlyTheCCMStateAnchor(t *testing.T) {
 		}
 	})
 
-	t.Run("another finalizer still holds capacity", func(t *testing.T) {
-		controller := newController(t, newPool(t, "karpenter.sh/termination", nodeLoadBalancerNodePoolFinalizer), nil)
+	t.Run("foreground deletion still holds capacity", func(t *testing.T) {
+		controller := newController(t, newPool(t, metav1.FinalizerDeleteDependents, nodeLoadBalancerNodePoolFinalizer), nil)
 		absent, err := controller.managedShardCapacityAbsent(ctx, shard)
 		if err != nil || absent {
 			t.Fatalf("capacity absent = %t, %v; want false", absent, err)

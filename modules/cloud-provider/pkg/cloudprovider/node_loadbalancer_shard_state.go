@@ -984,6 +984,16 @@ func managedNodeLoadBalancerNodeClaimsRemain(items []unstructured.Unstructured, 
 	return false
 }
 
+func (c *nodeLoadBalancerController) managedShardNodeClaimsRemain(ctx context.Context, shard string) (bool, error) {
+	claims, err := c.provider.dynamicClient.Resource(nodeClaimGVR).List(ctx, metav1.ListOptions{
+		LabelSelector: labels.SelectorFromSet(labels.Set{karpenterNodePoolLabel: shard}).String(),
+	})
+	if err != nil {
+		return false, err
+	}
+	return managedNodeLoadBalancerNodeClaimsRemain(claims.Items, shard, c.provider.config.ClusterID), nil
+}
+
 func (c *nodeLoadBalancerController) managedShardCapacityAbsent(ctx context.Context, shard string) (bool, error) {
 	if pool, err := c.provider.dynamicClient.Resource(nodePoolGVR).Get(ctx, shard, metav1.GetOptions{}); err == nil {
 		poolLabels := pool.GetLabels()
@@ -999,13 +1009,11 @@ func (c *nodeLoadBalancerController) managedShardCapacityAbsent(ctx context.Cont
 	} else if !apierrors.IsNotFound(err) {
 		return false, err
 	}
-	claims, err := c.provider.dynamicClient.Resource(nodeClaimGVR).List(ctx, metav1.ListOptions{
-		LabelSelector: labels.SelectorFromSet(labels.Set{karpenterNodePoolLabel: shard}).String(),
-	})
+	claimsRemain, err := c.managedShardNodeClaimsRemain(ctx, shard)
 	if err != nil {
 		return false, err
 	}
-	if managedNodeLoadBalancerNodeClaimsRemain(claims.Items, shard, c.provider.config.ClusterID) {
+	if claimsRemain {
 		return false, nil
 	}
 	nodes, err := c.rawNodesForShard(ctx, shard)

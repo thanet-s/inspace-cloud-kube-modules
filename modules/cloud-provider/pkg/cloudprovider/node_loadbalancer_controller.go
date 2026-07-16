@@ -31,9 +31,9 @@ const (
 	nodeLoadBalancerDefaultPool   = "default"
 
 	nodeLoadBalancerDefaultCPU       = int32(1)
-	nodeLoadBalancerDefaultMemoryMiB = int64(4096)
+	nodeLoadBalancerDefaultMemoryMiB = int64(2048)
 	nodeLoadBalancerMinimumCPU       = int32(1)
-	nodeLoadBalancerMinimumMemoryMiB = int64(4096)
+	nodeLoadBalancerMinimumMemoryMiB = int64(2048)
 
 	nodeLoadBalancerLabel      = "inspace.cloud/node-lb"
 	nodeLoadBalancerShardLabel = "inspace.cloud/node-lb-shard"

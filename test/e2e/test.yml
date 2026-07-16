@@ -1624,6 +1624,73 @@
           delay: 1
           until: e2e_node_lb_continuity_result.finished
           no_log: true
+
+        - name: Select the dedicated shard for background-delete recovery
+          ansible.builtin.set_fact:
+            e2e_node_lb_background_shard: >-
+              {{ e2e_node_lb_result.services['inspace-e2e-node-dedicated'].shard }}
+          no_log: true
+
+        - name: Capture the exact dedicated NodePool UID before background deletion
+          ansible.builtin.command:
+            argv:
+              - kubectl
+              - get
+              - nodepool
+              - "{{ e2e_node_lb_background_shard }}"
+              - -o
+              - jsonpath={.metadata.uid}
+          register: e2e_node_lb_background_pool_uid
+          changed_when: false
+          no_log: true
+
+        - name: Capture the exact dedicated NodeClaim UID before background deletion
+          ansible.builtin.command:
+            argv:
+              - kubectl
+              - get
+              - nodeclaims
+              - -l
+              - "karpenter.sh/nodepool={{ e2e_node_lb_background_shard }}"
+              - -o
+              - 'jsonpath={range .items[*]}{.metadata.uid}{"\n"}{end}'
+          register: e2e_node_lb_background_claim_uid
+          changed_when: false
+          failed_when: >-
+            e2e_node_lb_background_claim_uid.rc != 0 or
+            (e2e_node_lb_background_claim_uid.stdout_lines | length) != 1
+          no_log: true
+
+        - name: Start a user-style background deletion of the dedicated NodePool
+          ansible.builtin.command:
+            argv:
+              - kubectl
+              - delete
+              - nodepool
+              - "{{ e2e_node_lb_background_shard }}"
+              - --cascade=background
+              - --wait=false
+          changed_when: true
+
+        - name: Require CCM to upgrade the same live owner to foreground deletion
+          ansible.builtin.shell: |
+            set -euo pipefail
+            pool_uid=$(kubectl get nodepool "{{ e2e_node_lb_background_shard }}" -o jsonpath='{.metadata.uid}')
+            finalizers=$(kubectl get nodepool "{{ e2e_node_lb_background_shard }}" -o jsonpath='{.metadata.finalizers}')
+            claim_uids=$(kubectl get nodeclaims \
+              -l "karpenter.sh/nodepool={{ e2e_node_lb_background_shard }}" \
+              -o jsonpath='{range .items[*]}{.metadata.uid}{"\n"}{end}')
+            test "$pool_uid" = "{{ e2e_node_lb_background_pool_uid.stdout }}"
+            test "$claim_uids" = "{{ e2e_node_lb_background_claim_uid.stdout }}"
+            grep -qw foregroundDeletion <<<"$finalizers"
+          args:
+            executable: /bin/bash
+          register: e2e_node_lb_background_upgrade
+          changed_when: false
+          retries: 90
+          delay: 1
+          until: e2e_node_lb_background_upgrade.rc == 0
+          no_log: true
       always:
         - name: Stop any retained Node-LB continuity probe before cleanup
           ansible.builtin.file:

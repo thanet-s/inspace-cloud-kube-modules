@@ -4811,8 +4811,33 @@ func (c *nodeLoadBalancerController) deleteManagedNodePool(ctx context.Context, 
 	if uid == "" {
 		return fmt.Errorf("node load balancer: refusing to delete NodePool %s without an observed UID", name)
 	}
+	if nodePool.GetDeletionTimestamp() != nil {
+		// Do not repeat an in-flight foreground request, and never re-add its
+		// foregroundDeletion finalizer after Kubernetes has drained the owned
+		// NodeClaims. Nodes are still checked separately before CCM releases its
+		// state finalizer, but they are not direct blockOwnerDeletion dependents
+		// whose collection benefits from another NodePool DELETE.
+		if containsString(nodePool.GetFinalizers(), metav1.FinalizerDeleteDependents) {
+			return nil
+		}
+		claimsRemain, claimsErr := c.managedShardNodeClaimsRemain(ctx, name)
+		if claimsErr != nil {
+			return fmt.Errorf("node load balancer: list NodeClaims before foreground NodePool deletion: %w", claimsErr)
+		}
+		if !claimsRemain {
+			return nil
+		}
+	}
+	// The CCM state finalizer deliberately keeps the NodePool as the durable
+	// aggregate-firewall anchor until its capacity and cloud policy are gone.
+	// Foreground deletion lets Kubernetes delete blockOwnerDeletion NodeClaims
+	// while that anchor remains. Background deletion would wait for this finalizer
+	// before starting garbage collection, creating a circular wait with
+	// managedShardCapacityAbsent.
+	propagation := metav1.DeletePropagationForeground
 	if err := resource.Delete(ctx, name, metav1.DeleteOptions{
-		Preconditions: &metav1.Preconditions{UID: &uid},
+		Preconditions:     &metav1.Preconditions{UID: &uid},
+		PropagationPolicy: &propagation,
 	}); err != nil && !apierrors.IsNotFound(err) {
 		return fmt.Errorf("node load balancer: delete NodePool %s: %w", name, err)
 	}
