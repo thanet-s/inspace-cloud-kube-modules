@@ -35,28 +35,30 @@ import (
 )
 
 const (
-	nodeLoadBalancerFinalizer                   = "service.inspace.cloud/node-lb"
-	annotationNodeLoadBalancerFirewallUUID      = "service.inspace.cloud/node-lb-firewall-uuid"
-	annotationNodeLoadBalancerFirewallHash      = "service.inspace.cloud/node-lb-firewall-hash"
-	annotationNodeLoadBalancerFirewallAbsent    = "service.inspace.cloud/node-lb-firewall-absence-count"
-	annotationNodeLoadBalancerFirewallChecked   = "service.inspace.cloud/node-lb-firewall-absence-checked-at"
-	annotationNodeLoadBalancerPendingFirewall   = "service.inspace.cloud/node-lb-pending-firewall-uuid"
-	annotationNodeLoadBalancerPendingFWName     = "service.inspace.cloud/node-lb-pending-firewall-name"
-	annotationNodeLoadBalancerPendingFWStarted  = "service.inspace.cloud/node-lb-pending-firewall-started-at"
-	annotationNodeLoadBalancerPendingFWDelete   = "service.inspace.cloud/node-lb-pending-firewall-deleting"
-	annotationNodeLoadBalancerPendingFWAbsent   = "service.inspace.cloud/node-lb-pending-firewall-absence-count"
-	annotationNodeLoadBalancerPendingFWChecked  = "service.inspace.cloud/node-lb-pending-firewall-absence-checked-at"
-	annotationNodeLoadBalancerCleanupFWAbsent   = "service.inspace.cloud/node-lb-cleanup-firewall-absence-count"
-	annotationNodeLoadBalancerCleanupFWChecked  = "service.inspace.cloud/node-lb-cleanup-firewall-absence-checked-at"
-	annotationNodeLoadBalancerWithdrawFWAbsent  = "service.inspace.cloud/node-lb-withdraw-firewall-absence-count"
-	annotationNodeLoadBalancerWithdrawFWChecked = "service.inspace.cloud/node-lb-withdraw-firewall-absence-checked-at"
-	annotationNodeLoadBalancerWithdrawFWMissing = "service.inspace.cloud/node-lb-withdraw-firewall-missing-set"
-	annotationNodeLoadBalancerFirewallAssigning = "service.inspace.cloud/node-lb-firewall-assigning-uuid"
-	annotationNodeLoadBalancerFirewallAssignAt  = "service.inspace.cloud/node-lb-firewall-assigning-started-at"
-	annotationNodeLoadBalancerPreviousFirewall  = "service.inspace.cloud/node-lb-previous-firewall-uuid"
-	annotationNodeLoadBalancerPreviousShard     = "service.inspace.cloud/node-lb-previous-shard"
-	annotationNodeLoadBalancerDatapathShard     = "service.inspace.cloud/node-lb-datapath-shard"
-	annotationNodeLoadBalancerDatapathActive    = "service.inspace.cloud/node-lb-datapath-active-shard"
+	nodeLoadBalancerFinalizer                    = "service.inspace.cloud/node-lb"
+	annotationNodeLoadBalancerFirewallUUID       = "service.inspace.cloud/node-lb-firewall-uuid"
+	annotationNodeLoadBalancerFirewallHash       = "service.inspace.cloud/node-lb-firewall-hash"
+	annotationNodeLoadBalancerFirewallAbsent     = "service.inspace.cloud/node-lb-firewall-absence-count"
+	annotationNodeLoadBalancerFirewallChecked    = "service.inspace.cloud/node-lb-firewall-absence-checked-at"
+	annotationNodeLoadBalancerPendingFirewall    = "service.inspace.cloud/node-lb-pending-firewall-uuid"
+	annotationNodeLoadBalancerPendingFWName      = "service.inspace.cloud/node-lb-pending-firewall-name"
+	annotationNodeLoadBalancerPendingFWStarted   = "service.inspace.cloud/node-lb-pending-firewall-started-at"
+	annotationNodeLoadBalancerPendingFWDelete    = "service.inspace.cloud/node-lb-pending-firewall-deleting"
+	annotationNodeLoadBalancerPendingFWAbsent    = "service.inspace.cloud/node-lb-pending-firewall-absence-count"
+	annotationNodeLoadBalancerPendingFWChecked   = "service.inspace.cloud/node-lb-pending-firewall-absence-checked-at"
+	annotationNodeLoadBalancerCleanupFWAbsent    = "service.inspace.cloud/node-lb-cleanup-firewall-absence-count"
+	annotationNodeLoadBalancerCleanupFWChecked   = "service.inspace.cloud/node-lb-cleanup-firewall-absence-checked-at"
+	annotationNodeLoadBalancerWithdrawFWAbsent   = "service.inspace.cloud/node-lb-withdraw-firewall-absence-count"
+	annotationNodeLoadBalancerWithdrawFWChecked  = "service.inspace.cloud/node-lb-withdraw-firewall-absence-checked-at"
+	annotationNodeLoadBalancerWithdrawFWMissing  = "service.inspace.cloud/node-lb-withdraw-firewall-missing-set"
+	annotationNodeLoadBalancerWithdrawFWDetach   = "service.inspace.cloud/node-lb-withdraw-firewall-detach-set"
+	annotationNodeLoadBalancerWithdrawFWDetachAt = "service.inspace.cloud/node-lb-withdraw-firewall-detach-at"
+	annotationNodeLoadBalancerFirewallAssigning  = "service.inspace.cloud/node-lb-firewall-assigning-uuid"
+	annotationNodeLoadBalancerFirewallAssignAt   = "service.inspace.cloud/node-lb-firewall-assigning-started-at"
+	annotationNodeLoadBalancerPreviousFirewall   = "service.inspace.cloud/node-lb-previous-firewall-uuid"
+	annotationNodeLoadBalancerPreviousShard      = "service.inspace.cloud/node-lb-previous-shard"
+	annotationNodeLoadBalancerDatapathShard      = "service.inspace.cloud/node-lb-datapath-shard"
+	annotationNodeLoadBalancerDatapathActive     = "service.inspace.cloud/node-lb-datapath-active-shard"
 	// The ready label is the API-owned eligibility gate used to derive private
 	// and public status pairs. Keep it protected so a kubelet cannot
 	// self-advertise.
@@ -73,6 +75,7 @@ const (
 	nodeLoadBalancerAssignmentReadbackTimeout = 30 * time.Second
 	nodeLoadBalancerAssignmentReadbackDelay   = 500 * time.Millisecond
 	nodeLoadBalancerPendingCreateTimeout      = 5 * time.Minute
+	nodeLoadBalancerFirewallDetachRetry       = 5 * time.Minute
 	nodeLoadBalancerAbsenceConfirmationDelay  = 30 * time.Second
 	nodeLoadBalancerAbsenceConfirmations      = 3
 )
@@ -529,6 +532,18 @@ func (c *nodeLoadBalancerController) auditAdvertisedServiceShard(ctx context.Con
 	if !assignmentsMatch {
 		return failClosed(errors.New("node load balancer: Service firewall assignment changed before public status publication"))
 	}
+	if len(readyNodes) > 0 {
+		if cleared, clearErr := c.clearServiceFirewallWithdrawalEvidenceAfterAssignment(ctx, service, firewall.UUID, readyNodes); clearErr != nil {
+			return failClosed(clearErr)
+		} else if cleared {
+			// Withdrawal absence evidence is deliberately retained after the activation
+			// marker is cleared so deletion and quarantine can consume the same proof.
+			// Persist its reset after a positive, non-empty assignment readback, then
+			// stop: the next reconciliation must re-prove the assignment before public
+			// status returns. An empty desired/actual set is not positive recovery proof.
+			return c.waitForServiceFirewallGate(ctx, service)
+		}
+	}
 	service, err = c.publishPublicProxyStatus(ctx, service, shard, expected, addresses)
 	if err != nil {
 		return failClosed(err)
@@ -775,25 +790,205 @@ func (c *nodeLoadBalancerController) withdrawServiceDatapath(ctx context.Context
 }
 
 func (c *nodeLoadBalancerController) detachOwnedServiceFirewallsForFailure(ctx context.Context, service *corev1.Service) error {
-	owned, discoveryErr := c.serviceFirewallsForEmergencyDetach(ctx, service)
-	var result error = discoveryErr
-	observedAssignment := false
-	for _, firewall := range owned {
-		for _, resource := range firewall.ResourcesAssigned {
-			observedAssignment = true
-			if !strings.EqualFold(resource.ResourceType, "vm") || resource.ResourceUUID == "" {
-				result = errors.Join(result, fmt.Errorf("node load balancer: owned firewall %s has invalid assigned resource %#v", firewall.UUID, resource))
-				continue
+	current, err := c.getExactParentService(ctx, service)
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	owned, discoveryErr := c.serviceFirewallsForEmergencyDetach(ctx, current)
+	assignments, assignmentSet, err := nodeLoadBalancerFirewallDetachAssignments(owned)
+	if err != nil {
+		return errors.Join(discoveryErr, err)
+	}
+	if len(assignments) == 0 {
+		// Retain an existing fence until an exact positive assignment readback
+		// proves recovery. A transient empty ListFirewalls response must not arm
+		// the same detach again when the stale assignment reappears.
+		return discoveryErr
+	}
+
+	now := time.Now().UTC()
+	issueDetach := make([]nodeLoadBalancerFirewallDetachAssignment, 0, len(assignments))
+	_, _, err = c.updateExactParentService(ctx, current, func(copy *corev1.Service) (bool, error) {
+		storedSet := copy.Annotations[annotationNodeLoadBalancerWithdrawFWDetach]
+		storedAt := copy.Annotations[annotationNodeLoadBalancerWithdrawFWDetachAt]
+		if (storedSet == "") != (storedAt == "") {
+			return false, errors.New("node load balancer: incomplete firewall withdrawal detach fence")
+		}
+		detachedAt := map[string]string{}
+		if storedSet != "" {
+			if err := validateNodeLoadBalancerFirewallDetachSet(storedSet); err != nil {
+				return false, err
 			}
-			if err := c.provider.api.UnassignFirewallFromVM(ctx, c.provider.config.Location, firewall.UUID, resource.ResourceUUID); err != nil && !inspace.IsNotFound(err) {
-				result = errors.Join(result, fmt.Errorf("node load balancer: detach owned firewall %s from VM %s while failing closed: %w", firewall.UUID, resource.ResourceUUID, err))
+			var parseErr error
+			detachedAt, parseErr = parseNodeLoadBalancerFirewallDetachTimes(storedAt)
+			if parseErr != nil {
+				return false, parseErr
+			}
+			for _, pair := range strings.Split(storedSet, ",") {
+				if detachedAt[pair] == "" {
+					return false, fmt.Errorf("node load balancer: firewall withdrawal detach set has no timestamp for %s", pair)
+				}
 			}
 		}
+		changed := storedSet != assignmentSet
+		for _, assignment := range assignments {
+			pair := assignment.firewallUUID + "/" + assignment.vmUUID
+			encodedTime := detachedAt[pair]
+			if encodedTime != "" {
+				issuedAt, _ := time.Parse(time.RFC3339Nano, encodedTime)
+				if now.Before(issuedAt.Add(nodeLoadBalancerFirewallDetachRetry)) {
+					continue
+				}
+			}
+			detachedAt[pair] = now.Format(time.RFC3339Nano)
+			issueDetach = append(issueDetach, assignment)
+			changed = true
+		}
+		for _, key := range []string{
+			annotationNodeLoadBalancerWithdrawFWAbsent,
+			annotationNodeLoadBalancerWithdrawFWChecked,
+			annotationNodeLoadBalancerWithdrawFWMissing,
+		} {
+			if copy.Annotations[key] != "" {
+				delete(copy.Annotations, key)
+				changed = true
+			}
+		}
+		if !changed {
+			return false, nil
+		}
+		encodedTimes, marshalErr := json.Marshal(detachedAt)
+		if marshalErr != nil {
+			return false, fmt.Errorf("node load balancer: encode firewall withdrawal detach timestamps: %w", marshalErr)
+		}
+		if copy.Annotations == nil {
+			copy.Annotations = map[string]string{}
+		}
+		copy.Annotations[annotationNodeLoadBalancerWithdrawFWDetach] = assignmentSet
+		copy.Annotations[annotationNodeLoadBalancerWithdrawFWDetachAt] = string(encodedTimes)
+		return true, nil
+	})
+	if err != nil {
+		return errors.Join(discoveryErr, fmt.Errorf("node load balancer: persist firewall withdrawal detach fence: %w", err))
 	}
-	if observedAssignment {
-		result = errors.Join(result, c.resetServiceFirewallWithdrawalEvidence(ctx, service))
+	if len(issueDetach) == 0 {
+		return discoveryErr
+	}
+
+	result := discoveryErr
+	for _, assignment := range issueDetach {
+		if err := c.provider.api.UnassignFirewallFromVM(
+			ctx,
+			c.provider.config.Location,
+			assignment.firewallUUID,
+			assignment.vmUUID,
+		); err != nil && !inspace.IsNotFound(err) {
+			result = errors.Join(result, fmt.Errorf(
+				"node load balancer: detach owned firewall %s from VM %s while failing closed: %w",
+				assignment.firewallUUID,
+				assignment.vmUUID,
+				err,
+			))
+		}
 	}
 	return result
+}
+
+type nodeLoadBalancerFirewallDetachAssignment struct {
+	firewallUUID string
+	vmUUID       string
+}
+
+func nodeLoadBalancerFirewallDetachAssignments(
+	firewalls []inspace.Firewall,
+) ([]nodeLoadBalancerFirewallDetachAssignment, string, error) {
+	assignments := make([]nodeLoadBalancerFirewallDetachAssignment, 0)
+	seen := map[string]struct{}{}
+	for _, firewall := range firewalls {
+		if !validNodeLoadBalancerCloudUUID(firewall.UUID) {
+			return nil, "", fmt.Errorf("node load balancer: owned firewall has invalid UUID %q", firewall.UUID)
+		}
+		for _, resource := range firewall.ResourcesAssigned {
+			if !strings.EqualFold(resource.ResourceType, "vm") || !validNodeLoadBalancerCloudUUID(resource.ResourceUUID) {
+				return nil, "", fmt.Errorf("node load balancer: owned firewall %s has invalid assigned resource %#v", firewall.UUID, resource)
+			}
+			key := firewall.UUID + "/" + resource.ResourceUUID
+			if _, duplicate := seen[key]; duplicate {
+				return nil, "", fmt.Errorf("node load balancer: duplicate firewall withdrawal assignment %s", key)
+			}
+			seen[key] = struct{}{}
+			assignments = append(assignments, nodeLoadBalancerFirewallDetachAssignment{
+				firewallUUID: firewall.UUID,
+				vmUUID:       resource.ResourceUUID,
+			})
+		}
+	}
+	sort.Slice(assignments, func(i, j int) bool {
+		left := assignments[i].firewallUUID + "/" + assignments[i].vmUUID
+		right := assignments[j].firewallUUID + "/" + assignments[j].vmUUID
+		return left < right
+	})
+	encoded := make([]string, 0, len(assignments))
+	for _, assignment := range assignments {
+		encoded = append(encoded, assignment.firewallUUID+"/"+assignment.vmUUID)
+	}
+	return assignments, strings.Join(encoded, ","), nil
+}
+
+func validateNodeLoadBalancerFirewallDetachSet(encoded string) error {
+	if encoded == "" {
+		return errors.New("node load balancer: empty firewall withdrawal detach set")
+	}
+	previous := ""
+	for _, item := range strings.Split(encoded, ",") {
+		parts := strings.Split(item, "/")
+		if len(parts) != 2 || !validNodeLoadBalancerCloudUUID(parts[0]) || !validNodeLoadBalancerCloudUUID(parts[1]) {
+			return fmt.Errorf("node load balancer: invalid firewall withdrawal detach set %q", encoded)
+		}
+		if previous != "" && item <= previous {
+			return fmt.Errorf("node load balancer: firewall withdrawal detach set is not strictly sorted: %q", encoded)
+		}
+		previous = item
+	}
+	return nil
+}
+
+func parseNodeLoadBalancerFirewallDetachTimes(encoded string) (map[string]string, error) {
+	detachedAt := map[string]string{}
+	if err := json.Unmarshal([]byte(encoded), &detachedAt); err != nil || len(detachedAt) == 0 {
+		return nil, fmt.Errorf("node load balancer: invalid firewall withdrawal detach timestamps %q", encoded)
+	}
+	for pair, encodedTime := range detachedAt {
+		if err := validateNodeLoadBalancerFirewallDetachSet(pair); err != nil || strings.Contains(pair, ",") {
+			return nil, fmt.Errorf("node load balancer: invalid firewall withdrawal detach timestamp key %q", pair)
+		}
+		if _, err := time.Parse(time.RFC3339Nano, encodedTime); err != nil {
+			return nil, fmt.Errorf("node load balancer: invalid firewall withdrawal detach timestamp for %s: %w", pair, err)
+		}
+	}
+	return detachedAt, nil
+}
+
+func nodeLoadBalancerFirewallDetachSetFromTimes(detachedAt map[string]string) string {
+	pairs := make([]string, 0, len(detachedAt))
+	for pair := range detachedAt {
+		pairs = append(pairs, pair)
+	}
+	sort.Strings(pairs)
+	return strings.Join(pairs, ",")
+}
+
+func validNodeLoadBalancerCloudUUID(value string) bool {
+	parts := strings.Split(value, "-")
+	if len(parts) != 5 || len(parts[0]) != 8 || len(parts[1]) != 4 || len(parts[2]) != 4 ||
+		len(parts[3]) != 4 || len(parts[4]) != 12 {
+		return false
+	}
+	_, err := hex.DecodeString(strings.Join(parts, ""))
+	return err == nil
 }
 
 func (c *nodeLoadBalancerController) serviceDatapathWithdrawn(ctx context.Context, service *corev1.Service) (bool, error) {
@@ -3087,9 +3282,6 @@ func (c *nodeLoadBalancerController) clearDatapathActivation(ctx context.Context
 			annotationNodeLoadBalancerDatapathActive,
 			annotationNodeLoadBalancerFirewallAssigning,
 			annotationNodeLoadBalancerFirewallAssignAt,
-			annotationNodeLoadBalancerWithdrawFWAbsent,
-			annotationNodeLoadBalancerWithdrawFWChecked,
-			annotationNodeLoadBalancerWithdrawFWMissing,
 		} {
 			if copy.Annotations[key] != "" {
 				delete(copy.Annotations, key)
@@ -3105,6 +3297,93 @@ func (c *nodeLoadBalancerController) clearDatapathActivation(ctx context.Context
 		return fmt.Errorf("node load balancer: clear active datapath marker: %w", err)
 	}
 	return nil
+}
+
+func (c *nodeLoadBalancerController) clearServiceFirewallWithdrawalEvidenceAfterAssignment(
+	ctx context.Context,
+	service *corev1.Service,
+	firewallUUID string,
+	nodes []*corev1.Node,
+) (bool, error) {
+	if firewallUUID == "" || len(nodes) == 0 {
+		return false, errors.New("node load balancer: firewall UUID and assigned Nodes are required before clearing withdrawal evidence")
+	}
+	provedPairs := make(map[string]struct{}, len(nodes))
+	for _, node := range nodes {
+		vmUUID, ok := nodeLoadBalancerVMUUID(node)
+		if !ok || !nodeLoadBalancerNodeHealthy(node) {
+			return false, fmt.Errorf("node load balancer: Node %s is not eligible withdrawal recovery proof", node.Name)
+		}
+		pair := firewallUUID + "/" + vmUUID
+		if _, duplicate := provedPairs[pair]; duplicate {
+			return false, fmt.Errorf("node load balancer: duplicate withdrawal recovery assignment %s", pair)
+		}
+		provedPairs[pair] = struct{}{}
+	}
+	_, changed, err := c.updateExactParentService(ctx, service, func(copy *corev1.Service) (bool, error) {
+		if copy.DeletionTimestamp != nil || !isNodeLoadBalancerService(copy) {
+			return false, errors.New("node load balancer: parent Service changed before withdrawal evidence reset")
+		}
+		if copy.Annotations[annotationNodeLoadBalancerFirewallUUID] != firewallUUID ||
+			!isManagedNodeLoadBalancerShardName(copy.Annotations[annotationNodeLoadBalancerDatapathActive]) {
+			return false, errors.New("node load balancer: positive firewall assignment readback lost its active Service identity")
+		}
+		changed := false
+		for _, key := range []string{
+			annotationNodeLoadBalancerWithdrawFWAbsent,
+			annotationNodeLoadBalancerWithdrawFWChecked,
+			annotationNodeLoadBalancerWithdrawFWMissing,
+		} {
+			if copy.Annotations[key] != "" {
+				delete(copy.Annotations, key)
+				changed = true
+			}
+		}
+		storedSet := copy.Annotations[annotationNodeLoadBalancerWithdrawFWDetach]
+		storedAt := copy.Annotations[annotationNodeLoadBalancerWithdrawFWDetachAt]
+		if (storedSet == "") != (storedAt == "") {
+			return false, errors.New("node load balancer: incomplete firewall withdrawal detach fence during recovery")
+		}
+		if storedSet == "" {
+			return changed, nil
+		}
+		if err := validateNodeLoadBalancerFirewallDetachSet(storedSet); err != nil {
+			return false, err
+		}
+		detachedAt, parseErr := parseNodeLoadBalancerFirewallDetachTimes(storedAt)
+		if parseErr != nil {
+			return false, parseErr
+		}
+		for _, pair := range strings.Split(storedSet, ",") {
+			if detachedAt[pair] == "" {
+				return false, fmt.Errorf("node load balancer: firewall withdrawal detach set has no timestamp for %s", pair)
+			}
+		}
+		for pair := range provedPairs {
+			if _, recorded := detachedAt[pair]; recorded {
+				delete(detachedAt, pair)
+				changed = true
+			}
+		}
+		if len(detachedAt) == 0 {
+			delete(copy.Annotations, annotationNodeLoadBalancerWithdrawFWDetach)
+			delete(copy.Annotations, annotationNodeLoadBalancerWithdrawFWDetachAt)
+			return changed, nil
+		}
+		if changed {
+			encodedTimes, marshalErr := json.Marshal(detachedAt)
+			if marshalErr != nil {
+				return false, fmt.Errorf("node load balancer: encode retained firewall withdrawal detach timestamps: %w", marshalErr)
+			}
+			copy.Annotations[annotationNodeLoadBalancerWithdrawFWDetach] = nodeLoadBalancerFirewallDetachSetFromTimes(detachedAt)
+			copy.Annotations[annotationNodeLoadBalancerWithdrawFWDetachAt] = string(encodedTimes)
+		}
+		return changed, nil
+	})
+	if err != nil {
+		return false, fmt.Errorf("node load balancer: clear withdrawal evidence after exact firewall assignment readback: %w", err)
+	}
+	return changed, nil
 }
 
 func (c *nodeLoadBalancerController) rawNodesForShard(shard string) ([]*corev1.Node, error) {
@@ -4040,6 +4319,8 @@ func (c *nodeLoadBalancerController) cleanupService(ctx context.Context, service
 			annotationNodeLoadBalancerWithdrawFWAbsent,
 			annotationNodeLoadBalancerWithdrawFWChecked,
 			annotationNodeLoadBalancerWithdrawFWMissing,
+			annotationNodeLoadBalancerWithdrawFWDetach,
+			annotationNodeLoadBalancerWithdrawFWDetachAt,
 			annotationNodeLoadBalancerFirewallAssigning,
 			annotationNodeLoadBalancerFirewallAssignAt,
 		} {

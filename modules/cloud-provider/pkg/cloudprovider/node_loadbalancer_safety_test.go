@@ -2,6 +2,7 @@ package cloudprovider
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"reflect"
@@ -1062,6 +1063,119 @@ func TestNodeLoadBalancerCleanupDiscoversUnannotatedOwnedFirewallToAbsence(t *te
 	stored = getNodeLoadBalancerTestService(t, ctx, provider, service.Namespace, service.Name)
 	if containsString(stored.Finalizers, nodeLoadBalancerFinalizer) {
 		t.Fatalf("finalizer remained after firewall absence was proved: %#v", stored.Finalizers)
+	}
+}
+
+func TestNodeLoadBalancerDeletingServiceRetainsMissingFirewallProofUntilFinalization(t *testing.T) {
+	fixture := newNodeLoadBalancerFailClosedFixture(t)
+	defer fixture.controller.queue.ShutDown()
+	nodeLoadBalancerSeedAdvertisedStatuses(t, fixture)
+
+	current := getNodeLoadBalancerTestService(
+		t, fixture.ctx, fixture.provider, fixture.service.Namespace, fixture.service.Name,
+	)
+	deletingAt := metav1.Now()
+	current.DeletionTimestamp = &deletingAt
+	if _, err := fixture.provider.kubeClient.CoreV1().Services(current.Namespace).Update(
+		fixture.ctx, current, metav1.UpdateOptions{},
+	); err != nil {
+		t.Fatal(err)
+	}
+	// Keep another finalized owner so this focused test does not enter the
+	// unrelated last-owner cluster ICMP teardown state machine.
+	survivor := &corev1.Service{ObjectMeta: metav1.ObjectMeta{
+		Namespace: current.Namespace,
+		Name:      "surviving-node-lb-owner",
+		UID:       types.UID("surviving-node-lb-owner-uid"),
+		Finalizers: []string{
+			nodeLoadBalancerFinalizer,
+		},
+	}}
+	if _, err := fixture.provider.kubeClient.CoreV1().Services(survivor.Namespace).Create(
+		fixture.ctx, survivor, metav1.CreateOptions{},
+	); err != nil {
+		t.Fatal(err)
+	}
+	// Model the live failure: the Service still persists the exact UUID while the
+	// authoritative firewall List no longer contains that resource.
+	fixture.api.firewalls = nil
+
+	cleanup := func() error {
+		t.Helper()
+		service := getNodeLoadBalancerTestService(
+			t, fixture.ctx, fixture.provider, fixture.service.Namespace, fixture.service.Name,
+		)
+		return fixture.controller.cleanupService(fixture.ctx, service)
+	}
+	for confirmation := 1; confirmation <= nodeLoadBalancerAbsenceConfirmations; confirmation++ {
+		err := cleanup()
+		if err == nil || !strings.Contains(err.Error(), "waiting for exact Service firewall detachment readback") {
+			t.Fatalf("withdrawal absence confirmation %d error = %v", confirmation, err)
+		}
+		current = getNodeLoadBalancerTestService(
+			t, fixture.ctx, fixture.provider, fixture.service.Namespace, fixture.service.Name,
+		)
+		if got := current.Annotations[annotationNodeLoadBalancerWithdrawFWAbsent]; got != strconv.Itoa(confirmation) {
+			t.Fatalf("withdrawal absence confirmation %d = %q", confirmation, got)
+		}
+		if confirmation < nodeLoadBalancerAbsenceConfirmations {
+			ageNodeLoadBalancerAbsenceEvidence(
+				t,
+				fixture.ctx,
+				fixture.provider,
+				current,
+				annotationNodeLoadBalancerWithdrawFWChecked,
+			)
+		}
+	}
+
+	if err := cleanup(); err != nil {
+		t.Fatal(err)
+	}
+	current = getNodeLoadBalancerTestService(
+		t, fixture.ctx, fixture.provider, fixture.service.Namespace, fixture.service.Name,
+	)
+	if current.Annotations[annotationNodeLoadBalancerDatapathActive] != "" {
+		t.Fatalf("completed withdrawal retained activation marker: %#v", current.Annotations)
+	}
+	if got := current.Annotations[annotationNodeLoadBalancerWithdrawFWAbsent]; got != strconv.Itoa(nodeLoadBalancerAbsenceConfirmations) {
+		t.Fatalf("datapath deactivation discarded withdrawal proof: got %q", got)
+	}
+	if got := current.Annotations[annotationNodeLoadBalancerCleanupFWAbsent]; got != "1" {
+		t.Fatalf("cleanup did not advance beyond withdrawal after retained proof: got %q", got)
+	}
+	if _, err := fixture.provider.kubeClient.CoreV1().Services(current.Namespace).Get(
+		fixture.ctx, nodeLoadBalancerDatapathName(current), metav1.GetOptions{},
+	); !apierrors.IsNotFound(err) {
+		t.Fatalf("generated datapath still exists after proven withdrawal: %v", err)
+	}
+
+	for confirmation := 2; confirmation <= nodeLoadBalancerAbsenceConfirmations; confirmation++ {
+		current = ageNodeLoadBalancerAbsenceEvidence(
+			t,
+			fixture.ctx,
+			fixture.provider,
+			current,
+			annotationNodeLoadBalancerCleanupFWChecked,
+		)
+		if err := cleanup(); err != nil {
+			t.Fatal(err)
+		}
+		current = getNodeLoadBalancerTestService(
+			t, fixture.ctx, fixture.provider, fixture.service.Namespace, fixture.service.Name,
+		)
+		if got := current.Annotations[annotationNodeLoadBalancerCleanupFWAbsent]; got != strconv.Itoa(confirmation) {
+			t.Fatalf("cleanup absence confirmation %d = %q", confirmation, got)
+		}
+	}
+	if err := cleanup(); err != nil {
+		t.Fatal(err)
+	}
+	current = getNodeLoadBalancerTestService(
+		t, fixture.ctx, fixture.provider, fixture.service.Namespace, fixture.service.Name,
+	)
+	if containsString(current.Finalizers, nodeLoadBalancerFinalizer) {
+		t.Fatalf("Service finalizer remained after both absence proofs converged: %#v", current.ObjectMeta)
 	}
 }
 
@@ -2160,6 +2274,148 @@ func TestNodeLoadBalancerWithdrawalDetachesPersistedFirewallAfterPolicyDrift(t *
 	nodeLoadBalancerAssertWithdrawn(t, fixture)
 }
 
+func TestNodeLoadBalancerWithdrawalDetachFenceSurvivesStaleReadbackAndRestart(t *testing.T) {
+	fixture := newNodeLoadBalancerFailClosedFixture(t)
+	defer fixture.controller.queue.ShutDown()
+	nodeLoadBalancerSeedAdvertisedStatuses(t, fixture)
+	sticky := &nodeLoadBalancerStickyUnassignAPI{fakeAPI: fixture.api}
+	fixture.provider.api = sticky
+
+	withdraw := func(controller *nodeLoadBalancerController) error {
+		t.Helper()
+		current := getNodeLoadBalancerTestService(
+			t, fixture.ctx, fixture.provider, fixture.service.Namespace, fixture.service.Name,
+		)
+		return controller.withdrawServiceDatapath(fixture.ctx, current)
+	}
+	wantWaiting := func(err error) {
+		t.Helper()
+		if err == nil || !strings.Contains(err.Error(), "waiting for exact Service firewall detachment readback") {
+			t.Fatalf("withdrawal error = %v, want exact detachment readback wait", err)
+		}
+	}
+
+	wantWaiting(withdraw(fixture.controller))
+	vmUUID, ok := nodeLoadBalancerVMUUID(fixture.node)
+	if !ok {
+		t.Fatal("fixture Node has no VM UUID")
+	}
+	wantFirstSet := fixture.serviceFirewallUUID + "/" + vmUUID
+	if got := fixture.api.unassignedFirewalls; len(got) != 1 || got[0] != wantFirstSet {
+		t.Fatalf("first withdrawal detach calls = %#v, want [%q]", got, wantFirstSet)
+	}
+	current := getNodeLoadBalancerTestService(
+		t, fixture.ctx, fixture.provider, fixture.service.Namespace, fixture.service.Name,
+	)
+	if current.Annotations[annotationNodeLoadBalancerWithdrawFWDetach] != wantFirstSet ||
+		current.Annotations[annotationNodeLoadBalancerWithdrawFWDetachAt] == "" {
+		t.Fatalf("withdrawal detach fence was not persisted exactly: %#v", current.Annotations)
+	}
+
+	wantWaiting(withdraw(fixture.controller))
+	if got := len(fixture.api.unassignedFirewalls); got != 1 {
+		t.Fatalf("same controller repeated a fenced detach %d times, want 1", got)
+	}
+
+	restarted := &nodeLoadBalancerController{provider: fixture.provider}
+	wantWaiting(withdraw(restarted))
+	if got := len(fixture.api.unassignedFirewalls); got != 1 {
+		t.Fatalf("restarted controller repeated a fenced detach %d times, want 1", got)
+	}
+
+	current = getNodeLoadBalancerTestService(
+		t, fixture.ctx, fixture.provider, fixture.service.Namespace, fixture.service.Name,
+	)
+	agedDetachTimes, err := json.Marshal(map[string]string{
+		wantFirstSet: time.Now().Add(-nodeLoadBalancerFirewallDetachRetry - time.Second).UTC().Format(time.RFC3339Nano),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	current.Annotations[annotationNodeLoadBalancerWithdrawFWDetachAt] = string(agedDetachTimes)
+	if _, err := fixture.provider.kubeClient.CoreV1().Services(current.Namespace).Update(
+		fixture.ctx, current, metav1.UpdateOptions{},
+	); err != nil {
+		t.Fatal(err)
+	}
+	wantWaiting(withdraw(restarted))
+	if got := len(fixture.api.unassignedFirewalls); got != 2 {
+		t.Fatalf("expired fence detach calls = %d, want 2", got)
+	}
+
+	const secondVM = "bbbbbbbb-2222-4333-8444-cccccccccccc"
+	fixture.firewall(t, fixture.serviceFirewallUUID).ResourcesAssigned = append(
+		fixture.firewall(t, fixture.serviceFirewallUUID).ResourcesAssigned,
+		inspace.FirewallResource{ResourceType: "vm", ResourceUUID: secondVM},
+	)
+	wantWaiting(withdraw(restarted))
+	if got := len(fixture.api.unassignedFirewalls); got != 3 {
+		t.Fatalf("expanded assignment set detach calls = %d, want 3", got)
+	}
+	wantChangedSet := strings.Join([]string{
+		fixture.serviceFirewallUUID + "/" + vmUUID,
+		fixture.serviceFirewallUUID + "/" + secondVM,
+	}, ",")
+	current = getNodeLoadBalancerTestService(
+		t, fixture.ctx, fixture.provider, fixture.service.Namespace, fixture.service.Name,
+	)
+	if got := current.Annotations[annotationNodeLoadBalancerWithdrawFWDetach]; got != wantChangedSet {
+		t.Fatalf("changed assignment fence = %q, want %q", got, wantChangedSet)
+	}
+	if got := fixture.api.unassignedFirewalls[2]; got != fixture.serviceFirewallUUID+"/"+secondVM {
+		t.Fatalf("expanded assignment set retried an old pair: call = %q", got)
+	}
+
+	fixture.firewall(t, fixture.serviceFirewallUUID).ResourcesAssigned = []inspace.FirewallResource{{
+		ResourceType: "vm", ResourceUUID: secondVM,
+	}}
+	wantWaiting(withdraw(restarted))
+	if got := len(fixture.api.unassignedFirewalls); got != 3 {
+		t.Fatalf("shrunk assignment set retried a retained pair; calls = %d, want 3", got)
+	}
+	current = getNodeLoadBalancerTestService(
+		t, fixture.ctx, fixture.provider, fixture.service.Namespace, fixture.service.Name,
+	)
+	wantShrunkSet := fixture.serviceFirewallUUID + "/" + secondVM
+	if got := current.Annotations[annotationNodeLoadBalancerWithdrawFWDetach]; got != wantShrunkSet {
+		t.Fatalf("shrunk assignment fence = %q, want %q", got, wantShrunkSet)
+	}
+
+	fixture.firewall(t, fixture.serviceFirewallUUID).ResourcesAssigned = append(
+		fixture.firewall(t, fixture.serviceFirewallUUID).ResourcesAssigned,
+		inspace.FirewallResource{ResourceType: "vm", ResourceUUID: vmUUID},
+	)
+	wantWaiting(withdraw(restarted))
+	if got := len(fixture.api.unassignedFirewalls); got != 3 {
+		t.Fatalf("reappearing historically fenced pair was retried; calls = %d, want 3", got)
+	}
+
+	fixture.firewall(t, fixture.serviceFirewallUUID).ResourcesAssigned = nil
+	if err := withdraw(fixture.controller); err != nil {
+		t.Fatal(err)
+	}
+	current = getNodeLoadBalancerTestService(
+		t, fixture.ctx, fixture.provider, fixture.service.Namespace, fixture.service.Name,
+	)
+	if len(current.Status.LoadBalancer.Ingress) != 0 ||
+		current.Annotations[annotationNodeLoadBalancerDatapathActive] != "" {
+		t.Fatalf("withdrawal did not converge after assignment cleared: annotations=%#v status=%#v", current.Annotations, current.Status.LoadBalancer)
+	}
+	child := getNodeLoadBalancerTestService(
+		t, fixture.ctx, fixture.provider, fixture.service.Namespace, nodeLoadBalancerDatapathName(current),
+	)
+	if len(child.Status.LoadBalancer.Ingress) != 0 {
+		t.Fatalf("private datapath remained published after assignment cleared: %#v", child.Status.LoadBalancer)
+	}
+	if got := len(fixture.api.unassignedFirewalls); got != 3 {
+		t.Fatalf("assignment-clear convergence issued another detach; calls = %d, want 3", got)
+	}
+	if current.Annotations[annotationNodeLoadBalancerWithdrawFWDetach] != wantChangedSet ||
+		current.Annotations[annotationNodeLoadBalancerWithdrawFWDetachAt] == "" {
+		t.Fatalf("withdrawal convergence cleared the durable detach fence early: %#v", current.Annotations)
+	}
+}
+
 func TestNodeLoadBalancerWithdrawalDoesNotTrustTransientFirewallOmission(t *testing.T) {
 	fixture := newNodeLoadBalancerFailClosedFixture(t)
 	defer fixture.controller.queue.ShutDown()
@@ -2330,6 +2586,225 @@ func TestNodeLoadBalancerLateAssignmentResetsConsecutiveWithdrawalProof(t *testi
 	}
 }
 
+func TestNodeLoadBalancerRecoveryClearsRetainedWithdrawalProofBeforeRepublishing(t *testing.T) {
+	fixture := newNodeLoadBalancerFailClosedFixture(t)
+	defer fixture.controller.queue.ShutDown()
+	nodeLoadBalancerSeedAdvertisedStatuses(t, fixture)
+
+	parent := getNodeLoadBalancerTestService(
+		t, fixture.ctx, fixture.provider, fixture.service.Namespace, fixture.service.Name,
+	)
+	parent.Annotations[annotationNodeLoadBalancerWithdrawFWMissing] = fixture.serviceFirewallUUID
+	parent.Annotations[annotationNodeLoadBalancerWithdrawFWAbsent] = strconv.Itoa(nodeLoadBalancerAbsenceConfirmations)
+	parent.Annotations[annotationNodeLoadBalancerWithdrawFWChecked] = time.Now().Add(
+		-nodeLoadBalancerAbsenceConfirmationDelay - time.Second,
+	).UTC().Format(time.RFC3339Nano)
+	vmUUID, ok := nodeLoadBalancerVMUUID(fixture.node)
+	if !ok {
+		t.Fatal("fixture Node has no VM UUID")
+	}
+	detachPair := fixture.serviceFirewallUUID + "/" + vmUUID
+	detachTimes, marshalErr := json.Marshal(map[string]string{
+		detachPair: time.Now().UTC().Format(time.RFC3339Nano),
+	})
+	if marshalErr != nil {
+		t.Fatal(marshalErr)
+	}
+	parent.Annotations[annotationNodeLoadBalancerWithdrawFWDetach] = detachPair
+	parent.Annotations[annotationNodeLoadBalancerWithdrawFWDetachAt] = string(detachTimes)
+	parent, err := fixture.provider.kubeClient.CoreV1().Services(parent.Namespace).Update(
+		fixture.ctx, parent, metav1.UpdateOptions{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	waiting, err := fixture.controller.auditAdvertisedServiceShard(fixture.ctx, parent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !waiting {
+		t.Fatal("proof reset did not force a separate assignment re-audit before publication")
+	}
+	parent = getNodeLoadBalancerTestService(
+		t, fixture.ctx, fixture.provider, fixture.service.Namespace, fixture.service.Name,
+	)
+	for _, key := range []string{
+		annotationNodeLoadBalancerWithdrawFWMissing,
+		annotationNodeLoadBalancerWithdrawFWAbsent,
+		annotationNodeLoadBalancerWithdrawFWChecked,
+		annotationNodeLoadBalancerWithdrawFWDetach,
+		annotationNodeLoadBalancerWithdrawFWDetachAt,
+	} {
+		if parent.Annotations[key] != "" {
+			t.Fatalf("retained withdrawal proof key %s was not cleared after positive assignment readback: %#v", key, parent.Annotations)
+		}
+	}
+	if len(parent.Status.LoadBalancer.Ingress) != 0 {
+		t.Fatalf("public status remained published during durable proof reset: %#v", parent.Status.LoadBalancer)
+	}
+
+	waiting, err = fixture.controller.auditAdvertisedServiceShard(fixture.ctx, parent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if waiting {
+		t.Fatal("exact assignment re-audit did not republish the recovered Service")
+	}
+	parent = getNodeLoadBalancerTestService(
+		t, fixture.ctx, fixture.provider, fixture.service.Namespace, fixture.service.Name,
+	)
+	nodeLoadBalancerAssertStatusIngress(t, parent.Status.LoadBalancer, "203.0.113.10", corev1.LoadBalancerIPModeProxy)
+
+	fixture.provider.api = &nodeLoadBalancerFirewallOmissionAPI{
+		fakeAPI:  fixture.api,
+		omitUUID: fixture.serviceFirewallUUID,
+	}
+	err = fixture.controller.withdrawServiceDatapath(fixture.ctx, parent)
+	if err == nil || !strings.Contains(err.Error(), "waiting for exact Service firewall detachment readback") {
+		t.Fatalf("first post-recovery firewall omission reused stale proof: %v", err)
+	}
+	parent = getNodeLoadBalancerTestService(
+		t, fixture.ctx, fixture.provider, fixture.service.Namespace, fixture.service.Name,
+	)
+	if parent.Annotations[annotationNodeLoadBalancerWithdrawFWAbsent] != "1" ||
+		parent.Annotations[annotationNodeLoadBalancerDatapathActive] != fixture.shard ||
+		len(parent.Status.LoadBalancer.Ingress) != 1 {
+		t.Fatalf("first post-recovery omission was not treated as provisional: annotations=%#v status=%#v", parent.Annotations, parent.Status.LoadBalancer)
+	}
+}
+
+func TestNodeLoadBalancerZeroReadyNodesRetainWithdrawalFence(t *testing.T) {
+	fixture := newNodeLoadBalancerFailClosedFixture(t)
+	defer fixture.controller.queue.ShutDown()
+	nodeLoadBalancerSeedAdvertisedStatuses(t, fixture)
+
+	vmUUID, ok := nodeLoadBalancerVMUUID(fixture.node)
+	if !ok {
+		t.Fatal("fixture Node has no VM UUID")
+	}
+	detachPair := fixture.serviceFirewallUUID + "/" + vmUUID
+	detachTimes, err := json.Marshal(map[string]string{
+		detachPair: time.Now().UTC().Format(time.RFC3339Nano),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent := getNodeLoadBalancerTestService(
+		t, fixture.ctx, fixture.provider, fixture.service.Namespace, fixture.service.Name,
+	)
+	parent.Annotations[annotationNodeLoadBalancerWithdrawFWDetach] = detachPair
+	parent.Annotations[annotationNodeLoadBalancerWithdrawFWDetachAt] = string(detachTimes)
+	parent, err = fixture.provider.kubeClient.CoreV1().Services(parent.Namespace).Update(
+		fixture.ctx, parent, metav1.UpdateOptions{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	node := fixture.node.DeepCopy()
+	for index := range node.Status.Conditions {
+		if node.Status.Conditions[index].Type == corev1.NodeReady {
+			node.Status.Conditions[index].Status = corev1.ConditionFalse
+		}
+	}
+	if _, err := fixture.provider.kubeClient.CoreV1().Nodes().UpdateStatus(
+		fixture.ctx, node, metav1.UpdateOptions{},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.nodeIndexer.Update(node.DeepCopy()); err != nil {
+		t.Fatal(err)
+	}
+
+	waiting, err := fixture.controller.auditAdvertisedServiceShard(fixture.ctx, parent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if waiting {
+		t.Fatal("zero-node audit unexpectedly entered an assignment gate")
+	}
+	parent = getNodeLoadBalancerTestService(
+		t, fixture.ctx, fixture.provider, fixture.service.Namespace, fixture.service.Name,
+	)
+	if parent.Annotations[annotationNodeLoadBalancerWithdrawFWDetach] != detachPair ||
+		parent.Annotations[annotationNodeLoadBalancerWithdrawFWDetachAt] != string(detachTimes) {
+		t.Fatalf("empty desired/actual assignment readback cleared the withdrawal fence: %#v", parent.Annotations)
+	}
+	if len(parent.Status.LoadBalancer.Ingress) != 0 {
+		t.Fatalf("zero-ready-node audit retained public status: %#v", parent.Status.LoadBalancer)
+	}
+	if assigned := fixture.firewall(t, fixture.serviceFirewallUUID).ResourcesAssigned; len(assigned) != 0 {
+		t.Fatalf("zero-ready-node audit retained firewall assignments: %#v", assigned)
+	}
+}
+
+func TestNodeLoadBalancerRecoveryClearsOnlyPositivelyReadCurrentFirewallFence(t *testing.T) {
+	fixture := newNodeLoadBalancerFailClosedFixture(t)
+	defer fixture.controller.queue.ShutDown()
+
+	vmUUID, ok := nodeLoadBalancerVMUUID(fixture.node)
+	if !ok {
+		t.Fatal("fixture Node has no VM UUID")
+	}
+	const previousFirewallUUID = "dddddddd-3333-4444-8555-eeeeeeeeeeee"
+	currentPair := fixture.serviceFirewallUUID + "/" + vmUUID
+	previousPair := previousFirewallUUID + "/" + vmUUID
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	detachTimes := map[string]string{currentPair: now, previousPair: now}
+	encodedTimes, err := json.Marshal(detachTimes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent := getNodeLoadBalancerTestService(
+		t, fixture.ctx, fixture.provider, fixture.service.Namespace, fixture.service.Name,
+	)
+	parent.Annotations[annotationNodeLoadBalancerPreviousFirewall] = previousFirewallUUID
+	parent.Annotations[annotationNodeLoadBalancerWithdrawFWDetach] = nodeLoadBalancerFirewallDetachSetFromTimes(detachTimes)
+	parent.Annotations[annotationNodeLoadBalancerWithdrawFWDetachAt] = string(encodedTimes)
+	parent, err = fixture.provider.kubeClient.CoreV1().Services(parent.Namespace).Update(
+		fixture.ctx, parent, metav1.UpdateOptions{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cleared, err := fixture.controller.clearServiceFirewallWithdrawalEvidenceAfterAssignment(
+		fixture.ctx, parent, fixture.serviceFirewallUUID, []*corev1.Node{fixture.node},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cleared {
+		t.Fatal("positive current-firewall readback did not clear its withdrawal record")
+	}
+	parent = getNodeLoadBalancerTestService(
+		t, fixture.ctx, fixture.provider, fixture.service.Namespace, fixture.service.Name,
+	)
+	if got := parent.Annotations[annotationNodeLoadBalancerWithdrawFWDetach]; got != previousPair {
+		t.Fatalf("recovery cleared or changed the previous-firewall fence: got %q, want %q", got, previousPair)
+	}
+	retained, err := parseNodeLoadBalancerFirewallDetachTimes(
+		parent.Annotations[annotationNodeLoadBalancerWithdrawFWDetachAt],
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(retained) != 1 || retained[previousPair] != now {
+		t.Fatalf("recovery retained withdrawal timestamps = %#v, want only %s", retained, previousPair)
+	}
+
+	cleared, err = fixture.controller.clearServiceFirewallWithdrawalEvidenceAfterAssignment(
+		fixture.ctx, parent, fixture.serviceFirewallUUID, []*corev1.Node{fixture.node},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cleared {
+		t.Fatal("second current-firewall readback mutated an unrelated previous-firewall fence")
+	}
+}
+
 func TestNodeLoadBalancerIncompleteWithdrawalRetainsActivationMarker(t *testing.T) {
 	fixture := newNodeLoadBalancerFailClosedFixture(t)
 	defer fixture.controller.queue.ShutDown()
@@ -2337,7 +2812,8 @@ func TestNodeLoadBalancerIncompleteWithdrawalRetainsActivationMarker(t *testing.
 
 	detachErr := errors.New("injected firewall detach failure")
 	statusErr := errors.New("injected private VIP withdrawal failure")
-	fixture.provider.api = &nodeLoadBalancerFailingUnassignAPI{fakeAPI: fixture.api, err: detachErr}
+	failingAPI := &nodeLoadBalancerFailingUnassignAPI{fakeAPI: fixture.api, err: detachErr}
+	fixture.provider.api = failingAPI
 	clientset, ok := fixture.provider.kubeClient.(*kubefake.Clientset)
 	if !ok {
 		t.Fatalf("kube client type = %T", fixture.provider.kubeClient)
@@ -2363,6 +2839,16 @@ func TestNodeLoadBalancerIncompleteWithdrawalRetainsActivationMarker(t *testing.
 	}
 	if childStatusUpdates != 0 {
 		t.Fatalf("private VIP withdrawal ran %d times before the firewall detached", childStatusUpdates)
+	}
+	current := getNodeLoadBalancerTestService(
+		t, fixture.ctx, fixture.provider, fixture.service.Namespace, fixture.service.Name,
+	)
+	err = fixture.controller.withdrawServiceDatapath(fixture.ctx, current)
+	if err == nil || !strings.Contains(err.Error(), "waiting for exact Service firewall detachment readback") {
+		t.Fatalf("fenced withdrawal retry error = %v, want exact detachment readback wait", err)
+	}
+	if failingAPI.calls != 1 {
+		t.Fatalf("failed cloud detach was retried %d times before its durable timeout, want 1", failingAPI.calls)
 	}
 	stored := getNodeLoadBalancerTestService(
 		t,
@@ -2707,7 +3193,8 @@ type nodeLoadBalancerFailClosedFixture struct {
 
 type nodeLoadBalancerFailingUnassignAPI struct {
 	*fakeAPI
-	err error
+	err   error
+	calls int
 }
 
 type nodeLoadBalancerAssignmentOrderAPI struct {
@@ -2754,6 +3241,29 @@ type nodeLoadBalancerFirewallListHookAPI struct {
 	afterList func() error
 }
 
+type nodeLoadBalancerStickyUnassignAPI struct {
+	*fakeAPI
+}
+
+func (a *nodeLoadBalancerStickyUnassignAPI) UnassignFirewallFromVM(
+	_ context.Context,
+	_, firewallUUID, vmUUID string,
+) error {
+	for _, firewall := range a.firewalls {
+		if firewall.UUID != firewallUUID {
+			continue
+		}
+		for _, resource := range firewall.ResourcesAssigned {
+			if strings.EqualFold(resource.ResourceType, "vm") && resource.ResourceUUID == vmUUID {
+				a.unassignedFirewalls = append(a.unassignedFirewalls, firewallUUID+"/"+vmUUID)
+				return nil
+			}
+		}
+		return &inspace.APIError{StatusCode: 404, Method: "DELETE", Path: "/firewall/vms", Message: "assignment not found"}
+	}
+	return &inspace.APIError{StatusCode: 404, Method: "DELETE", Path: "/firewall/vms", Message: "firewall not found"}
+}
+
 func (a *nodeLoadBalancerFirewallListHookAPI) ListFirewalls(ctx context.Context, location string) ([]inspace.Firewall, error) {
 	items, err := a.fakeAPI.ListFirewalls(ctx, location)
 	if err != nil || a.afterList == nil {
@@ -2780,6 +3290,7 @@ func (a *nodeLoadBalancerFirewallOmissionAPI) ListFirewalls(ctx context.Context,
 }
 
 func (f *nodeLoadBalancerFailingUnassignAPI) UnassignFirewallFromVM(context.Context, string, string, string) error {
+	f.calls++
 	return f.err
 }
 
