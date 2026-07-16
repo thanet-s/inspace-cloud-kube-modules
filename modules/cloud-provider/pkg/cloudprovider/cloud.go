@@ -51,6 +51,7 @@ const (
 // API is the exact SDK surface used by the CCM and permits loopback-only
 // contract tests without network access.
 type API interface {
+	GetNetwork(context.Context, string, string) (*inspace.Network, error)
 	ListVMs(context.Context, string) ([]inspace.VM, error)
 	GetVM(context.Context, string, string) (*inspace.VM, error)
 	ListLoadBalancers(context.Context, string) ([]inspace.LoadBalancer, error)

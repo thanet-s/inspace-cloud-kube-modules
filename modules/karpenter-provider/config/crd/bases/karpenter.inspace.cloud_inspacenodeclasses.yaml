@@ -108,7 +108,7 @@ spec:
                     any-destination egress, with no public inbound rule.
                 firewallProfile:
                   type: string
-                  enum: [private-worker, public-node-load-balancer]
+                  enum: [private-worker, public-node-load-balancer, public-node-local]
                   description: >-
                     Optional firewall-assignment profile. Omitted means
                     private-worker, which requires exactly the private
@@ -116,6 +116,8 @@ spec:
                     firewallUUID private and additionally permits only the
                     provider-validated CCM-owned cluster ICMP firewall and
                     at most one aggregate shard ingress firewall.
+                    public-node-local permits only provider-validated,
+                    CCM-owned per-Service TCP/UDP ingress firewalls.
                 imageSelector:
                   type: object
                   required: [osName, osVersion]

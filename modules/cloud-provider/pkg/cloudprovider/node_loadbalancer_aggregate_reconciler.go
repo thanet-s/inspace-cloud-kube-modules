@@ -38,6 +38,20 @@ func (c *nodeLoadBalancerController) sync(ctx context.Context, key string) error
 	if err != nil {
 		return fmt.Errorf("node load balancer: refresh exact parent Service: %w", err)
 	}
+	localRequested := publicNodeLocalRequested(service)
+	hasLocalFinalizer := containsString(service.Finalizers, publicNodeLocalFinalizer)
+	if hasLocalFinalizer && !localRequested {
+		return c.syncPublicNodeLocal(ctx, key, service)
+	}
+	if hasLocalFinalizer || localRequested {
+		// A mode transition must retire the old aggregate datapath before the
+		// direct-node controller can attach a per-Service firewall. The two
+		// ownership models are intentionally never active at the same time.
+		if containsString(service.Finalizers, nodeLoadBalancerFinalizer) {
+			return c.cleanupAggregateService(ctx, service)
+		}
+		return c.syncPublicNodeLocal(ctx, key, service)
+	}
 	if service.DeletionTimestamp != nil || !isNodeLoadBalancerService(service) {
 		if containsString(service.Finalizers, nodeLoadBalancerFinalizer) {
 			return c.cleanupAggregateService(ctx, service)
@@ -1784,7 +1798,7 @@ func (c *nodeLoadBalancerController) cleanupAggregateService(ctx context.Context
 		}
 	}
 	_, _, err = c.updateExactParentService(ctx, current, func(copy *corev1.Service) (bool, error) {
-		if copy.DeletionTimestamp == nil && isNodeLoadBalancerService(copy) {
+		if copy.DeletionTimestamp == nil && isNodeLoadBalancerService(copy) && !publicNodeLocalRequested(copy) {
 			return false, errors.New("node load balancer: Service became active before aggregate finalization")
 		}
 		if len(copy.Status.LoadBalancer.Ingress) != 0 {

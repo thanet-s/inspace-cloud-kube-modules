@@ -209,6 +209,38 @@ equal its pre-Node-LB snapshot. The deployments, PVC, private Services,
 cluster, and general worker remain available to later checks or a preserved
 phased run.
 
+The final endpoint-local block then creates a separate user-owned static edge
+NodePool with one 1-vCPU/2-GiB AMD EPYC node, one replacement-surge slot, a
+30-GiB root disk, a reserved FIP, the protected
+`inspace.cloud.node-restriction.kubernetes.io/public-local-pool=edge` label,
+and a dedicated `public-node-local` NodeClass. A selector-backed Service uses
+`externalTrafficPolicy: Local`, keeps `publishNotReadyAddresses: false`,
+disables data-port NodePorts, and causes CCM to create one exact `inlb-dp-*`
+private-VIP child plus one per-Service firewall containing only TCP/80 and
+UDP/443.
+Kubernetes still allocates the standard `healthCheckNodePort` for both Local
+LoadBalancer Services; neither is opened by the public InSpace firewall.
+Before exposure, acceptance proves the static Node and NodeClaim are Ready and
+checks every Node→NodeClaim→NodePool→NodeClass UID, owner-reference,
+providerID, and class-reference link plus the VM's trusted base-firewall UUID.
+Creating and journaling the Service must make CCM independently prove the
+Karpenter ownership chain and ensure the protected NodePool template label is
+present before the selected Pod and public frontend are accepted. Karpenter
+may already have synchronized that protected label after node registration;
+the kubelet bootstrap never self-applies it.
+Acceptance binds the child VIP to the Node InternalIP, the parent Proxy status
+to the same VM's FIP, proves public TCP/80, UDP/443, and the retained HTTP
+client source, and requires the InSpace NLB UUID set to remain unchanged.
+Scaling the only local endpoint to zero must clear both statuses and detach the
+Service firewall without changing the Node, VM, or FIP. Restoring the endpoint
+must republish the same identities. The suite then deletes that NodeClaim while the
+Service is live and proves the static NodePool supplies a different NodeClaim,
+VM, and deterministic FIP identity, the old VM/FIP are absent, the same
+Service firewall is attached only to the replacement, status reconverges, and
+public traffic still works. The test then deletes the public Service promptly,
+proves its child and firewall are gone while its user-owned NodePool, VM, and
+FIP remain, and only then deletes the static capacity and NodeClass.
+
 ## Safety and cleanup
 
 Use only a new, empty, isolated billing account. Before its first mutation the
@@ -244,13 +276,15 @@ provisioning the cluster again. The `destroy` phase is the explicit cleanup
 path for those preserved runs. A durable `phase-preserved` marker prevents a
 later default `all` run from cleaning them implicitly. Owner removal is ordered:
 
-1. all paid, private, and Node-LB workloads and Services, including
-   controller-owned Node-LB datapaths;
+1. all paid, private, managed Node-LB, and endpoint-local workloads and
+   Services, including controller-owned `inlb-dp-*` datapaths; endpoint-local
+   Service finalization must finish before its user-owned edge capacity moves;
 2. pods, PV, and VolumeAttachments must disappear;
 3. both private `cilium-l2announce-*` Leases must disappear and
    `CiliumLoadBalancerIPPool/inspace-private` must report zero used IPs;
-4. managed Node-LB NodePools/NodeClaims/nodes, the general NodePool,
-   NodeClaims and worker Nodes, then NodeClasses;
+4. managed Node-LB NodePools/NodeClaims/nodes, the endpoint-local static
+   NodePool/NodeClaims/nodes, and the general NodePool/NodeClaims/nodes, then
+   their NodeClasses;
 5. CSI/CCM/Karpenter-owned disks, workers, floating IPs, and service NLB must
    be absent before controller charts are removed; Karpenter deletes its named
    FIP before deleting the worker VM because VM deletion only leaves that FIP

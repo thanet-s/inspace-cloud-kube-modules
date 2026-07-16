@@ -1,0 +1,159 @@
+apiVersion: karpenter.inspace.cloud/v1alpha1
+kind: InSpaceNodeClass
+metadata:
+  name: {{ e2e_public_local_nodeclass_name }}
+spec:
+  clusterName: {{ e2e_state.clusterName }}
+  billingAccountID: {{ lookup('env', 'INSPACE_BILLING_ACCOUNT_ID') }}
+  location: {{ lookup('env', 'INSPACE_LOCATION') }}
+  networkUUID: {{ lookup('env', 'INSPACE_NETWORK_UUID') }}
+  privateLoadBalancerPool:
+    start: "{{ lookup('env', 'INSPACE_PRIVATE_LOAD_BALANCER_POOL_START') }}"
+    stop: "{{ lookup('env', 'INSPACE_PRIVATE_LOAD_BALANCER_POOL_STOP') }}"
+  reservePublicIPv4: true
+  firewallUUID: {{ e2e_state.firewallUUID }}
+  firewallProfile: public-node-local
+  imageSelector:
+    osName: {{ lookup('env', 'INSPACE_OS_NAME') | default('ubuntu', true) }}
+    osVersion: "{{ lookup('env', 'INSPACE_OS_VERSION') | default('24.04', true) }}"
+  rootDiskGiB: 30
+  bootstrapCache:
+    directDownload: false
+    address: "{{ e2e_state.bootstrapCacheAddress }}"
+    caBundle: {{ e2e_state.bootstrapCacheCABundle | to_json }}
+  rke2:
+    version: v1.35.6+rke2r1
+    skipOSUpgrade: true
+    server: {{ e2e_state.privateRegistrationEndpoint }}
+    tokenSecretRef:
+      name: inspace-rke2-agent-token
+      key: token
+  sshUsername: {{ e2e_state.sshUsername }}
+  sshPublicKey: {{ lookup('file', lookup('env', 'E2E_PUBLIC_KEY')) | trim | to_json }}
+---
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: {{ e2e_public_local_nodepool_name }}
+spec:
+  replicas: 1
+  limits:
+    nodes: 2
+  template:
+    metadata:
+      labels:
+        inspace.cloud.node-restriction.kubernetes.io/public-local-pool: {{ e2e_public_local_pool }}
+    spec:
+      expireAfter: Never
+      nodeClassRef:
+        group: karpenter.inspace.cloud
+        kind: InSpaceNodeClass
+        name: {{ e2e_public_local_nodeclass_name }}
+      taints:
+        - key: inspace.cloud/public-local
+          value: "true"
+          effect: NoSchedule
+      requirements:
+        - key: inspace.cloud/instance-family
+          operator: In
+          values: [general]
+        - key: inspace.cloud/instance-cpu
+          operator: In
+          values: ["1"]
+        - key: inspace.cloud/instance-memory
+          operator: In
+          values: ["2048"]
+        - key: inspace.cloud/host-class
+          operator: In
+          values: [amd-epyc]
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: [on-demand]
+        - key: kubernetes.io/arch
+          operator: In
+          values: [amd64]
+        - key: kubernetes.io/os
+          operator: In
+          values: [linux]
+  disruption:
+    consolidateAfter: Never
+    budgets:
+      - nodes: "0"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: inspace-e2e-public-local
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: inspace-e2e-public-local
+  template:
+    metadata:
+      labels:
+        app: inspace-e2e-public-local
+    spec:
+      nodeSelector:
+        inspace.cloud.node-restriction.kubernetes.io/public-local-pool: {{ e2e_public_local_pool }}
+      tolerations:
+        - key: inspace.cloud/public-local
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: inspace-e2e-public-local
+      containers:
+        - name: echo
+          image: docker.io/library/busybox:1.36.1@sha256:b7f3d86d6e84fc17718c48bcde1450807faa2d56704205c697b4bd5df7b9e29f
+          imagePullPolicy: IfNotPresent
+          command: [sh, -ceu]
+          args:
+            - |
+              mkdir -p /www/cgi-bin
+              printf '%s\n' '{{ e2e_marker }}-public-local' >/www/index.html
+              printf '%s\n' \
+                '#!/bin/sh' \
+                "printf 'Content-Type: text/plain\\r\\n\\r\\n%s\\n' \"\$REMOTE_ADDR\"" \
+                >/www/cgi-bin/source
+              chmod 0700 /www/cgi-bin/source
+              exec httpd -f -p 8080 -h /www
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 1
+            periodSeconds: 2
+        - name: udp-echo
+          image: docker.io/library/busybox:1.36.1@sha256:b7f3d86d6e84fc17718c48bcde1450807faa2d56704205c697b4bd5df7b9e29f
+          imagePullPolicy: IfNotPresent
+          command: [sh, -ceu]
+          args:
+            - |
+              printf '%s\n' \
+                '#!/bin/sh' \
+                "printf '%s\\n' '{{ e2e_marker }}-public-local-udp'" \
+                >/tmp/udp-echo
+              chmod 0700 /tmp/udp-echo
+              while true; do
+                nc -u -l -p 18443 -e /tmp/udp-echo
+              done
+          ports:
+            - name: http3
+              containerPort: 18443
+              protocol: UDP
+          readinessProbe:
+            exec:
+              command: [sh, -ceu, "test -x /tmp/udp-echo"]
+            initialDelaySeconds: 1
+            periodSeconds: 2

@@ -425,6 +425,48 @@ func TestCreateAndReadbackPreserveOfferingAndNumericIdentity(t *testing.T) {
 	assertCapacityLabels(t, listed[0].Labels)
 }
 
+func TestCreatePersistsPublicNodeLocalNodePoolIdentity(t *testing.T) {
+	ctx := context.Background()
+	nodeClass := readyProviderNodeClass()
+	nodeClass.Spec.FirewallProfile = inspacev1.FirewallProfilePublicNodeLocal
+	nodeClass.Status.ObservedSpecHash = NodeClassHash(nodeClass)
+	resolver := NewStaticResolver(nodeClass)
+	resolver.SetToken(inspacev1.RKE2AgentTokenSecretName, inspacev1.RKE2AgentTokenSecretKey, "agent-token")
+	cloud := cloudfake.New()
+	provider, err := New(cloud, resolver, providerOptions(nodeClass))
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim := &karpv1.NodeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   "edge-ab12c",
+			UID:    types.UID("local-claim-uid"),
+			Labels: map[string]string{karpv1.NodePoolLabelKey: "edge"},
+		},
+		Spec: karpv1.NodeClaimSpec{
+			NodeClassRef: &karpv1.NodeClassReference{Group: inspacev1.Group, Kind: inspacev1.Kind, Name: nodeClass.Name},
+		},
+	}
+	created, err := provider.Create(ctx, claim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := providerid.Parse(created.Status.ProviderID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, ok := cloud.Request(id.VMUUID)
+	if !ok {
+		t.Fatal("cloud did not record launch request")
+	}
+	if request.FirewallProfile != inspacev1.FirewallProfilePublicNodeLocal || request.NodePoolName != "edge" || request.NodeClaimName != "edge-ab12c" {
+		t.Fatalf("public-local launch identity profile/NodePool/NodeClaim=%q/%q/%q", request.FirewallProfile, request.NodePoolName, request.NodeClaimName)
+	}
+	if created.Labels[karpv1.NodePoolLabelKey] != "edge" {
+		t.Fatalf("created NodeClaim NodePool label=%q, want edge", created.Labels[karpv1.NodePoolLabelKey])
+	}
+}
+
 func TestConcurrentCreateUsesOneImmutableCloudLaunch(t *testing.T) {
 	ctx := context.Background()
 	nodeClass := readyProviderNodeClass()

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -26,6 +27,7 @@ import (
 	"k8s.io/client-go/informers"
 	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
 	corelisters "k8s.io/client-go/listers/core/v1"
+	discoverylisters "k8s.io/client-go/listers/discovery/v1"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
@@ -95,13 +97,15 @@ var (
 )
 
 type nodeLoadBalancerController struct {
-	provider *Provider
-	nodes    corelisters.NodeLister
-	services corelisters.ServiceLister
+	provider       *Provider
+	nodes          corelisters.NodeLister
+	services       corelisters.ServiceLister
+	endpointSlices discoverylisters.EndpointSliceLister
 
-	nodesSynced    cache.InformerSynced
-	servicesSynced cache.InformerSynced
-	queue          workqueue.TypedRateLimitingInterface[string]
+	nodesSynced          cache.InformerSynced
+	servicesSynced       cache.InformerSynced
+	endpointSlicesSynced cache.InformerSynced
+	queue                workqueue.TypedRateLimitingInterface[string]
 }
 
 // nodeLoadBalancerPlanningServiceError proves that a planning failure belongs
@@ -168,9 +172,11 @@ func newNodeLoadBalancerController(provider *Provider, factory informers.SharedI
 	}
 	nodes := factory.Core().V1().Nodes()
 	services := factory.Core().V1().Services()
+	endpointSlices := factory.Discovery().V1().EndpointSlices()
 	controller := &nodeLoadBalancerController{
-		provider: provider, nodes: nodes.Lister(), services: services.Lister(),
+		provider: provider, nodes: nodes.Lister(), services: services.Lister(), endpointSlices: endpointSlices.Lister(),
 		nodesSynced: nodes.Informer().HasSynced, servicesSynced: services.Informer().HasSynced,
+		endpointSlicesSynced: endpointSlices.Informer().HasSynced,
 		queue: workqueue.NewTypedRateLimitingQueueWithConfig(
 			workqueue.DefaultTypedControllerRateLimiter[string](),
 			workqueue.TypedRateLimitingQueueConfig[string]{Name: "inspace-node-load-balancers"},
@@ -192,6 +198,21 @@ func newNodeLoadBalancerController(provider *Provider, factory informers.SharedI
 	if _, err := nodes.Informer().AddEventHandler(nodeHandler); err != nil {
 		return nil, fmt.Errorf("node load balancer: register Node handler: %w", err)
 	}
+	if _, err := endpointSlices.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(object any) { controller.enqueueNodeLoadBalancerEndpointSlice(object) },
+		UpdateFunc: func(oldObject, newObject any) {
+			oldSlice, oldOK := oldObject.(*discoveryv1.EndpointSlice)
+			newSlice, newOK := newObject.(*discoveryv1.EndpointSlice)
+			if !oldOK || !newOK || reflect.DeepEqual(oldSlice, newSlice) {
+				return
+			}
+			controller.enqueueNodeLoadBalancerEndpointSlice(oldSlice)
+			controller.enqueueNodeLoadBalancerEndpointSlice(newSlice)
+		},
+		DeleteFunc: func(object any) { controller.enqueueNodeLoadBalancerEndpointSlice(object) },
+	}); err != nil {
+		return nil, fmt.Errorf("node load balancer: register EndpointSlice handler: %w", err)
+	}
 	return controller, nil
 }
 
@@ -201,7 +222,7 @@ func (c *nodeLoadBalancerController) Run(stopCh <-chan struct{}) {
 	if stopCh == nil {
 		panic("node load balancer: stop channel is required")
 	}
-	if !cache.WaitForCacheSync(stopCh, c.nodesSynced, c.servicesSynced) {
+	if !cache.WaitForCacheSync(stopCh, c.nodesSynced, c.servicesSynced, c.endpointSlicesSynced) {
 		return
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -227,6 +248,21 @@ func (c *nodeLoadBalancerController) Run(stopCh <-chan struct{}) {
 	}
 }
 
+func (c *nodeLoadBalancerController) enqueueNodeLoadBalancerEndpointSlice(object any) {
+	endpointSlice, ok := object.(*discoveryv1.EndpointSlice)
+	if !ok {
+		if tombstone, tombstoneOK := object.(cache.DeletedFinalStateUnknown); tombstoneOK {
+			endpointSlice, ok = tombstone.Obj.(*discoveryv1.EndpointSlice)
+		}
+	}
+	if !ok {
+		return
+	}
+	if key := endpointSliceServiceKey(endpointSlice); key != "" {
+		c.queue.Add(key)
+	}
+}
+
 func (c *nodeLoadBalancerController) processNext(ctx context.Context) bool {
 	key, shutdown := c.queue.Get()
 	if shutdown {
@@ -249,7 +285,9 @@ func (c *nodeLoadBalancerController) enqueueAll() {
 		return
 	}
 	for _, service := range services {
-		if isNodeLoadBalancerService(service) || containsString(service.Finalizers, nodeLoadBalancerFinalizer) {
+		if isNodeLoadBalancerService(service) ||
+			containsString(service.Finalizers, nodeLoadBalancerFinalizer) ||
+			containsString(service.Finalizers, publicNodeLocalFinalizer) {
 			c.queue.Add(service.Namespace + "/" + service.Name)
 		}
 	}
@@ -1214,6 +1252,11 @@ func (c *nodeLoadBalancerController) planForService(ctx context.Context, target 
 			// firewall can then be recovered if the user fixes the Service without
 			// letting malformed claims evict healthy Services.
 			klog.ErrorS(parseErr, "quarantined invalid InSpace node load balancer Service", "service", service.Namespace+"/"+service.Name)
+			continue
+		}
+		if intent.Mode == nodeLoadBalancerModeLocal {
+			// Direct-node Services own neither a generated NodePool nor an
+			// aggregate shard port reservation.
 			continue
 		}
 		if intent.ExistingShard != "" {

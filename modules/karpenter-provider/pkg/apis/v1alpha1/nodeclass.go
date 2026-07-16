@@ -20,6 +20,7 @@ const (
 
 	FirewallProfilePrivateWorker          FirewallProfile = "private-worker"
 	FirewallProfilePublicNodeLoadBalancer FirewallProfile = "public-node-load-balancer"
+	FirewallProfilePublicNodeLocal        FirewallProfile = "public-node-local"
 
 	IntelScalableHostPoolUUID = "aac7dd66-f390-4edd-80c0-dd7cae49bd99"
 	AMDEPYCHostPoolUUID       = "6976fdc8-4492-465b-bd16-9ad5f6b00b03"
@@ -27,9 +28,11 @@ const (
 
 // FirewallProfile controls which additional firewall assignments are valid
 // for a node. The NodeClass firewall itself is always the same strict private
-// worker firewall; the public load-balancer profile only permits the shared
+// worker firewall. The public load-balancer profile only permits the shared
 // cluster ICMP firewall and at most one stable, mutable shard firewall in
-// addition.
+// addition. The public-node-local profile instead permits only CCM-owned
+// per-Service TCP/UDP ingress firewalls; it never permits the cluster ICMP or
+// aggregate shard policies.
 type FirewallProfile string
 
 // EffectiveFirewallProfile preserves the original private-worker behavior for
@@ -84,8 +87,10 @@ type InSpaceNodeClassSpec struct {
 	// ReservePublicIPv4 makes VM creation reserve exactly one implicit floating
 	// IPv4 because InSpace has no managed NAT gateway. The provider discovers
 	// that exact VM assignment, PATCHes its deterministic name/account, and
-	// requires readback before success. The address is for egress only; RKE2
-	// uses RFC1918 and the external CCM publishes the Node ExternalIP.
+	// requires readback before success. RKE2 always uses RFC1918 for cluster
+	// traffic. The address provides egress and, only for an explicitly
+	// authorized public-node-local or public-node-load-balancer NodeClass, may
+	// also be a CCM-managed public Service frontend.
 	ReservePublicIPv4 bool `json:"reservePublicIPv4"`
 	// FirewallUUID is a pre-created default-deny InSpace firewall assigned to
 	// every worker before the provider reports a successful launch. Readiness
@@ -96,7 +101,8 @@ type InSpaceNodeClassSpec struct {
 	// FirewallProfile defaults to private-worker. public-node-load-balancer
 	// keeps FirewallUUID private and permits only the CCM-owned cluster ICMP
 	// firewall and one CCM-owned aggregate shard firewall that pass provider
-	// audit.
+	// audit. public-node-local permits only exact CCM-owned per-Service TCP/UDP
+	// ingress firewalls in addition to FirewallUUID.
 	FirewallProfile FirewallProfile `json:"firewallProfile,omitempty"`
 	// ImageSelector selects a stock operating-system image supported by the VM
 	// create API. The first release supports Ubuntu 24.04 only.

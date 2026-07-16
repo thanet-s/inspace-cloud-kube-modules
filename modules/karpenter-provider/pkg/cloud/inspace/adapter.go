@@ -2525,13 +2525,17 @@ func validateCreateRequest(r cloudapi.CreateVMRequest) error {
 		return fmt.Errorf("invalid worker SSH access: %w", err)
 	}
 	switch r.FirewallProfile {
-	case "", inspacev1.FirewallProfilePrivateWorker, inspacev1.FirewallProfilePublicNodeLoadBalancer:
+	case "", inspacev1.FirewallProfilePrivateWorker, inspacev1.FirewallProfilePublicNodeLoadBalancer, inspacev1.FirewallProfilePublicNodeLocal:
 	default:
 		return fmt.Errorf("unsupported firewall profile %q", r.FirewallProfile)
 	}
 	if inspacev1.EffectiveFirewallProfile(r.FirewallProfile) == inspacev1.FirewallProfilePublicNodeLoadBalancer {
 		if _, err := nodeLoadBalancerShardFromOwnedNodeClaim(r.NodePoolName, r.NodeClaimName); err != nil {
 			return fmt.Errorf("public Node load balancer NodeClaim/NodePool shard identity: %w", err)
+		}
+	} else if inspacev1.EffectiveFirewallProfile(r.FirewallProfile) == inspacev1.FirewallProfilePublicNodeLocal {
+		if err := validateOwnedNodePoolIdentity(r.NodePoolName, r.NodeClaimName); err != nil {
+			return fmt.Errorf("public local NodeClaim/NodePool identity: %w", err)
 		}
 	}
 	if err := bootstrap.ValidateVPCSubnetTemplate(r.CloudInitJSON); err != nil {
@@ -2553,8 +2557,13 @@ func validateFencedCreateCleanupRequest(r cloudapi.FencedCreateCleanupRequest) e
 		return fmt.Errorf("fenced VM cleanup requires exact cluster, location, NodeClaim, VM, billing, key-hash, token, phase, and observed identity")
 	}
 	if (r.FirewallProfile == inspacev1.FirewallProfilePrivateWorker && r.NodePoolName != "") ||
-		(r.FirewallProfile == inspacev1.FirewallProfilePublicNodeLoadBalancer && r.NodePoolName == "") {
+		((r.FirewallProfile == inspacev1.FirewallProfilePublicNodeLoadBalancer || r.FirewallProfile == inspacev1.FirewallProfilePublicNodeLocal) && r.NodePoolName == "") {
 		return fmt.Errorf("fenced VM cleanup firewall profile and NodePool binding are inconsistent")
+	}
+	if r.FirewallProfile == inspacev1.FirewallProfilePublicNodeLoadBalancer || r.FirewallProfile == inspacev1.FirewallProfilePublicNodeLocal {
+		if err := validateOwnedNodePoolIdentity(r.NodePoolName, r.NodeClaimName); err != nil {
+			return fmt.Errorf("fenced VM cleanup NodePool/NodeClaim binding: %w", err)
+		}
 	}
 	if err := validateV2WorkerName(r.ClusterName, r.NodeClaimName, r.VMName); err != nil {
 		return err
@@ -2833,7 +2842,7 @@ func normalizeOwnershipLaunchIdentity(record ownership) (normalized ownership, p
 	normalized = record
 	publicOwnershipPartial := false
 	switch normalized.FirewallProfile {
-	case "", inspacev1.FirewallProfilePrivateWorker, inspacev1.FirewallProfilePublicNodeLoadBalancer:
+	case "", inspacev1.FirewallProfilePrivateWorker, inspacev1.FirewallProfilePublicNodeLoadBalancer, inspacev1.FirewallProfilePublicNodeLocal:
 		normalized.FirewallProfile = inspacev1.EffectiveFirewallProfile(normalized.FirewallProfile)
 	default:
 		return ownership{}, false, fmt.Errorf("unsupported recorded firewall profile %q", normalized.FirewallProfile)
@@ -2843,6 +2852,12 @@ func normalizeOwnershipLaunchIdentity(record ownership) (normalized ownership, p
 			publicOwnershipPartial = true
 		} else if _, err := nodeLoadBalancerShardFromOwnedNodeClaim(normalized.NodePool, normalized.NodeClaim); err != nil {
 			return ownership{}, false, fmt.Errorf("invalid public Node load balancer NodePool/NodeClaim ownership: %v", err)
+		}
+	} else if normalized.FirewallProfile == inspacev1.FirewallProfilePublicNodeLocal {
+		if normalized.NodePool == "" || normalized.NodeClaim == "" {
+			publicOwnershipPartial = true
+		} else if err := validateOwnedNodePoolIdentity(normalized.NodePool, normalized.NodeClaim); err != nil {
+			return ownership{}, false, fmt.Errorf("invalid public local NodePool/NodeClaim ownership: %v", err)
 		}
 	} else if normalized.NodePool != "" {
 		return ownership{}, false, fmt.Errorf("private worker ownership must not record NodePool identity %q", normalized.NodePool)
@@ -3672,6 +3687,50 @@ func validateWorkerFirewallAssignments(firewalls []sdk.Firewall, intendedFirewal
 			return false, fmt.Errorf("%w: worker VM %s must be attached exactly once to intended firewall %s, got %v", cloudapi.ErrOwnershipMismatch, vmUUID, intendedFirewallUUID, assignments)
 		}
 		return true, nil
+	case inspacev1.FirewallProfilePublicNodeLocal:
+		if len(assignments) == 0 && !requireIntended {
+			return false, nil
+		}
+		if len(assignments) == 0 {
+			return false, fmt.Errorf("%w: public-node-local VM %s", errFirewallAssignmentNotVisible, vmUUID)
+		}
+		byUUID := make(map[string]*sdk.Firewall, len(firewalls))
+		for i := range firewalls {
+			byUUID[firewalls[i].UUID] = &firewalls[i]
+		}
+		intendedFirewall := byUUID[intendedFirewallUUID]
+		if intendedFirewall == nil || intendedFirewall.BillingAccountID < 1 {
+			return false, fmt.Errorf("%w: intended public-node-local firewall %s is absent or lacks billing identity", cloudapi.ErrOwnershipMismatch, intendedFirewallUUID)
+		}
+		intendedCount := 0
+		seenAdditional := make(map[string]struct{}, len(assignments))
+		for _, firewallUUID := range assignments {
+			if firewallUUID == intendedFirewallUUID {
+				intendedCount++
+				continue
+			}
+			firewall := byUUID[firewallUUID]
+			if firewall == nil {
+				return false, fmt.Errorf("%w: assigned firewall %s is absent from the authoritative list", cloudapi.ErrOwnershipMismatch, firewallUUID)
+			}
+			if _, duplicate := seenAdditional[firewallUUID]; duplicate {
+				return false, fmt.Errorf("%w: public-node-local VM %s has duplicate Service firewall %s assignments", cloudapi.ErrOwnershipMismatch, vmUUID, firewallUUID)
+			}
+			seenAdditional[firewallUUID] = struct{}{}
+			if err := sdk.ValidateNodeLoadBalancerServiceFirewall(*firewall, clusterName, intendedFirewall.BillingAccountID); err != nil {
+				return false, fmt.Errorf("%w: public-node-local VM %s additional firewall %s: %v", cloudapi.ErrOwnershipMismatch, vmUUID, firewallUUID, err)
+			}
+		}
+		if intendedCount > 1 {
+			return false, fmt.Errorf("%w: %w: public-node-local VM %s has duplicate intended firewall %s assignments", cloudapi.ErrOwnershipMismatch, errFirewallAssignmentReadbackDuplicate, vmUUID, intendedFirewallUUID)
+		}
+		if intendedCount == 0 {
+			if requireIntended {
+				return false, fmt.Errorf("%w: public-node-local VM %s", errFirewallAssignmentNotVisible, vmUUID)
+			}
+			return false, nil
+		}
+		return true, nil
 	case inspacev1.FirewallProfilePublicNodeLoadBalancer:
 		expectedShard, err = nodeLoadBalancerShardFromOwnedNodeClaim(nodePoolName, nodeClaimName)
 		if err != nil {
@@ -3752,14 +3811,24 @@ func nodeLoadBalancerShardFromOwnedNodeClaim(nodePoolName, nodeClaimName string)
 	if !nodeLoadBalancerShardPattern.MatchString(nodePoolName) {
 		return "", fmt.Errorf("NodePool name %q must exactly match inlb-<8 lowercase hex characters>", nodePoolName)
 	}
+	if err := validateOwnedNodePoolIdentity(nodePoolName, nodeClaimName); err != nil {
+		return "", err
+	}
+	return nodePoolName, nil
+}
+
+func validateOwnedNodePoolIdentity(nodePoolName, nodeClaimName string) error {
+	if messages := k8svalidation.IsDNS1123Label(nodePoolName); len(messages) != 0 {
+		return fmt.Errorf("NodePool name %q is not a DNS-1123 label: %s", nodePoolName, strings.Join(messages, "; "))
+	}
 	if messages := k8svalidation.IsDNS1123Label(nodeClaimName); len(messages) != 0 {
-		return "", fmt.Errorf("NodeClaim name %q is not a DNS-1123 label: %s", nodeClaimName, strings.Join(messages, "; "))
+		return fmt.Errorf("NodeClaim name %q is not a DNS-1123 label: %s", nodeClaimName, strings.Join(messages, "; "))
 	}
 	prefix := nodePoolName + "-"
 	if !strings.HasPrefix(nodeClaimName, prefix) || len(nodeClaimName) == len(prefix) {
-		return "", fmt.Errorf("NodeClaim name %q must use exact NodePool-generated prefix %q followed by a nonempty suffix", nodeClaimName, prefix)
+		return fmt.Errorf("NodeClaim name %q must use exact NodePool-generated prefix %q followed by a nonempty suffix", nodeClaimName, prefix)
 	}
-	return nodePoolName, nil
+	return nil
 }
 
 func validateNodeLoadBalancerClusterICMPFirewall(firewall sdk.Firewall, clusterName string, billingAccountID int64) error {
@@ -4515,7 +4584,8 @@ func inspectOwnershipForFence(description, targetCluster, targetNodeClaim string
 func ownershipRecordStructurallyComplete(record ownership) bool {
 	validSchemaAndName := ((record.Schema == ownershipSchema || record.Schema == legacyV2OwnershipSchema) && record.VMName != "") || record.Schema == legacyOwnershipSchema
 	validPublicIdentity := record.Schema == ownershipSchema || record.PublicIPv4 != ""
-	validNodePoolIdentity := inspacev1.EffectiveFirewallProfile(record.FirewallProfile) != inspacev1.FirewallProfilePublicNodeLoadBalancer || record.NodePool != ""
+	profile := inspacev1.EffectiveFirewallProfile(record.FirewallProfile)
+	validNodePoolIdentity := (profile != inspacev1.FirewallProfilePublicNodeLoadBalancer && profile != inspacev1.FirewallProfilePublicNodeLocal) || record.NodePool != ""
 	return validSchemaAndName && record.Cluster != "" && record.NodeClaim != "" && record.KeyHash != "" &&
 		record.HostClass != "" && record.InstanceType != "" && record.RootDiskGiB > 0 && record.SpecHash != "" &&
 		record.BootstrapHash != "" && record.FirewallUUID != "" && record.NetworkUUID != "" && record.ControlPlaneVIP != "" &&

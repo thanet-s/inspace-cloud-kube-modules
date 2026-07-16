@@ -2301,6 +2301,14 @@ func validateFirewallPolicy(firewall *inspace.Firewall, subnet, podCIDR, managem
 	return nil
 }
 
+// ValidateDefaultNodeFirewallPolicy exposes the exact bootstrap-owned worker
+// firewall contract to runtime controllers that must fail closed on cloud-side
+// rule drift. Default workers have private VPC/pod ingress and unrestricted
+// egress only; public Service edges are independent firewalls.
+func ValidateDefaultNodeFirewallPolicy(firewall *inspace.Firewall, subnet, podCIDR string) error {
+	return validateFirewallPolicy(firewall, subnet, podCIDR, "", nil)
+}
+
 func validatePrivateSubnet(value string) error {
 	prefix, err := netip.ParsePrefix(value)
 	if err != nil || !prefix.Addr().Is4() || !prefix.Addr().IsPrivate() {

@@ -1,0 +1,26 @@
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: inspace-e2e-public-local
+  namespace: default
+  annotations:
+    service.inspace.cloud/node-lb-mode: public-node-local
+    service.inspace.cloud/node-lb-pool: {{ e2e_public_local_pool }}
+spec:
+  type: LoadBalancer
+  loadBalancerClass: inspace.cloud/node
+  allocateLoadBalancerNodePorts: false
+  externalTrafficPolicy: Local
+  publishNotReadyAddresses: false
+  selector:
+    app: inspace-e2e-public-local
+  ports:
+    - name: http
+      protocol: TCP
+      port: 80
+      targetPort: http
+    - name: http3
+      protocol: UDP
+      port: 443
+      targetPort: http3
