@@ -54,6 +54,7 @@ type fakeAPI struct {
 	suppressAttachCommit   bool
 	suppressDetachCommit   bool
 	preserveDiskBilling    bool
+	preserveDiskSource     bool
 	preserveVMBilling      bool
 	preserveVMNetwork      bool
 	networkVMUUIDs         []string
@@ -224,7 +225,7 @@ func (a *staleAttachmentListAPI) ListVMs(ctx context.Context, location string) (
 func (a *detailSequenceAPI) GetDisk(ctx context.Context, location, id string) (*sdk.Disk, error) {
 	a.diskGets++
 	if disk, ok := a.diskOverride[a.diskGets]; ok {
-		copy := disk
+		copy := a.fakeAPI.canonicalTestDisk(disk)
 		return &copy, nil
 	}
 	return a.fakeAPI.GetDisk(ctx, location, id)
@@ -292,6 +293,7 @@ func (f *fakeAPI) GetDisk(_ context.Context, _ string, id string) (*sdk.Disk, er
 			if copy.BillingAccountID == 0 && !f.preserveDiskBilling {
 				copy.BillingAccountID = 42
 			}
+			copy = f.canonicalTestDisk(copy)
 			copy.Snapshots = append([]sdk.DiskSnapshot{}, f.disks[i].Snapshots...)
 			return &copy, nil
 		}
@@ -314,8 +316,16 @@ func (f *fakeAPI) ListDisks(context.Context, string) ([]sdk.Disk, error) {
 		if result[i].BillingAccountID == 0 && !f.preserveDiskBilling {
 			result[i].BillingAccountID = 42
 		}
+		result[i] = f.canonicalTestDisk(result[i])
 	}
 	return result, f.listError
+}
+
+func (f *fakeAPI) canonicalTestDisk(disk sdk.Disk) sdk.Disk {
+	if strings.TrimSpace(disk.SourceImageType) == "" && !f.preserveDiskSource {
+		disk.SourceImageType = "EMPTY"
+	}
+	return disk
 }
 
 func (f *fakeAPI) DeleteDisk(_ context.Context, _ string, id string) error {

@@ -1635,6 +1635,14 @@ def main() -> None:
         and "allowed_statuses={200}" in strict_api_reader,
         "shared InSpace reader lost its no-proxy/no-redirect/4-MiB/exact-200 boundary",
     )
+    require(
+        'if "display_name" in row:' in strict_api_reader
+        and 'row.get("source_image_type") != "OS_BASE"' in strict_api_reader
+        and 'row.get("status") != "Active"' in strict_api_reader
+        and 'row.get("read_only_bootable") is not False' in strict_api_reader
+        and '_required_list(row, "snapshots", label)' in strict_api_reader,
+        "strict disk reader lost its complete unnamed Active OS-base boot-disk contract",
+    )
     for reader in (
         account_inventory,
         cloud_audit,
@@ -3574,6 +3582,25 @@ def main() -> None:
             ]
         if path == "network/networks" and location == "hkt01":
             return [{"uuid": "network-deleted", "is_deleted": True}]
+        if path == "storage/disks" and location == "bkk01":
+            return [
+                {
+                    "uuid": "11111111-aaaa-4111-8111-111111111111",
+                    "status": "Active",
+                    "source_image_type": "OS_BASE",
+                },
+                {
+                    "uuid": "22222222-bbbb-4222-8222-222222222222",
+                    "display_name": "pvc-static",
+                    "status": "Active",
+                    "source_image_type": "EMPTY",
+                },
+                {
+                    "uuid": "33333333-cccc-4333-8333-333333333333",
+                    "status": "deleted",
+                    "source_image_type": "OS_BASE",
+                },
+            ]
         if path == "storage/bucket/list" and location is None:
             return [
                 {"name": "bucket-a"},
@@ -3592,6 +3619,11 @@ def main() -> None:
         require(
             complete_inventory["vms"] == ["bkk01:vm-a"]
             and complete_inventory["networks"] == ["bkk01:network-a"]
+            and complete_inventory["disks"]
+            == [
+                "bkk01:11111111-aaaa-4111-8111-111111111111",
+                "bkk01:22222222-bbbb-4222-8222-222222222222",
+            ]
             and complete_inventory["buckets"] == ["global:bucket-a"]
             and complete_inventory["servicePackages"] == ["global:package-a"],
             "complete account inventory must scope stable location/global identities and ignore only explicit tombstones",
@@ -3637,6 +3669,13 @@ def main() -> None:
     require("preflight found owned resources without an ownership journal" in cloud_audit and
             "allow_missing_state=allow_missing_state" in cloud_audit,
             "missing-state preflight must accept only a stable zero without weakening later audits")
+    require(
+        "def _select_owned_csi_disks(" in cloud_audit
+        and 'disk.get("display_name") != disk_name' in cloud_audit
+        and 'disk.get("billing_account_id") != billing_account' in cloud_audit
+        and 'disk.get("source_image_type") != "EMPTY"' in cloud_audit,
+        "deterministic audit must not promote VM boot disks into CSI ownership",
+    )
     require("Require gratuitous ARP to update the existing VIP neighbor" in playbook and
             "Flush the VIP neighbor and prove fresh ARP" in playbook,
             "private L2 failover must separately prove GARP update and fresh ARP resolution")
@@ -3663,6 +3702,7 @@ def main() -> None:
         "Persist Kubernetes owner quiescence before bootstrap deletion",
         "Destroy only bootstrap-controller-owned infrastructure synchronously",
         "Require the final deterministic cloud audit to converge to zero",
+        "Require the complete isolated-account inventory to match its baseline",
         "Close the private API tunnel after the final zero audit",
     ]
     offsets = [cleanup.index(value) for value in ordering]

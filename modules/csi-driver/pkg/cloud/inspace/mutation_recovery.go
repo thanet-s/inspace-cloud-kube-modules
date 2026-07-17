@@ -293,8 +293,14 @@ func validateDiskCreateReadback(disk sdk.Disk, intent diskCreateIntent) error {
 	if disk.SizeGiB != intent.SizeGiB {
 		return fmt.Errorf("%w: disk %s has %d GiB, requested %d GiB", cloud.ErrIncompatibleVolume, disk.UUID, disk.SizeGiB, intent.SizeGiB)
 	}
-	if disk.SourceImageType != "" && !strings.EqualFold(disk.SourceImageType, "EMPTY") {
+	if !strings.EqualFold(strings.TrimSpace(disk.SourceImageType), "EMPTY") {
 		return fmt.Errorf("%w: disk %s source type is %q", cloud.ErrIncompatibleVolume, disk.UUID, disk.SourceImageType)
+	}
+	if strings.TrimSpace(disk.SourceImage) != "" {
+		return fmt.Errorf("%w: disk %s unexpectedly has source image %q", cloud.ErrIncompatibleVolume, disk.UUID, disk.SourceImage)
+	}
+	if disk.ReadOnlyBootable {
+		return fmt.Errorf("%w: disk %s is unexpectedly marked read-only bootable", cloud.ErrIncompatibleVolume, disk.UUID)
 	}
 	return nil
 }
@@ -683,6 +689,17 @@ func (a *Adapter) observeDetachState(ctx context.Context, intent diskAttachmentI
 			if !strings.EqualFold(storage.UUID, intent.DiskUUID) {
 				continue
 			}
+			if storage.Primary {
+				listStateErr = errors.Join(
+					listStateErr,
+					fmt.Errorf(
+						"%w: disk %s is listed as the primary boot disk of VM %s",
+						cloud.ErrPermissionDenied,
+						intent.DiskUUID,
+						vm.UUID,
+					),
+				)
+			}
 			listedRows++
 			vmUUID := strings.ToLower(vm.UUID)
 			if !uuidPattern.MatchString(vmUUID) {
@@ -723,6 +740,10 @@ func (a *Adapter) observeDetachState(ctx context.Context, intent diskAttachmentI
 		}
 		if relationErr := requireExactVMAttachmentCollection(*vm, intent.DiskUUID); relationErr != nil {
 			exactStateErr = relationErr
+			break
+		}
+		if err := rejectPrimaryDiskReference(*vm, intent.DiskUUID); err != nil {
+			exactStateErr = err
 			break
 		}
 		rows := 0

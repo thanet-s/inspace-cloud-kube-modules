@@ -2,7 +2,12 @@
 
 package linux
 
-import "testing"
+import (
+	"errors"
+	"testing"
+
+	"github.com/thanet-s/inspace-cloud-kube-modules/modules/csi-driver/pkg/host"
+)
 
 func TestValidateFlags(t *testing.T) {
 	flags, err := validateFlags([]string{"discard", "noatime", "discard"}, false)
@@ -39,5 +44,36 @@ func TestValidateAbsolutePath(t *testing.T) {
 		if err := validateAbsolutePath(invalid); err == nil {
 			t.Errorf("invalid path %q accepted", invalid)
 		}
+	}
+}
+
+func TestValidateWholeDiskMountSafety(t *testing.T) {
+	const device = "/dev/vdb"
+	valid := `{"blockdevices":[{"path":"/dev/vdb","type":"disk","mountpoints":[null]}]}`
+	if err := validateWholeDiskMountSafety([]byte(valid), device); err != nil {
+		t.Fatalf("valid empty whole disk: %v", err)
+	}
+	validEmptyMountpoints := `{"blockdevices":[{"path":"/dev/vdb","type":"disk","mountpoints":[]}]}`
+	if err := validateWholeDiskMountSafety([]byte(validEmptyMountpoints), device); err != nil {
+		t.Fatalf("valid whole disk with empty mountpoint array: %v", err)
+	}
+
+	invalid := map[string]string{
+		"mounted":             `{"blockdevices":[{"path":"/dev/vdb","type":"disk","mountpoints":["/"]}]}`,
+		"partitioned":         `{"blockdevices":[{"path":"/dev/vdb","type":"disk","mountpoints":[null],"children":[{"path":"/dev/vdb1","type":"part","mountpoints":["/"]}]}]}`,
+		"partition":           `{"blockdevices":[{"path":"/dev/vdb","type":"part","mountpoints":[null]}]}`,
+		"wrong path":          `{"blockdevices":[{"path":"/dev/vda","type":"disk","mountpoints":[null]}]}`,
+		"omitted mountpoints": `{"blockdevices":[{"path":"/dev/vdb","type":"disk"}]}`,
+		"duplicate roots":     `{"blockdevices":[{"path":"/dev/vdb","type":"disk","mountpoints":[null]},{"path":"/dev/vdc","type":"disk","mountpoints":[null]}]}`,
+		"trailing JSON":       `{"blockdevices":[{"path":"/dev/vdb","type":"disk","mountpoints":[null]}]} {}`,
+	}
+	for name, payload := range invalid {
+		t.Run(name, func(t *testing.T) {
+			if err := validateWholeDiskMountSafety([]byte(payload), device); !errors.Is(err, host.ErrMountConflict) && name != "trailing JSON" {
+				t.Fatalf("error = %v, want ErrMountConflict", err)
+			} else if err == nil {
+				t.Fatal("unsafe block-device topology unexpectedly accepted")
+			}
+		})
 	}
 }

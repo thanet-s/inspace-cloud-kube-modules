@@ -290,6 +290,12 @@ func (a *Adapter) DeleteVolume(ctx context.Context, location, volumeID string) e
 		}
 		deletedTombstone = diskDeletedTombstone(*disk)
 		if issueDelete && !deletedTombstone {
+			if authorityErr := validateCSIMutableDisk(*disk, volumeID, a.billing); authorityErr != nil {
+				if deleteErr := a.deleteMutationFenceDetached(ctx, deleteFence); deleteErr != nil {
+					return errors.Join(authorityErr, fmt.Errorf("clear unauthorized disk-delete fence: %w", deleteErr))
+				}
+				return authorityErr
+			}
 			if relationErr := requireExactDiskSnapshotCollection(*disk, volumeID); relationErr != nil {
 				if deleteErr := a.deleteMutationFenceDetached(ctx, deleteFence); deleteErr != nil {
 					return errors.Join(relationErr, fmt.Errorf("clear unissued disk-delete fence: %w", deleteErr))
@@ -735,6 +741,9 @@ func (a *Adapter) attachedVM(ctx context.Context, location, diskUUID string) (st
 		if relationErr := requireExactVMAttachmentCollection(*vm, diskUUID); relationErr != nil {
 			return "", relationErr
 		}
+		if err := rejectPrimaryDiskReference(*vm, diskUUID); err != nil {
+			return "", err
+		}
 		rows := vmDiskRows(*vm, diskUUID)
 		if rows > 1 {
 			return "", fmt.Errorf("InSpace exact VM %s reported %d attachment rows for disk %s", vmUUID, rows, diskUUID)
@@ -823,8 +832,11 @@ func (a *Adapter) waitForDiskReady(ctx context.Context, intent diskCreateIntent,
 }
 
 // getOwnedDisk is the only authoritative disk detail read used by ordinary
-// get and mutation paths. Both UUID and billing account must be echoed exactly;
-// omission is uncertainty and therefore fails closed.
+// get and mutation paths. A mutable CSI disk must echo exact account identity,
+// retain its non-empty CSI name, and be an EMPTY non-bootable disk. Kubernetes
+// volume handles contain only a location and UUID, so accepting an OS_BASE,
+// image-backed, unnamed, or bootable disk here would let a forged static PV
+// target a VM boot disk in the same billing account.
 func (a *Adapter) getOwnedDisk(ctx context.Context, location, diskUUID string) (sdk.Disk, error) {
 	disk, err := a.api.GetDisk(ctx, location, diskUUID)
 	if err != nil {
@@ -838,6 +850,9 @@ func (a *Adapter) getOwnedDisk(ctx context.Context, location, diskUUID string) (
 	}
 	if diskDeletedTombstone(*disk) {
 		return sdk.Disk{}, cloud.ErrNotFound
+	}
+	if err := validateCSIMutableDisk(*disk, diskUUID, a.billing); err != nil {
+		return sdk.Disk{}, err
 	}
 	return *disk, nil
 }
@@ -857,6 +872,49 @@ func validateExactDisk(disk sdk.Disk, expectedUUID string, billingAccountID int6
 	}
 	if disk.BillingAccountID != billingAccountID {
 		return fmt.Errorf("%w: disk %s billing account is %d, expected %d", cloud.ErrPermissionDenied, actualUUID, disk.BillingAccountID, billingAccountID)
+	}
+	return nil
+}
+
+func validateCSIMutableDisk(disk sdk.Disk, expectedUUID string, billingAccountID int64) error {
+	if err := validateExactDisk(disk, expectedUUID, billingAccountID); err != nil {
+		return err
+	}
+	if strings.TrimSpace(disk.DisplayName) == "" {
+		return fmt.Errorf("%w: disk %s has no CSI display name", cloud.ErrPermissionDenied, disk.UUID)
+	}
+	if !strings.EqualFold(strings.TrimSpace(disk.SourceImageType), "EMPTY") {
+		return fmt.Errorf(
+			"%w: disk %s source type %q is not mutable CSI EMPTY storage",
+			cloud.ErrPermissionDenied,
+			disk.UUID,
+			disk.SourceImageType,
+		)
+	}
+	if strings.TrimSpace(disk.SourceImage) != "" {
+		return fmt.Errorf(
+			"%w: disk %s has source image %q and is not mutable CSI EMPTY storage",
+			cloud.ErrPermissionDenied,
+			disk.UUID,
+			disk.SourceImage,
+		)
+	}
+	if disk.ReadOnlyBootable {
+		return fmt.Errorf("%w: disk %s is marked read-only bootable", cloud.ErrPermissionDenied, disk.UUID)
+	}
+	return nil
+}
+
+func rejectPrimaryDiskReference(vm sdk.VM, diskUUID string) error {
+	for _, storage := range vm.Storage {
+		if strings.EqualFold(strings.TrimSpace(storage.UUID), strings.TrimSpace(diskUUID)) && storage.Primary {
+			return fmt.Errorf(
+				"%w: disk %s is the primary boot disk of VM %s",
+				cloud.ErrPermissionDenied,
+				diskUUID,
+				vm.UUID,
+			)
+		}
 	}
 	return nil
 }
