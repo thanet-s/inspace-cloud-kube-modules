@@ -95,13 +95,11 @@ func (a *softDeleteStandardNLBAPI) GetLoadBalancer(_ context.Context, _ string, 
 			continue
 		}
 		copy := a.lbs[index]
-		copy.ForwardingRules = append([]inspace.LoadBalancerRule(nil), a.lbs[index].ForwardingRules...)
-		copy.Targets = append([]inspace.LoadBalancerTarget(nil), a.lbs[index].Targets...)
+		copy.ForwardingRules = append([]inspace.LoadBalancerRule{}, a.lbs[index].ForwardingRules...)
+		copy.Targets = append([]inspace.LoadBalancerTarget{}, a.lbs[index].Targets...)
 		return &copy, nil
 	}
-	return nil, &inspace.APIError{
-		StatusCode: 404, Method: "GET", Path: "/network/load_balancers/" + uuid, Message: "not found",
-	}
+	return nil, exactLoadBalancerNotFound(uuid)
 }
 
 func TestGetLoadBalancerAcceptsOnlyCleanUnassignmentDuringServiceDeletion(t *testing.T) {

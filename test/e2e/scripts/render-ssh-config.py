@@ -7,7 +7,8 @@ import json
 import os
 import pathlib
 import re
-import tempfile
+
+from durable_io import atomic_write_text
 
 
 USER = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
@@ -29,21 +30,6 @@ def ip(value: object, public: bool) -> str:
     if not public and not address.is_private:
         raise SystemExit("node SSH addresses must be private")
     return str(address)
-
-
-def atomic_write(path: pathlib.Path, content: str) -> None:
-    fd, temporary = tempfile.mkstemp(prefix=path.name + ".", dir=path.parent)
-    try:
-        os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as stream:
-            stream.write(content)
-        os.replace(temporary, path)
-    except BaseException:
-        try:
-            os.unlink(temporary)
-        except FileNotFoundError:
-            pass
-        raise
 
 
 def main() -> None:
@@ -99,7 +85,7 @@ def main() -> None:
             "  ServerAliveCountMax 3",
             "",
         ])
-    atomic_write(pathlib.Path(args.output), "\n".join(lines))
+    atomic_write_text(pathlib.Path(args.output), "\n".join(lines))
 
 
 if __name__ == "__main__":

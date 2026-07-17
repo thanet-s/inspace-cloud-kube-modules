@@ -37,7 +37,10 @@ func (a *detachFenceAPI) CreateDisk(context.Context, string, sdk.CreateDiskReque
 }
 
 func (a *detachFenceAPI) GetDisk(context.Context, string, string) (*sdk.Disk, error) {
-	return &sdk.Disk{UUID: testDiskID, DisplayName: "pvc", SizeGiB: 1, Status: "Active", BillingAccountID: 42}, nil
+	return &sdk.Disk{
+		UUID: testDiskID, DisplayName: "pvc", SizeGiB: 1, Status: "Active", BillingAccountID: 42,
+		Snapshots: []sdk.DiskSnapshot{},
+	}, nil
 }
 
 func (a *detachFenceAPI) ListDisks(context.Context, string) ([]sdk.Disk, error) {
@@ -62,7 +65,7 @@ func (a *detachFenceAPI) GetVM(_ context.Context, _ string, id string) (*sdk.VM,
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if id != testVM1 {
-		return &sdk.VM{UUID: id, BillingAccountID: 42, NetworkUUID: testNetwork}, nil
+		return &sdk.VM{UUID: id, BillingAccountID: 42, NetworkUUID: testNetwork, Storage: []sdk.VMStorage{}}, nil
 	}
 	mode := a.actualModeLocked()
 	if a.issued && a.step < len(a.steps) {
@@ -136,9 +139,11 @@ func detachExactVM(mode, id string) (*sdk.VM, error) {
 	case "present":
 		return &sdk.VM{UUID: id, BillingAccountID: 42, NetworkUUID: testNetwork, Storage: []sdk.VMStorage{{UUID: testDiskID}}}, nil
 	case "absent":
+		return &sdk.VM{UUID: id, BillingAccountID: 42, NetworkUUID: testNetwork, Storage: []sdk.VMStorage{}}, nil
+	case "omitted":
 		return &sdk.VM{UUID: id, BillingAccountID: 42, NetworkUUID: testNetwork}, nil
 	case "not-found":
-		return nil, apiNotFound("VM")
+		return nil, exactAPINotFound("VM", id)
 	case "empty":
 		return nil, nil
 	case "mismatch":
@@ -243,6 +248,39 @@ func TestDetachCommittedHTTP500EmptyReadbackAndRestartNeverReplay(t *testing.T) 
 	}
 	if fence, err := store.Get(context.Background(), diskAttachmentFenceKey(testLocation, testDiskID)); err != nil || fence != nil {
 		t.Fatalf("completed detach fence = %#v, err=%v", fence, err)
+	}
+}
+
+func TestDetachCommittedHTTP500OmittedStorageRetainsDurableFence(t *testing.T) {
+	steps := make([]detachReadStep, 128)
+	for index := range steps {
+		steps[index] = detachReadStep{list: "absent", get: "omitted"}
+	}
+	api := &detachFenceAPI{
+		attached: true, detachCommit: true,
+		detachErr: &sdk.APIError{
+			StatusCode: 500, Method: "POST", Path: "/storage/detach",
+			Message: "committed response lost", Retryable: true,
+		},
+		steps: steps,
+	}
+	store := newMemoryMutationFenceStore()
+	resolver := detachFenceResolver(store)
+	adapter := newFencedAdapter(t, api, resolver, 8*time.Millisecond)
+
+	err := adapter.DetachVolume(context.Background(), testLocation, testDiskID, "worker-1")
+	if !errors.Is(err, cloud.ErrUnavailable) || !strings.Contains(err.Error(), "omitted storage") {
+		t.Fatalf("omitted-storage detach error = %v", err)
+	}
+	if api.calls() != 1 {
+		t.Fatalf("DetachDisk calls = %d, want 1", api.calls())
+	}
+	fence, getErr := store.Get(context.Background(), diskAttachmentFenceKey(testLocation, testDiskID))
+	if getErr != nil || fence == nil {
+		t.Fatalf("omitted-storage durable fence = %#v, err=%v", fence, getErr)
+	}
+	if fence.Attempt == "" {
+		t.Fatal("omitted-storage readback cleared immutable issue authority")
 	}
 }
 

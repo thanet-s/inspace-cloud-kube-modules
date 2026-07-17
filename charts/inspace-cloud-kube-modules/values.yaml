@@ -127,8 +127,15 @@ csi:
   sidecars:
     provisioner:
       image: registry.k8s.io/sig-storage/csi-provisioner:v5.2.0
+      # Allow up to 120 seconds of CSI preflight before the driver's final
+      # dispatch guard requires 480 seconds for the five-minute HTTP mutation,
+      # two-minute destructive recovery, and one-minute persistence reserve.
+      timeoutSeconds: 600
     attacher:
       image: registry.k8s.io/sig-storage/csi-attacher:v4.8.1
+      # Uses the same 120-second preflight allowance and 480-second mandatory
+      # dispatch reserve for attach and detach.
+      timeoutSeconds: 600
     registrar:
       image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.13.0
     livenessProbe:

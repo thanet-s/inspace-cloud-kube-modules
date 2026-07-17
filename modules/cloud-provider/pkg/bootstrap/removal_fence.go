@@ -534,6 +534,9 @@ func (r *Reconciler) readDestroyFirewallAuthority(
 	if err != nil {
 		return nil, err
 	}
+	if err := validateFirewallAssignmentCollections(items); err != nil {
+		return nil, fmt.Errorf("bootstrap: firewall removal authority: %w", err)
+	}
 	var found *inspace.Firewall
 	for index := range items {
 		if !strings.EqualFold(items[index].UUID, attempt.ResourceUUID) {

@@ -125,8 +125,8 @@ func TestDeleteThreadsDurableFloatingIPIdentityFromNodeClaimAnnotations(t *testi
 	if claim.Annotations[AnnotationBillingAccount] != "42" {
 		t.Fatalf("NodeClaim billing annotation = %q, want 42", claim.Annotations[AnnotationBillingAccount])
 	}
-	if err := provider.Delete(context.Background(), claim); err != nil {
-		t.Fatal(err)
+	if err := provider.Delete(context.Background(), claim); !cloudprovider.IsNodeClaimNotFoundError(err) {
+		t.Fatalf("Delete() error = %v, want typed NodeClaimNotFound after full convergence", err)
 	}
 	want := cloudapi.DeleteVMIdentity{
 		FloatingIPName: vm.FloatingIPName, PublicIPv4: vm.PublicIPv4, BillingAccountID: 42,
@@ -165,8 +165,8 @@ func TestDeleteUsesRetainedLaunchNetworkAfterControllerConfigChanges(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := providerB.Delete(ctx, created); err != nil {
-		t.Fatal(err)
+	if err := providerB.Delete(ctx, created); !cloudprovider.IsNodeClaimNotFoundError(err) {
+		t.Fatalf("Delete() error = %v, want typed NodeClaimNotFound after full convergence", err)
 	}
 	if cloud.lastDeleteIdentity.NetworkUUID != launchNetwork {
 		t.Fatalf("DeleteVM network = %q, want retained launch network %q rather than current config %q", cloud.lastDeleteIdentity.NetworkUUID, launchNetwork, optsB.NetworkUUID)

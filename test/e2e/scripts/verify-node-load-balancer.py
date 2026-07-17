@@ -9,11 +9,12 @@ import os
 import pathlib
 import re
 import socket
-import ssl
 import stat
 import subprocess
 import urllib.parse
-import urllib.request
+
+from cloud_identity_journal import record_known_cloud_identities
+from strict_inspace_api import location_api_get
 
 
 SERVICE_SPECS = {
@@ -115,19 +116,10 @@ def active(item: object) -> bool:
 
 
 def api_get(path: str):
-    base = os.environ["INSPACE_API_URL"].rstrip("/")
-    location = os.environ["INSPACE_LOCATION"]
-    request = urllib.request.Request(
-        f"{base}/v1/{location}/{path}",
-        headers={
-            "apikey": os.environ["INSPACE_API_TOKEN"],
-            "User-Agent": "inspace-rke2-e2e-node-load-balancer/1",
-        },
+    return location_api_get(
+        path,
+        user_agent="inspace-rke2-e2e-node-load-balancer/2",
     )
-    with urllib.request.urlopen(
-        request, timeout=60, context=ssl.create_default_context()
-    ) as response:
-        return json.load(response)
 
 
 def kubectl(kubeconfig: str, *arguments: str):
@@ -1437,6 +1429,14 @@ def main() -> None:
         else:
             require(args.policy_change == "any", "--policy-change requires --anchor")
             require(not args.require_new_uid, "--require-new-uid requires --anchor")
+        record_known_cloud_identities(
+            pathlib.Path(args.state),
+            state,
+            vm_uuids=result["vms"],
+            floating_ip_addresses=[
+                details["ip"] for details in result["shardDetails"].values()
+            ],
+        )
     print(json.dumps(result, sort_keys=True))
 
 

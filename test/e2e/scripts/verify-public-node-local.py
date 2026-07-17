@@ -9,11 +9,13 @@ import os
 import pathlib
 import re
 import socket
-import ssl
 import stat
 import subprocess
 import urllib.parse
 import urllib.request
+
+from cloud_identity_journal import record_known_cloud_identities
+from strict_inspace_api import location_api_get
 
 
 SERVICE_NAME = "inspace-e2e-public-local"
@@ -55,19 +57,10 @@ def active(item: object) -> bool:
 
 
 def api_get(path: str):
-    base = os.environ["INSPACE_API_URL"].rstrip("/")
-    location = os.environ["INSPACE_LOCATION"]
-    request = urllib.request.Request(
-        f"{base}/v1/{location}/{path}",
-        headers={
-            "apikey": os.environ["INSPACE_API_TOKEN"],
-            "User-Agent": "inspace-rke2-e2e-public-node-local/1",
-        },
+    return location_api_get(
+        path,
+        user_agent="inspace-rke2-e2e-public-node-local/2",
     )
-    with urllib.request.urlopen(
-        request, timeout=60, context=ssl.create_default_context()
-    ) as response:
-        return json.load(response)
 
 
 def kubectl(kubeconfig: str, *arguments: str):
@@ -991,6 +984,12 @@ def main() -> None:
         if anchor is not None:
             require_replacement(anchor, result)
             result["replacementOf"] = anchor["nodes"][0]["nodeClaim"]
+        record_known_cloud_identities(
+            pathlib.Path(args.state),
+            state,
+            vm_uuids=[node["vmUUID"] for node in result["nodes"]],
+            floating_ip_addresses=[node["publicIP"] for node in result["nodes"]],
+        )
     elif args.expect == "withdrawn":
         require(anchor is not None, "withdrawn proof requires --anchor")
         result = prove_withdrawn(state, args.kubeconfig, baseline, anchor)

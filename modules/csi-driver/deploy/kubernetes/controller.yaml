@@ -75,6 +75,8 @@ spec:
           image: registry.k8s.io/sig-storage/csi-provisioner:v5.2.0
           args:
             - --csi-address=/csi/csi.sock
+            # Allows 2m preflight before the driver requires an 8m dispatch reserve.
+            - --timeout=600s
             - --feature-gates=Topology=true
             - --strict-topology
             - --leader-election
@@ -85,6 +87,8 @@ spec:
           image: registry.k8s.io/sig-storage/csi-attacher:v4.8.1
           args:
             - --csi-address=/csi/csi.sock
+            # Allows 2m preflight before the driver requires an 8m dispatch reserve.
+            - --timeout=600s
             - --leader-election
           volumeMounts:
             - name: socket-dir

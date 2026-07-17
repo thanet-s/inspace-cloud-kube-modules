@@ -8,21 +8,14 @@ import json
 import os
 import pathlib
 import re
-import ssl
-import tempfile
 import urllib.parse
-import urllib.request
+
+from durable_io import atomic_write_json
+from strict_inspace_api import location_api_get
 
 
 def api_get(path: str):
-    base = os.environ["INSPACE_API_URL"].rstrip("/")
-    location = os.environ["INSPACE_LOCATION"]
-    request = urllib.request.Request(
-        f"{base}/v1/{location}/{path}",
-        headers={"apikey": os.environ["INSPACE_API_TOKEN"], "User-Agent": "inspace-rke2-e2e-worker/1"},
-    )
-    with urllib.request.urlopen(request, timeout=60, context=ssl.create_default_context()) as response:
-        return json.load(response)
+    return location_api_get(path, user_agent="inspace-rke2-e2e-worker/2")
 
 
 def description(vm):
@@ -99,22 +92,6 @@ def validate_worker_root_disk(vm: object) -> None:
     root_disks = [disk for disk in storage if disk.get("primary") is True]
     if len(root_disks) != 1 or root_disks[0].get("size") != 100:
         raise SystemExit("worker VM must have exactly one 100-GiB primary root disk")
-
-
-def atomic_write(path: pathlib.Path, value) -> None:
-    fd, temporary = tempfile.mkstemp(prefix=path.name + ".", dir=path.parent)
-    try:
-        os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as stream:
-            json.dump(value, stream, indent=2, sort_keys=True)
-            stream.write("\n")
-        os.replace(temporary, path)
-    except BaseException:
-        try:
-            os.unlink(temporary)
-        except FileNotFoundError:
-            pass
-        raise
 
 
 def main() -> None:
@@ -266,7 +243,7 @@ def main() -> None:
     state["workerVMs"] = [worker]
     state["workerNode"] = node["name"]
     state["workerPublicIPv4"] = str(public_ip)
-    atomic_write(state_path, state)
+    atomic_write_json(state_path, state)
     print(json.dumps(worker, sort_keys=True))
 
 

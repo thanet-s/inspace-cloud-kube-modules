@@ -402,14 +402,17 @@ func (r *Reconciler) corroborateVMDeletionAbsence(
 	if network == nil || !strings.EqualFold(network.UUID, cluster.Spec.Network.UUID) {
 		return false, fmt.Errorf("bootstrap: configured VPC identity changed while corroborating deletion of %s", attempt.ResourceUUID)
 	}
-	networkMatches := 0
-	for _, vmUUID := range network.VMUUIDs {
-		if strings.EqualFold(vmUUID, attempt.ResourceUUID) {
-			networkMatches++
-		}
+	members, membershipErr := canonicalConfiguredVPCVMUUIDs(network)
+	if membershipErr != nil {
+		return false, fmt.Errorf(
+			"bootstrap: configured VPC membership while corroborating deletion of %s: %w",
+			attempt.ResourceUUID,
+			membershipErr,
+		)
 	}
-	if networkMatches > 1 {
-		return false, fmt.Errorf("bootstrap: VM %s appears multiple times in configured VPC membership", attempt.ResourceUUID)
+	networkMatches := 0
+	if _, present := members[strings.ToLower(attempt.ResourceUUID)]; present {
+		networkMatches = 1
 	}
 	if listMatches == 0 && networkMatches == 0 {
 		return true, nil
@@ -564,13 +567,11 @@ func (r *Reconciler) authorizeVMDeleteDispatch(
 	if network == nil || !strings.EqualFold(network.UUID, cluster.Spec.Network.UUID) {
 		return false, fmt.Errorf("bootstrap: configured VPC identity changed before deleting VM %s", attempt.ResourceUUID)
 	}
-	membership := 0
-	for _, vmUUID := range network.VMUUIDs {
-		if strings.EqualFold(vmUUID, attempt.ResourceUUID) {
-			membership++
-		}
+	members, membershipErr := canonicalConfiguredVPCVMUUIDs(network)
+	if membershipErr != nil {
+		return false, fmt.Errorf("bootstrap: pre-delete configured-VPC membership for VM %s: %w", attempt.ResourceUUID, membershipErr)
 	}
-	if membership != 1 {
+	if _, present := members[strings.ToLower(attempt.ResourceUUID)]; !present {
 		return false, fmt.Errorf("bootstrap: refusing to delete VM %q without exactly one configured-VPC membership", attempt.ResourceName)
 	}
 
@@ -592,6 +593,9 @@ func (r *Reconciler) authorizeVMDeleteDispatch(
 // before DELETE. The receipt has no expiry: dependent firewall teardown waits
 // for authoritative VM absence and relation withdrawal across restarts.
 func durableVMDeleteAssignments(cluster *v1alpha1.InSpaceCluster, firewalls []inspace.Firewall) (map[string]v1alpha1.ResourceDeleteAttemptStatus, error) {
+	if err := validateFirewallAssignmentCollections(firewalls); err != nil {
+		return nil, fmt.Errorf("bootstrap: durable VM deletion firewall inventory: %w", err)
+	}
 	result := make(map[string]v1alpha1.ResourceDeleteAttemptStatus, len(cluster.Status.DeleteAttempts))
 	for key, attempt := range cluster.Status.DeleteAttempts {
 		if attempt.ResourceKind != deleteAttemptKindVM {
@@ -696,7 +700,10 @@ func (r *Reconciler) rollbackFloatingIP(ctx context.Context, cluster *v1alpha1.I
 			}
 		}
 		if err != nil {
-			return false, err
+			return false, errors.Join(
+				ErrCreateAttemptPending,
+				fmt.Errorf("bootstrap: rollback floating-IP readback is not yet authoritative: %w", err),
+			)
 		}
 		if found == nil {
 			if attempt.FloatingIPAddress == "" {
@@ -859,7 +866,10 @@ func (r *Reconciler) observeRollbackFloatingIP(ctx context.Context, cluster *v1a
 	item, err := r.findFloatingIPByAddress(readCtx, attempt.Location, attempt.FloatingIPAddress)
 	cancel()
 	if err != nil {
-		return fmt.Errorf("bootstrap: read back floating IP %s after rollback mutation: %w", attempt.FloatingIPAddress, err)
+		return errors.Join(
+			ErrCreateAttemptPending,
+			fmt.Errorf("bootstrap: read back floating IP %s after rollback mutation: %w", attempt.FloatingIPAddress, err),
+		)
 	}
 	if item == nil {
 		_, err := r.advanceDestroyRemovalAbsence(ctx, cluster, key, attempt, deletePhaseAbsent)

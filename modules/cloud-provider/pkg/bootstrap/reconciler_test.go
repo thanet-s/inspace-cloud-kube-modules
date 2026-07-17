@@ -553,7 +553,13 @@ func TestReconcileWaitsWithoutMutationWhenVMListDetailIsStale(t *testing.T) {
 	}
 	bastion := mustVM(t, api.vms, currentBastionName(cluster.Metadata.Name))
 	api.getVMErrorByUUID = map[string]error{
-		bastion.UUID: &inspace.APIError{StatusCode: 400, Method: "GET", Path: "/vm", Message: "Error: No such virtual machine exists: " + bastion.UUID},
+		bastion.UUID: &inspace.APIError{
+			StatusCode:    400,
+			Method:        "GET",
+			Path:          "/v1/bkk01/user-resource/vm",
+			Message:       "Error: No such virtual machine exists: " + bastion.UUID,
+			RequestedUUID: bastion.UUID,
+		},
 	}
 	eventsBefore := len(api.events)
 
@@ -1395,6 +1401,96 @@ func TestReconcileRejectsLoadBalancerVIPCollisionBeforeMutation(t *testing.T) {
 	}
 }
 
+func TestConfiguredVPCCollisionScansRejectMalformedPrivateAddresses(t *testing.T) {
+	pool, err := validatePrivateLoadBalancerPool(
+		"10.20.30.0/24",
+		"10.42.0.0/16",
+		"10.43.0.0/16",
+		"10.20.30.10",
+		"10.20.30.200",
+		"10.20.30.220",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, value := range []string{"", "not-an-ip", "10.20.30.50 ", "2001:db8::10", "203.0.113.10"} {
+		t.Run("VM/"+value, func(t *testing.T) {
+			vms := []inspace.VM{{
+				UUID:        "11111111-1111-4111-8111-111111111111",
+				Name:        "configured-vpc-vm",
+				PrivateIPv4: value,
+			}}
+			for _, validate := range []func([]inspace.VM) error{
+				func(items []inspace.VM) error {
+					return validateNoVirtualIPCollision(items, "10.20.30.10")
+				},
+				func(items []inspace.VM) error {
+					return validateNoVMPoolCollision(items, pool)
+				},
+			} {
+				if validationErr := validate(vms); validationErr == nil || !strings.Contains(validationErr.Error(), "malformed private IPv4") {
+					t.Fatalf("private IPv4 %q: expected malformed-address refusal, got %v", value, validationErr)
+				}
+			}
+		})
+
+		t.Run("load-balancer/"+value, func(t *testing.T) {
+			loadBalancers := []inspace.LoadBalancer{{
+				UUID:           "22222222-2222-4222-8222-222222222222",
+				DisplayName:    "configured-vpc-load-balancer",
+				NetworkUUID:    "33333333-3333-4333-8333-333333333333",
+				PrivateAddress: value,
+			}}
+			for _, validate := range []func([]inspace.LoadBalancer) error{
+				func(items []inspace.LoadBalancer) error {
+					return validateNoLoadBalancerVirtualIPCollision(
+						items,
+						"33333333-3333-4333-8333-333333333333",
+						"10.20.30.10",
+					)
+				},
+				func(items []inspace.LoadBalancer) error {
+					return validateNoLoadBalancerPoolCollision(
+						items,
+						"33333333-3333-4333-8333-333333333333",
+						pool,
+					)
+				},
+			} {
+				if validationErr := validate(loadBalancers); validationErr == nil || !strings.Contains(validationErr.Error(), "malformed private IPv4") {
+					t.Fatalf("private IPv4 %q: expected malformed-address refusal, got %v", value, validationErr)
+				}
+			}
+		})
+	}
+
+	validVMs := []inspace.VM{{
+		UUID:        "44444444-4444-4444-8444-444444444444",
+		Name:        "configured-vpc-vm",
+		PrivateIPv4: "10.20.30.50",
+	}}
+	if err := validateNoVirtualIPCollision(validVMs, "10.20.30.10"); err != nil {
+		t.Fatalf("valid VM collision scan failed: %v", err)
+	}
+	if err := validateNoVMPoolCollision(validVMs, pool); err != nil {
+		t.Fatalf("valid VM pool scan failed: %v", err)
+	}
+
+	validLoadBalancers := []inspace.LoadBalancer{{
+		UUID:           "55555555-5555-4555-8555-555555555555",
+		DisplayName:    "configured-vpc-load-balancer",
+		NetworkUUID:    "33333333-3333-4333-8333-333333333333",
+		PrivateAddress: "10.20.30.60",
+	}}
+	if err := validateNoLoadBalancerVirtualIPCollision(validLoadBalancers, "33333333-3333-4333-8333-333333333333", "10.20.30.10"); err != nil {
+		t.Fatalf("valid load-balancer collision scan failed: %v", err)
+	}
+	if err := validateNoLoadBalancerPoolCollision(validLoadBalancers, "33333333-3333-4333-8333-333333333333", pool); err != nil {
+		t.Fatalf("valid load-balancer pool scan failed: %v", err)
+	}
+}
+
 func TestReconcileFailsClosedOnLegacyOwnerNamedControlPlanes(t *testing.T) {
 	api := newFakeAPI()
 	cluster := testCluster()
@@ -1790,6 +1886,61 @@ func TestFirewallAssignmentRequiresExactAuthoritativeReadback(t *testing.T) {
 	}
 }
 
+func TestOmittedFirewallAssignmentsNeverAuthorizeBootstrapMutation(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		run  func(*Reconciler, *v1alpha1.InSpaceCluster) error
+	}{
+		{
+			name: "reconcile",
+			run: func(reconciler *Reconciler, cluster *v1alpha1.InSpaceCluster) error {
+				_, err := reconciler.Reconcile(context.Background(), cluster, "unit-test-secret-token")
+				return err
+			},
+		},
+		{
+			name: "destroy",
+			run: func(reconciler *Reconciler, cluster *v1alpha1.InSpaceCluster) error {
+				_, err := reconciler.Destroy(context.Background(), cluster)
+				return err
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			api := newFakeAPI()
+			cluster := testCluster()
+			reconciler := testReconciler(api)
+			reconcileUntilReady(t, reconciler, cluster)
+
+			api.omitFirewallAssignments = true
+			eventsBefore := len(api.events)
+			vmCreatesBefore := len(api.vmCreates)
+			vmDeletesBefore := len(api.vmDeletes)
+			fipDeletesBefore := len(api.floatingIPDeletes)
+			firewallDeletesBefore := len(api.firewallDeletes)
+
+			err := test.run(reconciler, cluster)
+			if err == nil || !strings.Contains(err.Error(), "omitted resources_assigned") {
+				t.Fatalf("%s with omitted firewall relationships = %v, want fail-closed error", test.name, err)
+			}
+			if len(api.events) != eventsBefore ||
+				len(api.vmCreates) != vmCreatesBefore ||
+				len(api.vmDeletes) != vmDeletesBefore ||
+				len(api.floatingIPDeletes) != fipDeletesBefore ||
+				len(api.firewallDeletes) != firewallDeletesBefore {
+				t.Fatalf("%s mutated cloud state after partial firewall HTTP 200: events=%d/%d creates=%d/%d VM deletes=%d/%d FIP deletes=%d/%d firewall deletes=%d/%d",
+					test.name,
+					len(api.events), eventsBefore,
+					len(api.vmCreates), vmCreatesBefore,
+					len(api.vmDeletes), vmDeletesBefore,
+					len(api.floatingIPDeletes), fipDeletesBefore,
+					len(api.firewallDeletes), firewallDeletesBefore,
+				)
+			}
+		})
+	}
+}
+
 func TestFirewallPolicyDriftDuringAssignmentReadbackRollsBackVM(t *testing.T) {
 	api := newFakeAPI()
 	api.firewallAssignmentPolicyDrift = true
@@ -1865,8 +2016,8 @@ func TestRollbackPostVMFloatingIPAbsenceRequiresTwoObservationsAndResetsOnPresen
 		t.Fatalf("stale post-VM floating-IP readback error = %v, want durable pending", err)
 	}
 	attempt := cluster.Status.DeleteAttempts[deleteAttemptBastion]
-	if attempt.Phase != deletePhaseRollbackFIPAfterVM || attempt.FloatingIPAddress == "" || attempt.AbsenceObservedAt == "" {
-		t.Fatalf("single stale omission cleared rollback identity: %#v", attempt)
+	if attempt.Phase != deletePhaseRollbackFIPAfterVM || attempt.FloatingIPAddress == "" || attempt.AbsenceObservedAt != "" {
+		t.Fatalf("exact/list split view changed rollback identity or recorded false absence: %#v", attempt)
 	}
 	if len(api.floatingIPs) != 1 || len(api.floatingIPDeletes) != 0 {
 		t.Fatalf("single stale omission lost or deleted the anchored FIP: FIPs=%#v deletes=%#v", api.floatingIPs, api.floatingIPDeletes)
@@ -1909,26 +2060,26 @@ func TestMismatchedCreateVMResponseIsProtectedAndCanonicalized(t *testing.T) {
 	}
 }
 
-func TestAuthoritativeVMWithoutPrivateIPIsFirewalledButNotAdoptedYet(t *testing.T) {
+func TestAuthoritativeVMWithoutPrivateIPFailsClosedAfterFirewallProtection(t *testing.T) {
 	api := newFakeAPI()
 	cluster := testCluster()
 	reconciler := testReconciler(api)
 	if _, err := reconciler.Reconcile(context.Background(), cluster, "unit-test-secret-token"); err != nil {
 		t.Fatal(err)
 	}
+	eventsBefore := len(api.events)
 	api.vms[0].PrivateIPv4 = ""
-	result, err := reconciler.Reconcile(context.Background(), cluster, "unit-test-secret-token")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(result.Message, "private networking") {
-		t.Fatalf("unexpected progress result: %#v", result)
+	if _, err := reconciler.Reconcile(context.Background(), cluster, "unit-test-secret-token"); err == nil || !strings.Contains(err.Error(), "malformed private IPv4") {
+		t.Fatalf("expected malformed configured-VPC address refusal, got %v", err)
 	}
 	if len(api.firewalls) != 1 || len(api.firewalls[0].ResourcesAssigned) != 1 || api.firewalls[0].ResourcesAssigned[0].ResourceUUID != api.vms[0].UUID {
 		t.Fatalf("public VM without authoritative private IP was not already firewalled: %#v", api.firewalls)
 	}
 	if api.floatingIPs[0].Name != "" || api.floatingIPs[0].AssignedTo == "" {
 		t.Fatalf("VM without authoritative private IP auto FIP was renamed or lost: %#v", api.floatingIPs[0])
+	}
+	if len(api.events) != eventsBefore {
+		t.Fatalf("malformed configured-VPC address caused a mutation: %v", api.events[eventsBefore:])
 	}
 }
 
@@ -4882,6 +5033,7 @@ type fakeAPI struct {
 	blockFloatingIPCleanupAfterCreate    bool
 	floatingIPCleanupBlocked             bool
 	omitFirewallDescriptions             bool
+	omitFirewallAssignments              bool
 	sparseVMListResponses                bool
 	vmListReadbackDelay                  int
 	vmListReadbackRemaining              int
@@ -5016,7 +5168,10 @@ func countIssuedFirewallAssignments(status v1alpha1.InSpaceClusterStatus) int {
 
 func newFakeAPI() *fakeAPI {
 	return &fakeAPI{
-		network: inspace.Network{UUID: "11111111-2222-4333-8444-555555555555", Name: "private", Type: "private", Subnet: "10.20.30.0/24"},
+		network: inspace.Network{
+			UUID: "11111111-2222-4333-8444-555555555555", Name: "private", Type: "private", Subnet: "10.20.30.0/24",
+			VMUUIDs: []string{},
+		},
 		hostPools: []inspace.HostPool{{
 			UUID: "aac7dd66-f390-4edd-80c0-dd7cae49bd99", Name: "AMD EPYC", IsVisible: true,
 		}},
@@ -5030,7 +5185,9 @@ func (f *fakeAPI) GetNetwork(context.Context, string, string) (*inspace.Network,
 		return nil, f.getNetworkError
 	}
 	copy := f.network
-	copy.VMUUIDs = append([]string(nil), f.network.VMUUIDs...)
+	if f.network.VMUUIDs != nil {
+		copy.VMUUIDs = append([]string{}, f.network.VMUUIDs...)
+	}
 	return &copy, nil
 }
 func (f *fakeAPI) ListHostPools(context.Context, string) ([]inspace.HostPool, error) {
@@ -5098,19 +5255,36 @@ func (f *fakeAPI) GetVM(_ context.Context, _, uuid string) (*inspace.VM, error) 
 	}
 	f.mu.Unlock()
 	if injected != nil {
-		return nil, injected
+		return nil, bindTestExactVMError(injected, uuid)
 	}
 	if returnNil {
 		return nil, nil
 	}
 	if found == nil {
-		return nil, &inspace.APIError{StatusCode: 404, Method: "GET", Path: "/vm", Message: "not found"}
+		return nil, bindTestExactVMError(
+			&inspace.APIError{StatusCode: 404, Method: "GET", Path: "/v1/bkk01/user-resource/vm", Message: "not found"},
+			uuid,
+		)
 	}
 	if mutate != nil {
 		mutate(found)
 	}
 	return found, nil
 }
+
+func bindTestExactVMError(err error, uuid string) error {
+	var apiErr *inspace.APIError
+	if !errors.As(err, &apiErr) {
+		return err
+	}
+	bound := *apiErr
+	bound.Method = "GET"
+	bound.Path = "/v1/bkk01/user-resource/vm"
+	bound.ExactLookup = true
+	bound.RequestedUUID = uuid
+	return &bound
+}
+
 func (f *fakeAPI) CreateVM(ctx context.Context, _ string, request inspace.CreateVMRequest) (*inspace.VM, error) {
 	f.mu.Lock()
 	f.vmCreates = append(f.vmCreates, request)
@@ -5280,12 +5454,17 @@ func (f *fakeAPI) ListFirewalls(ctx context.Context, _ string) ([]inspace.Firewa
 	for i := range f.firewalls {
 		items[i] = f.firewalls[i]
 		items[i].Rules = append([]inspace.FirewallRule(nil), f.firewalls[i].Rules...)
-		items[i].ResourcesAssigned = append([]inspace.FirewallResource(nil), f.firewalls[i].ResourcesAssigned...)
+		items[i].ResourcesAssigned = append([]inspace.FirewallResource{}, f.firewalls[i].ResourcesAssigned...)
+	}
+	if f.omitFirewallAssignments {
+		for i := range items {
+			items[i].ResourcesAssigned = nil
+		}
 	}
 	if f.firewallAssignmentReadbackRemaining > 0 {
 		f.firewallAssignmentReadbackRemaining--
 		for i := range items {
-			items[i].ResourcesAssigned = nil
+			items[i].ResourcesAssigned = []inspace.FirewallResource{}
 		}
 	}
 	if f.omitFirewallDescriptions {
@@ -5428,6 +5607,27 @@ func (f *fakeAPI) ListFloatingIPs(ctx context.Context, _ string, filters *inspac
 		result = append(result, item)
 	}
 	return result, nil
+}
+func (f *fakeAPI) GetFloatingIP(ctx context.Context, location, address string) (*inspace.FloatingIP, error) {
+	if f.requireLiveSafetyContext && ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for index := range f.floatingIPs {
+		if f.floatingIPs[index].Address == address {
+			copy := f.floatingIPs[index]
+			return &copy, nil
+		}
+	}
+	return nil, &inspace.APIError{
+		StatusCode:       404,
+		Method:           "GET",
+		Path:             "/v1/" + location + "/network/ip_addresses/" + address,
+		Message:          "not found",
+		ExactLookup:      true,
+		RequestedAddress: address,
+	}
 }
 func (f *fakeAPI) UpdateFloatingIP(_ context.Context, _, address string, request inspace.UpdateFloatingIPRequest) (*inspace.FloatingIP, error) {
 	f.mu.Lock()

@@ -203,6 +203,17 @@ Files in `deploy/kubernetes` provide:
 - controller RBAC, including read-only Node resolution and durable
   mutation-fence Lease management.
 
+The standalone controller manifest gives both `csi-provisioner` and
+`csi-attacher` a 600-second RPC timeout. This allows up to two minutes for
+preflight reads and durable-fence acquisition. Immediately before any
+CreateDisk, DeleteDisk, AttachDisk, or DetachDisk call, the driver requires
+480 seconds to remain: five minutes for the shared client's mutation deadline,
+two minutes for destructive recovery, and one minute for final readback and
+Lease persistence. If less remains, the driver issues no cloud mutation and
+exact-clears only that invocation's undispatched Lease. A shorter sidecar
+deadline can cancel and strand the original no-replay Lease or cause
+overlapping retries.
+
 Replace the example image tag before deployment. The controller Secret must be
 created out of band with `api-token` and `billing-account-id` keys; no
 credential is stored in this repository.

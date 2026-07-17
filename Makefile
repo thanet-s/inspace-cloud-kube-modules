@@ -69,6 +69,7 @@ live-harness-verify:
 
 release-notes-verify:
 	@./scripts/test-filter-release-notes.sh
+	@./scripts/test-verify-release-tag.sh
 
 verify: test smoke vet helm-verify e2e-static live-harness-verify release-notes-verify
 

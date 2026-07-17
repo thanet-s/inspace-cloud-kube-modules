@@ -25,9 +25,7 @@ func (a *splitViewStandardNLBAPI) GetLoadBalancer(
 	location, uuid string,
 ) (*inspace.LoadBalancer, error) {
 	if a.forceGetMissing {
-		return nil, &inspace.APIError{
-			StatusCode: 404, Method: "GET", Path: "/network/load_balancers/" + uuid, Message: "not found",
-		}
+		return nil, exactLoadBalancerNotFound(uuid)
 	}
 	item, err := a.fakeAPI.GetLoadBalancer(ctx, location, uuid)
 	if err == nil && item != nil && a.transformGet != nil {
@@ -490,8 +488,8 @@ func TestStandardNLBAddRelationRecoveryUsesExactUUIDRead(t *testing.T) {
 					context.Background(), service, &lb, test.targets, test.rules,
 				)
 				if view.hideExact {
-					if err == nil || !strings.Contains(err.Error(), "remains ambiguous") {
-						t.Fatalf("list-only additive evidence = %v, want ambiguous", err)
+					if err == nil || !strings.Contains(err.Error(), "omitted") {
+						t.Fatalf("list-only additive evidence = %v, want omitted exact relationship", err)
 					}
 					assertIssuedStandardNLBFence(t, store, service, desired.Operation)
 					return

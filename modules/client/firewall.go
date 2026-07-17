@@ -3,9 +3,11 @@ package inspace
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/netip"
 	"net/url"
+	"strings"
 )
 
 func (c *Client) ListFirewalls(ctx context.Context, location string) ([]Firewall, error) {
@@ -15,11 +17,20 @@ func (c *Client) ListFirewalls(ctx context.Context, location string) ([]Firewall
 	}
 	var result []Firewall
 	err = c.do(ctx, http.MethodGet, path, nil, nil, &result)
-	return result, err
+	return validatedListResponse(result, err, http.MethodGet, path, func(firewall Firewall) (string, error) {
+		if strings.TrimSpace(firewall.EffectiveName()) == "" {
+			return "", errors.New("inspace: firewall list row has an empty effective name")
+		}
+		return validatedUUIDListIdentity("firewall", firewall.UUID)
+	})
 }
 
 func (c *Client) GetFirewall(ctx context.Context, location, firewallUUID string) (*Firewall, error) {
 	if err := validateUUID("firewall", firewallUUID); err != nil {
+		return nil, err
+	}
+	path, err := c.locationPath(location, "network/firewalls")
+	if err != nil {
 		return nil, err
 	}
 	// InSpace documents no GET-by-ID firewall endpoint (it returns 405).
@@ -29,11 +40,16 @@ func (c *Client) GetFirewall(ctx context.Context, location, firewallUUID string)
 		return nil, err
 	}
 	for i := range items {
-		if items[i].UUID == firewallUUID {
+		if strings.EqualFold(items[i].UUID, firewallUUID) {
 			return &items[i], nil
 		}
 	}
-	return nil, &APIError{StatusCode: http.StatusNotFound, Method: http.MethodGet, Path: "/network/firewalls", Message: "firewall not found"}
+	return nil, &APIError{
+		StatusCode: http.StatusNotFound,
+		Method:     http.MethodGet,
+		Path:       path,
+		Message:    "firewall not found in list response; absence is not exact-authoritative",
+	}
 }
 
 func (c *Client) CreateFirewall(ctx context.Context, location string, input CreateFirewallRequest) (*Firewall, error) {
@@ -54,6 +70,9 @@ func (c *Client) CreateFirewall(ctx context.Context, location string, input Crea
 	}
 	var result Firewall
 	err = c.doJSON(ctx, http.MethodPost, path, nil, input, &result)
+	if err == nil {
+		err = validateResponseUUID("created firewall", result.UUID)
+	}
 	return &result, err
 }
 
@@ -85,6 +104,9 @@ func (c *Client) UpdateFirewall(ctx context.Context, location, firewallUUID stri
 	}
 	var result Firewall
 	err = c.doJSON(ctx, http.MethodPut, path, nil, input, &result)
+	if err == nil {
+		err = validateExpectedResponseUUID("updated firewall", result.UUID, firewallUUID)
+	}
 	return &result, err
 }
 
@@ -112,6 +134,32 @@ func (c *Client) AssignFirewallToVM(ctx context.Context, location, firewallUUID,
 	}
 	var result []FirewallResource
 	err = c.doJSON(ctx, http.MethodPost, path, url.Values{"vm_uuid": {vmUUID}}, nil, &result)
+	if err == nil {
+		seen := make(map[string]struct{}, len(result))
+		matches := 0
+		for index := range result {
+			if result[index].ResourceType != "vm" {
+				err = fmt.Errorf("inspace: firewall assignment response row %d has resource type %q, want %q", index, result[index].ResourceType, "vm")
+				break
+			}
+			if identityErr := validateResponseUUID("firewall-assigned VM", result[index].ResourceUUID); identityErr != nil {
+				err = fmt.Errorf("inspace: firewall assignment response row %d: %w", index, identityErr)
+				break
+			}
+			canonicalUUID := strings.ToLower(result[index].ResourceUUID)
+			if _, duplicate := seen[canonicalUUID]; duplicate {
+				err = fmt.Errorf("inspace: firewall assignment response contains duplicate VM UUID %q", result[index].ResourceUUID)
+				break
+			}
+			seen[canonicalUUID] = struct{}{}
+			if strings.EqualFold(result[index].ResourceUUID, vmUUID) {
+				matches++
+			}
+		}
+		if err == nil && matches != 1 {
+			err = fmt.Errorf("inspace: firewall assignment response contains %d rows for requested VM %s, want exactly one", matches, vmUUID)
+		}
+	}
 	return err
 }
 

@@ -147,7 +147,7 @@ func (a *ambiguousFirewallRelationAPI) UnassignFirewallFromVM(ctx context.Contex
 func cloneNodeLoadBalancerTestFirewalls(items []inspace.Firewall) []inspace.Firewall {
 	result := append([]inspace.Firewall(nil), items...)
 	for index := range result {
-		result[index].ResourcesAssigned = append([]inspace.FirewallResource(nil), items[index].ResourcesAssigned...)
+		result[index].ResourcesAssigned = append([]inspace.FirewallResource{}, items[index].ResourcesAssigned...)
 		result[index].Rules = append([]inspace.FirewallRule(nil), items[index].Rules...)
 	}
 	return result
@@ -186,9 +186,18 @@ func TestNodeLoadBalancerRelationDeletedVMTombstoneNeedsCanonicalMultiSourceAbse
 		members    []string
 		wantAbsent bool
 	}{
-		{name: "canonical absence", exact: base, wantAbsent: true},
+		{name: "canonical absence", exact: base, members: []string{}, wantAbsent: true},
+		{name: "missing VPC membership field", exact: base},
+		{name: "empty or null unrelated VPC member", exact: base, members: []string{""}},
+		{name: "malformed unrelated VPC member", exact: base, members: []string{"bad"}},
+		{
+			name:    "case-fold duplicate unrelated VPC member",
+			exact:   base,
+			members: []string{"cccccccc-1111-4222-8333-dddddddddddd", "CCCCCCCC-1111-4222-8333-DDDDDDDDDDDD"},
+		},
 		{name: "still listed", exact: base, listed: []inspace.VM{base}},
 		{name: "still in VPC", exact: base, members: []string{testFirewallRelationVMUUID}},
+		{name: "duplicate target in VPC", exact: base, members: []string{testFirewallRelationVMUUID, testFirewallRelationVMUUID}},
 		{name: "wrong billing", exact: func() inspace.VM { vm := base; vm.BillingAccountID++; return vm }()},
 	} {
 		t.Run(test.name, func(t *testing.T) {

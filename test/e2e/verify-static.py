@@ -2,16 +2,19 @@
 """Static contract test for the destructive E2E harness; never touches cloud state."""
 
 import importlib.util
+import hashlib
 import json
 import os
 import pathlib
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
 
 
 ROOT = pathlib.Path(__file__).resolve().parent
+sys.path.insert(0, str(ROOT / "scripts"))
 
 
 def repository_root() -> pathlib.Path:
@@ -145,13 +148,19 @@ def require_unrestricted_parallel_task(block: str) -> None:
 
 
 def verify_host_launcher_external_allow_list() -> None:
-    """Execute default and shell paths with Docker as the only PATH command."""
-    for inspect_fails, phase in ((False, None), (True, None), (False, "shell")):
+    """Execute default and shell paths with only the required Docker and Git."""
+    for inspect_fails, phase in (
+        (False, None),
+        (True, None),
+        (False, "shell"),
+        (False, "destroy"),
+    ):
       with tempfile.TemporaryDirectory(prefix="inspace-e2e-static-") as temporary:
         root = pathlib.Path(temporary)
         bin_dir = root / "bin"
         bin_dir.mkdir(mode=0o700)
         docker_log = root / "docker.log"
+        git_log = root / "git.log"
         unknown_log = root / "unknown.log"
         docker = bin_dir / "docker"
         docker.write_text(
@@ -160,10 +169,60 @@ def verify_host_launcher_external_allow_list() -> None:
             "if [ \"${E2E_DOCKER_INSPECT_FAIL:-false}\" = true ] && "
             "[ \"$1\" = volume ] && [ \"$2\" = inspect ]; then\n"
             "  exit 1\n"
-            "fi\n",
+            "fi\n"
+            "if [ \"${E2E_DOCKER_IMAGE_MISSING:-false}\" = true ] && "
+            "[ \"$1\" = image ] && [ \"$2\" = inspect ] && [ \"${3:-}\" != --format ]; then\n"
+            "  exit 1\n"
+            "fi\n"
+            "if [ \"$1\" = image ] && [ \"$2\" = inspect ] && [ \"${3:-}\" = --format ]; then\n"
+            "  printf '%s\\n' '0.0.0-static|1111111111111111111111111111111111111111|sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb|sha256:9999999999999999999999999999999999999999999999999999999999999999|sha256:8888888888888888888888888888888888888888888888888888888888888888'\n"
+            "  exit 0\n"
+            "fi\n"
+            "case \" $* \" in\n"
+            "  *' --entrypoint /opt/e2e/scripts/verify-release-images.py '*)\n"
+            "    case \" $* \" in\n"
+            "      *' --persisted-state-root '*)\n"
+            "        ;;\n"
+            "    esac\n"
+            "    printf '%s\\n' \\\n"
+            "      'INSPACE_E2E_RELEASE_VERSION=0.0.0-static' \\\n"
+            "      'INSPACE_E2E_RELEASE_REVISION=1111111111111111111111111111111111111111' \\\n"
+            "      'INSPACE_E2E_CCM_RELEASE_DIGEST=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \\\n"
+            "      'INSPACE_E2E_CCM_PLATFORM_DIGEST=sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' \\\n"
+            "      'INSPACE_E2E_CSI_RELEASE_DIGEST=sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc' \\\n"
+            "      'INSPACE_E2E_CSI_PLATFORM_DIGEST=sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd' \\\n"
+            "      'INSPACE_E2E_KARPENTER_RELEASE_DIGEST=sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee' \\\n"
+            "      'INSPACE_E2E_KARPENTER_PLATFORM_DIGEST=sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff' \\\n"
+            "      'INSPACE_E2E_CRDS_CHART_DIGEST=sha256:9999999999999999999999999999999999999999999999999999999999999999' \\\n"
+            "      'INSPACE_E2E_MODULES_CHART_DIGEST=sha256:8888888888888888888888888888888888888888888888888888888888888888'\n"
+            "    ;;\n"
+            "esac\n",
             encoding="utf-8",
         )
         docker.chmod(0o700)
+        git = bin_dir / "git"
+        git.write_text(
+            "#!/bin/sh\n"
+            "printf '%s\\n' \"$*\" >> \"$E2E_GIT_LOG\"\n"
+            "case \"$1\" in\n"
+            "  cat-file) printf '%s\\n' \"${E2E_TAG_TYPE:-tag}\" ;;\n"
+            "  rev-parse)\n"
+            "    case \"$*\" in\n"
+            "      *'^{commit}'*|*' HEAD') printf '%s\\n' \"${E2E_LOCAL_COMMIT:-1111111111111111111111111111111111111111}\" ;;\n"
+            "      *) printf '%s\\n' \"${E2E_LOCAL_TAG_OBJECT:-2222222222222222222222222222222222222222}\" ;;\n"
+            "    esac ;;\n"
+            "  status)\n"
+            "    [ \"${E2E_GIT_STATUS_FAIL:-false}\" != true ] || exit 92\n"
+            "    printf '%s' \"${E2E_GIT_STATUS_OUTPUT:-}\" ;;\n"
+            "  ls-remote)\n"
+            "    printf '%s\\t%s\\n' \\\n"
+            "      \"${E2E_REMOTE_TAG_OBJECT:-2222222222222222222222222222222222222222}\" refs/tags/v0.0.0-static \\\n"
+            "      \"${E2E_REMOTE_COMMIT:-1111111111111111111111111111111111111111}\" 'refs/tags/v0.0.0-static^{}' ;;\n"
+            "  *) exit 2 ;;\n"
+            "esac\n",
+            encoding="utf-8",
+        )
+        git.chmod(0o700)
         bash_env = root / "bash-env"
         bash_env.write_text(
             "command_not_found_handle() { printf '%s\\n' \"$1\" >> \"$E2E_UNKNOWN_COMMAND_LOG\"; return 127; }\n",
@@ -184,12 +243,14 @@ def verify_host_launcher_external_allow_list() -> None:
             "HOME": str(root),
             "BASH_ENV": str(bash_env),
             "E2E_DOCKER_LOG": str(docker_log),
+            "E2E_GIT_LOG": str(git_log),
             "E2E_UNKNOWN_COMMAND_LOG": str(unknown_log),
             "E2E_DOCKER_INSPECT_FAIL": str(inspect_fails).lower(),
             "INSPACE_E2E_ENV_FILE": str(root / "workspace.env"),
             "INSPACE_E2E_SSH_PRIVATE_KEY": str(root / "id_rsa"),
             "INSPACE_E2E_SSH_PUBLIC_KEY": str(root / "id_rsa.pub"),
             "INSPACE_E2E_STATE_VOLUME": "static-contract-state",
+            "INSPACE_E2E_SOURCE_ROOT": str(repository_root()),
             "CONFIRM_INSPACE_CLUSTER_E2E": "static-contract-account",
             "INSPACE_E2E_VERSION": "0.0.0-static",
         }
@@ -211,46 +272,155 @@ def verify_host_launcher_external_allow_list() -> None:
             if match is not None:
                 traced_commands.append(match.group(1))
         require(traced_commands, "host launcher produced no Bash execution trace")
-        allowed_builtins = {"set", "[[", "case", "cd", "pwd", "docker"}
+        if phase == "destroy":
+            require(
+                all(
+                    command != "command -v git" and not command.startswith("git ")
+                    for command in traced_commands
+                ),
+                "destroy must remain available without candidate-checkout Git binding",
+            )
+        else:
+            require(
+                "command -v git" in traced_commands
+                and any(
+                    command.startswith("/bin/bash test/e2e/scripts/verify-release-source.sh ")
+                    for command in traced_commands
+                ),
+                "mutating/debug phases must invoke the canonical candidate verifier",
+            )
         for command_line in traced_commands:
             command_word = command_line.split(maxsplit=1)[0]
-            assignment = re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", command_line)
             require(
-                command_word != "command" or command_line == "command -v docker",
-                f"host launcher command builtin is restricted to exact command -v docker: {command_line}",
-            )
-            require(
-                assignment is not None or command_line == "command -v docker" or command_word in allowed_builtins,
-                f"host launcher executed a command outside the Docker/builtin allow-list: {command_line}",
+                command_word != "command" or command_line in ("command -v docker", "command -v git"),
+                f"host launcher command builtin is restricted to command -v docker/git: {command_line}",
             )
         unknown = unknown_log.read_text(encoding="utf-8").strip() if unknown_log.exists() else ""
-        require(not unknown, f"host launcher attempted non-Docker external commands: {unknown}")
+        require(not unknown, f"host launcher attempted an unapproved external command: {unknown}")
         calls = docker_log.read_text(encoding="utf-8").splitlines()
-        expected_calls = ["volume inspect static-contract-state"]
+        require(calls[0] == "volume inspect static-contract-state",
+                "host launcher must inspect the durable state volume first")
         if inspect_fails:
-            expected_calls.append("volume create static-contract-state")
-        expected_calls.extend([
-            "build --platform linux/amd64 --file test/e2e/Dockerfile --target published-live "
-            "--build-arg CONTROLLER_IMAGE=ghcr.io/thanet-s/inspace-cloud-controller-manager:0.0.0-static "
-            "--tag inspace-cloud-rke2-e2e:local .",
-            " ".join((
-                "run --rm" + (" -it" if phase == "shell" else "") + " --platform linux/amd64",
-                "--env CONFIRM_INSPACE_CLUSTER_E2E=static-contract-account",
-                "--env INSPACE_E2E_VERSION=0.0.0-static",
-                "--env INSPACE_E2E_KEEP_RESOURCES=false",
-                "--env INSPACE_E2E_RUN_ID=",
-                "--env INSPACE_E2E_RECOVER_RETAINED=false",
-                f"--mount type=bind,src={root / 'workspace.env'},dst=/run/config/workspace.env,readonly",
-                f"--mount type=bind,src={root / 'id_rsa'},dst=/run/secrets/e2e_ssh_key,readonly",
-                f"--mount type=bind,src={root / 'id_rsa.pub'},dst=/run/secrets/e2e_ssh_key.pub,readonly",
-                "--mount type=volume,src=static-contract-state,dst=/state",
-                f"inspace-cloud-rke2-e2e:local {phase or 'all'}",
-            )),
-        ])
+            require(calls[1] == "volume create static-contract-state",
+                    "host launcher must create an absent durable state volume")
+        if phase == "destroy":
+            require(any(
+                call == "image inspect inspace-cloud-rke2-e2e:local-0.0.0-static"
+                for call in calls
+            ), "destroy must select the version-scoped preserved runner")
+        verifier_calls = [
+            call for call in calls
+            if "--entrypoint /opt/e2e/scripts/verify-release-images.py" in call
+        ]
+        require(len(verifier_calls) == 1,
+                "host launcher must run exactly one release-image verifier")
+        if phase == "destroy":
+            require("--persisted-state-root /state" in verifier_calls[0] and
+                    "--version" not in verifier_calls[0],
+                    "destroy must use the persisted offline manifest, not live GitHub metadata")
+            require("--expect-environment-prefix INSPACE_E2E_BUILT_" in verifier_calls[0],
+                    "destroy must validate its preserved runner against persisted artifacts")
+            require(not any("--target base" in call or "--target published-live" in call for call in calls),
+                    "matching verified destroy must reuse the existing runner without a build")
+        else:
+            require(
+                "--version 0.0.0-static" in verifier_calls[0]
+                and "--revision 1111111111111111111111111111111111111111" in verifier_calls[0]
+                and "--artifact-dir /state/release-preflight/v0.0.0-static-1111111111111111111111111111111111111111" in verifier_calls[0],
+                "non-destroy phases must reverify the exact source and artifact set",
+            )
+            require(any("--target base" in call for call in calls),
+                    "non-destroy phases must build the non-mutating verifier stage first")
+            published = [call for call in calls if "--target published-live" in call]
+            require(
+                len(published) == 1
+                and (
+                    "CONTROLLER_IMAGE=ghcr.io/thanet-s/inspace-cloud-controller-manager@sha256:"
+                    + "b" * 64
+                ) in published[0]
+                and ("E2E_KARPENTER_PLATFORM_DIGEST=sha256:" + "f" * 64) in published[0],
+                "live runner must be built from the verified platform digest set",
+            )
+            git_calls = git_log.read_text(encoding="utf-8").splitlines()
+            require(
+                git_calls == [
+                    "cat-file -t refs/tags/v0.0.0-static",
+                    "rev-parse --verify refs/tags/v0.0.0-static",
+                    "rev-parse --verify refs/tags/v0.0.0-static^{commit}",
+                    "rev-parse --verify HEAD",
+                    "status --porcelain=v1 --untracked-files=all",
+                    "ls-remote https://github.com/thanet-s/inspace-cloud-kube-modules.git refs/tags/v0.0.0-static refs/tags/v0.0.0-static^{}",
+                ],
+                f"canonical source verifier made unexpected Git calls: {git_calls}",
+            )
+            if phase is None:
+                source_verifier = ROOT / "scripts/verify-release-source.sh"
+                for key, value in (
+                    ("E2E_GIT_STATUS_FAIL", "true"),
+                    ("E2E_GIT_STATUS_OUTPUT", " M changed\n"),
+                    ("E2E_REMOTE_COMMIT", "3" * 40),
+                    ("E2E_REMOTE_TAG_OBJECT", "4" * 40),
+                    ("E2E_TAG_TYPE", "commit"),
+                ):
+                    rejected_environment = environment.copy()
+                    rejected_environment[key] = value
+                    rejected = subprocess.run(
+                        ["/bin/bash", str(source_verifier), "0.0.0-static"],
+                        cwd=ROOT.parent.parent,
+                        env=rejected_environment,
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                    require(
+                        rejected.returncode != 0,
+                        f"canonical source verifier accepted unsafe {key}",
+                    )
+                for key, value in (
+                    ("INSPACE_E2E_RUNNER_PLATFORM", "linux/arm64"),
+                    ("INSPACE_E2E_STATE_VOLUME", "--privileged"),
+                    ("INSPACE_E2E_RUNNER_IMAGE", "--network=host"),
+                ):
+                    rejected_environment = environment.copy()
+                    rejected_environment[key] = value
+                    rejected = subprocess.run(
+                        ["/bin/bash", str(ROOT / "run.sh")],
+                        cwd=ROOT.parent.parent,
+                        env=rejected_environment,
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                    require(
+                        rejected.returncode != 0,
+                        f"host launcher accepted unsafe {key}={value}",
+                    )
+        final_run = calls[-1]
         require(
-            calls == expected_calls,
-            f"unexpected host Docker call sequence: got {calls!r}, want {expected_calls!r}",
+            (("run --rm -it --platform linux/amd64" in final_run) == (phase == "shell"))
+            and f"--env INSPACE_E2E_CCM_PLATFORM_DIGEST={'sha256:' + 'b' * 64}" in final_run
+            and "--env INSPACE_E2E_RELEASE_REVISION=1111111111111111111111111111111111111111" in final_run
+            and final_run.endswith(
+                f"inspace-cloud-rke2-e2e:local-0.0.0-static {phase or 'all'}"
+            ),
+            "final runner dispatch lost its phase, immutable digests, or shell TTY boundary",
         )
+        if phase == "destroy":
+            missing_environment = environment.copy()
+            missing_environment["E2E_DOCKER_IMAGE_MISSING"] = "true"
+            missing = subprocess.run(
+                ["/bin/bash", str(ROOT / "run.sh"), "destroy"],
+                cwd=ROOT.parent.parent,
+                env=missing_environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            require(
+                missing.returncode != 0
+                and "requires the preserved exact release runner" in missing.stderr,
+                "destroy must refuse to rebuild or reuse a missing release runner",
+            )
 
 
 def verify_retention_state_parser(entrypoint: str) -> None:
@@ -309,6 +479,535 @@ def verify_retention_state_parser(entrypoint: str) -> None:
                     f"malformed or non-boolean retention state was accepted: {contents!r}")
 
 
+def verify_final_audit_parser(entrypoint: str) -> None:
+    """Exercise the exact final-audit schema gate with adversarial local state."""
+    function = re.search(r"(?ms)^final_audit_is_zero\(\) \{\n.*?^\}\n", entrypoint)
+    require(function is not None, "entrypoint lacks a testable final-audit parser")
+    harness = (
+        "set -euo pipefail\n"
+        "require_run_directory() { [ ! -L \"$1\" ] && [ -d \"$1\" ]; }\n"
+        "strict_regular_file() { [ ! -L \"$1\" ] && [ -f \"$1\" ]; }\n"
+        "state_binds_run_directory() { "
+        "jq -e --arg run_id \"${1##*/}\" '.runID == $run_id' \"$1/state.json\" >/dev/null; }\n"
+        + function.group(0)
+        + '\nfinal_audit_is_zero "$1"\n'
+    )
+
+    def invoke(directory: pathlib.Path) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["/bin/bash", "-c", harness, "final-audit-parser", str(directory)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    with tempfile.TemporaryDirectory(prefix="inspace-final-audit-") as temporary:
+        root = pathlib.Path(temporary)
+        preflight = root / "preflight"
+        preflight.mkdir()
+        (preflight / "mutations-not-started").write_text(
+            "mutations-not-started\n", encoding="utf-8"
+        )
+        audit = preflight / "final-audit.json"
+        audit.write_text(
+            json.dumps({"count": 0, "mutationsNeverStarted": True}),
+            encoding="utf-8",
+        )
+        require(invoke(preflight).returncode == 0,
+                "strict preflight-only final audit was rejected")
+        audit.write_text(json.dumps({"count": 0}), encoding="utf-8")
+        require(invoke(preflight).returncode != 0,
+                "count-only final audit bypassed the strict schema")
+
+        completed = root / "completed"
+        completed.mkdir()
+        (completed / "state.json").write_text(
+            json.dumps({"runID": "completed"}), encoding="utf-8"
+        )
+        resources = {
+            name: []
+            for name in (
+                "buckets", "disks", "firewalls", "floatingIPs",
+                "loadBalancers", "networks", "servicePackages", "vms",
+            )
+        }
+        (completed / "baseline-inventory.json").write_text(
+            json.dumps(resources), encoding="utf-8"
+        )
+        completed_audit = {
+            "count": 0,
+            "deterministicOwners": {
+                "count": 0,
+                "strictReadCount": 3,
+                "disks": [],
+                "firewalls": [],
+                "floatingIPs": [],
+                "loadBalancers": [],
+                "vms": [],
+            },
+            "accountInventory": {
+                "matches": True,
+                "differenceCount": 0,
+                "strictReadCount": 3,
+                "extra": resources,
+                "missing": resources,
+            },
+        }
+        completed_path = completed / "final-audit.json"
+        completed_path.write_text(json.dumps(completed_audit), encoding="utf-8")
+        require(invoke(completed).returncode == 0,
+                "complete exact-account final audit was rejected")
+        completed_audit["accountInventory"]["differenceCount"] = 1
+        completed_path.write_text(json.dumps(completed_audit), encoding="utf-8")
+        require(invoke(completed).returncode != 0,
+                "non-matching account baseline was accepted as destroyed")
+        completed_path.unlink()
+        target = completed / "audit-target"
+        target.write_text(json.dumps(completed_audit), encoding="utf-8")
+        completed_path.symlink_to(target)
+        require(invoke(completed).returncode != 0,
+                "symlinked final audit was accepted")
+
+
+def verify_durable_release_state_contract() -> None:
+    durable_module = load_script_module(
+        "e2e_durable_io_static", ROOT / "scripts/durable_io.py"
+    )
+    with tempfile.TemporaryDirectory(prefix="inspace-e2e-durable-") as directory:
+        root = pathlib.Path(directory)
+        state = root / "state.json"
+        durable_module.atomic_write_json(state, {"generation": 1})
+        require(state.stat().st_mode & 0o777 == 0o600, "durable JSON must be mode 0600")
+        require(json.loads(state.read_text(encoding="utf-8")) == {"generation": 1},
+                "durable JSON wrote the wrong initial value")
+        durable_module.atomic_write_json(state, {"generation": 2})
+        durable_module.sync_file(state)
+        require(json.loads(state.read_text(encoding="utf-8")) == {"generation": 2},
+                "durable JSON replacement did not converge")
+        durable_module.durable_remove(state)
+        require(not state.exists(), "durable remove left the journal file present")
+
+    release_module = load_script_module(
+        "e2e_release_images_static", ROOT / "scripts/verify-release-images.py"
+    )
+    digest = "sha256:" + "a" * 64
+    version = "1.2.3-rc.4"
+    revision = "1a" * 20
+    assets = [{
+        "name": image + ".txt",
+        "browser_download_url": (
+            "https://github.com/thanet-s/inspace-cloud-kube-modules/releases/"
+            f"download/v{version}/{image}.txt"
+        ),
+        "size": 100,
+        "state": "uploaded",
+        "id": index + 1,
+        "digest": "sha256:" + f"{index + 1:x}" * 64,
+        "content_type": "text/plain; charset=utf-8",
+    } for index, image in enumerate(release_module.IMAGE_NAMES)]
+    for index, chart in enumerate(release_module.CHART_NAMES, start=10):
+        filename = f"{chart}-{version}.tgz"
+        assets.append({
+            "name": filename,
+            "browser_download_url": (
+                "https://github.com/thanet-s/inspace-cloud-kube-modules/releases/"
+                f"download/v{version}/{filename}"
+            ),
+            "size": 100,
+            "state": "uploaded",
+            "id": index,
+            "digest": "sha256:" + f"{index:x}" * 64,
+            "content_type": "application/x-gtar",
+        })
+    assets.append({
+        "name": "SHA256SUMS",
+        "browser_download_url": (
+            "https://github.com/thanet-s/inspace-cloud-kube-modules/releases/"
+            f"download/v{version}/SHA256SUMS"
+        ),
+        "size": 100,
+        "state": "uploaded",
+        "id": 20,
+        "digest": "sha256:" + "a" * 64,
+        "content_type": "application/octet-stream",
+    })
+    resolved = release_module.release_digest_assets({
+        "tag_name": "v" + version,
+        "draft": False,
+        "prerelease": True,
+        "assets": assets,
+    }, version)
+    require(set(resolved) == set(release_module.IMAGE_NAMES),
+            "release metadata parser did not bind every controller digest asset")
+    for image in release_module.IMAGE_NAMES:
+        require(
+            release_module.parse_digest_record(
+                f"ghcr.io/thanet-s/{image}@{digest}\n", image
+            ) == digest,
+            f"release digest parser rejected the exact {image} record",
+        )
+    try:
+        release_module.parse_digest_record(
+            f"ghcr.io/thanet-s/{release_module.IMAGE_NAMES[0]}@sha256:short\n",
+            release_module.IMAGE_NAMES[0],
+        )
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("release digest parser accepted a malformed digest")
+    checksum_lines = "".join(
+        f"{index + 1:064x}  ./{chart}-{version}.tgz\n"
+        for index, chart in enumerate(release_module.CHART_NAMES)
+    ).encode()
+    parsed_checksums = release_module.parse_chart_checksums(
+        checksum_lines, version
+    )
+    require(
+        set(parsed_checksums)
+        == {f"{chart}-{version}.tgz" for chart in release_module.CHART_NAMES},
+        "strict release checksum parser lost a chart",
+    )
+    try:
+        release_module.parse_chart_checksums(
+            checksum_lines.replace(b"  ./", b"  ", 1), version
+        )
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("release checksum parser accepted a non-workflow path")
+
+    amd64_digest = "sha256:" + "b" * 64
+    arm64_digest = "sha256:" + "c" * 64
+    attestation_digest = "sha256:" + "d" * 64
+    require(
+        release_module.linux_amd64_platform_digest({
+            "mediaType": "application/vnd.oci.image.index.v1+json",
+            "manifests": [
+                {
+                    "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                    "digest": amd64_digest,
+                    "size": 1024,
+                    "platform": {"os": "linux", "architecture": "amd64"},
+                },
+                {
+                    "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                    "digest": arm64_digest,
+                    "size": 1024,
+                    "platform": {"os": "linux", "architecture": "arm64"},
+                },
+                {
+                    "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                    "digest": attestation_digest,
+                    "size": 1024,
+                    "platform": {"os": "unknown", "architecture": "unknown"},
+                },
+            ],
+        }) == amd64_digest,
+        "release verifier did not select the unique linux/amd64 platform manifest",
+    )
+    original_raw = release_module.inspect_raw
+    original_config = release_module.inspect_config
+    try:
+        release_module.inspect_raw = lambda _reference: {
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {"digest": digest, "size": 100},
+            "layers": [],
+        }
+        release_module.inspect_config = lambda _reference: {
+            "os": "linux",
+            "architecture": "amd64",
+            "config": {
+                "Labels": {
+                    "org.opencontainers.image.source": release_module.REPOSITORY_URL,
+                    "org.opencontainers.image.version": version,
+                    "org.opencontainers.image.revision": revision,
+                }
+            },
+        }
+        release_module.require_platform_identity(
+            release_module.IMAGE_NAMES[0], amd64_digest, version, revision
+        )
+        try:
+            release_module.require_platform_identity(
+                release_module.IMAGE_NAMES[0], amd64_digest, version, "2" * 40
+            )
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("release verifier accepted an image config from another commit")
+    finally:
+        release_module.inspect_raw = original_raw
+        release_module.inspect_config = original_config
+
+    images = {}
+    for index, image in enumerate(release_module.IMAGE_NAMES):
+        release_digest = "sha256:" + f"{index + 4:x}" * 64
+        platform_digest = "sha256:" + f"{index + 7:x}" * 64
+        images[image] = {
+            "releaseDigest": release_digest,
+            "platformDigest": platform_digest,
+            "releaseReference": f"ghcr.io/thanet-s/{image}@{release_digest}",
+            "platformReference": f"ghcr.io/thanet-s/{image}@{platform_digest}",
+        }
+    with tempfile.TemporaryDirectory(prefix="inspace-e2e-release-state-") as directory:
+        state_root = pathlib.Path(directory)
+        repository = repository_root()
+        packages: dict[str, pathlib.Path] = {}
+        for chart in release_module.CHART_NAMES:
+            source = state_root / "chart-sources" / chart
+            source.parent.mkdir(mode=0o700, exist_ok=True)
+            shutil.copytree(repository / "charts" / chart, source)
+            chart_yaml = source / "Chart.yaml"
+            chart_text = chart_yaml.read_text(encoding="utf-8")
+            placeholder = '  org.opencontainers.image.revision: ""'
+            require(
+                chart_text.count(placeholder) == 1,
+                f"{chart} lacks one release-managed revision placeholder",
+            )
+            chart_yaml.write_text(
+                chart_text.replace(
+                    placeholder,
+                    f"  org.opencontainers.image.revision: {revision}",
+                ),
+                encoding="utf-8",
+            )
+            app_version = "1.14.0" if chart.endswith("-crds") else version
+            package_result = subprocess.run(
+                [
+                    "helm", "package", str(source),
+                    "--version", version,
+                    "--app-version", app_version,
+                    "--destination", str(state_root),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            require(package_result.returncode == 0,
+                    f"could not make static chart fixture: {package_result.stderr}")
+            packages[chart] = state_root / f"{chart}-{version}.tgz"
+            release_module.validate_chart_package(
+                packages[chart], chart, version, revision
+            )
+            try:
+                release_module.validate_chart_package(
+                    packages[chart], chart, version, "2b" * 20
+                )
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(
+                    f"released chart {chart} accepted another source revision"
+                )
+        oci_chart = release_module.CHART_NAMES[0]
+        oci_package = packages[oci_chart]
+        original_subprocess_run = release_module.subprocess.run
+        pulled_content = oci_package.read_bytes()
+        try:
+            def fake_helm_pull(command, **_kwargs):
+                destination = pathlib.Path(
+                    command[command.index("--destination") + 1]
+                )
+                (destination / oci_package.name).write_bytes(pulled_content)
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            release_module.subprocess.run = fake_helm_pull
+            release_module.verify_oci_chart_bytes(
+                oci_package, oci_chart, version
+            )
+            pulled_content = bytes([pulled_content[0] ^ 1]) + pulled_content[1:]
+            try:
+                release_module.verify_oci_chart_bytes(
+                    oci_package, oci_chart, version
+                )
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError(
+                    "release verifier accepted same-size OCI and GitHub chart packages "
+                    "with different bytes"
+                )
+        finally:
+            release_module.subprocess.run = original_subprocess_run
+        charts = {}
+        for chart, package in packages.items():
+            filename = package.name
+            charts[chart] = {
+                "name": chart,
+                "version": version,
+                "appVersion": "1.14.0" if chart.endswith("-crds") else version,
+                "source": release_module.REPOSITORY_URL,
+                "revision": revision,
+                "filename": filename,
+                "relativePath": f"release-charts/{filename}",
+                "sha256": "sha256:" + hashlib.sha256(package.read_bytes()).hexdigest(),
+                "releaseURL": release_module.canonical_release_asset_url(version, filename),
+                "ociReference": f"oci://ghcr.io/thanet-s/charts/{chart}:{version}",
+            }
+        document = {
+            "schema": release_module.SCHEMA,
+            "version": version,
+            "tag": "v" + version,
+            "revision": revision,
+            "platform": {"os": "linux", "architecture": "amd64"},
+            "images": images,
+            "charts": charts,
+        }
+        require(
+            release_module.validate_release_images_document(
+                document, version, revision
+            ) == document,
+            "strict persisted release-artifact manifest validation changed its document",
+        )
+        run_id = "static-run"
+        run_root = state_root / run_id
+        run_root.mkdir(mode=0o700)
+        chart_root = run_root / "release-charts"
+        chart_root.mkdir(mode=0o700)
+        for chart, package in packages.items():
+            target = chart_root / package.name
+            target.write_bytes(package.read_bytes())
+            target.chmod(0o600)
+        last_run = state_root / "last-run-id"
+        last_run.write_text(run_id + "\n", encoding="utf-8")
+        last_run.chmod(0o600)
+        state = run_root / "state.json"
+        state.write_text(json.dumps({"runID": run_id}), encoding="utf-8")
+        state.chmod(0o600)
+        (run_root / "release-images.json").write_text(
+            json.dumps(document),
+            encoding="utf-8",
+        )
+        (run_root / "release-images.json").chmod(0o600)
+        require(
+            release_module.load_persisted_release_images(state_root, None) == document,
+            "offline destroy lookup did not load the durable verified release manifest",
+        )
+        state_content = state.read_bytes()
+        state.unlink()
+        preflight_marker = run_root / "mutations-not-started"
+        preflight_marker.write_text("mutations-not-started\n", encoding="utf-8")
+        preflight_marker.chmod(0o600)
+        require(
+            release_module.load_persisted_release_images(state_root, run_id)
+            == document,
+            "offline destroy rejected a proven mutation-free preflight run",
+        )
+        preflight_marker.unlink()
+        state.write_bytes(state_content)
+        state.chmod(0o600)
+
+        def require_offline_rejection(message: str, selected: str | None = run_id) -> None:
+            try:
+                release_module.load_persisted_release_images(state_root, selected)
+            except (ValueError, FileNotFoundError, OSError):
+                return
+            raise AssertionError(message)
+
+        state.write_text(json.dumps({"runID": "another-run"}), encoding="utf-8")
+        state.chmod(0o600)
+        require_offline_rejection(
+            "offline destroy accepted a journal bound to another run ID"
+        )
+        state.write_text(json.dumps({"runID": run_id}), encoding="utf-8")
+        state.chmod(0o600)
+
+        first_chart = next(iter(packages))
+        chart_path = chart_root / packages[first_chart].name
+        original_chart = chart_path.read_bytes()
+        chart_path.write_bytes(original_chart + b"corrupt")
+        chart_path.chmod(0o600)
+        require_offline_rejection(
+            "offline destroy accepted a chart whose persisted checksum changed"
+        )
+        chart_path.write_bytes(original_chart)
+        chart_path.chmod(0o600)
+
+        manifest_path = run_root / "release-images.json"
+        manifest_content = manifest_path.read_bytes()
+        manifest_path.unlink()
+        manifest_target = run_root / "manifest-target"
+        manifest_target.write_bytes(manifest_content)
+        manifest_target.chmod(0o600)
+        manifest_path.symlink_to(manifest_target)
+        require_offline_rejection(
+            "offline destroy followed a symlinked release manifest"
+        )
+        manifest_path.unlink()
+        manifest_target.unlink()
+        manifest_path.write_bytes(manifest_content)
+        manifest_path.chmod(0o600)
+
+        last_content = last_run.read_bytes()
+        last_run.unlink()
+        last_target = state_root / "last-run-target"
+        last_target.write_bytes(last_content)
+        last_target.chmod(0o600)
+        last_run.symlink_to(last_target)
+        require_offline_rejection(
+            "offline destroy followed a symlinked last-run-id", None
+        )
+        last_run.unlink()
+        last_target.unlink()
+        last_run.write_bytes(last_content)
+        last_run.chmod(0o600)
+
+        symlink_root = state_root / "symlink-state"
+        symlink_root.mkdir(mode=0o700)
+        symlink_last = symlink_root / "last-run-id"
+        symlink_last.write_text(run_id + "\n", encoding="utf-8")
+        symlink_last.chmod(0o600)
+        (symlink_root / run_id).symlink_to(run_root, target_is_directory=True)
+        try:
+            release_module.load_persisted_release_images(symlink_root, None)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("offline destroy followed a symlinked run directory")
+
+        environment = os.environ.copy()
+        environment["INSPACE_E2E_BUILT_VERSION"] = version
+        environment["INSPACE_E2E_BUILT_REVISION"] = revision
+        for image in release_module.IMAGE_NAMES:
+            prefix = release_module.ENV_PREFIXES[image].replace(
+                "INSPACE_E2E_", "INSPACE_E2E_BUILT_", 1
+            )
+            environment[prefix + "_RELEASE_DIGEST"] = images[image]["releaseDigest"]
+            environment[prefix + "_PLATFORM_DIGEST"] = images[image]["platformDigest"]
+        for chart in release_module.CHART_NAMES:
+            prefix = release_module.CHART_ENV_PREFIXES[chart].replace(
+                "INSPACE_E2E_", "INSPACE_E2E_BUILT_", 1
+            )
+            environment[prefix + "_DIGEST"] = charts[chart]["sha256"]
+        output = state_root / "offline-output.json"
+        offline = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "scripts/verify-release-images.py"),
+                "--persisted-state-root",
+                str(state_root),
+                "--run-id",
+                run_id,
+                "--output",
+                str(output),
+                "--format",
+                "env",
+                "--expect-environment-prefix",
+                "INSPACE_E2E_BUILT_",
+            ],
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        require(
+            offline.returncode == 0
+            and offline.stdout.count("\n") == 10
+            and json.loads(output.read_text(encoding="utf-8")) == document,
+            f"offline destroy verifier CLI failed: {offline.stderr}",
+        )
+
+
 def verify_node_load_balancer_helm_contract() -> None:
     """Prove chart defaults, rendered wiring, examples, and fail-closed gates."""
     repository = repository_root()
@@ -316,6 +1015,10 @@ def verify_node_load_balancer_helm_contract() -> None:
     values_path = chart / "values.yaml"
     ci_values = chart / "ci/test-values.yaml"
     values = values_path.read_text(encoding="utf-8")
+    client_source = (repository / "modules/client/client.go").read_text(encoding="utf-8")
+    csi_adapter_source = (
+        repository / "modules/csi-driver/pkg/cloud/inspace/adapter.go"
+    ).read_text(encoding="utf-8")
 
     require(yaml_mapping_scalar(values, "ccm", "nodeLoadBalancer", "enabled") == "true",
             "chart must enable the CCM node-load-balancer controller by default")
@@ -323,6 +1026,18 @@ def verify_node_load_balancer_helm_contract() -> None:
             "chart node-load-balancer shards must default to one node")
     require(yaml_mapping_scalar(values, "karpenter", "featureGates", "staticCapacity") == "true",
             "chart must enable Karpenter StaticCapacity for managed node-load-balancer shards")
+    require(yaml_mapping_scalar(values, "csi", "sidecars", "provisioner", "timeoutSeconds") == "600",
+            "chart must leave 2m preflight before the CSI provisioner's 8m dispatch reserve")
+    require(yaml_mapping_scalar(values, "csi", "sidecars", "attacher", "timeoutSeconds") == "600",
+            "chart must leave 2m preflight before the CSI attacher's 8m dispatch reserve")
+    require(re.search(r"defaultHTTPTimeout\s*=\s*5\s*\*\s*time\.Minute", client_source) is not None and
+            re.search(r"defaultDestructiveReadbackTimeout\s*=\s*2\s*\*\s*time\.Minute",
+                      csi_adapter_source) is not None and
+            re.search(r"minimumMutationDispatchReserve\s*=\s*8\s*\*\s*time\.Minute",
+                      csi_adapter_source) is not None,
+            "CSI sidecar timeout proof must remain bound to the 5m SDK, 2m destructive, and 8m dispatch defaults")
+    require(csi_adapter_source.count("requireMutationDispatchReserve(ctx)") == 4,
+            "all four CSI disk mutations must retain the final 8m dispatch-reserve guard")
 
     render_command = [
         "helm", "template", "verify", str(chart), "--namespace", "kube-system",
@@ -340,6 +1055,13 @@ def verify_node_load_balancer_helm_contract() -> None:
         f"Node-LB Helm render failed:\n{rendered_result.stdout}{rendered_result.stderr}",
     )
     rendered = rendered_result.stdout
+    csi_deployment = manifest_document(
+        rendered, "Deployment", "verify-inspace-cloud-kube-modules-csi-controller"
+    )
+    require(
+        csi_deployment.count("            - --timeout=600s") == 2,
+        "rendered CSI provisioner and attacher must each have a 600-second RPC timeout",
+    )
     ccm_deployment = manifest_document(
         rendered, "Deployment", "verify-inspace-cloud-kube-modules-ccm"
     )
@@ -384,6 +1106,28 @@ def verify_node_load_balancer_helm_contract() -> None:
         disabled_result.returncode == 0,
         "Helm must render with the optional CCM Node-LB controller disabled:\n"
         f"{disabled_result.stdout}{disabled_result.stderr}",
+    )
+    unsafe_csi_timeout = subprocess.run(
+        [*render_command, "--set", "csi.sidecars.provisioner.timeoutSeconds=599"],
+        cwd=repository,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    require(
+        unsafe_csi_timeout.returncode != 0,
+        "Helm must reject a CSI provisioner RPC timeout below the safe 600-second floor",
+    )
+    unsafe_csi_attacher_timeout = subprocess.run(
+        [*render_command, "--set", "csi.sidecars.attacher.timeoutSeconds=599"],
+        cwd=repository,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    require(
+        unsafe_csi_attacher_timeout.returncode != 0,
+        "Helm must reject a CSI attacher RPC timeout below the safe 600-second floor",
     )
     disabled_ccm_role = manifest_document(
         disabled_result.stdout, "ClusterRole", "verify-inspace-cloud-kube-modules-ccm"
@@ -807,8 +1551,14 @@ def main() -> None:
     public_node_local_verifier = (
         ROOT / "scripts/verify-public-node-local.py"
     ).read_text(encoding="utf-8")
+    strict_api_reader = (
+        ROOT / "scripts/strict_inspace_api.py"
+    ).read_text(encoding="utf-8")
     ansible_cfg = (ROOT / "ansible.cfg").read_text(encoding="utf-8")
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    release_workflow = (
+        repository_root() / ".github/workflows/release.yaml"
+    ).read_text(encoding="utf-8")
     node_lb_service_names = (
         "inspace-e2e-node-traefik",
         "inspace-e2e-node-shared-b",
@@ -822,6 +1572,8 @@ def main() -> None:
     )
     verify_host_launcher_external_allow_list()
     verify_retention_state_parser(entrypoint)
+    verify_final_audit_parser(entrypoint)
+    verify_durable_release_state_contract()
     verify_worker_egress_runtime()
     verify_node_load_balancer_helm_contract()
     verify_public_node_local_e2e_contract(
@@ -833,17 +1585,75 @@ def main() -> None:
         public_node_local_verifier,
         readme,
     )
+    strict_reader_test = subprocess.run(
+        [sys.executable, str(ROOT / "scripts/test-strict-inspace-api.py")],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    require(
+        strict_reader_test.returncode == 0,
+        "strict InSpace reader adversarial tests failed: "
+        + (strict_reader_test.stderr.strip() or strict_reader_test.stdout.strip()),
+    )
+    require(
+        "ProxyHandler({})" in strict_api_reader
+        and "HTTPRedirectHandler" in strict_api_reader
+        and "MAX_RESPONSE_BYTES = 4 * 1024 * 1024" in strict_api_reader
+        and "allowed_statuses={200}" in strict_api_reader,
+        "shared InSpace reader lost its no-proxy/no-redirect/4-MiB/exact-200 boundary",
+    )
+    for reader in (
+        account_inventory,
+        cloud_audit,
+        bootstrap_discovery,
+        worker_discovery,
+        service_cloud,
+        node_load_balancer_cloud,
+        public_node_local_verifier,
+    ):
+        require(
+            "strict_inspace_api import" in reader
+            and "urllib.request.urlopen" not in reader,
+            "an E2E cloud reader bypasses the shared strict InSpace API boundary",
+        )
     require("docker build" in executable_host and "docker run" in executable_host, "host launcher must build and run Docker")
     require("runner_platform=${INSPACE_E2E_RUNNER_PLATFORM:-linux/amd64}" in executable_host,
             "E2E runner must default explicitly to linux/amd64")
-    require("linux/amd64 | linux/arm64" in executable_host and
-            "INSPACE_E2E_RUNNER_PLATFORM must be linux/amd64 or linux/arm64" in host,
-            "E2E runner platform override must reject unsupported platforms")
-    require(executable_host.count('--platform "$runner_platform"') == 2,
-            "E2E runner platform must be passed to both Docker build and Docker run")
+    require("[[ $runner_platform == linux/amd64 ]]" in executable_host and
+            "while InSpace is x86-only" in host and
+            "linux/arm64" not in executable_host,
+            "E2E runner must reject arm64 until InSpace offers it")
+    require(executable_host.count('--platform "$runner_platform"') >= 2,
+            "E2E runner platform must be passed to verifier/build and final Docker run")
     require("--target published-live" in executable_host and
-            "CONTROLLER_IMAGE=ghcr.io/thanet-s/inspace-cloud-controller-manager:" in executable_host,
-            "destructive launcher must copy the bootstrap binary from the exact published image")
+            "CONTROLLER_IMAGE=ghcr.io/thanet-s/inspace-cloud-controller-manager@$ccm_platform_digest" in executable_host,
+            "normal destructive launcher must copy the bootstrap binary from the verified platform digest")
+    require(
+        "REVISION: ${{ github.sha }}" in release_workflow
+        and 'org.opencontainers.image.revision: \\"\\"' in release_workflow
+        and "helm show chart" in release_workflow
+        and "charts/inspace-cloud-kube-modules-crds/Chart.yaml"
+        in release_workflow
+        and "charts/inspace-cloud-kube-modules/Chart.yaml"
+        in release_workflow,
+        "release workflow must inject and read back the exact event revision in both charts",
+    )
+    crd_install = named_yaml_sequence_item(
+        init_playbook, "Install the released CRDs chart", 4
+    )
+    modules_install = named_yaml_sequence_item(
+        init_playbook, "Install released CCM CSI and Karpenter controllers", 4
+    )
+    require(
+        "e2e_release_images.charts['inspace-cloud-kube-modules-crds'].relativePath"
+        in crd_install
+        and "e2e_release_images.charts['inspace-cloud-kube-modules'].relativePath"
+        in modules_install
+        and "oci://ghcr.io/thanet-s/charts/" not in crd_install + modules_install,
+        "live E2E must install both locally verified release chart archives",
+    )
     require("--init" not in executable_host, "host launcher must not add a second init process")
     require("--env-file" not in executable_host,
             "token-bearing environment file must not be copied into Docker container metadata")
@@ -902,6 +1712,33 @@ def main() -> None:
                 f"Dockerfile-specific ignore is missing {forbidden_build_input}")
     require("INSPACE_CONTROL_PLANE_VIP" in entrypoint,
             "runner must require the private control-plane VIP before provisioning")
+    recovery_sync = named_yaml_sequence_item(
+        init_playbook,
+        "Durably persist every Kubernetes recovery access artifact",
+        4,
+    )
+    require(
+        all(
+            path in recovery_sync
+            for path in (
+                '"{{ e2e_kubeconfig }}"',
+                '"{{ e2e_ssh_config }}"',
+                '"{{ e2e_state_dir }}/known-hosts-bastion"',
+                "/opt/e2e/scripts/durable_io.py",
+                "sync-file",
+            )
+        )
+        and init_playbook.index(
+            "- name: Durably persist every Kubernetes recovery access artifact"
+        )
+        < init_playbook.index(
+            "- name: Mark Kubernetes ownership possible before creating any Kubernetes object"
+        )
+        < init_playbook.index(
+            "- name: Create the cloud and RKE2 registration secrets"
+        ),
+        "kubeconfig/SSH recovery files must be fsynced before the ownership marker and first Kubernetes mutation",
+    )
     require("INSPACE_AMD_HOST_POOL_UUID" in entrypoint and
             "INSPACE_AMD_HOST_POOL_UUID" in cluster and
             "INSPACE_AMD_HOST_POOL_UUID" in bootstrap_discovery,
@@ -1232,7 +2069,10 @@ def main() -> None:
         "inspace-control-plane-vip",
         "/var/lib/inspace/kube-vip.yaml.e2e-disabled",
         "Require uninterrupted API reachability during kube-vip failover",
-        "Prove the chart launched the exact released product image tags",
+        "Prove the chart and runtime launched the immutable released product digests",
+        "INSPACE_BOOTSTRAP_CACHE_IMAGE_DIGESTS",
+        "verify_product_digest",
+        "platformDigest",
         "/opt/e2e/scripts/api-tunnel.sh",
         "skopeo",
         "global.inspace.privateLoadBalancerPool.start",
@@ -1320,9 +2160,11 @@ def main() -> None:
             "/usr/local/sbin/inspace-install-prerequisites" in init_playbook,
             "live bootstrap acceptance must prove the E2E upgrade bypass on bastion, control planes, and workers")
     require('"global.inspace.systemImageRegistry={{ e2e_state.bootstrapCacheRegistry }}"' in init_playbook and
-            '"$registry/thanet-s/inspace-cloud-controller-manager:$version"' in init_playbook and
-            '"$registry/sig-storage/csi-provisioner:v5.2.0"' in init_playbook,
-            "released chart installation must route its audited system images through the cache")
+            '"$registry/thanet-s/inspace-cloud-controller-manager@$ccm_digest"' in init_playbook and
+            '"$registry/sig-storage/csi-provisioner:v5.2.0"' in init_playbook and
+            'select(.name=="csi-provisioner") | [.args[] | select(. == "--timeout=600s")] | length' in init_playbook and
+            'select(.name=="csi-attacher") | [.args[] | select(. == "--timeout=600s")] | length' in init_playbook,
+            "released chart installation must route its audited system images through the cache and retain both safe CSI RPC timeouts")
     cached_pause = "rancher/mirrored-pause:3.6@sha256:c2280d2f5f56cf9c9a01bb64b2db4651e35efd6d62a54dcfc12049fe6449c5e4"
     require(f"image: {{{{ e2e_state.bootstrapCacheRegistry }}}}/{cached_pause}" in trigger and
             playbook.count(cached_pause) == 2,
@@ -2102,7 +2944,7 @@ def main() -> None:
     require(init_playbook.count(cached_digest) >= 2,
             "control-plane manifests and live pods must use the cached amd64 kube-vip digest")
     require("expected one exact egress FIP for each control plane and bastion" in bootstrap_discovery and
-            "vm_by_name = canonical_owned_vm_details(listed_owned_vms)" in bootstrap_discovery and
+            "vpc_vm_by_name = canonical_owned_vm_details(listed_member_vms)" in bootstrap_discovery and
             'expected_cp_names = [f"{cluster_resource_name}-cp{index}"' in bootstrap_discovery and
             "validate_optional_vm_hostname(vm, name, name)" in bootstrap_discovery and
             "user-resource/vm?" in bootstrap_discovery and
@@ -2427,7 +3269,9 @@ def main() -> None:
         ) == 1
         and bootstrap_discovery.count(
             "validate_optional_vm_network_uuid(vm, network_uuid, name)"
-        ) == 1
+        ) >= 2
+        and "configured VPC membership and strict VM list are not a bijection"
+        in bootstrap_discovery
         and "network_members.count(vm_uuid) != 1" in bootstrap_discovery
         and 'subnet = ipaddress.ip_network(network["subnet"], strict=False)' in bootstrap_discovery
         and bootstrap_discovery.count("require_private_ipv4(") >= 3,
@@ -2725,18 +3569,19 @@ def main() -> None:
             'item.get("is_deleted") is True' in cloud_audit and
             cloud_audit.count("active_resources(") == 6,
             "deterministic cleanup audit must ignore only explicitly deleted cloud rows")
-    require('worker_vm_prefix = f"{args.cluster}-karp-{args.nodepool}-"' in cloud_audit and
-            'worker_fip_prefix = f"karpenter-{args.nodepool}-"' in cloud_audit and
+    require('worker_vm_prefix = f"{cluster}-karp-{nodepool}-"' in cloud_audit and
+            'worker_fip_prefix = f"karpenter-{nodepool}-"' in cloud_audit and
             'state.get("workerVMs", [])' in cloud_audit,
             "cleanup audit must retain new worker VM/FIP naming even with sparse list descriptions")
-    require('f"{args.cluster}-nodes-{args.owner}"' in cloud_audit and
-            'f"{args.cluster}-bastion-{args.owner}"' in cloud_audit and
-            'f"{args.cluster}-bastion-ip"' in cloud_audit and
-            'f"{args.cluster}-cp{slot}-ip"' in cloud_audit,
+    require('f"{cluster}-nodes-{owner}"' in cloud_audit and
+            'f"{cluster}-bastion-{owner}"' in cloud_audit and
+            'f"{cluster}-bastion-ip"' in cloud_audit and
+            'f"{cluster}-cp{slot}-ip"' in cloud_audit,
             "cleanup audit must retain cluster-prefixed bootstrap firewall/FIP naming")
-    require('f"{args.cluster}-bastion"' in cloud_audit and
-            'f"rke2-{args.owner}-bastion"' in cloud_audit and
-            "or vm.get(\"name\") in bastion_vm_names" in cloud_audit,
+    require('f"{cluster}-bastion"' in cloud_audit and
+            'f"rke2-{owner}-bastion"' in cloud_audit and
+            "if name in bastion_vm_names:" in cloud_audit and
+            "_bootstrap_vm_owned(" in cloud_audit,
             "cleanup audit must allow the current bastion VM and safe prior owner-derived VM name")
     cloud_audit_module = load_script_module("e2e_cloud_audit_static", ROOT / "scripts/cloud-audit.py")
     require(cloud_audit_module.parse_description('{"cluster":"expected"}') == {"cluster": "expected"},
@@ -2770,6 +3615,7 @@ def main() -> None:
             "INSPACE_BOOTSTRAP_CACHE_NOT_BEFORE" not in destroy_task,
             "bootstrap destroy must not require cache key or certificate time input")
     ordering = [
+        "Durably capture cloud identities before deleting Kubernetes owners",
         "Delete workload owners before infrastructure owners",
         "Wait for E2E pods PVs and VolumeAttachments to disappear",
         "Wait for private Cilium L2 leases and LB IPAM allocations to quiesce",

@@ -18,6 +18,7 @@
     e2e_bootstrap_result_file: "{{ lookup('env', 'E2E_STATE_DIR') }}/bootstrap-result.json"
     e2e_bootstrap_cache_ca_file: "{{ lookup('env', 'E2E_STATE_DIR') }}/bootstrap-cache-ca.crt"
     e2e_baseline_inventory_file: "{{ lookup('env', 'E2E_STATE_DIR') }}/baseline-inventory.json"
+    e2e_release_images_file: "{{ lookup('env', 'E2E_STATE_DIR') }}/release-images.json"
     e2e_ssh_config: "{{ lookup('env', 'E2E_STATE_DIR') }}/ssh-config"
     e2e_virtual_ip: "{{ lookup('env', 'INSPACE_CONTROL_PLANE_VIP') }}"
     e2e_private_lb_pool_start: "{{ lookup('env', 'INSPACE_PRIVATE_LOAD_BALANCER_POOL_START') }}"
@@ -161,34 +162,39 @@
         dest: "{{ e2e_cluster_file }}"
         mode: "0600"
 
-    - name: Verify released OCI charts exist before creating infrastructure
+    - name: Revalidate the pre-cloud immutable release artifact set
       ansible.builtin.command:
         argv:
-          - helm
-          - show
-          - chart
-          - "oci://ghcr.io/thanet-s/charts/{{ item }}"
-          - --version
-          - "{{ lookup('env', 'INSPACE_E2E_VERSION') }}"
-      changed_when: false
-      loop:
-        - inspace-cloud-kube-modules-crds
-        - inspace-cloud-kube-modules
+          - /opt/e2e/scripts/verify-release-images.py
+          - --artifact-root
+          - "{{ e2e_state_dir }}"
+          - --output
+          - "{{ e2e_release_images_file }}"
+          - --expect-environment-prefix
+          - INSPACE_E2E_
+      register: e2e_release_images_result
+      changed_when: true
 
-    - name: Verify all released controller images exist before creating infrastructure
-      ansible.builtin.command:
-        argv:
-          - skopeo
-          - inspect
-          - --retry-times
-          - "5"
-          - "docker://ghcr.io/thanet-s/{{ item }}:{{ lookup('env', 'INSPACE_E2E_VERSION') }}"
-      changed_when: false
-      loop:
-        - inspace-cloud-controller-manager
-        - inspace-csi-driver
-        - karpenter-provider-inspace
+    - name: Load the immutable controller image digests
+      ansible.builtin.set_fact:
+        e2e_release_images: "{{ lookup('file', e2e_release_images_file) | from_json }}"
 
+    - name: Require the complete immutable controller image manifest
+      ansible.builtin.assert:
+        that:
+          - e2e_release_images.schema == 'inspace-e2e-release-artifacts-v2'
+          - e2e_release_images.version == lookup('env', 'INSPACE_E2E_VERSION')
+          - e2e_release_images.tag == 'v' + lookup('env', 'INSPACE_E2E_VERSION')
+          - e2e_release_images.revision == lookup('env', 'INSPACE_E2E_RELEASE_REVISION')
+          - "e2e_release_images.platform == {'os': 'linux', 'architecture': 'amd64'}"
+          - e2e_release_images.images.keys() | list | sort == ['inspace-cloud-controller-manager', 'inspace-csi-driver', 'karpenter-provider-inspace']
+          - e2e_release_images.images.values() | map(attribute='releaseDigest') | select('match', '^sha256:[0-9a-f]{64}$') | list | length == 3
+          - e2e_release_images.images.values() | map(attribute='platformDigest') | select('match', '^sha256:[0-9a-f]{64}$') | list | length == 3
+          - e2e_release_images.charts.keys() | list | sort == ['inspace-cloud-kube-modules', 'inspace-cloud-kube-modules-crds']
+          - e2e_release_images.charts['inspace-cloud-kube-modules-crds'].revision == lookup('env', 'INSPACE_E2E_RELEASE_REVISION')
+          - e2e_release_images.charts['inspace-cloud-kube-modules'].revision == lookup('env', 'INSPACE_E2E_RELEASE_REVISION')
+          - e2e_release_images.charts['inspace-cloud-kube-modules-crds'].sha256 == lookup('env', 'INSPACE_E2E_CRDS_CHART_DIGEST')
+          - e2e_release_images.charts['inspace-cloud-kube-modules'].sha256 == lookup('env', 'INSPACE_E2E_MODULES_CHART_DIGEST')
     - name: Inspect the pinned kube-vip release before infrastructure creation
       ansible.builtin.command:
         argv:
@@ -290,16 +296,33 @@
         dest: "{{ e2e_state_file }}"
         mode: "0600"
 
+    - name: Durably persist the bootstrap input and ownership journal before mutation
+      ansible.builtin.command:
+        argv:
+          - /opt/e2e/scripts/durable_io.py
+          - sync-file
+          - "{{ item }}"
+      loop:
+        - "{{ e2e_cluster_file }}"
+        - "{{ e2e_state_file }}"
+      changed_when: false
+
     - name: Persist that remote mutations may now begin
-      ansible.builtin.copy:
-        content: "remote mutations may exist\n"
-        dest: "{{ e2e_state_dir }}/mutations-may-exist"
-        mode: "0600"
+      ansible.builtin.command:
+        argv:
+          - /opt/e2e/scripts/durable_io.py
+          - write-text
+          - "{{ e2e_state_dir }}/mutations-may-exist"
+          - "remote mutations may exist\n"
+      changed_when: true
 
     - name: Clear the preflight-only checkpoint before the first mutation
-      ansible.builtin.file:
-        path: "{{ e2e_state_dir }}/mutations-not-started"
-        state: absent
+      ansible.builtin.command:
+        argv:
+          - /opt/e2e/scripts/durable_io.py
+          - remove
+          - "{{ e2e_state_dir }}/mutations-not-started"
+      changed_when: true
 
     - name: Run the bootstrap reconciler synchronously to readiness
       ansible.builtin.command:
@@ -326,6 +349,12 @@
         INSPACE_RKE2_TOKEN: "{{ lookup('file', e2e_token_file) | trim }}"
         INSPACE_BOOTSTRAP_CACHE_KEY: "{{ lookup('file', e2e_bootstrap_cache_key_file) | trim }}"
         INSPACE_BOOTSTRAP_CACHE_NOT_BEFORE: "{{ lookup('file', e2e_bootstrap_cache_not_before_file) | trim }}"
+        INSPACE_BOOTSTRAP_CACHE_IMAGE_DIGESTS: >-
+          {{ {
+            'inspace-cloud-controller-manager': e2e_release_images.images['inspace-cloud-controller-manager'].platformDigest,
+            'inspace-csi-driver': e2e_release_images.images['inspace-csi-driver'].platformDigest,
+            'karpenter-provider-inspace': e2e_release_images.images['karpenter-provider-inspace'].platformDigest
+          } | to_json }}
       register: e2e_bootstrap_wait
       changed_when: true
       no_log: true
@@ -628,6 +657,32 @@
         resolve=(--resolve "$cache_host:8443:$cache_address")
         test "$(curl --fail --silent --show-error --cacert "$cache_ca" "${resolve[@]}" "$cache_endpoint/healthz")" = ready
         curl --fail --silent --show-error --cacert "$cache_ca" "${resolve[@]}" "$cache_endpoint/v2/" >/dev/null
+        verify_product_digest() {
+          repository=$1
+          reference=$2
+          expected=$3
+          headers=$(mktemp)
+          curl --fail --silent --show-error --cacert "$cache_ca" "${resolve[@]}" \
+            --dump-header "$headers" \
+            --header 'Accept: application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json' \
+            "$cache_endpoint/v2/$repository/manifests/$reference" >/dev/null
+          actual=$(awk 'tolower($1) == "docker-content-digest:" { gsub(/\r/, "", $2); print $2 }' "$headers")
+          rm -f "$headers"
+          test "$actual" = "$expected"
+          grep -Fqx "docker://ghcr.io/$repository@$expected"$'\t'"$repository:$reference" /etc/inspace-cache/images.tsv
+        }
+        verify_product_digest \
+          thanet-s/inspace-cloud-controller-manager \
+          {{ lookup('env', 'INSPACE_E2E_VERSION') | quote }} \
+          {{ e2e_release_images.images['inspace-cloud-controller-manager'].platformDigest | quote }}
+        verify_product_digest \
+          thanet-s/inspace-csi-driver \
+          {{ lookup('env', 'INSPACE_E2E_VERSION') | quote }} \
+          {{ e2e_release_images.images['inspace-csi-driver'].platformDigest | quote }}
+        verify_product_digest \
+          thanet-s/karpenter-provider-inspace \
+          {{ lookup('env', 'INSPACE_E2E_VERSION') | quote }} \
+          {{ e2e_release_images.images['karpenter-provider-inspace'].platformDigest | quote }}
         image_count=0
         while IFS="$(printf '\t')" read -r _ target; do
           test -n "$target" || continue
@@ -1525,6 +1580,27 @@
             fail_msg: "the tunneled Kubernetes API was interrupted during kube-vip failover"
           when: e2e_api_monitor_job is defined and e2e_api_monitor_job.ansible_job_id is defined
 
+    - name: Durably persist every Kubernetes recovery access artifact
+      ansible.builtin.command:
+        argv:
+          - /opt/e2e/scripts/durable_io.py
+          - sync-file
+          - "{{ item }}"
+      loop:
+        - "{{ e2e_kubeconfig }}"
+        - "{{ e2e_ssh_config }}"
+        - "{{ e2e_state_dir }}/known-hosts-bastion"
+      changed_when: false
+
+    - name: Mark Kubernetes ownership possible before creating any Kubernetes object
+      ansible.builtin.command:
+        argv:
+          - /opt/e2e/scripts/state-update.py
+          - "{{ e2e_state_file }}"
+          - kubernetesOwnersPossible
+          - "true"
+      changed_when: true
+
     - name: Create the cloud and RKE2 registration secrets
       ansible.builtin.shell: |
         set -euo pipefail
@@ -1539,15 +1615,6 @@
         executable: /bin/bash
       no_log: true
 
-    - name: Mark Kubernetes ownership possible before installing controllers
-      ansible.builtin.command:
-        argv:
-          - /opt/e2e/scripts/state-update.py
-          - "{{ e2e_state_file }}"
-          - kubernetesOwnersPossible
-          - "true"
-      changed_when: true
-
     - name: Install the released CRDs chart
       ansible.builtin.command:
         argv:
@@ -1555,9 +1622,7 @@
           - upgrade
           - --install
           - inspace-crds
-          - oci://ghcr.io/thanet-s/charts/inspace-cloud-kube-modules-crds
-          - --version
-          - "{{ lookup('env', 'INSPACE_E2E_VERSION') }}"
+          - "{{ e2e_state_dir }}/{{ e2e_release_images.charts['inspace-cloud-kube-modules-crds'].relativePath }}"
           - --namespace
           - kube-system
           - --wait
@@ -1572,9 +1637,7 @@
           - upgrade
           - --install
           - inspace
-          - oci://ghcr.io/thanet-s/charts/inspace-cloud-kube-modules
-          - --version
-          - "{{ lookup('env', 'INSPACE_E2E_VERSION') }}"
+          - "{{ e2e_state_dir }}/{{ e2e_release_images.charts['inspace-cloud-kube-modules'].relativePath }}"
           - --namespace
           - kube-system
           - --wait
@@ -1602,6 +1665,12 @@
           - "karpenter.clusterName={{ e2e_cluster_name }}"
           - --set
           - "karpenter.defaultNodeClass={{ e2e_nodeclass_name }}"
+          - --set-string
+          - "ccm.image.digest={{ e2e_release_images.images['inspace-cloud-controller-manager'].platformDigest }}"
+          - --set-string
+          - "csi.image.digest={{ e2e_release_images.images['inspace-csi-driver'].platformDigest }}"
+          - --set-string
+          - "karpenter.image.digest={{ e2e_release_images.images['karpenter-provider-inspace'].platformDigest }}"
       changed_when: true
 
     - name: Wait for all released controller workloads
@@ -1614,30 +1683,61 @@
         - deployment/inspace-karpenter
       changed_when: false
 
-    - name: Prove the chart launched the exact released product image tags
+    - name: Prove the chart and runtime launched the immutable released product digests
       ansible.builtin.shell: |
         set -euo pipefail
         version={{ lookup('env', 'INSPACE_E2E_VERSION') | quote }}
         registry={{ e2e_state.bootstrapCacheRegistry | quote }}
+        ccm_digest={{ e2e_release_images.images['inspace-cloud-controller-manager'].platformDigest | quote }}
+        csi_digest={{ e2e_release_images.images['inspace-csi-driver'].platformDigest | quote }}
+        karpenter_digest={{ e2e_release_images.images['karpenter-provider-inspace'].platformDigest | quote }}
         test "$(helm -n kube-system get values inspace -o json | jq -r '.global.inspace.systemImageRegistry')" = "$registry"
         test "$(kubectl -n kube-system get deployment/inspace-ccm -o json | jq -r '.spec.template.spec.containers[] | select(.name=="cloud-controller-manager") | .image')" = \
-          "$registry/thanet-s/inspace-cloud-controller-manager:$version"
+          "$registry/thanet-s/inspace-cloud-controller-manager@$ccm_digest"
         test "$(kubectl -n kube-system get deployment/inspace-csi-controller -o json | jq -r '.spec.template.spec.containers[] | select(.name=="driver") | .image')" = \
-          "$registry/thanet-s/inspace-csi-driver:$version"
+          "$registry/thanet-s/inspace-csi-driver@$csi_digest"
         test "$(kubectl -n kube-system get daemonset/inspace-csi-node -o json | jq -r '.spec.template.spec.containers[] | select(.name=="driver") | .image')" = \
-          "$registry/thanet-s/inspace-csi-driver:$version"
+          "$registry/thanet-s/inspace-csi-driver@$csi_digest"
         test "$(kubectl -n kube-system get deployment/inspace-karpenter -o json | jq -r '.spec.template.spec.containers[] | select(.name=="controller") | .image')" = \
-          "$registry/thanet-s/karpenter-provider-inspace:$version"
+          "$registry/thanet-s/karpenter-provider-inspace@$karpenter_digest"
         test "$(kubectl -n kube-system get deployment/inspace-csi-controller -o json | jq -r '.spec.template.spec.containers[] | select(.name=="csi-provisioner") | .image')" = \
           "$registry/sig-storage/csi-provisioner:v5.2.0"
+        test "$(kubectl -n kube-system get deployment/inspace-csi-controller -o json | jq -r '.spec.template.spec.containers[] | select(.name=="csi-provisioner") | [.args[] | select(. == "--timeout=600s")] | length')" = \
+          "1"
         test "$(kubectl -n kube-system get deployment/inspace-csi-controller -o json | jq -r '.spec.template.spec.containers[] | select(.name=="csi-attacher") | .image')" = \
           "$registry/sig-storage/csi-attacher:v4.8.1"
+        test "$(kubectl -n kube-system get deployment/inspace-csi-controller -o json | jq -r '.spec.template.spec.containers[] | select(.name=="csi-attacher") | [.args[] | select(. == "--timeout=600s")] | length')" = \
+          "1"
         test "$(kubectl -n kube-system get deployment/inspace-csi-controller -o json | jq -r '.spec.template.spec.containers[] | select(.name=="liveness-probe") | .image')" = \
           "$registry/sig-storage/livenessprobe:v2.15.0"
         test "$(kubectl -n kube-system get daemonset/inspace-csi-node -o json | jq -r '.spec.template.spec.containers[] | select(.name=="node-driver-registrar") | .image')" = \
           "$registry/sig-storage/csi-node-driver-registrar:v2.13.0"
         test "$(kubectl -n kube-system get daemonset/inspace-csi-node -o json | jq -r '.spec.template.spec.containers[] | select(.name=="liveness-probe") | .image')" = \
           "$registry/sig-storage/livenessprobe:v2.15.0"
+
+        require_runtime_digest() {
+          kind=$1
+          name=$2
+          container=$3
+          digest=$4
+          selector=$(kubectl -n kube-system get "$kind/$name" -o json | jq -er '
+            .spec.selector.matchLabels | to_entries |
+            if length == 0 then error("workload selector is empty")
+            else map(.key + "=" + (.value | tostring)) | join(",")
+            end')
+          kubectl -n kube-system get pods -l "$selector" -o json | jq -e \
+            --arg container "$container" --arg digest "$digest" '
+            (.items | length) > 0 and all(.items[];
+              any(.status.containerStatuses[]?;
+                .name == $container and
+                (.ready == true) and
+                (.imageID | type == "string") and
+                (.imageID | endswith("@" + $digest))))'
+        }
+        require_runtime_digest deployment inspace-ccm cloud-controller-manager "$ccm_digest"
+        require_runtime_digest deployment inspace-csi-controller driver "$csi_digest"
+        require_runtime_digest daemonset inspace-csi-node driver "$csi_digest"
+        require_runtime_digest deployment inspace-karpenter controller "$karpenter_digest"
       args:
         executable: /bin/bash
       changed_when: false

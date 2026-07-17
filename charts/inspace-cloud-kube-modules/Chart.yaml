@@ -16,3 +16,4 @@ annotations:
   artifacthub.io/containsSecurityUpdates: "false"
   org.opencontainers.image.licenses: Apache-2.0
   org.opencontainers.image.source: https://github.com/thanet-s/inspace-cloud-kube-modules
+  org.opencontainers.image.revision: ""

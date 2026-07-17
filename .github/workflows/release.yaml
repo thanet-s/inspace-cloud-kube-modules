@@ -83,15 +83,16 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Require a tag reachable from main
+      - name: Require main reachability and exact stable RC promotion
         shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+          EVENT_COMMIT: ${{ github.sha }}
         run: |
           set -euo pipefail
           git fetch --no-tags origin '+refs/heads/main:refs/remotes/origin/main'
-          if ! git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main; then
-            echo "Release tag target must be reachable from main" >&2
-            exit 1
-          fi
+          git fetch --tags origin
+          ./scripts/verify-release-tag.sh "$TAG" refs/remotes/origin/main "$EVENT_COMMIT"
 
   quality:
     name: Release quality gate
@@ -466,6 +467,7 @@ jobs:
         shell: bash
         env:
           VERSION: ${{ needs.validate.outputs.version }}
+          REVISION: ${{ github.sha }}
         run: |
           set -euo pipefail
           owner="${GITHUB_REPOSITORY_OWNER,,}"
@@ -480,6 +482,23 @@ jobs:
             echo "failed to pin every controller image tag to $VERSION" >&2
             exit 1
           fi
+          if [[ ! "$REVISION" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "release chart revision must be the exact event commit" >&2
+            exit 1
+          fi
+          for chart_file in \
+            charts/inspace-cloud-kube-modules-crds/Chart.yaml \
+            charts/inspace-cloud-kube-modules/Chart.yaml; do
+            if [[ "$(grep -Fxc '  org.opencontainers.image.revision: ""' "$chart_file")" -ne 1 ]]; then
+              echo "$chart_file must contain exactly one empty release-managed revision annotation" >&2
+              exit 1
+            fi
+            sed -i "s/^  org.opencontainers.image.revision: \"\"$/  org.opencontainers.image.revision: \"$REVISION\"/" "$chart_file"
+            if [[ "$(grep -Fxc "  org.opencontainers.image.revision: \"$REVISION\"" "$chart_file")" -ne 1 ]]; then
+              echo "failed to bind $chart_file to $REVISION" >&2
+              exit 1
+            fi
+          done
           helm lint charts/inspace-cloud-kube-modules-crds
           helm lint charts/inspace-cloud-kube-modules \
             --values charts/inspace-cloud-kube-modules/ci/test-values.yaml
@@ -496,6 +515,14 @@ jobs:
             echo "packaged chart does not pin every controller image tag to $VERSION" >&2
             exit 1
           fi
+          for package in \
+            "dist/inspace-cloud-kube-modules-crds-$VERSION.tgz" \
+            "dist/inspace-cloud-kube-modules-$VERSION.tgz"; do
+            if [[ "$(helm show chart "$package" | grep -Ec "^  org\\.opencontainers\\.image\\.revision: ['\\\"]?$REVISION['\\\"]?$")" -ne 1 ]]; then
+              echo "$package does not bind its exact release revision" >&2
+              exit 1
+            fi
+          done
           charts=(
             "inspace-cloud-kube-modules-crds|dist/inspace-cloud-kube-modules-crds-$VERSION.tgz"
             "inspace-cloud-kube-modules|dist/inspace-cloud-kube-modules-$VERSION.tgz"

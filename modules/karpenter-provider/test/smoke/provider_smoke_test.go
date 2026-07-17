@@ -157,8 +157,8 @@ func TestFakeProvisioningLifecycleMakesNoNetworkCalls(t *testing.T) {
 		}
 	}
 
-	if err := cloudProvider.Delete(ctx, created); err != nil {
-		t.Fatal(err)
+	if err := cloudProvider.Delete(ctx, created); !cloudprovider.IsNodeClaimNotFoundError(err) {
+		t.Fatalf("expected typed not-found after converged delete, got %v", err)
 	}
 	if _, err := cloudProvider.Get(ctx, created.Status.ProviderID); !cloudprovider.IsNodeClaimNotFoundError(err) {
 		t.Fatalf("expected not-found after delete, got %v", err)

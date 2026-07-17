@@ -15,6 +15,7 @@ import (
 	"math/big"
 	"net/netip"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 )
@@ -35,8 +36,15 @@ const (
 
 var (
 	moduleVersionPattern      = regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?$`)
+	imageDigestPattern        = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
 	bootstrapCacheHostPattern = regexp.MustCompile(`^cache\.[a-z0-9](?:[a-z0-9-]{0,53}[a-z0-9])?\.inspace\.internal$`)
 )
+
+var moduleImageNames = []string{
+	"inspace-cloud-controller-manager",
+	"inspace-csi-driver",
+	"karpenter-provider-inspace",
+}
 
 // NodeCacheConfig is the public trust and routing material injected into an
 // RKE2 node. The cache's private key is deliberately absent.
@@ -315,11 +323,31 @@ func source(repository, _ string, digest string) string {
 }
 
 func renderCacheImageManifest(rke2Version, moduleVersion string, disabled []string) (string, error) {
+	return renderCacheImageManifestWithDigests(rke2Version, moduleVersion, disabled, nil)
+}
+
+func renderCacheImageManifestWithDigests(rke2Version, moduleVersion string, disabled []string, moduleImageDigests map[string]string) (string, error) {
 	if rke2Version != bootstrapCacheRKE2Version {
 		return "", fmt.Errorf("bootstrap cache has no audited image inventory for RKE2 %s; use %s or set spec.bootstrapCache.directDownload=true", rke2Version, bootstrapCacheRKE2Version)
 	}
 	if !moduleVersionPattern.MatchString(moduleVersion) {
 		return "", fmt.Errorf("bootstrap cache requires an exact released module version, got %q", moduleVersion)
+	}
+	if moduleImageDigests != nil {
+		if len(moduleImageDigests) != len(moduleImageNames) {
+			return "", fmt.Errorf("bootstrap cache module image digests must contain exactly %d entries", len(moduleImageNames))
+		}
+		for _, component := range moduleImageNames {
+			digest, ok := moduleImageDigests[component]
+			if !ok || !imageDigestPattern.MatchString(digest) {
+				return "", fmt.Errorf("bootstrap cache module image digest for %s must be sha256:<64 lowercase hex>", component)
+			}
+		}
+		for component := range moduleImageDigests {
+			if !slices.Contains(moduleImageNames, component) {
+				return "", fmt.Errorf("bootstrap cache module image digest contains unknown component %q", component)
+			}
+		}
 	}
 	disabledSet := make(map[string]struct{}, len(disabled))
 	for _, component := range disabled {
@@ -335,9 +363,13 @@ func renderCacheImageManifest(rke2Version, moduleVersion string, disabled []stri
 		images = append(images, image)
 	}
 	images = append(images, fixedCacheImages...)
-	for _, component := range []string{"inspace-cloud-controller-manager", "inspace-csi-driver", "karpenter-provider-inspace"} {
+	for _, component := range moduleImageNames {
+		sourceReference := "docker://ghcr.io/thanet-s/" + component + ":" + moduleVersion
+		if moduleImageDigests != nil {
+			sourceReference = "docker://ghcr.io/thanet-s/" + component + "@" + moduleImageDigests[component]
+		}
 		images = append(images, cachedImage{
-			Source: "docker://ghcr.io/thanet-s/" + component + ":" + moduleVersion,
+			Source: sourceReference,
 			Target: "thanet-s/" + component + ":" + moduleVersion,
 		})
 	}

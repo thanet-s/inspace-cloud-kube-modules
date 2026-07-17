@@ -39,6 +39,15 @@
         mode: "0600"
       when: not e2e_cleanup_state_stat.stat.exists
 
+    - name: Durably persist the preflight-only final audit
+      ansible.builtin.command:
+        argv:
+          - /opt/e2e/scripts/durable_io.py
+          - sync-file
+          - "{{ e2e_state_dir }}/final-audit.json"
+      changed_when: false
+      when: not e2e_cleanup_state_stat.stat.exists
+
     - name: End cleanup after proven preflight-only failure
       ansible.builtin.meta: end_play
       when: not e2e_cleanup_state_stat.stat.exists
@@ -148,6 +157,28 @@
       when: e2e_cleanup_state.kubernetesOwnersPossible | default(false) | bool
 
     - name: Reload the ownership journal after recovery
+      ansible.builtin.set_fact:
+        e2e_cleanup_state: "{{ lookup('file', e2e_state_file) | from_json }}"
+      when: e2e_cleanup_state.kubernetesOwnersPossible | default(false) | bool
+
+    - name: Durably capture cloud identities before deleting Kubernetes owners
+      ansible.builtin.command:
+        argv:
+          - /opt/e2e/scripts/cloud-audit.py
+          - --state
+          - "{{ e2e_state_file }}"
+          - --owner
+          - "{{ e2e_cleanup_state.owner }}"
+          - --cluster
+          - "{{ e2e_cleanup_state.clusterName }}"
+          - --nodepool
+          - "{{ e2e_cleanup_state.nodePoolName }}"
+      register: e2e_predelete_cloud_audit
+      changed_when: true
+      no_log: true
+      when: e2e_cleanup_state.kubernetesOwnersPossible | default(false) | bool
+
+    - name: Reload the ownership journal after cloud identity capture
       ansible.builtin.set_fact:
         e2e_cleanup_state: "{{ lookup('file', e2e_state_file) | from_json }}"
       when: e2e_cleanup_state.kubernetesOwnersPossible | default(false) | bool
@@ -542,6 +573,14 @@
           } | to_nice_json }}
         dest: "{{ e2e_state_dir }}/final-audit.json"
         mode: "0600"
+
+    - name: Durably persist the final zero audit
+      ansible.builtin.command:
+        argv:
+          - /opt/e2e/scripts/durable_io.py
+          - sync-file
+          - "{{ e2e_state_dir }}/final-audit.json"
+      changed_when: false
 
     - name: Close the private API tunnel after the final zero audit
       ansible.builtin.command:

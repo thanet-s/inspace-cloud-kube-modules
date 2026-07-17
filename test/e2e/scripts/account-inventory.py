@@ -5,10 +5,11 @@ import argparse
 import json
 import os
 import pathlib
-import ssl
 import stat
 import tempfile
-import urllib.request
+import time
+
+from strict_inspace_api import scoped_api_get
 
 
 LOCATION_RESOURCE_PATHS = {
@@ -29,17 +30,11 @@ RESOURCE_PATHS = {**LOCATION_RESOURCE_PATHS, **GLOBAL_RESOURCE_PATHS}
 
 
 def api_get(path: str, location: str | None = None):
-    base = os.environ["INSPACE_API_URL"].rstrip("/")
-    endpoint = f"v1/{location}/{path}" if location else f"v1/{path}"
-    request = urllib.request.Request(
-        f"{base}/{endpoint}",
-        headers={"apikey": os.environ["INSPACE_API_TOKEN"], "User-Agent": "inspace-rke2-e2e-inventory/1"},
+    return scoped_api_get(
+        path,
+        location=location,
+        user_agent="inspace-rke2-e2e-inventory/2",
     )
-    with urllib.request.urlopen(request, timeout=60, context=ssl.create_default_context()) as response:
-        value = json.load(response)
-    if not isinstance(value, list):
-        raise SystemExit(f"{path} did not return an array")
-    return value
 
 
 def locations() -> list[str]:
@@ -92,6 +87,31 @@ def inventory() -> dict[str, list[str]]:
     return result
 
 
+def stable_inventory(
+    *,
+    inventory_reader=inventory,
+    read_count: int = 3,
+    delay_seconds: float = 1.0,
+    sleeper=time.sleep,
+) -> dict[str, list[str]]:
+    """Require multiple spaced, identical complete-account snapshots."""
+    if read_count < 3:
+        raise ValueError("a destructive inventory proof requires at least three reads")
+    if delay_seconds < 0:
+        raise ValueError("inventory read delay cannot be negative")
+    snapshots = []
+    for index in range(read_count):
+        snapshots.append(inventory_reader())
+        if index + 1 < read_count:
+            sleeper(delay_seconds)
+    anchor = snapshots[0]
+    if any(snapshot != anchor for snapshot in snapshots[1:]):
+        raise SystemExit(
+            "complete account inventory changed across three spaced strict reads"
+        )
+    return anchor
+
+
 def atomic_write(path: pathlib.Path, value: dict) -> None:
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     fd, temporary = tempfile.mkstemp(prefix=path.name + ".", dir=path.parent)
@@ -142,7 +162,7 @@ def main() -> None:
     compare.add_argument("--baseline", required=True)
     args = parser.parse_args()
 
-    current = inventory()
+    current = stable_inventory()
     if args.action == "capture":
         output = pathlib.Path(args.output)
         if output.exists():
@@ -150,6 +170,7 @@ def main() -> None:
         atomic_write(output, current)
         print(json.dumps({
             "captured": True,
+            "strictReadCount": 3,
             "counts": {key: len(value) for key, value in current.items()},
             "networks": current["networks"],
         }, sort_keys=True))
@@ -159,7 +180,13 @@ def main() -> None:
     extra = {key: sorted(set(current[key]) - set(baseline[key])) for key in RESOURCE_PATHS}
     missing = {key: sorted(set(baseline[key]) - set(current[key])) for key in RESOURCE_PATHS}
     difference_count = sum(len(value) for value in extra.values()) + sum(len(value) for value in missing.values())
-    result = {"matches": difference_count == 0, "differenceCount": difference_count, "extra": extra, "missing": missing}
+    result = {
+        "matches": difference_count == 0,
+        "strictReadCount": 3,
+        "differenceCount": difference_count,
+        "extra": extra,
+        "missing": missing,
+    }
     print(json.dumps(result, sort_keys=True))
     if difference_count != 0:
         raise SystemExit(1)

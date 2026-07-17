@@ -15,6 +15,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -41,6 +42,54 @@ type controllerLoopOptions struct {
 	OutputFormat   string
 	StandardOutput io.Writer
 	StandardError  io.Writer
+}
+
+var bootstrapCacheImageNames = []string{
+	"inspace-cloud-controller-manager",
+	"inspace-csi-driver",
+	"karpenter-provider-inspace",
+}
+
+func parseBootstrapCacheImageDigests(raw string) (map[string]string, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, nil
+	}
+	var values map[string]string
+	if err := json.Unmarshal([]byte(raw), &values); err != nil {
+		return nil, fmt.Errorf("decode INSPACE_BOOTSTRAP_CACHE_IMAGE_DIGESTS: %w", err)
+	}
+	if len(values) != len(bootstrapCacheImageNames) {
+		return nil, fmt.Errorf(
+			"INSPACE_BOOTSTRAP_CACHE_IMAGE_DIGESTS must contain exactly %d module images",
+			len(bootstrapCacheImageNames),
+		)
+	}
+	for _, image := range bootstrapCacheImageNames {
+		digest, ok := values[image]
+		if !ok || len(digest) != len("sha256:")+64 || !strings.HasPrefix(digest, "sha256:") {
+			return nil, fmt.Errorf(
+				"INSPACE_BOOTSTRAP_CACHE_IMAGE_DIGESTS[%q] must be sha256:<64 lowercase hex>",
+				image,
+			)
+		}
+		for _, character := range digest[len("sha256:"):] {
+			if !strings.ContainsRune("0123456789abcdef", character) {
+				return nil, fmt.Errorf(
+					"INSPACE_BOOTSTRAP_CACHE_IMAGE_DIGESTS[%q] must be sha256:<64 lowercase hex>",
+					image,
+				)
+			}
+		}
+	}
+	for image := range values {
+		if !slices.Contains(bootstrapCacheImageNames, image) {
+			return nil, fmt.Errorf(
+				"INSPACE_BOOTSTRAP_CACHE_IMAGE_DIGESTS contains unknown module image %q",
+				image,
+			)
+		}
+	}
+	return values, nil
 }
 
 func main() {
@@ -119,6 +168,10 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	moduleImageDigests, err := parseBootstrapCacheImageDigests(os.Getenv("INSPACE_BOOTSTRAP_CACHE_IMAGE_DIGESTS"))
+	if err != nil {
+		return err
+	}
 	allowMutations, err := strconv.ParseBool(defaultValue(os.Getenv("INSPACE_ALLOW_REMOTE_MUTATIONS"), "false"))
 	if err != nil {
 		return fmt.Errorf("parse INSPACE_ALLOW_REMOTE_MUTATIONS: %w", err)
@@ -136,6 +189,7 @@ func run() error {
 		StatusCompareAndSwap: newFileStatusCompareAndSwap(configPath),
 		ManagementCIDR:       managementCIDR, ManagementTCPPorts: ports,
 		BootstrapCacheKey: cacheKey, BootstrapCacheNotBefore: cacheNotBefore, ModuleVersion: buildversion.Version,
+		ModuleImageDigests: moduleImageDigests,
 	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()

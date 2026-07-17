@@ -1039,18 +1039,19 @@ func nodeLoadBalancerFirewallDetachAssignments(
 		if !validNodeLoadBalancerCloudUUID(firewall.UUID) {
 			return nil, "", fmt.Errorf("node load balancer: owned firewall has invalid UUID %q", firewall.UUID)
 		}
-		for _, resource := range firewall.ResourcesAssigned {
-			if !strings.EqualFold(resource.ResourceType, "vm") || !validNodeLoadBalancerCloudUUID(resource.ResourceUUID) {
-				return nil, "", fmt.Errorf("node load balancer: owned firewall %s has invalid assigned resource %#v", firewall.UUID, resource)
-			}
-			key := firewall.UUID + "/" + resource.ResourceUUID
+		resources, err := nodeLoadBalancerFirewallVMAssignments(firewall)
+		if err != nil {
+			return nil, "", err
+		}
+		for resourceUUID := range resources {
+			key := firewall.UUID + "/" + resourceUUID
 			if _, duplicate := seen[key]; duplicate {
 				continue
 			}
 			seen[key] = struct{}{}
 			assignments = append(assignments, nodeLoadBalancerFirewallDetachAssignment{
 				firewallUUID: firewall.UUID,
-				vmUUID:       resource.ResourceUUID,
+				vmUUID:       resourceUUID,
 			})
 		}
 	}
@@ -4338,16 +4339,13 @@ func (c *nodeLoadBalancerController) managedNodeLoadBalancerVMIdentityAuthoritat
 	if network == nil || network.UUID != c.provider.config.NetworkUUID {
 		return nil, "canonical VPC UUID does not exactly match the configured VPC", nil
 	}
-	memberships := 0
-	exactMembership := false
-	for _, vmUUID := range network.VMUUIDs {
-		if strings.EqualFold(vmUUID, identity.UUID) {
-			memberships++
-			exactMembership = exactMembership || vmUUID == identity.UUID
-		}
+	members, membershipErr := canonicalConfiguredVPCVMUUIDs(identity.Location, network)
+	if membershipErr != nil {
+		return nil, "canonical VPC membership is invalid: " + membershipErr.Error(), nil
 	}
-	if memberships != 1 || !exactMembership {
-		return nil, fmt.Sprintf("expected exactly one canonical VPC membership, found %d", memberships), nil
+	member, present := members[identity.UUID]
+	if !present || member != identity.UUID {
+		return nil, "expected exactly one canonical VPC membership", nil
 	}
 	if err := c.auditManagedNodeLoadBalancerBaseFirewall(
 		ctx,
@@ -6042,10 +6040,11 @@ func (c *nodeLoadBalancerController) serviceFirewallsDetached(
 	observed := make(map[string]struct{}, len(items))
 	for _, firewall := range items {
 		observed[firewall.UUID] = struct{}{}
-		for _, resource := range firewall.ResourcesAssigned {
-			if !strings.EqualFold(resource.ResourceType, "vm") || resource.ResourceUUID == "" {
-				return false, fmt.Errorf("node load balancer: firewall %s has invalid assigned resource %#v", firewall.UUID, resource)
-			}
+		assignments, assignmentErr := nodeLoadBalancerFirewallVMAssignments(firewall)
+		if assignmentErr != nil {
+			return false, assignmentErr
+		}
+		if len(assignments) != 0 {
 			if resetErr := c.resetServiceFirewallWithdrawalEvidence(ctx, current); resetErr != nil {
 				return false, resetErr
 			}

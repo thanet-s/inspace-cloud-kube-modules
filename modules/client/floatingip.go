@@ -3,10 +3,12 @@ package inspace
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/netip"
 	"net/url"
 	"strconv"
+	"strings"
 )
 
 func (c *Client) ListFloatingIPs(ctx context.Context, location string, filters *FloatingIPFilters) ([]FloatingIP, error) {
@@ -28,7 +30,30 @@ func (c *Client) ListFloatingIPs(ctx context.Context, location string, filters *
 	}
 	var result []FloatingIP
 	err = c.do(ctx, http.MethodGet, path, query, nil, &result)
-	return result, err
+	return validatedListResponse(result, err, http.MethodGet, path, func(address FloatingIP) (string, error) {
+		if err := validateFloatingIPResponseIdentity(&address, ""); err != nil {
+			return "", err
+		}
+		return address.Address, nil
+	})
+}
+
+func (c *Client) GetFloatingIP(ctx context.Context, location, address string) (*FloatingIP, error) {
+	if err := validatePublicIPv4(address); err != nil {
+		return nil, err
+	}
+	path, err := c.locationPath(location, "network/ip_addresses/"+address)
+	if err != nil {
+		return nil, err
+	}
+	var result FloatingIP
+	err = c.do(ctx, http.MethodGet, path, nil, nil, &result)
+	if err != nil {
+		err = bindExactFloatingIPLookupError(err, address)
+	} else {
+		err = validateFloatingIPResponseIdentity(&result, address)
+	}
+	return &result, err
 }
 
 func (c *Client) CreateFloatingIP(ctx context.Context, location string, input CreateFloatingIPRequest) (*FloatingIP, error) {
@@ -41,6 +66,9 @@ func (c *Client) CreateFloatingIP(ctx context.Context, location string, input Cr
 	}
 	var result FloatingIP
 	err = c.doJSON(ctx, http.MethodPost, path, nil, input, &result)
+	if err == nil {
+		err = validateFloatingIPResponseIdentity(&result, "")
+	}
 	return &result, err
 }
 
@@ -63,6 +91,9 @@ func (c *Client) UpdateFloatingIP(ctx context.Context, location, address string,
 	}
 	var result FloatingIP
 	err = c.doJSON(ctx, http.MethodPatch, path, nil, input, &result)
+	if err == nil {
+		err = validateFloatingIPResponseIdentity(&result, address)
+	}
 	return &result, err
 }
 
@@ -86,6 +117,18 @@ func (c *Client) AssignFloatingIP(ctx context.Context, location, address, resour
 	err = c.doJSON(ctx, http.MethodPost, path, nil, map[string]string{
 		"assigned_to": resourceUUID, "assigned_to_resource_type": resourceType,
 	}, &result)
+	if err == nil {
+		err = validateFloatingIPResponseIdentity(&result, address)
+	}
+	if err == nil && (!strings.EqualFold(result.AssignedTo, resourceUUID) || result.AssignedToResourceType != resourceType) {
+		err = fmt.Errorf(
+			"inspace: floating IP assignment response does not match requested resource: got %q/%q, want %q/%q",
+			result.AssignedTo,
+			result.AssignedToResourceType,
+			resourceUUID,
+			resourceType,
+		)
+	}
 	return &result, err
 }
 
@@ -99,6 +142,16 @@ func (c *Client) UnassignFloatingIP(ctx context.Context, location, address strin
 	}
 	var result FloatingIP
 	err = c.doJSON(ctx, http.MethodPost, path, nil, nil, &result)
+	if err == nil {
+		err = validateFloatingIPResponseIdentity(&result, address)
+	}
+	if err == nil && (result.AssignedTo != "" || result.AssignedToResourceType != "") {
+		err = fmt.Errorf(
+			"inspace: floating IP unassignment response still reports resource %q/%q",
+			result.AssignedTo,
+			result.AssignedToResourceType,
+		)
+	}
 	return &result, err
 }
 
@@ -117,6 +170,57 @@ func validatePublicIPv4(value string) error {
 	address, err := netip.ParseAddr(value)
 	if err != nil || !address.Is4() || !address.IsGlobalUnicast() || address.IsPrivate() {
 		return errors.New("inspace: floating IP address must be a public IPv4 address")
+	}
+	return nil
+}
+
+func validateFloatingIPResponseIdentity(result *FloatingIP, expectedAddress string) error {
+	if result == nil {
+		return errors.New("inspace: floating IP response is nil")
+	}
+	if err := validatePublicIPv4(result.Address); err != nil {
+		return fmt.Errorf("inspace: malformed floating IP response identity: %w", err)
+	}
+	if expectedAddress != "" && result.Address != expectedAddress {
+		return fmt.Errorf("inspace: floating IP response address %q does not match expected address %q", result.Address, expectedAddress)
+	}
+	if result.UUID != "" {
+		if err := validateResponseUUID("floating IP", result.UUID); err != nil {
+			return err
+		}
+	}
+	if !result.assignedToPresent {
+		return errors.New("inspace: malformed floating IP response: assigned_to field is omitted")
+	}
+	if result.AssignedTo == "" {
+		if result.AssignedToResourceType != "" || result.AssignedToPrivateIP != "" {
+			return fmt.Errorf(
+				"inspace: malformed unassigned floating IP response: resource type/private IP is %q/%q",
+				result.AssignedToResourceType,
+				result.AssignedToPrivateIP,
+			)
+		}
+		return nil
+	}
+	if err := validateResponseUUID("floating IP assigned resource", result.AssignedTo); err != nil {
+		return err
+	}
+	switch result.AssignedToResourceType {
+	case "virtual_machine", "service", "load_balancer":
+	default:
+		return fmt.Errorf(
+			"inspace: malformed floating IP response resource type %q",
+			result.AssignedToResourceType,
+		)
+	}
+	if result.AssignedToPrivateIP != "" {
+		privateAddress, err := netip.ParseAddr(result.AssignedToPrivateIP)
+		if err != nil || !privateAddress.Is4() || !privateAddress.IsPrivate() {
+			return fmt.Errorf(
+				"inspace: malformed floating IP response private address %q",
+				result.AssignedToPrivateIP,
+			)
+		}
 	}
 	return nil
 }

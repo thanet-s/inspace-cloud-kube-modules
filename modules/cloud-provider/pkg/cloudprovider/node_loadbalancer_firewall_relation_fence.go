@@ -117,6 +117,9 @@ func nodeLoadBalancerFirewallVMAssignments(firewall inspace.Firewall) (map[strin
 	if !validNodeLoadBalancerCloudUUID(firewall.UUID) {
 		return nil, fmt.Errorf("node load balancer: firewall has invalid UUID %q", firewall.UUID)
 	}
+	if firewall.ResourcesAssigned == nil {
+		return nil, fmt.Errorf("node load balancer: firewall %s omitted resources_assigned", firewall.UUID)
+	}
 	result := make(map[string]struct{}, len(firewall.ResourcesAssigned))
 	for _, resource := range firewall.ResourcesAssigned {
 		if !strings.EqualFold(resource.ResourceType, "vm") || !validNodeLoadBalancerCloudUUID(resource.ResourceUUID) {
@@ -295,6 +298,10 @@ func (c *nodeLoadBalancerController) nodeLoadBalancerFirewallRelationVMCloudAuth
 	if network == nil || network.UUID != c.provider.config.NetworkUUID {
 		return false, false, errors.New("node load balancer: relation VM VPC identity changed")
 	}
+	members, membershipErr := canonicalConfiguredVPCVMUUIDs(c.provider.config.Location, network)
+	if membershipErr != nil {
+		return false, false, fmt.Errorf("node load balancer: relation VM VPC membership is invalid: %w", membershipErr)
+	}
 	listMatches := 0
 	var listed *inspace.VM
 	for index := range items {
@@ -309,12 +316,9 @@ func (c *nodeLoadBalancerController) nodeLoadBalancerFirewallRelationVMCloudAuth
 	}
 	memberships := 0
 	exactMembership := false
-	for _, candidate := range network.VMUUIDs {
-		if !strings.EqualFold(candidate, vmUUID) {
-			continue
-		}
-		memberships++
-		exactMembership = exactMembership || candidate == vmUUID
+	if member, present := members[vmUUID]; present {
+		memberships = 1
+		exactMembership = member == vmUUID
 	}
 	if exactAbsent {
 		if listMatches == 0 && memberships == 0 {
@@ -584,6 +588,9 @@ func exactNodeLoadBalancerFirewallFromItems(items []inspace.Firewall, uuid strin
 	}
 	if matches != 1 || exact == nil {
 		return nil, fmt.Errorf("node load balancer: firewall UUID %s has %d case-folded rows and no unique exact authority", uuid, matches)
+	}
+	if _, err := nodeLoadBalancerFirewallVMAssignments(*exact); err != nil {
+		return nil, err
 	}
 	return exact, nil
 }

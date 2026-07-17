@@ -149,6 +149,10 @@ func TestDocumentedResourceContracts(t *testing.T) {
 	if err != nil || len(ips) != 1 || ips[0].Address != floatingIP {
 		t.Fatalf("ListFloatingIPs() = %#v, %v", ips, err)
 	}
+	exactIP, err := client.GetFloatingIP(ctx, "bkk01", floatingIP)
+	if err != nil || exactIP.Address != floatingIP || exactIP.AssignedTo != "" {
+		t.Fatalf("GetFloatingIP() = %#v, %v", exactIP, err)
+	}
 	assignedIP, err := client.AssignFloatingIP(ctx, "bkk01", floatingIP, vmUUID, "virtual_machine")
 	if err != nil || assignedIP.AssignedTo != vmUUID {
 		t.Fatalf("AssignFloatingIP() = %#v, %v", assignedIP, err)
@@ -259,11 +263,12 @@ func contractHandler(t *testing.T) http.HandlerFunc {
 		case "POST /v1/bkk01/network/load_balancers/" + lbUUID + "/targets":
 			writeLiteral(w, http.StatusOK, `{"target_uuid":"`+vmUUID+`","target_type":"vm","target_ip_address":"10.0.0.10"}`)
 		case "POST /v1/bkk01/network/load_balancers/" + lbUUID + "/forwarding_rules":
-			writeLiteral(w, http.StatusOK, `{"uuid":"`+ruleUUID+`","protocol":"TCP","source_port":6443,"target_port":6443}`)
+			// The official response example contains only the two ports.
+			writeLiteral(w, http.StatusOK, `{"source_port":6443,"target_port":6443}`)
 		case "DELETE /v1/bkk01/network/load_balancers/" + lbUUID + "/targets/" + vmUUID,
 			"DELETE /v1/bkk01/network/load_balancers/" + lbUUID + "/forwarding_rules/" + ruleUUID,
 			"DELETE /v1/bkk01/network/load_balancers/" + lbUUID:
-			w.WriteHeader(http.StatusNoContent)
+			w.WriteHeader(http.StatusOK)
 		case "GET /v1/bkk01/network/firewalls":
 			writeLiteral(w, http.StatusOK, `[{"uuid":"`+firewallUUID+`","display_name":"k8s-firewall","billing_account_id":129673,"rules":[{"protocol":"tcp","direction":"inbound","port_start":6443,"port_end":6443,"endpoint_spec_type":"ip_prefixes","endpoint_spec":["10.4.200.0/24"]}],"resources_assigned":[]}]`)
 		case "POST /v1/bkk01/network/firewalls":
@@ -305,12 +310,14 @@ func contractHandler(t *testing.T) http.HandlerFunc {
 				t.Errorf("floating IP query = %s", r.URL.RawQuery)
 			}
 			writeLiteral(w, http.StatusOK, "["+floatingIPLiteral(false)+"]")
+		case "GET /v1/bkk01/network/ip_addresses/" + floatingIP:
+			writeLiteral(w, http.StatusOK, floatingIPLiteral(false))
 		case "POST /v1/bkk01/network/ip_addresses/" + floatingIP + "/assign":
 			writeLiteral(w, http.StatusOK, floatingIPLiteral(true))
 		case "POST /v1/bkk01/network/ip_addresses/" + floatingIP + "/unassign":
 			writeLiteral(w, http.StatusOK, floatingIPLiteral(false))
 		case "DELETE /v1/bkk01/network/ip_addresses/" + floatingIP:
-			w.WriteHeader(http.StatusNoContent)
+			w.WriteHeader(http.StatusOK)
 		default:
 			t.Errorf("unexpected request %s %s", r.Method, r.URL.String())
 			http.NotFound(w, r)
