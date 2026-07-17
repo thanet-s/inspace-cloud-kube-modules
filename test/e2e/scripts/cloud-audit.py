@@ -449,6 +449,36 @@ def stable_audit(
     return anchor
 
 
+def persist_audit_identities(
+    state_path: pathlib.Path,
+    state: dict,
+    result: dict,
+    *,
+    allow_missing_state: bool,
+) -> None:
+    """Persist discovered identities, except for a proven-empty preflight."""
+    if not state_path.exists():
+        if not allow_missing_state:
+            raise SystemExit("ownership journal is missing")
+        if result.get("count") != 0:
+            raise SystemExit(
+                "preflight found owned resources without an ownership journal"
+            )
+        return
+    record_known_cloud_identities(
+        state_path,
+        state,
+        vm_uuids=(item["uuid"] for item in result["vms"]),
+        disk_uuids=(item["uuid"] for item in result["disks"]),
+        load_balancer_uuids=(
+            item["uuid"] for item in result["loadBalancers"]
+        ),
+        floating_ip_addresses=(
+            item["address"] for item in result["floatingIPs"]
+        ),
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--state", required=True)
@@ -458,9 +488,10 @@ def main() -> None:
     args = parser.parse_args()
 
     state_path = pathlib.Path(args.state)
+    allow_missing_state = os.getenv("E2E_AUDIT_ALLOW_MISSING_STATE") == "true"
     if state_path.exists():
         state = json.loads(state_path.read_text(encoding="utf-8"))
-    elif os.getenv("E2E_AUDIT_ALLOW_MISSING_STATE") == "true":
+    elif allow_missing_state:
         state = {}
     else:
         raise SystemExit("ownership journal is missing")
@@ -473,17 +504,11 @@ def main() -> None:
         args.cluster,
         args.nodepool,
     )
-    record_known_cloud_identities(
+    persist_audit_identities(
         state_path,
         state,
-        vm_uuids=(item["uuid"] for item in result["vms"]),
-        disk_uuids=(item["uuid"] for item in result["disks"]),
-        load_balancer_uuids=(
-            item["uuid"] for item in result["loadBalancers"]
-        ),
-        floating_ip_addresses=(
-            item["address"] for item in result["floatingIPs"]
-        ),
+        result,
+        allow_missing_state=allow_missing_state,
     )
     print(json.dumps(result, sort_keys=True))
 
