@@ -324,6 +324,16 @@ def test_list_identity_contracts() -> None:
     }
     for route, value in valid_lists.items():
         StrictInSpaceAPI._validate_endpoint_value(route, value)  # noqa: SLF001
+    StrictInSpaceAPI._validate_endpoint_value(  # noqa: SLF001
+        "network/ip_addresses",
+        [
+            {
+                "address": "203.0.113.11",
+                "name": "live-unassigned",
+                "unassigned_at": "2026-07-17T09:54:01Z",
+            }
+        ],
+    )
 
     invalid_rows = (
         (
@@ -339,7 +349,31 @@ def test_list_identity_contracts() -> None:
         (
             "network/ip_addresses",
             [{"address": "203.0.113.10", "name": ""}],
-            "floating-IP assignment omission",
+            "floating-IP assignment and unassignment-marker omission",
+        ),
+        (
+            "network/ip_addresses",
+            [
+                {
+                    "address": "203.0.113.10",
+                    "name": "",
+                    "unassigned_at": "2026-07-17T09:54:01Z",
+                    "assigned_to_resource_type": "virtual_machine",
+                }
+            ],
+            "floating-IP omitted assignment with contradictory resource type",
+        ),
+        (
+            "network/ip_addresses",
+            [
+                {
+                    "address": "203.0.113.10",
+                    "name": "",
+                    "unassigned_at": "2026-07-17T09:54:01Z",
+                    "assigned_to_private_ip": "10.91.72.254",
+                }
+            ],
+            "floating-IP omitted assignment with contradictory private address",
         ),
         (
             "network/load_balancers",

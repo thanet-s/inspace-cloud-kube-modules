@@ -3095,6 +3095,9 @@ def main() -> None:
     bootstrap_discovery_module = load_script_module(
         "e2e_discover_bootstrap_static", ROOT / "scripts/discover-bootstrap.py"
     )
+    require(hasattr(bootstrap_discovery_module, "ssl") and
+            callable(bootstrap_discovery_module.ssl.PEM_cert_to_DER_cert),
+            "bootstrap discovery must load the TLS parser used to validate the cache CA")
     require(bootstrap_discovery_module.require_cluster_resource_name("a" * 55) == "a" * 55,
             "bootstrap discovery rejected the longest valid cluster resource name")
     try:
