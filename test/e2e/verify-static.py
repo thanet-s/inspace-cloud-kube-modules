@@ -250,6 +250,7 @@ def verify_host_launcher_external_allow_list() -> None:
             "INSPACE_E2E_SSH_PRIVATE_KEY": str(root / "id_rsa"),
             "INSPACE_E2E_SSH_PUBLIC_KEY": str(root / "id_rsa.pub"),
             "INSPACE_E2E_STATE_VOLUME": "static-contract-state",
+            "INSPACE_E2E_SOURCE_ROOT": str(repository_root()),
             "CONFIRM_INSPACE_CLUSTER_E2E": "static-contract-account",
             "INSPACE_E2E_VERSION": "0.0.0-static",
         }

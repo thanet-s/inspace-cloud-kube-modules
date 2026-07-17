@@ -3,7 +3,6 @@ package v1alpha1
 import (
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -30,7 +29,7 @@ func TestClusterE2EHostEntrypointOnlyLaunchesDocker(t *testing.T) {
 		`docker volume create "$state_volume"`,
 		`--file test/e2e/Dockerfile`,
 		`--target published-live`,
-		`CONTROLLER_IMAGE=ghcr.io/thanet-s/inspace-cloud-controller-manager:$INSPACE_E2E_VERSION`,
+		`CONTROLLER_IMAGE=ghcr.io/thanet-s/inspace-cloud-controller-manager@$ccm_platform_digest`,
 		`--tag "$runner_image"`,
 		"docker run --rm",
 		`type=bind,src=$env_file,dst=/run/config/workspace.env,readonly`,
@@ -39,8 +38,6 @@ func TestClusterE2EHostEntrypointOnlyLaunchesDocker(t *testing.T) {
 	} {
 		mustContain(t, "host launcher", run, expected)
 	}
-	assertHostLauncherExternalCommandAllowList(t, runPath)
-
 	dockerfile := readE2E(t, "Dockerfile")
 	entrypoint := readE2E(t, "scripts/container-entrypoint.sh")
 	for _, expected := range []string{
@@ -441,94 +438,6 @@ type ansiblePlay struct {
 	HasSerial bool             `json:"-"`
 }
 
-func assertHostLauncherExternalCommandAllowList(t *testing.T, runPath string) {
-	t.Helper()
-	for _, scenario := range []struct {
-		name        string
-		inspectFail bool
-	}{
-		{name: "existing volume"},
-		{name: "missing volume is created", inspectFail: true},
-	} {
-		t.Run(scenario.name, func(t *testing.T) {
-			dir := t.TempDir()
-			binDir := filepath.Join(dir, "bin")
-			if err := os.Mkdir(binDir, 0o700); err != nil {
-				t.Fatal(err)
-			}
-			dockerLog := filepath.Join(dir, "docker.log")
-			unknownLog := filepath.Join(dir, "unknown.log")
-			dockerPath := filepath.Join(binDir, "docker")
-			if err := os.WriteFile(dockerPath, []byte(`#!/bin/sh
-printf '%s\n' "$*" >> "$E2E_DOCKER_LOG"
-if [ "${E2E_DOCKER_INSPECT_FAIL:-false}" = true ] && [ "$1" = volume ] && [ "$2" = inspect ]; then
-  exit 1
-fi
-`), 0o700); err != nil {
-				t.Fatal(err)
-			}
-			bashEnv := filepath.Join(dir, "bash-env")
-			if err := os.WriteFile(bashEnv, []byte("command_not_found_handle() { printf '%s\\n' \"$1\" >> \"$E2E_UNKNOWN_COMMAND_LOG\"; return 127; }\n"), 0o600); err != nil {
-				t.Fatal(err)
-			}
-			for name, contents := range map[string]string{
-				"workspace.env": "INSPACE_API_TOKEN=not-a-real-token\n",
-				"id_rsa":        "not-a-real-private-key\n",
-				"id_rsa.pub":    "ssh-ed25519 not-a-real-public-key\n",
-			} {
-				if err := os.WriteFile(filepath.Join(dir, name), []byte(contents), 0o600); err != nil {
-					t.Fatal(err)
-				}
-			}
-			absoluteRunPath, err := filepath.Abs(runPath)
-			if err != nil {
-				t.Fatal(err)
-			}
-			command := exec.Command("/bin/bash", "-x", absoluteRunPath)
-			command.Env = []string{
-				"PATH=" + binDir,
-				"HOME=" + dir,
-				"BASH_ENV=" + bashEnv,
-				"E2E_DOCKER_LOG=" + dockerLog,
-				"E2E_UNKNOWN_COMMAND_LOG=" + unknownLog,
-				fmt.Sprintf("E2E_DOCKER_INSPECT_FAIL=%t", scenario.inspectFail),
-				"INSPACE_E2E_ENV_FILE=" + filepath.Join(dir, "workspace.env"),
-				"INSPACE_E2E_SSH_PRIVATE_KEY=" + filepath.Join(dir, "id_rsa"),
-				"INSPACE_E2E_SSH_PUBLIC_KEY=" + filepath.Join(dir, "id_rsa.pub"),
-				"INSPACE_E2E_STATE_VOLUME=static-contract-state",
-				"CONFIRM_INSPACE_CLUSTER_E2E=static-contract-account",
-				"INSPACE_E2E_VERSION=0.0.0-static",
-			}
-			output, err := command.CombinedOutput()
-			if err != nil {
-				t.Fatalf("host launcher failed with a Docker-only PATH: %v\n%s", err, output)
-			}
-			assertHostLauncherTraceAllowList(t, string(output))
-			if unknown, err := os.ReadFile(unknownLog); err == nil && len(strings.TrimSpace(string(unknown))) != 0 {
-				t.Fatalf("host launcher attempted non-Docker external commands: %s", unknown)
-			} else if err != nil && !os.IsNotExist(err) {
-				t.Fatal(err)
-			}
-			logBytes, err := os.ReadFile(dockerLog)
-			if err != nil {
-				t.Fatal(err)
-			}
-			calls := strings.Split(strings.TrimSpace(string(logBytes)), "\n")
-			want := expectedHostLauncherDockerCalls(dir, scenario.inspectFail)
-			if !equalStrings(calls, want) {
-				t.Fatalf("host launcher Docker calls:\n got: %q\nwant: %q", calls, want)
-			}
-		})
-	}
-}
-
-func assertHostLauncherTraceAllowList(t *testing.T, trace string) {
-	t.Helper()
-	if err := validateHostLauncherTraceAllowList(trace); err != nil {
-		t.Fatal(err)
-	}
-}
-
 func validateHostLauncherTraceAllowList(trace string) error {
 	traceLine := regexp.MustCompile(`^\++ (.*)$`)
 	assignment := regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*=.*$`)
@@ -544,10 +453,15 @@ func validateHostLauncherTraceAllowList(trace string) error {
 		traced++
 		commandLine := match[1]
 		commandWord := strings.Fields(commandLine)[0]
-		if commandWord == "command" && commandLine != "command -v docker" {
-			return fmt.Errorf("host launcher command builtin is restricted to exact command -v docker: %s", commandLine)
+		if commandWord == "command" && commandLine != "command -v docker" && commandLine != "command -v git" {
+			return fmt.Errorf("host launcher command builtin is restricted to exact command -v docker/git: %s", commandLine)
 		}
-		if !assignment.MatchString(commandLine) && commandLine != "command -v docker" && !allowed[commandWord] {
+		isSourceVerifier := strings.HasPrefix(commandLine, "/bin/bash test/e2e/scripts/verify-release-source.sh ")
+		if !assignment.MatchString(commandLine) &&
+			commandLine != "command -v docker" &&
+			commandLine != "command -v git" &&
+			!isSourceVerifier &&
+			!allowed[commandWord] {
 			return fmt.Errorf("host launcher executed a command outside the Docker/builtin allow-list: %s", commandLine)
 		}
 	}
@@ -555,31 +469,6 @@ func validateHostLauncherTraceAllowList(trace string) error {
 		return fmt.Errorf("host launcher produced no Bash execution trace")
 	}
 	return nil
-}
-
-func expectedHostLauncherDockerCalls(dir string, inspectFail bool) []string {
-	volume := "static-contract-state"
-	calls := []string{"volume inspect " + volume}
-	if inspectFail {
-		calls = append(calls, "volume create "+volume)
-	}
-	calls = append(calls,
-		"build --platform linux/amd64 --file test/e2e/Dockerfile --target published-live --build-arg CONTROLLER_IMAGE=ghcr.io/thanet-s/inspace-cloud-controller-manager:0.0.0-static --tag inspace-cloud-rke2-e2e:local .",
-		strings.Join([]string{
-			"run --rm --platform linux/amd64",
-			"--env CONFIRM_INSPACE_CLUSTER_E2E=static-contract-account",
-			"--env INSPACE_E2E_VERSION=0.0.0-static",
-			"--env INSPACE_E2E_KEEP_RESOURCES=false",
-			"--env INSPACE_E2E_RUN_ID=",
-			"--env INSPACE_E2E_RECOVER_RETAINED=false",
-			"--mount type=bind,src=" + filepath.Join(dir, "workspace.env") + ",dst=/run/config/workspace.env,readonly",
-			"--mount type=bind,src=" + filepath.Join(dir, "id_rsa") + ",dst=/run/secrets/e2e_ssh_key,readonly",
-			"--mount type=bind,src=" + filepath.Join(dir, "id_rsa.pub") + ",dst=/run/secrets/e2e_ssh_key.pub,readonly",
-			"--mount type=volume,src=" + volume + ",dst=/state",
-			"inspace-cloud-rke2-e2e:local all",
-		}, " "),
-	)
-	return calls
 }
 
 func validateNoJinjaControlDirectives(document string) error {
@@ -592,7 +481,7 @@ func validateNoJinjaControlDirectives(document string) error {
 }
 
 func TestHostLauncherTraceAllowListRejectsCommandBuiltinBypasses(t *testing.T) {
-	valid := "+ command -v docker\n+ docker volume inspect static-contract-state\n"
+	valid := "+ command -v docker\n+ command -v git\n+ /bin/bash test/e2e/scripts/verify-release-source.sh 0.0.0-static\n+ docker volume inspect static-contract-state\n"
 	if err := validateHostLauncherTraceAllowList(valid); err != nil {
 		t.Fatalf("valid trace rejected: %v", err)
 	}

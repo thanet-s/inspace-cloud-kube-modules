@@ -6,7 +6,20 @@ set -Eeuo pipefail
 # execute inside the release-bound E2E runner container.
 script_dir=${BASH_SOURCE[0]%/*}
 [[ $script_dir != "${BASH_SOURCE[0]}" ]] || script_dir=.
-workspace=$(CDPATH='' cd -- "$script_dir/../.." && pwd)
+if [[ -n ${INSPACE_E2E_SOURCE_ROOT:-} ]]; then
+  [[ $INSPACE_E2E_SOURCE_ROOT == /* && $INSPACE_E2E_SOURCE_ROOT != *$'\n'* ]] || {
+    echo "INSPACE_E2E_SOURCE_ROOT must be an absolute path without newlines" >&2
+    exit 2
+  }
+  workspace=$(CDPATH='' cd -- "$INSPACE_E2E_SOURCE_ROOT" && pwd -P)
+else
+  workspace=$(CDPATH='' cd -- "$script_dir/../.." && pwd -P)
+fi
+[[ -f "$workspace/test/e2e/Dockerfile" &&
+   -f "$workspace/test/e2e/scripts/verify-release-source.sh" ]] || {
+  echo "E2E source root does not contain the expected release harness" >&2
+  exit 2
+}
 cd "$workspace"
 
 command -v docker >/dev/null 2>&1 || {
