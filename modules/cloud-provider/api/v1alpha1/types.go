@@ -130,6 +130,41 @@ type InSpaceClusterStatus struct {
 	ObservedGeneration   int64  `json:"observedGeneration,omitempty"`
 	ControlPlaneEndpoint string `json:"controlPlaneEndpoint,omitempty"`
 	Message              string `json:"message,omitempty"`
+	// CreateAttempts is the durable create/assignment/update mutation ledger. A
+	// controller must persist intent before marking an attempt issued, and must
+	// never replay an issued POST until authoritative cloud reads resolve it.
+	CreateAttempts map[string]ResourceCreateAttemptStatus `json:"createAttempts,omitempty"`
+	// DeleteAttempts is the durable exact-identity removal ledger. Issued
+	// destructive mutations are never replayed until an authoritative read
+	// resolves the exact VM, floating-IP, or firewall identity.
+	DeleteAttempts map[string]ResourceDeleteAttemptStatus `json:"deleteAttempts,omitempty"`
+}
+
+type ResourceCreateAttemptStatus struct {
+	ResourceKind string `json:"resourceKind"`
+	ResourceName string `json:"resourceName"`
+	IntentHash   string `json:"intentHash"`
+	Phase        string `json:"phase"`
+	IssueID      string `json:"issueID,omitempty"`
+	IssuedAt     string `json:"issuedAt,omitempty"`
+	ResourceUUID string `json:"resourceUUID,omitempty"`
+}
+
+type ResourceDeleteAttemptStatus struct {
+	ResourceKind        string `json:"resourceKind"`
+	ResourceName        string `json:"resourceName"`
+	ResourceUUID        string `json:"resourceUUID,omitempty"`
+	FirewallUUID        string `json:"firewallUUID,omitempty"`
+	RelatedResourceUUID string `json:"relatedResourceUUID,omitempty"`
+	Location            string `json:"location"`
+	Owner               string `json:"owner"`
+	Purpose             string `json:"purpose"`
+	Phase               string `json:"phase"`
+	IssueID             string `json:"issueID,omitempty"`
+	IssuedAt            string `json:"issuedAt,omitempty"`
+	AbsenceObservedAt   string `json:"absenceObservedAt,omitempty"`
+	FloatingIPName      string `json:"floatingIPName,omitempty"`
+	FloatingIPAddress   string `json:"floatingIPAddress,omitempty"`
 }
 
 // ValidationError identifies one invalid field without depending on a

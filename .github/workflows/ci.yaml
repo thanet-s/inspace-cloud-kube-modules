@@ -175,6 +175,9 @@ jobs:
       - name: Verify release-note filtering
         run: ./scripts/test-filter-release-notes.sh
 
+      - name: Verify live-harness mutation ambiguity recovery
+        run: python3 scripts/test-live-suite-mutation-safety.py
+
       - name: Set up Helm
         uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
         with:

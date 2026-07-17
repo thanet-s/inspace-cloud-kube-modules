@@ -58,11 +58,14 @@ spec:
             - --mode=controller
             - --location=$(INSPACE_LOCATION)
             - --api-base-url=$(INSPACE_API_BASE_URL)
+            - --network-uuid=$(INSPACE_NETWORK_UUID)
           env:
             - name: INSPACE_LOCATION
               value: {{ .Values.global.inspace.location | quote }}
             - name: INSPACE_API_BASE_URL
               value: {{ .Values.global.inspace.apiBaseURL | quote }}
+            - name: INSPACE_NETWORK_UUID
+              value: {{ .Values.global.inspace.networkUUID | quote }}
             - name: INSPACE_API_TOKEN
               valueFrom:
                 secretKeyRef:

@@ -42,6 +42,51 @@ func TestCreateFenceControllerUsesExactReadBeforeCloudCleanup(t *testing.T) {
 	}
 }
 
+func TestCreateFenceControllerInitializesRemovalFenceBeforeLiveClaimCanDelete(t *testing.T) {
+	claim := createFenceControllerClaim(t, createFenceMaterialized)
+	delete(claim.Annotations, AnnotationRemovalMutationFence)
+	kubeClient := createFenceControllerClient(t, claim)
+	cloud := &recordingFenceCleanupCloud{}
+	controller, err := NewCreateFenceController(kubeClient, kubeClient, cloud)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := controller.Reconcile(context.Background(), claim); err != nil {
+		t.Fatal(err)
+	}
+	var stored karpv1.NodeClaim
+	if err := kubeClient.Get(context.Background(), types.NamespacedName{Name: claim.Name}, &stored); err != nil {
+		t.Fatal(err)
+	}
+	record, err := decodeCreateFence(stored.Annotations[AnnotationCreateFence])
+	if err != nil {
+		t.Fatal(err)
+	}
+	removal, err := decodeRemovalMutationRecord(stored.Annotations[AnnotationRemovalMutationFence], record.Binding, record.Token)
+	if err != nil || removal.Phase != cloudapi.RemovalMutationReady {
+		t.Fatalf("migrated removal fence = %#v, %v", removal, err)
+	}
+	if cloud.calls != 0 {
+		t.Fatalf("live migration invoked cleanup cloud %d times", cloud.calls)
+	}
+}
+
+func TestCreateFenceControllerMissingRemovalFenceAfterDeletionFailsClosed(t *testing.T) {
+	claim := createFenceControllerClaim(t, createFenceMaterialized)
+	delete(claim.Annotations, AnnotationRemovalMutationFence)
+	now := metav1.Now()
+	claim.DeletionTimestamp = &now
+	kubeClient := createFenceControllerClient(t, claim)
+	cloud := &recordingFenceCleanupCloud{}
+	controller, _ := NewCreateFenceController(kubeClient, kubeClient, cloud)
+	if _, err := controller.Reconcile(context.Background(), claim); err == nil {
+		t.Fatal("deleting legacy claim without a pre-removal fence did not fail closed")
+	}
+	if cloud.calls != 0 {
+		t.Fatalf("missing removal fence reached cloud cleanup %d times", cloud.calls)
+	}
+}
+
 func TestCreateFenceControllerRetainsIssuedUnobservedAttempt(t *testing.T) {
 	now := metav1.NewTime(time.Now())
 	claim := createFenceControllerClaim(t, createFenceIssued)
@@ -80,6 +125,87 @@ func TestCreateFenceControllerReleasesReservedOnlyAfterCloudAbsence(t *testing.T
 	}
 	if containsString(stored.Finalizers, CreateFenceFinalizer) || stored.Annotations[AnnotationCreateFence] != "" || cloud.calls != 1 {
 		t.Fatalf("reserved cleanup did not converge: finalizers=%v annotation=%q calls=%d", stored.Finalizers, stored.Annotations[AnnotationCreateFence], cloud.calls)
+	}
+}
+
+func TestCreateFenceControllerRetriesFinalizerCASAfterUnrelatedNodeClaimUpdate(t *testing.T) {
+	now := metav1.NewTime(time.Now())
+	claim := createFenceControllerClaim(t, createFenceIssued)
+	claim.DeletionTimestamp = &now
+	record, err := decodeCreateFence(claim.Annotations[AnnotationCreateFence])
+	if err != nil {
+		t.Fatal(err)
+	}
+	anchorCreatedFence(&record)
+	rollbackAt := time.Now().Add(-time.Minute).UTC()
+	record.RollbackAt = &rollbackAt
+	dependentsResolvedAt := time.Now().Add(-30 * time.Second).UTC()
+	record.DependentsResolvedAt = &dependentsResolvedAt
+	claim.Annotations[AnnotationCreateFence] = mustEncodeCreateFence(record)
+	baseClient := createFenceControllerClient(t, claim)
+	kubeClient := &conflictOnceCreateFenceClient{
+		Client: baseClient,
+		mutate: func(current *karpv1.NodeClaim) {
+			if current.Labels == nil {
+				current.Labels = map[string]string{}
+			}
+			current.Labels["test.inspace.cloud/concurrent-update"] = "preserved"
+		},
+	}
+	cloud := &recordingFenceCleanupCloud{Cloud: cloudfake.New(), result: cloudapi.ErrNotFound}
+	controller, _ := NewCreateFenceController(kubeClient, kubeClient, cloud)
+
+	if _, err := controller.Reconcile(context.Background(), claim.DeepCopy()); err != nil {
+		t.Fatalf("Reconcile() after one finalizer CAS conflict = %v", err)
+	}
+	var stored karpv1.NodeClaim
+	if err := kubeClient.Get(context.Background(), types.NamespacedName{Name: claim.Name}, &stored); err != nil {
+		t.Fatal(err)
+	}
+	if containsString(stored.Finalizers, CreateFenceFinalizer) || stored.Annotations[AnnotationCreateFence] != "" {
+		t.Fatalf("finalizer cleanup did not converge: finalizers=%v annotation=%q", stored.Finalizers, stored.Annotations[AnnotationCreateFence])
+	}
+	if stored.Labels["test.inspace.cloud/concurrent-update"] != "preserved" {
+		t.Fatalf("finalizer cleanup lost concurrent NodeClaim update: labels=%v", stored.Labels)
+	}
+	if kubeClient.patchCalls != 2 || cloud.calls != 1 {
+		t.Fatalf("patch calls=%d cloud cleanup calls=%d, want one bounded CAS retry without repeating cloud cleanup", kubeClient.patchCalls, cloud.calls)
+	}
+}
+
+func TestCreateFenceControllerDoesNotReleaseProviderStateChangedAfterCloudAudit(t *testing.T) {
+	now := metav1.NewTime(time.Now())
+	claim := createFenceControllerClaim(t, createFenceRejected)
+	claim.DeletionTimestamp = &now
+	record, err := decodeCreateFence(claim.Annotations[AnnotationCreateFence])
+	if err != nil {
+		t.Fatal(err)
+	}
+	operatorResolution := mustOperatorResolution(t, createFenceOperatorResolution{
+		Schema: createFenceResolutionSchema, IssueID: record.IssueID, Result: createFenceResolutionNoResult,
+	})
+	baseClient := createFenceControllerClient(t, claim)
+	kubeClient := &conflictOnceCreateFenceClient{
+		Client: baseClient,
+		mutate: func(current *karpv1.NodeClaim) {
+			current.Annotations[AnnotationCreateFenceResolution] = operatorResolution
+		},
+	}
+	cloud := &recordingFenceCleanupCloud{Cloud: cloudfake.New(), result: cloudapi.ErrNotFound}
+	controller, _ := NewCreateFenceController(kubeClient, kubeClient, cloud)
+
+	if _, err := controller.Reconcile(context.Background(), claim.DeepCopy()); err == nil {
+		t.Fatal("Reconcile() released protection after provider-owned state changed")
+	}
+	var stored karpv1.NodeClaim
+	if err := kubeClient.Get(context.Background(), types.NamespacedName{Name: claim.Name}, &stored); err != nil {
+		t.Fatal(err)
+	}
+	if !containsString(stored.Finalizers, CreateFenceFinalizer) || stored.Annotations[AnnotationCreateFence] == "" || stored.Annotations[AnnotationCreateFenceResolution] != operatorResolution {
+		t.Fatalf("changed provider state lost protection: finalizers=%v fence=%q resolution=%q", stored.Finalizers, stored.Annotations[AnnotationCreateFence], stored.Annotations[AnnotationCreateFenceResolution])
+	}
+	if kubeClient.patchCalls != 1 || cloud.calls != 1 {
+		t.Fatalf("patch calls=%d cloud cleanup calls=%d, want changed fence to stop the in-place retry", kubeClient.patchCalls, cloud.calls)
 	}
 }
 
@@ -354,6 +480,27 @@ type recordingFenceCleanupCloud struct {
 	protectCalls int
 }
 
+type conflictOnceCreateFenceClient struct {
+	client.Client
+	mutate     func(*karpv1.NodeClaim)
+	patchCalls int
+}
+
+func (c *conflictOnceCreateFenceClient) Patch(ctx context.Context, object client.Object, patch client.Patch, options ...client.PatchOption) error {
+	c.patchCalls++
+	if c.patchCalls == 1 {
+		var current karpv1.NodeClaim
+		if err := c.Client.Get(ctx, client.ObjectKeyFromObject(object), &current); err != nil {
+			return err
+		}
+		c.mutate(&current)
+		if err := c.Client.Update(ctx, &current); err != nil {
+			return err
+		}
+	}
+	return c.Client.Patch(ctx, object, patch, options...)
+}
+
 func (c *recordingFenceCleanupCloud) ProtectFencedCreate(_ context.Context, _ cloudapi.FencedCreateCleanupRequest) error {
 	c.protectCalls++
 	return c.protectErr
@@ -386,17 +533,32 @@ func createFenceControllerClaim(t *testing.T, phase string) *karpv1.NodeClaim {
 		record.IssueID = "22222222222222222222222222222222"
 		issuedAt := time.Now().Add(-30 * time.Minute).UTC()
 		record.IssuedAt = &issuedAt
+		record.BaseFirewallAssignment.Phase = cloudapi.FirewallAssignmentIssued
+		record.BaseFirewallAssignment.IssueID = "33333333333333333333333333333333"
+		record.BaseFirewallAssignment.IssuedAt = &issuedAt
+		if phase == createFenceRejected {
+			record.BaseFirewallAssignment.Phase = cloudapi.FirewallAssignmentRejected
+			record.BaseFirewallAssignment.RejectedAt = &issuedAt
+		}
 	}
 	if phase == createFenceMaterialized {
 		observedAt := time.Now().Add(-20 * time.Minute).UTC()
 		record.LaunchObservedAt = &observedAt
 		record.CreatedVMUUID = "22222222-2222-4222-8222-222222222222"
+		record.BaseFirewallAssignment = &baseFirewallAssignmentRecord{
+			VMUUID: record.CreatedVMUUID, FirewallUUID: record.Cleanup.FirewallUUID,
+			Phase: cloudapi.FirewallAssignmentObserved, IssueID: "33333333333333333333333333333333",
+			IntentAt: observedAt.Add(-2 * time.Minute), IssuedAt: timePointer(observedAt.Add(-time.Minute)), ObservedAt: &observedAt,
+		}
 		record.ObservedAt = &observedAt
 		record.ObservedVMUUID = "22222222-2222-4222-8222-222222222222"
 		record.FloatingIPName = "fenced-public"
 		record.PublicIPv4 = "203.0.113.10"
 	}
-	claim.Annotations = map[string]string{AnnotationCreateFence: mustEncodeCreateFence(record)}
+	claim.Annotations = map[string]string{
+		AnnotationCreateFence:          mustEncodeCreateFence(record),
+		AnnotationRemovalMutationFence: mustEncodeRemovalMutation(newRemovalMutationReadyRecord(binding, record.Token, record.StartedAt)),
+	}
 	claim.Finalizers = append(claim.Finalizers, CreateFenceFinalizer)
 	return claim
 }
@@ -405,4 +567,7 @@ func anchorCreatedFence(record *createFenceRecord) {
 	observedAt := time.Now().Add(-20 * time.Minute).UTC()
 	record.LaunchObservedAt = &observedAt
 	record.CreatedVMUUID = "22222222-2222-4222-8222-222222222222"
+	record.BaseFirewallAssignment.VMUUID = record.CreatedVMUUID
 }
+
+func timePointer(value time.Time) *time.Time { return &value }

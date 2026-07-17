@@ -26,6 +26,10 @@ const (
 var (
 	// ErrMutationBlocked is returned before an unsafe request can reach the network.
 	ErrMutationBlocked = errors.New("inspace: mutation blocked for non-loopback API endpoint")
+	// ErrMutationRedirect prevents net/http from replaying a POST, PUT, PATCH,
+	// or DELETE at a redirect target. InSpace mutations do not expose an
+	// idempotency-key contract, so even a same-origin 307/308 is ambiguous.
+	ErrMutationRedirect = errors.New("inspace: mutation redirect blocked")
 	// ErrCrossOriginRedirect prevents an API key from following redirects to a
 	// different origin. This applies to read and write requests alike.
 	ErrCrossOriginRedirect = errors.New("inspace: cross-origin redirect blocked")
@@ -90,6 +94,9 @@ func NewClient(opts Options) (*Client, error) {
 	httpClientCopy := *httpClient
 	originalCheckRedirect := httpClientCopy.CheckRedirect
 	httpClientCopy.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if len(via) != 0 && isMutation(via[len(via)-1].Method) {
+			return fmt.Errorf("%w: %s to %s", ErrMutationRedirect, via[len(via)-1].Method, req.URL.Redacted())
+		}
 		if !sameOrigin(baseURL, req.URL) {
 			return fmt.Errorf("%w: %s", ErrCrossOriginRedirect, req.URL.Redacted())
 		}
@@ -232,7 +239,10 @@ func (c *Client) doBody(ctx context.Context, method, path string, query url.Valu
 	return nil
 }
 
-// APIError is a normalized non-2xx API response.
+// APIError is a normalized non-2xx API response. Retryable is only a scheduling
+// hint: for POST, PUT, PATCH, and DELETE, no HTTP status proves that the
+// mutation did not commit. Callers must resolve the outcome by authoritative
+// readback before replaying or releasing durable ownership.
 type APIError struct {
 	StatusCode int
 	Method     string
@@ -274,7 +284,8 @@ func newAPIError(method, path string, status int, data []byte) *APIError {
 		Method:     method,
 		Path:       path,
 		Message:    message,
-		Retryable:  status == http.StatusTooManyRequests || status >= 500,
+		Retryable: status == http.StatusRequestTimeout ||
+			status == http.StatusTooManyRequests || status >= 500,
 	}
 }
 

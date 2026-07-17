@@ -3,18 +3,117 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
 
+	"sigs.k8s.io/yaml"
+
 	"github.com/thanet-s/inspace-cloud-kube-modules/modules/cloud-provider/api/v1alpha1"
 	"github.com/thanet-s/inspace-cloud-kube-modules/modules/cloud-provider/pkg/bootstrap"
 )
+
+func TestFileStatusCompareAndSwapPersistsAndRejectsStaleWriter(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cluster.yaml")
+	cluster := &v1alpha1.InSpaceCluster{
+		APIVersion: v1alpha1.APIVersion,
+		Kind:       v1alpha1.Kind,
+		Metadata:   v1alpha1.ObjectMeta{Name: "unit", Namespace: "default"},
+	}
+	data, err := json.Marshal(cluster)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	desired := v1alpha1.InSpaceClusterStatus{CreateAttempts: map[string]v1alpha1.ResourceCreateAttemptStatus{
+		"firewall/bastion": {
+			ResourceKind: "firewall", ResourceName: "unit-bastion", IntentHash: strings.Repeat("a", 64), Phase: "intent",
+		},
+	}}
+	compareAndSwap := newFileStatusCompareAndSwap(path)
+	readback, err := compareAndSwap(context.Background(), cluster, v1alpha1.InSpaceClusterStatus{}, desired)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(readback, desired) {
+		t.Fatalf("status readback = %#v, want %#v", readback, desired)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("cluster config mode = %o, want 0600", info.Mode().Perm())
+	}
+	persistedData, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var persisted v1alpha1.InSpaceCluster
+	if err := yaml.UnmarshalStrict(persistedData, &persisted); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(persisted.Status, desired) {
+		t.Fatalf("persisted status = %#v, want %#v", persisted.Status, desired)
+	}
+	// Model a process restart: the second writer knows only the cluster and
+	// durable status loaded from disk, not any in-memory state from the first
+	// controller instance.
+	issued := cloneTestStatus(desired)
+	attempt := issued.CreateAttempts["firewall/bastion"]
+	attempt.Phase = "issued"
+	attempt.IssueID = strings.Repeat("b", 32)
+	attempt.IssuedAt = time.Now().UTC().Format(time.RFC3339Nano)
+	issued.CreateAttempts["firewall/bastion"] = attempt
+	restartedCompareAndSwap := newFileStatusCompareAndSwap(path)
+	restartedReadback, err := restartedCompareAndSwap(context.Background(), &persisted, persisted.Status, issued)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(restartedReadback, issued) {
+		t.Fatalf("restarted status readback = %#v, want %#v", restartedReadback, issued)
+	}
+	restartedData, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var restarted v1alpha1.InSpaceCluster
+	if err := yaml.UnmarshalStrict(restartedData, &restarted); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(restarted.Status, issued) {
+		t.Fatalf("status after restart = %#v, want %#v", restarted.Status, issued)
+	}
+	if _, err := compareAndSwap(context.Background(), cluster, v1alpha1.InSpaceClusterStatus{}, desired); err == nil || !strings.Contains(err.Error(), "compare-and-swap conflict") {
+		t.Fatalf("stale status CAS error = %v", err)
+	}
+}
+
+func cloneTestStatus(status v1alpha1.InSpaceClusterStatus) v1alpha1.InSpaceClusterStatus {
+	copy := status
+	if status.CreateAttempts != nil {
+		copy.CreateAttempts = make(map[string]v1alpha1.ResourceCreateAttemptStatus, len(status.CreateAttempts))
+		for key, attempt := range status.CreateAttempts {
+			copy.CreateAttempts[key] = attempt
+		}
+	}
+	if status.DeleteAttempts != nil {
+		copy.DeleteAttempts = make(map[string]v1alpha1.ResourceDeleteAttemptStatus, len(status.DeleteAttempts))
+		for key, attempt := range status.DeleteAttempts {
+			copy.DeleteAttempts[key] = attempt
+		}
+	}
+	return copy
+}
 
 type sequenceReconciler struct {
 	reconcileResults []bootstrap.Result
@@ -119,7 +218,7 @@ func TestEmitJSONResult(t *testing.T) {
 	}
 	defer file.Close()
 	result := bootstrap.Result{
-		Ready: true, MaxParallelControlPlaneCreates: 3, Owner: "owner",
+		Ready: true, MaxParallelControlPlaneCreates: 1, Owner: "owner",
 		FirewallUUID: "nodes-fw", BastionFirewallUUID: "bastion-fw", BastionVMUUID: "bastion-vm",
 		BastionPublicIPv4: "203.0.113.10", BastionPrivateIPv4: "10.0.0.2",
 		PrivateControlPlaneEndpoint: "https://10.0.0.10:6443", PrivateRegistrationEndpoint: "https://10.0.0.10:9345",
@@ -131,7 +230,7 @@ func TestEmitJSONResult(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := `{"ready":true,"requeueAfter":0,"maxParallelControlPlaneCreates":3,"owner":"owner","firewallUUID":"nodes-fw","bastionFirewallUUID":"bastion-fw","bastionVMUUID":"bastion-vm","bastionPublicIPv4":"203.0.113.10","bastionPrivateIPv4":"10.0.0.2","privateControlPlaneEndpoint":"https://10.0.0.10:6443","privateRegistrationEndpoint":"https://10.0.0.10:9345"}` + "\n"
+	want := `{"ready":true,"requeueAfter":0,"maxParallelControlPlaneCreates":1,"owner":"owner","firewallUUID":"nodes-fw","bastionFirewallUUID":"bastion-fw","bastionVMUUID":"bastion-vm","bastionPublicIPv4":"203.0.113.10","bastionPrivateIPv4":"10.0.0.2","privateControlPlaneEndpoint":"https://10.0.0.10:6443","privateRegistrationEndpoint":"https://10.0.0.10:9345"}` + "\n"
 	if string(data) != want {
 		t.Fatalf("JSON = %q, want %q", data, want)
 	}

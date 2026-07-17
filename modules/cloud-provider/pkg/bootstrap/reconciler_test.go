@@ -2,6 +2,7 @@ package bootstrap
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -133,8 +134,8 @@ func TestReconcileBuildsBastionThenExactlyThreeControlPlaneVMs(t *testing.T) {
 			t.Fatalf("bootstrap used the standalone floating-IP create/assign API: %v", api.events)
 		}
 	}
-	if result.MaxParallelControlPlaneCreates != ControlPlaneReplicas {
-		t.Fatalf("parallel bound=%d", result.MaxParallelControlPlaneCreates)
+	if result.MaxParallelControlPlaneCreates != 1 {
+		t.Fatalf("ordered create concurrency=%d, want 1", result.MaxParallelControlPlaneCreates)
 	}
 }
 
@@ -641,7 +642,7 @@ func TestDestroyWaitsWithoutMutationUntilStaleVMListEntryDisappears(t *testing.T
 	}
 }
 
-func TestReconcileRejectsSuppliedFirewallCreateIdentityDriftWithoutDeletion(t *testing.T) {
+func TestReconcileTreatsFirewallCreateResponseIdentityAsProvisional(t *testing.T) {
 	tests := map[string]func(*inspace.Firewall){
 		"invalid UUID":    func(firewall *inspace.Firewall) { firewall.UUID = "not-a-uuid" },
 		"name":            func(firewall *inspace.Firewall) { firewall.Name = "foreign" },
@@ -657,32 +658,69 @@ func TestReconcileRejectsSuppliedFirewallCreateIdentityDriftWithoutDeletion(t *t
 			}
 			cluster := testCluster()
 			reconciler := testReconciler(api)
-			var reconcileErr error
-			for attempt := 0; attempt < 10 && reconcileErr == nil; attempt++ {
-				_, reconcileErr = reconciler.Reconcile(context.Background(), cluster, "unit-test-secret-token")
+			result := reconcileUntilReady(t, reconciler, cluster)
+			if !result.Ready || len(api.firewalls) != 2 || len(api.firewallCreates) != 2 || len(api.firewallDeletes) != 0 {
+				t.Fatalf("provisional POST response overrode canonical firewall readback: result=%#v firewalls=%#v creates=%#v deletes=%#v", result, api.firewalls, api.firewallCreates, api.firewallDeletes)
 			}
-			if reconcileErr == nil || !strings.Contains(reconcileErr.Error(), "create bastion firewall response") {
-				t.Fatalf("expected provisional identity rejection, got %v", reconcileErr)
-			}
-			if len(api.firewalls) != 1 || len(api.firewallCreates) != 1 || len(api.firewallDeletes) != 0 || len(api.vms) != 0 || len(api.floatingIPs) != 0 {
-				t.Fatalf("ambiguous POST response caused unsafe mutation or deletion: firewalls=%#v creates=%#v deletes=%#v VMs=%#v FIPs=%#v", api.firewalls, api.firewallCreates, api.firewallDeletes, api.vms, api.floatingIPs)
-			}
-			api.mutateCreateFirewallResponse = nil
-			reconcileUntilReady(t, reconciler, cluster)
-			if len(api.firewallCreates) != 2 {
-				t.Fatalf("existing node firewall was recreated instead of adopted: %#v", api.firewallCreates)
+			for _, key := range []string{createAttemptBastionFirewall, createAttemptNodeFirewall} {
+				attempt := cluster.Status.CreateAttempts[key]
+				if attempt.Phase != createAttemptPhaseMaterialized || !vmUUIDPattern.MatchString(attempt.ResourceUUID) {
+					t.Fatalf("canonical firewall receipt %q was not materialized: %#v", key, attempt)
+				}
 			}
 		})
 	}
 }
 
-func TestReconcileStartsAllThreeControlPlaneCreatesBehindOneBarrier(t *testing.T) {
+func TestFirewallCreateForeignResponseUUIDAdoptsActualNamedFirewall(t *testing.T) {
 	api := newFakeAPI()
+	foreign := inspace.Firewall{
+		UUID: "66666666-1111-4222-8333-444444444444", DisplayName: "pre-existing-foreign", BillingAccountID: 999,
+	}
+	api.firewalls = append(api.firewalls, foreign)
+	api.mutateCreateFirewallResponse = func(_ inspace.CreateFirewallRequest, response *inspace.Firewall) {
+		response.UUID = foreign.UUID
+	}
 	cluster := testCluster()
 	reconciler := testReconciler(api)
+	owner := ownerKey(cluster)
+	actual, err := reconciler.ensureManagedBastionFirewall(context.Background(), cluster, api.network.Subnet, owner, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if actual == nil || actual.UUID == foreign.UUID || actual.EffectiveName() != currentBootstrapResourceNames(cluster.Metadata.Name, owner).BastionFirewall {
+		t.Fatalf("foreign response UUID was promoted instead of canonical named firewall: foreign=%#v actual=%#v", foreign, actual)
+	}
+	attempt := cluster.Status.CreateAttempts[createAttemptBastionFirewall]
+	if attempt.Phase != createAttemptPhaseMaterialized || attempt.ResourceUUID != actual.UUID {
+		t.Fatalf("canonical firewall UUID was not durably promoted: %#v", attempt)
+	}
+	if len(api.firewallCreates) != 1 || len(api.firewallDeletes) != 0 || !reflect.DeepEqual(api.firewalls[0], foreign) {
+		t.Fatalf("foreign firewall was mutated or actual firewall was duplicated: creates=%#v deletes=%#v firewalls=%#v", api.firewallCreates, api.firewallDeletes, api.firewalls)
+	}
+	readback := mustFirewall(t, api.firewalls, actual.EffectiveName())
+	reconciler = testReconciler(api)
+	if _, err := reconciler.ensureManagedBastionFirewall(context.Background(), cluster, api.network.Subnet, owner, readback); err != nil {
+		t.Fatalf("restart did not adopt canonical firewall: %v", err)
+	}
+	if len(api.firewallCreates) != 1 || len(api.firewallDeletes) != 0 {
+		t.Fatalf("restart replayed or deleted a firewall: creates=%#v deletes=%#v", api.firewallCreates, api.firewallDeletes)
+	}
+}
+
+func TestReconcileSequencesControlPlaneCreatesAfterPriorFirewallReadback(t *testing.T) {
+	base := newFakeAPI()
+	cluster := testCluster()
+	reconciler := testReconciler(base)
 	prepareBastion(t, reconciler, cluster)
-	api.createVMBarrier = make(chan struct{})
-	api.createVMStarted = make(chan string, ControlPlaneReplicas)
+	api := &postAssignmentReadBarrierAPI{
+		fakeAPI:         base,
+		readbackStarted: make(chan struct{}),
+		releaseReadback: make(chan struct{}),
+	}
+	reconciler.API = api
+	reconciler.protectionAuditTimeout = 2 * time.Second
+	reconciler.protectionRequestTimeout = 2 * time.Second
 
 	type outcome struct {
 		result Result
@@ -693,51 +731,534 @@ func TestReconcileStartsAllThreeControlPlaneCreatesBehindOneBarrier(t *testing.T
 		result, err := reconciler.Reconcile(context.Background(), cluster, "unit-test-secret-token")
 		done <- outcome{result: result, err: err}
 	}()
-	started := map[string]bool{}
-	for len(started) < ControlPlaneReplicas {
-		select {
-		case name := <-api.createVMStarted:
-			if name == currentBastionName(cluster.Metadata.Name) {
-				t.Fatal("bastion was recreated inside the control-plane barrier")
-			}
-			started[name] = true
-		case got := <-done:
-			t.Fatalf("reconcile completed before all three creates started: %#v %v", got.result, got.err)
-		case <-time.After(2 * time.Second):
-			t.Fatalf("only %d/3 control-plane creates reached barrier", len(started))
-		}
+	select {
+	case <-api.readbackStarted:
+	case got := <-done:
+		t.Fatalf("reconcile completed before slot 0 firewall readback was released: %#v %v", got.result, got.err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("slot 0 assignment never reached authoritative firewall readback")
 	}
-	api.mu.Lock()
-	finished := len(api.vms)
-	api.mu.Unlock()
-	if finished != 1 {
-		t.Fatalf("VM creates crossed barrier early: finished VMs=%d", finished)
+	base.mu.Lock()
+	createsWhileReadbackBlocked := append([]inspace.CreateVMRequest(nil), base.vmCreates...)
+	base.mu.Unlock()
+	if countVMCreatesByName(createsWhileReadbackBlocked, controlPlaneName(cluster.Metadata.Name, 0)) != 1 ||
+		countVMCreatesByName(createsWhileReadbackBlocked, controlPlaneName(cluster.Metadata.Name, 1)) != 0 ||
+		countVMCreatesByName(createsWhileReadbackBlocked, controlPlaneName(cluster.Metadata.Name, 2)) != 0 {
+		t.Fatalf("later VM POST crossed slot 0 firewall readback: %#v", createsWhileReadbackBlocked)
 	}
-	close(api.createVMBarrier)
+	close(api.releaseReadback)
 	select {
 	case got := <-done:
 		if got.err != nil || len(got.result.ControlPlaneVMs) != 3 {
-			t.Fatalf("barrier reconcile=%#v err=%v", got.result, got.err)
+			t.Fatalf("ordered reconcile=%#v err=%v", got.result, got.err)
 		}
-		if len(api.firewalls) != 2 {
-			t.Fatalf("control-plane firewall was not created before VM launch: %#v", api.firewalls)
+		if len(base.firewalls) != 2 {
+			t.Fatalf("control-plane firewall was not created before VM launch: %#v", base.firewalls)
 		}
 		resourceNames := currentBootstrapResourceNames(cluster.Metadata.Name, ownerKey(cluster))
-		nodeFirewall := mustFirewall(t, api.firewalls, resourceNames.NodeFirewall)
+		nodeFirewall := mustFirewall(t, base.firewalls, resourceNames.NodeFirewall)
 		if len(nodeFirewall.ResourcesAssigned) != ControlPlaneReplicas {
-			t.Fatalf("control-plane create returned before every VM was firewalled: %#v", nodeFirewall.ResourcesAssigned)
+			t.Fatalf("ordered create returned before every VM was firewalled: %#v", nodeFirewall.ResourcesAssigned)
 		}
-		for _, floatingIP := range api.floatingIPs {
+		for _, floatingIP := range base.floatingIPs {
 			if floatingIP.Name != resourceNames.BastionFloatingIP && (floatingIP.Name != "" || floatingIP.AssignedTo == "") {
-				t.Fatalf("control-plane create did not retain its nameless assigned auto FIP: %#v", floatingIP)
+				t.Fatalf("ordered control-plane create did not retain its nameless assigned auto FIP: %#v", floatingIP)
 			}
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("reconcile did not complete after barrier release")
+		t.Fatal("ordered reconcile did not complete after firewall readback release")
 	}
 }
 
-func TestParallelControlPlaneErrorsAreSlotOrderedAndKeepSuccesses(t *testing.T) {
+func TestFirstControlPlaneHidden500StopsLaterVMPosts(t *testing.T) {
+	api := newFakeAPI()
+	cluster := testCluster()
+	reconciler := testReconciler(api)
+	prepareBastion(t, reconciler, cluster)
+	hidden500 := &inspace.APIError{
+		StatusCode: 500,
+		Method:     "POST",
+		Path:       "/core/v2/firewalls/assignment",
+		Message:    "injected hidden committed assignment",
+		Retryable:  true,
+	}
+	api.firewallAssignmentError = hidden500
+	api.firewallAssignmentErrorCommits = true
+	api.firewallAssignmentReadbackDelay = 1_000
+	reconciler.protectionAuditTimeout = 20 * time.Millisecond
+
+	_, err := reconciler.Reconcile(context.Background(), cluster, "unit-test-secret-token")
+	if !errors.Is(err, hidden500) || !errors.Is(err, ErrCreateAttemptPending) {
+		t.Fatalf("hidden-500 assignment error = %v, want API error plus durable pending", err)
+	}
+	if countVMCreatesByName(api.vmCreates, controlPlaneName(cluster.Metadata.Name, 0)) != 1 ||
+		countVMCreatesByName(api.vmCreates, controlPlaneName(cluster.Metadata.Name, 1)) != 0 ||
+		countVMCreatesByName(api.vmCreates, controlPlaneName(cluster.Metadata.Name, 2)) != 0 {
+		t.Fatalf("hidden first assignment allowed later VM POSTs: %#v", api.vmCreates)
+	}
+	if len(api.vmCreates) != 2 || len(api.vmDeletes) != 1 || len(api.vms) != 1 || api.vms[0].Name != currentBastionName(cluster.Metadata.Name) {
+		t.Fatalf("hidden first assignment containment: creates=%#v deletes=%#v VMs=%#v", api.vmCreates, api.vmDeletes, api.vms)
+	}
+	attempt := cluster.Status.CreateAttempts[controlPlaneFirewallAssignmentAttemptKey(0)]
+	if attempt.Phase != createAttemptPhaseIssued || attempt.ResourceUUID != "" {
+		t.Fatalf("hidden first assignment lost its unresolved durable receipt: %#v", attempt)
+	}
+}
+
+func TestFirewallAssignmentGateSerializesThroughAuthoritativeReadback(t *testing.T) {
+	base := newFakeAPI()
+	cluster := testCluster()
+	firewall := inspace.Firewall{
+		UUID:             "aaaaaaaa-1111-4222-8333-444444444444",
+		DisplayName:      "shared-node-firewall",
+		BillingAccountID: cluster.Spec.BillingAccountID,
+	}
+	base.firewalls = []inspace.Firewall{firewall}
+	api := &postAssignmentReadBarrierAPI{
+		fakeAPI:         base,
+		readbackStarted: make(chan struct{}),
+		releaseReadback: make(chan struct{}),
+	}
+	reconciler := testReconciler(base)
+	reconciler.API = api
+	reconciler.protectionAuditTimeout = 2 * time.Second
+	reconciler.protectionRequestTimeout = 2 * time.Second
+
+	const (
+		firstKey  = "firewall-assignment/gate-first"
+		secondKey = "firewall-assignment/gate-second"
+		firstVM   = "bbbbbbbb-1111-4222-8333-444444444444"
+		secondVM  = "cccccccc-1111-4222-8333-444444444444"
+	)
+	seedOwnedMutationVMs(t, base, cluster, firstVM, secondVM)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	firstDone := make(chan error, 1)
+	go func() {
+		firstDone <- reconciler.ensureExactFirewallAssignment(ctx, cluster, firstKey, &firewall, firstVM)
+	}()
+	select {
+	case <-api.readbackStarted:
+	case err := <-firstDone:
+		t.Fatalf("first assignment returned before its authoritative readback was released: %v", err)
+	case <-ctx.Done():
+		t.Fatal("first assignment never reached its authoritative readback")
+	}
+
+	secondStarted := make(chan struct{})
+	secondDone := make(chan error, 1)
+	go func() {
+		close(secondStarted)
+		secondDone <- reconciler.ensureExactFirewallAssignment(ctx, cluster, secondKey, &firewall, secondVM)
+	}()
+	<-secondStarted
+
+	// Simulate an independent actor attaching the second VM while its stale
+	// caller snapshot is queued behind the first assignment's readback. The
+	// in-gate authority must observe and adopt this relation without a POST.
+	base.mu.Lock()
+	base.firewalls[0].ResourcesAssigned = append(base.firewalls[0].ResourcesAssigned, inspace.FirewallResource{
+		ResourceType: "vm",
+		ResourceUUID: secondVM,
+	})
+	base.mu.Unlock()
+	close(api.releaseReadback)
+
+	for name, done := range map[string]<-chan error{"first": firstDone, "second": secondDone} {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("%s assignment: %v", name, err)
+			}
+		case <-ctx.Done():
+			t.Fatalf("%s assignment did not complete", name)
+		}
+	}
+	base.mu.Lock()
+	assignmentCalls := base.firewallAssignmentCalls
+	base.mu.Unlock()
+	if assignmentCalls != 1 {
+		t.Fatalf("serialized stale snapshots issued %d assignment POSTs, want only the first", assignmentCalls)
+	}
+	firstAttempt := cluster.Status.CreateAttempts[firstKey]
+	secondAttempt := cluster.Status.CreateAttempts[secondKey]
+	if firstAttempt.Phase != createAttemptPhaseMaterialized || firstAttempt.ResourceUUID != firstVM {
+		t.Fatalf("first assignment receipt = %#v", firstAttempt)
+	}
+	if secondAttempt.Phase != createAttemptPhaseAdopted || secondAttempt.ResourceUUID != secondVM {
+		t.Fatalf("second assignment did not adopt the fresh in-gate readback: %#v", secondAttempt)
+	}
+}
+
+func TestFirewallAssignmentGatesKeepDifferentFirewallsParallel(t *testing.T) {
+	base := newFakeAPI()
+	cluster := testCluster()
+	firstFirewall := inspace.Firewall{
+		UUID:             "aaaaaaaa-1111-4222-8333-444444444444",
+		DisplayName:      "first-firewall",
+		BillingAccountID: cluster.Spec.BillingAccountID,
+	}
+	secondFirewall := inspace.Firewall{
+		UUID:             "dddddddd-1111-4222-8333-444444444444",
+		DisplayName:      "second-firewall",
+		BillingAccountID: cluster.Spec.BillingAccountID,
+	}
+	base.firewalls = []inspace.Firewall{firstFirewall, secondFirewall}
+	api := &parallelFirewallAssignmentAPI{
+		fakeAPI: base,
+		started: make(chan string, 2),
+		release: make(chan struct{}),
+	}
+	reconciler := testReconciler(base)
+	reconciler.API = api
+	reconciler.protectionAuditTimeout = 2 * time.Second
+	reconciler.protectionRequestTimeout = 2 * time.Second
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	type assignment struct {
+		key      string
+		firewall *inspace.Firewall
+		vmUUID   string
+	}
+	assignments := []assignment{
+		{key: "firewall-assignment/parallel-first", firewall: &firstFirewall, vmUUID: "bbbbbbbb-1111-4222-8333-444444444444"},
+		{key: "firewall-assignment/parallel-second", firewall: &secondFirewall, vmUUID: "cccccccc-1111-4222-8333-444444444444"},
+	}
+	seedOwnedMutationVMs(t, base, cluster, assignments[0].vmUUID, assignments[1].vmUUID)
+	done := make(chan error, len(assignments))
+	for _, item := range assignments {
+		item := item
+		go func() {
+			done <- reconciler.ensureExactFirewallAssignment(ctx, cluster, item.key, item.firewall, item.vmUUID)
+		}()
+	}
+	started := map[string]bool{}
+	for len(started) < len(assignments) {
+		select {
+		case firewallUUID := <-api.started:
+			started[firewallUUID] = true
+		case err := <-done:
+			t.Fatalf("assignment returned before both independent gates reached their POST: %v", err)
+		case <-ctx.Done():
+			t.Fatalf("only %d/%d independent firewall assignments ran in parallel", len(started), len(assignments))
+		}
+	}
+	close(api.release)
+	for range assignments {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatal(err)
+			}
+		case <-ctx.Done():
+			t.Fatal("parallel firewall assignments did not complete")
+		}
+	}
+}
+
+func TestFirewallAssignmentGateWaitDoesNotConsumeRequestTimeoutOrIssue(t *testing.T) {
+	api := newFakeAPI()
+	cluster := testCluster()
+	firewall := inspace.Firewall{
+		UUID:             "aaaaaaaa-1111-4222-8333-444444444444",
+		DisplayName:      "shared-node-firewall",
+		BillingAccountID: cluster.Spec.BillingAccountID,
+	}
+	api.firewalls = []inspace.Firewall{firewall}
+	reconciler := testReconciler(api)
+	reconciler.protectionRequestTimeout = 10 * time.Millisecond
+	reconciler.protectionAuditTimeout = 500 * time.Millisecond
+
+	releaseGate := reconciler.acquireFirewallAssignmentGate(cluster.Spec.Location, firewall.UUID)
+	const (
+		attemptKey = "firewall-assignment/wait-timeout"
+		vmUUID     = "bbbbbbbb-1111-4222-8333-444444444444"
+	)
+	seedOwnedMutationVMs(t, api, cluster, vmUUID)
+	started := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		close(started)
+		done <- reconciler.ensureExactFirewallAssignment(context.Background(), cluster, attemptKey, &firewall, vmUUID)
+	}()
+	<-started
+	// Hold the gate for several complete per-request timeout windows. No read,
+	// durable issue, or cloud mutation may begin until this unrelated holder
+	// releases the shared-firewall critical section.
+	time.Sleep(5 * reconciler.protectionRequestTimeout)
+	if _, exists := cluster.Status.CreateAttempts[attemptKey]; exists {
+		releaseGate()
+		t.Fatalf("gate wait consumed durable issue authority: %#v", cluster.Status.CreateAttempts[attemptKey])
+	}
+	api.mu.Lock()
+	assignmentCalls := api.firewallAssignmentCalls
+	api.mu.Unlock()
+	if assignmentCalls != 0 {
+		releaseGate()
+		t.Fatalf("gate wait dispatched %d assignment POSTs", assignmentCalls)
+	}
+	releaseGate()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("fresh request timeout was not available after gate wait: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("assignment did not complete after gate release")
+	}
+	attempt := cluster.Status.CreateAttempts[attemptKey]
+	if attempt.Phase != createAttemptPhaseMaterialized || attempt.ResourceUUID != vmUUID {
+		t.Fatalf("post-wait assignment receipt = %#v", attempt)
+	}
+}
+
+func TestUnresolvedFirewallAssignmentBlocksSameFirewallAcrossRestart(t *testing.T) {
+	api := newFakeAPI()
+	cluster := testCluster()
+	firewall := inspace.Firewall{
+		UUID:             "aaaaaaaa-1111-4222-8333-444444444444",
+		DisplayName:      "shared-node-firewall",
+		BillingAccountID: cluster.Spec.BillingAccountID,
+	}
+	api.firewalls = []inspace.Firewall{firewall}
+	api.firewallAssignmentNilWithoutCommit = true
+	first := testReconciler(api)
+	first.protectionAuditTimeout = 20 * time.Millisecond
+
+	const (
+		firstKey  = "firewall-assignment/restart-first"
+		secondKey = "firewall-assignment/restart-second"
+		firstVM   = "bbbbbbbb-1111-4222-8333-444444444444"
+		secondVM  = "cccccccc-1111-4222-8333-444444444444"
+	)
+	seedOwnedMutationVMs(t, api, cluster, firstVM, secondVM)
+	if err := first.ensureExactFirewallAssignment(context.Background(), cluster, firstKey, &firewall, firstVM); !errors.Is(err, ErrCreateAttemptPending) {
+		t.Fatalf("first unresolved assignment error = %v, want durable pending", err)
+	}
+	if attempt := cluster.Status.CreateAttempts[firstKey]; attempt.Phase != createAttemptPhaseIssued {
+		t.Fatalf("first unresolved assignment receipt = %#v", attempt)
+	}
+	api.mu.Lock()
+	firstCalls := api.firewallAssignmentCalls
+	api.mu.Unlock()
+	if firstCalls != 1 {
+		t.Fatalf("first unresolved assignment POSTs = %d, want 1", firstCalls)
+	}
+
+	cluster = restartClusterFromJSON(t, cluster)
+	restarted := testReconciler(api)
+	restarted.protectionAuditTimeout = 20 * time.Millisecond
+	err := restarted.ensureExactFirewallAssignment(context.Background(), cluster, secondKey, &firewall, secondVM)
+	if !errors.Is(err, ErrCreateAttemptPending) || !strings.Contains(err.Error(), firstKey) {
+		t.Fatalf("same-firewall restart guard error = %v, want reference to unresolved %q", err, firstKey)
+	}
+	api.mu.Lock()
+	secondCalls := api.firewallAssignmentCalls
+	api.mu.Unlock()
+	if secondCalls != firstCalls {
+		t.Fatalf("same-firewall restart dispatched a second POST: before=%d after=%d", firstCalls, secondCalls)
+	}
+	if attempt := cluster.Status.CreateAttempts[secondKey]; attempt.Phase != createAttemptPhaseIntent {
+		t.Fatalf("blocked second assignment consumed issue authority: %#v", attempt)
+	}
+}
+
+func TestUnresolvedFirewallAssignmentDoesNotBlockDifferentFirewall(t *testing.T) {
+	api := newFakeAPI()
+	cluster := testCluster()
+	firstFirewall := inspace.Firewall{
+		UUID:             "aaaaaaaa-1111-4222-8333-444444444444",
+		DisplayName:      "first-firewall",
+		BillingAccountID: cluster.Spec.BillingAccountID,
+	}
+	secondFirewall := inspace.Firewall{
+		UUID:             "dddddddd-1111-4222-8333-444444444444",
+		DisplayName:      "second-firewall",
+		BillingAccountID: cluster.Spec.BillingAccountID,
+	}
+	api.firewalls = []inspace.Firewall{firstFirewall, secondFirewall}
+	api.firewallAssignmentNilWithoutCommit = true
+	reconciler := testReconciler(api)
+	reconciler.protectionAuditTimeout = 20 * time.Millisecond
+
+	const (
+		firstKey  = "firewall-assignment/different-first"
+		secondKey = "firewall-assignment/different-second"
+		firstVM   = "bbbbbbbb-1111-4222-8333-444444444444"
+		secondVM  = "cccccccc-1111-4222-8333-444444444444"
+	)
+	seedOwnedMutationVMs(t, api, cluster, firstVM, secondVM)
+	if err := reconciler.ensureExactFirewallAssignment(context.Background(), cluster, firstKey, &firstFirewall, firstVM); !errors.Is(err, ErrCreateAttemptPending) {
+		t.Fatalf("first unresolved assignment error = %v, want durable pending", err)
+	}
+	api.firewallAssignmentNilWithoutCommit = false
+	if err := reconciler.ensureExactFirewallAssignment(context.Background(), cluster, secondKey, &secondFirewall, secondVM); err != nil {
+		t.Fatalf("different firewall was blocked by unrelated unresolved receipt: %v", err)
+	}
+	api.mu.Lock()
+	assignmentCalls := api.firewallAssignmentCalls
+	api.mu.Unlock()
+	if assignmentCalls != 2 {
+		t.Fatalf("different firewall assignment POSTs = %d, want one unresolved plus one committed", assignmentCalls)
+	}
+	if attempt := cluster.Status.CreateAttempts[firstKey]; attempt.Phase != createAttemptPhaseIssued {
+		t.Fatalf("first unresolved receipt changed: %#v", attempt)
+	}
+	if attempt := cluster.Status.CreateAttempts[secondKey]; attempt.Phase != createAttemptPhaseMaterialized || attempt.ResourceUUID != secondVM {
+		t.Fatalf("different firewall receipt = %#v", attempt)
+	}
+}
+
+func TestConcurrentFirewallAssignmentIssueCASAllowsAtMostOnePerFirewall(t *testing.T) {
+	api := newFakeAPI()
+	firstCluster := testCluster()
+	firewall := inspace.Firewall{
+		UUID:             "aaaaaaaa-1111-4222-8333-444444444444",
+		DisplayName:      "shared-node-firewall",
+		BillingAccountID: firstCluster.Spec.BillingAccountID,
+	}
+	api.firewalls = []inspace.Firewall{firewall}
+	api.firewallAssignmentNilWithoutCommit = true
+
+	const (
+		firstKey  = "firewall-assignment/cas-first"
+		secondKey = "firewall-assignment/cas-second"
+		firstVM   = "bbbbbbbb-1111-4222-8333-444444444444"
+		secondVM  = "cccccccc-1111-4222-8333-444444444444"
+	)
+	seedOwnedMutationVMs(t, api, firstCluster, firstVM, secondVM)
+	initialAttempts := make(map[string]v1alpha1.ResourceCreateAttemptStatus, 2)
+	for _, item := range []struct {
+		key, vmUUID string
+	}{{firstKey, firstVM}, {secondKey, secondVM}} {
+		resourceName := firewall.UUID + "/" + item.vmUUID
+		intentHash, err := createIntentHash(createAttemptKindFirewallAssignment, resourceName, firewallAssignmentIntent{
+			Location: firstCluster.Spec.Location, FirewallUUID: firewall.UUID, VMUUID: item.vmUUID,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		initialAttempts[item.key] = v1alpha1.ResourceCreateAttemptStatus{
+			ResourceKind: createAttemptKindFirewallAssignment,
+			ResourceName: resourceName,
+			IntentHash:   intentHash,
+			Phase:        createAttemptPhaseIntent,
+		}
+	}
+	firstCluster.Status.CreateAttempts = initialAttempts
+	secondCluster := restartClusterFromJSON(t, firstCluster)
+	store := &issueBarrierStatusStore{
+		status:  cloneClusterStatus(firstCluster.Status),
+		started: make(chan struct{}, 2),
+		release: make(chan struct{}),
+	}
+	first := testReconciler(api)
+	second := testReconciler(api)
+	first.StatusCompareAndSwap = store.compareAndSwap
+	second.StatusCompareAndSwap = store.compareAndSwap
+	first.protectionAuditTimeout = 20 * time.Millisecond
+	second.protectionAuditTimeout = 20 * time.Millisecond
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	done := make(chan error, 2)
+	go func() {
+		done <- first.ensureExactFirewallAssignment(ctx, firstCluster, firstKey, &firewall, firstVM)
+	}()
+	go func() {
+		done <- second.ensureExactFirewallAssignment(ctx, secondCluster, secondKey, &firewall, secondVM)
+	}()
+	for range 2 {
+		select {
+		case <-store.started:
+		case err := <-done:
+			t.Fatalf("assignment returned before both stale snapshots reached issue CAS: %v", err)
+		case <-ctx.Done():
+			t.Fatal("both stale snapshots did not reach issue CAS")
+		}
+	}
+	close(store.release)
+	for range 2 {
+		select {
+		case err := <-done:
+			if err == nil {
+				t.Fatal("ambiguous or CAS-conflicted assignment unexpectedly succeeded")
+			}
+		case <-ctx.Done():
+			t.Fatal("concurrent assignment did not return")
+		}
+	}
+
+	status := store.snapshot()
+	issued := 0
+	intents := 0
+	for _, key := range []string{firstKey, secondKey} {
+		switch status.CreateAttempts[key].Phase {
+		case createAttemptPhaseIssued:
+			issued++
+		case createAttemptPhaseIntent:
+			intents++
+		default:
+			t.Fatalf("concurrent assignment receipt %q = %#v", key, status.CreateAttempts[key])
+		}
+	}
+	if issued != 1 || intents != 1 {
+		t.Fatalf("concurrent issue CAS status = %#v, want exactly one issued and one intent", status.CreateAttempts)
+	}
+	api.mu.Lock()
+	assignmentCalls := api.firewallAssignmentCalls
+	api.mu.Unlock()
+	if assignmentCalls != 1 {
+		t.Fatalf("concurrent stale snapshots dispatched %d assignment POSTs, want at most one", assignmentCalls)
+	}
+}
+
+func TestAmbiguousFirewallAssignmentReadbackStillBlocksAfterGateRelease(t *testing.T) {
+	api := newFakeAPI()
+	cluster := testCluster()
+	firewall := inspace.Firewall{
+		UUID:             "aaaaaaaa-1111-4222-8333-444444444444",
+		DisplayName:      "shared-node-firewall",
+		BillingAccountID: cluster.Spec.BillingAccountID,
+	}
+	api.firewalls = []inspace.Firewall{firewall}
+	api.firewallAssignmentNilWithoutCommit = true
+	reconciler := testReconciler(api)
+	reconciler.protectionAuditTimeout = 20 * time.Millisecond
+
+	const (
+		firstKey  = "firewall-assignment/released-first"
+		secondKey = "firewall-assignment/released-second"
+		firstVM   = "bbbbbbbb-1111-4222-8333-444444444444"
+		secondVM  = "cccccccc-1111-4222-8333-444444444444"
+	)
+	seedOwnedMutationVMs(t, api, cluster, firstVM, secondVM)
+	if err := reconciler.ensureExactFirewallAssignment(context.Background(), cluster, firstKey, &firewall, firstVM); !errors.Is(err, ErrCreateAttemptPending) {
+		t.Fatalf("first ambiguous assignment error = %v, want durable pending", err)
+	}
+	// The first call has returned and therefore released its process-local
+	// mutex. Only the durable active-Issued receipt can prevent this stale
+	// second snapshot from dispatching another same-firewall relationship POST.
+	if err := reconciler.ensureExactFirewallAssignment(context.Background(), cluster, secondKey, &firewall, secondVM); !errors.Is(err, ErrCreateAttemptPending) {
+		t.Fatalf("second same-firewall assignment error = %v, want durable pending", err)
+	}
+	api.mu.Lock()
+	assignmentCalls := api.firewallAssignmentCalls
+	api.mu.Unlock()
+	if assignmentCalls != 1 {
+		t.Fatalf("released process-local gate allowed %d assignment POSTs, want 1", assignmentCalls)
+	}
+	if attempt := cluster.Status.CreateAttempts[firstKey]; attempt.Phase != createAttemptPhaseIssued {
+		t.Fatalf("ambiguous first receipt changed: %#v", attempt)
+	}
+	if attempt := cluster.Status.CreateAttempts[secondKey]; attempt.Phase != createAttemptPhaseIntent {
+		t.Fatalf("blocked second receipt consumed issue authority: %#v", attempt)
+	}
+}
+
+func TestControlPlaneCreateErrorStopsAtFirstSlot(t *testing.T) {
 	api := newFakeAPI()
 	cluster := testCluster()
 	reconciler := testReconciler(api)
@@ -747,11 +1268,13 @@ func TestParallelControlPlaneErrorsAreSlotOrderedAndKeepSuccesses(t *testing.T) 
 		controlPlaneName(cluster.Metadata.Name, 0): errors.New("slot zero"),
 	}
 	result, err := reconciler.Reconcile(context.Background(), cluster, "unit-test-secret-token")
-	if err == nil || strings.Index(err.Error(), "slot 0") > strings.Index(err.Error(), "slot 2") {
-		t.Fatalf("errors are not slot ordered: %v", err)
+	if err == nil || !strings.Contains(err.Error(), "slot 0") || strings.Contains(err.Error(), "slot two") {
+		t.Fatalf("ordered create did not stop at slot 0: %v", err)
 	}
-	if len(result.ControlPlaneVMs) != 1 || len(api.vms) != 2 {
-		t.Fatalf("successful bastion/CP state was not retained: result=%#v VMs=%#v", result, api.vms)
+	if len(result.ControlPlaneVMs) != 0 || len(api.vms) != 1 || len(api.vmCreates) != 2 ||
+		countVMCreatesByName(api.vmCreates, controlPlaneName(cluster.Metadata.Name, 1)) != 0 ||
+		countVMCreatesByName(api.vmCreates, controlPlaneName(cluster.Metadata.Name, 2)) != 0 {
+		t.Fatalf("slot 0 error allowed later creates: result=%#v creates=%#v VMs=%#v", result, api.vmCreates, api.vms)
 	}
 }
 
@@ -775,7 +1298,7 @@ func TestBastionFirewallFailureRollsBackNewPublicVM(t *testing.T) {
 			vmDeleteIndex = index
 		}
 	}
-	if assignIndex < 0 || fipDeleteIndex <= assignIndex || vmDeleteIndex <= fipDeleteIndex {
+	if assignIndex < 0 || vmDeleteIndex <= assignIndex || fipDeleteIndex <= vmDeleteIndex {
 		t.Fatalf("unprotected VM rollback order is unsafe: %v", api.events)
 	}
 }
@@ -794,7 +1317,7 @@ func TestAmbiguousCommittedFirewallAssignmentProtectsNewVM(t *testing.T) {
 	}
 }
 
-func TestControlPlaneFirewallFailureRollsBackEveryNewPublicVM(t *testing.T) {
+func TestControlPlaneFirewallFailureStopsBeforeLaterPublicVMs(t *testing.T) {
 	api := newFakeAPI()
 	cluster := testCluster()
 	reconciler := testReconciler(api)
@@ -804,8 +1327,10 @@ func TestControlPlaneFirewallFailureRollsBackEveryNewPublicVM(t *testing.T) {
 	if _, err := reconciler.Reconcile(context.Background(), cluster, "unit-test-secret-token"); err == nil {
 		t.Fatal("expected control-plane firewall assignment failure")
 	}
-	if len(api.vmCreates) != 1+ControlPlaneReplicas || len(api.vmDeletes) != ControlPlaneReplicas || len(api.vms) != 1 {
-		t.Fatalf("unprotected control planes were retained: creates=%#v deletes=%#v VMs=%#v", api.vmCreates, api.vmDeletes, api.vms)
+	if len(api.vmCreates) != 2 || len(api.vmDeletes) != 1 || len(api.vms) != 1 ||
+		countVMCreatesByName(api.vmCreates, controlPlaneName(cluster.Metadata.Name, 1)) != 0 ||
+		countVMCreatesByName(api.vmCreates, controlPlaneName(cluster.Metadata.Name, 2)) != 0 {
+		t.Fatalf("failed first firewall protection allowed later control-plane POSTs: creates=%#v deletes=%#v VMs=%#v", api.vmCreates, api.vmDeletes, api.vms)
 	}
 	if api.vms[0].Name != currentBastionName(cluster.Metadata.Name) || len(api.floatingIPs) != 1 || api.floatingIPs[0].AssignedTo != api.vms[0].UUID {
 		t.Fatalf("control-plane rollback touched the protected bastion or leaked auto FIPs: VMs=%#v FIPs=%#v", api.vms, api.floatingIPs)
@@ -1045,19 +1570,61 @@ func TestMalformedCreateVMResponseRollsBackBeforeProtection(t *testing.T) {
 	if len(api.floatingIPs) != 0 {
 		t.Fatalf("malformed create response left its auto floating IP behind: %#v", api.floatingIPs)
 	}
-	unassignIndex, fipDeleteIndex, vmDeleteIndex := -1, -1, -1
+	fipDeleteIndex, vmDeleteIndex := -1, -1
 	for index, event := range api.events {
 		switch {
-		case strings.HasPrefix(event, "unassign-fip/"):
-			unassignIndex = index
 		case strings.HasPrefix(event, "delete-fip/"):
 			fipDeleteIndex = index
 		case strings.HasPrefix(event, "delete-vm/"):
 			vmDeleteIndex = index
 		}
 	}
-	if unassignIndex < 0 || fipDeleteIndex <= unassignIndex || vmDeleteIndex <= fipDeleteIndex {
+	if vmDeleteIndex < 0 || fipDeleteIndex <= vmDeleteIndex {
 		t.Fatalf("malformed create rollback order was unsafe: %v", api.events)
+	}
+}
+
+func TestCreateVMResponseForeignUUIDNeverAuthorizesFollowUpMutation(t *testing.T) {
+	api := newFakeAPI()
+	cluster := testCluster()
+	foreign := inspace.VM{
+		UUID: "99999999-1111-4222-8333-bbbbbbbbbbbb", Name: "pre-existing-foreign", Description: "not managed by this cluster",
+		BillingAccountID: 999, NetworkUUID: "aaaaaaaa-2222-4333-8444-555555555555",
+	}
+	api.vms = append(api.vms, foreign)
+	api.mutateCreateVMResponse = func(_ inspace.CreateVMRequest, response *inspace.VM) {
+		response.UUID = foreign.UUID
+	}
+
+	reconciler := testReconciler(api)
+	if _, err := reconciler.Reconcile(context.Background(), cluster, "unit-test-secret-token"); err != nil {
+		t.Fatalf("foreign response UUID prevented canonical exact-name recovery: %v", err)
+	}
+	owned := mustVM(t, api.vms, currentBastionName(cluster.Metadata.Name))
+	if api.firewallAssignmentCalls != 1 || len(api.vmDeletes) != 0 || api.floatingIPUpdateCalls != 0 || len(api.floatingIPDeletes) != 0 {
+		t.Fatalf("foreign response UUID did not confine follow-up mutation to the recovered VM: assignments=%d deletes=%#v FIP updates=%d FIP deletes=%#v events=%#v",
+			api.firewallAssignmentCalls, api.vmDeletes, api.floatingIPUpdateCalls, api.floatingIPDeletes, api.events)
+	}
+	if len(api.firewalls) != 1 || len(api.firewalls[0].ResourcesAssigned) != 1 || api.firewalls[0].ResourcesAssigned[0].ResourceUUID != owned.UUID || api.firewalls[0].ResourcesAssigned[0].ResourceUUID == foreign.UUID {
+		t.Fatalf("foreign response VM was mutated instead of the canonically owned VM: foreign=%#v owned=%#v firewalls=%#v", foreign, owned, api.firewalls)
+	}
+	if attempt := cluster.Status.CreateAttempts[createAttemptBastionVM]; attempt.Phase != createAttemptPhaseMaterialized || !strings.EqualFold(attempt.ResourceUUID, owned.UUID) {
+		t.Fatalf("canonical owned identity was not durably retained: %#v", attempt)
+	}
+	if len(api.vmCreates) != 1 {
+		t.Fatalf("initial create count=%d, want one", len(api.vmCreates))
+	}
+	_, _ = reconciler.Reconcile(context.Background(), cluster, "unit-test-secret-token")
+	foreignAssignments := 0
+	for _, firewall := range api.firewalls {
+		for _, resource := range firewall.ResourcesAssigned {
+			if resource.ResourceUUID == foreign.UUID {
+				foreignAssignments++
+			}
+		}
+	}
+	if countVMCreatesByName(api.vmCreates, currentBastionName(cluster.Metadata.Name)) != 1 || foreignAssignments != 0 || len(api.vmDeletes) != 0 {
+		t.Fatalf("restart replayed the bastion or mutated the foreign response identity: creates=%#v foreignAssignments=%d deletes=%#v", api.vmCreates, foreignAssignments, api.vmDeletes)
 	}
 }
 
@@ -1115,7 +1682,7 @@ func TestSparseCreateVMResponseIsProtectedOrRolledBack(t *testing.T) {
 	})
 }
 
-func TestUUIDLessCreateResponseDiscoversAndProtectsBeforeCanonicalReadback(t *testing.T) {
+func TestUUIDLessCreateResponseProvesCanonicalOwnershipBeforeProtection(t *testing.T) {
 	for _, test := range []struct {
 		name            string
 		listDelay       int
@@ -1131,7 +1698,6 @@ func TestUUIDLessCreateResponseDiscoversAndProtectsBeforeCanonicalReadback(t *te
 			bastionName := currentBastionName(cluster.Metadata.Name)
 			api.mutateCreateVMResponse = func(_ inspace.CreateVMRequest, vm *inspace.VM) { vm.UUID = "" }
 			api.vmListReadbackDelay = test.listDelay
-			api.requireProtectionBeforeGetVM = true
 			if test.ambiguousCreate {
 				api.failVMCreateNames = map[string]error{bastionName: io.ErrUnexpectedEOF}
 				api.commitVMCreateErrors = map[string]bool{bastionName: true}
@@ -1148,8 +1714,8 @@ func TestUUIDLessCreateResponseDiscoversAndProtectsBeforeCanonicalReadback(t *te
 			if len(api.vmCreates) != 1 || len(api.vms) != 1 || len(api.vmDeletes) != 0 {
 				t.Fatalf("UUID-less recovery duplicated or deleted the committed VM: creates=%d VMs=%#v deletes=%#v", len(api.vmCreates), api.vms, api.vmDeletes)
 			}
-			if api.getVMBeforeProtectionCalls != 0 {
-				t.Fatalf("canonical GetVM ran before protection %d times", api.getVMBeforeProtectionCalls)
+			if len(api.getVMCalls) == 0 {
+				t.Fatal("UUID-less response was protected without canonical GetVM ownership proof")
 			}
 			if len(api.firewalls) != 1 || len(api.firewalls[0].ResourcesAssigned) != 1 || api.firewalls[0].ResourcesAssigned[0].ResourceUUID != api.vms[0].UUID {
 				t.Fatalf("UUID-less response returned without exact firewall protection: %#v", api.firewalls)
@@ -1165,7 +1731,7 @@ func TestUUIDLessUncommittedCreateDoesNotRetryPOST(t *testing.T) {
 	api.failVMCreateNames = map[string]error{bastionName: io.ErrUnexpectedEOF}
 
 	_, err := testReconciler(api).Reconcile(context.Background(), cluster, "unit-test-secret-token")
-	if !errors.Is(err, io.ErrUnexpectedEOF) || !strings.Contains(err.Error(), "protection is uncertain") {
+	if !errors.Is(err, io.ErrUnexpectedEOF) || !strings.Contains(err.Error(), "ownership is uncertain") {
 		t.Fatalf("uncommitted UUID-less create did not report explicit uncertainty: %v", err)
 	}
 	if len(api.vmCreates) != 1 || len(api.vms) != 0 || len(api.vmDeletes) != 0 {
@@ -1194,16 +1760,31 @@ func TestFirewallAssignmentRequiresExactAuthoritativeReadback(t *testing.T) {
 			t.Fatalf("delayed assignment was not authoritatively proven: remaining=%d VMs=%#v deletes=%#v firewalls=%#v", api.firewallAssignmentReadbackRemaining, api.vms, api.vmDeletes, api.firewalls)
 		}
 	})
-	for _, drift := range []string{"duplicate", "wrong firewall"} {
-		t.Run(drift, func(t *testing.T) {
+	t.Run("duplicate exact rows are set semantics", func(t *testing.T) {
+		api := newFakeAPI()
+		api.firewallAssignmentDuplicate = true
+		if _, err := testReconciler(api).Reconcile(context.Background(), testCluster(), "unit-test-secret-token"); err != nil {
+			t.Fatalf("duplicate exact assignment rows were rejected: %v", err)
+		}
+		if len(api.vmDeletes) != 0 || len(api.vms) != 1 || len(api.firewalls) != 1 || len(api.firewalls[0].ResourcesAssigned) != 2 {
+			t.Fatalf("duplicate exact rows did not normalize as one relation: deletes=%#v VMs=%#v firewalls=%#v", api.vmDeletes, api.vms, api.firewalls)
+		}
+	})
+	for _, drift := range []struct {
+		name, want string
+	}{
+		{name: "wrong firewall", want: "wrong firewall"},
+		{name: "non-VM", want: "resource type"},
+	} {
+		t.Run(drift.name, func(t *testing.T) {
 			api := newFakeAPI()
-			api.firewallAssignmentDuplicate = drift == "duplicate"
-			api.firewallAssignmentWrongFirewall = drift == "wrong firewall"
-			if _, err := testReconciler(api).Reconcile(context.Background(), testCluster(), "unit-test-secret-token"); err == nil || !strings.Contains(err.Error(), drift) {
-				t.Fatalf("%s assignment readback was accepted: %v", drift, err)
+			api.firewallAssignmentWrongFirewall = drift.name == "wrong firewall"
+			api.firewallAssignmentWrongType = drift.name == "non-VM"
+			if _, err := testReconciler(api).Reconcile(context.Background(), testCluster(), "unit-test-secret-token"); err == nil || !strings.Contains(err.Error(), drift.want) {
+				t.Fatalf("%s assignment readback was accepted: %v", drift.name, err)
 			}
 			if len(api.vmDeletes) != 1 || len(api.vms) != 0 || len(api.floatingIPs) != 0 {
-				t.Fatalf("%s assignment drift retained public infrastructure: deletes=%#v VMs=%#v FIPs=%#v", drift, api.vmDeletes, api.vms, api.floatingIPs)
+				t.Fatalf("%s assignment drift retained public infrastructure: deletes=%#v VMs=%#v FIPs=%#v", drift.name, api.vmDeletes, api.vms, api.floatingIPs)
 			}
 		})
 	}
@@ -1259,7 +1840,7 @@ func TestMalformedCreateDeletesVMWhenAutoFloatingIPIsNotYetVisible(t *testing.T)
 	api.floatingIPReadbackDelay = 1
 	api.mutateStoredVM = func(_ inspace.CreateVMRequest, vm *inspace.VM) { vm.VCPU++ }
 	_, err := testReconciler(api).Reconcile(context.Background(), testCluster(), "unit-test-secret-token")
-	if err == nil || !strings.Contains(err.Error(), "waiting for") {
+	if err == nil || !errors.Is(err, ErrCreateAttemptPending) {
 		t.Fatalf("malformed response did not retain floating-IP cleanup uncertainty: %v", err)
 	}
 	if len(api.vmDeletes) != 1 || len(api.vms) != 0 {
@@ -1267,6 +1848,50 @@ func TestMalformedCreateDeletesVMWhenAutoFloatingIPIsNotYetVisible(t *testing.T)
 	}
 	if len(api.floatingIPs) != 1 || api.floatingIPs[0].AssignedTo != "" {
 		t.Fatalf("VM deletion contract was not reflected in delayed FIP state: %#v", api.floatingIPs)
+	}
+}
+
+func TestRollbackPostVMFloatingIPAbsenceRequiresTwoObservationsAndResetsOnPresence(t *testing.T) {
+	api := newFakeAPI()
+	api.mutateStoredVM = func(_ inspace.CreateVMRequest, vm *inspace.VM) { vm.VCPU++ }
+	api.vmDeleteHook = func() {
+		// The exact address was discovered before VM deletion. Hide it only from
+		// the first post-delete list to model an eventually consistent omission.
+		api.floatingIPReadbackRemaining = 1
+	}
+	cluster := testCluster()
+	reconciler := testReconciler(api)
+	if _, err := reconciler.Reconcile(context.Background(), cluster, "unit-test-secret-token"); !errors.Is(err, ErrCreateAttemptPending) {
+		t.Fatalf("stale post-VM floating-IP readback error = %v, want durable pending", err)
+	}
+	attempt := cluster.Status.DeleteAttempts[deleteAttemptBastion]
+	if attempt.Phase != deletePhaseRollbackFIPAfterVM || attempt.FloatingIPAddress == "" || attempt.AbsenceObservedAt == "" {
+		t.Fatalf("single stale omission cleared rollback identity: %#v", attempt)
+	}
+	if len(api.floatingIPs) != 1 || len(api.floatingIPDeletes) != 0 {
+		t.Fatalf("single stale omission lost or deleted the anchored FIP: FIPs=%#v deletes=%#v", api.floatingIPs, api.floatingIPDeletes)
+	}
+
+	api.vmDeleteHook = nil
+	if _, err := reconciler.rollbackFloatingIP(context.Background(), cluster, deleteAttemptBastion); err != nil {
+		t.Fatalf("reappearing exact FIP did not resume rollback: %v", err)
+	}
+	attempt = cluster.Status.DeleteAttempts[deleteAttemptBastion]
+	if attempt.Phase != deletePhaseRollbackFIPDeleteIntent || attempt.AbsenceObservedAt != "" {
+		t.Fatalf("positive reappearance did not clear absence evidence: %#v", attempt)
+	}
+
+	var done bool
+	var err error
+	for observation := 0; observation < 2 && !done; observation++ {
+		reconciler = testReconciler(api)
+		done, err = reconciler.reconcileRollbackDelete(context.Background(), cluster, deleteAttemptBastion)
+		if err != nil && !errors.Is(err, ErrCreateAttemptPending) {
+			t.Fatalf("rollback FIP cleanup observation %d: %v", observation+1, err)
+		}
+	}
+	if !done || len(api.floatingIPs) != 0 || len(api.floatingIPDeletes) != 1 {
+		t.Fatalf("two-observation rollback cleanup did not converge: done=%t error=%v FIPs=%#v deletes=%#v", done, err, api.floatingIPs, api.floatingIPDeletes)
 	}
 }
 
@@ -1424,6 +2049,413 @@ func TestAmbiguousVMCreateCommitConvergesWithoutDuplicate(t *testing.T) {
 	}
 }
 
+func TestReconcileRequiresDurableStatusStoreBeforePaidCreate(t *testing.T) {
+	api := newFakeAPI()
+	reconciler := testReconciler(api)
+	reconciler.StatusCompareAndSwap = nil
+	if _, err := reconciler.Reconcile(context.Background(), testCluster(), "unit-test-secret-token"); err == nil || !strings.Contains(err.Error(), "durable InSpaceCluster status") {
+		t.Fatalf("Reconcile() error = %v, want missing durable status store", err)
+	}
+	if len(api.events) != 0 || len(api.firewallCreates) != 0 || len(api.vmCreates) != 0 {
+		t.Fatalf("missing status store reached cloud mutation: events=%v firewallPOSTs=%d VMPOSTs=%d", api.events, len(api.firewallCreates), len(api.vmCreates))
+	}
+}
+
+func TestBootstrapMutationFailureProvesNoDispatchOnlyForLocalBlock(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		err        error
+		definitive bool
+	}{
+		{name: "validation", err: &inspace.APIError{StatusCode: 422}},
+		{name: "bad request", err: &inspace.APIError{StatusCode: 400}},
+		{name: "request timeout", err: &inspace.APIError{StatusCode: 408}},
+		{name: "conflict", err: &inspace.APIError{StatusCode: 409}},
+		{name: "too early", err: &inspace.APIError{StatusCode: 425}},
+		{name: "rate limit", err: &inspace.APIError{StatusCode: 429}},
+		{name: "client closed request", err: &inspace.APIError{StatusCode: 499}},
+		{name: "server error", err: &inspace.APIError{StatusCode: 500}},
+		{name: "transport", err: io.ErrUnexpectedEOF},
+		{name: "preflight block", err: inspace.ErrMutationBlocked, definitive: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := bootstrapMutationFailureProvesNoDispatch(test.err); got != test.definitive {
+				t.Fatalf("bootstrapMutationFailureProvesNoDispatch(%v) = %t, want %t", test.err, got, test.definitive)
+			}
+		})
+	}
+}
+
+func TestDefinitiveCreateRejectionRequiresPostErrorProofAcrossRestart(t *testing.T) {
+	t.Run("firewall", func(t *testing.T) {
+		api := newFakeAPI()
+		api.firewallCreateError = inspace.ErrMutationBlocked
+		api.firewallListErrorAfterCreate = io.ErrUnexpectedEOF
+		cluster := testCluster()
+		if _, err := testReconciler(api).Reconcile(context.Background(), cluster, "unit-test-secret-token"); !errors.Is(err, ErrCreateAttemptPending) {
+			t.Fatalf("first Reconcile() error = %v, want durable pending rejection proof", err)
+		}
+		attempt := cluster.Status.CreateAttempts[createAttemptBastionFirewall]
+		if attempt.Phase != createAttemptPhaseRejected || len(api.firewallCreates) != 1 {
+			t.Fatalf("firewall rejection attempt=%#v creates=%d", attempt, len(api.firewallCreates))
+		}
+
+		cluster = restartClusterFromJSON(t, cluster)
+		api.firewallListErrorAfterCreate = nil
+		if _, err := testReconciler(api).Reconcile(context.Background(), cluster, "unit-test-secret-token"); !errors.Is(err, ErrCreateAttemptPending) {
+			t.Fatalf("restart Reconcile() error = %v, want cleared rejection requeue", err)
+		}
+		if _, exists := cluster.Status.CreateAttempts[createAttemptBastionFirewall]; exists || len(api.firewallCreates) != 1 {
+			t.Fatalf("post-error absence did not clear without replay: attempts=%#v creates=%d", cluster.Status.CreateAttempts, len(api.firewallCreates))
+		}
+	})
+
+	t.Run("virtual machine", func(t *testing.T) {
+		api := newFakeAPI()
+		cluster := testCluster()
+		name := currentBastionName(cluster.Metadata.Name)
+		api.failVMCreateNames = map[string]error{name: inspace.ErrMutationBlocked}
+		api.vmListErrorAfterCreate = io.ErrUnexpectedEOF
+		if _, err := testReconciler(api).Reconcile(context.Background(), cluster, "unit-test-secret-token"); !errors.Is(err, ErrCreateAttemptPending) {
+			t.Fatalf("first Reconcile() error = %v, want durable pending rejection proof", err)
+		}
+		attempt := cluster.Status.CreateAttempts[createAttemptBastionVM]
+		if attempt.Phase != createAttemptPhaseRejected || countVMCreatesByName(api.vmCreates, name) != 1 {
+			t.Fatalf("VM rejection attempt=%#v creates=%#v", attempt, api.vmCreates)
+		}
+
+		cluster = restartClusterFromJSON(t, cluster)
+		api.vmListErrorAfterCreate = nil
+		if _, err := testReconciler(api).Reconcile(context.Background(), cluster, "unit-test-secret-token"); !errors.Is(err, ErrCreateAttemptPending) {
+			t.Fatalf("restart Reconcile() error = %v, want cleared rejection requeue", err)
+		}
+		if _, exists := cluster.Status.CreateAttempts[createAttemptBastionVM]; exists || countVMCreatesByName(api.vmCreates, name) != 1 {
+			t.Fatalf("post-error VM absence did not clear without replay: attempts=%#v creates=%#v", cluster.Status.CreateAttempts, api.vmCreates)
+		}
+	})
+
+	t.Run("visible VM wins over rejection", func(t *testing.T) {
+		api := newFakeAPI()
+		cluster := testCluster()
+		name := currentBastionName(cluster.Metadata.Name)
+		createErr := &inspace.APIError{StatusCode: 422, Method: "POST", Path: "/vm", Message: "late rejection"}
+		api.failVMCreateNames = map[string]error{name: createErr}
+		api.commitVMCreateErrors = map[string]bool{name: true}
+		api.mutateCreateVMResponse = func(request inspace.CreateVMRequest, response *inspace.VM) {
+			if request.Name == name {
+				response.UUID = ""
+			}
+		}
+		if _, err := testReconciler(api).Reconcile(context.Background(), cluster, "unit-test-secret-token"); !errors.Is(err, createErr) || !errors.Is(err, ErrCreateAttemptPending) {
+			t.Fatalf("Reconcile() error = %v, want visible rejected-response recovery", err)
+		}
+		attempt := cluster.Status.CreateAttempts[createAttemptBastionVM]
+		if attempt.Phase != createAttemptPhaseMaterialized || !vmUUIDPattern.MatchString(attempt.ResourceUUID) || countVMCreatesByName(api.vmCreates, name) != 1 {
+			t.Fatalf("visible post-error VM was not durably adopted: attempt=%#v creates=%#v", attempt, api.vmCreates)
+		}
+	})
+}
+
+func TestFloatingIPUpdateFenceNeverReplaysAmbiguousPATCHAcrossRestart(t *testing.T) {
+	api := newFakeAPI()
+	cluster := testCluster()
+	reconciler := testReconciler(api)
+	if _, err := reconciler.Reconcile(context.Background(), cluster, "unit-test-secret-token"); err != nil {
+		t.Fatal(err)
+	}
+	updateErr := &inspace.APIError{StatusCode: 400, Method: "PATCH", Path: "/ip", Message: "post-dispatch error"}
+	api.floatingIPUpdateError = updateErr
+	api.floatingIPUpdateErrorCommits = true
+	api.floatingIPReadbackDelay = 1000
+	if _, err := reconciler.Reconcile(context.Background(), cluster, "unit-test-secret-token"); !errors.Is(err, ErrCreateAttemptPending) {
+		t.Fatalf("ambiguous PATCH error = %v, want durable pending", err)
+	}
+	attempt := cluster.Status.CreateAttempts[createAttemptBastionFloatingIPUpdate]
+	if attempt.Phase != createAttemptPhaseIssued || api.floatingIPUpdateCalls != 1 {
+		t.Fatalf("ambiguous PATCH attempt=%#v calls=%d", attempt, api.floatingIPUpdateCalls)
+	}
+
+	cluster = restartClusterFromJSON(t, cluster)
+	if _, err := testReconciler(api).Reconcile(context.Background(), cluster, "unit-test-secret-token"); err != nil && !errors.Is(err, ErrCreateAttemptPending) {
+		t.Fatalf("restart PATCH recovery error = %v, want reads-only reconciliation", err)
+	}
+	attempt = cluster.Status.CreateAttempts[createAttemptBastionFloatingIPUpdate]
+	if attempt.Phase != createAttemptPhaseIssued || api.floatingIPUpdateCalls != 1 {
+		t.Fatalf("restart changed/replayed ambiguous PATCH: attempt=%#v calls=%d", attempt, api.floatingIPUpdateCalls)
+	}
+
+	api.mu.Lock()
+	api.floatingIPUpdateError = nil
+	api.floatingIPReadbackRemaining = 0
+	api.floatingIPReadbackDelay = 0
+	api.mu.Unlock()
+	cluster = restartClusterFromJSON(t, cluster)
+	if _, err := testReconciler(api).Reconcile(context.Background(), cluster, "unit-test-secret-token"); err != nil {
+		t.Fatalf("late visible PATCH did not recover: %v", err)
+	}
+	attempt = cluster.Status.CreateAttempts[createAttemptBastionFloatingIPUpdate]
+	if attempt.Phase != createAttemptPhaseMaterialized || api.floatingIPUpdateCalls != 1 {
+		t.Fatalf("late PATCH recovery attempt=%#v calls=%d", attempt, api.floatingIPUpdateCalls)
+	}
+}
+
+func TestFloatingIPDefinitiveRejectionClearsOnlyAfterRestartReadback(t *testing.T) {
+	api := newFakeAPI()
+	cluster := testCluster()
+	reconciler := testReconciler(api)
+	if _, err := reconciler.Reconcile(context.Background(), cluster, "unit-test-secret-token"); err != nil {
+		t.Fatal(err)
+	}
+	api.floatingIPUpdateError = inspace.ErrMutationBlocked
+	api.floatingIPListErrorAfterUpdate = io.ErrUnexpectedEOF
+	if _, err := reconciler.Reconcile(context.Background(), cluster, "unit-test-secret-token"); !errors.Is(err, ErrCreateAttemptPending) {
+		t.Fatalf("definitive PATCH error = %v, want pending proof", err)
+	}
+	attempt := cluster.Status.CreateAttempts[createAttemptBastionFloatingIPUpdate]
+	if attempt.Phase != createAttemptPhaseRejected || api.floatingIPUpdateCalls != 1 {
+		t.Fatalf("definitive PATCH attempt=%#v calls=%d", attempt, api.floatingIPUpdateCalls)
+	}
+
+	cluster = restartClusterFromJSON(t, cluster)
+	api.floatingIPListErrorAfterUpdate = nil
+	if _, err := testReconciler(api).Reconcile(context.Background(), cluster, "unit-test-secret-token"); err != nil {
+		t.Fatalf("post-error unchanged readback did not clear receipt: %v", err)
+	}
+	if _, exists := cluster.Status.CreateAttempts[createAttemptBastionFloatingIPUpdate]; exists || api.floatingIPUpdateCalls != 1 {
+		t.Fatalf("unchanged proof did not clear without replay: attempts=%#v calls=%d", cluster.Status.CreateAttempts, api.floatingIPUpdateCalls)
+	}
+
+	api.floatingIPUpdateError = nil
+	if _, err := testReconciler(api).Reconcile(context.Background(), cluster, "unit-test-secret-token"); err != nil {
+		t.Fatalf("cleared PATCH did not retry safely: %v", err)
+	}
+	attempt = cluster.Status.CreateAttempts[createAttemptBastionFloatingIPUpdate]
+	if attempt.Phase != createAttemptPhaseMaterialized || api.floatingIPUpdateCalls != 2 {
+		t.Fatalf("retried PATCH attempt=%#v calls=%d", attempt, api.floatingIPUpdateCalls)
+	}
+}
+
+func TestFirewallAssignmentDefinitiveRejectionClearsOnlyAfterRestartReadback(t *testing.T) {
+	api := newFakeAPI()
+	cluster := testCluster()
+	reconcileUntilReady(t, testReconciler(api), cluster)
+	resourceNames := currentBootstrapResourceNames(cluster.Metadata.Name, ownerKey(cluster))
+	bastion := mustVM(t, api.vms, currentBastionName(cluster.Metadata.Name))
+	bastionFirewall := mustFirewall(t, api.firewalls, resourceNames.BastionFirewall)
+	bastionFirewall.ResourcesAssigned = nil
+	delete(cluster.Status.CreateAttempts, createAttemptBastionFirewallAssignment)
+
+	api.firewallAssignmentError = inspace.ErrMutationBlocked
+	api.firewallListErrorAfterAssignment = io.ErrUnexpectedEOF
+	api.firewallListErrorAfterAssignmentCall = api.firewallAssignmentCalls + 1
+	before := api.firewallAssignmentCalls
+	if _, err := testReconciler(api).Reconcile(context.Background(), cluster, "unit-test-secret-token"); !errors.Is(err, ErrCreateAttemptPending) {
+		t.Fatalf("definitive assignment error = %v, want pending proof", err)
+	}
+	attempt := cluster.Status.CreateAttempts[createAttemptBastionFirewallAssignment]
+	if attempt.Phase != createAttemptPhaseRejected || api.firewallAssignmentCalls != before+1 {
+		t.Fatalf("definitive assignment attempt=%#v calls=%d before=%d", attempt, api.firewallAssignmentCalls, before)
+	}
+
+	cluster = restartClusterFromJSON(t, cluster)
+	api.firewallListErrorAfterAssignment = nil
+	if _, err := testReconciler(api).Reconcile(context.Background(), cluster, "unit-test-secret-token"); !errors.Is(err, ErrCreateAttemptPending) {
+		t.Fatalf("post-error assignment absence error = %v, want cleared rejection requeue", err)
+	}
+	if _, exists := cluster.Status.CreateAttempts[createAttemptBastionFirewallAssignment]; exists || api.firewallAssignmentCalls != before+1 {
+		t.Fatalf("assignment absence did not clear without replay: attempts=%#v calls=%d", cluster.Status.CreateAttempts, api.firewallAssignmentCalls)
+	}
+
+	api.firewallAssignmentError = nil
+	if _, err := testReconciler(api).Reconcile(context.Background(), cluster, "unit-test-secret-token"); err != nil {
+		t.Fatalf("cleared assignment did not retry safely: %v", err)
+	}
+	attempt = cluster.Status.CreateAttempts[createAttemptBastionFirewallAssignment]
+	if attempt.Phase != createAttemptPhaseMaterialized || attempt.ResourceUUID != bastion.UUID || api.firewallAssignmentCalls != before+2 {
+		t.Fatalf("retried assignment attempt=%#v calls=%d", attempt, api.firewallAssignmentCalls)
+	}
+}
+
+func TestCreateAttemptLedgerCoversAllPaidCreatesAndClearsAfterDestroy(t *testing.T) {
+	api := newFakeAPI()
+	cluster := testCluster()
+	reconciler := testReconciler(api)
+	result := reconcileUntilReady(t, reconciler, cluster)
+	if !result.Ready || len(cluster.Status.CreateAttempts) != 2+3*(1+ControlPlaneReplicas) {
+		t.Fatalf("ready result=%#v create attempts=%#v", result, cluster.Status.CreateAttempts)
+	}
+	for key, attempt := range cluster.Status.CreateAttempts {
+		if attempt.Phase != createAttemptPhaseMaterialized || !vmUUIDPattern.MatchString(attempt.ResourceUUID) {
+			t.Fatalf("create attempt %q = %#v, want materialized exact UUID", key, attempt)
+		}
+	}
+	destroyed := destroyUntilDone(t, reconciler, cluster)
+	if !destroyed.Done || len(cluster.Status.CreateAttempts) != 0 {
+		t.Fatalf("destroy result=%#v retained attempts=%#v", destroyed, cluster.Status.CreateAttempts)
+	}
+}
+
+func TestAmbiguousFirewallCreateLateVisibilityNeverReplaysAcrossRestart(t *testing.T) {
+	createErr := &inspace.APIError{StatusCode: 400, Method: "POST", Path: "/firewall", Message: "post-dispatch error"}
+	api := newFakeAPI()
+	api.firewallCreateError = createErr
+	api.firewallCreateErrorCommits = true
+	api.mutateCreateFirewallResponse = func(_ inspace.CreateFirewallRequest, response *inspace.Firewall) {
+		response.UUID = ""
+	}
+	api.firewallListReadbackRemaining = 1000
+	cluster := testCluster()
+
+	if _, err := testReconciler(api).Reconcile(context.Background(), cluster, "unit-test-secret-token"); !errors.Is(err, createErr) {
+		t.Fatalf("first Reconcile() error = %v, want ambiguous firewall create", err)
+	}
+	attempt := cluster.Status.CreateAttempts[createAttemptBastionFirewall]
+	if attempt.Phase != createAttemptPhaseIssued || attempt.ResourceUUID != "" || len(api.firewallCreates) != 1 {
+		t.Fatalf("first firewall attempt = %#v creates=%d", attempt, len(api.firewallCreates))
+	}
+	cluster = restartClusterFromJSON(t, cluster)
+	if _, err := testReconciler(api).Reconcile(context.Background(), cluster, "unit-test-secret-token"); !errors.Is(err, ErrCreateAttemptPending) {
+		t.Fatalf("restart Reconcile() error = %v, want read-only pending recovery", err)
+	}
+	if len(api.firewallCreates) != 1 || len(api.firewalls) != 1 {
+		t.Fatalf("hidden committed firewall was replayed: creates=%d firewalls=%#v", len(api.firewallCreates), api.firewalls)
+	}
+
+	api.firewallCreateError = nil
+	api.firewallListReadbackRemaining = 0
+	if _, err := testReconciler(api).Reconcile(context.Background(), cluster, "unit-test-secret-token"); err != nil {
+		t.Fatalf("visible committed firewall did not recover: %v", err)
+	}
+	if len(api.firewallCreates) != 1 {
+		t.Fatalf("authoritative recovery issued %d firewall creates, want one", len(api.firewallCreates))
+	}
+}
+
+func TestAmbiguousVMCreateLateVisibilityNeverReplaysAcrossRestart(t *testing.T) {
+	createErr := &inspace.APIError{StatusCode: 400, Method: "POST", Path: "/vm", Message: "post-dispatch error"}
+	api := newFakeAPI()
+	cluster := testCluster()
+	bastionName := currentBastionName(cluster.Metadata.Name)
+	api.failVMCreateNames = map[string]error{bastionName: createErr}
+	api.commitVMCreateErrors = map[string]bool{bastionName: true}
+	api.mutateCreateVMResponse = func(request inspace.CreateVMRequest, vm *inspace.VM) {
+		if request.Name == bastionName {
+			vm.UUID = ""
+		}
+	}
+	api.vmListReadbackDelay = 1000
+
+	if _, err := testReconciler(api).Reconcile(context.Background(), cluster, "unit-test-secret-token"); !errors.Is(err, createErr) {
+		t.Fatalf("first Reconcile() error = %v, want ambiguous VM create", err)
+	}
+	attempt := cluster.Status.CreateAttempts[createAttemptBastionVM]
+	if attempt.Phase != createAttemptPhaseIssued || attempt.ResourceUUID != "" || countVMCreatesByName(api.vmCreates, bastionName) != 1 {
+		t.Fatalf("first VM attempt = %#v creates=%#v", attempt, api.vmCreates)
+	}
+	cluster = restartClusterFromJSON(t, cluster)
+	if _, err := testReconciler(api).Reconcile(context.Background(), cluster, "unit-test-secret-token"); !errors.Is(err, ErrCreateAttemptPending) {
+		t.Fatalf("restart Reconcile() error = %v, want read-only pending recovery", err)
+	}
+	if countVMCreatesByName(api.vmCreates, bastionName) != 1 || len(api.vms) != 1 {
+		t.Fatalf("hidden committed VM was replayed: creates=%#v VMs=%#v", api.vmCreates, api.vms)
+	}
+
+	delete(api.failVMCreateNames, bastionName)
+	delete(api.commitVMCreateErrors, bastionName)
+	api.vmListReadbackRemaining = 0
+	api.vmListReadbackDelay = 0
+	if _, err := testReconciler(api).Reconcile(context.Background(), cluster, "unit-test-secret-token"); err != nil {
+		t.Fatalf("visible committed VM did not recover: %v", err)
+	}
+	attempt = cluster.Status.CreateAttempts[createAttemptBastionVM]
+	if attempt.Phase != createAttemptPhaseMaterialized || !vmUUIDPattern.MatchString(attempt.ResourceUUID) || countVMCreatesByName(api.vmCreates, bastionName) != 1 {
+		t.Fatalf("recovered VM attempt = %#v creates=%#v", attempt, api.vmCreates)
+	}
+}
+
+func TestAmbiguousFirewallAssignmentLateVisibilityNeverReplaysAcrossRestart(t *testing.T) {
+	api := newFakeAPI()
+	cluster := testCluster()
+	reconcileUntilReady(t, testReconciler(api), cluster)
+	resourceNames := currentBootstrapResourceNames(cluster.Metadata.Name, ownerKey(cluster))
+	bastion := mustVM(t, api.vms, currentBastionName(cluster.Metadata.Name))
+	bastionFirewall := mustFirewall(t, api.firewalls, resourceNames.BastionFirewall)
+	bastionFirewall.ResourcesAssigned = nil
+	delete(cluster.Status.CreateAttempts, createAttemptBastionFirewallAssignment)
+
+	api.firewallAssignmentError = &inspace.APIError{StatusCode: 400, Method: "POST", Path: "/firewall/assign", Message: "post-dispatch error"}
+	api.firewallAssignmentErrorCommits = true
+	api.firewallAssignmentReadbackDelay = 1000
+	assignmentPrefix := "assign-firewall/" + bastionFirewall.UUID + "/" + bastion.UUID
+	before := countEventsWithPrefix(api.events, assignmentPrefix)
+	if _, err := testReconciler(api).Reconcile(context.Background(), cluster, "unit-test-secret-token"); !errors.Is(err, ErrCreateAttemptPending) {
+		t.Fatalf("first Reconcile() error = %v, want durable pending assignment", err)
+	}
+	attempt := cluster.Status.CreateAttempts[createAttemptBastionFirewallAssignment]
+	if attempt.Phase != createAttemptPhaseIssued || attempt.ResourceUUID != "" {
+		t.Fatalf("ambiguous assignment attempt = %#v, want issued without materialized UUID", attempt)
+	}
+	if got := countEventsWithPrefix(api.events, assignmentPrefix); got != before+1 {
+		t.Fatalf("first ambiguous assignment issued %d POSTs, want one", got-before)
+	}
+
+	// A fresh reconciler receives only the durably persisted cluster status.
+	// Although the committed row is still hidden, it must perform reads only.
+	cluster = restartClusterFromJSON(t, cluster)
+	if _, err := testReconciler(api).Reconcile(context.Background(), cluster, "unit-test-secret-token"); !errors.Is(err, ErrCreateAttemptPending) {
+		t.Fatalf("restart Reconcile() error = %v, want read-only pending recovery", err)
+	}
+	if got := countEventsWithPrefix(api.events, assignmentPrefix); got != before+1 {
+		t.Fatalf("restart replayed ambiguous assignment: POST count=%d, want %d", got, before+1)
+	}
+
+	api.firewallAssignmentError = nil
+	api.firewallAssignmentReadbackRemaining = 0
+	if _, err := testReconciler(api).Reconcile(context.Background(), cluster, "unit-test-secret-token"); err != nil {
+		t.Fatalf("visible committed assignment did not recover: %v", err)
+	}
+	attempt = cluster.Status.CreateAttempts[createAttemptBastionFirewallAssignment]
+	if attempt.Phase != createAttemptPhaseMaterialized || attempt.ResourceUUID != bastion.UUID {
+		t.Fatalf("recovered assignment attempt = %#v", attempt)
+	}
+	if got := countEventsWithPrefix(api.events, assignmentPrefix); got != before+1 {
+		t.Fatalf("authoritative recovery issued %d assignment POSTs, want one", got-before)
+	}
+}
+
+func countVMCreatesByName(requests []inspace.CreateVMRequest, name string) int {
+	count := 0
+	for _, request := range requests {
+		if request.Name == name {
+			count++
+		}
+	}
+	return count
+}
+
+func countEventsWithPrefix(events []string, prefix string) int {
+	count := 0
+	for _, event := range events {
+		if strings.HasPrefix(event, prefix) {
+			count++
+		}
+	}
+	return count
+}
+
+func restartClusterFromJSON(t *testing.T, cluster *v1alpha1.InSpaceCluster) *v1alpha1.InSpaceCluster {
+	t.Helper()
+	encoded, err := json.Marshal(cluster)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var restarted v1alpha1.InSpaceCluster
+	if err := json.Unmarshal(encoded, &restarted); err != nil {
+		t.Fatal(err)
+	}
+	return &restarted
+}
+
 func TestAmbiguousMalformedCreateResponseRollsBackExactReturnedVM(t *testing.T) {
 	t.Run("bastion", func(t *testing.T) {
 		api := newFakeAPI()
@@ -1441,7 +2473,7 @@ func TestAmbiguousMalformedCreateResponseRollsBackExactReturnedVM(t *testing.T) 
 			t.Fatalf("ambiguous malformed bastion remained public: deletes=%#v VMs=%#v FIPs=%#v", api.vmDeletes, api.vms, api.floatingIPs)
 		}
 	})
-	t.Run("parallel control plane", func(t *testing.T) {
+	t.Run("ordered control plane", func(t *testing.T) {
 		api := newFakeAPI()
 		cluster := testCluster()
 		reconciler := testReconciler(api)
@@ -1457,10 +2489,11 @@ func TestAmbiguousMalformedCreateResponseRollsBackExactReturnedVM(t *testing.T) 
 		}
 		_, err := reconciler.Reconcile(context.Background(), cluster, "unit-test-secret-token")
 		if !errors.Is(err, createErr) || !strings.Contains(err.Error(), "slot 1") {
-			t.Fatalf("parallel ambiguous malformed error was not retained: %v", err)
+			t.Fatalf("ordered ambiguous malformed error was not retained: %v", err)
 		}
-		if len(api.vmCreates) != 1+ControlPlaneReplicas || len(api.vmDeletes) != 1 || len(api.vms) != ControlPlaneReplicas || len(api.floatingIPs) != ControlPlaneReplicas {
-			t.Fatalf("parallel malformed slot rollback touched successes or retained failure: creates=%#v deletes=%#v VMs=%#v FIPs=%#v", api.vmCreates, api.vmDeletes, api.vms, api.floatingIPs)
+		if len(api.vmCreates) != 3 || len(api.vmDeletes) != 1 || len(api.vms) != 2 || len(api.floatingIPs) != 2 ||
+			countVMCreatesByName(api.vmCreates, controlPlaneName(cluster.Metadata.Name, 2)) != 0 {
+			t.Fatalf("ordered malformed slot rollback touched successes or launched slot 2: creates=%#v deletes=%#v VMs=%#v FIPs=%#v", api.vmCreates, api.vmDeletes, api.vms, api.floatingIPs)
 		}
 		for _, vm := range api.vms {
 			if vm.Name == name {
@@ -1650,15 +2683,11 @@ func TestDHCPPrivateLoadBalancerPoolCollisionRollsBackNewVM(t *testing.T) {
 			}
 		}
 		reconciler := testReconciler(api)
-		if _, err := reconciler.Reconcile(context.Background(), cluster, "token"); err != nil {
-			t.Fatal(err)
-		}
-		eventsBefore := len(api.events)
 		if _, err := reconciler.Reconcile(context.Background(), cluster, "token"); err == nil {
 			t.Fatal("expected authoritative VM pool collision")
 		}
-		if len(api.events) != eventsBefore {
-			t.Fatalf("authoritative pool collision mutated infrastructure: %v", api.events[eventsBefore:])
+		if len(api.vmCreates) != 1 || len(api.vmDeletes) != 1 || len(api.vms) != 0 {
+			t.Fatalf("authoritative pool collision was not confined to its canonically owned VM: creates=%#v deletes=%#v VMs=%#v", api.vmCreates, api.vmDeletes, api.vms)
 		}
 	})
 }
@@ -2347,7 +3376,14 @@ func TestDestroyConvergesThroughKnownFirewallAssignmentLag(t *testing.T) {
 	if len(api.vms) != 0 || len(api.vmDeletes) != 1+ControlPlaneReplicas {
 		t.Fatalf("owned VMs did not delete while exact assignments lagged: VMs=%#v deletes=%#v", api.vms, api.vmDeletes)
 	}
-	waiting, err := reconciler.Destroy(context.Background(), cluster)
+	var waiting DestroyResult
+	var err error
+	for i := 0; i < 10; i++ {
+		waiting, err = reconciler.Destroy(context.Background(), cluster)
+		if err != nil || strings.Contains(waiting.Message, "waiting for firewall assignments to clear") {
+			break
+		}
+	}
 	if err != nil {
 		t.Fatalf("exact pending assignments must wait without an error: %v", err)
 	}
@@ -2366,8 +3402,8 @@ func TestDestroyConvergesThroughKnownFirewallAssignmentLag(t *testing.T) {
 			break
 		}
 	}
-	if !result.Done || len(api.firewalls) != 0 || len(reconciler.pendingVMDeletions) != 0 {
-		t.Fatalf("destroy did not converge after assignments cleared: result=%#v firewalls=%#v pending=%#v", result, api.firewalls, reconciler.pendingVMDeletions)
+	if !result.Done || len(api.firewalls) != 0 || len(cluster.Status.DeleteAttempts) != 0 {
+		t.Fatalf("destroy did not converge after assignments cleared: result=%#v firewalls=%#v pending=%#v", result, api.firewalls, cluster.Status.DeleteAttempts)
 	}
 }
 
@@ -2393,25 +3429,40 @@ func TestDestroyRetainsDeletionIntentWhenAPIErrorCommits(t *testing.T) {
 			var deleteErr error
 			for i := 0; i < 20; i++ {
 				_, deleteErr = reconciler.Destroy(context.Background(), cluster)
-				if deleteErr != nil {
+				if len(api.vmDeletes) != 0 {
 					break
 				}
 			}
-			if !errors.Is(deleteErr, ErrRetryableAmbiguousVMDelete) || !errors.Is(deleteErr, ambiguousErr) || len(api.vmDeletes) != 1 || len(api.vms) != ControlPlaneReplicas {
+			if !errors.Is(deleteErr, ambiguousErr) || len(api.vmDeletes) != 1 || len(api.vms) != ControlPlaneReplicas {
 				t.Fatalf("ambiguous committed delete state: error=%v deletes=%#v VMs=%#v", deleteErr, api.vmDeletes, api.vms)
 			}
-			if len(reconciler.pendingVMDeletions) != 1 {
-				t.Fatalf("ambiguous committed delete lost its exact intent: %#v", reconciler.pendingVMDeletions)
+			if attempt, exists := cluster.Status.DeleteAttempts[deleteAttemptBastion]; !exists || attempt.Phase != deletePhaseVMIssued || attempt.AbsenceObservedAt == "" {
+				t.Fatalf("ambiguous committed delete lost its exact intent: %#v", cluster.Status.DeleteAttempts)
 			}
+			firstDeleted := api.vmDeletes[0]
+			reconciler = testReconciler(api)
 
 			api.vmDeleteError = nil
 			api.vmDeleteErrorCommits = false
+			if _, err := reconciler.Destroy(context.Background(), cluster); err != nil {
+				t.Fatalf("restart did not complete the second corroborated absence observation: %v", err)
+			}
+			if attempt := cluster.Status.DeleteAttempts[deleteAttemptBastion]; attempt.Phase != deletePhaseAbsent {
+				t.Fatalf("restart did not establish durable VM absence: %#v", attempt)
+			}
 			for i := 0; i < 20 && len(api.vms) != 0; i++ {
 				if _, err := reconciler.Destroy(context.Background(), cluster); err != nil {
 					t.Fatalf("destroy after ambiguous commit %d: %v", i, err)
 				}
 			}
-			waiting, err := reconciler.Destroy(context.Background(), cluster)
+			var waiting DestroyResult
+			var err error
+			for i := 0; i < 10; i++ {
+				waiting, err = reconciler.Destroy(context.Background(), cluster)
+				if err != nil || strings.Contains(waiting.Message, "waiting for firewall assignments to clear") {
+					break
+				}
+			}
 			if err != nil || !strings.Contains(waiting.Message, "waiting for firewall assignments to clear") || len(api.firewallDeletes) != 0 {
 				t.Fatalf("ambiguous committed delete did not reach safe assignment wait: result=%#v error=%v", waiting, err)
 			}
@@ -2426,56 +3477,395 @@ func TestDestroyRetainsDeletionIntentWhenAPIErrorCommits(t *testing.T) {
 					break
 				}
 			}
-			if !result.Done || len(api.firewalls) != 0 || len(reconciler.pendingVMDeletions) != 0 {
-				t.Fatalf("ambiguous committed delete did not converge: result=%#v firewalls=%#v pending=%#v", result, api.firewalls, reconciler.pendingVMDeletions)
+			if !result.Done || len(api.firewalls) != 0 || len(cluster.Status.DeleteAttempts) != 0 || countStrings(api.vmDeletes, firstDeleted) != 1 {
+				t.Fatalf("ambiguous committed delete did not converge exactly once: result=%#v firewalls=%#v pending=%#v deletes=%#v", result, api.firewalls, cluster.Status.DeleteAttempts, api.vmDeletes)
 			}
 		})
 	}
 }
 
-func TestDestroyRefreshesDeletionIntentAfterSlowDeleteOutcome(t *testing.T) {
-	tests := map[string]struct {
-		deleteErr error
-		ambiguous bool
-	}{
-		"success":   {},
-		"not found": {deleteErr: &inspace.APIError{StatusCode: 404, Method: "DELETE", Path: "/vm", Message: "not found"}},
-		"raw EOF":   {deleteErr: io.ErrUnexpectedEOF, ambiguous: true},
+func TestDestroyDeleteReceiptSurvivesControllerRestartWithoutTimeout(t *testing.T) {
+	api := newFakeAPI()
+	api.retainFirewallAssignmentsOnDelete = true
+	cluster := testCluster()
+	reconciler := testReconciler(api)
+	reconcileUntilReady(t, reconciler, cluster)
+	destroyUntilFirstVMDelete(t, reconciler, api, cluster)
+	if attempt, exists := cluster.Status.DeleteAttempts[deleteAttemptBastion]; !exists || attempt.Phase != deletePhaseAbsent {
+		t.Fatalf("durable delete receipt=%#v", cluster.Status.DeleteAttempts)
 	}
-	for name, test := range tests {
-		t.Run(name, func(t *testing.T) {
-			api := newFakeAPI()
-			api.retainFirewallAssignmentsOnDelete = true
-			api.vmDeleteError = test.deleteErr
-			api.vmDeleteErrorCommits = test.deleteErr != nil
-			cluster := testCluster()
-			reconciler := testReconciler(api)
-			current := time.Unix(1_800_000_000, 0)
-			reconciler.now = func() time.Time { return current }
-			reconcileUntilReady(t, reconciler, cluster)
-			api.vmDeleteHook = func() { current = current.Add(ownedVMDeletionTransitionTTL + time.Minute) }
+	firstDeleted := api.vmDeletes[0]
+	reconciler = testReconciler(api)
+	for i := 0; i < 20 && len(api.vms) != 0; i++ {
+		if _, err := reconciler.Destroy(context.Background(), cluster); err != nil {
+			t.Fatalf("destroy after reconstructed controller %d: %v", i, err)
+		}
+	}
+	if countStrings(api.vmDeletes, firstDeleted) != 1 {
+		t.Fatalf("reconstructed controller replayed exact DELETE: %#v", api.vmDeletes)
+	}
+}
 
-			var deleteErr error
-			for i := 0; i < 20 && len(api.vmDeletes) == 0; i++ {
-				_, deleteErr = reconciler.Destroy(context.Background(), cluster)
-			}
-			if len(api.vmDeletes) != 1 || len(reconciler.pendingVMDeletions) != 1 {
-				t.Fatalf("slow delete did not retain one exact intent: deletes=%#v pending=%#v", api.vmDeletes, reconciler.pendingVMDeletions)
-			}
-			if test.ambiguous {
-				if !errors.Is(deleteErr, ErrRetryableAmbiguousVMDelete) || !errors.Is(deleteErr, test.deleteErr) {
-					t.Fatalf("raw ambiguous error was not wrapped and preserved: %v", deleteErr)
+func TestDestroyCommittedHTTP500AndReadbackOutageNeverReplaysVMDelete(t *testing.T) {
+	api := newFakeAPI()
+	api.retainFirewallAssignmentsOnDelete = true
+	cluster := testCluster()
+	reconciler := testReconciler(api)
+	reconcileUntilReady(t, reconciler, cluster)
+	bastion := mustVM(t, api.vms, currentBastionName(cluster.Metadata.Name))
+	bastionUUID := bastion.UUID
+	http500 := &inspace.APIError{StatusCode: 500, Method: "DELETE", Path: "/vm", Message: "committed but response failed"}
+	readbackOutage := io.ErrUnexpectedEOF
+	api.vmDeleteError = http500
+	api.vmDeleteErrorCommits = true
+	api.vmDeleteHook = func() {
+		api.getVMErrorByUUID = map[string]error{bastionUUID: readbackOutage}
+	}
+
+	var destroyErr error
+	for i := 0; i < 30 && len(api.vmDeletes) == 0; i++ {
+		_, destroyErr = reconciler.Destroy(context.Background(), cluster)
+	}
+	if len(api.vmDeletes) != 1 || !errors.Is(destroyErr, http500) || !errors.Is(destroyErr, readbackOutage) {
+		t.Fatalf("committed HTTP500/readback outage state: deletes=%#v error=%v", api.vmDeletes, destroyErr)
+	}
+	attempt := cluster.Status.DeleteAttempts[deleteAttemptBastion]
+	if attempt.Phase != deletePhaseVMIssued || attempt.AbsenceObservedAt != "" {
+		t.Fatalf("ambiguous delete did not retain an unresolved issued lock: %#v", attempt)
+	}
+
+	reconciler = testReconciler(api)
+	if _, err := reconciler.Destroy(context.Background(), cluster); !errors.Is(err, readbackOutage) {
+		t.Fatalf("reconstructed controller did not remain read-only during outage: %v", err)
+	}
+	if len(api.vmDeletes) != 1 {
+		t.Fatalf("reconstructed controller replayed DELETE during outage: %#v", api.vmDeletes)
+	}
+	delete(api.getVMErrorByUUID, bastionUUID)
+	api.vmDeleteError = nil
+	api.vmDeleteErrorCommits = false
+	api.vmDeleteHook = nil
+	var recoveryErr error
+	for i := 0; i < 3; i++ {
+		reconciler = testReconciler(api)
+		_, recoveryErr = reconciler.Destroy(context.Background(), cluster)
+	}
+	if countStrings(api.vmDeletes, bastionUUID) != 1 || cluster.Status.DeleteAttempts[deleteAttemptBastion].Phase != deletePhaseAbsent {
+		t.Fatalf("two absence observations did not resolve without replay: deletes=%#v receipt=%#v lastError=%v", api.vmDeletes, cluster.Status.DeleteAttempts[deleteAttemptBastion], recoveryErr)
+	}
+}
+
+func TestDestroyCommittedHTTP500SplitVMReadbackRequiresListAndVPCAbsence(t *testing.T) {
+	api := newFakeAPI()
+	api.retainFirewallAssignmentsOnDelete = true
+	cluster := testCluster()
+	reconciler := testReconciler(api)
+	reconcileUntilReady(t, reconciler, cluster)
+	bastion := *mustVM(t, api.vms, currentBastionName(cluster.Metadata.Name))
+	bastion.Storage = append([]inspace.VMStorage(nil), bastion.Storage...)
+	http500 := &inspace.APIError{StatusCode: 500, Method: "DELETE", Path: "/vm", Message: "committed with split readback"}
+	api.vmDeleteError = http500
+	api.vmDeleteErrorCommits = true
+	api.retainVMInventoryOnDelete = true
+	api.vmDeleteHook = func() {
+		api.getVMErrorByUUID = map[string]error{bastion.UUID: &inspace.APIError{
+			StatusCode: 404, Method: "GET", Path: "/vm", Message: "detail already absent",
+		}}
+	}
+
+	var destroyErr error
+	for attempt := 0; attempt < 30 && len(api.vmDeletes) == 0; attempt++ {
+		_, destroyErr = reconciler.Destroy(context.Background(), cluster)
+	}
+	if len(api.vmDeletes) != 1 || !errors.Is(destroyErr, http500) {
+		t.Fatalf("committed split-view delete: deletes=%#v error=%v", api.vmDeletes, destroyErr)
+	}
+	receipt := cluster.Status.DeleteAttempts[deleteAttemptBastion]
+	if receipt.Phase != deletePhaseVMIssued || receipt.AbsenceObservedAt != "" || len(api.firewallDeletes) != 0 {
+		t.Fatalf("split-view readback advanced deletion: receipt=%#v firewallDeletes=%#v", receipt, api.firewallDeletes)
+	}
+
+	reconciler = testReconciler(api)
+	if _, err := reconciler.reconcileVMDelete(context.Background(), cluster, deleteAttemptBastion); err != nil {
+		t.Fatalf("restart split-view observation: %v", err)
+	}
+	if len(api.vmDeletes) != 1 || cluster.Status.DeleteAttempts[deleteAttemptBastion].AbsenceObservedAt != "" {
+		t.Fatalf("restart replayed or trusted split view: deletes=%#v receipt=%#v", api.vmDeletes, cluster.Status.DeleteAttempts[deleteAttemptBastion])
+	}
+
+	api.removeVMFromReadback(bastion.UUID)
+	delete(api.getVMErrorByUUID, bastion.UUID)
+	if absent, err := reconciler.reconcileVMDelete(context.Background(), cluster, deleteAttemptBastion); err != nil || absent {
+		t.Fatalf("first corroborated absence: absent=%t error=%v", absent, err)
+	}
+	if cluster.Status.DeleteAttempts[deleteAttemptBastion].AbsenceObservedAt == "" {
+		t.Fatal("first corroborated absence was not persisted")
+	}
+
+	api.mu.Lock()
+	api.vms = append(api.vms, bastion)
+	api.network.VMUUIDs = append(api.network.VMUUIDs, bastion.UUID)
+	api.mu.Unlock()
+	if absent, err := reconciler.reconcileVMDelete(context.Background(), cluster, deleteAttemptBastion); err != nil || absent {
+		t.Fatalf("positive reappearance reset: absent=%t error=%v", absent, err)
+	}
+	if cluster.Status.DeleteAttempts[deleteAttemptBastion].AbsenceObservedAt != "" {
+		t.Fatalf("positive reappearance did not reset evidence: %#v", cluster.Status.DeleteAttempts[deleteAttemptBastion])
+	}
+
+	api.removeVMFromReadback(bastion.UUID)
+	for observation := 0; observation < 2; observation++ {
+		reconciler = testReconciler(api)
+		if _, err := reconciler.reconcileVMDelete(context.Background(), cluster, deleteAttemptBastion); err != nil {
+			t.Fatalf("corroborated absence observation %d: %v", observation+1, err)
+		}
+	}
+	if len(api.vmDeletes) != 1 || cluster.Status.DeleteAttempts[deleteAttemptBastion].Phase != deletePhaseAbsent || len(api.firewallDeletes) != 0 {
+		t.Fatalf("corroborated convergence: deletes=%#v receipt=%#v firewallDeletes=%#v", api.vmDeletes, cluster.Status.DeleteAttempts[deleteAttemptBastion], api.firewallDeletes)
+	}
+}
+
+func TestDestroyCommittedHTTP500AndReadbackOutageNeverReplaysFloatingIPMutations(t *testing.T) {
+	api := newFakeAPI()
+	cluster := testCluster()
+	owner := ownerKey(cluster)
+	resourceNames := currentBootstrapResourceNames(cluster.Metadata.Name, owner)
+	vmUUID := "10000000-1111-4222-8333-bbbbbbbbbbbb"
+	item := inspace.FloatingIP{
+		Name: resourceNames.BastionFloatingIP, Address: "203.0.113.90", BillingAccountID: cluster.Spec.BillingAccountID,
+		Type: "public", Enabled: true, AssignedTo: vmUUID, AssignedToResourceType: "virtual_machine", AssignedToPrivateIP: "10.20.30.20",
+	}
+	seedOwnedMutationVMs(t, api, cluster, vmUUID)
+	api.floatingIPs = []inspace.FloatingIP{item}
+	reconciler := testReconciler(api)
+	if err := reconciler.ensureDestroyFloatingIPRemoval(context.Background(), cluster, destroyFIPBastionKey, &item); err != nil {
+		t.Fatal(err)
+	}
+
+	http500 := &inspace.APIError{StatusCode: 500, Method: "POST", Path: "/ip/unassign", Message: "committed but response failed"}
+	readbackOutage := io.ErrUnexpectedEOF
+	api.floatingIPUnassignError = http500
+	api.floatingIPUnassignErrorCommits = true
+	api.floatingIPListErrorAfterUnassign = readbackOutage
+	if _, err := reconciler.reconcileDestroyFloatingIPRemoval(context.Background(), cluster, destroyFIPBastionKey); !errors.Is(err, http500) || !errors.Is(err, readbackOutage) {
+		t.Fatalf("ambiguous unassign error = %v", err)
+	}
+	if got := countEvents(api.events, "unassign-fip/"+item.Address); got != 1 {
+		t.Fatalf("unassign calls = %d, want 1", got)
+	}
+	if attempt := cluster.Status.DeleteAttempts[destroyFIPBastionKey]; attempt.Phase != deletePhaseFIPUnassignIssued || attempt.AbsenceObservedAt != "" {
+		t.Fatalf("unassign receipt = %#v", attempt)
+	}
+
+	reconciler = testReconciler(api)
+	if _, err := reconciler.reconcileDestroyFloatingIPRemoval(context.Background(), cluster, destroyFIPBastionKey); !errors.Is(err, readbackOutage) {
+		t.Fatalf("restart unassign readback error = %v", err)
+	}
+	if got := countEvents(api.events, "unassign-fip/"+item.Address); got != 1 {
+		t.Fatalf("restart replayed unassign: %d calls", got)
+	}
+	api.floatingIPUnassignError = nil
+	api.floatingIPUnassignErrorCommits = false
+	api.floatingIPListErrorAfterUnassign = nil
+	if terminal, err := reconciler.reconcileDestroyFloatingIPRemoval(context.Background(), cluster, destroyFIPBastionKey); err != nil || terminal {
+		t.Fatalf("unassign convergence: terminal=%t error=%v", terminal, err)
+	}
+	if attempt := cluster.Status.DeleteAttempts[destroyFIPBastionKey]; attempt.Phase != deletePhaseFIPDeleteIntent {
+		t.Fatalf("unassign did not advance to delete intent: %#v", attempt)
+	}
+
+	http500 = &inspace.APIError{StatusCode: 500, Method: "DELETE", Path: "/ip", Message: "committed but response failed"}
+	api.floatingIPDeleteError = http500
+	api.floatingIPDeleteErrorCommits = true
+	api.floatingIPListErrorAfterDelete = readbackOutage
+	if _, err := reconciler.reconcileDestroyFloatingIPRemoval(context.Background(), cluster, destroyFIPBastionKey); !errors.Is(err, http500) || !errors.Is(err, readbackOutage) {
+		t.Fatalf("ambiguous floating-IP delete error = %v", err)
+	}
+	if got := countStrings(api.floatingIPDeletes, item.Address); got != 1 {
+		t.Fatalf("floating-IP delete calls = %d, want 1", got)
+	}
+	if attempt := cluster.Status.DeleteAttempts[destroyFIPBastionKey]; attempt.Phase != deletePhaseFIPDeleteIssued || attempt.AbsenceObservedAt != "" {
+		t.Fatalf("floating-IP delete receipt = %#v", attempt)
+	}
+
+	reconciler = testReconciler(api)
+	if _, err := reconciler.reconcileDestroyFloatingIPRemoval(context.Background(), cluster, destroyFIPBastionKey); !errors.Is(err, readbackOutage) {
+		t.Fatalf("restart delete readback error = %v", err)
+	}
+	if got := countStrings(api.floatingIPDeletes, item.Address); got != 1 {
+		t.Fatalf("restart replayed floating-IP delete: %d calls", got)
+	}
+	api.floatingIPDeleteError = nil
+	api.floatingIPDeleteErrorCommits = false
+	api.floatingIPListErrorAfterDelete = nil
+	terminal, err := reconciler.reconcileDestroyFloatingIPRemoval(context.Background(), cluster, destroyFIPBastionKey)
+	if err != nil || !terminal {
+		t.Fatalf("floating-IP delete convergence: terminal=%t error=%v", terminal, err)
+	}
+	if got := countStrings(api.floatingIPDeletes, item.Address); got != 1 {
+		t.Fatalf("convergence replayed floating-IP delete: %d calls", got)
+	}
+}
+
+func TestDestroyCommittedHTTP500AndReadbackOutageNeverReplaysFirewallDelete(t *testing.T) {
+	api := newFakeAPI()
+	cluster := testCluster()
+	resourceNames := currentBootstrapResourceNames(cluster.Metadata.Name, ownerKey(cluster))
+	item := inspace.Firewall{
+		UUID: "77777770-1111-4222-8333-444444444444", DisplayName: resourceNames.BastionFirewall,
+		BillingAccountID: cluster.Spec.BillingAccountID,
+		Rules:            managedBastionFirewallRules("198.51.100.24/32", api.network.Subnet, false),
+	}
+	api.firewalls = []inspace.Firewall{item}
+	reconciler := testReconciler(api)
+	if err := reconciler.ensureDestroyFirewallRemoval(context.Background(), cluster, destroyFirewallBastionKey, &item); err != nil {
+		t.Fatal(err)
+	}
+
+	http500 := &inspace.APIError{StatusCode: 500, Method: "DELETE", Path: "/firewall", Message: "committed but response failed"}
+	readbackOutage := io.ErrUnexpectedEOF
+	api.firewallDeleteError = http500
+	api.firewallDeleteErrorCommits = true
+	api.firewallListErrorAfterDelete = readbackOutage
+	if _, err := reconciler.reconcileDestroyFirewallRemoval(context.Background(), cluster, destroyFirewallBastionKey); !errors.Is(err, http500) || !errors.Is(err, readbackOutage) {
+		t.Fatalf("ambiguous firewall delete error = %v", err)
+	}
+	if got := countStrings(api.firewallDeletes, item.UUID); got != 1 {
+		t.Fatalf("firewall delete calls = %d, want 1", got)
+	}
+	if attempt := cluster.Status.DeleteAttempts[destroyFirewallBastionKey]; attempt.Phase != deletePhaseFirewallDeleteIssued || attempt.AbsenceObservedAt != "" {
+		t.Fatalf("firewall delete receipt = %#v", attempt)
+	}
+
+	reconciler = testReconciler(api)
+	if _, err := reconciler.reconcileDestroyFirewallRemoval(context.Background(), cluster, destroyFirewallBastionKey); !errors.Is(err, readbackOutage) {
+		t.Fatalf("restart firewall readback error = %v", err)
+	}
+	if got := countStrings(api.firewallDeletes, item.UUID); got != 1 {
+		t.Fatalf("restart replayed firewall delete: %d calls", got)
+	}
+	api.firewallDeleteError = nil
+	api.firewallDeleteErrorCommits = false
+	api.firewallListErrorAfterDelete = nil
+	terminal, err := reconciler.reconcileDestroyFirewallRemoval(context.Background(), cluster, destroyFirewallBastionKey)
+	if err != nil || !terminal {
+		t.Fatalf("firewall delete convergence: terminal=%t error=%v", terminal, err)
+	}
+	if got := countStrings(api.firewallDeletes, item.UUID); got != 1 {
+		t.Fatalf("convergence replayed firewall delete: %d calls", got)
+	}
+}
+
+func TestDestroyRemovalIntentsRevalidateCloudOwnershipAfterIssueCAS(t *testing.T) {
+	t.Run("floating IP", func(t *testing.T) {
+		tests := map[string]func(*inspace.FloatingIP){
+			"name":       func(item *inspace.FloatingIP) { item.Name = "foreign" },
+			"billing":    func(item *inspace.FloatingIP) { item.BillingAccountID = 999 },
+			"assignment": func(item *inspace.FloatingIP) { item.AssignedTo = "99999999-1111-4222-8333-bbbbbbbbbbbb" },
+			"type":       func(item *inspace.FloatingIP) { item.Type = "private" },
+		}
+		for name, mutate := range tests {
+			t.Run(name, func(t *testing.T) {
+				api := newFakeAPI()
+				cluster := testCluster()
+				resourceNames := currentBootstrapResourceNames(cluster.Metadata.Name, ownerKey(cluster))
+				vmUUID := "10000000-1111-4222-8333-bbbbbbbbbbbb"
+				item := inspace.FloatingIP{
+					Name: resourceNames.BastionFloatingIP, Address: "203.0.113.91", BillingAccountID: cluster.Spec.BillingAccountID,
+					Type: "public", Enabled: true, AssignedTo: vmUUID, AssignedToResourceType: "virtual_machine", AssignedToPrivateIP: "10.20.30.20",
 				}
-			} else if deleteErr != nil {
-				t.Fatalf("definitive delete outcome returned an error: %v", deleteErr)
-			}
-			for _, deletion := range reconciler.pendingVMDeletions {
-				wantExpiry := current.Add(ownedVMDeletionTransitionTTL)
-				if !deletion.ExpiresAt.Equal(wantExpiry) {
-					t.Fatalf("transition expiry=%s, want refresh from DELETE return %s", deletion.ExpiresAt, wantExpiry)
+				seedOwnedMutationVMs(t, api, cluster, vmUUID)
+				api.floatingIPs = []inspace.FloatingIP{item}
+				reconciler := testReconciler(api)
+				if err := reconciler.ensureDestroyFloatingIPRemoval(context.Background(), cluster, destroyFIPBastionKey, &item); err != nil {
+					t.Fatal(err)
 				}
-			}
-		})
+				mutate(&api.floatingIPs[0])
+				if _, err := reconciler.reconcileDestroyFloatingIPRemoval(context.Background(), cluster, destroyFIPBastionKey); err == nil {
+					t.Fatal("drifted floating-IP receipt authorized a cloud mutation")
+				}
+				attempt := cluster.Status.DeleteAttempts[destroyFIPBastionKey]
+				if countEventsWithPrefix(api.events, "unassign-fip/") != 0 || len(api.floatingIPDeletes) != 0 || attempt.Phase != deletePhaseFIPUnassignIssued {
+					t.Fatalf("floating-IP drift mutated cloud state or lost its durable issue lock: events=%#v deletes=%#v attempt=%#v", api.events, api.floatingIPDeletes, attempt)
+				}
+			})
+		}
+	})
+
+	t.Run("firewall", func(t *testing.T) {
+		tests := map[string]func(*inspace.Firewall){
+			"name":    func(item *inspace.Firewall) { item.DisplayName = "foreign" },
+			"billing": func(item *inspace.Firewall) { item.BillingAccountID = 999 },
+			"policy":  func(item *inspace.Firewall) { item.Rules = nil },
+			"assignments": func(item *inspace.Firewall) {
+				item.ResourcesAssigned = []inspace.FirewallResource{{ResourceType: "vm", ResourceUUID: "99999999-1111-4222-8333-bbbbbbbbbbbb"}}
+			},
+		}
+		for name, mutate := range tests {
+			t.Run(name, func(t *testing.T) {
+				api := newFakeAPI()
+				cluster := testCluster()
+				resourceNames := currentBootstrapResourceNames(cluster.Metadata.Name, ownerKey(cluster))
+				item := inspace.Firewall{
+					UUID: "77777770-1111-4222-8333-444444444444", DisplayName: resourceNames.BastionFirewall,
+					BillingAccountID: cluster.Spec.BillingAccountID,
+					Rules:            managedBastionFirewallRules("198.51.100.24/32", api.network.Subnet, false),
+				}
+				api.firewalls = []inspace.Firewall{item}
+				reconciler := testReconciler(api)
+				if err := reconciler.ensureDestroyFirewallRemoval(context.Background(), cluster, destroyFirewallBastionKey, &item); err != nil {
+					t.Fatal(err)
+				}
+				mutate(&api.firewalls[0])
+				if _, err := reconciler.reconcileDestroyFirewallRemoval(context.Background(), cluster, destroyFirewallBastionKey); err == nil {
+					t.Fatal("drifted firewall receipt authorized a cloud mutation")
+				}
+				attempt := cluster.Status.DeleteAttempts[destroyFirewallBastionKey]
+				if len(api.firewallDeletes) != 0 || attempt.Phase != deletePhaseFirewallDeleteIssued {
+					t.Fatalf("firewall drift mutated cloud state or lost its durable issue lock: deletes=%#v attempt=%#v", api.firewallDeletes, attempt)
+				}
+			})
+		}
+	})
+}
+
+func TestMalformedCreateRollbackRestartRecreatesOnlyAfterVMAndFIPAbsence(t *testing.T) {
+	api := newFakeAPI()
+	api.mutateStoredVM = func(_ inspace.CreateVMRequest, vm *inspace.VM) { vm.VCPU++ }
+	api.vmDeleteHook = func() { api.floatingIPListError = io.ErrUnexpectedEOF }
+	cluster := testCluster()
+	reconciler := testReconciler(api)
+	if _, err := reconciler.Reconcile(context.Background(), cluster, "unit-test-secret-token"); err == nil {
+		t.Fatal("expected malformed first VM to enter durable rollback")
+	}
+	if len(api.vmDeletes) != 1 || len(api.vmCreates) != 1 {
+		t.Fatalf("malformed containment did not issue exactly one create/delete: creates=%#v deletes=%#v", api.vmCreates, api.vmDeletes)
+	}
+	oldUUID := api.vmDeletes[0]
+	if len(api.floatingIPs) != 1 {
+		t.Fatalf("test requires the old auto floating IP to remain for durable cleanup: %#v", api.floatingIPs)
+	}
+	api.vmDeleteHook = nil
+	api.floatingIPListError = nil
+	api.mutateStoredVM = nil
+	for i := 0; i < 20 && len(api.vmCreates) < 2; i++ {
+		reconciler = testReconciler(api)
+		_, err := reconciler.Reconcile(context.Background(), cluster, "unit-test-secret-token")
+		if err != nil && !errors.Is(err, ErrCreateAttemptPending) {
+			t.Fatalf("rollback/replacement reconcile %d: %v", i, err)
+		}
+	}
+	if len(api.vmCreates) != 2 || countStrings(api.vmDeletes, oldUUID) != 1 || len(api.floatingIPs) != 1 {
+		t.Fatalf("rollback replacement was not exact: creates=%#v deletes=%#v FIPs=%#v", api.vmCreates, api.vmDeletes, api.floatingIPs)
+	}
+	newVM := mustVM(t, api.vms, currentBastionName(cluster.Metadata.Name))
+	if newVM.UUID == oldUUID {
+		t.Fatal("replacement reused the deleted VM UUID")
+	}
+	create := cluster.Status.CreateAttempts[createAttemptBastionVM]
+	assignment := cluster.Status.CreateAttempts[createAttemptBastionFirewallAssignment]
+	if !strings.EqualFold(create.ResourceUUID, newVM.UUID) || strings.Contains(assignment.ResourceName, oldUUID) {
+		t.Fatalf("replacement receipts retained deleted identity: create=%#v assignment=%#v", create, assignment)
 	}
 }
 
@@ -2495,19 +3885,61 @@ func TestDestroyDropsDeletionIntentAfterLocalMutationGuard(t *testing.T) {
 			break
 		}
 	}
-	if deleteErr != rejectedErr || len(api.vmDeletes) != 1 || len(api.vms) != 1+ControlPlaneReplicas {
+	if !errors.Is(deleteErr, rejectedErr) || len(api.vmDeletes) != 1 || len(api.vms) != 1+ControlPlaneReplicas {
 		t.Fatalf("local pre-dispatch rejection state: error=%v deletes=%#v VMs=%#v", deleteErr, api.vmDeletes, api.vms)
 	}
-	if len(reconciler.pendingVMDeletions) != 0 {
-		t.Fatalf("local pre-dispatch rejection retained deletion authority: %#v", reconciler.pendingVMDeletions)
+	if _, exists := cluster.Status.DeleteAttempts[deleteAttemptBastion]; !exists {
+		t.Fatalf("local pre-dispatch rejection lost durable intent: %#v", cluster.Status.DeleteAttempts)
+	}
+	deletion := cluster.Status.DeleteAttempts[deleteAttemptBastion]
+	if deletion.Phase != deletePhaseVMIntent || deletion.IssueID != "" {
+		t.Fatalf("local pre-dispatch rejection did not reset safely: %#v", deletion)
 	}
 
 	api.vmDeleteError = nil
-	if _, err := reconciler.Destroy(context.Background(), cluster); err != nil {
-		t.Fatalf("retry after local pre-dispatch rejection: %v", err)
+	for observation := 0; observation < 2; observation++ {
+		if _, err := reconciler.Destroy(context.Background(), cluster); err != nil {
+			t.Fatalf("retry after local pre-dispatch rejection observation %d: %v", observation+1, err)
+		}
 	}
-	if len(api.vms) != ControlPlaneReplicas || len(reconciler.pendingVMDeletions) != 1 {
-		t.Fatalf("successful retry did not establish one exact transition: VMs=%#v pending=%#v", api.vms, reconciler.pendingVMDeletions)
+	if len(api.vms) != ControlPlaneReplicas || cluster.Status.DeleteAttempts[deleteAttemptBastion].Phase != deletePhaseAbsent {
+		t.Fatalf("successful retry did not establish one exact transition: VMs=%#v pending=%#v", api.vms, cluster.Status.DeleteAttempts)
+	}
+}
+
+func TestDestroyVMIntentRevalidatesCanonicalOwnershipBeforeDispatch(t *testing.T) {
+	tests := map[string]func(*inspace.VM){
+		"billing":     func(vm *inspace.VM) { vm.BillingAccountID = 999 },
+		"network":     func(vm *inspace.VM) { vm.NetworkUUID = "aaaaaaaa-2222-4333-8444-555555555555" },
+		"description": func(vm *inspace.VM) { vm.Description = "foreign ownership" },
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			api := newFakeAPI()
+			cluster := testCluster()
+			reconciler := testReconciler(api)
+			reconcileUntilReady(t, reconciler, cluster)
+			bastion := mustVM(t, api.vms, currentBastionName(cluster.Metadata.Name))
+			resourceNames := currentBootstrapResourceNames(cluster.Metadata.Name, ownerKey(cluster))
+			firewall := mustFirewall(t, api.firewalls, resourceNames.BastionFirewall)
+			if err := reconciler.ensureVMDeleteAttempt(context.Background(), cluster, deleteAttemptBastion, deletePurposeDestroy, bastion, firewall.UUID, ""); err != nil {
+				t.Fatal(err)
+			}
+			api.mu.Lock()
+			for index := range api.vms {
+				if api.vms[index].UUID == bastion.UUID {
+					mutate(&api.vms[index])
+				}
+			}
+			api.mu.Unlock()
+
+			if _, err := reconciler.reconcileVMDelete(context.Background(), cluster, deleteAttemptBastion); err == nil {
+				t.Fatal("drifted durable VM intent became deletion authority")
+			}
+			if len(api.vmDeletes) != 0 || cluster.Status.DeleteAttempts[deleteAttemptBastion].Phase != deletePhaseVMIssued {
+				t.Fatalf("drifted durable VM intent mutated cloud state or lost its durable issue lock: deletes=%#v receipt=%#v", api.vmDeletes, cluster.Status.DeleteAttempts[deleteAttemptBastion])
+			}
+		})
 	}
 }
 
@@ -2554,7 +3986,7 @@ func TestDestroyPendingDeletionRejectsRememberedUUIDOnSecondFirewall(t *testing.
 	}
 }
 
-func TestDestroyRejectsExpiredPendingDeletionAssignment(t *testing.T) {
+func TestDestroyDurablePendingDeletionHasNoExpiry(t *testing.T) {
 	api := newFakeAPI()
 	api.retainFirewallAssignmentsOnDelete = true
 	cluster := testCluster()
@@ -2562,31 +3994,46 @@ func TestDestroyRejectsExpiredPendingDeletionAssignment(t *testing.T) {
 	reconcileUntilReady(t, reconciler, cluster)
 	destroyUntilFirstVMDelete(t, reconciler, api, cluster)
 
-	reconciler.pendingDeletionMu.Lock()
-	for key, deletion := range reconciler.pendingVMDeletions {
-		deletion.ExpiresAt = time.Now().Add(-time.Second)
-		reconciler.pendingVMDeletions[key] = deletion
+	reconciler = testReconciler(api)
+	var waiting DestroyResult
+	var err error
+	for i := 0; i < 10; i++ {
+		waiting, err = reconciler.Destroy(context.Background(), cluster)
+		if err != nil || strings.Contains(waiting.Message, "waiting for firewall assignments to clear") {
+			break
+		}
 	}
-	reconciler.pendingDeletionMu.Unlock()
-	mutationsBefore := len(api.vmDeletes) + len(api.floatingIPDeletes) + len(api.firewallDeletes)
-	if _, err := reconciler.Destroy(context.Background(), cluster); err == nil || !strings.Contains(err.Error(), "did not clear within") {
-		t.Fatalf("expired pending assignment was not rejected: %v", err)
+	if err != nil || !strings.Contains(waiting.Message, "waiting for firewall assignments to clear") {
+		t.Fatalf("durable pending assignment did not survive restart: result=%#v error=%v", waiting, err)
 	}
-	if got := len(api.vmDeletes) + len(api.floatingIPDeletes) + len(api.firewallDeletes); got != mutationsBefore {
-		t.Fatal("expired pending assignment caused a teardown mutation")
+}
+
+func countStrings(items []string, target string) int {
+	count := 0
+	for _, item := range items {
+		if item == target {
+			count++
+		}
 	}
+	return count
+}
+
+func countEvents(items []string, target string) int {
+	return countStrings(items, target)
 }
 
 func destroyUntilFirstVMDelete(t *testing.T, reconciler *Reconciler, api *fakeAPI, cluster *v1alpha1.InSpaceCluster) {
 	t.Helper()
-	for i := 0; i < 20 && len(api.vmDeletes) == 0; i++ {
+	for i := 0; i < 30; i++ {
 		if _, err := reconciler.Destroy(context.Background(), cluster); err != nil {
 			t.Fatalf("destroy before first VM deletion %d: %v", i, err)
 		}
+		attempt, exists := cluster.Status.DeleteAttempts[deleteAttemptBastion]
+		if len(api.vmDeletes) == 1 && exists && attempt.Phase == deletePhaseAbsent {
+			return
+		}
 	}
-	if len(api.vmDeletes) != 1 {
-		t.Fatalf("expected one owned VM deletion, got %#v", api.vmDeletes)
-	}
+	t.Fatalf("expected one corroborated owned VM deletion, got deletes=%#v receipt=%#v", api.vmDeletes, cluster.Status.DeleteAttempts[deleteAttemptBastion])
 }
 
 func TestDestroyRejectsAssignmentAndPolicyDriftBeforeMutation(t *testing.T) {
@@ -2910,11 +4357,14 @@ func convertBootstrapResourceNamesToLegacy(t *testing.T, api *fakeAPI, cluster *
 func testReconciler(api *fakeAPI) *Reconciler {
 	return &Reconciler{
 		API: api, SSHUsername: "inspacee2e", SSHPublicKey: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest unit@test",
+		StatusCompareAndSwap: func(_ context.Context, _ *v1alpha1.InSpaceCluster, _ v1alpha1.InSpaceClusterStatus, desired v1alpha1.InSpaceClusterStatus) (v1alpha1.InSpaceClusterStatus, error) {
+			return desired, nil
+		},
 		ManagementCIDR: "198.51.100.24/32", ManagementTCPPorts: []int{22},
 		protectionAuditTimeout: 100 * time.Millisecond, protectionRequestTimeout: 25 * time.Millisecond,
 		protectionReadbackMinInterval: time.Millisecond, protectionReadbackMaxInterval: 5 * time.Millisecond,
 		createdVMRecoveryTimeout: 100 * time.Millisecond, createdVMFloatingIPCleanupTimeout: 25 * time.Millisecond,
-		createdVMDeleteTimeout: 25 * time.Millisecond,
+		createdVMDeleteTimeout: 25 * time.Millisecond, vmAbsenceObservationMinInterval: time.Nanosecond,
 	}
 }
 
@@ -3340,9 +4790,38 @@ func mustFirewall(t *testing.T, firewalls []inspace.Firewall, name string) *insp
 	return nil
 }
 
+func seedOwnedMutationVMs(t *testing.T, api *fakeAPI, cluster *v1alpha1.InSpaceCluster, uuids ...string) {
+	t.Helper()
+	api.mu.Lock()
+	defer api.mu.Unlock()
+	owner := ownerKey(cluster)
+	for index, uuid := range uuids {
+		if !vmUUIDPattern.MatchString(uuid) {
+			t.Fatalf("invalid seeded VM UUID %q", uuid)
+		}
+		name := currentBastionName(cluster.Metadata.Name)
+		description := fmt.Sprintf("inspace-rke2-bastion/v6 owner=%s spec=%s", owner, strings.Repeat("0", sha256.Size*2))
+		if index > 0 {
+			slot := index - 1
+			name = controlPlaneName(cluster.Metadata.Name, slot)
+			description = fmt.Sprintf("inspace-rke2-cp/v8 owner=%s slot=%d spec=%s", owner, slot, strings.Repeat("0", sha256.Size*2))
+		}
+		vm := inspace.VM{
+			UUID: uuid, Name: name, Hostname: name, Description: description,
+			BillingAccountID: cluster.Spec.BillingAccountID, NetworkUUID: cluster.Spec.Network.UUID,
+			PrivateIPv4: fmt.Sprintf("10.20.30.%d", 20+index),
+		}
+		api.vms = append(api.vms, vm)
+		api.network.VMUUIDs = append(api.network.VMUUIDs, uuid)
+	}
+}
+
 type fakeAPI struct {
 	mu                      sync.Mutex
 	network                 inspace.Network
+	getNetworkError         error
+	hostPools               []inspace.HostPool
+	listHostPoolsError      error
 	loadBalancers           []inspace.LoadBalancer
 	vms                     []inspace.VM
 	firewalls               []inspace.Firewall
@@ -3357,63 +4836,210 @@ type fakeAPI struct {
 	firewallDeletes   []string
 	events            []string
 
-	failFirewallAssignmentForName       string
-	firewallAssignmentError             error
-	firewallAssignmentErrorCommits      bool
-	firewallAssignmentNilWithoutCommit  bool
-	firewallAssignmentReadbackDelay     int
-	firewallAssignmentReadbackRemaining int
-	firewallAssignmentDuplicate         bool
-	firewallAssignmentWrongFirewall     bool
-	firewallAssignmentPolicyDrift       bool
-	failVMCreateNames                   map[string]error
-	commitVMCreateErrors                map[string]bool
-	privateIPByName                     map[string]string
-	mutateStoredVM                      func(inspace.CreateVMRequest, *inspace.VM)
-	mutateCreateVMResponse              func(inspace.CreateVMRequest, *inspace.VM)
-	mutateUpdateFloatingIPResponse      func(*inspace.FloatingIP)
-	mutateCreateFirewallResponse        func(inspace.CreateFirewallRequest, *inspace.Firewall)
-	mutateGetVMResponse                 func(*inspace.VM)
-	getVMErrorByUUID                    map[string]error
-	nilGetVMUUID                        string
-	floatingIPUpdateError               error
-	floatingIPUpdateErrorCommits        bool
-	floatingIPUnassignError             error
-	floatingIPUnassignErrorCommits      bool
-	floatingIPDeleteError               error
-	floatingIPDeleteErrorCommits        bool
-	floatingIPReadbackDelay             int
-	floatingIPReadbackRemaining         int
-	floatingIPAfterFirewallCreate       *inspace.FloatingIP
-	blockFloatingIPCleanupAfterCreate   bool
-	floatingIPCleanupBlocked            bool
-	omitFirewallDescriptions            bool
-	sparseVMListResponses               bool
-	vmListReadbackDelay                 int
-	vmListReadbackRemaining             int
-	sparseFirewallCreateResponses       bool
-	retainFirewallAssignmentsOnDelete   bool
-	vmDeleteError                       error
-	vmDeleteErrorCommits                bool
-	vmDeleteHook                        func()
-	cancelAfterVMCreate                 func()
-	requireLiveSafetyContext            bool
-	requireProtectionBeforeGetVM        bool
-	getVMBeforeProtectionCalls          int
-	createVMBarrier                     chan struct{}
-	createVMStarted                     chan string
+	failFirewallAssignmentForName        string
+	firewallAssignmentError              error
+	firewallAssignmentErrorCommits       bool
+	firewallAssignmentCalls              int
+	firewallListErrorAfterAssignment     error
+	firewallListErrorAfterAssignmentCall int
+	firewallAssignmentNilWithoutCommit   bool
+	firewallAssignmentReadbackDelay      int
+	firewallAssignmentReadbackRemaining  int
+	firewallAssignmentDuplicate          bool
+	firewallAssignmentWrongFirewall      bool
+	firewallAssignmentWrongType          bool
+	firewallAssignmentPolicyDrift        bool
+	failVMCreateNames                    map[string]error
+	commitVMCreateErrors                 map[string]bool
+	privateIPByName                      map[string]string
+	mutateStoredVM                       func(inspace.CreateVMRequest, *inspace.VM)
+	mutateCreateVMResponse               func(inspace.CreateVMRequest, *inspace.VM)
+	mutateUpdateFloatingIPResponse       func(*inspace.FloatingIP)
+	mutateCreateFirewallResponse         func(inspace.CreateFirewallRequest, *inspace.Firewall)
+	firewallCreateError                  error
+	firewallCreateErrorCommits           bool
+	firewallListError                    error
+	firewallListErrorAfterCreate         error
+	firewallListReadbackRemaining        int
+	mutateGetVMResponse                  func(*inspace.VM)
+	getVMErrorByUUID                     map[string]error
+	nilGetVMUUID                         string
+	floatingIPUpdateError                error
+	floatingIPUpdateErrorCommits         bool
+	floatingIPUpdateCalls                int
+	floatingIPListError                  error
+	floatingIPListErrorAfterUpdate       error
+	floatingIPListErrorAfterUnassign     error
+	floatingIPListErrorAfterDelete       error
+	floatingIPUnassignError              error
+	floatingIPUnassignErrorCommits       bool
+	floatingIPUnassignCalls              int
+	floatingIPDeleteError                error
+	floatingIPDeleteErrorCommits         bool
+	floatingIPReadbackDelay              int
+	floatingIPReadbackRemaining          int
+	floatingIPAfterFirewallCreate        *inspace.FloatingIP
+	blockFloatingIPCleanupAfterCreate    bool
+	floatingIPCleanupBlocked             bool
+	omitFirewallDescriptions             bool
+	sparseVMListResponses                bool
+	vmListReadbackDelay                  int
+	vmListReadbackRemaining              int
+	vmListErrorAfterCreate               error
+	sparseFirewallCreateResponses        bool
+	retainFirewallAssignmentsOnDelete    bool
+	vmDeleteError                        error
+	vmDeleteErrorCommits                 bool
+	retainVMInventoryOnDelete            bool
+	vmDeleteHook                         func()
+	firewallDeleteError                  error
+	firewallDeleteErrorCommits           bool
+	firewallListErrorAfterDelete         error
+	cancelAfterVMCreate                  func()
+	requireLiveSafetyContext             bool
+	requireProtectionBeforeGetVM         bool
+	getVMBeforeProtectionCalls           int
+}
+
+// postAssignmentReadBarrierAPI pauses the first ListFirewalls call after an
+// assignment POST has returned. It exposes the boundary where the per-firewall
+// gate must remain held until authoritative commit readback completes.
+type postAssignmentReadBarrierAPI struct {
+	*fakeAPI
+	mu                 sync.Mutex
+	assignmentReturned bool
+	readbackBlocked    bool
+	readbackStarted    chan struct{}
+	releaseReadback    chan struct{}
+}
+
+func (f *postAssignmentReadBarrierAPI) AssignFirewallToVM(ctx context.Context, location, firewallUUID, vmUUID string) error {
+	err := f.fakeAPI.AssignFirewallToVM(ctx, location, firewallUUID, vmUUID)
+	f.mu.Lock()
+	f.assignmentReturned = true
+	f.mu.Unlock()
+	return err
+}
+
+func (f *postAssignmentReadBarrierAPI) ListFirewalls(ctx context.Context, location string) ([]inspace.Firewall, error) {
+	f.mu.Lock()
+	block := f.assignmentReturned && !f.readbackBlocked
+	if block {
+		f.readbackBlocked = true
+	}
+	f.mu.Unlock()
+	if block {
+		close(f.readbackStarted)
+		select {
+		case <-f.releaseReadback:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	return f.fakeAPI.ListFirewalls(ctx, location)
+}
+
+// parallelFirewallAssignmentAPI holds each assignment before dispatch so a
+// test can prove different per-firewall keys enter the cloud call together.
+type parallelFirewallAssignmentAPI struct {
+	*fakeAPI
+	started chan string
+	release chan struct{}
+}
+
+func (f *parallelFirewallAssignmentAPI) AssignFirewallToVM(ctx context.Context, location, firewallUUID, vmUUID string) error {
+	select {
+	case f.started <- firewallUUID:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	select {
+	case <-f.release:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	return f.fakeAPI.AssignFirewallToVM(ctx, location, firewallUUID, vmUUID)
+}
+
+// issueBarrierStatusStore models two controllers that read the same durable
+// status version and then race their firewall-assignment issue transitions.
+// The compare-and-swap itself is the only serialization shared across them.
+type issueBarrierStatusStore struct {
+	mu      sync.Mutex
+	status  v1alpha1.InSpaceClusterStatus
+	started chan struct{}
+	release chan struct{}
+}
+
+func (s *issueBarrierStatusStore) compareAndSwap(
+	ctx context.Context,
+	_ *v1alpha1.InSpaceCluster,
+	expected v1alpha1.InSpaceClusterStatus,
+	desired v1alpha1.InSpaceClusterStatus,
+) (v1alpha1.InSpaceClusterStatus, error) {
+	if countIssuedFirewallAssignments(desired) > countIssuedFirewallAssignments(expected) {
+		select {
+		case s.started <- struct{}{}:
+		case <-ctx.Done():
+			return v1alpha1.InSpaceClusterStatus{}, ctx.Err()
+		}
+		select {
+		case <-s.release:
+		case <-ctx.Done():
+			return v1alpha1.InSpaceClusterStatus{}, ctx.Err()
+		}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !reflect.DeepEqual(s.status, expected) {
+		return cloneClusterStatus(s.status), errors.New("injected status resourceVersion conflict")
+	}
+	s.status = cloneClusterStatus(desired)
+	return cloneClusterStatus(s.status), nil
+}
+
+func (s *issueBarrierStatusStore) snapshot() v1alpha1.InSpaceClusterStatus {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return cloneClusterStatus(s.status)
+}
+
+func countIssuedFirewallAssignments(status v1alpha1.InSpaceClusterStatus) int {
+	count := 0
+	for _, attempt := range status.CreateAttempts {
+		if attempt.ResourceKind == createAttemptKindFirewallAssignment && attempt.Phase == createAttemptPhaseIssued {
+			count++
+		}
+	}
+	return count
 }
 
 func newFakeAPI() *fakeAPI {
-	return &fakeAPI{network: inspace.Network{UUID: "11111111-2222-4333-8444-555555555555", Name: "private", Type: "private", Subnet: "10.20.30.0/24"}}
+	return &fakeAPI{
+		network: inspace.Network{UUID: "11111111-2222-4333-8444-555555555555", Name: "private", Type: "private", Subnet: "10.20.30.0/24"},
+		hostPools: []inspace.HostPool{{
+			UUID: "aac7dd66-f390-4edd-80c0-dd7cae49bd99", Name: "AMD EPYC", IsVisible: true,
+		}},
+	}
 }
 
 func (f *fakeAPI) GetNetwork(context.Context, string, string) (*inspace.Network, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.getNetworkError != nil {
+		return nil, f.getNetworkError
+	}
 	copy := f.network
 	copy.VMUUIDs = append([]string(nil), f.network.VMUUIDs...)
 	return &copy, nil
+}
+func (f *fakeAPI) ListHostPools(context.Context, string) ([]inspace.HostPool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.listHostPoolsError != nil {
+		return nil, f.listHostPoolsError
+	}
+	return append([]inspace.HostPool(nil), f.hostPools...), nil
 }
 func (f *fakeAPI) ListLoadBalancers(context.Context, string) ([]inspace.LoadBalancer, error) {
 	f.mu.Lock()
@@ -3423,6 +5049,9 @@ func (f *fakeAPI) ListLoadBalancers(context.Context, string) ([]inspace.LoadBala
 func (f *fakeAPI) ListVMs(context.Context, string) ([]inspace.VM, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.vmListErrorAfterCreate != nil && len(f.vmCreates) != 0 {
+		return nil, f.vmListErrorAfterCreate
+	}
 	if f.vmListReadbackRemaining > 0 {
 		f.vmListReadbackRemaining--
 		return nil, nil
@@ -3487,7 +5116,6 @@ func (f *fakeAPI) CreateVM(ctx context.Context, _ string, request inspace.Create
 	f.vmCreates = append(f.vmCreates, request)
 	f.events = append(f.events, "create-vm/"+request.Name)
 	index := len(f.vmCreates)
-	barrier, started := f.createVMBarrier, f.createVMStarted
 	mutateStored := f.mutateStoredVM
 	mutateResponse := f.mutateCreateVMResponse
 	injected := f.failVMCreateNames[request.Name]
@@ -3495,18 +5123,6 @@ func (f *fakeAPI) CreateVM(ctx context.Context, _ string, request inspace.Create
 	f.mu.Unlock()
 	if injected != nil && !commitInjected {
 		return nil, injected
-	}
-	if barrier != nil {
-		select {
-		case started <- request.Name:
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
-		select {
-		case <-barrier:
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
 	}
 	vm := inspace.VM{
 		UUID: fmt.Sprintf("%08d-1111-4222-8333-bbbbbbbbbbbb", index), Name: request.Name, Hostname: request.Name, Description: request.Description,
@@ -3559,16 +5175,18 @@ func (f *fakeAPI) DeleteVM(ctx context.Context, _ string, uuid string) error {
 	if f.vmDeleteError != nil && !f.vmDeleteErrorCommits {
 		return f.vmDeleteError
 	}
-	for i := range f.vms {
-		if f.vms[i].UUID == uuid {
-			f.vms = append(f.vms[:i], f.vms[i+1:]...)
-			break
+	if !f.retainVMInventoryOnDelete {
+		for i := range f.vms {
+			if f.vms[i].UUID == uuid {
+				f.vms = append(f.vms[:i], f.vms[i+1:]...)
+				break
+			}
 		}
-	}
-	for i := range f.network.VMUUIDs {
-		if f.network.VMUUIDs[i] == uuid {
-			f.network.VMUUIDs = append(f.network.VMUUIDs[:i], f.network.VMUUIDs[i+1:]...)
-			break
+		for i := range f.network.VMUUIDs {
+			if f.network.VMUUIDs[i] == uuid {
+				f.network.VMUUIDs = append(f.network.VMUUIDs[:i], f.network.VMUUIDs[i+1:]...)
+				break
+			}
 		}
 	}
 	for i := range f.floatingIPs {
@@ -3642,6 +5260,22 @@ func (f *fakeAPI) ListFirewalls(ctx context.Context, _ string) ([]inspace.Firewa
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.firewallListError != nil {
+		return nil, f.firewallListError
+	}
+	if f.firewallListErrorAfterCreate != nil && len(f.firewallCreates) != 0 {
+		return nil, f.firewallListErrorAfterCreate
+	}
+	if f.firewallListErrorAfterAssignment != nil && f.firewallListErrorAfterAssignmentCall > 0 && f.firewallAssignmentCalls >= f.firewallListErrorAfterAssignmentCall {
+		return nil, f.firewallListErrorAfterAssignment
+	}
+	if f.firewallListErrorAfterDelete != nil && len(f.firewallDeletes) != 0 {
+		return nil, f.firewallListErrorAfterDelete
+	}
+	if f.firewallListReadbackRemaining > 0 {
+		f.firewallListReadbackRemaining--
+		return nil, nil
+	}
 	items := make([]inspace.Firewall, len(f.firewalls))
 	for i := range f.firewalls {
 		items[i] = f.firewalls[i]
@@ -3665,6 +5299,9 @@ func (f *fakeAPI) CreateFirewall(_ context.Context, _ string, request inspace.Cr
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.firewallCreates = append(f.firewallCreates, request)
+	if f.firewallCreateError != nil && !f.firewallCreateErrorCommits {
+		return nil, f.firewallCreateError
+	}
 	item := inspace.Firewall{UUID: fmt.Sprintf("7777777%d-1111-4222-8333-444444444444", len(f.firewalls)), DisplayName: request.DisplayName, Description: request.Description, BillingAccountID: request.BillingAccountID, Rules: request.Rules}
 	f.firewalls = append(f.firewalls, item)
 	f.events = append(f.events, "create-firewall/"+request.DisplayName)
@@ -3683,7 +5320,7 @@ func (f *fakeAPI) CreateFirewall(_ context.Context, _ string, request inspace.Cr
 		response.Description = ""
 	}
 	f.firewallCreateResponses = append(f.firewallCreateResponses, response)
-	return &response, nil
+	return &response, f.firewallCreateError
 }
 func (f *fakeAPI) AssignFirewallToVM(ctx context.Context, _ string, firewallUUID, vmUUID string) error {
 	if f.requireLiveSafetyContext && ctx.Err() != nil {
@@ -3691,6 +5328,7 @@ func (f *fakeAPI) AssignFirewallToVM(ctx context.Context, _ string, firewallUUID
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.firewallAssignmentCalls++
 	f.events = append(f.events, "assign-firewall/"+firewallUUID+"/"+vmUUID)
 	for i := range f.firewalls {
 		if f.firewalls[i].UUID != firewallUUID {
@@ -3714,6 +5352,9 @@ func (f *fakeAPI) AssignFirewallToVM(ctx context.Context, _ string, firewallUUID
 			}
 		}
 		f.firewalls[i].ResourcesAssigned = append(f.firewalls[i].ResourcesAssigned, inspace.FirewallResource{ResourceType: "vm", ResourceUUID: vmUUID})
+		if f.firewallAssignmentWrongType {
+			f.firewalls[i].ResourcesAssigned[len(f.firewalls[i].ResourcesAssigned)-1].ResourceType = "disk"
+		}
 		if f.firewallAssignmentDuplicate {
 			f.firewalls[i].ResourcesAssigned = append(f.firewalls[i].ResourcesAssigned, inspace.FirewallResource{ResourceType: "vm", ResourceUUID: vmUUID})
 		}
@@ -3736,13 +5377,16 @@ func (f *fakeAPI) DeleteFirewall(_ context.Context, _, uuid string) error {
 	defer f.mu.Unlock()
 	f.firewallDeletes = append(f.firewallDeletes, uuid)
 	f.events = append(f.events, "delete-firewall/"+uuid)
+	if f.firewallDeleteError != nil && !f.firewallDeleteErrorCommits {
+		return f.firewallDeleteError
+	}
 	for i := range f.firewalls {
 		if f.firewalls[i].UUID == uuid {
 			f.firewalls = append(f.firewalls[:i], f.firewalls[i+1:]...)
 			break
 		}
 	}
-	return nil
+	return f.firewallDeleteError
 }
 func (f *fakeAPI) ListFloatingIPs(ctx context.Context, _ string, filters *inspace.FloatingIPFilters) ([]inspace.FloatingIP, error) {
 	if f.requireLiveSafetyContext && ctx.Err() != nil {
@@ -3757,6 +5401,18 @@ func (f *fakeAPI) ListFloatingIPs(ctx context.Context, _ string, filters *inspac
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.floatingIPListError != nil {
+		return nil, f.floatingIPListError
+	}
+	if f.floatingIPListErrorAfterUpdate != nil && f.floatingIPUpdateCalls != 0 {
+		return nil, f.floatingIPListErrorAfterUpdate
+	}
+	if f.floatingIPListErrorAfterUnassign != nil && f.floatingIPUnassignCalls != 0 {
+		return nil, f.floatingIPListErrorAfterUnassign
+	}
+	if f.floatingIPListErrorAfterDelete != nil && len(f.floatingIPDeletes) != 0 {
+		return nil, f.floatingIPListErrorAfterDelete
+	}
 	if f.floatingIPReadbackRemaining > 0 {
 		f.floatingIPReadbackRemaining--
 		return nil, nil
@@ -3776,6 +5432,7 @@ func (f *fakeAPI) ListFloatingIPs(ctx context.Context, _ string, filters *inspac
 func (f *fakeAPI) UpdateFloatingIP(_ context.Context, _, address string, request inspace.UpdateFloatingIPRequest) (*inspace.FloatingIP, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.floatingIPUpdateCalls++
 	for i := range f.floatingIPs {
 		if f.floatingIPs[i].Address != address {
 			continue
@@ -3785,6 +5442,7 @@ func (f *fakeAPI) UpdateFloatingIP(_ context.Context, _, address string, request
 		}
 		f.floatingIPs[i].Name = request.Name
 		f.floatingIPs[i].BillingAccountID = request.BillingAccountID
+		f.floatingIPReadbackRemaining = f.floatingIPReadbackDelay
 		f.events = append(f.events, "update-fip/"+address+"/"+request.Name)
 		copy := f.floatingIPs[i]
 		if f.mutateUpdateFloatingIPResponse != nil {
@@ -3800,6 +5458,7 @@ func (f *fakeAPI) UnassignFloatingIP(ctx context.Context, _, address string) (*i
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.floatingIPUnassignCalls++
 	for i := range f.floatingIPs {
 		if f.floatingIPs[i].Address == address {
 			if f.floatingIPUnassignError != nil && !f.floatingIPUnassignErrorCommits {

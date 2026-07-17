@@ -81,7 +81,8 @@ func TestReconcileShardFirewallPolicyStableCreateAndAdopt(t *testing.T) {
 		}
 
 		second := fixture.reconcile(t)
-		if second.Firewall != nil || len(fixture.api.createdFirewalls) != 1 || len(fixture.api.firewalls) != 1 {
+		if second.Firewall == nil || !second.PolicyReady || second.AssignmentsReady ||
+			len(fixture.api.createdFirewalls) != 1 || len(fixture.api.firewalls) != 1 {
 			t.Fatalf("create reconcile = state %#v, requests=%d, firewalls=%#v", second, len(fixture.api.createdFirewalls), fixture.api.firewalls)
 		}
 		createdUUID := fixture.api.firewalls[0].UUID
@@ -89,9 +90,11 @@ func TestReconcileShardFirewallPolicyStableCreateAndAdopt(t *testing.T) {
 			t.Fatal("fake cloud create returned no firewall UUID")
 		}
 
+		// The create response is provisional; the same reconciliation performs
+		// an unfiltered deterministic-name readback and promotes only that row.
 		third := fixture.reconcile(t)
 		if third.Firewall == nil || third.Firewall.UUID != createdUUID || !third.PolicyReady || third.AssignmentsReady {
-			t.Fatalf("promotion reconcile did not return persisted policy state: %#v", third)
+			t.Fatalf("stable reconcile did not return persisted policy state: %#v", third)
 		}
 		pool = fixture.pool(t)
 		if got := pool.GetAnnotations()[annotationNodeLoadBalancerShardFirewallUUID]; got != createdUUID {
@@ -270,8 +273,18 @@ func TestEnsureShardFirewallAssignmentsRetainsNotReadyNodeAndDetachesDeletedVM(t
 		provider: provider,
 		nodes:    corelisters.NewNodeLister(nodeIndexer),
 	}
+	shardFirewallName, err := inspace.NodeLoadBalancerShardFirewallName(provider.config.ClusterID, aggregateTestShard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := int32(443)
 	api.firewalls = append(api.firewalls, inspace.Firewall{
-		UUID: aggregateTestFirewallUUID,
+		UUID: aggregateTestFirewallUUID, DisplayName: shardFirewallName,
+		BillingAccountID: provider.config.BillingAccountID,
+		Rules: []inspace.FirewallRule{{
+			Protocol: "tcp", Direction: "inbound", EndpointSpecType: "any",
+			PortStart: &port, PortEnd: &port,
+		}},
 		ResourcesAssigned: []inspace.FirewallResource{
 			{ResourceType: "vm", ResourceUUID: aggregateTestVMUUID},
 			{ResourceType: "vm", ResourceUUID: aggregateTestStaleVMUUID},

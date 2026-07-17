@@ -431,6 +431,26 @@ def verify_node_load_balancer_helm_contract() -> None:
     require(chart_crd == source_crd,
             "packaged and source InSpaceNodeClass CRDs must remain byte-identical")
 
+    chart_cluster_crd = (
+        repository
+        / "charts/inspace-cloud-kube-modules-crds/templates/infrastructure.inspace.cloud_inspaceclusters.yaml"
+    ).read_text(encoding="utf-8")
+    source_cluster_crd = (
+        repository
+        / "modules/cloud-provider/config/crd/bases/infrastructure.inspace.cloud_inspaceclusters.yaml"
+    ).read_text(encoding="utf-8")
+    require(chart_cluster_crd == source_cluster_crd,
+            "packaged and source InSpaceCluster CRDs must remain byte-identical")
+    require(
+        "                deleteAttempts:\n"
+        "                  type: object\n"
+        "                  maxProperties: 10\n" in source_cluster_crd
+        and source_cluster_crd.count("                      absenceObservedAt:\n") == 2
+        and "rollback-fip-after-vm" in source_cluster_crd
+        and "firewall-delete-issued" in source_cluster_crd,
+        "InSpaceCluster CRD must persist the bounded exact-delete receipt ledger",
+    )
+
     shared_example = (chart / "examples/service-public-node-shared.yaml").read_text(encoding="utf-8")
     dedicated_example = (chart / "examples/service-public-node-dedicated.yaml").read_text(encoding="utf-8")
     local_example = (chart / "examples/service-public-node-local.yaml").read_text(encoding="utf-8")
@@ -995,32 +1015,32 @@ def main() -> None:
             "cached bootstrap launch must receive its persisted key and certificate epoch")
     require("\n      async:" not in launch_task and "ansible.builtin.async_status" not in provision_play,
             "bootstrap cloud mutation must remain attached to the managed Ansible process group")
-    parallel_assertion = named_yaml_sequence_item(
-        provision_play, "Prove exact and parallel three-control-plane provisioning", 4
+    ordered_assertion = named_yaml_sequence_item(
+        provision_play, "Prove exact and ordered three-control-plane provisioning", 4
     )
     for clause in (
         "e2e_bootstrap_result.controlPlaneVMs | length == 3",
         "e2e_bootstrap_result.controlPlaneVMs | unique | length == 3",
-        "e2e_bootstrap_result.maxParallelControlPlaneCreates | int == 3",
+        "e2e_bootstrap_result.maxParallelControlPlaneCreates | int == 1",
         "e2e_bootstrap_result.bootstrapCacheEndpoint == 'https://cache.' + e2e_cluster_name + '.inspace.internal:8443'",
         "e2e_bootstrap_result.bootstrapCacheRegistry == 'cache.' + e2e_cluster_name + '.inspace.internal:8443'",
         "e2e_bootstrap_result.bootstrapCacheAddress == e2e_bootstrap_result.bastionPrivateIPv4",
         "e2e_bootstrap_result.bootstrapCacheCABundle is match('^-----BEGIN CERTIFICATE-----\\n')",
     ):
-        require(f"\n          - {clause}" in parallel_assertion,
-                f"parallel provisioning assertion lacks exact clause: {clause}")
-    authoritative_parallel_binding = named_yaml_sequence_item(
-        provision_play, "Bind the parallel-create contract to the authoritative three VM identities", 4
+        require(f"\n          - {clause}" in ordered_assertion,
+                f"ordered provisioning assertion lacks exact clause: {clause}")
+    authoritative_ordered_binding = named_yaml_sequence_item(
+        provision_play, "Bind the ordered-create contract to the authoritative three VM identities", 4
     )
     for clause in (
         "e2e_state.controlPlanes | length == 3",
         "e2e_state.controlPlanes | map(attribute='uuid') | list | unique | length == 3",
         "e2e_state.controlPlanes | map(attribute='uuid') | list | difference(e2e_bootstrap_result.controlPlaneVMs) | length == 0",
         "e2e_bootstrap_result.controlPlaneVMs | difference(e2e_state.controlPlanes | map(attribute='uuid') | list) | length == 0",
-        "(e2e_bootstrap_result.maxParallelControlPlaneCreates | int) == (e2e_state.controlPlanes | length)",
+        "e2e_bootstrap_result.maxParallelControlPlaneCreates | int == 1",
     ):
-        require(f"\n          - {clause}" in authoritative_parallel_binding,
-                f"authoritative parallel-create binding lacks exact clause: {clause}")
+        require(f"\n          - {clause}" in authoritative_ordered_binding,
+                f"authoritative ordered-create binding lacks exact clause: {clause}")
 
     control_plane_wait_play = named_yaml_sequence_item(
         playbook, "Wait for all RKE2 servers independently and in parallel through the bastion", 0
@@ -1188,7 +1208,7 @@ def main() -> None:
                 f"per-node kube-vip manifest proof is missing: {marker}")
 
     for marker in (
-        "maxParallelControlPlaneCreates | int == 3",
+        "maxParallelControlPlaneCreates | int == 1",
         "e2e_bootstrap_result.apiLoadBalancerUUID is not defined",
         "e2e_bootstrap_result.bastionVMUUID | length > 0",
         "controlPlaneVMs | length == 3",

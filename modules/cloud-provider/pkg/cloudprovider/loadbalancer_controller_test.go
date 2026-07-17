@@ -134,9 +134,9 @@ func TestPublicIntentAnnotationNudgesStockServiceControllerOnLabelTransitions(t 
 			fixture := newTargetControllerFixture(t, provider)
 			fixture.addService(t, service)
 
-			if err := fixture.controller.sync(context.Background(), "default/web"); err != nil {
-				t.Fatal(err)
-			}
+			requireStandardNLBConvergence(t, func() error {
+				return fixture.controller.sync(context.Background(), "default/web")
+			})
 			actions := client.Actions()
 			if len(actions) != 2 || actions[0].GetVerb() != "get" {
 				t.Fatalf("Kubernetes actions = %#v, want exact GET then Update", actions)
@@ -228,7 +228,11 @@ func TestPublicIntentAnnotationDoesNotPatchLoopAfterInformerObservesTrigger(t *t
 }
 
 func TestLocalTargetsUseOnlyReadyNonTerminatingEndpointNodes(t *testing.T) {
-	provider := newTestProvider(t, &fakeAPI{})
+	const workerDVMUUID = "99999999-1111-4222-8333-444444444444"
+	api := &fakeAPI{vms: []inspace.VM{{
+		UUID: workerDVMUUID, BillingAccountID: 42, NetworkUUID: testNetworkUUID,
+	}}}
+	provider := newTestProvider(t, api)
 	endpointIndexer := newNamespacedIndexer()
 	provider.endpointSliceLister = discoverylisters.NewEndpointSliceLister(endpointIndexer)
 	provider.endpointSlicesSynced = func() bool { return true }
@@ -261,18 +265,18 @@ func TestLocalTargetsUseOnlyReadyNonTerminatingEndpointNodes(t *testing.T) {
 	controlPlane := readyNode("control-plane-a", "inspace://bkk01/"+testVMUUIDD)
 	controlPlane.Labels = map[string]string{nodeRoleControlPlaneLabel: ""}
 
-	targets, err := provider.targetUUIDs(service, []*corev1.Node{
+	targets, err := provider.targetUUIDs(context.Background(), service, []*corev1.Node{
 		readyNode("worker-a", "inspace://bkk01/"+testVMUUID),
 		readyNode("worker-b", "inspace://bkk01/"+testVMUUIDB),
 		readyNode("worker-c", "inspace://bkk01/"+testVMUUIDC),
-		readyNode("worker-d", "inspace://bkk01/99999999-1111-4222-8333-444444444444"),
+		readyNode("worker-d", "inspace://bkk01/"+workerDVMUUID),
 		notReady,
 		controlPlane,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantTargets := map[string]struct{}{testVMUUID: {}, "99999999-1111-4222-8333-444444444444": {}}
+	wantTargets := map[string]struct{}{testVMUUID: {}, workerDVMUUID: {}}
 	if len(targets) != len(wantTargets) {
 		t.Fatalf("Local targets = %v, want %v", targets, wantTargets)
 	}
@@ -289,12 +293,12 @@ func TestLocalTargetsFailClosedUntilEndpointSliceCacheIsSynced(t *testing.T) {
 	service.Spec.ExternalTrafficPolicy = corev1.ServiceExternalTrafficPolicyLocal
 	nodes := []*corev1.Node{readyNode("worker-a", "inspace://bkk01/"+testVMUUID)}
 
-	if _, err := provider.targetUUIDs(service, nodes); err == nil || !strings.Contains(err.Error(), "synchronized EndpointSlice informer") {
+	if _, err := provider.targetUUIDs(context.Background(), service, nodes); err == nil || !strings.Contains(err.Error(), "synchronized EndpointSlice informer") {
 		t.Fatalf("targetUUIDs() without informer error = %v", err)
 	}
 	provider.endpointSliceLister = discoverylisters.NewEndpointSliceLister(newNamespacedIndexer())
 	provider.endpointSlicesSynced = func() bool { return false }
-	if _, err := provider.targetUUIDs(service, nodes); err == nil || !strings.Contains(err.Error(), "synchronized EndpointSlice informer") {
+	if _, err := provider.targetUUIDs(context.Background(), service, nodes); err == nil || !strings.Contains(err.Error(), "synchronized EndpointSlice informer") {
 		t.Fatalf("targetUUIDs() with unsynced informer error = %v", err)
 	}
 }
@@ -345,7 +349,7 @@ func TestClusterTargetsOnlyReadyEligibleNodes(t *testing.T) {
 	legacyMaster := readyNode("master-a", "inspace://bkk01/"+testVMUUIDE)
 	legacyMaster.Labels = map[string]string{nodeRoleMasterLabel: "false"}
 
-	targets, err := provider.targetUUIDs(service, []*corev1.Node{
+	targets, err := provider.targetUUIDs(context.Background(), service, []*corev1.Node{
 		ready, notReady, deleting, excluded, disrupted, uninitialized, controlPlane, legacyMaster,
 	})
 	if err != nil {
@@ -416,10 +420,15 @@ func TestEnsureLocalLoadBalancerCreatesOnlyExactLocalTargets(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := provider.EnsureLoadBalancer(context.Background(), "ignored", service, []*corev1.Node{
+	nodes := []*corev1.Node{
 		readyNode("worker-a", "inspace://bkk01/"+testVMUUID),
 		readyNode("worker-b", "inspace://bkk01/"+testVMUUIDB),
-	}); err != nil {
+	}
+	provider.kubeClient = fake.NewSimpleClientset(
+		nodes[0].DeepCopy(), nodes[1].DeepCopy(),
+		testEndpointSlice("default", "web", "web-a", endpointForNode("worker-b", true, false)),
+	)
+	if _, err := provider.EnsureLoadBalancer(context.Background(), "ignored", service, nodes); err != nil {
 		t.Fatal(err)
 	}
 	if len(api.creates) != 1 || len(api.creates[0].Targets) != 1 || api.creates[0].Targets[0].TargetUUID != testVMUUIDB {
@@ -461,9 +470,9 @@ func TestTargetControllerReconcilesEndpointMovementReadinessAndTermination(t *te
 			fixture.addEndpointSlice(t, testEndpointSlice("default", "web", "web-a", test.endpoint))
 			setOwnedLoadBalancer(api, provider, service, []string{testVMUUID})
 
-			if err := fixture.controller.sync(context.Background(), "default/web"); err != nil {
-				t.Fatal(err)
-			}
+			requireStandardNLBConvergence(t, func() error {
+				return fixture.controller.sync(context.Background(), "default/web")
+			})
 			if !reflectStrings(api.addedTargets, test.wantAdd) || !reflectStrings(api.removedTargets, test.wantDrop) {
 				t.Fatalf("target changes add=%v drop=%v, want add=%v drop=%v", api.addedTargets, api.removedTargets, test.wantAdd, test.wantDrop)
 			}
@@ -529,9 +538,9 @@ func TestTargetControllerReconcilesNodeReadyAddAndDelete(t *testing.T) {
 			}
 			setOwnedLoadBalancer(api, provider, service, test.currentTargets)
 
-			if err := fixture.controller.sync(context.Background(), "default/web"); err != nil {
-				t.Fatal(err)
-			}
+			requireStandardNLBConvergence(t, func() error {
+				return fixture.controller.sync(context.Background(), "default/web")
+			})
 			if !reflectStrings(api.addedTargets, test.wantAdd) || !reflectStrings(api.removedTargets, test.wantDrop) {
 				t.Fatalf("target changes add=%v drop=%v, want add=%v drop=%v", api.addedTargets, api.removedTargets, test.wantAdd, test.wantDrop)
 			}
@@ -559,9 +568,9 @@ func TestTargetControllerSkipsInvalidNodeIdentityAndStillRemovesStaleTargets(t *
 			fixture.addNode(t, readyNode("worker-invalid", test.providerID))
 			setOwnedLoadBalancer(api, provider, service, []string{testVMUUIDB, testVMUUIDC})
 
-			if err := fixture.controller.sync(context.Background(), "default/web"); err != nil {
-				t.Fatal(err)
-			}
+			requireStandardNLBConvergence(t, func() error {
+				return fixture.controller.sync(context.Background(), "default/web")
+			})
 			if !reflectStrings(api.addedTargets, []string{testVMUUID}) ||
 				!reflectStrings(api.removedTargets, []string{testVMUUIDB, testVMUUIDC}) {
 				t.Fatalf("target changes add=%v drop=%v", api.addedTargets, api.removedTargets)
@@ -735,6 +744,11 @@ func (b staticControllerClientBuilder) ClientOrDie(string) kubernetes.Interface 
 
 func (f *targetControllerFixture) addNode(t *testing.T, node *corev1.Node) {
 	t.Helper()
+	if client, ok := f.controller.provider.kubeClient.(*fake.Clientset); ok {
+		if err := client.Tracker().Add(node.DeepCopy()); err != nil && !apierrors.IsAlreadyExists(err) {
+			t.Fatal(err)
+		}
+	}
 	if err := f.nodeIndexer.Add(node); err != nil {
 		t.Fatal(err)
 	}
@@ -754,6 +768,11 @@ func (f *targetControllerFixture) addService(t *testing.T, service *corev1.Servi
 
 func (f *targetControllerFixture) addEndpointSlice(t *testing.T, endpointSlice *discoveryv1.EndpointSlice) {
 	t.Helper()
+	if client, ok := f.controller.provider.kubeClient.(*fake.Clientset); ok {
+		if err := client.Tracker().Add(endpointSlice.DeepCopy()); err != nil && !apierrors.IsAlreadyExists(err) {
+			t.Fatal(err)
+		}
+	}
 	if err := f.endpointIndexer.Add(endpointSlice); err != nil {
 		t.Fatal(err)
 	}

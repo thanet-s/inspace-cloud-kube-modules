@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
@@ -244,6 +245,17 @@ func TestNodeLoadBalancerReconcileSmokeCreatesOwnedKarpenterAndDatapathResources
 		}
 		if err := serviceIndexer.Update(stored); err != nil {
 			t.Fatal(err)
+		}
+		if shard := stored.Annotations[annotationNodeLoadBalancerShard]; shard != "" {
+			pool, getErr := provider.dynamicClient.Resource(nodePoolGVR).Get(ctx, shard, metav1.GetOptions{})
+			if getErr == nil && pool.GetUID() == "" {
+				pool.SetUID(types.UID("nodepool-" + shard))
+				if _, updateErr := provider.dynamicClient.Resource(nodePoolGVR).Update(ctx, pool, metav1.UpdateOptions{}); updateErr != nil {
+					t.Fatal(updateErr)
+				}
+			} else if getErr != nil && !apierrors.IsNotFound(getErr) {
+				t.Fatal(getErr)
+			}
 		}
 	}
 	stored, _ := provider.kubeClient.CoreV1().Services("default").Get(ctx, "web", metav1.GetOptions{})

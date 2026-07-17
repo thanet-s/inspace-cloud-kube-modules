@@ -24,20 +24,24 @@ const serviceAccountPath = "/var/run/secrets/kubernetes.io/serviceaccount"
 
 var nodeNamePattern = regexp.MustCompile(`^[a-z0-9](?:[-a-z0-9.]{0,251}[a-z0-9])?$`)
 
-// KubernetesNodeResolver performs the single read needed by the CSI
-// controller without pulling the full client-go dependency graph. It uses the
-// rotating projected ServiceAccount token on every request.
+// KubernetesNodeResolver performs Node provider-ID reads and persists CSI
+// cloud-mutation fences as coordination.k8s.io Leases without pulling the full
+// client-go dependency graph. It uses the rotating projected ServiceAccount
+// token on every request.
 type KubernetesNodeResolver struct {
 	baseURL   *url.URL
 	client    *http.Client
 	tokenPath string
+	namespace string
 }
 
 type KubernetesResolverConfig struct {
-	BaseURL   string
-	CAFile    string
-	TokenFile string
-	Timeout   time.Duration
+	BaseURL       string
+	CAFile        string
+	TokenFile     string
+	Namespace     string
+	NamespaceFile string
+	Timeout       time.Duration
 }
 
 func NewInClusterNodeResolver() (*KubernetesNodeResolver, error) {
@@ -51,10 +55,11 @@ func NewInClusterNodeResolver() (*KubernetesNodeResolver, error) {
 		return nil, errors.New("Kubernetes service environment is not configured")
 	}
 	return NewKubernetesNodeResolver(KubernetesResolverConfig{
-		BaseURL:   "https://" + net.JoinHostPort(host, port),
-		CAFile:    filepath.Join(serviceAccountPath, "ca.crt"),
-		TokenFile: filepath.Join(serviceAccountPath, "token"),
-		Timeout:   15 * time.Second,
+		BaseURL:       "https://" + net.JoinHostPort(host, port),
+		CAFile:        filepath.Join(serviceAccountPath, "ca.crt"),
+		TokenFile:     filepath.Join(serviceAccountPath, "token"),
+		NamespaceFile: filepath.Join(serviceAccountPath, "namespace"),
+		Timeout:       15 * time.Second,
 	})
 }
 
@@ -65,6 +70,20 @@ func NewKubernetesNodeResolver(cfg KubernetesResolverConfig) (*KubernetesNodeRes
 	}
 	if cfg.CAFile == "" || cfg.TokenFile == "" {
 		return nil, errors.New("Kubernetes CA and ServiceAccount token files are required")
+	}
+	namespace := strings.TrimSpace(cfg.Namespace)
+	if namespace == "" && cfg.NamespaceFile != "" {
+		value, err := os.ReadFile(cfg.NamespaceFile)
+		if err != nil {
+			return nil, fmt.Errorf("read Kubernetes ServiceAccount namespace: %w", err)
+		}
+		namespace = strings.TrimSpace(string(value))
+	}
+	if namespace == "" {
+		namespace = "default"
+	}
+	if !nodeNamePattern.MatchString(namespace) {
+		return nil, errors.New("invalid Kubernetes namespace")
 	}
 	caPEM, err := os.ReadFile(cfg.CAFile)
 	if err != nil {
@@ -87,7 +106,7 @@ func NewKubernetesNodeResolver(cfg KubernetesResolverConfig) (*KubernetesNodeRes
 		},
 	}
 	baseURL.Path = strings.TrimRight(baseURL.Path, "/")
-	return &KubernetesNodeResolver{baseURL: baseURL, client: client, tokenPath: cfg.TokenFile}, nil
+	return &KubernetesNodeResolver{baseURL: baseURL, client: client, tokenPath: cfg.TokenFile, namespace: namespace}, nil
 }
 
 func (r *KubernetesNodeResolver) ProviderIDForNode(ctx context.Context, nodeName string) (string, error) {

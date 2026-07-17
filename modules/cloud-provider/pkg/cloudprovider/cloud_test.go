@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -14,6 +16,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
+	kubefake "k8s.io/client-go/kubernetes/fake"
 	cloud "k8s.io/cloud-provider"
 
 	"github.com/thanet-s/inspace-cloud-kube-modules/modules/client"
@@ -188,6 +191,9 @@ func TestEnsureLoadBalancerCreatesTCPRulesAndOwnedName(t *testing.T) {
 	api := &fakeAPI{}
 	provider := newTestProvider(t, api)
 	service := testService()
+	provider.kubeClient = kubefake.NewSimpleClientset(
+		readyNode("worker-0", "inspace://bkk01/"+testVMUUID),
+	)
 	nodes := []*corev1.Node{readyNode("worker-0", "inspace://bkk01/"+testVMUUID)}
 	status, err := provider.EnsureLoadBalancer(context.Background(), "ignored", service, nodes)
 	if err != nil {
@@ -257,6 +263,7 @@ func TestPublicLoadBalancerRecreatesFloatingIPAfterSoftDeletedOwnershipRow(t *te
 	api := &fakeAPI{}
 	provider := newTestProvider(t, api)
 	service := testService()
+	setStandardNLBKubeNodes(provider, readyNode("worker-0", "inspace://bkk01/"+testVMUUID))
 	api.lbs = []inspace.LoadBalancer{{
 		UUID: testLBUUID, DisplayName: provider.loadBalancerName(service),
 		NetworkUUID: testNetworkUUID, PrivateAddress: "10.0.0.50",
@@ -268,9 +275,9 @@ func TestPublicLoadBalancerRecreatesFloatingIPAfterSoftDeletedOwnershipRow(t *te
 		Type: "public", Enabled: false, IsDeleted: true,
 	}}
 
-	status, err := provider.EnsureLoadBalancer(context.Background(), "ignored", service, []*corev1.Node{{
-		Spec: corev1.NodeSpec{ProviderID: "inspace://bkk01/" + testVMUUID},
-	}})
+	status, err := provider.EnsureLoadBalancer(context.Background(), "ignored", service, []*corev1.Node{
+		readyNode("worker-0", "inspace://bkk01/"+testVMUUID),
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -423,13 +430,20 @@ func TestMarkerRemovalNeverLeaksOwnedResourcesOrReturnsImplementedElsewhereEarly
 	provider := newTestProvider(t, api)
 	service := testService()
 	nodes := []*corev1.Node{readyNode("worker-0", "inspace://bkk01/"+testVMUUID)}
+	setStandardNLBKubeNodes(provider, nodes...)
 	if _, err := provider.EnsureLoadBalancer(context.Background(), "ignored", service, nodes); err != nil {
 		t.Fatal(err)
 	}
 	delete(service.Labels, LabelLoadBalancerScope)
-	status, err := provider.EnsureLoadBalancer(context.Background(), "ignored", service, nodes)
-	if err != nil || len(status.Ingress) != 0 || len(api.lbs) != 0 || len(api.floatingIPs) != 0 {
-		t.Fatalf("cleanup result = %#v, %v; LBs=%#v FIPs=%#v", status, err, api.lbs, api.floatingIPs)
+	syncMemoryStandardNLBServiceIntent(t, provider.standardNLBServiceStore, service)
+	var status *corev1.LoadBalancerStatus
+	requireStandardNLBConvergence(t, func() error {
+		var err error
+		status, err = provider.EnsureLoadBalancer(context.Background(), "ignored", service, nodes)
+		return err
+	})
+	if len(status.Ingress) != 0 || len(api.lbs) != 0 || len(api.floatingIPs) != 0 {
+		t.Fatalf("cleanup result = %#v; LBs=%#v FIPs=%#v", status, api.lbs, api.floatingIPs)
 	}
 	if _, err := provider.EnsureLoadBalancer(context.Background(), "ignored", service, nodes); !errors.Is(err, cloud.ImplementedElsewhere) {
 		t.Fatalf("post-cleanup error = %v, want ImplementedElsewhere", err)
@@ -471,9 +485,13 @@ func TestPublicLoadBalancerReservedAddressCollisionDeletesBeforeFIP(t *testing.T
 					}}
 				}
 				nodes := []*corev1.Node{{Spec: corev1.NodeSpec{ProviderID: "inspace://bkk01/" + testVMUUID}}}
-				if _, err := provider.EnsureLoadBalancer(context.Background(), "ignored", service, nodes); err == nil {
+				if _, err := provider.EnsureLoadBalancer(context.Background(), "ignored", service, nodes); err == nil ||
+					!strings.Contains(err.Error(), "collides with") {
 					t.Fatal("expected reserved-address NLB collision")
 				}
+				requireStandardNLBConvergence(t, func() error {
+					return provider.EnsureLoadBalancerDeleted(context.Background(), "ignored", service)
+				})
 				if len(api.deletedLBs) != 1 || len(api.lbs) != 0 || len(api.floatingIPs) != 0 || (!existing && len(api.deletedIPs) != 0) || (existing && len(api.deletedIPs) != 1) {
 					t.Fatalf("collision cleanup: deletedLB=%v LBs=%#v FIPs=%#v deletedIPs=%v", api.deletedLBs, api.lbs, api.floatingIPs, api.deletedIPs)
 				}
@@ -518,6 +536,8 @@ func TestExistingReservedAddressCollisionCleanupPrecedesUnrelatedValidation(t *t
 			if err != nil {
 				t.Fatal(err)
 			}
+			provider.standardNLBServiceStore = newMemoryStandardNLBServiceStore()
+			provider.standardNLBAbsentDelay = 0
 			service := testService()
 			if test.mutateService != nil {
 				test.mutateService(service)
@@ -539,6 +559,9 @@ func TestExistingReservedAddressCollisionCleanupPrecedesUnrelatedValidation(t *t
 			if err == nil || !strings.Contains(err.Error(), "collides with") {
 				t.Fatalf("collision result = %v, want collision error", err)
 			}
+			requireStandardNLBConvergence(t, func() error {
+				return provider.EnsureLoadBalancerDeleted(context.Background(), "ignored", service)
+			})
 			wantDeletedIPs := 0
 			if test.withFIP {
 				wantDeletedIPs = 1
@@ -618,10 +641,13 @@ func TestPublicToPrivateTransitionRemovesFloatingIP(t *testing.T) {
 		t.Fatal(err)
 	}
 	service.Annotations[AnnotationPublicLoadBalancer] = "false"
-	status, err := provider.EnsureLoadBalancer(context.Background(), "ignored", service, nodes)
-	if err != nil {
-		t.Fatal(err)
-	}
+	syncMemoryStandardNLBServiceIntent(t, provider.standardNLBServiceStore, service)
+	var status *corev1.LoadBalancerStatus
+	requireStandardNLBConvergence(t, func() error {
+		var err error
+		status, err = provider.EnsureLoadBalancer(context.Background(), "ignored", service, nodes)
+		return err
+	})
 	if len(status.Ingress) != 0 || len(api.unassignedIPs) != 1 || len(api.deletedIPs) != 1 || len(api.floatingIPs) != 0 || len(api.deletedLBs) != 1 || len(api.lbs) != 0 {
 		t.Fatalf("public cleanup: status=%#v unassign=%v deleteIP=%v remainingIPs=%v deleteLB=%v remainingLBs=%v", status, api.unassignedIPs, api.deletedIPs, api.floatingIPs, api.deletedLBs, api.lbs)
 	}
@@ -661,6 +687,9 @@ func TestEnsureLoadBalancerReconcilesTargetsAndRules(t *testing.T) {
 	api := &fakeAPI{}
 	provider := newTestProvider(t, api)
 	service := testService()
+	provider.kubeClient = kubefake.NewSimpleClientset(
+		readyNode("worker-0", "inspace://bkk01/"+testVMUUID),
+	)
 	ownedName := provider.GetLoadBalancerName(context.Background(), "ignored", service)
 	api.lbs = []inspace.LoadBalancer{{
 		UUID: testLBUUID, DisplayName: ownedName, NetworkUUID: testNetworkUUID, PrivateAddress: "10.0.0.50",
@@ -668,9 +697,10 @@ func TestEnsureLoadBalancerReconcilesTargetsAndRules(t *testing.T) {
 		ForwardingRules: []inspace.LoadBalancerRule{{UUID: "77777777-1111-4222-8333-444444444444", Protocol: "TCP", SourcePort: 443, TargetPort: 30001}},
 	}}
 	nodes := []*corev1.Node{readyNode("worker-0", "inspace://bkk01/"+testVMUUID)}
-	if _, err := provider.EnsureLoadBalancer(context.Background(), "ignored", service, nodes); err != nil {
-		t.Fatal(err)
-	}
+	requireStandardNLBConvergence(t, func() error {
+		_, err := provider.EnsureLoadBalancer(context.Background(), "ignored", service, nodes)
+		return err
+	})
 	if len(api.addedTargets) != 1 || api.addedTargets[0] != testVMUUID || len(api.removedTargets) != 1 {
 		t.Fatalf("target changes: add=%v remove=%v", api.addedTargets, api.removedTargets)
 	}
@@ -755,9 +785,9 @@ func TestEnsureLoadBalancerDeletedCleansOwnedResourcesWithoutMarkers(t *testing.
 	api.floatingIPs = []inspace.FloatingIP{{
 		Name: provider.floatingIPName(service), Address: "203.0.113.20", BillingAccountID: 42, Type: "public", Enabled: true, AssignedTo: testLBUUID, AssignedToResourceType: "load_balancer",
 	}}
-	if err := provider.EnsureLoadBalancerDeleted(context.Background(), "ignored", service); err != nil {
-		t.Fatal(err)
-	}
+	requireStandardNLBConvergence(t, func() error {
+		return provider.EnsureLoadBalancerDeleted(context.Background(), "ignored", service)
+	})
 	if len(api.lbs) != 0 || len(api.floatingIPs) != 0 || len(api.deletedLBs) != 1 || len(api.deletedIPs) != 1 {
 		t.Fatalf("marker-independent cleanup failed: LBs=%#v FIPs=%#v deleteLB=%v deleteIP=%v", api.lbs, api.floatingIPs, api.deletedLBs, api.deletedIPs)
 	}
@@ -780,7 +810,99 @@ func newTestProvider(t *testing.T, api API) *Provider {
 			nodePoolGVR: "NodePoolList", nodeClaimGVR: "NodeClaimList",
 		},
 	)
+	provider.standardNLBServiceStore = newMemoryStandardNLBServiceStore()
+	provider.standardNLBAbsentDelay = 0
+	provider.kubeClient = kubefake.NewSimpleClientset()
 	return provider
+}
+
+func setStandardNLBKubeNodes(provider *Provider, nodes ...*corev1.Node) {
+	objects := make([]runtime.Object, 0, len(nodes))
+	for _, node := range nodes {
+		objects = append(objects, node.DeepCopy())
+	}
+	provider.kubeClient = kubefake.NewSimpleClientset(objects...)
+}
+
+func syncMemoryStandardNLBServiceIntent(
+	t *testing.T,
+	store standardNLBServiceStore,
+	service *corev1.Service,
+) {
+	t.Helper()
+	current, err := store.GetExact(context.Background(), service)
+	if err != nil {
+		t.Fatal(err)
+	}
+	copy := service.DeepCopy()
+	copy.ResourceVersion = current.ResourceVersion
+	if copy.Annotations == nil {
+		copy.Annotations = map[string]string{}
+	}
+	if receipt := current.Annotations[annotationStandardNLBMutation]; receipt != "" {
+		copy.Annotations[annotationStandardNLBMutation] = receipt
+	}
+	if _, err := store.UpdateExact(context.Background(), copy); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func requireStandardNLBConvergence(t *testing.T, reconcile func() error) {
+	t.Helper()
+	for range 32 {
+		err := reconcile()
+		if err == nil {
+			return
+		}
+		if !errors.Is(err, errStandardNLBRemovalPending) {
+			t.Fatal(err)
+		}
+	}
+	t.Fatal("standard NLB cleanup did not converge within 32 reconciliations")
+}
+
+type memoryStandardNLBServiceStore struct {
+	mu    sync.Mutex
+	items map[string]*corev1.Service
+}
+
+func newMemoryStandardNLBServiceStore() *memoryStandardNLBServiceStore {
+	return &memoryStandardNLBServiceStore{items: map[string]*corev1.Service{}}
+}
+
+func standardNLBServiceStoreKey(service *corev1.Service) string {
+	return service.Namespace + "/" + service.Name
+}
+
+func (s *memoryStandardNLBServiceStore) GetExact(_ context.Context, anchor *corev1.Service) (*corev1.Service, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key := standardNLBServiceStoreKey(anchor)
+	current := s.items[key]
+	if current == nil {
+		current = anchor.DeepCopy()
+		current.ResourceVersion = "1"
+		s.items[key] = current
+	}
+	return current.DeepCopy(), nil
+}
+
+func (s *memoryStandardNLBServiceStore) UpdateExact(_ context.Context, service *corev1.Service) (*corev1.Service, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key := standardNLBServiceStoreKey(service)
+	current := s.items[key]
+	if current == nil || current.UID != service.UID {
+		return nil, errors.New("memory Service store identity changed")
+	}
+	if current.ResourceVersion != service.ResourceVersion {
+		return nil, errors.New("memory Service store resourceVersion conflict")
+	}
+	next := service.DeepCopy()
+	version, _ := strconv.Atoi(current.ResourceVersion)
+	next.ResourceVersion = strconv.Itoa(version + 1)
+	s.items[key] = next
+	return next.DeepCopy(), nil
 }
 
 func testService() *corev1.Service {
@@ -790,7 +912,10 @@ func testService() *corev1.Service {
 			Labels:      map[string]string{LabelLoadBalancerScope: LoadBalancerScopePublic},
 			Annotations: map[string]string{AnnotationPublicLoadBalancer: "true"},
 		},
-		Spec: corev1.ServiceSpec{Ports: []corev1.ServicePort{{Protocol: corev1.ProtocolTCP, Port: 443, NodePort: 30443}}},
+		Spec: corev1.ServiceSpec{
+			Type:  corev1.ServiceTypeLoadBalancer,
+			Ports: []corev1.ServicePort{{Protocol: corev1.ProtocolTCP, Port: 443, NodePort: 30443}},
+		},
 	}
 }
 
@@ -805,9 +930,11 @@ func readyNode(name, providerID string) *corev1.Node {
 }
 
 type fakeAPI struct {
-	vms       []inspace.VM
-	lbs       []inspace.LoadBalancer
-	firewalls []inspace.Firewall
+	vms        []inspace.VM
+	lbs        []inspace.LoadBalancer
+	firewalls  []inspace.Firewall
+	network    *inspace.Network
+	networkErr error
 
 	creates                        []inspace.CreateLoadBalancerRequest
 	deletedLBs                     []string
@@ -831,20 +958,84 @@ type fakeAPI struct {
 }
 
 func (f *fakeAPI) GetNetwork(_ context.Context, _, uuid string) (*inspace.Network, error) {
-	return &inspace.Network{UUID: uuid, Subnet: "10.0.0.0/24"}, nil
+	if f.networkErr != nil {
+		return nil, f.networkErr
+	}
+	if f.network != nil {
+		copy := *f.network
+		copy.VMUUIDs = append([]string(nil), f.network.VMUUIDs...)
+		return &copy, nil
+	}
+	inventory := f.vmInventory()
+	vmUUIDs := make([]string, 0, len(inventory))
+	for index := range inventory {
+		vmUUIDs = append(vmUUIDs, inventory[index].UUID)
+	}
+	return &inspace.Network{UUID: uuid, Subnet: "10.0.0.0/24", VMUUIDs: vmUUIDs}, nil
 }
 
-func (f *fakeAPI) ListVMs(context.Context, string) ([]inspace.VM, error) { return f.vms, nil }
+func (f *fakeAPI) vmInventory() []inspace.VM {
+	items := append([]inspace.VM(nil), f.vms...)
+	for _, uuid := range []string{testVMUUID, testVMUUIDB, testVMUUIDC} {
+		found := false
+		for index := range items {
+			if items[index].UUID == uuid {
+				found = true
+				break
+			}
+		}
+		if !found {
+			items = append(items, inspace.VM{
+				UUID: uuid, Status: "running", BillingAccountID: 42, NetworkUUID: testNetworkUUID,
+			})
+		}
+	}
+	return items
+}
+
+func (f *fakeAPI) ListVMs(context.Context, string) ([]inspace.VM, error) {
+	return f.vmInventory(), nil
+}
 func (f *fakeAPI) GetVM(_ context.Context, _ string, uuid string) (*inspace.VM, error) {
 	for i := range f.vms {
 		if f.vms[i].UUID == uuid {
 			return &f.vms[i], nil
 		}
 	}
+	if uuid == testVMUUID || uuid == testVMUUIDB || uuid == testVMUUIDC {
+		return &inspace.VM{
+			UUID: uuid, Status: "running", BillingAccountID: 42, NetworkUUID: testNetworkUUID,
+		}, nil
+	}
 	return nil, &inspace.APIError{StatusCode: 404, Method: "GET", Path: "/vm", Message: "not found"}
 }
 func (f *fakeAPI) ListLoadBalancers(context.Context, string) ([]inspace.LoadBalancer, error) {
-	return f.lbs, nil
+	items := make([]inspace.LoadBalancer, len(f.lbs))
+	for index := range f.lbs {
+		items[index] = f.lbs[index]
+		if items[index].BillingAccountID == 0 {
+			// Older unit fixtures predate billing_account_id on the SDK type.
+			// Model the real list response, which always returns the account.
+			items[index].BillingAccountID = 42
+		}
+		items[index].ForwardingRules = append([]inspace.LoadBalancerRule(nil), f.lbs[index].ForwardingRules...)
+		items[index].Targets = append([]inspace.LoadBalancerTarget(nil), f.lbs[index].Targets...)
+	}
+	return items, nil
+}
+func (f *fakeAPI) GetLoadBalancer(_ context.Context, _ string, uuid string) (*inspace.LoadBalancer, error) {
+	for index := range f.lbs {
+		if f.lbs[index].UUID == uuid && !f.lbs[index].IsDeleted {
+			copy := f.lbs[index]
+			if copy.BillingAccountID == 0 {
+				copy.BillingAccountID = 42
+			}
+			copy.ForwardingRules = append([]inspace.LoadBalancerRule(nil), f.lbs[index].ForwardingRules...)
+			copy.Targets = append([]inspace.LoadBalancerTarget(nil), f.lbs[index].Targets...)
+			return &copy, nil
+		}
+	}
+	return nil, &inspace.APIError{StatusCode: 404, Method: "GET", Path: "/network/load_balancers/" + uuid, Message: "not found"}
 }
 func (f *fakeAPI) CreateLoadBalancer(_ context.Context, _ string, request inspace.CreateLoadBalancerRequest) (*inspace.LoadBalancer, error) {
 	f.creates = append(f.creates, request)
@@ -852,7 +1043,11 @@ func (f *fakeAPI) CreateLoadBalancer(_ context.Context, _ string, request inspac
 	if f.createPrivateAddress != nil {
 		privateAddress = *f.createPrivateAddress
 	}
-	lb := inspace.LoadBalancer{UUID: testLBUUID, DisplayName: request.DisplayName, NetworkUUID: request.NetworkUUID, PrivateAddress: privateAddress, ForwardingRules: request.Rules, Targets: request.Targets}
+	lb := inspace.LoadBalancer{
+		UUID: testLBUUID, DisplayName: request.DisplayName, NetworkUUID: request.NetworkUUID,
+		BillingAccountID: request.BillingAccountID, PrivateAddress: privateAddress,
+		ForwardingRules: request.Rules, Targets: request.Targets,
+	}
 	f.lbs = append(f.lbs, lb)
 	return &lb, nil
 }
@@ -866,20 +1061,58 @@ func (f *fakeAPI) DeleteLoadBalancer(_ context.Context, _ string, uuid string) e
 	}
 	return nil
 }
-func (f *fakeAPI) AddLoadBalancerTarget(_ context.Context, _, _ string, uuid string) (*inspace.LoadBalancerTarget, error) {
+func (f *fakeAPI) AddLoadBalancerTarget(_ context.Context, _, loadBalancerUUID string, uuid string) (*inspace.LoadBalancerTarget, error) {
 	f.addedTargets = append(f.addedTargets, uuid)
-	return &inspace.LoadBalancerTarget{TargetUUID: uuid, TargetType: "vm"}, nil
+	target := inspace.LoadBalancerTarget{TargetUUID: uuid, TargetType: "vm"}
+	for i := range f.lbs {
+		if f.lbs[i].UUID == loadBalancerUUID {
+			f.lbs[i].Targets = append(f.lbs[i].Targets, target)
+			break
+		}
+	}
+	return &target, nil
 }
-func (f *fakeAPI) RemoveLoadBalancerTarget(_ context.Context, _, _, uuid string) error {
+func (f *fakeAPI) RemoveLoadBalancerTarget(_ context.Context, _, loadBalancerUUID, uuid string) error {
 	f.removedTargets = append(f.removedTargets, uuid)
+	for i := range f.lbs {
+		if f.lbs[i].UUID != loadBalancerUUID {
+			continue
+		}
+		for index := range f.lbs[i].Targets {
+			if f.lbs[i].Targets[index].TargetUUID == uuid {
+				f.lbs[i].Targets = append(f.lbs[i].Targets[:index], f.lbs[i].Targets[index+1:]...)
+				break
+			}
+		}
+	}
 	return nil
 }
-func (f *fakeAPI) AddLoadBalancerRule(_ context.Context, _, _ string, rule inspace.LoadBalancerRule) (*inspace.LoadBalancerRule, error) {
+func (f *fakeAPI) AddLoadBalancerRule(_ context.Context, _, loadBalancerUUID string, rule inspace.LoadBalancerRule) (*inspace.LoadBalancerRule, error) {
 	f.addedRules = append(f.addedRules, rule)
+	if rule.UUID == "" {
+		rule.UUID = "cccccccc-3333-4333-8444-dddddddddddd"
+	}
+	for i := range f.lbs {
+		if f.lbs[i].UUID == loadBalancerUUID {
+			f.lbs[i].ForwardingRules = append(f.lbs[i].ForwardingRules, rule)
+			break
+		}
+	}
 	return &rule, nil
 }
-func (f *fakeAPI) RemoveLoadBalancerRule(_ context.Context, _, _, uuid string) error {
+func (f *fakeAPI) RemoveLoadBalancerRule(_ context.Context, _, loadBalancerUUID, uuid string) error {
 	f.removedRules = append(f.removedRules, uuid)
+	for i := range f.lbs {
+		if f.lbs[i].UUID != loadBalancerUUID {
+			continue
+		}
+		for index := range f.lbs[i].ForwardingRules {
+			if f.lbs[i].ForwardingRules[index].UUID == uuid {
+				f.lbs[i].ForwardingRules = append(f.lbs[i].ForwardingRules[:index], f.lbs[i].ForwardingRules[index+1:]...)
+				break
+			}
+		}
+	}
 	return nil
 }
 func (f *fakeAPI) ListFloatingIPs(context.Context, string, *inspace.FloatingIPFilters) ([]inspace.FloatingIP, error) {

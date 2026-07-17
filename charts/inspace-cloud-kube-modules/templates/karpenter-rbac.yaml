@@ -87,10 +87,12 @@ rules:
     verbs: ["get"]
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
+    # Kubernetes RBAC cannot constrain create by resourceName. Reads remain
+    # namespace-local and writes below are limited to two fixed Lease names.
     verbs: ["get", "watch", "create"]
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
-    resourceNames: ["karpenter-leader-election"]
+    resourceNames: ["karpenter-leader-election", "karpenter-inspace-firewall-mutations"]
     verbs: ["patch", "update"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1

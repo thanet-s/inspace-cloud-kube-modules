@@ -27,6 +27,34 @@ import (
 // NodePool state. They protect ordering guarantees that helper-only tests can
 // miss when several individually safe cloud mutations are composed.
 
+type aggregateHiddenPostCreateFirewallAPI struct {
+	*fakeAPI
+	hideLists int
+}
+
+func (a *aggregateHiddenPostCreateFirewallAPI) CreateFirewall(
+	ctx context.Context,
+	location string,
+	request inspace.CreateFirewallRequest,
+) (*inspace.Firewall, error) {
+	created, err := a.fakeAPI.CreateFirewall(ctx, location, request)
+	if err == nil {
+		a.hideLists = 100
+	}
+	return created, err
+}
+
+func (a *aggregateHiddenPostCreateFirewallAPI) ListFirewalls(
+	ctx context.Context,
+	location string,
+) ([]inspace.Firewall, error) {
+	if a.hideLists > 0 {
+		a.hideLists--
+		return nil, nil
+	}
+	return a.fakeAPI.ListFirewalls(ctx, location)
+}
+
 func TestAggregateFirstServiceStaysClosedUntilFirewallAssignmentReadback(t *testing.T) {
 	harness := newAggregateSafetySyncHarness(t, nodeLoadBalancerTestService(
 		"aggregate-bootstrap-fence",
@@ -285,7 +313,7 @@ func TestAggregateAmbiguousCreateNeverRetriesAndRejectsPendingUUIDConflict(t *te
 		)
 
 		_, err := fixture.controller.reconcileShardFirewallPolicy(fixture.ctx, fixture.shard)
-		if err == nil || !strings.Contains(err.Error(), "pending UUID") {
+		if err == nil || !strings.Contains(err.Error(), "pending shard firewall UUID") {
 			t.Fatalf("pending UUID conflict error = %v", err)
 		}
 		if len(fixture.api.createdFirewalls) != 1 || len(fixture.api.updatedFirewalls) != 0 {
@@ -369,7 +397,12 @@ func TestAggregateDeletingShardRetainsReturnedUUIDCreateUntilVisible(t *testing.
 		13443,
 	))
 	fixture.reconcile(t) // persist staged policy
-	fixture.reconcile(t) // POST succeeds and persists pending UUID
+	hidden := &aggregateHiddenPostCreateFirewallAPI{fakeAPI: fixture.api}
+	fixture.provider.api = hidden
+	if _, err := fixture.controller.reconcileShardFirewallPolicy(fixture.ctx, fixture.shard); err == nil ||
+		!strings.Contains(err.Error(), "remains ambiguous") {
+		t.Fatalf("hidden authoritative create readback = %v", err)
+	}
 	if len(fixture.api.firewalls) != 1 {
 		t.Fatalf("created firewalls = %#v", fixture.api.firewalls)
 	}
@@ -379,7 +412,7 @@ func TestAggregateDeletingShardRetainsReturnedUUIDCreateUntilVisible(t *testing.
 		t.Fatal(err)
 	}
 	annotations := pool.GetAnnotations()
-	if annotations[annotationNodeLoadBalancerShardFWPendingUUID] != lateFirewall.UUID ||
+	if annotations[annotationNodeLoadBalancerShardFWPendingUUID] != "" ||
 		annotations[annotationNodeLoadBalancerShardFWIssuedAt] == "" ||
 		annotations[annotationNodeLoadBalancerShardFirewallUUID] != "" {
 		t.Fatalf("returned UUID create fence = %#v", annotations)
@@ -403,13 +436,14 @@ func TestAggregateDeletingShardRetainsReturnedUUIDCreateUntilVisible(t *testing.
 		if getErr != nil {
 			t.Fatal(getErr)
 		}
-		if stored.GetAnnotations()[annotationNodeLoadBalancerShardFWPendingUUID] != lateFirewall.UUID ||
+		if stored.GetAnnotations()[annotationNodeLoadBalancerShardFWPendingUUID] != "" ||
 			stored.GetAnnotations()[annotationNodeLoadBalancerShardFWIssuedAt] == "" ||
 			stored.GetAnnotations()[annotationNodeLoadBalancerShardFWCleanupAbsent] != "" {
 			t.Fatalf("returned-UUID cleanup %d released durable fence: %#v", attempt, stored.GetAnnotations())
 		}
 	}
 
+	hidden.hideLists = 0
 	fixture.api.firewalls = []inspace.Firewall{lateFirewall}
 	absent, err := fixture.controller.deleteAggregateShardFirewall(fixture.ctx, fixture.shard)
 	if err != nil || absent {

@@ -241,12 +241,17 @@ func (p *CloudProvider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim)
 	if fence.RollbackChosen || fence.HasCleanupHistory {
 		return nil, fmt.Errorf("%w: durable rollback or deletion cleanup already selected for NodeClaim %q", cloudapi.ErrCreateAttemptPending, nodeClaim.Name)
 	}
+	fencedClaim, err = p.fences.EnsureRemovalFence(ctx, fencedClaim, binding, fence.Token)
+	if err != nil {
+		return nil, fmt.Errorf("establishing durable removal mutation fence: %w", err)
+	}
 	request.CreateAttemptToken = fence.Token
 	request.CreateAttemptStartedAt = fence.StartedAt
 	request.CreateAttemptAllowPOST = allowPOST
 	request.CreateAttemptIntent = fence.Intent
 	request.CreatedVMUUID = fence.CreatedVMUUID
 	request.CreateBaseline = fence.Baseline
+	request.BaseFirewallAssignment = fence.BaseFirewallAssignment
 	authorizedIssueID := fence.IssueID
 	createdVMUUID := fence.CreatedVMUUID
 	request.AuthorizeLaunch = func(authorizeCtx context.Context, intent cloudapi.CreateAuthorizationKind) error {
@@ -269,6 +274,94 @@ func (p *CloudProvider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim)
 		}
 		return anchorErr
 	}
+	request.AuthorizeBaseFirewall = func(authorizeCtx context.Context, vmUUID string) (cloudapi.FirewallAssignmentAuthorization, error) {
+		authorizedClaim, authorization, authorizeErr := p.fences.AuthorizeBaseFirewall(authorizeCtx, fencedClaim, binding, fence.Token, vmUUID)
+		if authorizedClaim != nil {
+			fencedClaim = authorizedClaim
+		}
+		return authorization, authorizeErr
+	}
+	request.ObserveBaseFirewall = func(observeCtx context.Context, vmUUID, issueID string) error {
+		observeCtx, cancel := detachedCreateFenceContext(observeCtx)
+		defer cancel()
+		observedClaim, observeErr := p.fences.ObserveBaseFirewall(observeCtx, fencedClaim, binding, fence.Token, vmUUID, issueID)
+		if observeErr == nil {
+			fencedClaim = observedClaim
+		}
+		return observeErr
+	}
+	request.RejectBaseFirewall = func(rejectCtx context.Context, vmUUID, issueID string) error {
+		rejectCtx, cancel := detachedCreateFenceContext(rejectCtx)
+		defer cancel()
+		rejectedClaim, rejectErr := p.fences.RejectBaseFirewall(rejectCtx, fencedClaim, binding, fence.Token, vmUUID, issueID)
+		if rejectErr == nil {
+			fencedClaim = rejectedClaim
+		}
+		return rejectErr
+	}
+	request.AuthorizeBaseFirewallDetach = func(authorizeCtx context.Context, vmUUID string) (cloudapi.FirewallDetachmentAuthorization, error) {
+		return p.fences.AuthorizeBaseFirewallDetach(authorizeCtx, fencedClaim, binding, fence.Token, vmUUID)
+	}
+	request.ObserveBaseFirewallDetach = func(observeCtx context.Context, detachFence cloudapi.FirewallDetachmentFence) error {
+		observeCtx, cancel := detachedCreateFenceContext(observeCtx)
+		defer cancel()
+		return p.fences.ObserveBaseFirewallDetach(observeCtx, fencedClaim, binding, fence.Token, detachFence)
+	}
+	request.RejectBaseFirewallDetach = func(rejectCtx context.Context, detachFence cloudapi.FirewallDetachmentFence) error {
+		rejectCtx, cancel := detachedCreateFenceContext(rejectCtx)
+		defer cancel()
+		return p.fences.RejectBaseFirewallDetach(rejectCtx, fencedClaim, binding, fence.Token, detachFence)
+	}
+	request.AuthorizeFloatingIPUpdate = func(authorizeCtx context.Context, vmUUID, address, name string, billingAccountID int64) (cloudapi.FloatingIPUpdateAuthorization, error) {
+		authorizedClaim, authorization, authorizeErr := p.fences.AuthorizeFloatingIPUpdate(authorizeCtx, fencedClaim, binding, fence.Token, vmUUID, address, name, billingAccountID)
+		if authorizedClaim != nil {
+			fencedClaim = authorizedClaim
+		}
+		return authorization, authorizeErr
+	}
+	request.ObserveFloatingIPUpdate = func(observeCtx context.Context, updateFence cloudapi.FloatingIPUpdateFence) error {
+		observeCtx, cancel := detachedCreateFenceContext(observeCtx)
+		defer cancel()
+		observedClaim, observeErr := p.fences.ObserveFloatingIPUpdate(observeCtx, fencedClaim, binding, fence.Token, updateFence)
+		if observedClaim != nil {
+			fencedClaim = observedClaim
+		}
+		return observeErr
+	}
+	request.RejectFloatingIPUpdate = func(rejectCtx context.Context, updateFence cloudapi.FloatingIPUpdateFence) error {
+		rejectCtx, cancel := detachedCreateFenceContext(rejectCtx)
+		defer cancel()
+		rejectedClaim, rejectErr := p.fences.RejectFloatingIPUpdate(rejectCtx, fencedClaim, binding, fence.Token, updateFence)
+		if rejectedClaim != nil {
+			fencedClaim = rejectedClaim
+		}
+		return rejectErr
+	}
+	request.AuthorizeRemovalMutation = func(authorizeCtx context.Context, mutation cloudapi.RemovalMutation, present bool) (cloudapi.RemovalMutationAuthorization, error) {
+		authorizedClaim, authorization, authorizeErr := p.fences.AuthorizeRemovalMutation(authorizeCtx, fencedClaim, binding, fence.Token, mutation, present)
+		if authorizedClaim != nil {
+			fencedClaim = authorizedClaim
+		}
+		return authorization, authorizeErr
+	}
+	request.ObserveRemovalMutation = func(observeCtx context.Context, removalFence cloudapi.RemovalMutationFence) error {
+		observeCtx, cancel := detachedCreateFenceContext(observeCtx)
+		defer cancel()
+		observedClaim, observeErr := p.fences.ObserveRemovalMutation(observeCtx, fencedClaim, binding, fence.Token, removalFence)
+		if observedClaim != nil {
+			fencedClaim = observedClaim
+		}
+		return observeErr
+	}
+	request.RejectRemovalMutation = func(rejectCtx context.Context, removalFence cloudapi.RemovalMutationFence) error {
+		rejectCtx, cancel := detachedCreateFenceContext(rejectCtx)
+		defer cancel()
+		rejectedClaim, rejectErr := p.fences.RejectRemovalMutation(rejectCtx, fencedClaim, binding, fence.Token, removalFence)
+		if rejectedClaim != nil {
+			fencedClaim = rejectedClaim
+		}
+		return rejectErr
+	}
 	request.ChooseRollback = func(rollbackCtx context.Context, vmUUID string, resolution *cloudapi.FencedCreateCleanupResolution) error {
 		rollbackCtx, cancel := detachedCreateFenceContext(rollbackCtx)
 		defer cancel()
@@ -285,7 +378,7 @@ func (p *CloudProvider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim)
 			rejectedClaim, rejectErr := p.fences.MarkRejected(terminalCtx, fencedClaim, binding, fence.Token, authorizedIssueID)
 			cancel()
 			if rejectErr != nil {
-				return nil, fmt.Errorf("creating InSpace VM was definitively rejected, but persisting that terminal fence state failed: %w", errors.Join(err, rejectErr))
+				return nil, fmt.Errorf("creating InSpace VM was locally blocked before dispatch, but persisting that terminal fence state failed: %w", errors.Join(err, rejectErr))
 			}
 			fencedClaim = rejectedClaim
 		}
@@ -350,6 +443,36 @@ func (p *CloudProvider) Delete(ctx context.Context, nodeClaim *karpv1.NodeClaim)
 			PublicIPv4:       record.PublicIPv4,
 			BillingAccountID: record.Cleanup.BillingAccountID,
 			NetworkUUID:      record.Cleanup.NetworkUUID,
+			FirewallUUID:     record.Cleanup.FirewallUUID,
+		}
+		deleteIdentity.AuthorizeBaseFirewallDetach = func(authorizeCtx context.Context, vmUUID string) (cloudapi.FirewallDetachmentAuthorization, error) {
+			return p.fences.AuthorizeBaseFirewallDetach(authorizeCtx, nodeClaim, record.Binding, record.Token, vmUUID)
+		}
+		deleteIdentity.ObserveBaseFirewallDetach = func(observeCtx context.Context, detachFence cloudapi.FirewallDetachmentFence) error {
+			observeCtx, cancel := detachedCreateFenceContext(observeCtx)
+			defer cancel()
+			return p.fences.ObserveBaseFirewallDetach(observeCtx, nodeClaim, record.Binding, record.Token, detachFence)
+		}
+		deleteIdentity.RejectBaseFirewallDetach = func(rejectCtx context.Context, detachFence cloudapi.FirewallDetachmentFence) error {
+			rejectCtx, cancel := detachedCreateFenceContext(rejectCtx)
+			defer cancel()
+			return p.fences.RejectBaseFirewallDetach(rejectCtx, nodeClaim, record.Binding, record.Token, detachFence)
+		}
+		deleteIdentity.AuthorizeRemovalMutation = func(authorizeCtx context.Context, mutation cloudapi.RemovalMutation, present bool) (cloudapi.RemovalMutationAuthorization, error) {
+			_, authorization, authorizeErr := p.fences.AuthorizeRemovalMutation(authorizeCtx, nodeClaim, record.Binding, record.Token, mutation, present)
+			return authorization, authorizeErr
+		}
+		deleteIdentity.ObserveRemovalMutation = func(observeCtx context.Context, removalFence cloudapi.RemovalMutationFence) error {
+			observeCtx, cancel := detachedCreateFenceContext(observeCtx)
+			defer cancel()
+			_, observeErr := p.fences.ObserveRemovalMutation(observeCtx, nodeClaim, record.Binding, record.Token, removalFence)
+			return observeErr
+		}
+		deleteIdentity.RejectRemovalMutation = func(rejectCtx context.Context, removalFence cloudapi.RemovalMutationFence) error {
+			rejectCtx, cancel := detachedCreateFenceContext(rejectCtx)
+			defer cancel()
+			_, rejectErr := p.fences.RejectRemovalMutation(rejectCtx, nodeClaim, record.Binding, record.Token, removalFence)
+			return rejectErr
 		}
 		deleteClusterName = record.Cleanup.ClusterName
 	}

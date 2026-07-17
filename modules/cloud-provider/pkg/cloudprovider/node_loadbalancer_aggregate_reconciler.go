@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -1396,9 +1397,27 @@ func (c *nodeLoadBalancerController) deleteAggregateShardFirewall(ctx context.Co
 		pool.GetDeletionTimestamp() == nil {
 		return false, fmt.Errorf("node load balancer: shard state anchor %s is not an exactly owned deleting NodePool", shard)
 	}
+	converged, err := c.reconcileNodeLoadBalancerFirewallRelation(
+		ctx,
+		c.shardFirewallRelationOwner(shard),
+		nil,
+	)
+	if err != nil || !converged {
+		return false, err
+	}
 	annotations, err := nodeLoadBalancerShardFirewallAnnotations(pool)
 	if err != nil {
 		return false, err
+	}
+	deleteTarget, deleteIssuedAt, err := nodeLoadBalancerFirewallDeleteReceipt(
+		annotations,
+		annotationNodeLoadBalancerShardFWDeleteTarget,
+		annotationNodeLoadBalancerShardFWDeleteIssued,
+		annotationNodeLoadBalancerShardFWCleanupAbsent,
+		annotationNodeLoadBalancerShardFWCleanupCheck,
+	)
+	if err != nil {
+		return false, fmt.Errorf("node load balancer: parse shard firewall delete receipt: %w", err)
 	}
 	name, err := inspace.NodeLoadBalancerShardFirewallName(c.provider.config.ClusterID, shard)
 	if err != nil {
@@ -1408,7 +1427,7 @@ func (c *nodeLoadBalancerController) deleteAggregateShardFirewall(ctx context.Co
 	if err != nil {
 		return false, err
 	}
-	var byName, byAppliedUUID, byPendingUUID, byCleanupUUID *inspace.Firewall
+	var byName, byAppliedUUID, byPendingUUID, byCleanupUUID, byDeleteUUID *inspace.Firewall
 	appliedUUID := annotations[annotationNodeLoadBalancerShardFirewallUUID]
 	pendingUUID := annotations[annotationNodeLoadBalancerShardFWPendingUUID]
 	cleanupUUID := annotations[annotationNodeLoadBalancerShardFWCleanupSeen]
@@ -1433,6 +1452,13 @@ func (c *nodeLoadBalancerController) deleteAggregateShardFirewall(ctx context.Co
 			copy := item
 			byCleanupUUID = &copy
 		}
+		if deleteTarget != "" && item.UUID == deleteTarget {
+			if byDeleteUUID != nil {
+				return false, fmt.Errorf("node load balancer: shard firewall delete target UUID %s appears multiple times", deleteTarget)
+			}
+			copy := item
+			byDeleteUUID = &copy
+		}
 	}
 	if appliedUUID != "" && byName != nil && byName.UUID != appliedUUID {
 		return false, fmt.Errorf("node load balancer: cleanup name %q resolves to UUID %s, expected applied UUID %s", name, byName.UUID, appliedUUID)
@@ -1449,14 +1475,26 @@ func (c *nodeLoadBalancerController) deleteAggregateShardFirewall(ctx context.Co
 	if cleanupUUID != "" && byName != nil && byName.UUID != cleanupUUID {
 		return false, fmt.Errorf("node load balancer: cleanup name %q resolves to UUID %s, expected observed UUID %s", name, byName.UUID, cleanupUUID)
 	}
+	if deleteTarget != "" && byName != nil && byName.UUID != deleteTarget {
+		return false, fmt.Errorf("node load balancer: cleanup name %q resolves to UUID %s, expected delete target UUID %s", name, byName.UUID, deleteTarget)
+	}
 	if byCleanupUUID != nil && byCleanupUUID.EffectiveName() != name {
 		return false, fmt.Errorf("node load balancer: cleanup-observed UUID %s lost stable name %q", cleanupUUID, name)
 	}
 	if cleanupUUID != "" && pendingUUID != "" && cleanupUUID != pendingUUID && appliedUUID == "" {
 		return false, errors.New("node load balancer: pending and cleanup-observed shard firewall UUIDs conflict")
 	}
+	for role, persisted := range map[string]string{
+		"applied": appliedUUID, "pending": pendingUUID, "cleanup-observed": cleanupUUID,
+	} {
+		if deleteTarget != "" && persisted != "" && deleteTarget != persisted {
+			return false, fmt.Errorf("node load balancer: shard firewall delete target %s conflicts with %s UUID %s", deleteTarget, role, persisted)
+		}
+	}
 	firewall := byName
-	if appliedUUID != "" {
+	if deleteTarget != "" {
+		firewall = byDeleteUUID
+	} else if appliedUUID != "" {
 		firewall = byAppliedUUID
 	} else if cleanupUUID != "" {
 		firewall = byCleanupUUID
@@ -1464,7 +1502,7 @@ func (c *nodeLoadBalancerController) deleteAggregateShardFirewall(ctx context.Co
 		firewall = byPendingUUID
 	}
 	if firewall == nil {
-		if issued := annotations[annotationNodeLoadBalancerShardFWIssuedAt]; issued != "" && appliedUUID == "" && cleanupUUID == "" {
+		if issued := annotations[annotationNodeLoadBalancerShardFWIssuedAt]; issued != "" && appliedUUID == "" && cleanupUUID == "" && deleteTarget == "" {
 			// Empty list responses cannot prove that a paid POST which crossed the
 			// request boundary will never commit later. Retain the exact NodePool
 			// ledger/finalizer until the stable-name firewall becomes observable or
@@ -1473,6 +1511,39 @@ func (c *nodeLoadBalancerController) deleteAggregateShardFirewall(ctx context.Co
 				"node load balancer: shard firewall create issued at %s remains ambiguous during cleanup; retaining the NodePool finalizer until the original firewall is observable or manually resolved",
 				issued,
 			)
+		}
+		if deleteTarget == "" {
+			candidate := appliedUUID
+			if candidate == "" {
+				candidate = cleanupUUID
+			}
+			if candidate == "" {
+				candidate = pendingUUID
+			}
+			if candidate != "" {
+				_, changed, stageErr := c.updateManagedNodePoolAnnotations(ctx, shard, func(values map[string]string) (bool, error) {
+					if existing := values[annotationNodeLoadBalancerShardFWDeleteTarget]; existing != "" {
+						if existing != candidate {
+							return false, fmt.Errorf("node load balancer: concurrent shard firewall delete targets %s, not %s", existing, candidate)
+						}
+						return false, nil
+					}
+					values[annotationNodeLoadBalancerShardFWDeleteTarget] = candidate
+					delete(values, annotationNodeLoadBalancerShardFWDeleteIssued)
+					delete(values, annotationNodeLoadBalancerShardFWCleanupAbsent)
+					delete(values, annotationNodeLoadBalancerShardFWCleanupCheck)
+					return true, nil
+				})
+				if stageErr != nil {
+					return false, fmt.Errorf("node load balancer: persist shard firewall delete intent: %w", stageErr)
+				}
+				if changed {
+					deleteTarget = candidate
+					deleteIssuedAt = ""
+				} else {
+					return false, nil
+				}
+			}
 		}
 		notBefore := time.Time{}
 		if issued := annotations[annotationNodeLoadBalancerShardFWIssuedAt]; issued != "" {
@@ -1495,8 +1566,16 @@ func (c *nodeLoadBalancerController) deleteAggregateShardFirewall(ctx context.Co
 			if values[annotationNodeLoadBalancerShardFirewallUUID] != appliedUUID ||
 				values[annotationNodeLoadBalancerShardFWPendingUUID] != pendingUUID ||
 				values[annotationNodeLoadBalancerShardFWCleanupSeen] != cleanupUUID ||
-				values[annotationNodeLoadBalancerShardFWIssuedAt] != annotations[annotationNodeLoadBalancerShardFWIssuedAt] {
+				values[annotationNodeLoadBalancerShardFWIssuedAt] != annotations[annotationNodeLoadBalancerShardFWIssuedAt] ||
+				values[annotationNodeLoadBalancerShardFWDeleteTarget] != deleteTarget ||
+				values[annotationNodeLoadBalancerShardFWDeleteIssued] != deleteIssuedAt {
 				return false, errors.New("node load balancer: shard firewall cleanup identity changed during absence proof")
+			}
+			if deleteTarget != "" {
+				count, parseErr := strconv.Atoi(values[annotationNodeLoadBalancerShardFWCleanupAbsent])
+				if parseErr != nil || count < nodeLoadBalancerAbsenceConfirmations {
+					return false, errors.New("node load balancer: shard firewall delete absence is no longer confirmed")
+				}
 			}
 			for _, key := range []string{
 				annotationNodeLoadBalancerShardFirewallUUID,
@@ -1514,6 +1593,9 @@ func (c *nodeLoadBalancerController) deleteAggregateShardFirewall(ctx context.Co
 				annotationNodeLoadBalancerShardFWCleanupAbsent,
 				annotationNodeLoadBalancerShardFWCleanupCheck,
 				annotationNodeLoadBalancerShardFWCleanupSeen,
+				annotationNodeLoadBalancerShardFWDeleteTarget,
+				annotationNodeLoadBalancerShardFWDeleteIssued,
+				annotationNodeLoadBalancerFirewallRelationIssued,
 			} {
 				delete(values, key)
 			}
@@ -1530,6 +1612,16 @@ func (c *nodeLoadBalancerController) deleteAggregateShardFirewall(ctx context.Co
 		annotationNodeLoadBalancerShardFWCleanupCheck,
 	); clearErr != nil {
 		return false, clearErr
+	}
+	if deleteTarget != "" {
+		changed, clearErr := c.clearManagedNodePoolFirewallAbsence(
+			ctx, shard,
+			annotationNodeLoadBalancerShardFWCleanupAbsent,
+			annotationNodeLoadBalancerShardFWCleanupCheck,
+		)
+		if clearErr != nil || changed {
+			return false, clearErr
+		}
 	}
 	hash, err := inspace.NodeLoadBalancerShardFirewallSpecHash(firewall.Rules)
 	if err != nil {
@@ -1565,19 +1657,121 @@ func (c *nodeLoadBalancerController) deleteAggregateShardFirewall(ctx context.Co
 		})
 		return false, persistErr
 	}
-	if len(firewall.ResourcesAssigned) != 0 {
-		for _, resource := range firewall.ResourcesAssigned {
-			if !strings.EqualFold(resource.ResourceType, "vm") || !validNodeLoadBalancerCloudUUID(resource.ResourceUUID) {
-				return false, fmt.Errorf("node load balancer: shard firewall %s has invalid cleanup assignment %#v", firewall.UUID, resource)
-			}
-			if err := c.provider.api.UnassignFirewallFromVM(ctx, c.provider.config.Location, firewall.UUID, resource.ResourceUUID); err != nil && !inspace.IsNotFound(err) {
-				return false, err
+	assignments, assignmentErr := nodeLoadBalancerFirewallAssignmentVMs(*firewall)
+	if assignmentErr != nil {
+		return false, assignmentErr
+	}
+	if len(assignments) != 0 {
+		for _, vmUUID := range assignments {
+			converged, relationErr := c.reconcileNodeLoadBalancerFirewallRelation(
+				ctx,
+				c.shardFirewallRelationOwner(shard),
+				&nodeLoadBalancerFirewallRelationFence{
+					operation: nodeLoadBalancerFirewallRelationUnassign, firewallUUID: firewall.UUID, vmUUID: vmUUID,
+				},
+			)
+			if relationErr != nil || !converged {
+				return false, relationErr
 			}
 		}
 		return false, nil
 	}
-	if err := c.provider.api.DeleteFirewall(ctx, c.provider.config.Location, firewall.UUID); err != nil && !inspace.IsNotFound(err) {
-		return false, err
+	if deleteIssuedAt != "" {
+		// The exact delete receipt is intentionally read-only after dispatch.
+		// A lagging list response must never authorize a second DELETE.
+		return false, nil
+	}
+	issuedAt := time.Now().UTC().Format(time.RFC3339Nano)
+	_, winner, issueErr := c.updateManagedNodePoolAnnotations(ctx, shard, func(values map[string]string) (bool, error) {
+		storedTarget, storedIssued, parseErr := nodeLoadBalancerFirewallDeleteReceipt(
+			values,
+			annotationNodeLoadBalancerShardFWDeleteTarget,
+			annotationNodeLoadBalancerShardFWDeleteIssued,
+			annotationNodeLoadBalancerShardFWCleanupAbsent,
+			annotationNodeLoadBalancerShardFWCleanupCheck,
+		)
+		if parseErr != nil {
+			return false, parseErr
+		}
+		if storedTarget != "" && storedTarget != firewall.UUID {
+			return false, fmt.Errorf("node load balancer: concurrent shard firewall delete targets %s, not %s", storedTarget, firewall.UUID)
+		}
+		if storedIssued != "" {
+			return false, nil
+		}
+		values[annotationNodeLoadBalancerShardFWDeleteTarget] = firewall.UUID
+		values[annotationNodeLoadBalancerShardFWDeleteIssued] = issuedAt
+		delete(values, annotationNodeLoadBalancerShardFWCleanupAbsent)
+		delete(values, annotationNodeLoadBalancerShardFWCleanupCheck)
+		return true, nil
+	})
+	if issueErr != nil {
+		return false, fmt.Errorf("node load balancer: persist shard firewall delete-issued receipt: %w", issueErr)
+	}
+	if !winner {
+		return false, nil
+	}
+	authorizedPool, authorityErr := c.provider.dynamicClient.Resource(nodePoolGVR).Get(ctx, shard, metav1.GetOptions{})
+	if authorityErr != nil {
+		return false, fmt.Errorf("node load balancer: re-read shard owner after firewall delete issue: %w", authorityErr)
+	}
+	authorizedAnnotations, authorityErr := nodeLoadBalancerShardFirewallAnnotations(authorizedPool)
+	if authorityErr != nil {
+		return false, authorityErr
+	}
+	authorizedLabels := authorizedPool.GetLabels()
+	if authorizedLabels[nodeLoadBalancerManagedLabel] != "true" ||
+		authorizedLabels[nodeLoadBalancerClusterLabel] != c.provider.config.ClusterID ||
+		authorizedLabels[nodeLoadBalancerShardLabel] != shard ||
+		!containsString(authorizedPool.GetFinalizers(), nodeLoadBalancerNodePoolFinalizer) ||
+		authorizedAnnotations[annotationNodeLoadBalancerShardFirewallUUID] != appliedUUID ||
+		authorizedAnnotations[annotationNodeLoadBalancerShardFWPendingUUID] != pendingUUID ||
+		authorizedAnnotations[annotationNodeLoadBalancerShardFWCleanupSeen] != cleanupUUID ||
+		authorizedAnnotations[annotationNodeLoadBalancerShardFWDeleteTarget] != firewall.UUID ||
+		authorizedAnnotations[annotationNodeLoadBalancerShardFWDeleteIssued] != issuedAt {
+		return false, errors.New("node load balancer: shard firewall delete authority changed after issue")
+	}
+	authorizedFirewall, authorityErr := c.exactNodeLoadBalancerFirewallFresh(ctx, firewall.UUID)
+	if authorityErr != nil {
+		return false, fmt.Errorf("node load balancer: re-read shard firewall after delete issue: %w", authorityErr)
+	}
+	if !nodeLoadBalancerFirewallAuthorityUnchanged(*firewall, *authorizedFirewall) {
+		return false, errors.New("node load balancer: shard firewall changed after delete issue")
+	}
+	authorizedHash, authorityErr := inspace.NodeLoadBalancerShardFirewallSpecHash(authorizedFirewall.Rules)
+	if authorityErr != nil {
+		return false, authorityErr
+	}
+	if authorityErr := inspace.ValidateNodeLoadBalancerShardFirewall(
+		*authorizedFirewall,
+		c.provider.config.ClusterID,
+		shard,
+		c.provider.config.BillingAccountID,
+		authorizedHash,
+	); authorityErr != nil {
+		return false, fmt.Errorf("node load balancer: shard firewall lost exact ownership after delete issue: %w", authorityErr)
+	}
+	postIssueAssignments, authorityErr := nodeLoadBalancerFirewallAssignmentVMs(*authorizedFirewall)
+	if authorityErr != nil {
+		return false, authorityErr
+	}
+	if len(postIssueAssignments) != 0 {
+		return false, errors.New("node load balancer: shard firewall gained assignments after delete issue")
+	}
+	deleteErr := c.provider.api.DeleteFirewall(ctx, c.provider.config.Location, firewall.UUID)
+	if nodeLoadBalancerMutationKnownPreDispatch(deleteErr) {
+		_, _, resetErr := c.updateManagedNodePoolAnnotations(ctx, shard, func(values map[string]string) (bool, error) {
+			if values[annotationNodeLoadBalancerShardFWDeleteTarget] != firewall.UUID ||
+				values[annotationNodeLoadBalancerShardFWDeleteIssued] != issuedAt {
+				return false, errors.New("node load balancer: shard firewall delete receipt changed before pre-dispatch rejection")
+			}
+			delete(values, annotationNodeLoadBalancerShardFWDeleteIssued)
+			return true, nil
+		})
+		return false, errors.Join(deleteErr, resetErr)
+	}
+	if deleteErr != nil {
+		return false, deleteErr
 	}
 	return false, nil
 }

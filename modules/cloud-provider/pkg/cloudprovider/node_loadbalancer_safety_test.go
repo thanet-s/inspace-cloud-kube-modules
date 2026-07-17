@@ -1383,8 +1383,11 @@ func TestNodeLoadBalancerPendingFirewallPreventsDuplicateCreateDuringDelayedRead
 	provider := newTestProvider(t, api)
 	provider.kubeClient = kubefake.NewSimpleClientset(service.DeepCopy())
 	controller := &nodeLoadBalancerController{provider: provider}
+	hidden := &nodeLoadBalancerHiddenPostCreateAPI{fakeAPI: api}
+	provider.api = hidden
 
-	if firewall, _, ready, err := controller.ensureServiceFirewall(ctx, service, nil); err != nil || firewall != nil || ready {
+	if firewall, _, ready, err := controller.ensureServiceFirewall(ctx, service, nil); err == nil || firewall != nil || ready ||
+		!strings.Contains(err.Error(), "remains ambiguous") {
 		t.Fatalf("initial firewall create = %#v, ready=%t, err=%v", firewall, ready, err)
 	}
 	if len(api.createdFirewalls) != 1 {
@@ -1394,16 +1397,19 @@ func TestNodeLoadBalancerPendingFirewallPreventsDuplicateCreateDuringDelayedRead
 	if err != nil {
 		t.Fatal(err)
 	}
-	if stored.Annotations[annotationNodeLoadBalancerPendingFirewall] == "" ||
-		stored.Annotations[annotationNodeLoadBalancerPendingFWName] == "" {
-		t.Fatalf("pending identity was not persisted: %#v", stored.Annotations)
+	if stored.Annotations[annotationNodeLoadBalancerPendingFirewall] != "" ||
+		stored.Annotations[annotationNodeLoadBalancerPendingFWName] == "" ||
+		stored.Annotations[annotationNodeLoadBalancerPendingFWIssued] == "" ||
+		stored.Annotations[annotationNodeLoadBalancerPendingFWIssuedAt] == "" {
+		t.Fatalf("durable create-issued identity was not persisted: %#v", stored.Annotations)
 	}
 
 	// Simulate an eventually consistent ListFirewalls response immediately
 	// after a successful POST. The pending identity must suppress another POST.
 	api.firewalls = nil
-	if firewall, _, ready, err := controller.ensureServiceFirewall(ctx, stored, nil); err != nil || firewall != nil || ready {
-		t.Fatalf("delayed readback = %#v, ready=%t, err=%v", firewall, ready, err)
+	if firewall, _, ready, err := controller.ensureServiceFirewall(ctx, stored, nil); err == nil || firewall != nil || ready ||
+		!strings.Contains(err.Error(), "remains ambiguous") {
+		t.Fatalf("delayed readback did not fail closed = %#v, ready=%t, err=%v", firewall, ready, err)
 	}
 	if len(api.createdFirewalls) != 1 {
 		t.Fatalf("delayed readback issued %d creates, want exactly one", len(api.createdFirewalls))
@@ -1417,12 +1423,15 @@ func TestNodeLoadBalancerClusterICMPPendingPreventsDuplicateCreateDuringDelayedR
 	provider.config.NodeLoadBalancer = NodeLoadBalancerConfig{Enabled: true, DefaultNodeClass: "workers", NodesPerShard: 1}
 	provider.dynamicClient = newNodeLoadBalancerTestDynamicClient(nodeLoadBalancerSafetyBaseNodeClass())
 	controller := &nodeLoadBalancerController{provider: provider}
+	hidden := &nodeLoadBalancerHiddenPostCreateAPI{fakeAPI: api}
+	provider.api = hidden
 	nodeClassName := managedNodeLoadBalancerName(provider.config.ClusterID, "node-lb")
 	if err := controller.ensureNodeClass(ctx, nodeClassName); err != nil {
 		t.Fatal(err)
 	}
 
-	if firewall, ready, err := controller.ensureClusterICMPFirewall(ctx, nodeClassName, nil); err != nil || firewall != nil || ready {
+	if firewall, ready, err := controller.ensureClusterICMPFirewall(ctx, nodeClassName, nil); err == nil || firewall != nil || ready ||
+		!strings.Contains(err.Error(), "remains ambiguous") {
 		t.Fatalf("initial cluster ICMP create = %#v, ready=%t, err=%v", firewall, ready, err)
 	}
 	if len(api.createdFirewalls) != 1 {
@@ -1433,7 +1442,7 @@ func TestNodeLoadBalancerClusterICMPPendingPreventsDuplicateCreateDuringDelayedR
 		t.Fatal(err)
 	}
 	annotations := nodeClass.GetAnnotations()
-	if annotations[annotationNodeLoadBalancerICMPPendingUUID] == "" ||
+	if annotations[annotationNodeLoadBalancerICMPPendingUUID] != "" ||
 		annotations[annotationNodeLoadBalancerICMPPendingName] == "" ||
 		annotations[annotationNodeLoadBalancerICMPPendingStarted] == "" ||
 		annotations[annotationNodeLoadBalancerICMPCreateIssued] == "" {
@@ -2433,12 +2442,26 @@ func TestNodeLoadBalancerWithdrawalDetachesPersistedFirewallAfterPolicyDrift(t *
 	nodeLoadBalancerAssertWithdrawn(t, fixture)
 }
 
-func TestNodeLoadBalancerWithdrawalDetachFenceSurvivesStaleReadbackAndRestart(t *testing.T) {
+func TestNodeLoadBalancerEmergencyWithdrawalSerializesMultipleVMAssignments(t *testing.T) {
 	fixture := newNodeLoadBalancerFailClosedFixture(t)
 	defer fixture.controller.queue.ShutDown()
+	now := time.Date(2026, 7, 17, 3, 0, 0, 0, time.UTC)
+	clock := func() time.Time { return now }
+	fixture.controller.firewallRelationNow = clock
+	fixture.controller.firewallRelationAbsentDelay = nodeLoadBalancerAbsenceConfirmationDelay
 	nodeLoadBalancerSeedAdvertisedStatuses(t, fixture)
 	sticky := &nodeLoadBalancerStickyUnassignAPI{fakeAPI: fixture.api}
 	fixture.provider.api = sticky
+	const secondVM = "bbbbbbbb-2222-4333-8444-cccccccccccc"
+	fixture.api.vms = append(fixture.api.vms, inspace.VM{
+		UUID: secondVM, Name: "lb-1", Status: "running",
+		BillingAccountID: fixture.provider.config.BillingAccountID,
+		NetworkUUID:      fixture.provider.config.NetworkUUID,
+	})
+	fixture.firewall(t, fixture.serviceFirewallUUID).ResourcesAssigned = append(
+		fixture.firewall(t, fixture.serviceFirewallUUID).ResourcesAssigned,
+		inspace.FirewallResource{ResourceType: "vm", ResourceUUID: secondVM},
+	)
 
 	withdraw := func(controller *nodeLoadBalancerController) error {
 		t.Helper()
@@ -2449,8 +2472,8 @@ func TestNodeLoadBalancerWithdrawalDetachFenceSurvivesStaleReadbackAndRestart(t 
 	}
 	wantWaiting := func(err error) {
 		t.Helper()
-		if err == nil || !strings.Contains(err.Error(), "waiting for exact Service firewall detachment readback") {
-			t.Fatalf("withdrawal error = %v, want exact detachment readback wait", err)
+		if err == nil || !strings.Contains(err.Error(), "firewall relation") {
+			t.Fatalf("withdrawal error = %v, want canonical firewall relation wait", err)
 		}
 	}
 
@@ -2459,34 +2482,43 @@ func TestNodeLoadBalancerWithdrawalDetachFenceSurvivesStaleReadbackAndRestart(t 
 	if !ok {
 		t.Fatal("fixture Node has no VM UUID")
 	}
-	wantFirstSet := fixture.serviceFirewallUUID + "/" + vmUUID
-	if got := fixture.api.unassignedFirewalls; len(got) != 1 || got[0] != wantFirstSet {
-		t.Fatalf("first withdrawal detach calls = %#v, want [%q]", got, wantFirstSet)
+	wantFirstPair := fixture.serviceFirewallUUID + "/" + vmUUID
+	wantSecondPair := fixture.serviceFirewallUUID + "/" + secondVM
+	if got := fixture.api.unassignedFirewalls; len(got) != 1 || got[0] != wantFirstPair {
+		t.Fatalf("first withdrawal detach calls = %#v, want sorted first pair %q", got, wantFirstPair)
 	}
 	current := getNodeLoadBalancerTestService(
 		t, fixture.ctx, fixture.provider, fixture.service.Namespace, fixture.service.Name,
 	)
-	if current.Annotations[annotationNodeLoadBalancerWithdrawFWDetach] != wantFirstSet ||
+	wantEvidenceSet := strings.Join([]string{wantFirstPair, wantSecondPair}, ",")
+	if current.Annotations[annotationNodeLoadBalancerWithdrawFWDetach] != wantEvidenceSet ||
 		current.Annotations[annotationNodeLoadBalancerWithdrawFWDetachAt] == "" {
-		t.Fatalf("withdrawal detach fence was not persisted exactly: %#v", current.Annotations)
+		t.Fatalf("withdrawal evidence was not persisted exactly: %#v", current.Annotations)
 	}
+	firstEvidenceAt := current.Annotations[annotationNodeLoadBalancerWithdrawFWDetachAt]
 
 	wantWaiting(withdraw(fixture.controller))
 	if got := len(fixture.api.unassignedFirewalls); got != 1 {
 		t.Fatalf("same controller repeated a fenced detach %d times, want 1", got)
 	}
 
-	restarted := &nodeLoadBalancerController{provider: fixture.provider}
+	restarted := &nodeLoadBalancerController{
+		provider: fixture.provider, firewallRelationNow: clock,
+		firewallRelationAbsentDelay: nodeLoadBalancerAbsenceConfirmationDelay,
+	}
 	wantWaiting(withdraw(restarted))
 	if got := len(fixture.api.unassignedFirewalls); got != 1 {
 		t.Fatalf("restarted controller repeated a fenced detach %d times, want 1", got)
 	}
 
+	// The old evidence timestamps are diagnostic only. Aging them must never
+	// authorize another relationship mutation while the canonical issue remains.
 	current = getNodeLoadBalancerTestService(
 		t, fixture.ctx, fixture.provider, fixture.service.Namespace, fixture.service.Name,
 	)
 	agedDetachTimes, err := json.Marshal(map[string]string{
-		wantFirstSet: time.Now().Add(-nodeLoadBalancerFirewallDetachRetry - time.Second).UTC().Format(time.RFC3339Nano),
+		wantFirstPair:  time.Unix(1, 0).UTC().Format(time.RFC3339Nano),
+		wantSecondPair: time.Unix(1, 0).UTC().Format(time.RFC3339Nano),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -2498,59 +2530,50 @@ func TestNodeLoadBalancerWithdrawalDetachFenceSurvivesStaleReadbackAndRestart(t 
 		t.Fatal(err)
 	}
 	wantWaiting(withdraw(restarted))
-	if got := len(fixture.api.unassignedFirewalls); got != 2 {
-		t.Fatalf("expired fence detach calls = %d, want 2", got)
+	if got := len(fixture.api.unassignedFirewalls); got != 1 {
+		t.Fatalf("aged evidence authorized %d detach calls, want 1", got)
 	}
 
-	const secondVM = "bbbbbbbb-2222-4333-8444-cccccccccccc"
-	fixture.firewall(t, fixture.serviceFirewallUUID).ResourcesAssigned = append(
-		fixture.firewall(t, fixture.serviceFirewallUUID).ResourcesAssigned,
-		inspace.FirewallResource{ResourceType: "vm", ResourceUUID: secondVM},
-	)
-	wantWaiting(withdraw(restarted))
-	if got := len(fixture.api.unassignedFirewalls); got != 3 {
-		t.Fatalf("expanded assignment set detach calls = %d, want 3", got)
-	}
-	wantChangedSet := strings.Join([]string{
-		fixture.serviceFirewallUUID + "/" + vmUUID,
-		fixture.serviceFirewallUUID + "/" + secondVM,
-	}, ",")
-	current = getNodeLoadBalancerTestService(
-		t, fixture.ctx, fixture.provider, fixture.service.Namespace, fixture.service.Name,
-	)
-	if got := current.Annotations[annotationNodeLoadBalancerWithdrawFWDetach]; got != wantChangedSet {
-		t.Fatalf("changed assignment fence = %q, want %q", got, wantChangedSet)
-	}
-	if got := fixture.api.unassignedFirewalls[2]; got != fixture.serviceFirewallUUID+"/"+secondVM {
-		t.Fatalf("expanded assignment set retried an old pair: call = %q", got)
-	}
-
+	// Exact absence of the sorted first pair clears that canonical issue, but the
+	// same pass must stop before it can authorize the second pair.
 	fixture.firewall(t, fixture.serviceFirewallUUID).ResourcesAssigned = []inspace.FirewallResource{{
 		ResourceType: "vm", ResourceUUID: secondVM,
 	}}
 	wantWaiting(withdraw(restarted))
-	if got := len(fixture.api.unassignedFirewalls); got != 3 {
-		t.Fatalf("shrunk assignment set retried a retained pair; calls = %d, want 3", got)
+	if got := len(fixture.api.unassignedFirewalls); got != 1 {
+		t.Fatalf("first-absence pass dispatched another detach; calls = %d, want 1", got)
+	}
+
+	now = now.Add(nodeLoadBalancerAbsenceConfirmationDelay + time.Second)
+	wantWaiting(withdraw(restarted))
+	if got := len(fixture.api.unassignedFirewalls); got != 1 {
+		t.Fatalf("spaced issue-clear pass dispatched another detach; calls = %d, want 1", got)
+	}
+	wantWaiting(withdraw(restarted))
+	if got := fixture.api.unassignedFirewalls; len(got) != 2 || got[1] != wantSecondPair {
+		t.Fatalf("second sorted detach calls = %#v, want [%q %q]", got, wantFirstPair, wantSecondPair)
 	}
 	current = getNodeLoadBalancerTestService(
 		t, fixture.ctx, fixture.provider, fixture.service.Namespace, fixture.service.Name,
 	)
-	wantShrunkSet := fixture.serviceFirewallUUID + "/" + secondVM
-	if got := current.Annotations[annotationNodeLoadBalancerWithdrawFWDetach]; got != wantShrunkSet {
-		t.Fatalf("shrunk assignment fence = %q, want %q", got, wantShrunkSet)
+	if got := current.Annotations[annotationNodeLoadBalancerWithdrawFWDetach]; got != wantSecondPair {
+		t.Fatalf("current withdrawal evidence = %q, want %q", got, wantSecondPair)
 	}
-
-	fixture.firewall(t, fixture.serviceFirewallUUID).ResourcesAssigned = append(
-		fixture.firewall(t, fixture.serviceFirewallUUID).ResourcesAssigned,
-		inspace.FirewallResource{ResourceType: "vm", ResourceUUID: vmUUID},
-	)
-	wantWaiting(withdraw(restarted))
-	if got := len(fixture.api.unassignedFirewalls); got != 3 {
-		t.Fatalf("reappearing historically fenced pair was retried; calls = %d, want 3", got)
+	if got := current.Annotations[annotationNodeLoadBalancerWithdrawFWDetachAt]; got == firstEvidenceAt {
+		t.Fatal("assignment-set evidence did not advance after exact first-pair absence")
 	}
 
 	fixture.firewall(t, fixture.serviceFirewallUUID).ResourcesAssigned = nil
-	if err := withdraw(fixture.controller); err != nil {
+	wantWaiting(withdraw(restarted))
+	if got := len(fixture.api.unassignedFirewalls); got != 2 {
+		t.Fatalf("second first-absence pass dispatched another detach; calls = %d, want 2", got)
+	}
+	now = now.Add(nodeLoadBalancerAbsenceConfirmationDelay + time.Second)
+	wantWaiting(withdraw(restarted))
+	if got := len(fixture.api.unassignedFirewalls); got != 2 {
+		t.Fatalf("second spaced issue-clear pass dispatched another detach; calls = %d, want 2", got)
+	}
+	if err := withdraw(restarted); err != nil {
 		t.Fatal(err)
 	}
 	current = getNodeLoadBalancerTestService(
@@ -2566,12 +2589,355 @@ func TestNodeLoadBalancerWithdrawalDetachFenceSurvivesStaleReadbackAndRestart(t 
 	if len(child.Status.LoadBalancer.Ingress) != 0 {
 		t.Fatalf("private datapath remained published after assignment cleared: %#v", child.Status.LoadBalancer)
 	}
-	if got := len(fixture.api.unassignedFirewalls); got != 3 {
-		t.Fatalf("assignment-clear convergence issued another detach; calls = %d, want 3", got)
+	if got := len(fixture.api.unassignedFirewalls); got != 2 {
+		t.Fatalf("assignment-clear convergence issued another detach; calls = %d, want 2", got)
 	}
-	if current.Annotations[annotationNodeLoadBalancerWithdrawFWDetach] != wantChangedSet ||
+	if current.Annotations[annotationNodeLoadBalancerWithdrawFWDetach] != wantSecondPair ||
 		current.Annotations[annotationNodeLoadBalancerWithdrawFWDetachAt] == "" {
-		t.Fatalf("withdrawal convergence cleared the durable detach fence early: %#v", current.Annotations)
+		t.Fatalf("withdrawal convergence cleared diagnostic evidence early: %#v", current.Annotations)
+	}
+}
+
+func TestNodeLoadBalancerEmergencyWithdrawalResolvesPendingAssignBeforeDelete(t *testing.T) {
+	fixture := newNodeLoadBalancerFailClosedFixture(t)
+	defer fixture.controller.queue.ShutDown()
+	now := time.Date(2026, 7, 17, 4, 0, 0, 0, time.UTC)
+	fixture.controller.firewallRelationNow = func() time.Time { return now }
+	fixture.controller.firewallRelationAbsentDelay = nodeLoadBalancerAbsenceConfirmationDelay
+	vmUUID, ok := nodeLoadBalancerVMUUID(fixture.node)
+	if !ok {
+		t.Fatal("fixture Node has no VM UUID")
+	}
+	current := getNodeLoadBalancerTestService(
+		t, fixture.ctx, fixture.provider, fixture.service.Namespace, fixture.service.Name,
+	)
+	copy := current.DeepCopy()
+	copy.Annotations[annotationNodeLoadBalancerFirewallRelationIssued] = nodeLoadBalancerFirewallRelationFence{
+		operation:    nodeLoadBalancerFirewallRelationAssign,
+		firewallUUID: fixture.serviceFirewallUUID,
+		vmUUID:       vmUUID,
+		issueID:      strings.Repeat("a", 32),
+		issuedAt:     time.Now().UTC().Format(time.RFC3339Nano),
+	}.String()
+	if _, err := fixture.provider.kubeClient.CoreV1().Services(copy.Namespace).Update(
+		fixture.ctx, copy, metav1.UpdateOptions{},
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	current = getNodeLoadBalancerTestService(
+		t, fixture.ctx, fixture.provider, fixture.service.Namespace, fixture.service.Name,
+	)
+	err := fixture.controller.detachOwnedServiceFirewallsForFailure(fixture.ctx, current)
+	if err == nil || !strings.Contains(err.Error(), "waiting for prior Service firewall relation readback") {
+		t.Fatalf("pending assignment resolution error = %v, want a fresh-pass wait", err)
+	}
+	if got := len(fixture.api.unassignedFirewalls); got != 0 {
+		t.Fatalf("assignment-fence resolution dispatched %d emergency DELETEs, want 0", got)
+	}
+	stored := getNodeLoadBalancerTestService(
+		t, fixture.ctx, fixture.provider, fixture.service.Namespace, fixture.service.Name,
+	)
+	if got := stored.Annotations[annotationNodeLoadBalancerFirewallRelationIssued]; got != "" {
+		t.Fatalf("converged assignment fence remains stored: %q", got)
+	}
+
+	if err := fixture.controller.detachOwnedServiceFirewallsForFailure(fixture.ctx, stored); err == nil || !strings.Contains(err.Error(), "firewall relation") {
+		t.Fatalf("first removal absence did not remain fenced: %v", err)
+	}
+	wantPair := fixture.serviceFirewallUUID + "/" + vmUUID
+	if got := fixture.api.unassignedFirewalls; len(got) != 1 || got[0] != wantPair {
+		t.Fatalf("post-resolution emergency DELETEs = %#v, want [%q]", got, wantPair)
+	}
+	now = now.Add(nodeLoadBalancerAbsenceConfirmationDelay + time.Second)
+	stored = getNodeLoadBalancerTestService(
+		t, fixture.ctx, fixture.provider, fixture.service.Namespace, fixture.service.Name,
+	)
+	if err := fixture.controller.detachOwnedServiceFirewallsForFailure(fixture.ctx, stored); err == nil || !strings.Contains(err.Error(), "prior Service firewall relation readback") {
+		t.Fatalf("spaced removal issue-clear error = %v, want fresh-pass wait", err)
+	}
+	stored = getNodeLoadBalancerTestService(
+		t, fixture.ctx, fixture.provider, fixture.service.Namespace, fixture.service.Name,
+	)
+	if err := fixture.controller.detachOwnedServiceFirewallsForFailure(fixture.ctx, stored); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(fixture.api.unassignedFirewalls); got != 1 {
+		t.Fatalf("removal confirmation reissued %d DELETEs, want 1", got)
+	}
+}
+
+func TestNodeLoadBalancerEmergencyWithdrawalCommitted500RestartDoesNotReissue(t *testing.T) {
+	fixture := newNodeLoadBalancerFailClosedFixture(t)
+	defer fixture.controller.queue.ShutDown()
+	now := time.Date(2026, 7, 17, 5, 0, 0, 0, time.UTC)
+	clock := func() time.Time { return now }
+	fixture.controller.firewallRelationNow = clock
+	fixture.controller.firewallRelationAbsentDelay = nodeLoadBalancerAbsenceConfirmationDelay
+	vmUUID, ok := nodeLoadBalancerVMUUID(fixture.node)
+	if !ok {
+		t.Fatal("fixture Node has no VM UUID")
+	}
+	api := &nodeLoadBalancerCommittedHiddenUnassignAPI{
+		fakeAPI:      fixture.api,
+		firewallUUID: fixture.serviceFirewallUUID,
+		vmUUID:       vmUUID,
+		hiddenReads:  2,
+	}
+	fixture.provider.api = api
+
+	current := getNodeLoadBalancerTestService(
+		t, fixture.ctx, fixture.provider, fixture.service.Namespace, fixture.service.Name,
+	)
+	err := fixture.controller.detachOwnedServiceFirewallsForFailure(fixture.ctx, current)
+	if err == nil || !strings.Contains(err.Error(), "committed but response lost") {
+		t.Fatalf("committed HTTP 500 error = %v, want ambiguous failure", err)
+	}
+	if api.calls != 1 {
+		t.Fatalf("initial emergency DELETE calls = %d, want 1", api.calls)
+	}
+	stored := getNodeLoadBalancerTestService(
+		t, fixture.ctx, fixture.provider, fixture.service.Namespace, fixture.service.Name,
+	)
+	if stored.Annotations[annotationNodeLoadBalancerFirewallRelationIssued] == "" {
+		t.Fatalf("ambiguous emergency DELETE lacks canonical issue: %#v", stored.Annotations)
+	}
+
+	restarted := &nodeLoadBalancerController{
+		provider: fixture.provider, firewallRelationNow: clock,
+		firewallRelationAbsentDelay: nodeLoadBalancerAbsenceConfirmationDelay,
+	}
+	err = restarted.detachOwnedServiceFirewallsForFailure(fixture.ctx, stored)
+	if err == nil || !strings.Contains(err.Error(), "remains ambiguous") {
+		t.Fatalf("restart hidden-readback error = %v, want canonical pending state", err)
+	}
+	if api.calls != 1 {
+		t.Fatalf("restart reissued committed emergency DELETE %d times, want 1", api.calls)
+	}
+
+	stored = getNodeLoadBalancerTestService(
+		t, fixture.ctx, fixture.provider, fixture.service.Namespace, fixture.service.Name,
+	)
+	err = restarted.detachOwnedServiceFirewallsForFailure(fixture.ctx, stored)
+	if err == nil || !strings.Contains(err.Error(), "remains ambiguous") {
+		t.Fatalf("first exact-absence observation error = %v, want durable pending state", err)
+	}
+	if api.calls != 1 {
+		t.Fatalf("first exact-absence observation reissued emergency DELETE %d times, want 1", api.calls)
+	}
+	stored = getNodeLoadBalancerTestService(
+		t, fixture.ctx, fixture.provider, fixture.service.Namespace, fixture.service.Name,
+	)
+	issued, parseErr := parseNodeLoadBalancerFirewallRelationFence(stored.Annotations[annotationNodeLoadBalancerFirewallRelationIssued])
+	if parseErr != nil || issued.absenceObservedAt == "" {
+		t.Fatalf("first exact absence did not persist canonical observation: %#v err=%v", issued, parseErr)
+	}
+	now = now.Add(nodeLoadBalancerAbsenceConfirmationDelay + time.Second)
+	err = restarted.detachOwnedServiceFirewallsForFailure(fixture.ctx, stored)
+	if err == nil || !strings.Contains(err.Error(), "waiting for prior Service firewall relation readback") {
+		t.Fatalf("spaced exact-absence issue-clear error = %v, want fresh-pass wait", err)
+	}
+	if api.calls != 1 {
+		t.Fatalf("spaced exact-absence issue clear reissued emergency DELETE %d times, want 1", api.calls)
+	}
+	stored = getNodeLoadBalancerTestService(
+		t, fixture.ctx, fixture.provider, fixture.service.Namespace, fixture.service.Name,
+	)
+	if stored.Annotations[annotationNodeLoadBalancerFirewallRelationIssued] != "" {
+		t.Fatalf("two authoritative absences did not clear canonical issue: %#v", stored.Annotations)
+	}
+	if err := restarted.detachOwnedServiceFirewallsForFailure(fixture.ctx, stored); err != nil {
+		t.Fatal(err)
+	}
+	if api.calls != 1 {
+		t.Fatalf("absence convergence reissued emergency DELETE %d times, want 1", api.calls)
+	}
+}
+
+func TestNodeLoadBalancerWithdrawalDoesNotDispatchWhenDetachReceiptIsStripped(t *testing.T) {
+	fixture := newNodeLoadBalancerFailClosedFixture(t)
+	defer fixture.controller.queue.ShutDown()
+	client, ok := fixture.provider.kubeClient.(*kubefake.Clientset)
+	if !ok {
+		t.Fatal("fixture does not use a fake Kubernetes clientset")
+	}
+	client.PrependReactor("update", "services", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		update, ok := action.(k8stesting.UpdateAction)
+		if !ok {
+			return false, nil, nil
+		}
+		service, ok := update.GetObject().(*corev1.Service)
+		if !ok || service.Name != fixture.service.Name || service.Annotations[annotationNodeLoadBalancerWithdrawFWDetachAt] == "" {
+			return false, nil, nil
+		}
+		stripped := service.DeepCopy()
+		delete(stripped.Annotations, annotationNodeLoadBalancerWithdrawFWDetach)
+		delete(stripped.Annotations, annotationNodeLoadBalancerWithdrawFWDetachAt)
+		return true, stripped, nil
+	})
+
+	current := getNodeLoadBalancerTestService(
+		t, fixture.ctx, fixture.provider, fixture.service.Namespace, fixture.service.Name,
+	)
+	err := fixture.controller.detachOwnedServiceFirewallsForFailure(fixture.ctx, current)
+	if err == nil || !strings.Contains(err.Error(), "exact controller receipt") {
+		t.Fatalf("stripped emergency-detach receipt error = %v", err)
+	}
+	if len(fixture.api.unassignedFirewalls) != 0 {
+		t.Fatalf("stripped emergency-detach receipt dispatched cloud mutation: %#v", fixture.api.unassignedFirewalls)
+	}
+}
+
+func TestExactParentUpdateAcceptsAPIServerNilNormalizationOfEmptyFinalizers(t *testing.T) {
+	fixture := newNodeLoadBalancerFailClosedFixture(t)
+	defer fixture.controller.queue.ShutDown()
+	client := fixture.provider.kubeClient.(*kubefake.Clientset)
+	client.PrependReactor("update", "services", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		update, ok := action.(k8stesting.UpdateAction)
+		if !ok {
+			return false, nil, nil
+		}
+		service, ok := update.GetObject().(*corev1.Service)
+		if !ok || service.Name != fixture.service.Name || len(service.Finalizers) != 0 {
+			return false, nil, nil
+		}
+		normalized := service.DeepCopy()
+		normalized.Finalizers = nil
+		if err := client.Tracker().Update(
+			corev1.SchemeGroupVersion.WithResource("services"), normalized, normalized.Namespace,
+		); err != nil {
+			return true, nil, err
+		}
+		return true, normalized, nil
+	})
+
+	current := getNodeLoadBalancerTestService(
+		t, fixture.ctx, fixture.provider, fixture.service.Namespace, fixture.service.Name,
+	)
+	updated, changed, err := fixture.controller.updateExactParentService(fixture.ctx, current, func(copy *corev1.Service) (bool, error) {
+		copy.Finalizers = removeString(copy.Finalizers, nodeLoadBalancerFinalizer)
+		return true, nil
+	})
+	if err != nil || !changed || updated == nil || len(updated.Finalizers) != 0 {
+		t.Fatalf("nil-normalized finalizer removal = updated %#v, changed=%t, err=%v", updated, changed, err)
+	}
+}
+
+func TestClusterICMPDoesNotDispatchWhenIssuedReceiptIsStripped(t *testing.T) {
+	ctx, api, provider, controller, nodeClassName, _ := newClusterICMPSafetyFixture(t)
+	dynamicClient, ok := provider.dynamicClient.(*fake.FakeDynamicClient)
+	if !ok {
+		t.Fatal("fixture does not use a fake dynamic client")
+	}
+	dynamicClient.PrependReactor("update", nodeClassGVR.Resource, func(action k8stesting.Action) (bool, runtime.Object, error) {
+		update, ok := action.(k8stesting.UpdateAction)
+		if !ok {
+			return false, nil, nil
+		}
+		object, ok := update.GetObject().(*unstructured.Unstructured)
+		if !ok || object.GetName() != nodeClassName || object.GetAnnotations()[annotationNodeLoadBalancerICMPCreateIssued] == "" {
+			return false, nil, nil
+		}
+		stripped := object.DeepCopy()
+		annotations := stripped.GetAnnotations()
+		delete(annotations, annotationNodeLoadBalancerICMPCreateIssued)
+		stripped.SetAnnotations(annotations)
+		return true, stripped, nil
+	})
+
+	_, _, err := controller.ensureClusterICMPFirewall(ctx, nodeClassName, nil)
+	if err == nil || !strings.Contains(err.Error(), "exact cluster ICMP firewall receipt") {
+		t.Fatalf("stripped cluster ICMP receipt error = %v", err)
+	}
+	if len(api.createdFirewalls) != 0 {
+		t.Fatalf("stripped cluster ICMP receipt dispatched %d firewall creates", len(api.createdFirewalls))
+	}
+}
+
+func TestShardFirewallDoesNotDispatchWhenIssuedReceiptIsStripped(t *testing.T) {
+	existing := aggregateTestService(
+		"receipt-create",
+		"71111111-1111-4111-8111-111111111111",
+		corev1.ProtocolTCP,
+		80,
+	)
+	fixture := newAggregateShardFirewallTestFixture(t, existing)
+	fixture.reconcile(t) // persist create intent only
+	dynamicClient := fixture.provider.dynamicClient.(*fake.FakeDynamicClient)
+	stripIssued := func(action k8stesting.Action) (bool, runtime.Object, error) {
+		update, ok := action.(k8stesting.UpdateAction)
+		if !ok {
+			return false, nil, nil
+		}
+		object, ok := update.GetObject().(*unstructured.Unstructured)
+		if !ok || object.GetName() != fixture.shard || object.GetAnnotations()[annotationNodeLoadBalancerShardFWIssuedAt] == "" {
+			return false, nil, nil
+		}
+		stripped := object.DeepCopy()
+		annotations := stripped.GetAnnotations()
+		delete(annotations, annotationNodeLoadBalancerShardFWIssuedAt)
+		stripped.SetAnnotations(annotations)
+		return true, stripped, nil
+	}
+	dynamicClient.PrependReactor("update", nodePoolGVR.Resource, stripIssued)
+	if _, err := fixture.controller.reconcileShardFirewallPolicy(fixture.ctx, fixture.shard); err == nil ||
+		!strings.Contains(err.Error(), "exact shard firewall receipt") {
+		t.Fatalf("stripped shard-create receipt error = %v", err)
+	}
+	if len(fixture.api.createdFirewalls) != 0 {
+		t.Fatalf("stripped shard-create receipt dispatched %d firewall creates", len(fixture.api.createdFirewalls))
+	}
+}
+
+func TestShardFirewallUpdateDoesNotDispatchWhenIssuedReceiptIsStripped(t *testing.T) {
+	existing := aggregateTestService(
+		"receipt-update",
+		"72222222-2222-4222-8222-222222222222",
+		corev1.ProtocolTCP,
+		80,
+	)
+	fixture := newAggregateShardFirewallTestFixture(t, existing)
+	desired, _, _, err := fixture.controller.desiredStagedShardFirewallPolicy(fixture.ctx, fixture.shard)
+	if err != nil || desired == nil {
+		t.Fatalf("initial desired policy = %#v, %v", desired, err)
+	}
+	fixture.api.firewalls = []inspace.Firewall{aggregateTestFirewall(*desired, aggregateTestFirewallUUID)}
+	fixture.reconcile(t) // adopt
+	fixture.reconcile(t) // ready
+	newMember := aggregateTestService(
+		"receipt-update-new",
+		"73333333-3333-4333-8333-333333333333",
+		corev1.ProtocolTCP,
+		443,
+	)
+	if _, err := fixture.provider.kubeClient.CoreV1().Services(newMember.Namespace).Create(
+		fixture.ctx, newMember, metav1.CreateOptions{},
+	); err != nil {
+		t.Fatal(err)
+	}
+	fixture.reconcile(t) // persist update intent only
+	dynamicClient := fixture.provider.dynamicClient.(*fake.FakeDynamicClient)
+	dynamicClient.PrependReactor("update", nodePoolGVR.Resource, func(action k8stesting.Action) (bool, runtime.Object, error) {
+		update, ok := action.(k8stesting.UpdateAction)
+		if !ok {
+			return false, nil, nil
+		}
+		object, ok := update.GetObject().(*unstructured.Unstructured)
+		if !ok || object.GetName() != fixture.shard || object.GetAnnotations()[annotationNodeLoadBalancerShardFWIssuedAt] == "" {
+			return false, nil, nil
+		}
+		stripped := object.DeepCopy()
+		annotations := stripped.GetAnnotations()
+		delete(annotations, annotationNodeLoadBalancerShardFWIssuedAt)
+		stripped.SetAnnotations(annotations)
+		return true, stripped, nil
+	})
+	if _, err := fixture.controller.reconcileShardFirewallPolicy(fixture.ctx, fixture.shard); err == nil ||
+		!strings.Contains(err.Error(), "exact shard firewall receipt") {
+		t.Fatalf("stripped shard-update receipt error = %v", err)
+	}
+	if len(fixture.api.updatedFirewalls) != 0 {
+		t.Fatalf("stripped shard-update receipt dispatched %d firewall updates", len(fixture.api.updatedFirewalls))
 	}
 }
 
@@ -3003,11 +3369,11 @@ func TestNodeLoadBalancerIncompleteWithdrawalRetainsActivationMarker(t *testing.
 		t, fixture.ctx, fixture.provider, fixture.service.Namespace, fixture.service.Name,
 	)
 	err = fixture.controller.withdrawServiceDatapath(fixture.ctx, current)
-	if err == nil || !strings.Contains(err.Error(), "waiting for exact Service firewall detachment readback") {
-		t.Fatalf("fenced withdrawal retry error = %v, want exact detachment readback wait", err)
+	if err == nil || !strings.Contains(err.Error(), "firewall relation") {
+		t.Fatalf("fenced withdrawal retry error = %v, want canonical relation readback wait", err)
 	}
 	if failingAPI.calls != 1 {
-		t.Fatalf("failed cloud detach was retried %d times before its durable timeout, want 1", failingAPI.calls)
+		t.Fatalf("failed cloud detach was retried %d times without authoritative absence, want 1", failingAPI.calls)
 	}
 	stored := getNodeLoadBalancerTestService(
 		t,
@@ -3319,6 +3685,7 @@ func TestNodeLoadBalancerLastOwnerCleansSharedICMPDespiteInvalidUnfinalizedServi
 	}
 	annotations := storedNodeClass.GetAnnotations()
 	annotations[annotationNodeLoadBalancerICMPCleanupAbsent] = strconv.Itoa(nodeLoadBalancerAbsenceConfirmations)
+	annotations[annotationNodeLoadBalancerICMPCleanupChecked] = time.Now().Add(-nodeLoadBalancerAbsenceConfirmationDelay).UTC().Format(time.RFC3339Nano)
 	storedNodeClass.SetAnnotations(annotations)
 	if _, err := provider.dynamicClient.Resource(nodeClassGVR).Update(ctx, storedNodeClass, metav1.UpdateOptions{}); err != nil {
 		t.Fatal(err)
@@ -3406,8 +3773,45 @@ type nodeLoadBalancerFirewallListHookAPI struct {
 	afterList func() error
 }
 
+type nodeLoadBalancerHiddenPostCreateAPI struct {
+	*fakeAPI
+	hideLists int
+}
+
+func (a *nodeLoadBalancerHiddenPostCreateAPI) CreateFirewall(
+	ctx context.Context,
+	location string,
+	request inspace.CreateFirewallRequest,
+) (*inspace.Firewall, error) {
+	created, err := a.fakeAPI.CreateFirewall(ctx, location, request)
+	if err == nil {
+		a.hideLists = 100
+	}
+	return created, err
+}
+
+func (a *nodeLoadBalancerHiddenPostCreateAPI) ListFirewalls(
+	ctx context.Context,
+	location string,
+) ([]inspace.Firewall, error) {
+	if a.hideLists > 0 {
+		a.hideLists--
+		return nil, nil
+	}
+	return a.fakeAPI.ListFirewalls(ctx, location)
+}
+
 type nodeLoadBalancerStickyUnassignAPI struct {
 	*fakeAPI
+}
+
+type nodeLoadBalancerCommittedHiddenUnassignAPI struct {
+	*fakeAPI
+	firewallUUID string
+	vmUUID       string
+	hiddenReads  int
+	committed    bool
+	calls        int
 }
 
 func (a *nodeLoadBalancerStickyUnassignAPI) UnassignFirewallFromVM(
@@ -3427,6 +3831,53 @@ func (a *nodeLoadBalancerStickyUnassignAPI) UnassignFirewallFromVM(
 		return &inspace.APIError{StatusCode: 404, Method: "DELETE", Path: "/firewall/vms", Message: "assignment not found"}
 	}
 	return &inspace.APIError{StatusCode: 404, Method: "DELETE", Path: "/firewall/vms", Message: "firewall not found"}
+}
+
+func (a *nodeLoadBalancerCommittedHiddenUnassignAPI) ListFirewalls(
+	ctx context.Context,
+	location string,
+) ([]inspace.Firewall, error) {
+	items, err := a.fakeAPI.ListFirewalls(ctx, location)
+	if err != nil {
+		return nil, err
+	}
+	result := cloneNodeLoadBalancerTestFirewalls(items)
+	if !a.committed || a.hiddenReads == 0 {
+		return result, nil
+	}
+	a.hiddenReads--
+	for index := range result {
+		if result[index].UUID != a.firewallUUID {
+			continue
+		}
+		for _, relation := range result[index].ResourcesAssigned {
+			if strings.EqualFold(relation.ResourceType, "vm") && relation.ResourceUUID == a.vmUUID {
+				return result, nil
+			}
+		}
+		result[index].ResourcesAssigned = append(result[index].ResourcesAssigned, inspace.FirewallResource{
+			ResourceType: "vm", ResourceUUID: a.vmUUID,
+		})
+	}
+	return result, nil
+}
+
+func (a *nodeLoadBalancerCommittedHiddenUnassignAPI) UnassignFirewallFromVM(
+	ctx context.Context,
+	location, firewallUUID, vmUUID string,
+) error {
+	a.calls++
+	if err := a.fakeAPI.UnassignFirewallFromVM(ctx, location, firewallUUID, vmUUID); err != nil {
+		return err
+	}
+	a.committed = true
+	return &inspace.APIError{
+		StatusCode: 500,
+		Method:     "DELETE",
+		Path:       "/firewall/vms",
+		Message:    "committed but response lost",
+		Retryable:  true,
+	}
 }
 
 func (a *nodeLoadBalancerFirewallListHookAPI) ListFirewalls(ctx context.Context, location string) ([]inspace.Firewall, error) {
@@ -3858,6 +4309,9 @@ func TestNodeLoadBalancerExactLabelAndProviderIDSpoofCannotAttachFirewallOrAdver
 		t.Fatalf("spoofed Node was authorized: %#v", authorized)
 	}
 	service := nodeLoadBalancerTestService("web", "web-uid", corev1.ProtocolTCP, 443)
+	if _, err := provider.kubeClient.CoreV1().Services(service.Namespace).Create(ctx, service.DeepCopy(), metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
 	desired, err := controller.desiredServiceFirewall(service)
 	if err != nil {
 		t.Fatal(err)
@@ -3950,6 +4404,7 @@ func TestNodeLoadBalancerDetachesStaleFirewallAssignmentWithReadback(t *testing.
 	service := nodeLoadBalancerTestService("web", "web-uid", corev1.ProtocolTCP, 443)
 	api := &fakeAPI{}
 	provider := newTestProvider(t, api)
+	provider.kubeClient = kubefake.NewSimpleClientset(service.DeepCopy())
 	controller := &nodeLoadBalancerController{provider: provider}
 	desired, err := controller.desiredServiceFirewall(service)
 	if err != nil {
@@ -4045,14 +4500,43 @@ func installNodeLoadBalancerSafetyIdentity(
 ) {
 	t.Helper()
 	ctx := context.Background()
+	if provider.config.NodeLoadBalancer.DefaultNodeClass == "" {
+		provider.config.NodeLoadBalancer.DefaultNodeClass = "workers"
+	}
+	baseNodeClass, err := provider.dynamicClient.Resource(nodeClassGVR).Get(
+		ctx, provider.config.NodeLoadBalancer.DefaultNodeClass, metav1.GetOptions{},
+	)
+	baseNeedsCreate := apierrors.IsNotFound(err)
+	if baseNeedsCreate {
+		baseNodeClass = nodeLoadBalancerSafetyBaseNodeClass()
+	} else if err != nil {
+		t.Fatal(err)
+	}
+	baseFirewallUUID, found, err := unstructured.NestedString(baseNodeClass.Object, "spec", "firewallUUID")
+	if err != nil || !found {
+		t.Fatalf("test base NodeClass has no firewall UUID: found=%v err=%v", found, err)
+	}
+	if err := unstructured.SetNestedField(baseNodeClass.Object, baseFirewallUUID, "status", "firewallUUID"); err != nil {
+		t.Fatal(err)
+	}
+	if baseNeedsCreate {
+		if _, err := provider.dynamicClient.Resource(nodeClassGVR).Create(ctx, baseNodeClass, metav1.CreateOptions{}); err != nil {
+			t.Fatal(err)
+		}
+	} else if _, err := provider.dynamicClient.Resource(nodeClassGVR).Update(ctx, baseNodeClass, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
 	nodeClassName := managedNodeLoadBalancerName(provider.config.ClusterID, "node-lb")
 	nodeClass, err := provider.dynamicClient.Resource(nodeClassGVR).Get(ctx, nodeClassName, metav1.GetOptions{})
 	if apierrors.IsNotFound(err) {
-		nodeClass, err = renderNodeLoadBalancerNodeClass(nodeLoadBalancerSafetyBaseNodeClass(), nodeClassName)
+		nodeClass, err = renderNodeLoadBalancerNodeClass(baseNodeClass, nodeClassName)
 		if err != nil {
 			t.Fatal(err)
 		}
 		if err := markNodeLoadBalancerManaged(nodeClass, provider.config.ClusterID, "", ""); err != nil {
+			t.Fatal(err)
+		}
+		if err := unstructured.SetNestedField(nodeClass.Object, baseFirewallUUID, "status", "firewallUUID"); err != nil {
 			t.Fatal(err)
 		}
 		if _, err = provider.dynamicClient.Resource(nodeClassGVR).Create(ctx, nodeClass, metav1.CreateOptions{}); err != nil {
@@ -4060,6 +4544,13 @@ func installNodeLoadBalancerSafetyIdentity(
 		}
 	} else if err != nil {
 		t.Fatal(err)
+	} else {
+		if err := unstructured.SetNestedField(nodeClass.Object, baseFirewallUUID, "status", "firewallUUID"); err != nil {
+			t.Fatal(err)
+		}
+		if nodeClass, err = provider.dynamicClient.Resource(nodeClassGVR).Update(ctx, nodeClass, metav1.UpdateOptions{}); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	pool, err := provider.dynamicClient.Resource(nodePoolGVR).Get(ctx, shard, metav1.GetOptions{})
@@ -4121,6 +4612,11 @@ func installNodeLoadBalancerSafetyIdentity(
 	node.Labels[nodeLoadBalancerNodeShardLabel] = shard
 	blockOwnerDeletion := true
 	claimName := shard + "-claim"
+	floatingIPName := managedNodeLoadBalancerFloatingIPName(provider.config.ClusterID, claimName)
+	externalIPForClaim, ok := nodeLoadBalancerNodeExternalIPv4(node)
+	if !ok {
+		t.Fatalf("Node %s has no public ExternalIP for its test identity", node.Name)
+	}
 	claimUID := types.UID("nodeclaim-" + shard)
 	node.OwnerReferences = []metav1.OwnerReference{{
 		APIVersion: "karpenter.sh/v1", Kind: "NodeClaim", Name: claimName, UID: claimUID,
@@ -4130,6 +4626,12 @@ func installNodeLoadBalancerSafetyIdentity(
 		"apiVersion": "karpenter.sh/v1", "kind": "NodeClaim",
 		"metadata": map[string]any{
 			"name": claimName, "uid": string(claimUID),
+			"annotations": map[string]any{
+				karpenterPublicIPv4Annotation:     externalIPForClaim,
+				karpenterFloatingIPNameAnnotation: floatingIPName,
+				karpenterBillingAccountAnnotation: strconv.FormatInt(provider.config.BillingAccountID, 10),
+				karpenterNodeNameAnnotation:       node.Name,
+			},
 			"labels": map[string]any{
 				karpenterNodePoolLabel:           shard,
 				nodeLoadBalancerNodeLabel:        "true",
@@ -4162,9 +4664,71 @@ func installNodeLoadBalancerSafetyIdentity(
 		if !ok {
 			t.Fatalf("Node %s has no public ExternalIP for its test identity", node.Name)
 		}
+		ownership, err := json.Marshal(publicNodeLocalVMOwnership{
+			Schema: "karpenter.inspace.cloud/v3", Cluster: provider.config.ClusterID,
+			NodePool: shard, NodeClaim: claimName, VMName: node.Name,
+			FirewallProfile: nodeLoadBalancerFirewallMode, FirewallUUID: baseFirewallUUID,
+			NetworkUUID: provider.config.NetworkUUID, BillingAccountID: provider.config.BillingAccountID,
+			FloatingIPName: floatingIPName,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		vmFound := false
+		for index := range api.vms {
+			if api.vms[index].UUID != identity.UUID {
+				continue
+			}
+			api.vms[index].Name = node.Name
+			api.vms[index].Description = string(ownership)
+			api.vms[index].BillingAccountID = provider.config.BillingAccountID
+			api.vms[index].NetworkUUID = provider.config.NetworkUUID
+			api.vms[index].PrivateIPv4 = internalIP
+			vmFound = true
+		}
+		if !vmFound {
+			api.vms = append(api.vms, inspace.VM{
+				UUID: identity.UUID, Name: node.Name, Description: string(ownership), Status: "running",
+				BillingAccountID: provider.config.BillingAccountID, NetworkUUID: provider.config.NetworkUUID,
+				PrivateIPv4: internalIP,
+			})
+		}
+		baseIndex := -1
+		for index := range api.firewalls {
+			if api.firewalls[index].UUID == baseFirewallUUID {
+				baseIndex = index
+				break
+			}
+		}
+		if baseIndex == -1 {
+			rules := make([]inspace.FirewallRule, 0, 6)
+			for _, protocol := range []string{"tcp", "udp", "icmp"} {
+				rules = append(rules,
+					inspace.FirewallRule{
+						Protocol: protocol, Direction: "inbound", EndpointSpecType: "ip_prefixes",
+						EndpointSpec: []string{"10.0.0.0/24", "10.42.0.0/16"},
+					},
+					inspace.FirewallRule{Protocol: protocol, Direction: "outbound", EndpointSpecType: "any"},
+				)
+			}
+			api.firewalls = append(api.firewalls, inspace.Firewall{
+				UUID: baseFirewallUUID, DisplayName: "unit-test-default-node-firewall",
+				BillingAccountID: provider.config.BillingAccountID, Rules: rules,
+			})
+			baseIndex = len(api.firewalls) - 1
+		}
+		if !firewallAssignedToVM(api.firewalls[baseIndex], identity.UUID) {
+			api.firewalls[baseIndex].ResourcesAssigned = append(
+				api.firewalls[baseIndex].ResourcesAssigned,
+				inspace.FirewallResource{ResourceType: "vm", ResourceUUID: identity.UUID},
+			)
+		}
 		found := false
 		for index := range api.floatingIPs {
 			if api.floatingIPs[index].AssignedTo == identity.UUID {
+				api.floatingIPs[index].Name = floatingIPName
+				api.floatingIPs[index].Address = externalIP
+				api.floatingIPs[index].BillingAccountID = provider.config.BillingAccountID
 				api.floatingIPs[index].AssignedToPrivateIP = internalIP
 				found = true
 				break
@@ -4172,7 +4736,7 @@ func installNodeLoadBalancerSafetyIdentity(
 		}
 		if !found {
 			api.floatingIPs = append(api.floatingIPs, inspace.FloatingIP{
-				Name: "karpenter-" + claimName, Address: externalIP,
+				Name: floatingIPName, Address: externalIP,
 				BillingAccountID: provider.config.BillingAccountID, Type: "public", Enabled: true,
 				AssignedTo: identity.UUID, AssignedToResourceType: "virtual_machine", AssignedToPrivateIP: internalIP,
 			})

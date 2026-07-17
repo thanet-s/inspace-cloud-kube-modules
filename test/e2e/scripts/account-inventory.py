@@ -20,11 +20,11 @@ RESOURCE_PATHS = {
 }
 
 
-def api_get(path: str):
+def api_get(path: str, location: str | None = None):
     base = os.environ["INSPACE_API_URL"].rstrip("/")
-    location = os.environ["INSPACE_LOCATION"]
+    endpoint = f"v1/{location}/{path}" if location else f"v1/{path}"
     request = urllib.request.Request(
-        f"{base}/v1/{location}/{path}",
+        f"{base}/{endpoint}",
         headers={"apikey": os.environ["INSPACE_API_TOKEN"], "User-Agent": "inspace-rke2-e2e-inventory/1"},
     )
     with urllib.request.urlopen(request, timeout=60, context=ssl.create_default_context()) as response:
@@ -34,23 +34,39 @@ def api_get(path: str):
     return value
 
 
+def locations() -> list[str]:
+    values = api_get("config/locations")
+    slugs = []
+    for item in values:
+        if not isinstance(item, dict) or not isinstance(item.get("slug"), str) or not item["slug"].strip():
+            raise SystemExit("location inventory contains an invalid slug")
+        slugs.append(item["slug"])
+    if not slugs or len(slugs) != len(set(slugs)):
+        raise SystemExit("location inventory must be non-empty and unique")
+    if os.environ["INSPACE_LOCATION"] not in slugs:
+        raise SystemExit("configured location is absent from the authoritative location inventory")
+    return sorted(slugs)
+
+
 def active(item: dict) -> bool:
     return item.get("is_deleted") is not True and str(item.get("status", "")).lower() != "deleted"
 
 
 def inventory() -> dict[str, list[str]]:
-    result = {}
-    for name, (path, identity_field) in RESOURCE_PATHS.items():
-        identities = []
-        for item in api_get(path):
-            if not isinstance(item, dict):
-                raise SystemExit(f"{path} returned a non-object resource item")
-            if not active(item):
-                continue
-            identity = item.get(identity_field)
-            if not isinstance(identity, str) or not identity.strip():
-                raise SystemExit(f"active {name} item has no stable {identity_field}")
-            identities.append(identity)
+    result = {name: [] for name in RESOURCE_PATHS}
+    for location in locations():
+        for name, (path, identity_field) in RESOURCE_PATHS.items():
+            identities = result[name]
+            for item in api_get(path, location):
+                if not isinstance(item, dict):
+                    raise SystemExit(f"{location}/{path} returned a non-object resource item")
+                if not active(item):
+                    continue
+                identity = item.get(identity_field)
+                if not isinstance(identity, str) or not identity.strip():
+                    raise SystemExit(f"active {location}/{name} item has no stable {identity_field}")
+                identities.append(f"{location}:{identity}")
+    for name, identities in result.items():
         if len(identities) != len(set(identities)):
             raise SystemExit(f"active {name} inventory contains duplicate identities")
         result[name] = sorted(identities)
@@ -65,7 +81,14 @@ def atomic_write(path: pathlib.Path, value: dict) -> None:
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
             json.dump(value, stream, indent=2, sort_keys=True)
             stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
         os.replace(temporary, path)
+        directory = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
     except BaseException:
         try:
             os.unlink(temporary)

@@ -132,7 +132,10 @@ func TestDeleteThreadsDurableFloatingIPIdentityFromNodeClaimAnnotations(t *testi
 		FloatingIPName: vm.FloatingIPName, PublicIPv4: vm.PublicIPv4, BillingAccountID: 42,
 		NetworkUUID: "11111111-1111-4111-8111-111111111111",
 	}
-	if cloud.lastDeleteIdentity != want {
+	if cloud.lastDeleteIdentity.FloatingIPName != want.FloatingIPName || cloud.lastDeleteIdentity.PublicIPv4 != want.PublicIPv4 ||
+		cloud.lastDeleteIdentity.BillingAccountID != want.BillingAccountID || cloud.lastDeleteIdentity.NetworkUUID != want.NetworkUUID ||
+		cloud.lastDeleteIdentity.AuthorizeBaseFirewallDetach != nil || cloud.lastDeleteIdentity.ObserveBaseFirewallDetach != nil ||
+		cloud.lastDeleteIdentity.RejectBaseFirewallDetach != nil {
 		t.Fatalf("DeleteVM identity = %#v, want %#v", cloud.lastDeleteIdentity, want)
 	}
 }

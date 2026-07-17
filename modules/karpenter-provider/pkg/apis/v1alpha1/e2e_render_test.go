@@ -70,7 +70,7 @@ func TestClusterE2EHostEntrypointOnlyLaunchesDocker(t *testing.T) {
 	}
 }
 
-func TestClusterE2EProvisionsAndWaitsForThreeControlPlanesInParallel(t *testing.T) {
+func TestClusterE2EProvisionsInOrderAndWaitsForThreeControlPlanesInParallel(t *testing.T) {
 	clusterTemplate := readE2E(t, "templates/cluster.yaml.j2")
 	initPlaybook := readE2E(t, "init-cluster.yml")
 	playbook := initPlaybook + "\n" + readE2E(t, "test.yml")
@@ -97,7 +97,7 @@ func TestClusterE2EProvisionsAndWaitsForThreeControlPlanesInParallel(t *testing.
 		"Run the bootstrap reconciler synchronously to readiness",
 		"e2e_bootstrap_result.controlPlaneVMs | length == 3",
 		"e2e_bootstrap_result.controlPlaneVMs | unique | length == 3",
-		"e2e_bootstrap_result.maxParallelControlPlaneCreates | int == 3",
+		"e2e_bootstrap_result.maxParallelControlPlaneCreates | int == 1",
 		"e2e_bootstrap_result.apiLoadBalancerUUID is not defined",
 		"e2e_bootstrap_result.registrationLoadBalancerUUID is not defined",
 		"e2e_bootstrap_result.privateRegistrationEndpoint == 'https://' + e2e_virtual_ip + ':9345'",
@@ -145,19 +145,19 @@ func TestClusterE2EProvisionsAndWaitsForThreeControlPlanesInParallel(t *testing.
 	if _, exists := launch["poll"]; exists {
 		t.Fatal("bootstrap cloud mutation must not use detached Ansible polling")
 	}
-	parallelContract := exactAnsibleTask(t, provision, "Prove exact and parallel three-control-plane provisioning")
-	requireTaskAssertions(t, parallelContract,
+	orderedContract := exactAnsibleTask(t, provision, "Prove exact and ordered three-control-plane provisioning")
+	requireTaskAssertions(t, orderedContract,
 		"e2e_bootstrap_result.controlPlaneVMs | length == 3",
 		"e2e_bootstrap_result.controlPlaneVMs | unique | length == 3",
-		"e2e_bootstrap_result.maxParallelControlPlaneCreates | int == 3",
+		"e2e_bootstrap_result.maxParallelControlPlaneCreates | int == 1",
 	)
-	authoritativeBinding := exactAnsibleTask(t, provision, "Bind the parallel-create contract to the authoritative three VM identities")
+	authoritativeBinding := exactAnsibleTask(t, provision, "Bind the ordered-create contract to the authoritative three VM identities")
 	requireTaskAssertions(t, authoritativeBinding,
 		"e2e_state.controlPlanes | length == 3",
 		"e2e_state.controlPlanes | map(attribute='uuid') | list | unique | length == 3",
 		"e2e_state.controlPlanes | map(attribute='uuid') | list | difference(e2e_bootstrap_result.controlPlaneVMs) | length == 0",
 		"e2e_bootstrap_result.controlPlaneVMs | difference(e2e_state.controlPlanes | map(attribute='uuid') | list) | length == 0",
-		"(e2e_bootstrap_result.maxParallelControlPlaneCreates | int) == (e2e_state.controlPlanes | length)",
+		"e2e_bootstrap_result.maxParallelControlPlaneCreates | int == 1",
 	)
 
 	controlPlaneWait := exactAnsiblePlay(t, plays, "Wait for all RKE2 servers independently and in parallel through the bastion")
@@ -274,7 +274,7 @@ func TestClusterE2EProvisionsAndWaitsForThreeControlPlanesInParallel(t *testing.
 	requireTaskScalar(t, readyz, "until", "e2e_local_readyz.rc == 0")
 	assertOrdered(t, playbook,
 		"Run the bootstrap reconciler synchronously to readiness",
-		"Prove exact and parallel three-control-plane provisioning",
+		"Prove exact and ordered three-control-plane provisioning",
 		"Add exactly three dynamic RKE2 control-plane hosts",
 		"Wait for all RKE2 servers independently and in parallel",
 		"Require exactly three independently ready RKE2 servers",

@@ -28,6 +28,7 @@ func main() {
 	mode := flag.String("mode", "controller", "service mode: controller or node (all is development-fake only)")
 	nodeID := flag.String("node-id", os.Getenv("NODE_ID"), "Kubernetes node name or InSpace provider ID (node mode)")
 	apiBaseURL := flag.String("api-base-url", envOr("INSPACE_API_BASE_URL", "https://api.inspace.cloud"), "InSpace API base URL")
+	networkUUID := flag.String("network-uuid", os.Getenv("INSPACE_NETWORK_UUID"), "expected InSpace VPC UUID for CSI target VMs")
 	billingAccountID := flag.Int64("billing-account-id", envInt64("INSPACE_BILLING_ACCOUNT_ID"), "InSpace billing account ID (required for global tokens)")
 	developmentFake := flag.Bool("development-fake", false, "use in-memory adapters; NEVER use for real workloads")
 	showVersion := flag.Bool("version", false, "print version")
@@ -69,7 +70,7 @@ func main() {
 				log.Fatalf("configure Kubernetes node resolver: %v", err)
 			}
 			provider, err = cloudinspace.New(client, resolver, cloudinspace.Config{
-				Location: *location, BillingAccountID: *billingAccountID,
+				Location: *location, NetworkUUID: *networkUUID, BillingAccountID: *billingAccountID,
 			})
 			if err != nil {
 				log.Fatalf("configure cloud adapter: %v", err)

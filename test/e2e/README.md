@@ -9,9 +9,11 @@ non-live target compiles local source for CI. The host needs no Go toolchain,
 and nothing is installed or executed directly on it except Docker.
 
 The test creates exactly three fixed RKE2 `v1.35.6+rke2r1` control-plane VMs.
-The product bootstrap reconciler launches missing control-plane VMs with a
-hard concurrency bound of three, and its result must report
-`maxParallelControlPlaneCreates: 3`. Ansible binds the returned UUIDs to three
+The product bootstrap reconciler launches missing control-plane VMs in slot
+order with a hard creation concurrency bound of one, and its result must report
+`maxParallelControlPlaneCreates: 1`. Each VM receives authoritative restrictive
+firewall protection before the next VM POST; already-created VMs can continue
+booting in parallel. Ansible binds the returned UUIDs to three
 exact private VPC addresses and one egress FIP each, then uses at least three
 forks plus the `free` strategy to wait for cloud-init, `rke2-server`, embedded
 etcd, and the local API independently and in parallel through a bastion.
@@ -245,8 +247,9 @@ FIP remain, and only then deletes the static capacity and NodeClass.
 
 Use only a new, empty, isolated billing account. Before its first mutation the
 suite captures every API-visible VM, firewall, floating IP, load balancer, and
-disk and requires all five inventories to be empty. Cleanup must make the full
-account inventory exactly equal that persisted baseline, in addition to its
+disk in every location returned by the authoritative location inventory and
+requires all five inventories to be empty. Cleanup must make the full
+cross-location account inventory exactly equal that persisted baseline, in addition to its
 deterministic ownership audit. A malformed or unidentifiable active API item
 is fatal rather than silently ignored.
 

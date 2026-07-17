@@ -19,16 +19,18 @@ import (
 )
 
 type recordingValidator struct {
-	calls           int
-	controlPlaneVIP string
-	poolStart       string
-	poolStop        string
-	hostPoolUUIDs   []string
-	failHostPool    string
+	calls            int
+	billingAccountID int64
+	controlPlaneVIP  string
+	poolStart        string
+	poolStop         string
+	hostPoolUUIDs    []string
+	failHostPool     string
 }
 
-func (v *recordingValidator) ValidateNodeClass(_ context.Context, _, _, controlPlaneVIP, poolStart, poolStop, hostPoolUUID, _ string) error {
+func (v *recordingValidator) ValidateNodeClass(_ context.Context, _ string, billingAccountID int64, _, controlPlaneVIP, poolStart, poolStop, hostPoolUUID, _ string) error {
 	v.calls++
+	v.billingAccountID = billingAccountID
 	v.controlPlaneVIP = controlPlaneVIP
 	v.poolStart = poolStart
 	v.poolStop = poolStop
@@ -79,7 +81,7 @@ func TestReconcileMarksReadyAfterSecretAndBothHostPoolValidations(t *testing.T) 
 	if ready == nil || ready.Message != "Private RKE2 supervisor VIP and Service pool, InSpace VPC, Cilium native-routing firewall, Intel and AMD host pools, and RKE2 token are ready" {
 		t.Fatalf("Ready condition does not describe validated native-routing infrastructure: %#v", ready)
 	}
-	if validator.calls != 2 || validator.controlPlaneVIP != "10.0.0.10" || validator.poolStart != "10.0.0.200" || validator.poolStop != "10.0.0.219" || !slices.Equal(validator.hostPoolUUIDs, wantHostPoolUUIDs) {
+	if validator.calls != 2 || validator.billingAccountID != nodeClass.Spec.BillingAccountID || validator.controlPlaneVIP != "10.0.0.10" || validator.poolStart != "10.0.0.200" || validator.poolStop != "10.0.0.219" || !slices.Equal(validator.hostPoolUUIDs, wantHostPoolUUIDs) {
 		t.Fatalf("cloud validation calls=%d supervisorVIP=%q pool=%s-%s", validator.calls, validator.controlPlaneVIP, validator.poolStart, validator.poolStop)
 	}
 }

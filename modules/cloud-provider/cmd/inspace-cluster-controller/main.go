@@ -133,7 +133,8 @@ func run() error {
 	}
 	reconciler := &bootstrap.Reconciler{
 		API: api, SSHUsername: sshUsername, SSHPublicKey: sshPublicKey,
-		ManagementCIDR: managementCIDR, ManagementTCPPorts: ports,
+		StatusCompareAndSwap: newFileStatusCompareAndSwap(configPath),
+		ManagementCIDR:       managementCIDR, ManagementTCPPorts: ports,
 		BootstrapCacheKey: cacheKey, BootstrapCacheNotBefore: cacheNotBefore, ModuleVersion: buildversion.Version,
 	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -273,7 +274,7 @@ func parseTCPPorts(value string) ([]int, error) {
 }
 
 func isRetryable(err error) bool {
-	if errors.Is(err, bootstrap.ErrRetryableAmbiguousVMDelete) {
+	if errors.Is(err, bootstrap.ErrRetryableAmbiguousVMDelete) || errors.Is(err, bootstrap.ErrCreateAttemptPending) {
 		return true
 	}
 	var apiErr *inspace.APIError

@@ -12,6 +12,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/types"
 
 	inspace "github.com/thanet-s/inspace-cloud-kube-modules/modules/client"
 )
@@ -26,6 +27,8 @@ const (
 	annotationNodeLoadBalancerICMPAbsentChecked  = "service.inspace.cloud/node-lb-icmp-firewall-absence-checked-at"
 	annotationNodeLoadBalancerICMPCleanupAbsent  = "service.inspace.cloud/node-lb-icmp-cleanup-absence-count"
 	annotationNodeLoadBalancerICMPCleanupChecked = "service.inspace.cloud/node-lb-icmp-cleanup-absence-checked-at"
+	annotationNodeLoadBalancerICMPDeleteTarget   = "service.inspace.cloud/node-lb-icmp-delete-target-uuid"
+	annotationNodeLoadBalancerICMPDeleteIssued   = "service.inspace.cloud/node-lb-icmp-delete-issued-at"
 	nodeLoadBalancerICMPFirewallDescription      = "Managed InSpace node load balancer cluster ICMP firewall"
 )
 
@@ -139,6 +142,17 @@ func (c *nodeLoadBalancerController) ensureClusterICMPFirewall(
 	if nodeClass.GetDeletionTimestamp() != nil {
 		return nil, false, fmt.Errorf("node load balancer: managed NodeClass %q is deleting", nodeClassName)
 	}
+	converged, err := c.reconcileNodeLoadBalancerFirewallRelation(
+		ctx,
+		c.clusterICMPFirewallRelationOwner(nodeClassName),
+		nil,
+	)
+	if err != nil {
+		return nil, false, err
+	}
+	if !converged {
+		return nil, false, nil
+	}
 	desired, err := desiredNodeLoadBalancerClusterICMPFirewall(c.provider.config.ClusterID, c.provider.config.BillingAccountID)
 	if err != nil {
 		return nil, false, err
@@ -154,6 +168,19 @@ func (c *nodeLoadBalancerController) ensureClusterICMPFirewall(
 	pendingName := annotations[annotationNodeLoadBalancerICMPPendingName]
 	pendingStarted := annotations[annotationNodeLoadBalancerICMPPendingStarted]
 	createIssued := annotations[annotationNodeLoadBalancerICMPCreateIssued]
+	deleteTarget, _, receiptErr := nodeLoadBalancerFirewallDeleteReceipt(
+		annotations,
+		annotationNodeLoadBalancerICMPDeleteTarget,
+		annotationNodeLoadBalancerICMPDeleteIssued,
+		annotationNodeLoadBalancerICMPCleanupAbsent,
+		annotationNodeLoadBalancerICMPCleanupChecked,
+	)
+	if receiptErr != nil {
+		return nil, false, fmt.Errorf("node load balancer: parse cluster ICMP firewall delete receipt: %w", receiptErr)
+	}
+	if deleteTarget != "" {
+		return nil, false, errors.New("node load balancer: cluster ICMP firewall deletion remains fenced")
+	}
 	if currentUUID != "" && !validNodeLoadBalancerCloudUUID(currentUUID) {
 		return nil, false, fmt.Errorf("node load balancer: invalid persisted cluster ICMP firewall UUID %q", currentUUID)
 	}
@@ -289,7 +316,13 @@ func (c *nodeLoadBalancerController) ensureClusterICMPFirewall(
 
 	if firewall == nil {
 		started := time.Now().UTC().Format(time.RFC3339Nano)
-		if _, err := c.updateManagedNodeClassAnnotations(ctx, nodeClassName, func(values map[string]string) {
+		staged, err := c.mutateManagedNodeClassICMPCreate(ctx, nodeClassName, map[string]string{
+			annotationNodeLoadBalancerICMPFirewallUUID:   currentUUID,
+			annotationNodeLoadBalancerICMPPendingUUID:    pendingUUID,
+			annotationNodeLoadBalancerICMPPendingName:    pendingName,
+			annotationNodeLoadBalancerICMPPendingStarted: pendingStarted,
+			annotationNodeLoadBalancerICMPCreateIssued:   createIssued,
+		}, func(values map[string]string) {
 			values[annotationNodeLoadBalancerICMPPendingName] = desired.Request.DisplayName
 			values[annotationNodeLoadBalancerICMPPendingStarted] = started
 			delete(values, annotationNodeLoadBalancerICMPPendingUUID)
@@ -298,34 +331,106 @@ func (c *nodeLoadBalancerController) ensureClusterICMPFirewall(
 			delete(values, annotationNodeLoadBalancerICMPAbsentChecked)
 			delete(values, annotationNodeLoadBalancerICMPCleanupAbsent)
 			delete(values, annotationNodeLoadBalancerICMPCleanupChecked)
-		}); err != nil {
+		})
+		if err != nil {
 			return nil, false, err
 		}
+		if !staged {
+			return nil, false, errors.New("node load balancer: cluster ICMP firewall create intent was not durably staged")
+		}
 		issuedAt := time.Now().UTC().Format(time.RFC3339Nano)
-		if _, err := c.updateManagedNodeClassAnnotations(ctx, nodeClassName, func(values map[string]string) {
-			values[annotationNodeLoadBalancerICMPCreateIssued] = issuedAt
-		}); err != nil {
+		expectedStaged := map[string]string{
+			annotationNodeLoadBalancerICMPFirewallUUID:   currentUUID,
+			annotationNodeLoadBalancerICMPPendingUUID:    "",
+			annotationNodeLoadBalancerICMPPendingName:    desired.Request.DisplayName,
+			annotationNodeLoadBalancerICMPPendingStarted: started,
+			annotationNodeLoadBalancerICMPCreateIssued:   "",
+		}
+		expectedCreate, err := c.issueManagedNodeClassICMPCreate(ctx, nodeClassName, expectedStaged, issuedAt)
+		if err != nil {
 			return nil, false, err
+		}
+		observed, absent, authorityErr := c.exactNodeLoadBalancerFirewallNameFresh(ctx, desired.Request.DisplayName)
+		if authorityErr != nil {
+			return nil, false, fmt.Errorf("node load balancer: authorize cluster ICMP firewall create after issue: %w", authorityErr)
+		}
+		if !absent {
+			if observed == nil || !validNodeLoadBalancerCloudUUID(observed.UUID) ||
+				!nodeLoadBalancerClusterICMPFirewallOwned(
+					*observed,
+					c.provider.config.ClusterID,
+					c.provider.config.BillingAccountID,
+				) {
+				return nil, false, fmt.Errorf(
+					"node load balancer: managed cluster ICMP name %q became foreign after create issue",
+					desired.Request.DisplayName,
+				)
+			}
+			committed, recoveryErr := c.resolveClusterICMPCreateReadback(
+				ctx, nodeClassName, expectedCreate, desired,
+			)
+			if recoveryErr != nil {
+				return nil, false, recoveryErr
+			}
+			if !committed {
+				return nil, false, errors.New("node load balancer: observed cluster ICMP firewall was not durably promoted")
+			}
+			return nil, false, nil
+		}
+		// Deletion may begin after the issued create receipt was persisted.  A
+		// fresh exact owner read immediately before POST prevents a deleting
+		// NodeClass from authorizing a new paid cluster firewall.
+		authorizedNodeClass, authorityErr := c.getManagedNodeLoadBalancerNodeClass(ctx, nodeClassName)
+		if authorityErr != nil {
+			return nil, false, fmt.Errorf("node load balancer: re-read cluster ICMP owner before create: %w", authorityErr)
+		}
+		if authorizedNodeClass.GetUID() != nodeClass.GetUID() || authorizedNodeClass.GetDeletionTimestamp() != nil {
+			return nil, false, errors.New("node load balancer: cluster ICMP firewall create owner is deleting or changed identity")
+		}
+		for key, value := range expectedCreate {
+			if authorizedNodeClass.GetAnnotations()[key] != value {
+				return nil, false, errors.New("node load balancer: cluster ICMP firewall create receipt changed after issue")
+			}
 		}
 		created, err := c.provider.api.CreateFirewall(ctx, c.provider.config.Location, desired.Request)
 		if err != nil {
-			if definitiveNodeLoadBalancerCreateFailure(err) {
-				_, clearErr := c.updateManagedNodeClassAnnotations(ctx, nodeClassName, func(values map[string]string) {
-					delete(values, annotationNodeLoadBalancerICMPPendingName)
-					delete(values, annotationNodeLoadBalancerICMPPendingStarted)
-					delete(values, annotationNodeLoadBalancerICMPCreateIssued)
-				})
-				return nil, false, errors.Join(fmt.Errorf("node load balancer: create cluster ICMP firewall: %w", err), clearErr)
+			createErr := fmt.Errorf("node load balancer: create cluster ICMP firewall: %w", err)
+			if nodeLoadBalancerMutationKnownPreDispatch(err) {
+				_, clearErr := c.transitionManagedNodeClassICMPCreate(ctx, nodeClassName, expectedCreate, "")
+				return nil, false, errors.Join(createErr, clearErr)
 			}
-			return nil, false, fmt.Errorf("node load balancer: create cluster ICMP firewall: %w", err)
+			committed, recoveryErr := c.resolveClusterICMPCreateReadback(ctx, nodeClassName, expectedCreate, desired)
+			if recoveryErr != nil {
+				return nil, false, errors.Join(createErr, recoveryErr)
+			}
+			if committed {
+				return nil, false, nil
+			}
+			return nil, false, createErr
 		}
 		if err := validateCreatedNodeLoadBalancerFirewall(created, desired); err != nil {
-			return nil, false, fmt.Errorf("node load balancer: created cluster ICMP firewall response: %w", err)
+			responseErr := fmt.Errorf("node load balancer: created cluster ICMP firewall response: %w", err)
+			committed, recoveryErr := c.resolveClusterICMPCreateReadback(ctx, nodeClassName, expectedCreate, desired)
+			if recoveryErr != nil {
+				return nil, false, errors.Join(responseErr, recoveryErr)
+			}
+			if committed {
+				return nil, false, nil
+			}
+			return nil, false, responseErr
 		}
-		_, err = c.updateManagedNodeClassAnnotations(ctx, nodeClassName, func(values map[string]string) {
-			values[annotationNodeLoadBalancerICMPPendingUUID] = created.UUID
-		})
-		return nil, false, err
+		// The response UUID is provisional only. Canonical identity is promoted
+		// exclusively from a unique deterministic-name ListFirewalls readback.
+		committed, recoveryErr := c.resolveClusterICMPCreateReadback(
+			ctx, nodeClassName, expectedCreate, desired,
+		)
+		if recoveryErr != nil {
+			return nil, false, recoveryErr
+		}
+		if !committed {
+			return nil, false, errors.New("node load balancer: cluster ICMP firewall create response lacks authoritative readback")
+		}
+		return nil, false, nil
 	}
 
 	if currentUUID != firewall.UUID {
@@ -350,6 +455,10 @@ func (c *nodeLoadBalancerController) ensureClusterICMPFirewall(
 	}
 
 	desiredVMs := make(map[string]struct{}, len(nodes))
+	assignments, err := nodeLoadBalancerFirewallVMAssignments(*firewall)
+	if err != nil {
+		return nil, false, err
+	}
 	assignmentsReady := true
 	for _, node := range nodes {
 		vmUUID, ok := nodeLoadBalancerVMUUID(node)
@@ -358,7 +467,7 @@ func (c *nodeLoadBalancerController) ensureClusterICMPFirewall(
 			continue
 		}
 		desiredVMs[vmUUID] = struct{}{}
-		if !firewallAssignedToVM(*firewall, vmUUID) {
+		if _, assigned := assignments[strings.ToLower(vmUUID)]; !assigned {
 			// Never attach a firewall while this VM is publicly advertised. An
 			// externally removed assignment is recovered in two passes: the caller
 			// first withdraws the protected ready label/status, then the next pass
@@ -367,10 +476,20 @@ func (c *nodeLoadBalancerController) ensureClusterICMPFirewall(
 				assignmentsReady = false
 				continue
 			}
-			if err := c.provider.api.AssignFirewallToVM(ctx, c.provider.config.Location, firewall.UUID, vmUUID); err != nil {
-				return nil, false, fmt.Errorf("node load balancer: assign cluster ICMP firewall %s to VM %s: %w", firewall.UUID, vmUUID, err)
+			converged, relationErr := c.reconcileNodeLoadBalancerFirewallRelation(
+				ctx,
+				c.clusterICMPFirewallRelationOwner(nodeClassName),
+				&nodeLoadBalancerFirewallRelationFence{
+					operation: nodeLoadBalancerFirewallRelationAssign, firewallUUID: firewall.UUID, vmUUID: vmUUID,
+				},
+			)
+			if relationErr != nil {
+				return nil, false, fmt.Errorf("node load balancer: assign cluster ICMP firewall %s to VM %s: %w", firewall.UUID, vmUUID, relationErr)
 			}
 			assignmentsReady = false
+			if !converged {
+				return firewall, false, nil
+			}
 		}
 	}
 	stale, err := staleNodeLoadBalancerFirewallAssignments(*firewall, desiredVMs)
@@ -378,10 +497,20 @@ func (c *nodeLoadBalancerController) ensureClusterICMPFirewall(
 		return nil, false, err
 	}
 	for _, vmUUID := range stale {
-		if err := c.provider.api.UnassignFirewallFromVM(ctx, c.provider.config.Location, firewall.UUID, vmUUID); err != nil && !inspace.IsNotFound(err) {
-			return nil, false, fmt.Errorf("node load balancer: unassign cluster ICMP firewall %s from stale VM %s: %w", firewall.UUID, vmUUID, err)
+		converged, relationErr := c.reconcileNodeLoadBalancerFirewallRelation(
+			ctx,
+			c.clusterICMPFirewallRelationOwner(nodeClassName),
+			&nodeLoadBalancerFirewallRelationFence{
+				operation: nodeLoadBalancerFirewallRelationUnassign, firewallUUID: firewall.UUID, vmUUID: vmUUID,
+			},
+		)
+		if relationErr != nil {
+			return nil, false, fmt.Errorf("node load balancer: unassign cluster ICMP firewall %s from stale VM %s: %w", firewall.UUID, vmUUID, relationErr)
 		}
 		assignmentsReady = false
+		if !converged {
+			return firewall, false, nil
+		}
 	}
 	return firewall, assignmentsReady, nil
 }
@@ -421,10 +550,194 @@ func (c *nodeLoadBalancerController) updateManagedNodeClassAnnotations(
 	}
 	copy := object.DeepCopy()
 	copy.SetAnnotations(values)
-	if _, err := c.provider.dynamicClient.Resource(nodeClassGVR).Update(ctx, copy, metav1.UpdateOptions{}); err != nil {
+	updated, err := c.provider.dynamicClient.Resource(nodeClassGVR).Update(ctx, copy, metav1.UpdateOptions{})
+	if err != nil {
 		return false, fmt.Errorf("node load balancer: update cluster ICMP firewall state: %w", err)
 	}
+	if err := c.validateManagedNodeClassAnnotationWrite(updated, name, object.GetUID(), values); err != nil {
+		return false, err
+	}
+	verified, err := c.getManagedNodeLoadBalancerNodeClass(ctx, name)
+	if err != nil {
+		return false, fmt.Errorf("node load balancer: read back cluster ICMP firewall state: %w", err)
+	}
+	if err := c.validateManagedNodeClassAnnotationWrite(verified, name, object.GetUID(), values); err != nil {
+		return false, err
+	}
 	return true, nil
+}
+
+func (c *nodeLoadBalancerController) validateManagedNodeClassAnnotationWrite(
+	object *unstructured.Unstructured,
+	name string,
+	uid types.UID,
+	expected map[string]string,
+) error {
+	if object == nil || object.GetName() != name {
+		return fmt.Errorf("node load balancer: cluster ICMP firewall state update returned the wrong NodeClass identity")
+	}
+	if uid != "" && object.GetUID() != uid {
+		return fmt.Errorf("node load balancer: NodeClass %q UID changed while persisting cluster ICMP firewall state", name)
+	}
+	labels := object.GetLabels()
+	if labels[nodeLoadBalancerManagedLabel] != "true" || labels[nodeLoadBalancerClusterLabel] != c.provider.config.ClusterID ||
+		!containsString(object.GetFinalizers(), nodeLoadBalancerNodeClassFinalizer) {
+		return fmt.Errorf("node load balancer: NodeClass %q lost exact ownership while persisting cluster ICMP firewall state", name)
+	}
+	if !mapsEqualStringString(object.GetAnnotations(), expected) {
+		return fmt.Errorf("node load balancer: NodeClass %q did not retain the exact cluster ICMP firewall receipt", name)
+	}
+	return nil
+}
+
+func (c *nodeLoadBalancerController) mutateManagedNodeClassICMPCreate(
+	ctx context.Context,
+	name string,
+	expected map[string]string,
+	mutate func(map[string]string),
+) (bool, error) {
+	object, err := c.getManagedNodeLoadBalancerNodeClass(ctx, name)
+	if err != nil {
+		return false, err
+	}
+	before := object.GetAnnotations()
+	for key, value := range expected {
+		if before[key] != value {
+			return false, fmt.Errorf("node load balancer: cluster ICMP firewall create receipt changed before exact transition")
+		}
+	}
+	values := make(map[string]string, len(before)+1)
+	for key, value := range before {
+		values[key] = value
+	}
+	mutate(values)
+	if mapsEqualStringString(before, values) {
+		return false, nil
+	}
+	copy := object.DeepCopy()
+	copy.SetAnnotations(values)
+	updated, err := c.provider.dynamicClient.Resource(nodeClassGVR).Update(ctx, copy, metav1.UpdateOptions{})
+	if err != nil {
+		return false, fmt.Errorf("node load balancer: transition cluster ICMP firewall create receipt: %w", err)
+	}
+	if err := c.validateManagedNodeClassAnnotationWrite(updated, name, object.GetUID(), values); err != nil {
+		return false, err
+	}
+	verified, err := c.getManagedNodeLoadBalancerNodeClass(ctx, name)
+	if err != nil {
+		return false, fmt.Errorf("node load balancer: read back cluster ICMP firewall create receipt: %w", err)
+	}
+	if err := c.validateManagedNodeClassAnnotationWrite(verified, name, object.GetUID(), values); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (c *nodeLoadBalancerController) recordManagedNodeClassICMPCreateUUID(
+	ctx context.Context,
+	name string,
+	expected map[string]string,
+	uuid string,
+) (bool, error) {
+	if !validNodeLoadBalancerCloudUUID(uuid) {
+		return false, fmt.Errorf("node load balancer: invalid cluster ICMP firewall create response UUID %q", uuid)
+	}
+	return c.mutateManagedNodeClassICMPCreate(ctx, name, expected, func(values map[string]string) {
+		values[annotationNodeLoadBalancerICMPPendingUUID] = uuid
+	})
+}
+
+func (c *nodeLoadBalancerController) issueManagedNodeClassICMPCreate(
+	ctx context.Context,
+	name string,
+	expectedStaged map[string]string,
+	issuedAt string,
+) (map[string]string, error) {
+	if expectedStaged[annotationNodeLoadBalancerICMPPendingName] == "" ||
+		expectedStaged[annotationNodeLoadBalancerICMPPendingStarted] == "" ||
+		expectedStaged[annotationNodeLoadBalancerICMPPendingUUID] != "" ||
+		expectedStaged[annotationNodeLoadBalancerICMPCreateIssued] != "" {
+		return nil, errors.New("node load balancer: incomplete cluster ICMP firewall staged create identity")
+	}
+	if _, err := time.Parse(time.RFC3339Nano, issuedAt); err != nil {
+		return nil, fmt.Errorf("node load balancer: invalid cluster ICMP firewall issue timestamp: %w", err)
+	}
+	issued, err := c.mutateManagedNodeClassICMPCreate(ctx, name, expectedStaged, func(values map[string]string) {
+		values[annotationNodeLoadBalancerICMPCreateIssued] = issuedAt
+	})
+	if err != nil {
+		return nil, err
+	}
+	if !issued {
+		return nil, errors.New("node load balancer: cluster ICMP firewall create authority was not durably issued")
+	}
+	expectedCreate := make(map[string]string, len(expectedStaged))
+	for key, value := range expectedStaged {
+		expectedCreate[key] = value
+	}
+	expectedCreate[annotationNodeLoadBalancerICMPCreateIssued] = issuedAt
+	return expectedCreate, nil
+}
+
+func (c *nodeLoadBalancerController) transitionManagedNodeClassICMPCreate(
+	ctx context.Context,
+	name string,
+	expected map[string]string,
+	committedUUID string,
+) (bool, error) {
+	if committedUUID != "" && !validNodeLoadBalancerCloudUUID(committedUUID) {
+		return false, fmt.Errorf("node load balancer: invalid observed cluster ICMP firewall UUID %q", committedUUID)
+	}
+	return c.mutateManagedNodeClassICMPCreate(ctx, name, expected, func(values map[string]string) {
+		if committedUUID != "" {
+			values[annotationNodeLoadBalancerICMPFirewallUUID] = committedUUID
+		}
+		for _, key := range []string{
+			annotationNodeLoadBalancerICMPPendingUUID,
+			annotationNodeLoadBalancerICMPPendingName,
+			annotationNodeLoadBalancerICMPPendingStarted,
+			annotationNodeLoadBalancerICMPCreateIssued,
+			annotationNodeLoadBalancerICMPAbsent,
+			annotationNodeLoadBalancerICMPAbsentChecked,
+		} {
+			delete(values, key)
+		}
+	})
+}
+
+func (c *nodeLoadBalancerController) resolveClusterICMPCreateReadback(
+	ctx context.Context,
+	nodeClassName string,
+	expected map[string]string,
+	desired desiredNodeLoadBalancerFirewall,
+) (bool, error) {
+	items, err := c.provider.api.ListFirewalls(ctx, c.provider.config.Location)
+	if err != nil {
+		return false, fmt.Errorf("node load balancer: read back cluster ICMP firewall after create response: %w", err)
+	}
+	var observed *inspace.Firewall
+	for index := range items {
+		item := items[index]
+		if item.EffectiveName() != desired.Request.DisplayName {
+			continue
+		}
+		if observed != nil {
+			return false, fmt.Errorf("node load balancer: multiple firewalls use managed cluster ICMP name %q after create response", desired.Request.DisplayName)
+		}
+		copy := item
+		observed = &copy
+	}
+	if observed != nil {
+		if !validNodeLoadBalancerCloudUUID(observed.UUID) ||
+			!nodeLoadBalancerClusterICMPFirewallOwned(*observed, c.provider.config.ClusterID, c.provider.config.BillingAccountID) {
+			return false, fmt.Errorf("node load balancer: managed cluster ICMP name %q resolved to a foreign or third-state resource after create response", desired.Request.DisplayName)
+		}
+		if _, err := c.transitionManagedNodeClassICMPCreate(ctx, nodeClassName, expected, observed.UUID); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+	return false, errors.New("node load balancer: cluster ICMP firewall create outcome remains ambiguous after exact name absence readback")
 }
 
 // clearManagedNodeClassICMPAnnotations clears a completed transaction only if
@@ -526,10 +839,12 @@ func (c *nodeLoadBalancerController) recordNodeClassFirewallAbsence(
 		}
 	}
 	changed, err = c.updateManagedNodeClassAnnotations(ctx, nodeClassName, func(values map[string]string) {
-		values[countAnnotation] = strconv.Itoa(count + 1)
+		next := count + 1
+		values[countAnnotation] = strconv.Itoa(next)
 		values[checkedAnnotation] = now.UTC().Format(time.RFC3339Nano)
+		confirmed = next >= nodeLoadBalancerAbsenceConfirmations
 	})
-	return false, changed, err
+	return confirmed, changed, err
 }
 
 func (c *nodeLoadBalancerController) cleanupClusterICMPFirewall(ctx context.Context, nodeClassName string) (bool, error) {
@@ -541,6 +856,16 @@ func (c *nodeLoadBalancerController) cleanupClusterICMPFirewall(ctx context.Cont
 	if nodeClassErr != nil && !apierrors.IsNotFound(nodeClassErr) {
 		return false, nodeClassErr
 	}
+	if nodeClass != nil {
+		converged, relationErr := c.reconcileNodeLoadBalancerFirewallRelation(
+			ctx,
+			c.clusterICMPFirewallRelationOwner(nodeClassName),
+			nil,
+		)
+		if relationErr != nil || !converged {
+			return false, relationErr
+		}
+	}
 	annotations := map[string]string{}
 	if nodeClass != nil {
 		annotations = nodeClass.GetAnnotations()
@@ -550,6 +875,16 @@ func (c *nodeLoadBalancerController) cleanupClusterICMPFirewall(ctx context.Cont
 	pendingName := annotations[annotationNodeLoadBalancerICMPPendingName]
 	pendingStarted := annotations[annotationNodeLoadBalancerICMPPendingStarted]
 	createIssued := annotations[annotationNodeLoadBalancerICMPCreateIssued]
+	deleteTarget, deleteIssuedAt, receiptErr := nodeLoadBalancerFirewallDeleteReceipt(
+		annotations,
+		annotationNodeLoadBalancerICMPDeleteTarget,
+		annotationNodeLoadBalancerICMPDeleteIssued,
+		annotationNodeLoadBalancerICMPCleanupAbsent,
+		annotationNodeLoadBalancerICMPCleanupChecked,
+	)
+	if receiptErr != nil {
+		return false, fmt.Errorf("node load balancer: parse cluster ICMP firewall delete receipt: %w", receiptErr)
+	}
 	if currentUUID != "" && !validNodeLoadBalancerCloudUUID(currentUUID) {
 		return false, fmt.Errorf("node load balancer: invalid persisted cluster ICMP cleanup UUID %q", currentUUID)
 	}
@@ -571,11 +906,17 @@ func (c *nodeLoadBalancerController) cleanupClusterICMPFirewall(ctx context.Cont
 	if currentUUID != "" && pendingUUID != "" && currentUUID != pendingUUID {
 		return false, errors.New("node load balancer: current and pending cluster ICMP cleanup UUIDs conflict")
 	}
+	if deleteTarget != "" && currentUUID != "" && deleteTarget != currentUUID {
+		return false, errors.New("node load balancer: cluster ICMP firewall delete target conflicts with current UUID")
+	}
+	if deleteTarget != "" && pendingUUID != "" && deleteTarget != pendingUUID {
+		return false, errors.New("node load balancer: cluster ICMP firewall delete target conflicts with pending UUID")
+	}
 	items, err := c.provider.api.ListFirewalls(ctx, c.provider.config.Location)
 	if err != nil {
 		return false, err
 	}
-	var byName, byCurrentUUID, byPendingUUID *inspace.Firewall
+	var byName, byCurrentUUID, byPendingUUID, byDeleteUUID *inspace.Firewall
 	for i := range items {
 		item := items[i]
 		if currentUUID != "" && item.UUID == currentUUID {
@@ -591,6 +932,16 @@ func (c *nodeLoadBalancerController) cleanupClusterICMPFirewall(ctx context.Cont
 			}
 			copy := item
 			byPendingUUID = &copy
+		}
+		if deleteTarget != "" && item.UUID == deleteTarget {
+			if byDeleteUUID != nil {
+				return false, fmt.Errorf("node load balancer: cluster ICMP firewall delete target UUID %s appears multiple times", deleteTarget)
+			}
+			if item.EffectiveName() != desired.Request.DisplayName || !nodeLoadBalancerClusterICMPFirewallOwned(item, c.provider.config.ClusterID, c.provider.config.BillingAccountID) {
+				return false, fmt.Errorf("node load balancer: cluster ICMP firewall delete target %s lost exact ownership", deleteTarget)
+			}
+			copy := item
+			byDeleteUUID = &copy
 		}
 		if item.EffectiveName() != desired.Request.DisplayName {
 			continue
@@ -616,9 +967,17 @@ func (c *nodeLoadBalancerController) cleanupClusterICMPFirewall(ctx context.Cont
 			byName.UUID, pendingUUID,
 		)
 	}
+	if deleteTarget != "" && byName != nil && byName.UUID != deleteTarget {
+		return false, fmt.Errorf(
+			"node load balancer: refusing to clean managed cluster ICMP name at UUID %s; delete target is %s",
+			byName.UUID, deleteTarget,
+		)
+	}
 
 	var firewall *inspace.Firewall
 	switch {
+	case deleteTarget != "":
+		firewall = byDeleteUUID
 	case currentUUID != "":
 		firewall = byCurrentUUID
 	case pendingUUID != "":
@@ -664,25 +1023,147 @@ func (c *nodeLoadBalancerController) cleanupClusterICMPFirewall(ctx context.Cont
 			})
 			return false, err
 		}
-		if len(firewall.ResourcesAssigned) != 0 {
-			for _, resource := range firewall.ResourcesAssigned {
-				if !stringsEqualFoldVMResource(resource) {
-					return false, fmt.Errorf("node load balancer: cluster ICMP firewall has unexpected assigned resource %#v", resource)
+		if nodeClass != nil && deleteTarget != "" &&
+			(annotations[annotationNodeLoadBalancerICMPCleanupAbsent] != "" ||
+				annotations[annotationNodeLoadBalancerICMPCleanupChecked] != "") {
+			changed, err := c.updateManagedNodeClassAnnotations(ctx, nodeClassName, func(values map[string]string) {
+				if values[annotationNodeLoadBalancerICMPDeleteTarget] != deleteTarget ||
+					values[annotationNodeLoadBalancerICMPDeleteIssued] != deleteIssuedAt {
+					return
 				}
-				if err := c.provider.api.UnassignFirewallFromVM(ctx, c.provider.config.Location, firewall.UUID, resource.ResourceUUID); err != nil && !inspace.IsNotFound(err) {
-					return false, err
+				delete(values, annotationNodeLoadBalancerICMPCleanupAbsent)
+				delete(values, annotationNodeLoadBalancerICMPCleanupChecked)
+			})
+			if err != nil || changed {
+				return false, err
+			}
+		}
+		assignments, assignmentErr := nodeLoadBalancerFirewallAssignmentVMs(*firewall)
+		if assignmentErr != nil {
+			return false, assignmentErr
+		}
+		if len(assignments) != 0 {
+			if nodeClass == nil {
+				return false, errors.New("node load balancer: cannot safely detach cluster ICMP firewall without its NodeClass state owner")
+			}
+			for _, vmUUID := range assignments {
+				converged, relationErr := c.reconcileNodeLoadBalancerFirewallRelation(
+					ctx,
+					c.clusterICMPFirewallRelationOwner(nodeClassName),
+					&nodeLoadBalancerFirewallRelationFence{
+						operation: nodeLoadBalancerFirewallRelationUnassign, firewallUUID: firewall.UUID, vmUUID: vmUUID,
+					},
+				)
+				if relationErr != nil || !converged {
+					return false, relationErr
 				}
 			}
 			return false, nil
 		}
-		if err := c.provider.api.DeleteFirewall(ctx, c.provider.config.Location, firewall.UUID); err != nil && !inspace.IsNotFound(err) {
-			return false, err
+		if deleteIssuedAt != "" {
+			// The issued receipt survives stale visibility and restarts. No cloud
+			// readback can authorize a second irreversible request.
+			return false, nil
+		}
+		issuedAt := time.Now().UTC().Format(time.RFC3339Nano)
+		winner, issueErr := c.updateManagedNodeClassAnnotations(ctx, nodeClassName, func(values map[string]string) {
+			storedTarget, storedIssued, parseErr := nodeLoadBalancerFirewallDeleteReceipt(
+				values,
+				annotationNodeLoadBalancerICMPDeleteTarget,
+				annotationNodeLoadBalancerICMPDeleteIssued,
+				annotationNodeLoadBalancerICMPCleanupAbsent,
+				annotationNodeLoadBalancerICMPCleanupChecked,
+			)
+			if parseErr != nil || (storedTarget != "" && storedTarget != firewall.UUID) || storedIssued != "" {
+				return
+			}
+			values[annotationNodeLoadBalancerICMPDeleteTarget] = firewall.UUID
+			values[annotationNodeLoadBalancerICMPDeleteIssued] = issuedAt
+			delete(values, annotationNodeLoadBalancerICMPCleanupAbsent)
+			delete(values, annotationNodeLoadBalancerICMPCleanupChecked)
+		})
+		if issueErr != nil {
+			return false, fmt.Errorf("node load balancer: persist cluster ICMP firewall delete-issued receipt: %w", issueErr)
+		}
+		if !winner {
+			return false, nil
+		}
+		authorizedNodeClass, authorityErr := c.getManagedNodeLoadBalancerNodeClass(ctx, nodeClassName)
+		if authorityErr != nil {
+			return false, fmt.Errorf("node load balancer: re-read NodeClass owner after cluster ICMP delete issue: %w", authorityErr)
+		}
+		authorizedAnnotations := authorizedNodeClass.GetAnnotations()
+		if authorizedAnnotations[annotationNodeLoadBalancerICMPFirewallUUID] != currentUUID ||
+			authorizedAnnotations[annotationNodeLoadBalancerICMPPendingUUID] != pendingUUID ||
+			authorizedAnnotations[annotationNodeLoadBalancerICMPPendingName] != pendingName ||
+			authorizedAnnotations[annotationNodeLoadBalancerICMPPendingStarted] != pendingStarted ||
+			authorizedAnnotations[annotationNodeLoadBalancerICMPCreateIssued] != createIssued ||
+			authorizedAnnotations[annotationNodeLoadBalancerICMPDeleteTarget] != firewall.UUID ||
+			authorizedAnnotations[annotationNodeLoadBalancerICMPDeleteIssued] != issuedAt {
+			return false, errors.New("node load balancer: cluster ICMP firewall delete authority changed after issue")
+		}
+		authorizedFirewall, authorityErr := c.exactNodeLoadBalancerFirewallFresh(ctx, firewall.UUID)
+		if authorityErr != nil {
+			return false, fmt.Errorf("node load balancer: re-read cluster ICMP firewall after delete issue: %w", authorityErr)
+		}
+		if !nodeLoadBalancerFirewallAuthorityUnchanged(*firewall, *authorizedFirewall) ||
+			!nodeLoadBalancerClusterICMPFirewallOwned(
+				*authorizedFirewall,
+				c.provider.config.ClusterID,
+				c.provider.config.BillingAccountID,
+			) {
+			return false, errors.New("node load balancer: cluster ICMP firewall lost exact ownership or policy after delete issue")
+		}
+		postIssueAssignments, authorityErr := nodeLoadBalancerFirewallAssignmentVMs(*authorizedFirewall)
+		if authorityErr != nil {
+			return false, authorityErr
+		}
+		if len(postIssueAssignments) != 0 {
+			return false, errors.New("node load balancer: cluster ICMP firewall gained assignments after delete issue")
+		}
+		deleteErr := c.provider.api.DeleteFirewall(ctx, c.provider.config.Location, firewall.UUID)
+		if nodeLoadBalancerMutationKnownPreDispatch(deleteErr) {
+			_, resetErr := c.updateManagedNodeClassAnnotations(ctx, nodeClassName, func(values map[string]string) {
+				if values[annotationNodeLoadBalancerICMPDeleteTarget] == firewall.UUID &&
+					values[annotationNodeLoadBalancerICMPDeleteIssued] == issuedAt {
+					delete(values, annotationNodeLoadBalancerICMPDeleteIssued)
+				}
+			})
+			return false, errors.Join(deleteErr, resetErr)
+		}
+		if deleteErr != nil {
+			return false, deleteErr
 		}
 		return false, nil
 	}
 
 	if nodeClass == nil {
 		return false, errors.New("node load balancer: managed NodeClass state anchor is absent during cluster ICMP cleanup")
+	}
+	if deleteTarget == "" {
+		candidate := currentUUID
+		if candidate == "" {
+			candidate = pendingUUID
+		}
+		if candidate != "" {
+			changed, stageErr := c.updateManagedNodeClassAnnotations(ctx, nodeClassName, func(values map[string]string) {
+				if values[annotationNodeLoadBalancerICMPDeleteTarget] == "" {
+					values[annotationNodeLoadBalancerICMPDeleteTarget] = candidate
+					delete(values, annotationNodeLoadBalancerICMPDeleteIssued)
+					delete(values, annotationNodeLoadBalancerICMPCleanupAbsent)
+					delete(values, annotationNodeLoadBalancerICMPCleanupChecked)
+				}
+			})
+			if stageErr != nil {
+				return false, fmt.Errorf("node load balancer: persist cluster ICMP firewall delete intent: %w", stageErr)
+			}
+			if changed {
+				deleteTarget = candidate
+				deleteIssuedAt = ""
+			} else {
+				return false, nil
+			}
+		}
 	}
 	if createIssued != "" {
 		return false, fmt.Errorf(
@@ -704,16 +1185,35 @@ func (c *nodeLoadBalancerController) cleanupClusterICMPFirewall(ctx context.Cont
 			annotationNodeLoadBalancerICMPPendingStarted, annotationNodeLoadBalancerICMPCreateIssued,
 			annotationNodeLoadBalancerICMPAbsent, annotationNodeLoadBalancerICMPAbsentChecked,
 			annotationNodeLoadBalancerICMPCleanupAbsent, annotationNodeLoadBalancerICMPCleanupChecked,
+			annotationNodeLoadBalancerFirewallRelationIssued,
 		)
 		return false, clearErr
 	}
-	confirmed, _, err := c.recordNodeClassFirewallAbsence(
+	confirmed, changed, err := c.recordNodeClassFirewallAbsence(
 		ctx, nodeClassName,
 		annotationNodeLoadBalancerICMPCleanupAbsent, annotationNodeLoadBalancerICMPCleanupChecked,
 		time.Now().UTC(), time.Time{},
 	)
-	if err != nil || !confirmed {
+	if err != nil || changed || !confirmed {
 		return false, err
+	}
+	deleteAbsent, deleteChecked := "", ""
+	if deleteTarget != "" {
+		latest, getErr := c.getManagedNodeLoadBalancerNodeClass(ctx, nodeClassName)
+		if getErr != nil {
+			return false, getErr
+		}
+		latestAnnotations := latest.GetAnnotations()
+		if latestAnnotations[annotationNodeLoadBalancerICMPDeleteTarget] != deleteTarget ||
+			latestAnnotations[annotationNodeLoadBalancerICMPDeleteIssued] != deleteIssuedAt {
+			return false, errors.New("node load balancer: cluster ICMP firewall delete receipt changed during absence proof")
+		}
+		count, parseErr := strconv.Atoi(latestAnnotations[annotationNodeLoadBalancerICMPCleanupAbsent])
+		if parseErr != nil || count < nodeLoadBalancerAbsenceConfirmations {
+			return false, errors.New("node load balancer: cluster ICMP firewall delete absence is no longer confirmed")
+		}
+		deleteAbsent = latestAnnotations[annotationNodeLoadBalancerICMPCleanupAbsent]
+		deleteChecked = latestAnnotations[annotationNodeLoadBalancerICMPCleanupChecked]
 	}
 	_, err = c.clearManagedNodeClassICMPAnnotations(
 		ctx, nodeClassName,
@@ -723,16 +1223,18 @@ func (c *nodeLoadBalancerController) cleanupClusterICMPFirewall(ctx context.Cont
 			annotationNodeLoadBalancerICMPPendingName:    pendingName,
 			annotationNodeLoadBalancerICMPPendingStarted: pendingStarted,
 			annotationNodeLoadBalancerICMPCreateIssued:   createIssued,
+			annotationNodeLoadBalancerICMPDeleteTarget:   deleteTarget,
+			annotationNodeLoadBalancerICMPDeleteIssued:   deleteIssuedAt,
+			annotationNodeLoadBalancerICMPCleanupAbsent:  deleteAbsent,
+			annotationNodeLoadBalancerICMPCleanupChecked: deleteChecked,
 		},
 		annotationNodeLoadBalancerICMPFirewallUUID, annotationNodeLoadBalancerICMPPendingUUID,
 		annotationNodeLoadBalancerICMPPendingName, annotationNodeLoadBalancerICMPPendingStarted,
 		annotationNodeLoadBalancerICMPCreateIssued,
 		annotationNodeLoadBalancerICMPAbsent, annotationNodeLoadBalancerICMPAbsentChecked,
 		annotationNodeLoadBalancerICMPCleanupAbsent, annotationNodeLoadBalancerICMPCleanupChecked,
+		annotationNodeLoadBalancerICMPDeleteTarget, annotationNodeLoadBalancerICMPDeleteIssued,
+		annotationNodeLoadBalancerFirewallRelationIssued,
 	)
 	return err == nil, err
-}
-
-func stringsEqualFoldVMResource(resource inspace.FirewallResource) bool {
-	return resource.ResourceUUID != "" && strings.EqualFold(resource.ResourceType, "vm")
 }

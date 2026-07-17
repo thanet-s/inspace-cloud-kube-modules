@@ -14,6 +14,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/types"
 
 	inspace "github.com/thanet-s/inspace-cloud-kube-modules/modules/client"
 	"github.com/thanet-s/inspace-cloud-kube-modules/modules/cloud-provider/pkg/providerid"
@@ -44,6 +45,8 @@ const (
 	annotationNodeLoadBalancerShardFWCleanupAbsent = "service.inspace.cloud/node-lb-shard-firewall-cleanup-absence-count"
 	annotationNodeLoadBalancerShardFWCleanupCheck  = "service.inspace.cloud/node-lb-shard-firewall-cleanup-absence-checked-at"
 	annotationNodeLoadBalancerShardFWCleanupSeen   = "service.inspace.cloud/node-lb-shard-firewall-cleanup-observed-uuid"
+	annotationNodeLoadBalancerShardFWDeleteTarget  = "service.inspace.cloud/node-lb-shard-firewall-delete-target-uuid"
+	annotationNodeLoadBalancerShardFWDeleteIssued  = "service.inspace.cloud/node-lb-shard-firewall-delete-issued-at"
 
 	nodeLoadBalancerShardFirewallMutationTimeout  = 5 * time.Minute
 	nodeLoadBalancerShardFirewallPolicyHashLength = 64
@@ -253,7 +256,42 @@ func (c *nodeLoadBalancerController) updateManagedNodePoolAnnotations(
 	if err != nil {
 		return nil, false, fmt.Errorf("node load balancer: persist shard firewall state on NodePool %s: %w", shard, err)
 	}
-	return updated, true, nil
+	if err := c.validateManagedNodePoolAnnotationWrite(updated, shard, pool.GetUID(), copyAnnotations); err != nil {
+		return nil, false, err
+	}
+	verified, err := resource.Get(ctx, shard, metav1.GetOptions{})
+	if err != nil {
+		return nil, false, fmt.Errorf("node load balancer: read back shard firewall state on NodePool %s: %w", shard, err)
+	}
+	if err := c.validateManagedNodePoolAnnotationWrite(verified, shard, pool.GetUID(), copyAnnotations); err != nil {
+		return nil, false, err
+	}
+	return verified, true, nil
+}
+
+func (c *nodeLoadBalancerController) validateManagedNodePoolAnnotationWrite(
+	pool *unstructured.Unstructured,
+	shard string,
+	uid types.UID,
+	expected map[string]string,
+) error {
+	if pool == nil || pool.GetName() != shard {
+		return fmt.Errorf("node load balancer: shard firewall state update returned the wrong NodePool identity")
+	}
+	if uid != "" && pool.GetUID() != uid {
+		return fmt.Errorf("node load balancer: NodePool %s UID changed while persisting shard firewall state", shard)
+	}
+	labels := pool.GetLabels()
+	if labels[nodeLoadBalancerManagedLabel] != "true" ||
+		labels[nodeLoadBalancerClusterLabel] != c.provider.config.ClusterID ||
+		labels[nodeLoadBalancerShardLabel] != shard ||
+		!containsString(pool.GetFinalizers(), nodeLoadBalancerNodePoolFinalizer) {
+		return fmt.Errorf("node load balancer: failed exact state-anchor readback: NodePool %s lost exact ownership while persisting shard firewall state", shard)
+	}
+	if !mapsEqualStringString(pool.GetAnnotations(), expected) {
+		return fmt.Errorf("node load balancer: NodePool %s did not retain the exact shard firewall receipt", shard)
+	}
+	return nil
 }
 
 func nodeLoadBalancerShardFirewallAnnotations(pool *unstructured.Unstructured) (map[string]string, error) {
@@ -322,6 +360,15 @@ func nodeLoadBalancerShardFirewallAnnotations(pool *unstructured.Unstructured) (
 	if cleanupUUID := annotations[annotationNodeLoadBalancerShardFWCleanupSeen]; cleanupUUID != "" && !validNodeLoadBalancerCloudUUID(cleanupUUID) {
 		return nil, fmt.Errorf("node load balancer: invalid cleanup-observed shard firewall UUID %q", cleanupUUID)
 	}
+	if _, _, err := nodeLoadBalancerFirewallDeleteReceipt(
+		annotations,
+		annotationNodeLoadBalancerShardFWDeleteTarget,
+		annotationNodeLoadBalancerShardFWDeleteIssued,
+		annotationNodeLoadBalancerShardFWCleanupAbsent,
+		annotationNodeLoadBalancerShardFWCleanupCheck,
+	); err != nil {
+		return nil, fmt.Errorf("node load balancer: invalid shard firewall delete receipt: %w", err)
+	}
 	return annotations, nil
 }
 
@@ -384,6 +431,342 @@ func (c *nodeLoadBalancerController) clearManagedNodePoolFirewallAbsence(
 		return changed, nil
 	})
 	return changed, err
+}
+
+var nodeLoadBalancerShardFirewallMutationReceiptKeys = []string{
+	annotationNodeLoadBalancerShardFirewallUUID,
+	annotationNodeLoadBalancerShardFirewallHash,
+	annotationNodeLoadBalancerShardFirewallLedger,
+	annotationNodeLoadBalancerShardFWPendingHash,
+	annotationNodeLoadBalancerShardFWPendingLedger,
+	annotationNodeLoadBalancerShardFWPendingAt,
+	annotationNodeLoadBalancerShardFWIssuedAt,
+	annotationNodeLoadBalancerShardFWPendingUUID,
+}
+
+func nodeLoadBalancerShardFirewallMutationExpected(annotations map[string]string, issuedAt string) map[string]string {
+	expected := make(map[string]string, len(nodeLoadBalancerShardFirewallMutationReceiptKeys))
+	for _, key := range nodeLoadBalancerShardFirewallMutationReceiptKeys {
+		expected[key] = annotations[key]
+	}
+	expected[annotationNodeLoadBalancerShardFWIssuedAt] = issuedAt
+	return expected
+}
+
+func (c *nodeLoadBalancerController) issueShardFirewallMutation(
+	ctx context.Context,
+	shard string,
+	expectedStaged map[string]string,
+	issuedAt string,
+	clearCreateAbsence bool,
+) (map[string]string, error) {
+	if expectedStaged[annotationNodeLoadBalancerShardFWPendingHash] == "" ||
+		expectedStaged[annotationNodeLoadBalancerShardFWPendingLedger] == "" ||
+		expectedStaged[annotationNodeLoadBalancerShardFWPendingAt] == "" ||
+		expectedStaged[annotationNodeLoadBalancerShardFWIssuedAt] != "" ||
+		expectedStaged[annotationNodeLoadBalancerShardFWPendingUUID] != "" {
+		return nil, errors.New("node load balancer: incomplete staged shard firewall mutation identity")
+	}
+	if _, err := time.Parse(time.RFC3339Nano, issuedAt); err != nil {
+		return nil, fmt.Errorf("node load balancer: invalid shard firewall issue timestamp: %w", err)
+	}
+	issuedPool, changed, err := c.updateManagedNodePoolAnnotations(ctx, shard, func(values map[string]string) (bool, error) {
+		for _, key := range nodeLoadBalancerShardFirewallMutationReceiptKeys {
+			if values[key] != expectedStaged[key] {
+				return false, errors.New("node load balancer: shard firewall staged mutation changed before authority issuance")
+			}
+		}
+		values[annotationNodeLoadBalancerShardFWIssuedAt] = issuedAt
+		if clearCreateAbsence {
+			delete(values, annotationNodeLoadBalancerShardFWCreateAbsent)
+			delete(values, annotationNodeLoadBalancerShardFWCreateChecked)
+		}
+		return true, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if !changed || issuedPool == nil {
+		return nil, errors.New("node load balancer: shard firewall mutation authority was not durably issued")
+	}
+	verifiedAnnotations, err := nodeLoadBalancerShardFirewallAnnotations(issuedPool)
+	if err != nil {
+		return nil, err
+	}
+	expectedMutation := nodeLoadBalancerShardFirewallMutationExpected(expectedStaged, issuedAt)
+	for _, key := range nodeLoadBalancerShardFirewallMutationReceiptKeys {
+		if verifiedAnnotations[key] != expectedMutation[key] {
+			return nil, errors.New("node load balancer: shard firewall issue readback changed the exact mutation receipt")
+		}
+	}
+	return expectedMutation, nil
+}
+
+// authorizeShardFirewallPolicyMutationPreDispatch re-derives both halves of
+// the mutation authority after the issued receipt is durable: the exact live
+// NodePool receipt and the policy assembled from live Services.  The latter is
+// important because a Service can change or disappear between staging the
+// receipt and crossing the cloud API boundary.
+func (c *nodeLoadBalancerController) authorizeShardFirewallPolicyMutationPreDispatch(
+	ctx context.Context,
+	shard string,
+	ownerUID types.UID,
+	expected map[string]string,
+	desired nodeLoadBalancerShardFirewallPolicy,
+	desiredLedger string,
+) error {
+	owner, err := c.provider.dynamicClient.Resource(nodePoolGVR).Get(ctx, shard, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("node load balancer: re-read shard owner before firewall mutation: %w", err)
+	}
+	labels := owner.GetLabels()
+	if owner.GetName() != shard || (ownerUID != "" && owner.GetUID() != ownerUID) ||
+		owner.GetDeletionTimestamp() != nil ||
+		labels[nodeLoadBalancerManagedLabel] != "true" ||
+		labels[nodeLoadBalancerClusterLabel] != c.provider.config.ClusterID ||
+		labels[nodeLoadBalancerShardLabel] != shard ||
+		!containsString(owner.GetFinalizers(), nodeLoadBalancerNodePoolFinalizer) {
+		return errors.New("node load balancer: shard firewall mutation owner is no longer an authoritative live NodePool")
+	}
+	annotations, err := nodeLoadBalancerShardFirewallAnnotations(owner)
+	if err != nil {
+		return err
+	}
+	for _, key := range nodeLoadBalancerShardFirewallMutationReceiptKeys {
+		if annotations[key] != expected[key] {
+			return errors.New("node load balancer: shard firewall mutation receipt changed after issue")
+		}
+	}
+
+	fresh, freshLedger, _, err := c.desiredStagedShardFirewallPolicy(ctx, shard)
+	if err != nil {
+		return fmt.Errorf("node load balancer: re-derive live shard firewall policy before mutation: %w", err)
+	}
+	if fresh == nil || fresh.Hash != desired.Hash || freshLedger != desiredLedger ||
+		fresh.ClusterID != desired.ClusterID || fresh.Shard != desired.Shard ||
+		fresh.Request.DisplayName != desired.Request.DisplayName ||
+		fresh.Request.Description != desired.Request.Description ||
+		fresh.Request.BillingAccountID != desired.Request.BillingAccountID ||
+		expected[annotationNodeLoadBalancerShardFWPendingHash] != fresh.Hash ||
+		expected[annotationNodeLoadBalancerShardFWPendingLedger] != freshLedger {
+		return errors.New("node load balancer: live staged Service policy changed after shard firewall mutation issue")
+	}
+	return nil
+}
+
+func (c *nodeLoadBalancerController) transitionShardFirewallMutation(
+	ctx context.Context,
+	shard string,
+	expected map[string]string,
+	committed *inspace.Firewall,
+) error {
+	updated, changed, err := c.updateManagedNodePoolAnnotations(ctx, shard, func(values map[string]string) (bool, error) {
+		for _, key := range nodeLoadBalancerShardFirewallMutationReceiptKeys {
+			if values[key] != expected[key] {
+				return false, errors.New("node load balancer: shard firewall mutation receipt changed before exact transition")
+			}
+		}
+		if expected[annotationNodeLoadBalancerShardFWIssuedAt] == "" ||
+			expected[annotationNodeLoadBalancerShardFWPendingHash] == "" ||
+			expected[annotationNodeLoadBalancerShardFWPendingLedger] == "" ||
+			expected[annotationNodeLoadBalancerShardFWPendingAt] == "" {
+			return false, errors.New("node load balancer: incomplete shard firewall mutation receipt")
+		}
+		if committed != nil {
+			if !validNodeLoadBalancerCloudUUID(committed.UUID) {
+				return false, fmt.Errorf("node load balancer: invalid observed shard firewall UUID %q", committed.UUID)
+			}
+			values[annotationNodeLoadBalancerShardFirewallUUID] = committed.UUID
+			values[annotationNodeLoadBalancerShardFirewallHash] = expected[annotationNodeLoadBalancerShardFWPendingHash]
+			values[annotationNodeLoadBalancerShardFirewallLedger] = expected[annotationNodeLoadBalancerShardFWPendingLedger]
+		}
+		for _, key := range []string{
+			annotationNodeLoadBalancerShardFWPendingHash,
+			annotationNodeLoadBalancerShardFWPendingLedger,
+			annotationNodeLoadBalancerShardFWPendingAt,
+			annotationNodeLoadBalancerShardFWIssuedAt,
+			annotationNodeLoadBalancerShardFWPendingUUID,
+			annotationNodeLoadBalancerShardFWCreateAbsent,
+			annotationNodeLoadBalancerShardFWCreateChecked,
+		} {
+			delete(values, key)
+		}
+		return true, nil
+	})
+	if err != nil {
+		return err
+	}
+	if !changed || updated == nil {
+		return errors.New("node load balancer: shard firewall mutation receipt transition was not persisted")
+	}
+	annotations := updated.GetAnnotations()
+	for _, key := range []string{
+		annotationNodeLoadBalancerShardFWPendingHash,
+		annotationNodeLoadBalancerShardFWPendingLedger,
+		annotationNodeLoadBalancerShardFWPendingAt,
+		annotationNodeLoadBalancerShardFWIssuedAt,
+		annotationNodeLoadBalancerShardFWPendingUUID,
+	} {
+		if annotations[key] != "" {
+			return errors.New("node load balancer: shard firewall mutation receipt update returned uncleared pending state")
+		}
+	}
+	if committed != nil && (annotations[annotationNodeLoadBalancerShardFirewallUUID] != committed.UUID ||
+		annotations[annotationNodeLoadBalancerShardFirewallHash] != expected[annotationNodeLoadBalancerShardFWPendingHash] ||
+		annotations[annotationNodeLoadBalancerShardFirewallLedger] != expected[annotationNodeLoadBalancerShardFWPendingLedger]) {
+		return errors.New("node load balancer: shard firewall mutation receipt update returned unexpected committed state")
+	}
+	return nil
+}
+
+func (c *nodeLoadBalancerController) resolveShardFirewallCreateReadback(
+	ctx context.Context,
+	shard string,
+	expected map[string]string,
+	desired nodeLoadBalancerShardFirewallPolicy,
+) (*inspace.Firewall, bool, error) {
+	items, err := c.provider.api.ListFirewalls(ctx, c.provider.config.Location)
+	if err != nil {
+		return nil, false, fmt.Errorf("node load balancer: read back shard firewall after create response: %w", err)
+	}
+	var observed *inspace.Firewall
+	for index := range items {
+		item := items[index]
+		if item.EffectiveName() != desired.Request.DisplayName {
+			continue
+		}
+		if observed != nil {
+			return nil, false, fmt.Errorf("node load balancer: multiple firewalls use stable shard name %q after create response", desired.Request.DisplayName)
+		}
+		copy := item
+		observed = &copy
+	}
+	if observed != nil {
+		if !validNodeLoadBalancerCloudUUID(observed.UUID) ||
+			(observed.Description != "" && observed.Description != desired.Request.Description) ||
+			inspace.ValidateNodeLoadBalancerShardFirewall(
+				*observed,
+				desired.ClusterID,
+				desired.Shard,
+				desired.Request.BillingAccountID,
+				desired.Hash,
+			) != nil {
+			return nil, false, fmt.Errorf("node load balancer: stable shard firewall name %q resolved to a foreign or third-state resource after create response", desired.Request.DisplayName)
+		}
+		if err := c.transitionShardFirewallMutation(ctx, shard, expected, observed); err != nil {
+			return nil, false, err
+		}
+		return observed, true, nil
+	}
+	return nil, false, errors.New("node load balancer: shard firewall create outcome remains ambiguous after exact name absence readback")
+}
+
+func (c *nodeLoadBalancerController) resolveShardFirewallUpdateReadback(
+	ctx context.Context,
+	shard string,
+	expected map[string]string,
+	desired nodeLoadBalancerShardFirewallPolicy,
+) (*inspace.Firewall, bool, error) {
+	items, err := c.provider.api.ListFirewalls(ctx, c.provider.config.Location)
+	if err != nil {
+		return nil, false, fmt.Errorf("node load balancer: read back shard firewall after update response: %w", err)
+	}
+	appliedUUID := expected[annotationNodeLoadBalancerShardFirewallUUID]
+	var byName, byUUID *inspace.Firewall
+	for index := range items {
+		item := items[index]
+		if item.EffectiveName() == desired.Request.DisplayName {
+			if byName != nil {
+				return nil, false, fmt.Errorf("node load balancer: multiple firewalls use stable shard name %q after update response", desired.Request.DisplayName)
+			}
+			copy := item
+			byName = &copy
+		}
+		if item.UUID == appliedUUID {
+			if byUUID != nil {
+				return nil, false, fmt.Errorf("node load balancer: shard firewall UUID %s appears multiple times after update response", appliedUUID)
+			}
+			copy := item
+			byUUID = &copy
+		}
+	}
+	if byName != nil && (byUUID == nil || byName.UUID != byUUID.UUID) {
+		return nil, false, errors.New("node load balancer: stable shard name and applied UUID resolve to different resources after update response")
+	}
+	if byUUID != nil && byUUID.EffectiveName() != desired.Request.DisplayName {
+		return nil, false, errors.New("node load balancer: applied shard firewall UUID lost its stable name after update response")
+	}
+	if byUUID == nil {
+		return nil, false, errors.New("node load balancer: shard firewall update outcome remains ambiguous after exact UUID and name absence readback")
+	}
+	if byUUID.Description != "" && byUUID.Description != desired.Request.Description {
+		return nil, false, fmt.Errorf("node load balancer: shard firewall %s has foreign description after update response", byUUID.UUID)
+	}
+	actualHash, err := inspace.NodeLoadBalancerShardFirewallSpecHash(byUUID.Rules)
+	if err != nil {
+		return nil, false, fmt.Errorf("node load balancer: shard firewall %s policy after update response: %w", byUUID.UUID, err)
+	}
+	switch actualHash {
+	case expected[annotationNodeLoadBalancerShardFWPendingHash]:
+		if err := inspace.ValidateNodeLoadBalancerShardFirewall(
+			*byUUID,
+			desired.ClusterID,
+			desired.Shard,
+			desired.Request.BillingAccountID,
+			actualHash,
+		); err != nil {
+			return nil, false, fmt.Errorf("node load balancer: pending shard firewall readback lost exact ownership: %w", err)
+		}
+		if err := c.transitionShardFirewallMutation(ctx, shard, expected, byUUID); err != nil {
+			return nil, false, err
+		}
+		return byUUID, true, nil
+	case expected[annotationNodeLoadBalancerShardFirewallHash]:
+		if err := inspace.ValidateNodeLoadBalancerShardFirewall(
+			*byUUID,
+			desired.ClusterID,
+			desired.Shard,
+			desired.Request.BillingAccountID,
+			actualHash,
+		); err != nil {
+			return nil, false, fmt.Errorf("node load balancer: unchanged shard firewall readback lost exact ownership: %w", err)
+		}
+		return nil, false, errors.New("node load balancer: shard firewall update outcome remains ambiguous after unchanged readback")
+	default:
+		return nil, false, fmt.Errorf("node load balancer: shard firewall %s is in a third policy state after update response", byUUID.UUID)
+	}
+}
+
+func validateUpdatedNodeLoadBalancerShardFirewallResponse(
+	response *inspace.Firewall,
+	uuid string,
+	desired nodeLoadBalancerShardFirewallPolicy,
+) error {
+	if response == nil || response.UUID == "" {
+		return errors.New("response has no firewall UUID")
+	}
+	if response.UUID != uuid {
+		return fmt.Errorf("response UUID %q does not match updated firewall %q", response.UUID, uuid)
+	}
+	if name := response.EffectiveName(); name != "" && name != desired.Request.DisplayName {
+		return fmt.Errorf("response name %q does not match %q", name, desired.Request.DisplayName)
+	}
+	if response.BillingAccountID != 0 && response.BillingAccountID != desired.Request.BillingAccountID {
+		return errors.New("response billing account does not match")
+	}
+	if response.Description != "" && response.Description != desired.Request.Description {
+		return errors.New("response description does not match")
+	}
+	if len(response.Rules) != 0 {
+		hash, err := inspace.NodeLoadBalancerShardFirewallSpecHash(response.Rules)
+		if err != nil {
+			return fmt.Errorf("response policy: %w", err)
+		}
+		if hash != desired.Hash {
+			return fmt.Errorf("response policy hash %q does not match %q", hash, desired.Hash)
+		}
+	}
+	return nil
 }
 
 func (c *nodeLoadBalancerController) reconcileShardFirewallPolicy(
@@ -629,34 +1012,114 @@ func (c *nodeLoadBalancerController) reconcileShardFirewallPolicy(
 			)
 		}
 		now := time.Now().UTC().Format(time.RFC3339Nano)
-		if _, _, err = c.updateManagedNodePoolAnnotations(ctx, shard, func(values map[string]string) (bool, error) {
-			values[annotationNodeLoadBalancerShardFWIssuedAt] = now
-			delete(values, annotationNodeLoadBalancerShardFWCreateAbsent)
-			delete(values, annotationNodeLoadBalancerShardFWCreateChecked)
-			return true, nil
-		}); err != nil {
-			return state, err
+		expectedStaged := nodeLoadBalancerShardFirewallMutationExpected(annotations, "")
+		expectedMutation, issueErr := c.issueShardFirewallMutation(ctx, shard, expectedStaged, now, true)
+		if issueErr != nil {
+			return state, issueErr
+		}
+		observed, absent, authorityErr := c.exactNodeLoadBalancerFirewallNameFresh(ctx, desired.Request.DisplayName)
+		if authorityErr != nil {
+			state.MutationIssued = true
+			return state, fmt.Errorf("node load balancer: authorize shard firewall create after issue: %w", authorityErr)
+		}
+		if !absent {
+			if observed == nil || !validNodeLoadBalancerCloudUUID(observed.UUID) ||
+				(observed.Description != "" && observed.Description != desired.Request.Description) ||
+				inspace.ValidateNodeLoadBalancerShardFirewall(
+					*observed,
+					desired.ClusterID,
+					desired.Shard,
+					desired.Request.BillingAccountID,
+					desired.Hash,
+				) != nil {
+				state.MutationIssued = true
+				return state, fmt.Errorf(
+					"node load balancer: stable shard firewall name %q became foreign after create issue",
+					desired.Request.DisplayName,
+				)
+			}
+			observed, committed, recoveryErr := c.resolveShardFirewallCreateReadback(
+				ctx, shard, expectedMutation, *desired,
+			)
+			if recoveryErr != nil {
+				state.MutationIssued = true
+				return state, recoveryErr
+			}
+			if !committed {
+				state.MutationIssued = true
+				return state, errors.New("node load balancer: observed shard firewall was not durably promoted")
+			}
+			state.Firewall = observed
+			state.AppliedHash = desired.Hash
+			state.AppliedLedger = desiredLedger
+			state.PolicyReady = true
+			return state, nil
+		}
+		if authorityErr := c.authorizeShardFirewallPolicyMutationPreDispatch(
+			ctx, shard, pool.GetUID(), expectedMutation, *desired, desiredLedger,
+		); authorityErr != nil {
+			state.MutationIssued = true
+			return state, fmt.Errorf("node load balancer: reject shard firewall create at final authority: %w", authorityErr)
 		}
 		created, createErr := c.provider.api.CreateFirewall(ctx, c.provider.config.Location, desired.Request)
 		if createErr != nil {
-			if definitiveNodeLoadBalancerCreateFailure(createErr) {
-				_, _, _ = c.updateManagedNodePoolAnnotations(ctx, shard, func(values map[string]string) (bool, error) {
-					for _, key := range []string{annotationNodeLoadBalancerShardFWPendingHash, annotationNodeLoadBalancerShardFWPendingLedger, annotationNodeLoadBalancerShardFWPendingAt, annotationNodeLoadBalancerShardFWIssuedAt, annotationNodeLoadBalancerShardFWPendingUUID, annotationNodeLoadBalancerShardFWCreateAbsent, annotationNodeLoadBalancerShardFWCreateChecked} {
-						delete(values, key)
-					}
-					return true, nil
-				})
+			wrappedErr := fmt.Errorf("node load balancer: create shard firewall: %w", createErr)
+			if nodeLoadBalancerMutationKnownPreDispatch(createErr) {
+				return state, errors.Join(wrappedErr, c.transitionShardFirewallMutation(ctx, shard, expectedMutation, nil))
 			}
-			return state, fmt.Errorf("node load balancer: create shard firewall: %w", createErr)
+			observed, committed, recoveryErr := c.resolveShardFirewallCreateReadback(
+				ctx, shard, expectedMutation, *desired,
+			)
+			if recoveryErr != nil {
+				return state, errors.Join(wrappedErr, recoveryErr)
+			}
+			if committed {
+				state.Firewall = observed
+				state.AppliedHash = desired.Hash
+				state.AppliedLedger = desiredLedger
+				state.PolicyReady = true
+				return state, nil
+			}
+			return state, wrappedErr
 		}
-		if created != nil && validNodeLoadBalancerCloudUUID(created.UUID) {
-			_, _, err = c.updateManagedNodePoolAnnotations(ctx, shard, func(values map[string]string) (bool, error) {
-				values[annotationNodeLoadBalancerShardFWPendingUUID] = created.UUID
-				return true, nil
-			})
+		if responseErr := validateCreatedNodeLoadBalancerFirewall(
+			created,
+			desiredNodeLoadBalancerFirewall{Request: desired.Request, Hash: desired.Hash},
+		); responseErr != nil {
+			wrappedErr := fmt.Errorf("node load balancer: created shard firewall response: %w", responseErr)
+			observed, committed, recoveryErr := c.resolveShardFirewallCreateReadback(
+				ctx, shard, expectedMutation, *desired,
+			)
+			if recoveryErr != nil {
+				return state, errors.Join(wrappedErr, recoveryErr)
+			}
+			if committed {
+				state.Firewall = observed
+				state.AppliedHash = desired.Hash
+				state.AppliedLedger = desiredLedger
+				state.PolicyReady = true
+				return state, nil
+			}
+			return state, wrappedErr
+		}
+		// The response UUID is provisional only. Canonical identity is promoted
+		// exclusively from a unique deterministic-name ListFirewalls readback.
+		observed, committed, recoveryErr := c.resolveShardFirewallCreateReadback(
+			ctx, shard, expectedMutation, *desired,
+		)
+		if recoveryErr != nil {
+			state.MutationIssued = true
+			return state, recoveryErr
+		}
+		if committed {
+			state.Firewall = observed
+			state.AppliedHash = desired.Hash
+			state.AppliedLedger = desiredLedger
+			state.PolicyReady = true
+			return state, nil
 		}
 		state.MutationIssued = true
-		return state, err
+		return state, errors.New("node load balancer: shard firewall create response lacks authoritative readback")
 	}
 
 	if state.AppliedHash == desired.Hash && state.AppliedLedger == desiredLedger {
@@ -706,26 +1169,85 @@ func (c *nodeLoadBalancerController) reconcileShardFirewallPolicy(
 			return state, requestErr
 		}
 		now := time.Now().UTC().Format(time.RFC3339Nano)
-		if _, _, err = c.updateManagedNodePoolAnnotations(ctx, shard, func(values map[string]string) (bool, error) {
-			values[annotationNodeLoadBalancerShardFWIssuedAt] = now
-			return true, nil
-		}); err != nil {
-			return state, err
+		expectedStaged := nodeLoadBalancerShardFirewallMutationExpected(annotations, "")
+		expectedMutation, issueErr := c.issueShardFirewallMutation(ctx, shard, expectedStaged, now, false)
+		if issueErr != nil {
+			return state, issueErr
 		}
-		if _, updateErr := c.provider.api.UpdateFirewall(ctx, c.provider.config.Location, state.Firewall.UUID, request); updateErr != nil {
-			if definitiveNodeLoadBalancerCreateFailure(updateErr) {
-				_, _, _ = c.updateManagedNodePoolAnnotations(ctx, shard, func(values map[string]string) (bool, error) {
-					for _, key := range []string{annotationNodeLoadBalancerShardFWPendingHash, annotationNodeLoadBalancerShardFWPendingLedger, annotationNodeLoadBalancerShardFWPendingAt, annotationNodeLoadBalancerShardFWIssuedAt} {
-						delete(values, key)
-					}
-					return true, nil
-				})
-			} else {
-				// A transport/5xx failure can still mean the PUT committed. Preserve
-				// established sibling status until a fresh List resolves the fence.
-				state.MutationIssued = true
+		if authorityErr := c.authorizeShardFirewallPolicyMutationPreDispatch(
+			ctx, shard, pool.GetUID(), expectedMutation, *desired, desiredLedger,
+		); authorityErr != nil {
+			state.MutationIssued = true
+			return state, fmt.Errorf("node load balancer: reject shard firewall update at final authority: %w", authorityErr)
+		}
+		fresh, authorityErr := c.exactNodeLoadBalancerFirewallFresh(ctx, state.Firewall.UUID)
+		if authorityErr != nil {
+			state.MutationIssued = true
+			return state, fmt.Errorf("node load balancer: authorize shard firewall update after issue: %w", authorityErr)
+		}
+		if !nodeLoadBalancerFirewallAuthorityUnchanged(*state.Firewall, *fresh) {
+			state.MutationIssued = true
+			return state, errors.New("node load balancer: shard firewall changed after update issue")
+		}
+		if err := inspace.ValidateNodeLoadBalancerShardFirewall(
+			*fresh,
+			desired.ClusterID,
+			desired.Shard,
+			desired.Request.BillingAccountID,
+			expectedMutation[annotationNodeLoadBalancerShardFirewallHash],
+		); err != nil {
+			state.MutationIssued = true
+			return state, fmt.Errorf("node load balancer: shard firewall lost exact applied-policy authority after update issue: %w", err)
+		}
+		// Keep the live Service policy check adjacent to the provider boundary;
+		// the cloud read above may itself take long enough for policy to change.
+		if authorityErr := c.authorizeShardFirewallPolicyMutationPreDispatch(
+			ctx, shard, pool.GetUID(), expectedMutation, *desired, desiredLedger,
+		); authorityErr != nil {
+			state.MutationIssued = true
+			return state, fmt.Errorf("node load balancer: reject shard firewall update at final authority: %w", authorityErr)
+		}
+		updated, updateErr := c.provider.api.UpdateFirewall(ctx, c.provider.config.Location, state.Firewall.UUID, request)
+		if updateErr != nil {
+			wrappedErr := fmt.Errorf("node load balancer: update shard firewall %s: %w", state.Firewall.UUID, updateErr)
+			if nodeLoadBalancerMutationKnownPreDispatch(updateErr) {
+				return state, errors.Join(wrappedErr, c.transitionShardFirewallMutation(ctx, shard, expectedMutation, nil))
 			}
-			return state, fmt.Errorf("node load balancer: update shard firewall %s: %w", state.Firewall.UUID, updateErr)
+			observed, committed, recoveryErr := c.resolveShardFirewallUpdateReadback(
+				ctx, shard, expectedMutation, *desired,
+			)
+			if recoveryErr != nil {
+				state.MutationIssued = true
+				return state, errors.Join(wrappedErr, recoveryErr)
+			}
+			if committed {
+				state.Firewall = observed
+				state.AppliedHash = desired.Hash
+				state.AppliedLedger = desiredLedger
+				state.PolicyReady = true
+				return state, nil
+			}
+			state.MutationIssued = true
+			return state, wrappedErr
+		}
+		if responseErr := validateUpdatedNodeLoadBalancerShardFirewallResponse(updated, state.Firewall.UUID, *desired); responseErr != nil {
+			wrappedErr := fmt.Errorf("node load balancer: updated shard firewall response: %w", responseErr)
+			observed, committed, recoveryErr := c.resolveShardFirewallUpdateReadback(
+				ctx, shard, expectedMutation, *desired,
+			)
+			if recoveryErr != nil {
+				state.MutationIssued = true
+				return state, errors.Join(wrappedErr, recoveryErr)
+			}
+			if committed {
+				state.Firewall = observed
+				state.AppliedHash = desired.Hash
+				state.AppliedLedger = desiredLedger
+				state.PolicyReady = true
+				return state, nil
+			}
+			state.MutationIssued = true
+			return state, wrappedErr
 		}
 		state.MutationIssued = true
 		return state, nil
@@ -741,6 +1263,17 @@ func (c *nodeLoadBalancerController) ensureShardFirewallAssignments(
 	shard string,
 	firewall inspace.Firewall,
 ) (bool, *inspace.Firewall, error) {
+	converged, err := c.reconcileNodeLoadBalancerFirewallRelation(
+		ctx,
+		c.shardFirewallRelationOwner(shard),
+		nil,
+	)
+	if err != nil {
+		return false, nil, err
+	}
+	if !converged {
+		return false, nil, nil
+	}
 	nodes, err := c.authorizedNodesForShard(ctx, shard)
 	if err != nil {
 		return false, nil, err
@@ -781,24 +1314,33 @@ func (c *nodeLoadBalancerController) ensureShardFirewallAssignments(
 			healthyVMs[vmUUID] = struct{}{}
 		}
 	}
-	mutated := false
-	for _, resource := range firewall.ResourcesAssigned {
-		if !strings.EqualFold(resource.ResourceType, "vm") || !validNodeLoadBalancerCloudUUID(resource.ResourceUUID) {
-			return false, nil, fmt.Errorf("node load balancer: shard firewall %s has invalid assignment %#v", firewall.UUID, resource)
-		}
-		if _, desired := desiredVMs[resource.ResourceUUID]; desired {
+	assignments, err := nodeLoadBalancerFirewallVMAssignments(firewall)
+	if err != nil {
+		return false, nil, err
+	}
+	for vmUUID := range assignments {
+		if _, desired := desiredVMs[vmUUID]; desired {
 			continue
 		}
-		if _, protected := protectedVMs[resource.ResourceUUID]; protected {
+		if _, protected := protectedVMs[vmUUID]; protected {
 			return false, &firewall, nil
 		}
-		if err := c.provider.api.UnassignFirewallFromVM(ctx, c.provider.config.Location, firewall.UUID, resource.ResourceUUID); err != nil && !inspace.IsNotFound(err) {
-			return false, nil, fmt.Errorf("node load balancer: detach shard firewall %s from stale VM %s: %w", firewall.UUID, resource.ResourceUUID, err)
+		converged, relationErr := c.reconcileNodeLoadBalancerFirewallRelation(
+			ctx,
+			c.shardFirewallRelationOwner(shard),
+			&nodeLoadBalancerFirewallRelationFence{
+				operation: nodeLoadBalancerFirewallRelationUnassign, firewallUUID: firewall.UUID, vmUUID: vmUUID,
+			},
+		)
+		if relationErr != nil {
+			return false, nil, fmt.Errorf("node load balancer: detach shard firewall %s from stale VM %s: %w", firewall.UUID, vmUUID, relationErr)
 		}
-		mutated = true
+		if !converged {
+			return false, nil, nil
+		}
 	}
 	for vmUUID := range healthyVMs {
-		if firewallAssignedToVM(firewall, vmUUID) {
+		if _, assigned := assignments[strings.ToLower(vmUUID)]; assigned {
 			continue
 		}
 		for _, node := range nodes {
@@ -810,13 +1352,19 @@ func (c *nodeLoadBalancerController) ensureShardFirewallAssignments(
 				return false, &firewall, nil
 			}
 		}
-		if err := c.provider.api.AssignFirewallToVM(ctx, c.provider.config.Location, firewall.UUID, vmUUID); err != nil {
-			return false, nil, fmt.Errorf("node load balancer: attach shard firewall %s to new VM %s: %w", firewall.UUID, vmUUID, err)
+		converged, relationErr := c.reconcileNodeLoadBalancerFirewallRelation(
+			ctx,
+			c.shardFirewallRelationOwner(shard),
+			&nodeLoadBalancerFirewallRelationFence{
+				operation: nodeLoadBalancerFirewallRelationAssign, firewallUUID: firewall.UUID, vmUUID: vmUUID,
+			},
+		)
+		if relationErr != nil {
+			return false, nil, fmt.Errorf("node load balancer: attach shard firewall %s to new VM %s: %w", firewall.UUID, vmUUID, relationErr)
 		}
-		mutated = true
-	}
-	if mutated {
-		return false, nil, nil
+		if !converged {
+			return false, nil, nil
+		}
 	}
 	firewalls, err := c.provider.api.ListFirewalls(ctx, c.provider.config.Location)
 	if err != nil {

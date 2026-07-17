@@ -80,7 +80,7 @@ func (c *Controller) Reconcile(ctx context.Context, nodeClass *inspacev1.InSpace
 				readinessErr = fmt.Errorf("provider has no host-pool UUID mapping for class %q", hostClass)
 				break
 			}
-			if err := c.validator.ValidateNodeClass(ctx, nodeClass.Spec.Location, nodeClass.Spec.NetworkUUID, controlPlaneVIP.String(), nodeClass.Spec.PrivateLoadBalancerPool.Start, nodeClass.Spec.PrivateLoadBalancerPool.Stop, hostPoolUUID, nodeClass.Spec.FirewallUUID); err != nil {
+			if err := c.validator.ValidateNodeClass(ctx, nodeClass.Spec.Location, nodeClass.Spec.BillingAccountID, nodeClass.Spec.NetworkUUID, controlPlaneVIP.String(), nodeClass.Spec.PrivateLoadBalancerPool.Start, nodeClass.Spec.PrivateLoadBalancerPool.Stop, hostPoolUUID, nodeClass.Spec.FirewallUUID); err != nil {
 				readinessErr = fmt.Errorf("validating %s host pool %s: %w", hostClass, hostPoolUUID, err)
 				requeue = true
 				break
