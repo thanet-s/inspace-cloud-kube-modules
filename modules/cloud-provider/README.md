@@ -16,8 +16,11 @@ and the fixed three-server RKE2 bootstrap reconciler.
   use deterministic InSpace NLB/FIP ownership.
 - A reconciler that first creates one fixed Ubuntu 24.04 bastion
   (1 vCPU/2048 MiB/30 GiB), then creates exactly three Ubuntu 24.04 RKE2
-  servers in one bounded parallel batch. The API and RKE2 registration use a
-  caller-selected private VPC VIP; bootstrap creates no control-plane NLB.
+  servers in deterministic slot order. Each server's restrictive firewall
+  assignment is authoritatively proven before the next VM POST; already
+  protected servers may continue booting in parallel. The API and RKE2
+  registration use a caller-selected private VPC VIP; bootstrap creates no
+  control-plane NLB.
 - A cache-by-default bastion path. The cache listens only on the bastion's
   allocator-assigned private address as
   `cache.<metadata.name>.inspace.internal:8443`; it does not allocate another
@@ -89,6 +92,10 @@ Remote API mutations are blocked unless
 for literal loopback test servers; remote API URLs must be HTTPS. Every
 cross-origin redirect is blocked so the `apikey` header cannot escape to
 another host. The client does not automatically retry POST requests.
+It also blocks redirects and automatic replay for PUT, PATCH, and DELETE.
+Timeouts, HTTP 408/409/425/429/499 and 5xx responses, malformed success
+responses, and transport errors are unknown commit outcomes; controller
+readback, not the HTTP error class, decides convergence.
 
 No credential belongs in Git, YAML, command-line flags, or logs. Supply it in
 `INSPACE_API_TOKEN` (or legacy `INSPACE_API_KEY`) from a local `.env` file or a
@@ -103,10 +110,41 @@ public load-balancer FIP validation, not an optional Service-only setting.
 The target cluster does not exist yet, so the bootstrap controller runs from a
 workstation or management host. It reads the `InSpaceCluster` YAML wire object
 and reconciles safe, retryable passes. The fixed bastion is fully protected
-before any control-plane creation. Missing control-plane VMs are then one hard
-bounded batch: all three slots are launched concurrently, and slot-ordered
-errors retain every successful VM for the next pass. Each server must use
-exactly Ubuntu 24.04 with 2-16 vCPUs and 4096-65536 MiB memory.
+before any control-plane creation. Missing control-plane VMs are created in
+deterministic slot order with a hard creation bound of one. Each VM's
+restrictive firewall assignment must be authoritatively visible before the
+next VM POST; protected servers may continue booting in parallel, and
+slot-ordered errors retain every successful VM for the next pass. Each server
+must use exactly Ubuntu 24.04 with 2-16 vCPUs and 4096-65536 MiB memory.
+
+Bootstrap persists bounded mutation ledgers in status. `status.createAttempts`
+holds fourteen create/assignment/update slots: two firewall creates, four VM
+creates, four exact firewall-to-VM assignments, and four floating-IP metadata
+updates. `status.deleteAttempts` holds ten exact removal slots: four FIPs, four
+VMs, and two firewalls. Intent and issue state are stored before the cloud
+request. An issued operation is read/adopt-only across restart until exact
+authoritative readback resolves it. The standalone command writes both maps
+back to the cluster YAML with a file lock, compare-and-swap, atomic rename, and
+readback; a process restart therefore cannot forget an ambiguous mutation.
+
+After each status/file CAS, bootstrap repeats the exact create or mutation
+authority immediately before the cloud request. For deterministic VM and
+firewall creates, one exact owned name is adopted, only authoritative absence
+permits POST, and a foreign, duplicate, or failed read retains the issued
+receipt. A response UUID is provisional: only canonical detail, billing, shape,
+and configured-VPC readback can promote it into the ledger. A foreign response
+UUID is never used for protection or cleanup.
+
+If an issued bootstrap entry remains unresolved, stop every bootstrap process
+and save the complete cluster YAML before recovery. Query the exact
+deterministic name and persisted UUID/address in the configured
+location/account. If a create target or assignment exists, leave the
+`createAttempts` entry intact so it can be adopted. If a removal target still
+exists, leave the `deleteAttempts` entry intact; visibility never authorizes a
+second destructive request. Clear only that exact key, including its
+`issueID`, and only with provider-side terminal proof appropriate to the
+operation. Never clear a whole map or start a second cluster config with the
+same names to work around an issued entry.
 
 `spec.bootstrapCache` is required and `directDownload` defaults to `false`.
 Cached mode provisions the bastion with Docker from Docker's official Ubuntu
@@ -240,18 +278,20 @@ three control-plane VMs, because InSpace VM deletion only leaves an automatic
 FIP active and unassigned. Both managed firewalls are deleted only after their
 assignments are absent:
 
-Before each owned VM deletion, the running controller records that exact VM
-UUID and its expected managed-firewall UUID. A successful or normalized
-not-found DELETE refreshes the record. Every other HTTP/API or transport failure
-keeps it because response retry metadata does not prove whether DELETE committed,
-and the controller marks that outcome explicitly retryable. It retains the
-record for five minutes after DELETE returns and removes it only when the
-explicit local pre-dispatch mutation guard rejects the request. This bounded
-transition tolerates delayed firewall-assignment cleanup without
-allowing an unknown UUID, another firewall, a duplicate assignment, or an
-expired record to become deletion authority. A process restart forgets the
-transition and therefore fails closed until the cloud assignment readback has
-cleared.
+Before every FIP unassign/delete, VM delete, and firewall delete, the controller
+records the exact owned address, UUID, related UUID, deterministic slot, and
+issued identity. Once a request is issued, neither a success response, HTTP
+error, timeout, nor a still-visible object grants another dispatch. Only a
+typed local pre-dispatch `ErrMutationBlocked` can return the receipt to intent.
+The controller releases dependents only after two exact authoritative
+absence/relationship-withdrawal observations separated in time. If the exact
+resource or relationship reappears between those reads, only the absence
+evidence is cleared; the issued no-replay lock remains.
+Malformed VM-create rollback uses the same durable ledger, deletes the exact
+unprotected VM once, proves its absence, then removes its exact auto-FIP before
+atomically resetting the create/assignment/FIP slots for replacement. These
+receipts have no TTL, survive controller reconstruction, and reject an unknown
+UUID, wrong deterministic name, different firewall, or duplicate assignment.
 
 ```sh
 go run ./cmd/inspace-cluster-controller \
@@ -270,7 +310,10 @@ both firewall UUIDs. In cached mode it also reports
 `bootstrapCacheAddress`, `bootstrapCacheEndpoint`, `bootstrapCacheRegistry`,
 and the public `bootstrapCacheCABundle`; use the address and CA bundle in
 cached `InSpaceNodeClass` resources. Direct mode omits those fields.
-`maxParallelControlPlaneCreates: 3` is the hard CP creation bound.
+`maxParallelControlPlaneCreates: 1` is the hard CP creation bound. Missing VMs
+are created in slot order, and each must receive authoritative restrictive
+firewall protection before the next VM POST; their subsequent boots may still
+overlap.
 
 Control-plane slot 0 is the one-time RKE2 initializer. The controller creates
 it only when no control-plane VM exists. If slot 0 is absent while slot 1 or 2
@@ -456,10 +499,13 @@ anchor can therefore never be downgraded to a fresh prospective assignment;
 cleanup must first persist cloud-absence proof. It
 updates the existing firewall with `PUT`, retaining provider UUIDs for unchanged
 logical rules, and requires exact authoritative readback before activating a
-new Service. CCM records paid-create authority before POST. If a create response
-is ambiguous and no exact resource is observable, the state finalizer remains
-and CCM permanently refuses a second create until the original stable-name
-resource appears or an operator resolves the attempt after cloud-side proof.
+new Service. CCM records paid-create authority before POST and repeats exact
+deterministic-name absence or ownership after the owner CAS. Response UUIDs are
+provisional until the unique stable-name resource passes canonical readback. If
+a create response is ambiguous and no exact resource is observable, the state
+finalizer remains and CCM permanently refuses a second create until the original
+stable-name resource appears or an operator resolves the attempt after
+cloud-side proof.
 After an ambiguous update response or restart, cloud readback decides whether
 the pending update was applied; CCM permanently retains the issued fence and
 does not repeat the PUT on elapsed time. This prevents an older delayed request

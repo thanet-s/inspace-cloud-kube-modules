@@ -75,7 +75,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	createFences, err := provider.NewKubernetesCreateFenceStore(op.GetClient(), op.GetAPIReader())
+	createFences, err := provider.NewKubernetesCreateFenceStore(op.GetClient(), op.GetAPIReader(), cfg.secretNamespace)
 	if err != nil {
 		return err
 	}
@@ -95,7 +95,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	createFenceController, err := provider.NewCreateFenceController(op.GetClient(), op.GetAPIReader(), cloud)
+	createFenceController, err := provider.NewCreateFenceController(op.GetClient(), op.GetAPIReader(), cloud, cfg.secretNamespace)
 	if err != nil {
 		return err
 	}

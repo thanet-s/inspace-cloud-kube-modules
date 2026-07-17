@@ -2,6 +2,7 @@ package cloudprovider
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -9,6 +10,7 @@ import (
 	"fmt"
 	"net/netip"
 	"reflect"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -47,6 +49,8 @@ const (
 	annotationNodeLoadBalancerPendingFirewall    = "service.inspace.cloud/node-lb-pending-firewall-uuid"
 	annotationNodeLoadBalancerPendingFWName      = "service.inspace.cloud/node-lb-pending-firewall-name"
 	annotationNodeLoadBalancerPendingFWStarted   = "service.inspace.cloud/node-lb-pending-firewall-started-at"
+	annotationNodeLoadBalancerPendingFWIssued    = "service.inspace.cloud/node-lb-pending-firewall-issued-token"
+	annotationNodeLoadBalancerPendingFWIssuedAt  = "service.inspace.cloud/node-lb-pending-firewall-issued-at"
 	annotationNodeLoadBalancerPendingFWDelete    = "service.inspace.cloud/node-lb-pending-firewall-deleting"
 	annotationNodeLoadBalancerPendingFWAbsent    = "service.inspace.cloud/node-lb-pending-firewall-absence-count"
 	annotationNodeLoadBalancerPendingFWChecked   = "service.inspace.cloud/node-lb-pending-firewall-absence-checked-at"
@@ -59,6 +63,8 @@ const (
 	annotationNodeLoadBalancerWithdrawFWDetachAt = "service.inspace.cloud/node-lb-withdraw-firewall-detach-at"
 	annotationNodeLoadBalancerFirewallAssigning  = "service.inspace.cloud/node-lb-firewall-assigning-uuid"
 	annotationNodeLoadBalancerFirewallAssignAt   = "service.inspace.cloud/node-lb-firewall-assigning-started-at"
+	annotationNodeLoadBalancerFWDeleteTarget     = "service.inspace.cloud/node-lb-firewall-delete-target-uuid"
+	annotationNodeLoadBalancerFWDeleteIssued     = "service.inspace.cloud/node-lb-firewall-delete-issued-at"
 	annotationNodeLoadBalancerPreviousFirewall   = "service.inspace.cloud/node-lb-previous-firewall-uuid"
 	annotationNodeLoadBalancerPreviousShard      = "service.inspace.cloud/node-lb-previous-shard"
 	annotationNodeLoadBalancerDatapathShard      = "service.inspace.cloud/node-lb-datapath-shard"
@@ -66,28 +72,35 @@ const (
 	// The ready label is the API-owned eligibility gate used to derive private
 	// and public status pairs. Keep it protected so a kubelet cannot
 	// self-advertise.
-	nodeLoadBalancerReadyLabel                = "inspace.cloud.node-restriction.kubernetes.io/ready"
-	nodeLoadBalancerManagedLabel              = "inspace.cloud/node-lb-managed"
-	nodeLoadBalancerClusterLabel              = "inspace.cloud/node-lb-cluster"
-	nodeLoadBalancerProfileLabel              = "inspace.cloud/node-lb-profile"
-	nodeLoadBalancerDatapathLabel             = "inspace.cloud/node-lb-datapath"
-	nodeLoadBalancerServiceIdentityLabel      = "inspace.cloud/node-lb-service-id"
-	nodeLoadBalancerDatapathClass             = "inspace.cloud/node-datapath"
-	karpenterNodePoolLabel                    = "karpenter.sh/nodepool"
-	nodeLoadBalancerResync                    = 30 * time.Second
-	nodeLoadBalancerRetry                     = 10 * time.Second
-	nodeLoadBalancerAssignmentReadbackTimeout = 30 * time.Second
-	nodeLoadBalancerAssignmentReadbackDelay   = 500 * time.Millisecond
-	nodeLoadBalancerPendingCreateTimeout      = 5 * time.Minute
-	nodeLoadBalancerFirewallDetachRetry       = 5 * time.Minute
-	nodeLoadBalancerAbsenceConfirmationDelay  = 30 * time.Second
-	nodeLoadBalancerAbsenceConfirmations      = 3
+	nodeLoadBalancerReadyLabel               = "inspace.cloud.node-restriction.kubernetes.io/ready"
+	nodeLoadBalancerManagedLabel             = "inspace.cloud/node-lb-managed"
+	nodeLoadBalancerClusterLabel             = "inspace.cloud/node-lb-cluster"
+	nodeLoadBalancerProfileLabel             = "inspace.cloud/node-lb-profile"
+	nodeLoadBalancerDatapathLabel            = "inspace.cloud/node-lb-datapath"
+	nodeLoadBalancerServiceIdentityLabel     = "inspace.cloud/node-lb-service-id"
+	nodeLoadBalancerDatapathClass            = "inspace.cloud/node-datapath"
+	karpenterNodePoolLabel                   = "karpenter.sh/nodepool"
+	karpenterPublicIPv4Annotation            = "karpenter.inspace.cloud/public-ipv4"
+	karpenterFloatingIPNameAnnotation        = "karpenter.inspace.cloud/floating-ip-name"
+	karpenterBillingAccountAnnotation        = "karpenter.inspace.cloud/billing-account-id"
+	karpenterNodeNameAnnotation              = "karpenter.inspace.cloud/node-name"
+	nodeLoadBalancerResync                   = 30 * time.Second
+	nodeLoadBalancerRetry                    = 10 * time.Second
+	nodeLoadBalancerPendingCreateTimeout     = 5 * time.Minute
+	nodeLoadBalancerAbsenceConfirmationDelay = 30 * time.Second
+	nodeLoadBalancerAbsenceConfirmations     = 3
 )
 
 type nodeLoadBalancerAddress struct {
 	Node        *corev1.Node
 	PrivateIPv4 string
 	PublicIPv4  string
+}
+
+type managedNodeLoadBalancerVMIdentity struct {
+	VMUUID         string
+	FloatingIPName string
+	PublicIPv4     string
 }
 
 var (
@@ -101,6 +114,10 @@ type nodeLoadBalancerController struct {
 	nodes          corelisters.NodeLister
 	services       corelisters.ServiceLister
 	endpointSlices discoverylisters.EndpointSliceLister
+	// These two fields permit deterministic relationship-removal tests. The
+	// production constructor always installs the real clock and convergence delay.
+	firewallRelationNow         func() time.Time
+	firewallRelationAbsentDelay time.Duration
 
 	nodesSynced          cache.InformerSynced
 	servicesSynced       cache.InformerSynced
@@ -175,6 +192,7 @@ func newNodeLoadBalancerController(provider *Provider, factory informers.SharedI
 	endpointSlices := factory.Discovery().V1().EndpointSlices()
 	controller := &nodeLoadBalancerController{
 		provider: provider, nodes: nodes.Lister(), services: services.Lister(), endpointSlices: endpointSlices.Lister(),
+		firewallRelationNow: time.Now, firewallRelationAbsentDelay: nodeLoadBalancerAbsenceConfirmationDelay,
 		nodesSynced: nodes.Informer().HasSynced, servicesSynced: services.Informer().HasSynced,
 		endpointSlicesSynced: endpointSlices.Informer().HasSynced,
 		queue: workqueue.NewTypedRateLimitingQueueWithConfig(
@@ -895,6 +913,17 @@ func (c *nodeLoadBalancerController) detachOwnedServiceFirewallsForFailure(ctx c
 	if err != nil {
 		return err
 	}
+	owner := c.serviceFirewallRelationOwner(current)
+	converged, err := c.reconcileNodeLoadBalancerFirewallRelation(ctx, owner, nil)
+	if err != nil {
+		return fmt.Errorf("node load balancer: resolve Service firewall relation before emergency withdrawal: %w", err)
+	}
+	if !converged {
+		// Clearing an exact prior assignment/removal receipt is its own durable
+		// transition. A fresh pass must rediscover the Service-owned firewalls
+		// before it may authorize a different relationship mutation.
+		return errors.New("node load balancer: waiting for prior Service firewall relation readback before emergency withdrawal")
+	}
 	owned, discoveryErr := c.serviceFirewallsForEmergencyDetach(ctx, current)
 	assignments, assignmentSet, err := nodeLoadBalancerFirewallDetachAssignments(owned)
 	if err != nil {
@@ -907,8 +936,10 @@ func (c *nodeLoadBalancerController) detachOwnedServiceFirewallsForFailure(ctx c
 		return discoveryErr
 	}
 
+	// Retain the legacy withdrawal ledger as read-only-compatible evidence for
+	// upgrades and diagnostics. It no longer authorizes cloud mutations: the
+	// canonical Service relation fence below is the sole authority.
 	now := time.Now().UTC()
-	issueDetach := make([]nodeLoadBalancerFirewallDetachAssignment, 0, len(assignments))
 	_, _, err = c.updateExactParentService(ctx, current, func(copy *corev1.Service) (bool, error) {
 		storedSet := copy.Annotations[annotationNodeLoadBalancerWithdrawFWDetach]
 		storedAt := copy.Annotations[annotationNodeLoadBalancerWithdrawFWDetachAt]
@@ -931,20 +962,20 @@ func (c *nodeLoadBalancerController) detachOwnedServiceFirewallsForFailure(ctx c
 				}
 			}
 		}
-		changed := storedSet != assignmentSet
+		nextDetachedAt := make(map[string]string, len(assignments))
 		for _, assignment := range assignments {
 			pair := assignment.firewallUUID + "/" + assignment.vmUUID
 			encodedTime := detachedAt[pair]
-			if encodedTime != "" {
-				issuedAt, _ := time.Parse(time.RFC3339Nano, encodedTime)
-				if now.Before(issuedAt.Add(nodeLoadBalancerFirewallDetachRetry)) {
-					continue
-				}
+			if encodedTime == "" {
+				encodedTime = now.Format(time.RFC3339Nano)
 			}
-			detachedAt[pair] = now.Format(time.RFC3339Nano)
-			issueDetach = append(issueDetach, assignment)
-			changed = true
+			nextDetachedAt[pair] = encodedTime
 		}
+		encodedTimes, marshalErr := json.Marshal(nextDetachedAt)
+		if marshalErr != nil {
+			return false, fmt.Errorf("node load balancer: encode firewall withdrawal evidence timestamps: %w", marshalErr)
+		}
+		changed := storedSet != assignmentSet || storedAt != string(encodedTimes)
 		for _, key := range []string{
 			annotationNodeLoadBalancerWithdrawFWAbsent,
 			annotationNodeLoadBalancerWithdrawFWChecked,
@@ -958,10 +989,6 @@ func (c *nodeLoadBalancerController) detachOwnedServiceFirewallsForFailure(ctx c
 		if !changed {
 			return false, nil
 		}
-		encodedTimes, marshalErr := json.Marshal(detachedAt)
-		if marshalErr != nil {
-			return false, fmt.Errorf("node load balancer: encode firewall withdrawal detach timestamps: %w", marshalErr)
-		}
 		if copy.Annotations == nil {
 			copy.Annotations = map[string]string{}
 		}
@@ -970,29 +997,32 @@ func (c *nodeLoadBalancerController) detachOwnedServiceFirewallsForFailure(ctx c
 		return true, nil
 	})
 	if err != nil {
-		return errors.Join(discoveryErr, fmt.Errorf("node load balancer: persist firewall withdrawal detach fence: %w", err))
-	}
-	if len(issueDetach) == 0 {
-		return discoveryErr
+		return errors.Join(discoveryErr, fmt.Errorf("node load balancer: persist firewall withdrawal evidence: %w", err))
 	}
 
-	result := discoveryErr
-	for _, assignment := range issueDetach {
-		if err := c.provider.api.UnassignFirewallFromVM(
-			ctx,
-			c.provider.config.Location,
+	// Mutate exactly one sorted relationship per pass. The relation helper
+	// persists and reads back the canonical Service-owned issue, so a second VM
+	// on this firewall cannot be touched until this removal is authoritatively
+	// absent (or a local pre-dispatch block is durably retired).
+	assignment := assignments[0]
+	_, relationErr := c.reconcileNodeLoadBalancerFirewallRelation(
+		ctx,
+		owner,
+		&nodeLoadBalancerFirewallRelationFence{
+			operation:    nodeLoadBalancerFirewallRelationUnassign,
+			firewallUUID: assignment.firewallUUID,
+			vmUUID:       assignment.vmUUID,
+		},
+	)
+	if relationErr != nil {
+		return errors.Join(discoveryErr, fmt.Errorf(
+			"node load balancer: detach owned firewall %s from VM %s while failing closed: %w",
 			assignment.firewallUUID,
 			assignment.vmUUID,
-		); err != nil && !inspace.IsNotFound(err) {
-			result = errors.Join(result, fmt.Errorf(
-				"node load balancer: detach owned firewall %s from VM %s while failing closed: %w",
-				assignment.firewallUUID,
-				assignment.vmUUID,
-				err,
-			))
-		}
+			relationErr,
+		))
 	}
-	return result
+	return discoveryErr
 }
 
 type nodeLoadBalancerFirewallDetachAssignment struct {
@@ -1015,7 +1045,7 @@ func nodeLoadBalancerFirewallDetachAssignments(
 			}
 			key := firewall.UUID + "/" + resource.ResourceUUID
 			if _, duplicate := seen[key]; duplicate {
-				return nil, "", fmt.Errorf("node load balancer: duplicate firewall withdrawal assignment %s", key)
+				continue
 			}
 			seen[key] = struct{}{}
 			assignments = append(assignments, nodeLoadBalancerFirewallDetachAssignment{
@@ -1996,9 +2026,25 @@ func (c *nodeLoadBalancerController) ensureServiceFirewall(ctx context.Context, 
 	if err != nil {
 		return nil, "", false, err
 	}
+	if waiting, completed, resumeErr := c.resumeOwnedServiceFirewallDelete(ctx, service); resumeErr != nil || waiting || completed {
+		return nil, "", false, resumeErr
+	}
 	firewalls, err := c.provider.api.ListFirewalls(ctx, c.provider.config.Location)
 	if err != nil {
 		return nil, "", false, fmt.Errorf("node load balancer: list firewalls: %w", err)
+	}
+	if nodes != nil {
+		converged, relationErr := c.reconcileNodeLoadBalancerFirewallRelation(
+			ctx,
+			c.serviceFirewallRelationOwner(service),
+			nil,
+		)
+		if relationErr != nil {
+			return nil, "", false, relationErr
+		}
+		if !converged {
+			return nil, "", false, nil
+		}
 	}
 	var firewall *inspace.Firewall
 	var currentFirewallByUUID *inspace.Firewall
@@ -2007,6 +2053,8 @@ func (c *nodeLoadBalancerController) ensureServiceFirewall(ctx context.Context, 
 	pendingUUID := service.Annotations[annotationNodeLoadBalancerPendingFirewall]
 	pendingName := service.Annotations[annotationNodeLoadBalancerPendingFWName]
 	pendingStarted := service.Annotations[annotationNodeLoadBalancerPendingFWStarted]
+	pendingIssued := service.Annotations[annotationNodeLoadBalancerPendingFWIssued]
+	pendingIssuedAt := service.Annotations[annotationNodeLoadBalancerPendingFWIssuedAt]
 	pendingDelete := service.Annotations[annotationNodeLoadBalancerPendingFWDelete] == "true"
 	currentUUID := service.Annotations[annotationNodeLoadBalancerFirewallUUID]
 	currentHash := service.Annotations[annotationNodeLoadBalancerFirewallHash]
@@ -2018,6 +2066,17 @@ func (c *nodeLoadBalancerController) ensureServiceFirewall(ctx context.Context, 
 	}
 	if pendingName != "" && pendingStarted == "" {
 		return nil, "", false, errors.New("node load balancer: pending firewall name is missing its create-attempt timestamp")
+	}
+	if (pendingIssued == "") != (pendingIssuedAt == "") {
+		return nil, "", false, errors.New("node load balancer: pending firewall create-issued token and timestamp must be persisted together")
+	}
+	if pendingIssued != "" {
+		if pendingName == "" || pendingStarted == "" {
+			return nil, "", false, errors.New("node load balancer: firewall create-issued fence lacks its immutable pending identity")
+		}
+		if err := validateNodeLoadBalancerFirewallCreateIssued(pendingIssued, pendingIssuedAt); err != nil {
+			return nil, "", false, err
+		}
 	}
 	for i := range firewalls {
 		if currentUUID != "" && firewalls[i].UUID == currentUUID {
@@ -2056,13 +2115,35 @@ func (c *nodeLoadBalancerController) ensureServiceFirewall(ctx context.Context, 
 		}
 		pendingFirewall := pendingFirewallByName
 		if pendingFirewall == nil {
-			if _, confirmErr := c.confirmPendingFirewallAbsent(ctx, service, time.Now().UTC()); confirmErr != nil {
-				return nil, "", false, confirmErr
+			if pendingIssued != "" {
+				return nil, "", false, fmt.Errorf(
+					"node load balancer: Service firewall create attempt %s issued at %s remains ambiguous; waiting for deterministic-name adoption or operator resolution",
+					pendingIssued,
+					pendingIssuedAt,
+				)
 			}
-			// A successful create response is only a provisional handle. Do not
-			// issue a second billable POST while its authoritative list readback
-			// may still be converging. Confirmation and metadata clearing happen
-			// in separate reconciliations before a replacement POST is allowed.
+			startedAt, parseErr := time.Parse(time.RFC3339Nano, pendingStarted)
+			if parseErr != nil {
+				return nil, "", false, fmt.Errorf("node load balancer: invalid pending firewall create timestamp: %w", parseErr)
+			}
+			if !time.Now().UTC().Before(startedAt.Add(nodeLoadBalancerPendingCreateTimeout)) ||
+				service.Annotations[annotationNodeLoadBalancerPendingFWAbsent] != "" ||
+				service.Annotations[annotationNodeLoadBalancerPendingFWChecked] != "" {
+				if _, confirmErr := c.confirmPendingFirewallAbsent(ctx, service, time.Now().UTC()); confirmErr != nil {
+					return nil, "", false, confirmErr
+				}
+				return nil, "", false, nil
+			}
+			issuedService, issued, issueErr := c.ensurePendingFirewallCreateIssued(ctx, service)
+			if issueErr != nil {
+				return nil, "", false, issueErr
+			}
+			if !issued {
+				return nil, "", false, nil
+			}
+			if createErr := c.createServiceFirewallFromIssuedIntent(ctx, issuedService, desired); createErr != nil {
+				return nil, "", false, createErr
+			}
 			return nil, "", false, nil
 		}
 		if !nodeLoadBalancerFirewallOwnedByService(*pendingFirewall, c.provider.config.ClusterID, string(service.UID), c.provider.config.BillingAccountID) {
@@ -2120,43 +2201,24 @@ func (c *nodeLoadBalancerController) ensureServiceFirewall(ctx context.Context, 
 		if !prepared {
 			return nil, "", false, nil
 		}
-		current, err := c.getExactParentService(ctx, preparedService)
-		if err != nil {
-			return nil, "", false, fmt.Errorf("node load balancer: revalidate firewall create attempt: %w", err)
+		issuedService, issued, issueErr := c.ensurePendingFirewallCreateIssued(ctx, preparedService)
+		if issueErr != nil {
+			return nil, "", false, issueErr
 		}
-		currentDesired, err := c.desiredServiceFirewall(current)
-		if err != nil {
-			return nil, "", false, err
+		if !issued {
+			return nil, "", false, nil
 		}
-		if current.DeletionTimestamp != nil || !isNodeLoadBalancerService(current) ||
-			current.Annotations[annotationNodeLoadBalancerPendingFWName] != desired.Request.DisplayName ||
-			current.Annotations[annotationNodeLoadBalancerPendingFWStarted] != preparedService.Annotations[annotationNodeLoadBalancerPendingFWStarted] ||
-			currentDesired.Hash != desired.Hash || currentDesired.Request.DisplayName != desired.Request.DisplayName {
-			return nil, "", false, errors.New("node load balancer: firewall create attempt became stale before the cloud API call")
+		if createErr := c.createServiceFirewallFromIssuedIntent(ctx, issuedService, desired); createErr != nil {
+			return nil, "", false, createErr
 		}
-		created, err := c.provider.api.CreateFirewall(ctx, c.provider.config.Location, desired.Request)
-		if err != nil {
-			if definitiveNodeLoadBalancerCreateFailure(err) {
-				if _, clearErr := c.clearPendingFirewallMetadata(ctx, preparedService); clearErr != nil {
-					return nil, "", false, errors.Join(fmt.Errorf("node load balancer: create Service firewall: %w", err), clearErr)
-				}
-			}
-			return nil, "", false, fmt.Errorf("node load balancer: create Service firewall: %w", err)
-		}
-		if err := validateCreatedNodeLoadBalancerFirewall(created, desired); err != nil {
-			return nil, "", false, fmt.Errorf("node load balancer: created firewall response: %w", err)
-		}
-		if _, err := c.ensurePendingFirewallMetadata(ctx, current, created.UUID, desired.Request.DisplayName); err != nil {
-			return nil, "", false, err
-		}
-		// InSpace may omit the name, description, billing account, and rules from
-		// the POST response. Never assign from this provisional handle; the next
-		// reconciliation must prove the deterministic name and exact policy via
-		// ListFirewalls first.
 		return nil, "", false, nil
 	}
 
 	ready := true
+	assignments, err := nodeLoadBalancerFirewallVMAssignments(*firewall)
+	if err != nil {
+		return nil, "", false, err
+	}
 	for _, node := range nodes {
 		if !nodeLoadBalancerNodeHealthy(node) {
 			continue
@@ -2166,14 +2228,24 @@ func (c *nodeLoadBalancerController) ensureServiceFirewall(ctx context.Context, 
 			ready = false
 			continue
 		}
-		if !firewallAssignedToVM(*firewall, vmUUID) {
+		if _, assigned := assignments[strings.ToLower(vmUUID)]; !assigned {
 			if err := c.validateServiceFirewallAssignmentMutation(ctx, service, *firewall, node); err != nil {
 				return nil, "", false, fmt.Errorf("node load balancer: refuse firewall assignment to VM %s: %w", vmUUID, err)
 			}
-			if err := c.provider.api.AssignFirewallToVM(ctx, c.provider.config.Location, firewall.UUID, vmUUID); err != nil {
-				return nil, "", false, fmt.Errorf("node load balancer: assign firewall %s to VM %s: %w", firewall.UUID, vmUUID, err)
+			converged, relationErr := c.reconcileNodeLoadBalancerFirewallRelation(
+				ctx,
+				c.serviceFirewallRelationOwner(service),
+				&nodeLoadBalancerFirewallRelationFence{
+					operation: nodeLoadBalancerFirewallRelationAssign, firewallUUID: firewall.UUID, vmUUID: vmUUID,
+				},
+			)
+			if relationErr != nil {
+				return nil, "", false, fmt.Errorf("node load balancer: assign firewall %s to VM %s: %w", firewall.UUID, vmUUID, relationErr)
 			}
 			ready = false
+			if !converged {
+				break
+			}
 		}
 	}
 	previousUUID := service.Annotations[annotationNodeLoadBalancerPreviousFirewall]
@@ -2259,15 +2331,215 @@ func (c *nodeLoadBalancerController) validateServiceFirewallAssignmentMutation(
 	return nil
 }
 
-func definitiveNodeLoadBalancerCreateFailure(err error) bool {
-	if err == nil {
-		return false
+// nodeLoadBalancerMutationKnownPreDispatch identifies the only error that
+// proves the cloud request never left this process. Every HTTP response and
+// transport error is post-dispatch ambiguous and must retain its issued
+// receipt until exact desired-state readback resolves it.
+func nodeLoadBalancerMutationKnownPreDispatch(err error) bool {
+	return errors.Is(err, inspace.ErrMutationBlocked)
+}
+
+func newNodeLoadBalancerFirewallCreateIssuedToken() (string, error) {
+	value := make([]byte, 16)
+	if _, err := rand.Read(value); err != nil {
+		return "", fmt.Errorf("node load balancer: generate firewall create-issued token: %w", err)
 	}
-	if errors.Is(err, inspace.ErrMutationBlocked) {
-		return true
+	return hex.EncodeToString(value), nil
+}
+
+func validateNodeLoadBalancerFirewallCreateIssued(token, issuedAt string) error {
+	decoded, err := hex.DecodeString(token)
+	if err != nil || len(decoded) != 16 {
+		return fmt.Errorf("node load balancer: invalid firewall create-issued token %q", token)
 	}
-	var apiErr *inspace.APIError
-	return errors.As(err, &apiErr) && !apiErr.Retryable
+	if _, err := time.Parse(time.RFC3339Nano, issuedAt); err != nil {
+		return fmt.Errorf("node load balancer: invalid firewall create-issued timestamp: %w", err)
+	}
+	return nil
+}
+
+func (c *nodeLoadBalancerController) ensurePendingFirewallCreateIssued(
+	ctx context.Context,
+	service *corev1.Service,
+) (*corev1.Service, bool, error) {
+	name := service.Annotations[annotationNodeLoadBalancerPendingFWName]
+	started := service.Annotations[annotationNodeLoadBalancerPendingFWStarted]
+	if name == "" || started == "" {
+		return nil, false, errors.New("node load balancer: complete pending firewall identity is required before create issuance")
+	}
+	token, err := newNodeLoadBalancerFirewallCreateIssuedToken()
+	if err != nil {
+		return nil, false, err
+	}
+	issuedAt := time.Now().UTC().Format(time.RFC3339Nano)
+	updated, changed, err := c.updateExactParentService(ctx, service, func(copy *corev1.Service) (bool, error) {
+		if copy.DeletionTimestamp != nil || !isNodeLoadBalancerService(copy) ||
+			copy.Annotations[annotationNodeLoadBalancerPendingFWName] != name ||
+			copy.Annotations[annotationNodeLoadBalancerPendingFWStarted] != started ||
+			copy.Annotations[annotationNodeLoadBalancerPendingFirewall] != "" ||
+			copy.Annotations[annotationNodeLoadBalancerPendingFWDelete] != "" {
+			return false, errors.New("node load balancer: pending firewall identity changed before create issuance")
+		}
+		desired, desiredErr := c.desiredServiceFirewall(copy)
+		if desiredErr != nil || desired.Request.DisplayName != name {
+			return false, errors.Join(desiredErr, errors.New("node load balancer: Service firewall policy changed before create issuance"))
+		}
+		existingToken := copy.Annotations[annotationNodeLoadBalancerPendingFWIssued]
+		existingAt := copy.Annotations[annotationNodeLoadBalancerPendingFWIssuedAt]
+		if existingToken != "" || existingAt != "" {
+			if existingToken == "" || existingAt == "" {
+				return false, errors.New("node load balancer: incomplete firewall create-issued fence")
+			}
+			if validateErr := validateNodeLoadBalancerFirewallCreateIssued(existingToken, existingAt); validateErr != nil {
+				return false, validateErr
+			}
+			return false, nil
+		}
+		copy.Annotations[annotationNodeLoadBalancerPendingFWIssued] = token
+		copy.Annotations[annotationNodeLoadBalancerPendingFWIssuedAt] = issuedAt
+		delete(copy.Annotations, annotationNodeLoadBalancerPendingFWAbsent)
+		delete(copy.Annotations, annotationNodeLoadBalancerPendingFWChecked)
+		return true, nil
+	})
+	if err != nil {
+		return nil, false, fmt.Errorf("node load balancer: persist Service firewall create-issued fence: %w", err)
+	}
+	return updated, changed, nil
+}
+
+func (c *nodeLoadBalancerController) createServiceFirewallFromIssuedIntent(
+	ctx context.Context,
+	service *corev1.Service,
+	desired desiredNodeLoadBalancerFirewall,
+) error {
+	current, err := c.getExactParentService(ctx, service)
+	if err != nil {
+		return fmt.Errorf("node load balancer: revalidate issued firewall create attempt: %w", err)
+	}
+	currentDesired, err := c.desiredServiceFirewall(current)
+	if err != nil {
+		return err
+	}
+	token := service.Annotations[annotationNodeLoadBalancerPendingFWIssued]
+	issuedAt := service.Annotations[annotationNodeLoadBalancerPendingFWIssuedAt]
+	if err := validateNodeLoadBalancerFirewallCreateIssued(token, issuedAt); err != nil {
+		return err
+	}
+	if current.DeletionTimestamp != nil || !isNodeLoadBalancerService(current) ||
+		current.Annotations[annotationNodeLoadBalancerPendingFWName] != desired.Request.DisplayName ||
+		current.Annotations[annotationNodeLoadBalancerPendingFWStarted] != service.Annotations[annotationNodeLoadBalancerPendingFWStarted] ||
+		current.Annotations[annotationNodeLoadBalancerPendingFWIssued] != token ||
+		current.Annotations[annotationNodeLoadBalancerPendingFWIssuedAt] != issuedAt ||
+		currentDesired.Hash != desired.Hash || currentDesired.Request.DisplayName != desired.Request.DisplayName {
+		return errors.New("node load balancer: firewall create-issued attempt became stale before the cloud API call")
+	}
+	observed, absent, err := c.exactNodeLoadBalancerFirewallNameFresh(ctx, desired.Request.DisplayName)
+	if err != nil {
+		return fmt.Errorf("node load balancer: authorize Service firewall create after issue: %w", err)
+	}
+	if !absent {
+		if observed == nil || !validNodeLoadBalancerCloudUUID(observed.UUID) ||
+			!nodeLoadBalancerFirewallOwnedByService(
+				*observed,
+				c.provider.config.ClusterID,
+				string(current.UID),
+				c.provider.config.BillingAccountID,
+			) || !nodeLoadBalancerFirewallMatches(*observed, desired) {
+			return fmt.Errorf(
+				"node load balancer: deterministic Service firewall name %q became foreign after create issue",
+				desired.Request.DisplayName,
+			)
+		}
+		committed, recoveryErr := c.resolveServiceFirewallCreateReadback(ctx, current, desired)
+		if recoveryErr != nil {
+			return recoveryErr
+		}
+		if !committed {
+			return errors.New("node load balancer: observed Service firewall was not durably promoted")
+		}
+		return nil
+	}
+	created, err := c.provider.api.CreateFirewall(ctx, c.provider.config.Location, desired.Request)
+	if err != nil {
+		createErr := fmt.Errorf("node load balancer: create Service firewall: %w", err)
+		if nodeLoadBalancerMutationKnownPreDispatch(err) {
+			_, clearErr := c.clearPendingFirewallMetadata(ctx, current)
+			return errors.Join(createErr, clearErr)
+		}
+		committed, recoveryErr := c.resolveServiceFirewallCreateReadback(ctx, current, desired)
+		if recoveryErr != nil {
+			return errors.Join(createErr, recoveryErr)
+		}
+		if committed {
+			return nil
+		}
+		return createErr
+	}
+	if err := validateCreatedNodeLoadBalancerFirewall(created, desired); err != nil {
+		responseErr := fmt.Errorf("node load balancer: created firewall response: %w", err)
+		committed, recoveryErr := c.resolveServiceFirewallCreateReadback(ctx, current, desired)
+		if recoveryErr != nil {
+			return errors.Join(responseErr, recoveryErr)
+		}
+		if committed {
+			return nil
+		}
+		return responseErr
+	}
+	// The response is only a provisional handle. Deterministic-name ownership,
+	// exact policy, and UUID are adopted exclusively from a later unfiltered
+	// ListFirewalls readback.
+	committed, recoveryErr := c.resolveServiceFirewallCreateReadback(ctx, current, desired)
+	if recoveryErr != nil {
+		return recoveryErr
+	}
+	if !committed {
+		return errors.New("node load balancer: Service firewall create response lacks authoritative readback")
+	}
+	return nil
+}
+
+// resolveServiceFirewallCreateReadback performs a new authoritative read after
+// an HTTP error or a malformed success response. The issued
+// receipt is transitioned only when that read proves the exact intended
+// firewall exists. Absence, foreign, duplicate, or unreadable state leaves the
+// receipt intact because a dispatched request can still commit later.
+func (c *nodeLoadBalancerController) resolveServiceFirewallCreateReadback(
+	ctx context.Context,
+	service *corev1.Service,
+	desired desiredNodeLoadBalancerFirewall,
+) (bool, error) {
+	items, err := c.provider.api.ListFirewalls(ctx, c.provider.config.Location)
+	if err != nil {
+		return false, fmt.Errorf("node load balancer: read back Service firewall after create response: %w", err)
+	}
+	var observed *inspace.Firewall
+	for index := range items {
+		item := items[index]
+		if item.EffectiveName() != desired.Request.DisplayName {
+			continue
+		}
+		if observed != nil {
+			return false, fmt.Errorf("node load balancer: multiple firewalls use managed name %q after create response", desired.Request.DisplayName)
+		}
+		copy := item
+		observed = &copy
+	}
+	if observed != nil {
+		if !validNodeLoadBalancerCloudUUID(observed.UUID) || !nodeLoadBalancerFirewallOwnedByService(
+			*observed,
+			c.provider.config.ClusterID,
+			string(service.UID),
+			c.provider.config.BillingAccountID,
+		) || !nodeLoadBalancerFirewallMatches(*observed, desired) {
+			return false, fmt.Errorf("node load balancer: managed Service firewall name %q resolved to a foreign or third-state resource after create response", desired.Request.DisplayName)
+		}
+		if _, err := c.ensurePendingFirewallMetadata(ctx, service, observed.UUID, desired.Request.DisplayName); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+	return false, fmt.Errorf("node load balancer: Service firewall create outcome remains ambiguous after exact name absence readback")
 }
 
 func (c *nodeLoadBalancerController) ensurePendingFirewallCreateIntent(ctx context.Context, service *corev1.Service, name string) (*corev1.Service, bool, error) {
@@ -2295,6 +2567,8 @@ func (c *nodeLoadBalancerController) ensurePendingFirewallCreateIntent(ctx conte
 		copy.Annotations[annotationNodeLoadBalancerPendingFWName] = name
 		copy.Annotations[annotationNodeLoadBalancerPendingFWStarted] = started
 		delete(copy.Annotations, annotationNodeLoadBalancerPendingFirewall)
+		delete(copy.Annotations, annotationNodeLoadBalancerPendingFWIssued)
+		delete(copy.Annotations, annotationNodeLoadBalancerPendingFWIssuedAt)
 		delete(copy.Annotations, annotationNodeLoadBalancerPendingFWDelete)
 		delete(copy.Annotations, annotationNodeLoadBalancerPendingFWAbsent)
 		delete(copy.Annotations, annotationNodeLoadBalancerPendingFWChecked)
@@ -2311,17 +2585,25 @@ func (c *nodeLoadBalancerController) ensurePendingFirewallMetadata(ctx context.C
 		return false, errors.New("node load balancer: complete provisional firewall identity is required")
 	}
 	expectedStarted := service.Annotations[annotationNodeLoadBalancerPendingFWStarted]
+	expectedIssued := service.Annotations[annotationNodeLoadBalancerPendingFWIssued]
+	expectedIssuedAt := service.Annotations[annotationNodeLoadBalancerPendingFWIssuedAt]
 	_, changed, err := c.updateExactParentService(ctx, service, func(copy *corev1.Service) (bool, error) {
 		if copy.Annotations[annotationNodeLoadBalancerPendingFWName] != name ||
-			expectedStarted == "" || copy.Annotations[annotationNodeLoadBalancerPendingFWStarted] != expectedStarted {
+			expectedStarted == "" || copy.Annotations[annotationNodeLoadBalancerPendingFWStarted] != expectedStarted ||
+			copy.Annotations[annotationNodeLoadBalancerPendingFWIssued] != expectedIssued ||
+			copy.Annotations[annotationNodeLoadBalancerPendingFWIssuedAt] != expectedIssuedAt {
 			return false, errors.New("node load balancer: provisional firewall create attempt changed before identity persistence")
 		}
 		if copy.Annotations[annotationNodeLoadBalancerPendingFirewall] == uuid &&
+			copy.Annotations[annotationNodeLoadBalancerPendingFWIssued] == "" &&
+			copy.Annotations[annotationNodeLoadBalancerPendingFWIssuedAt] == "" &&
 			copy.Annotations[annotationNodeLoadBalancerPendingFWAbsent] == "" &&
 			copy.Annotations[annotationNodeLoadBalancerPendingFWChecked] == "" {
 			return false, nil
 		}
 		copy.Annotations[annotationNodeLoadBalancerPendingFirewall] = uuid
+		delete(copy.Annotations, annotationNodeLoadBalancerPendingFWIssued)
+		delete(copy.Annotations, annotationNodeLoadBalancerPendingFWIssuedAt)
 		delete(copy.Annotations, annotationNodeLoadBalancerPendingFWAbsent)
 		delete(copy.Annotations, annotationNodeLoadBalancerPendingFWChecked)
 		return true, nil
@@ -2335,12 +2617,17 @@ func (c *nodeLoadBalancerController) ensurePendingFirewallMetadata(ctx context.C
 func (c *nodeLoadBalancerController) clearPendingFirewallMetadata(ctx context.Context, service *corev1.Service) (bool, error) {
 	expectedName := service.Annotations[annotationNodeLoadBalancerPendingFWName]
 	expectedStarted := service.Annotations[annotationNodeLoadBalancerPendingFWStarted]
+	expectedIssued := service.Annotations[annotationNodeLoadBalancerPendingFWIssued]
+	expectedIssuedAt := service.Annotations[annotationNodeLoadBalancerPendingFWIssuedAt]
 	_, changed, err := c.updateExactParentService(ctx, service, func(copy *corev1.Service) (bool, error) {
 		if copy.Annotations[annotationNodeLoadBalancerPendingFWName] != expectedName ||
-			copy.Annotations[annotationNodeLoadBalancerPendingFWStarted] != expectedStarted {
+			copy.Annotations[annotationNodeLoadBalancerPendingFWStarted] != expectedStarted ||
+			copy.Annotations[annotationNodeLoadBalancerPendingFWIssued] != expectedIssued ||
+			copy.Annotations[annotationNodeLoadBalancerPendingFWIssuedAt] != expectedIssuedAt {
 			return false, errors.New("node load balancer: provisional firewall create attempt changed before metadata clear")
 		}
 		if copy.Annotations[annotationNodeLoadBalancerPendingFirewall] == "" && expectedName == "" && expectedStarted == "" &&
+			expectedIssued == "" && expectedIssuedAt == "" &&
 			copy.Annotations[annotationNodeLoadBalancerPendingFWDelete] == "" &&
 			copy.Annotations[annotationNodeLoadBalancerPendingFWAbsent] == "" &&
 			copy.Annotations[annotationNodeLoadBalancerPendingFWChecked] == "" {
@@ -2349,6 +2636,8 @@ func (c *nodeLoadBalancerController) clearPendingFirewallMetadata(ctx context.Co
 		delete(copy.Annotations, annotationNodeLoadBalancerPendingFirewall)
 		delete(copy.Annotations, annotationNodeLoadBalancerPendingFWName)
 		delete(copy.Annotations, annotationNodeLoadBalancerPendingFWStarted)
+		delete(copy.Annotations, annotationNodeLoadBalancerPendingFWIssued)
+		delete(copy.Annotations, annotationNodeLoadBalancerPendingFWIssuedAt)
 		delete(copy.Annotations, annotationNodeLoadBalancerPendingFWDelete)
 		delete(copy.Annotations, annotationNodeLoadBalancerPendingFWAbsent)
 		delete(copy.Annotations, annotationNodeLoadBalancerPendingFWChecked)
@@ -2398,6 +2687,8 @@ func (c *nodeLoadBalancerController) promotePendingFirewallMetadata(
 			annotationNodeLoadBalancerPendingFirewall,
 			annotationNodeLoadBalancerPendingFWName,
 			annotationNodeLoadBalancerPendingFWStarted,
+			annotationNodeLoadBalancerPendingFWIssued,
+			annotationNodeLoadBalancerPendingFWIssuedAt,
 			annotationNodeLoadBalancerPendingFWDelete,
 			annotationNodeLoadBalancerPendingFWAbsent,
 			annotationNodeLoadBalancerPendingFWChecked,
@@ -2443,6 +2734,13 @@ func (c *nodeLoadBalancerController) confirmPendingFirewallAbsent(ctx context.Co
 	current, err := c.getExactParentService(ctx, service)
 	if err != nil {
 		return false, err
+	}
+	if issued := current.Annotations[annotationNodeLoadBalancerPendingFWIssued]; issued != "" ||
+		current.Annotations[annotationNodeLoadBalancerPendingFWIssuedAt] != "" {
+		return false, fmt.Errorf(
+			"node load balancer: firewall create-issued attempt %s cannot be cleared by absence confirmation; deterministic-name adoption or operator resolution is required",
+			issued,
+		)
 	}
 	started := current.Annotations[annotationNodeLoadBalancerPendingFWStarted]
 	if started == "" {
@@ -2544,8 +2842,10 @@ func (c *nodeLoadBalancerController) recordFirewallAbsence(
 		if copy.Annotations == nil {
 			copy.Annotations = map[string]string{}
 		}
-		copy.Annotations[countAnnotation] = strconv.Itoa(count + 1)
+		next := count + 1
+		copy.Annotations[countAnnotation] = strconv.Itoa(next)
 		copy.Annotations[checkedAnnotation] = now.UTC().Format(time.RFC3339Nano)
+		confirmed = next >= nodeLoadBalancerAbsenceConfirmations
 		return true, nil
 	})
 	if err != nil {
@@ -2593,8 +2893,8 @@ func nodeLoadBalancerFirewallMatches(firewall inspace.Firewall, desired desiredN
 }
 
 func validateCreatedNodeLoadBalancerFirewall(firewall *inspace.Firewall, desired desiredNodeLoadBalancerFirewall) error {
-	if firewall == nil || firewall.UUID == "" {
-		return errors.New("response has no firewall UUID")
+	if firewall == nil || !validNodeLoadBalancerCloudUUID(firewall.UUID) {
+		return errors.New("response has no valid firewall UUID")
 	}
 	if name := firewall.EffectiveName(); name != "" && name != desired.Request.DisplayName {
 		return fmt.Errorf("name %q does not match %q", name, desired.Request.DisplayName)
@@ -2625,12 +2925,12 @@ func nodeLoadBalancerFirewallRuleKey(rule inspace.FirewallRule) string {
 }
 
 func firewallAssignedToVM(firewall inspace.Firewall, vmUUID string) bool {
-	for _, resource := range firewall.ResourcesAssigned {
-		if strings.EqualFold(resource.ResourceType, "vm") && resource.ResourceUUID == vmUUID {
-			return true
-		}
+	assignments, err := nodeLoadBalancerFirewallVMAssignments(firewall)
+	if err != nil {
+		return false
 	}
-	return false
+	_, assigned := assignments[strings.ToLower(vmUUID)]
+	return assigned
 }
 
 func nodeLoadBalancerVMUUID(node *corev1.Node) (string, bool) {
@@ -2793,6 +3093,9 @@ func (c *nodeLoadBalancerController) serviceFirewallAssignmentsMatch(
 	if firewallUUID == "" || current.Annotations[annotationNodeLoadBalancerFirewallUUID] != firewallUUID {
 		return false, errors.New("node load balancer: firewall assignment readback is not bound to current metadata")
 	}
+	if current.Annotations[annotationNodeLoadBalancerFirewallRelationIssued] != "" {
+		return false, nil
+	}
 	expectedHash := current.Annotations[annotationNodeLoadBalancerFirewallHash]
 	if expectedHash == "" {
 		return false, errors.New("node load balancer: firewall assignment readback is missing the policy hash")
@@ -2831,7 +3134,11 @@ func (c *nodeLoadBalancerController) serviceFirewallAssignmentsMatch(
 		if assignmentErr != nil {
 			return false, assignmentErr
 		}
-		if len(assigned) != 0 || len(firewall.ResourcesAssigned) != len(desiredVMs) {
+		normalizedAssignments, assignmentErr := nodeLoadBalancerFirewallVMAssignments(firewall)
+		if assignmentErr != nil {
+			return false, assignmentErr
+		}
+		if len(assigned) != 0 || len(normalizedAssignments) != len(desiredVMs) {
 			return false, nil
 		}
 	}
@@ -2973,6 +3280,17 @@ func (c *nodeLoadBalancerController) quarantineInvalidService(ctx context.Contex
 		c.queue.AddAfter(service.Namespace+"/"+service.Name, nodeLoadBalancerRetry)
 		return nil
 	}
+	if waiting, completed, err := c.resumeOwnedServiceFirewallDelete(ctx, service); err != nil || waiting {
+		if waiting {
+			c.queue.AddAfter(service.Namespace+"/"+service.Name, nodeLoadBalancerRetry)
+		}
+		return err
+	} else if completed {
+		service, err = c.getExactParentService(ctx, service)
+		if err != nil {
+			return err
+		}
+	}
 	owned, err := c.ownedServiceFirewalls(ctx, service)
 	if err != nil {
 		return err
@@ -3059,8 +3377,11 @@ func (c *nodeLoadBalancerController) preparePendingFirewallTeardown(
 ) (bool, error) {
 	pendingName := service.Annotations[annotationNodeLoadBalancerPendingFWName]
 	pendingUUID := service.Annotations[annotationNodeLoadBalancerPendingFirewall]
+	pendingIssued := service.Annotations[annotationNodeLoadBalancerPendingFWIssued]
+	pendingIssuedAt := service.Annotations[annotationNodeLoadBalancerPendingFWIssuedAt]
 	if pendingName == "" {
 		if pendingUUID != "" || service.Annotations[annotationNodeLoadBalancerPendingFWStarted] != "" ||
+			pendingIssued != "" || pendingIssuedAt != "" ||
 			service.Annotations[annotationNodeLoadBalancerPendingFWDelete] != "" ||
 			service.Annotations[annotationNodeLoadBalancerPendingFWAbsent] != "" ||
 			service.Annotations[annotationNodeLoadBalancerPendingFWChecked] != "" {
@@ -3070,6 +3391,14 @@ func (c *nodeLoadBalancerController) preparePendingFirewallTeardown(
 	}
 	if service.Annotations[annotationNodeLoadBalancerPendingFWStarted] == "" {
 		return false, errors.New("node load balancer: pending firewall name is missing its create-attempt timestamp")
+	}
+	if (pendingIssued == "") != (pendingIssuedAt == "") {
+		return false, errors.New("node load balancer: incomplete pending firewall create-issued fence during teardown")
+	}
+	if pendingIssued != "" {
+		if err := validateNodeLoadBalancerFirewallCreateIssued(pendingIssued, pendingIssuedAt); err != nil {
+			return false, err
+		}
 	}
 	var pending *inspace.Firewall
 	for i := range owned {
@@ -3087,6 +3416,16 @@ func (c *nodeLoadBalancerController) preparePendingFirewallTeardown(
 	}
 	if pending != nil && pendingUUID != "" && pending.UUID != pendingUUID {
 		return false, fmt.Errorf("node load balancer: pending firewall name %q resolved to unexpected UUID %s", pendingName, pending.UUID)
+	}
+	if pending != nil && (pendingUUID == "" || pendingIssued != "") {
+		return c.ensurePendingFirewallMetadata(ctx, service, pending.UUID, pendingName)
+	}
+	if pending == nil && pendingIssued != "" {
+		return false, fmt.Errorf(
+			"node load balancer: Service firewall create attempt %s issued at %s remains ambiguous during teardown; retaining the Service finalizer until deterministic-name adoption or operator resolution",
+			pendingIssued,
+			pendingIssuedAt,
+		)
 	}
 	if service.Annotations[annotationNodeLoadBalancerPendingFWDelete] != "true" ||
 		(pending != nil && (service.Annotations[annotationNodeLoadBalancerPendingFWAbsent] != "" ||
@@ -3130,6 +3469,7 @@ func (c *nodeLoadBalancerController) clearInvalidServiceFirewallMetadata(ctx con
 			annotationNodeLoadBalancerFirewallAbsent,
 			annotationNodeLoadBalancerFirewallChecked,
 			annotationNodeLoadBalancerPreviousFirewall,
+			annotationNodeLoadBalancerFirewallRelationIssued,
 		} {
 			if _, exists := copy.Annotations[key]; exists {
 				delete(copy.Annotations, key)
@@ -3348,7 +3688,25 @@ func (c *nodeLoadBalancerController) updateExactParentService(
 			service.Namespace, service.Name,
 		)
 	}
-	return updated, true, nil
+	if !mapsEqualStringString(updated.Annotations, copy.Annotations) ||
+		!slices.Equal(updated.Finalizers, copy.Finalizers) {
+		return nil, false, fmt.Errorf(
+			"node load balancer: parent Service %s/%s metadata update did not retain the exact controller receipt",
+			service.Namespace, service.Name,
+		)
+	}
+	verified, err := c.getExactParentService(ctx, updated)
+	if err != nil {
+		return nil, false, fmt.Errorf("node load balancer: read back parent Service metadata update: %w", err)
+	}
+	if !mapsEqualStringString(verified.Annotations, copy.Annotations) ||
+		!slices.Equal(verified.Finalizers, copy.Finalizers) {
+		return nil, false, fmt.Errorf(
+			"node load balancer: parent Service %s/%s did not store the exact controller receipt",
+			service.Namespace, service.Name,
+		)
+	}
+	return verified, true, nil
 }
 
 func (c *nodeLoadBalancerController) updateExactParentStatus(
@@ -3817,6 +4175,10 @@ func (c *nodeLoadBalancerController) authorizedNodeLoadBalancerNodes(
 	if err := c.validateManagedNodeLoadBalancerNodeClass(nodeClass, nodeClassName); err != nil {
 		return nil, err
 	}
+	baseFirewallUUID, err := c.trustedNodeLoadBalancerBaseFirewall(ctx, nodeClass)
+	if err != nil {
+		return nil, fmt.Errorf("node load balancer: validate generated NodeClass security base: %w", err)
+	}
 	claims, err := c.provider.dynamicClient.Resource(nodeClaimGVR).List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("node load balancer: list NodeClaims for Node authorization: %w", err)
@@ -3861,7 +4223,17 @@ func (c *nodeLoadBalancerController) authorizedNodeLoadBalancerNodes(
 			klog.InfoS("Ignoring Node without an authoritative NodeClaim identity chain", "node", current.Name, "shard", shard, "reason", reason)
 			continue
 		}
-		fipAuthorized, fipReason, fipErr := c.nodeLoadBalancerFloatingIPAuthoritative(ctx, current)
+		vmIdentity, vmReason, vmErr := c.managedNodeLoadBalancerVMIdentityAuthoritative(
+			ctx, current, pool, claim, nodeClass, baseFirewallUUID,
+		)
+		if vmErr != nil {
+			return nil, vmErr
+		}
+		if vmIdentity == nil {
+			klog.InfoS("Ignoring Node without authoritative managed VM ownership", "node", current.Name, "shard", shard, "reason", vmReason)
+			continue
+		}
+		fipAuthorized, fipReason, fipErr := c.nodeLoadBalancerFloatingIPAuthoritative(ctx, current, *vmIdentity)
 		if fipErr != nil {
 			return nil, fipErr
 		}
@@ -3875,12 +4247,131 @@ func (c *nodeLoadBalancerController) authorizedNodeLoadBalancerNodes(
 	return authorized, nil
 }
 
+func (c *nodeLoadBalancerController) managedNodeLoadBalancerVMIdentityAuthoritative(
+	ctx context.Context,
+	node *corev1.Node,
+	pool, claim, nodeClass *unstructured.Unstructured,
+	baseFirewallUUID string,
+) (*managedNodeLoadBalancerVMIdentity, string, error) {
+	identity, err := providerid.Parse(node.Spec.ProviderID)
+	if err != nil || identity.Location != c.provider.config.Location || identity.String() != node.Spec.ProviderID {
+		return nil, "Node providerID is invalid or non-canonical", nil
+	}
+	vm, err := c.provider.api.GetVM(ctx, identity.Location, identity.UUID)
+	if err != nil {
+		return nil, "", fmt.Errorf("node load balancer: read canonical VM %s for Node %s: %w", identity.UUID, node.Name, err)
+	}
+	if vm == nil || vm.UUID != identity.UUID {
+		return nil, "canonical VM UUID does not exactly match the Node providerID", nil
+	}
+	if vm.BillingAccountID != c.provider.config.BillingAccountID {
+		return nil, "canonical VM billing account does not match the configured account", nil
+	}
+	// The VM detail endpoint may omit this redundant field. A non-empty value is
+	// contradictory unless it matches; authoritative attachment is always proved
+	// below from the exact VPC object and its unique VM membership.
+	if vm.NetworkUUID != "" && vm.NetworkUUID != c.provider.config.NetworkUUID {
+		return nil, "canonical VM network does not match the configured VPC", nil
+	}
+	network, err := c.provider.api.GetNetwork(ctx, identity.Location, c.provider.config.NetworkUUID)
+	if err != nil {
+		return nil, "", fmt.Errorf("node load balancer: read canonical VPC membership for Node %s: %w", node.Name, err)
+	}
+	if network == nil || network.UUID != c.provider.config.NetworkUUID {
+		return nil, "canonical VPC UUID does not exactly match the configured VPC", nil
+	}
+	memberships := 0
+	exactMembership := false
+	for _, vmUUID := range network.VMUUIDs {
+		if strings.EqualFold(vmUUID, identity.UUID) {
+			memberships++
+			exactMembership = exactMembership || vmUUID == identity.UUID
+		}
+	}
+	if memberships != 1 || !exactMembership {
+		return nil, fmt.Sprintf("expected exactly one canonical VPC membership, found %d", memberships), nil
+	}
+	if err := c.auditManagedNodeLoadBalancerBaseFirewall(
+		ctx,
+		identity.UUID,
+		baseFirewallUUID,
+		network.Subnet,
+	); err != nil {
+		return nil, "", fmt.Errorf("node load balancer: audit managed VM base firewall authority: %w", err)
+	}
+
+	if pool == nil || claim == nil || nodeClass == nil || !validNodeLoadBalancerCloudUUID(baseFirewallUUID) {
+		return nil, "managed Kubernetes ownership chain is incomplete", nil
+	}
+	var ownership publicNodeLocalVMOwnership
+	if vm.Description == "" || json.Unmarshal([]byte(vm.Description), &ownership) != nil {
+		return nil, "canonical VM has no decodable Karpenter ownership record", nil
+	}
+	shard := pool.GetName()
+	if ownership.Schema != "karpenter.inspace.cloud/v3" ||
+		ownership.Cluster != c.provider.config.ClusterID ||
+		ownership.NodePool != shard || ownership.NodeClaim != claim.GetName() ||
+		ownership.VMName == "" || ownership.VMName != vm.Name || ownership.VMName != node.Name ||
+		ownership.FirewallProfile != nodeLoadBalancerFirewallMode || ownership.FirewallUUID != baseFirewallUUID ||
+		ownership.NetworkUUID != c.provider.config.NetworkUUID || ownership.BillingAccountID != c.provider.config.BillingAccountID {
+		return nil, "Karpenter v3 VM ownership record does not match the managed Node chain", nil
+	}
+	classFirewallUUID, found, fieldErr := unstructured.NestedString(nodeClass.Object, "spec", "firewallUUID")
+	if fieldErr != nil || !found || classFirewallUUID != baseFirewallUUID {
+		return nil, "managed NodeClass no longer references the trusted base firewall", nil
+	}
+
+	expectedFloatingIPName := managedNodeLoadBalancerFloatingIPName(c.provider.config.ClusterID, claim.GetName())
+	annotations := claim.GetAnnotations()
+	publicIPv4 := annotations[karpenterPublicIPv4Annotation]
+	parsedPublicIPv4, parseErr := netip.ParseAddr(publicIPv4)
+	if parseErr != nil || !parsedPublicIPv4.Is4() || !parsedPublicIPv4.IsGlobalUnicast() || parsedPublicIPv4.IsPrivate() || parsedPublicIPv4.String() != publicIPv4 {
+		return nil, "NodeClaim has no canonical public IPv4 launch identity", nil
+	}
+	if ownership.FloatingIPName != expectedFloatingIPName ||
+		annotations[karpenterFloatingIPNameAnnotation] != expectedFloatingIPName ||
+		annotations[karpenterBillingAccountAnnotation] != strconv.FormatInt(c.provider.config.BillingAccountID, 10) ||
+		annotations[karpenterNodeNameAnnotation] != node.Name ||
+		(ownership.PublicIPv4 != "" && ownership.PublicIPv4 != publicIPv4) {
+		return nil, "durable VM/NodeClaim floating-IP identity does not match the deterministic launch identity", nil
+	}
+	return &managedNodeLoadBalancerVMIdentity{
+		VMUUID: identity.UUID, FloatingIPName: expectedFloatingIPName, PublicIPv4: publicIPv4,
+	}, "", nil
+}
+
+func managedNodeLoadBalancerFloatingIPName(clusterName, nodeClaimName string) string {
+	base := sanitizeManagedNodeLoadBalancerName(nodeClaimName)
+	if !strings.HasPrefix(base, "inspace-e2e-") {
+		base = "karpenter-" + base
+	}
+	suffix := nodeLoadBalancerHash(clusterName + "\x00" + nodeClaimName)[:10]
+	const maxBase = 63 - 1 - 10
+	if len(base) > maxBase {
+		base = strings.TrimRight(base[:maxBase], "-")
+	}
+	return base + "-" + suffix
+}
+
+func sanitizeManagedNodeLoadBalancerName(value string) string {
+	var result strings.Builder
+	for _, character := range strings.ToLower(value) {
+		if (character >= 'a' && character <= 'z') || (character >= '0' && character <= '9') || character == '-' {
+			result.WriteRune(character)
+		} else {
+			result.WriteByte('-')
+		}
+	}
+	return strings.Trim(result.String(), "-")
+}
+
 func (c *nodeLoadBalancerController) nodeLoadBalancerFloatingIPAuthoritative(
 	ctx context.Context,
 	node *corev1.Node,
+	durable managedNodeLoadBalancerVMIdentity,
 ) (bool, string, error) {
 	identity, err := providerid.Parse(node.Spec.ProviderID)
-	if err != nil || identity.Location != c.provider.config.Location || identity.String() != node.Spec.ProviderID {
+	if err != nil || identity.Location != c.provider.config.Location || identity.String() != node.Spec.ProviderID || identity.UUID != durable.VMUUID {
 		return false, "Node providerID is invalid or non-canonical", nil
 	}
 	internalIP, ok := nodeLoadBalancerNodeInternalIPv4(node)
@@ -3896,7 +4387,7 @@ func (c *nodeLoadBalancerController) nodeLoadBalancerFloatingIPAuthoritative(
 	}
 	assigned := make([]inspace.FloatingIP, 0, 1)
 	for _, item := range items {
-		if item.AssignedTo == identity.UUID && item.Enabled && !item.IsDeleted {
+		if strings.EqualFold(item.AssignedTo, identity.UUID) && item.Enabled && !item.IsDeleted {
 			assigned = append(assigned, item)
 		}
 	}
@@ -3904,9 +4395,10 @@ func (c *nodeLoadBalancerController) nodeLoadBalancerFloatingIPAuthoritative(
 		return false, fmt.Sprintf("expected one floating IP assigned to VM %s, found %d", identity.UUID, len(assigned)), nil
 	}
 	item := assigned[0]
-	if item.BillingAccountID != c.provider.config.BillingAccountID || !item.Enabled || item.IsDeleted || item.IsVirtual ||
+	if item.Name != durable.FloatingIPName || item.Address != durable.PublicIPv4 || item.AssignedTo != identity.UUID ||
+		item.BillingAccountID != c.provider.config.BillingAccountID || !item.Enabled || item.IsDeleted || item.IsVirtual ||
 		item.Type != "public" || item.AssignedToResourceType != "virtual_machine" {
-		return false, "floating IP is not one active public assignment owned by the configured billing account", nil
+		return false, "floating IP does not match the exact durable Karpenter launch identity", nil
 	}
 	if item.AssignedToPrivateIP != internalIP {
 		return false, "floating IP DNAT private IPv4 does not match the Node InternalIP", nil
@@ -4139,6 +4631,17 @@ func (c *nodeLoadBalancerController) detachServiceFirewallFromOtherNodes(
 	if firewall == nil {
 		return errors.New("node load balancer: Service firewall is required for assignment cleanup")
 	}
+	converged, err := c.reconcileNodeLoadBalancerFirewallRelation(
+		ctx,
+		c.serviceFirewallRelationOwner(service),
+		nil,
+	)
+	if err != nil {
+		return err
+	}
+	if !converged {
+		return errors.New("node load balancer: waiting for durable Service firewall relation readback")
+	}
 	desiredVMs := make(map[string]struct{}, len(nodes))
 	for _, node := range nodes {
 		vmUUID, ok := nodeLoadBalancerVMUUID(node)
@@ -4151,67 +4654,35 @@ func (c *nodeLoadBalancerController) detachServiceFirewallFromOtherNodes(
 	if err != nil || len(staleVMs) == 0 {
 		return err
 	}
-	var mutationErr error
 	for _, vmUUID := range staleVMs {
-		if err := c.provider.api.UnassignFirewallFromVM(ctx, c.provider.config.Location, firewall.UUID, vmUUID); err != nil && !inspace.IsNotFound(err) {
-			mutationErr = errors.Join(mutationErr, fmt.Errorf("unassign firewall %s from stale VM %s: %w", firewall.UUID, vmUUID, err))
+		converged, relationErr := c.reconcileNodeLoadBalancerFirewallRelation(
+			ctx,
+			c.serviceFirewallRelationOwner(service),
+			&nodeLoadBalancerFirewallRelationFence{
+				operation: nodeLoadBalancerFirewallRelationUnassign, firewallUUID: firewall.UUID, vmUUID: vmUUID,
+			},
+		)
+		if relationErr != nil {
+			return fmt.Errorf("node load balancer: unassign firewall %s from stale VM %s: %w", firewall.UUID, vmUUID, relationErr)
+		}
+		if !converged {
+			// The exact relation was removed and authoritatively read back, but a
+			// later pass must consume a fresh firewall snapshot before publication.
+			return nil
 		}
 	}
-
-	readbackCtx, cancel := context.WithTimeout(ctx, nodeLoadBalancerAssignmentReadbackTimeout)
-	defer cancel()
-	var lastObservation error
-	for {
-		firewalls, listErr := c.provider.api.ListFirewalls(readbackCtx, c.provider.config.Location)
-		if listErr == nil {
-			var current *inspace.Firewall
-			for i := range firewalls {
-				if firewalls[i].UUID == firewall.UUID {
-					copy := firewalls[i]
-					current = &copy
-					break
-				}
-			}
-			if current == nil {
-				return fmt.Errorf("node load balancer: Service firewall %s disappeared during assignment cleanup", firewall.UUID)
-			}
-			if !nodeLoadBalancerFirewallOwnedByService(*current, c.provider.config.ClusterID, string(service.UID), c.provider.config.BillingAccountID) {
-				return fmt.Errorf("node load balancer: Service firewall %s lost deterministic ownership during assignment cleanup", firewall.UUID)
-			}
-			remaining, assignmentErr := staleNodeLoadBalancerFirewallAssignments(*current, desiredVMs)
-			if assignmentErr != nil {
-				return assignmentErr
-			}
-			if len(remaining) == 0 {
-				return nil
-			}
-			lastObservation = fmt.Errorf("firewall %s remains assigned to stale VMs %v", firewall.UUID, remaining)
-		} else {
-			lastObservation = fmt.Errorf("list firewalls for stale assignment readback: %w", listErr)
-		}
-		timer := time.NewTimer(nodeLoadBalancerAssignmentReadbackDelay)
-		select {
-		case <-readbackCtx.Done():
-			timer.Stop()
-			return fmt.Errorf("node load balancer: stale firewall assignment cleanup did not converge: %w", errors.Join(mutationErr, lastObservation, readbackCtx.Err()))
-		case <-timer.C:
-		}
-	}
+	return nil
 }
 
 func staleNodeLoadBalancerFirewallAssignments(firewall inspace.Firewall, desiredVMs map[string]struct{}) ([]string, error) {
 	stale := make([]string, 0)
-	seen := make(map[string]struct{}, len(firewall.ResourcesAssigned))
-	for _, resource := range firewall.ResourcesAssigned {
-		if !strings.EqualFold(resource.ResourceType, "vm") || resource.ResourceUUID == "" {
-			return nil, fmt.Errorf("node load balancer: firewall %s has unexpected assigned resource %#v", firewall.UUID, resource)
-		}
-		if _, duplicate := seen[resource.ResourceUUID]; duplicate {
-			return nil, fmt.Errorf("node load balancer: firewall %s has duplicate VM assignment %s", firewall.UUID, resource.ResourceUUID)
-		}
-		seen[resource.ResourceUUID] = struct{}{}
-		if _, desired := desiredVMs[resource.ResourceUUID]; !desired {
-			stale = append(stale, resource.ResourceUUID)
+	assignments, err := nodeLoadBalancerFirewallVMAssignments(firewall)
+	if err != nil {
+		return nil, err
+	}
+	for vmUUID := range assignments {
+		if _, desired := desiredVMs[vmUUID]; !desired {
+			stale = append(stale, vmUUID)
 		}
 	}
 	sort.Strings(stale)
@@ -4377,11 +4848,12 @@ func (c *nodeLoadBalancerController) setShardNodesReady(ctx context.Context, nod
 			want = expectedOK && currentOK && expectedVM == currentVM
 		}
 		if want {
-			fipAuthorized, _, fipErr := c.nodeLoadBalancerFloatingIPAuthoritative(ctx, current)
-			if fipErr != nil {
-				return fipErr
+			shard := current.Labels[nodeLoadBalancerNodeShardLabel]
+			authorized, authorizationErr := c.authorizedNodeLoadBalancerNodes(ctx, []*corev1.Node{current}, shard)
+			if authorizationErr != nil {
+				return authorizationErr
 			}
-			want = fipAuthorized
+			want = len(authorized) == 1 && authorized[0].Name == current.Name && authorized[0].Spec.ProviderID == current.Spec.ProviderID
 		}
 		have := current.Labels[nodeLoadBalancerReadyLabel] == "true"
 		if want == have {
@@ -4406,6 +4878,17 @@ func (c *nodeLoadBalancerController) cleanupPreviousFirewall(ctx context.Context
 	current, err := c.getExactParentService(ctx, service)
 	if err != nil {
 		return err
+	}
+	if waiting, completed, resumeErr := c.resumeOwnedServiceFirewallDelete(ctx, current); resumeErr != nil || waiting {
+		if waiting {
+			c.queue.AddAfter(current.Namespace+"/"+current.Name, nodeLoadBalancerRetry)
+		}
+		return resumeErr
+	} else if completed {
+		current, err = c.getExactParentService(ctx, current)
+		if err != nil {
+			return err
+		}
 	}
 	currentUUID := current.Annotations[annotationNodeLoadBalancerFirewallUUID]
 	previousUUID := current.Annotations[annotationNodeLoadBalancerPreviousFirewall]
@@ -4530,6 +5013,17 @@ func (c *nodeLoadBalancerController) cleanupService(ctx context.Context, service
 	if !absent {
 		c.queue.AddAfter(service.Namespace+"/"+service.Name, nodeLoadBalancerRetry)
 		return nil
+	}
+	if waiting, completed, err := c.resumeOwnedServiceFirewallDelete(ctx, service); err != nil || waiting {
+		if waiting {
+			c.queue.AddAfter(service.Namespace+"/"+service.Name, nodeLoadBalancerRetry)
+		}
+		return err
+	} else if completed {
+		service, err = c.getExactParentService(ctx, service)
+		if err != nil {
+			return err
+		}
 	}
 	ownedFirewalls, err := c.ownedServiceFirewalls(ctx, service)
 	if err != nil {
@@ -4675,11 +5169,18 @@ func (c *nodeLoadBalancerController) cleanupService(ctx context.Context, service
 		}
 		if copy.Annotations[annotationNodeLoadBalancerPendingFirewall] != "" ||
 			copy.Annotations[annotationNodeLoadBalancerPendingFWName] != "" ||
-			copy.Annotations[annotationNodeLoadBalancerPendingFWStarted] != "" {
+			copy.Annotations[annotationNodeLoadBalancerPendingFWStarted] != "" ||
+			copy.Annotations[annotationNodeLoadBalancerPendingFWIssued] != "" ||
+			copy.Annotations[annotationNodeLoadBalancerPendingFWIssuedAt] != "" {
 			return false, errors.New("node load balancer: refusing finalization while firewall creation remains pending")
 		}
+		if copy.Annotations[annotationNodeLoadBalancerFWDeleteTarget] != "" ||
+			copy.Annotations[annotationNodeLoadBalancerFWDeleteIssued] != "" {
+			return false, errors.New("node load balancer: refusing finalization while firewall deletion remains fenced")
+		}
 		if copy.Annotations[annotationNodeLoadBalancerFirewallAssigning] != "" ||
-			copy.Annotations[annotationNodeLoadBalancerFirewallAssignAt] != "" {
+			copy.Annotations[annotationNodeLoadBalancerFirewallAssignAt] != "" ||
+			copy.Annotations[annotationNodeLoadBalancerFirewallRelationIssued] != "" {
 			return false, errors.New("node load balancer: refusing finalization while firewall assignment remains fenced")
 		}
 		changed := containsString(copy.Finalizers, nodeLoadBalancerFinalizer)
@@ -4692,6 +5193,8 @@ func (c *nodeLoadBalancerController) cleanupService(ctx context.Context, service
 			annotationNodeLoadBalancerPendingFirewall,
 			annotationNodeLoadBalancerPendingFWName,
 			annotationNodeLoadBalancerPendingFWStarted,
+			annotationNodeLoadBalancerPendingFWIssued,
+			annotationNodeLoadBalancerPendingFWIssuedAt,
 			annotationNodeLoadBalancerPendingFWDelete,
 			annotationNodeLoadBalancerPendingFWAbsent,
 			annotationNodeLoadBalancerPendingFWChecked,
@@ -4708,6 +5211,9 @@ func (c *nodeLoadBalancerController) cleanupService(ctx context.Context, service
 			annotationNodeLoadBalancerWithdrawFWDetachAt,
 			annotationNodeLoadBalancerFirewallAssigning,
 			annotationNodeLoadBalancerFirewallAssignAt,
+			annotationNodeLoadBalancerFirewallRelationIssued,
+			annotationNodeLoadBalancerFWDeleteTarget,
+			annotationNodeLoadBalancerFWDeleteIssued,
 		} {
 			if _, exists := copy.Annotations[key]; exists {
 				delete(copy.Annotations, key)
@@ -5023,7 +5529,61 @@ func (c *nodeLoadBalancerController) servicesForShard(ctx context.Context, exclu
 	return result, nil
 }
 
+func (c *nodeLoadBalancerController) resumeOwnedServiceFirewallDelete(ctx context.Context, service *corev1.Service) (waiting, completed bool, err error) {
+	current, err := c.getExactParentService(ctx, service)
+	if err != nil {
+		return false, false, err
+	}
+	target, _, err := nodeLoadBalancerFirewallDeleteReceipt(
+		current.Annotations,
+		annotationNodeLoadBalancerFWDeleteTarget,
+		annotationNodeLoadBalancerFWDeleteIssued,
+		annotationNodeLoadBalancerCleanupFWAbsent,
+		annotationNodeLoadBalancerCleanupFWChecked,
+	)
+	if err != nil {
+		return false, false, fmt.Errorf("node load balancer: parse Service firewall delete receipt: %w", err)
+	}
+	if target == "" {
+		return false, false, nil
+	}
+	done, err := c.deleteOwnedServiceFirewall(ctx, current, target)
+	return !done, done, err
+}
+
 func (c *nodeLoadBalancerController) deleteOwnedServiceFirewall(ctx context.Context, service *corev1.Service, uuid string) (bool, error) {
+	if !validNodeLoadBalancerCloudUUID(uuid) {
+		return false, fmt.Errorf("node load balancer: invalid Service firewall cleanup UUID %q", uuid)
+	}
+	current, err := c.getExactParentService(ctx, service)
+	if err != nil {
+		return false, err
+	}
+	if !containsString(current.Finalizers, nodeLoadBalancerFinalizer) &&
+		!containsString(current.Finalizers, publicNodeLocalFinalizer) {
+		return false, errors.New("node load balancer: refusing Service firewall cleanup without the durable provider finalizer")
+	}
+	target, issuedAt, err := nodeLoadBalancerFirewallDeleteReceipt(
+		current.Annotations,
+		annotationNodeLoadBalancerFWDeleteTarget,
+		annotationNodeLoadBalancerFWDeleteIssued,
+		annotationNodeLoadBalancerCleanupFWAbsent,
+		annotationNodeLoadBalancerCleanupFWChecked,
+	)
+	if err != nil {
+		return false, fmt.Errorf("node load balancer: parse Service firewall delete receipt: %w", err)
+	}
+	if target != "" && target != uuid {
+		return false, fmt.Errorf("node load balancer: Service firewall delete receipt targets %s, not %s", target, uuid)
+	}
+	converged, err := c.reconcileNodeLoadBalancerFirewallRelation(
+		ctx,
+		c.serviceFirewallRelationOwner(current),
+		nil,
+	)
+	if err != nil || !converged {
+		return false, err
+	}
 	firewalls, err := c.provider.api.ListFirewalls(ctx, c.provider.config.Location)
 	if err != nil {
 		return false, err
@@ -5031,32 +5591,278 @@ func (c *nodeLoadBalancerController) deleteOwnedServiceFirewall(ctx context.Cont
 	var firewall *inspace.Firewall
 	for i := range firewalls {
 		if firewalls[i].UUID == uuid {
+			if firewall != nil {
+				return false, fmt.Errorf("node load balancer: firewall UUID %s appears multiple times during cleanup", uuid)
+			}
 			copy := firewalls[i]
 			firewall = &copy
 			break
 		}
 	}
 	if firewall == nil {
-		return true, nil
+		if target == "" {
+			updated, changed, stageErr := c.updateExactParentService(ctx, current, func(copy *corev1.Service) (bool, error) {
+				if !containsString(copy.Finalizers, nodeLoadBalancerFinalizer) &&
+					!containsString(copy.Finalizers, publicNodeLocalFinalizer) {
+					return false, errors.New("node load balancer: Service lost its provider finalizer before firewall delete intent persistence")
+				}
+				if existing := copy.Annotations[annotationNodeLoadBalancerFWDeleteTarget]; existing != "" {
+					if existing != uuid {
+						return false, fmt.Errorf("node load balancer: concurrent Service firewall delete targets %s, not %s", existing, uuid)
+					}
+					return false, nil
+				}
+				copy.Annotations[annotationNodeLoadBalancerFWDeleteTarget] = uuid
+				delete(copy.Annotations, annotationNodeLoadBalancerFWDeleteIssued)
+				delete(copy.Annotations, annotationNodeLoadBalancerCleanupFWAbsent)
+				delete(copy.Annotations, annotationNodeLoadBalancerCleanupFWChecked)
+				return true, nil
+			})
+			if stageErr != nil {
+				return false, fmt.Errorf("node load balancer: persist Service firewall delete intent: %w", stageErr)
+			}
+			if !changed {
+				return false, nil
+			}
+			current = updated
+			target = uuid
+		}
+		confirmed, changed, confirmErr := c.recordFirewallAbsence(
+			ctx,
+			current,
+			annotationNodeLoadBalancerCleanupFWAbsent,
+			annotationNodeLoadBalancerCleanupFWChecked,
+			c.nodeLoadBalancerFirewallRelationTime(),
+			time.Time{},
+		)
+		if confirmErr != nil || changed || !confirmed {
+			return false, confirmErr
+		}
+		cleared, _, clearErr := c.updateExactParentService(ctx, current, func(copy *corev1.Service) (bool, error) {
+			storedTarget, storedIssued, parseErr := nodeLoadBalancerFirewallDeleteReceipt(
+				copy.Annotations,
+				annotationNodeLoadBalancerFWDeleteTarget,
+				annotationNodeLoadBalancerFWDeleteIssued,
+				annotationNodeLoadBalancerCleanupFWAbsent,
+				annotationNodeLoadBalancerCleanupFWChecked,
+			)
+			if parseErr != nil {
+				return false, parseErr
+			}
+			if storedTarget != uuid || storedIssued != issuedAt {
+				return false, errors.New("node load balancer: Service firewall delete receipt changed during absence proof")
+			}
+			count, parseErr := strconv.Atoi(copy.Annotations[annotationNodeLoadBalancerCleanupFWAbsent])
+			if parseErr != nil || count < nodeLoadBalancerAbsenceConfirmations {
+				return false, errors.New("node load balancer: Service firewall delete absence is no longer confirmed")
+			}
+			clearServiceFirewallDeleteState(copy.Annotations, uuid)
+			return true, nil
+		})
+		if clearErr != nil {
+			return false, fmt.Errorf("node load balancer: clear proven-absent Service firewall delete receipt: %w", clearErr)
+		}
+		return cleared != nil, nil
 	}
-	if !nodeLoadBalancerFirewallOwnedByService(*firewall, c.provider.config.ClusterID, string(service.UID), c.provider.config.BillingAccountID) {
+	if !nodeLoadBalancerFirewallOwnedByService(*firewall, c.provider.config.ClusterID, string(current.UID), c.provider.config.BillingAccountID) {
 		return false, fmt.Errorf("node load balancer: refusing to delete firewall %s without exact Service ownership", uuid)
 	}
-	if len(firewall.ResourcesAssigned) != 0 {
-		for _, resource := range firewall.ResourcesAssigned {
-			if !strings.EqualFold(resource.ResourceType, "vm") || resource.ResourceUUID == "" {
-				return false, fmt.Errorf("node load balancer: firewall %s has unexpected assigned resource %#v", uuid, resource)
+	if target != "" && (current.Annotations[annotationNodeLoadBalancerCleanupFWAbsent] != "" ||
+		current.Annotations[annotationNodeLoadBalancerCleanupFWChecked] != "") {
+		updated, changed, clearErr := c.updateExactParentService(ctx, current, func(copy *corev1.Service) (bool, error) {
+			if copy.Annotations[annotationNodeLoadBalancerFWDeleteTarget] != uuid ||
+				copy.Annotations[annotationNodeLoadBalancerFWDeleteIssued] != issuedAt {
+				return false, errors.New("node load balancer: Service firewall delete receipt changed before visibility reset")
 			}
-			if err := c.provider.api.UnassignFirewallFromVM(ctx, c.provider.config.Location, uuid, resource.ResourceUUID); err != nil && !inspace.IsNotFound(err) {
-				return false, fmt.Errorf("node load balancer: unassign firewall %s from VM %s: %w", uuid, resource.ResourceUUID, err)
+			changed := copy.Annotations[annotationNodeLoadBalancerCleanupFWAbsent] != "" ||
+				copy.Annotations[annotationNodeLoadBalancerCleanupFWChecked] != ""
+			delete(copy.Annotations, annotationNodeLoadBalancerCleanupFWAbsent)
+			delete(copy.Annotations, annotationNodeLoadBalancerCleanupFWChecked)
+			return changed, nil
+		})
+		if clearErr != nil || changed {
+			return false, clearErr
+		}
+		current = updated
+	}
+	assignments, assignmentErr := nodeLoadBalancerFirewallAssignmentVMs(*firewall)
+	if assignmentErr != nil {
+		return false, assignmentErr
+	}
+	if len(assignments) != 0 {
+		for _, vmUUID := range assignments {
+			converged, relationErr := c.reconcileNodeLoadBalancerFirewallRelation(
+				ctx,
+				c.serviceFirewallRelationOwner(current),
+				&nodeLoadBalancerFirewallRelationFence{
+					operation: nodeLoadBalancerFirewallRelationUnassign, firewallUUID: uuid, vmUUID: vmUUID,
+				},
+			)
+			if relationErr != nil || !converged {
+				return false, errors.Join(
+					relationErr,
+					fmt.Errorf("node load balancer: waiting to unassign firewall %s from VM %s", uuid, vmUUID),
+				)
 			}
 		}
 		return false, nil
 	}
-	if err := c.provider.api.DeleteFirewall(ctx, c.provider.config.Location, uuid); err != nil && !inspace.IsNotFound(err) {
-		return false, fmt.Errorf("node load balancer: delete firewall %s: %w", uuid, err)
+	if issuedAt != "" {
+		// A durable issued receipt is immutable after the request boundary. Even
+		// exact visibility can be stale and must never authorize a replay.
+		return false, nil
+	}
+	issuedAt = c.nodeLoadBalancerFirewallRelationTime().Format(time.RFC3339Nano)
+	issuedService, winner, issueErr := c.updateExactParentService(ctx, current, func(copy *corev1.Service) (bool, error) {
+		storedTarget, storedIssued, parseErr := nodeLoadBalancerFirewallDeleteReceipt(
+			copy.Annotations,
+			annotationNodeLoadBalancerFWDeleteTarget,
+			annotationNodeLoadBalancerFWDeleteIssued,
+			annotationNodeLoadBalancerCleanupFWAbsent,
+			annotationNodeLoadBalancerCleanupFWChecked,
+		)
+		if parseErr != nil {
+			return false, parseErr
+		}
+		if storedTarget != "" && storedTarget != uuid {
+			return false, fmt.Errorf("node load balancer: concurrent Service firewall delete targets %s, not %s", storedTarget, uuid)
+		}
+		if storedIssued != "" {
+			return false, nil
+		}
+		copy.Annotations[annotationNodeLoadBalancerFWDeleteTarget] = uuid
+		copy.Annotations[annotationNodeLoadBalancerFWDeleteIssued] = issuedAt
+		delete(copy.Annotations, annotationNodeLoadBalancerCleanupFWAbsent)
+		delete(copy.Annotations, annotationNodeLoadBalancerCleanupFWChecked)
+		return true, nil
+	})
+	if issueErr != nil {
+		return false, fmt.Errorf("node load balancer: persist Service firewall delete-issued receipt: %w", issueErr)
+	}
+	if !winner {
+		return false, nil
+	}
+	authorizedService, authorityErr := c.getExactParentService(ctx, issuedService)
+	if authorityErr != nil {
+		return false, fmt.Errorf("node load balancer: re-read Service owner after firewall delete issue: %w", authorityErr)
+	}
+	if authorizedService.UID != issuedService.UID ||
+		authorizedService.Annotations[annotationNodeLoadBalancerFWDeleteTarget] != uuid ||
+		authorizedService.Annotations[annotationNodeLoadBalancerFWDeleteIssued] != issuedAt {
+		return false, errors.New("node load balancer: Service firewall delete authority changed after issue")
+	}
+	authorizedFirewall, authorityErr := c.exactNodeLoadBalancerFirewallFresh(ctx, uuid)
+	if authorityErr != nil {
+		return false, fmt.Errorf("node load balancer: re-read Service firewall after delete issue: %w", authorityErr)
+	}
+	if !nodeLoadBalancerFirewallAuthorityUnchanged(*firewall, *authorizedFirewall) ||
+		!nodeLoadBalancerFirewallOwnedByService(
+			*authorizedFirewall,
+			c.provider.config.ClusterID,
+			string(authorizedService.UID),
+			c.provider.config.BillingAccountID,
+		) {
+		return false, errors.New("node load balancer: Service firewall lost exact ownership or stable policy after delete issue")
+	}
+	postIssueAssignments, authorityErr := nodeLoadBalancerFirewallAssignmentVMs(*authorizedFirewall)
+	if authorityErr != nil {
+		return false, authorityErr
+	}
+	if len(postIssueAssignments) != 0 {
+		return false, errors.New("node load balancer: Service firewall gained assignments after delete issue")
+	}
+	deleteErr := c.provider.api.DeleteFirewall(ctx, c.provider.config.Location, uuid)
+	if nodeLoadBalancerMutationKnownPreDispatch(deleteErr) {
+		_, _, resetErr := c.updateExactParentService(ctx, issuedService, func(copy *corev1.Service) (bool, error) {
+			if copy.Annotations[annotationNodeLoadBalancerFWDeleteTarget] != uuid ||
+				copy.Annotations[annotationNodeLoadBalancerFWDeleteIssued] != issuedAt {
+				return false, errors.New("node load balancer: Service firewall delete receipt changed before pre-dispatch rejection")
+			}
+			delete(copy.Annotations, annotationNodeLoadBalancerFWDeleteIssued)
+			return true, nil
+		})
+		return false, errors.Join(fmt.Errorf("node load balancer: delete firewall %s: %w", uuid, deleteErr), resetErr)
+	}
+	if deleteErr != nil {
+		return false, fmt.Errorf("node load balancer: delete firewall %s: %w", uuid, deleteErr)
 	}
 	return false, nil
+}
+
+// nodeLoadBalancerFirewallDeleteReceipt validates the exact durable state used
+// by all NodeLB firewall DELETE paths. A target without issuedAt is a staged
+// upgrade/absence intent. Once issuedAt exists it is immutable until repeated,
+// spaced exact-UUID absence is persisted on the same Kubernetes owner.
+func nodeLoadBalancerFirewallDeleteReceipt(
+	annotations map[string]string,
+	targetKey, issuedKey, absentKey, checkedKey string,
+) (target, issuedAt string, err error) {
+	target = annotations[targetKey]
+	issuedAt = annotations[issuedKey]
+	absent := annotations[absentKey]
+	checked := annotations[checkedKey]
+	if target == "" {
+		if issuedAt != "" {
+			return "", "", errors.New("firewall delete-issued timestamp lacks an exact target UUID")
+		}
+		// Cleanup absence annotations predate delete receipts and are also used
+		// by the surrounding finalizer convergence proof. They are intentionally
+		// ignored until an exact delete target has been staged.
+		return "", "", nil
+	}
+	if target != "" && !validNodeLoadBalancerCloudUUID(target) {
+		return "", "", fmt.Errorf("invalid firewall delete target UUID %q", target)
+	}
+	if issuedAt != "" {
+		if _, parseErr := time.Parse(time.RFC3339Nano, issuedAt); parseErr != nil {
+			return "", "", fmt.Errorf("invalid firewall delete-issued timestamp: %w", parseErr)
+		}
+	}
+	if (absent == "") != (checked == "") {
+		return "", "", errors.New("incomplete firewall delete absence evidence")
+	}
+	if absent != "" {
+		count, parseErr := strconv.Atoi(absent)
+		if parseErr != nil || count < 1 || count > nodeLoadBalancerAbsenceConfirmations {
+			return "", "", fmt.Errorf("invalid firewall delete absence count %q", absent)
+		}
+		if _, parseErr := time.Parse(time.RFC3339Nano, checked); parseErr != nil {
+			return "", "", fmt.Errorf("invalid firewall delete absence timestamp: %w", parseErr)
+		}
+	}
+	return target, issuedAt, nil
+}
+
+func clearServiceFirewallDeleteState(annotations map[string]string, uuid string) {
+	if annotations[annotationNodeLoadBalancerFirewallUUID] == uuid {
+		delete(annotations, annotationNodeLoadBalancerFirewallUUID)
+		delete(annotations, annotationNodeLoadBalancerFirewallHash)
+		delete(annotations, annotationNodeLoadBalancerFirewallAbsent)
+		delete(annotations, annotationNodeLoadBalancerFirewallChecked)
+	}
+	if annotations[annotationNodeLoadBalancerPreviousFirewall] == uuid {
+		delete(annotations, annotationNodeLoadBalancerPreviousFirewall)
+	}
+	if annotations[annotationNodeLoadBalancerPendingFirewall] == uuid {
+		for _, key := range []string{
+			annotationNodeLoadBalancerPendingFirewall,
+			annotationNodeLoadBalancerPendingFWName,
+			annotationNodeLoadBalancerPendingFWStarted,
+			annotationNodeLoadBalancerPendingFWIssued,
+			annotationNodeLoadBalancerPendingFWIssuedAt,
+			annotationNodeLoadBalancerPendingFWDelete,
+			annotationNodeLoadBalancerPendingFWAbsent,
+			annotationNodeLoadBalancerPendingFWChecked,
+		} {
+			delete(annotations, key)
+		}
+	}
+	for _, key := range []string{
+		annotationNodeLoadBalancerFWDeleteTarget,
+		annotationNodeLoadBalancerFWDeleteIssued,
+	} {
+		delete(annotations, key)
+	}
 }
 
 func (c *nodeLoadBalancerController) serviceFirewallsForEmergencyDetach(

@@ -369,13 +369,13 @@
         executable: /bin/bash
       changed_when: false
 
-    - name: Prove exact and parallel three-control-plane provisioning
+    - name: Prove exact and ordered three-control-plane provisioning
       ansible.builtin.assert:
         that:
           - e2e_bootstrap_result.ready | bool
           - e2e_bootstrap_result.controlPlaneVMs | length == 3
           - e2e_bootstrap_result.controlPlaneVMs | unique | length == 3
-          - e2e_bootstrap_result.maxParallelControlPlaneCreates | int == 3
+          - e2e_bootstrap_result.maxParallelControlPlaneCreates | int == 1
           - e2e_bootstrap_result.controlPlaneEndpoint == 'https://' + e2e_virtual_ip + ':6443'
           - e2e_bootstrap_result.privateControlPlaneEndpoint == 'https://' + e2e_virtual_ip + ':6443'
           - e2e_bootstrap_result.privateRegistrationEndpoint == 'https://' + e2e_virtual_ip + ':9345'
@@ -391,7 +391,7 @@
           - e2e_bootstrap_result.apiLoadBalancerUUID is not defined
           - e2e_bootstrap_result.registrationLoadBalancerUUID is not defined
           - e2e_bootstrap_result.allocatedEndpointIPv4 is not defined
-        fail_msg: "Bootstrap did not prove the fixed three-way concurrent RKE2 control plane"
+        fail_msg: "Bootstrap did not prove three fixed RKE2 control planes with one-at-a-time protected creation"
 
     - name: Bind the result to exact VPC VMs egress FIPs firewalls and zero control NLBs
       ansible.builtin.command:
@@ -409,15 +409,15 @@
       ansible.builtin.set_fact:
         e2e_state: "{{ lookup('file', e2e_state_file) | from_json }}"
 
-    - name: Bind the parallel-create contract to the authoritative three VM identities
+    - name: Bind the ordered-create contract to the authoritative three VM identities
       ansible.builtin.assert:
         that:
           - e2e_state.controlPlanes | length == 3
           - e2e_state.controlPlanes | map(attribute='uuid') | list | unique | length == 3
           - e2e_state.controlPlanes | map(attribute='uuid') | list | difference(e2e_bootstrap_result.controlPlaneVMs) | length == 0
           - e2e_bootstrap_result.controlPlaneVMs | difference(e2e_state.controlPlanes | map(attribute='uuid') | list) | length == 0
-          - (e2e_bootstrap_result.maxParallelControlPlaneCreates | int) == (e2e_state.controlPlanes | length)
-        fail_msg: "The measured parallel-create batch is not the authoritative three-control-plane VM set"
+          - e2e_bootstrap_result.maxParallelControlPlaneCreates | int == 1
+        fail_msg: "The ordered-create result is not the authoritative three-control-plane VM set"
 
     - name: Render the pinned bastion and private-node SSH configuration
       ansible.builtin.command:
@@ -465,7 +465,7 @@
         index_var: e2e_cp_index
         label: "{{ item.uuid }}"
 
-    - name: Persist the observed creation concurrency in the ownership journal
+    - name: Persist the reported creation bound in the ownership journal
       ansible.builtin.command:
         argv:
           - /opt/e2e/scripts/state-update.py

@@ -64,6 +64,11 @@ Elastic worker VM names, guest hostnames, and Kubernetes Node names are
 random suffix from the Karpenter NodeClaim name, while the original NodeClaim
 identity remains the cloud ownership and deletion key.
 
+Bootstrap creates fixed control-plane VMs in deterministic slot order with a
+hard creation bound of one. It must authoritatively read back each VM's
+restrictive firewall assignment before sending the next VM POST; already
+protected servers may continue booting in parallel.
+
 Immediately after setting the static hostname, every control plane, worker,
 and bastion removes any stale `127.0.1.1` mapping, writes exactly
 `127.0.1.1 <generated-hostname>` to `/etc/hosts`, and retries the exact
@@ -352,6 +357,82 @@ lexicographic Service UID wins; CCM withdraws and detaches the loser and emits
 address, so operators needing stable membership should use a static NodePool,
 `expireAfter: Never`, disruption budgets, and short DNS TTLs.
 
+### InSpace mutation outcome contract
+
+The official InSpace API exposes no idempotency-key contract. Therefore an
+HTTP error describes the response, not whether the mutation committed. This
+rule applies to all 22 write methods in the shared client:
+
+| Class | Client methods | Required controller behavior |
+| --- | --- | --- |
+| Resource creation | `CreateVM`, `CreateDisk`, `CreateFloatingIP`, `CreateFirewall`, `CreateLoadBalancer` | Persist immutable intent and an issued receipt before the POST. After that durability CAS, repeat the exact deterministic-name/ownership inventory: adopt one exact owned match, dispatch only from authoritative absence, and retain the receipt on a foreign, duplicate, or failed read. Never send a second POST while the first outcome is unresolved. |
+| Relationship creation | `AttachDisk`, `AssignFloatingIP`, `AssignFirewallToVM`, `AddLoadBalancerTarget`, `AddLoadBalancerRule` | Fence the exact resource pair or rule before POST. Treat exact duplicate relationship rows as one set member, but reject malformed rows or the same resource on a different owner. |
+| Deterministic replacement | `UpdateFloatingIP`, `UpdateFirewall` | Persist the exact desired payload/generation, issue once, then compare authoritative readback with both the applied and pending payload. A third state fails closed. |
+| Relationship removal | `DetachDisk`, `UnassignFloatingIP`, `UnassignFirewallFromVM`, `RemoveLoadBalancerTarget`, `RemoveLoadBalancerRule` | Persist the exact stable pair/UUID and an issued receipt before dispatch. Once issued, never repeat the removal merely because the relationship remains visible; require exact authoritative absence or explicit operator resolution. |
+| Resource deletion | `DeleteVM`, `DeleteDisk`, `DeleteFloatingIP`, `DeleteFirewall`, `DeleteLoadBalancer` | Delete only an exact durably owned UUID/address after persisting an issued receipt. Never replay an issued delete after any returned result; keep the finalizer or teardown receipt until repeated authoritative absence releases dependents and ownership state. |
+
+The shared client never automatically replays POST, PUT, PATCH, or DELETE, and
+blocks redirects for those methods. Every error returned after dispatch is
+ambiguous until authoritative readback proves the exact result. This includes
+every HTTP error status, transport failure, deadline/cancellation, response-read
+failure, malformed 2xx body, and mutation redirect. `APIError.Retryable` is only
+a scheduling hint; it is never proof that a write did not commit. A controller
+may clear an additive or replacement receipt automatically only for a
+positively identified local pre-dispatch block, or after a successful exact
+read proves the intended commit. An HTTP 4xx plus an unchanged/absent read is
+not terminal proof because the mutation may become visible later. For removals,
+a fresh read that still shows the exact owned relationship or resource is only
+evidence that cleanup remains unresolved; it is never authority for a second
+dispatch. Only a positively identified local pre-dispatch block may reset an
+issued receipt automatically.
+
+A UUID or other handle in a mutation response is provisional evidence, not
+ownership authority. Controllers promote only the canonical identity recovered
+from a fresh exact ownership read; a valid-looking foreign response handle is
+ignored while deterministic-name discovery finds the resource that actually
+committed. Every controller repeats its mutation-target or create-absence proof
+after its Kubernetes or status-store CAS and immediately before dispatch, so a
+concurrent change during receipt persistence fails closed instead of crossing
+the cloud boundary. The file-journal live probe applies the same rule after its
+fsynced durability boundary.
+
+Durable anchors are component-specific:
+
+- fixed bootstrap uses the bounded `InSpaceCluster.status.createAttempts` and
+  `status.deleteAttempts` ledgers, or the atomically locked cluster YAML status
+  store for the standalone controller. Issued bootstrap removals are permanent
+  no-replay locks until exact authoritative absence; VM absence is persisted
+  and observed twice with a minimum interval;
+- standard paid NLB and per-Service NodeLB operations use exact-UID Service
+  annotations;
+- shared NodeLB operations use their generated NodePool or NodeClass;
+- CSI uses immutable namespace-scoped Lease receipts. Disk-delete and detach
+  absence is stored in those Leases and completes only after three observations
+  at least 30 seconds apart; visibility resets only the absence evidence.
+  Attachment discovery exact-reads the union of every unfiltered location VM
+  row and every configured-VPC member, so an outside-VPC attachment fails
+  closed;
+- Karpenter uses the NodeClaim create and removal fences plus the fixed, non-expiring
+  `karpenter-inspace-firewall-mutations` Lease. That Lease stores independent
+  per-firewall CAS receipts, so only one controller invocation can dispatch an
+  assignment or detachment for a shared base firewall while unrelated
+  firewalls may progress independently. Karpenter persists the issued receipt
+  and terminal result; terminal destructive/removal state requires three fresh
+  authoritative observations at least 30 seconds apart. A restart before the
+  terminal write safely starts that observation sequence again.
+
+Karpenter owns and removes only the exact private base-firewall relationship
+persisted in its NodeClaim receipt. CCM exclusively owns the shared ICMP,
+NodeLB shard, and per-Service firewall relationships. Fixed bootstrap is fully
+Ready, with all control-plane relationship receipts materialized, before the
+Karpenter controller starts; this is required because the target cluster and
+its Lease coordinator do not exist during pre-cluster bootstrap.
+
+An empty list is not sufficient to release an issued additive mutation: the
+provider may have committed it but not exposed it through every read model yet.
+When an issued operation remains unresolved, pause that controller and obtain
+provider-side terminal no-commit proof before clearing only the exact receipt.
+
 ### Recovering a permanently fenced CCM mutation
 
 A retained issued marker is a safety condition, not a retry timer. Pause the
@@ -370,16 +451,38 @@ persisted applied policy or pending policy; any third policy requires manual
 cloud repair or support escalation before controller state is changed.
 
 After that external proof, remove only the transaction annotations. For a
-shard NodePool these are the `node-lb-shard-firewall-pending-*`,
+standard paid NLB Service, remove only
+`service.inspace.cloud/public-nlb-mutation`. For a per-Service NodeLB, the
+create receipts are `service.inspace.cloud/node-lb-pending-firewall-name`,
+`service.inspace.cloud/node-lb-pending-firewall-started-at`,
+`service.inspace.cloud/node-lb-pending-firewall-issued-token`, and
+`service.inspace.cloud/node-lb-pending-firewall-issued-at`; the exact relation
+receipt is `service.inspace.cloud/node-lb-firewall-relation-issued`. For an
+emergency withdrawal, retain the `node-lb-withdraw-firewall-*` ledger unless
+provider-side proof covers every persisted firewall/VM pair. For a shard
+NodePool the transaction annotations are the `node-lb-shard-firewall-pending-*`,
 `node-lb-shard-firewall-issued-at`,
 `node-lb-shard-firewall-create-absence-*`, and
 `node-lb-shard-firewall-cleanup-observed-uuid` annotations. For the generated
 NodeClass they are `node-lb-icmp-pending-firewall-*`,
-and `node-lb-icmp-create-issued-at`. Never remove the applied UUID/hash/ledger,
-ownership labels, or CCM finalizers during
-recovery. Resume CCM and let it perform its normal authoritative readback and
-spaced cleanup proof. Blindly removing a finalizer can orphan a billable
-firewall.
+and `node-lb-icmp-create-issued-at`. A Karpenter NodeClaim uses
+`karpenter.inspace.cloud/create-fence` and
+`karpenter.inspace.cloud/floating-ip-update-fence`; its shared base-firewall
+coordinator is the `karpenter-inspace-firewall-mutations` Lease in the
+Karpenter namespace. Do not edit any of these receipts while a VM,
+base-firewall assignment/detachment, or FIP PATCH is unresolved. Never
+remove the applied UUID/hash/ledger, ownership labels, or controller finalizers
+during recovery. Resume the controller and let it perform its normal
+authoritative readback and spaced cleanup proof. Blindly removing a finalizer
+can orphan a billable resource.
+
+Karpenter automatically decodes the v2 create-fence schema as conservative v3
+state. Materialized v2 claims become observed base-firewall assignments;
+reserved claims remain intent-only; issued claims remain issued/read-only and
+cannot gain a new POST solely because the controller restarted. An issued v2
+claim whose FIP PATCH outcome cannot be distinguished is also kept read-only.
+No manual migration is required, but an already ambiguous v2 receipt may still
+need the provider-side operator resolution described above.
 
 Public exposure also retains the explicit, paid, TCP-only InSpace NLB path documented in the
 [public Service example](charts/inspace-cloud-kube-modules/examples/service-public-nlb.yaml).
@@ -430,13 +533,16 @@ FIP-assignment absence again, and finally removes every stale firewall
 assignment for the UUID. The shared firewall itself is not deleted with an
 individual worker.
 
-Karpenter VM creation also uses a durable one-POST fence. The SDK response UUID
-is written and exactly read back before protection or materialization; an
-independent rollback CAS prevents a retry from racing successful adoption. The
-provider finalizer tracks an unknown auto-FIP through the original ambiguity
-window, including a pre-existing target/FIP association during adoption. An
-issued UUID-less ambiguous POST is never retried or auto-released from empty
-lists. Use the issue-bound operator resolution protocol in the
+Karpenter VM creation also uses a durable one-POST fence. After its issue CAS,
+fresh deterministic-name and ownership inventory either adopts one exact VM or
+proves the absence needed to authorize POST. The SDK response UUID remains
+provisional until canonical detail proves the complete v3 launch identity and
+billing account and the configured VPC contains it exactly once. An independent
+rollback CAS prevents a retry from racing successful adoption. The provider
+finalizer tracks an unknown auto-FIP through the original ambiguity window,
+including a pre-existing target/FIP association during adoption. An issued
+ambiguous POST is never retried or auto-released from empty lists. Use the
+issue-bound operator resolution protocol in the
 [Karpenter provider runbook](modules/karpenter-provider/README.md#recover-an-unresolved-vm-create-fence);
 never edit the opaque fence JSON or remove its finalizer manually.
 
@@ -455,12 +561,12 @@ The following rules apply to every development and test workflow:
 - Automated tests and smoke tests use loopback or in-memory fake APIs.
 - Normal root tests unset InSpace credentials and remote-mutation gates.
 - Live discovery is read-only and must be explicitly selected.
-- Live lifecycle tests are separate from normal tests, use unique
-  `inspace-e2e-*` names, and clean up every resource they create.
+- The root live lifecycle probe uses a durable local journal, unique
+  `inspace-e2e-*` names, and zero-residue audits before and after its mutation.
 - Mutating requests to `api.inspace.cloud` are denied by default in the shared
-  client. Live module tests require both `INSPACE_RUN_LIVE_TESTS=true` and
-  `INSPACE_ALLOW_REMOTE_MUTATIONS=true`; the root live-suite wrapper sets them
-  only after its billing-account confirmation succeeds.
+  client. The root live-suite wrapper sets its mutation gates only after the
+  billing-account confirmation succeeds. The former direct module lifecycle
+  targets are retired because they could not survive process loss safely.
 - API tokens, join tokens, private keys, generated kubeconfigs, state journals,
   and credential-bearing Helm values must never be committed or printed.
 - The bootstrap-cache key is operator secret material even though it is not an
@@ -495,12 +601,56 @@ make live-audit
 CONFIRM_INSPACE_LIVE_TEST="$INSPACE_BILLING_ACCOUNT_ID" make live-test
 ```
 
-The lifecycle suite creates only resources named `inspace-e2e-*`, preserves
-firewall protection when deletion is uncertain, and performs a zero-leftover
-audit before and after the run. Every test VM uses the configured AMD EPYC
-pool. The suite covers VM, firewall, floating-IP, TCP-NLB, block-disk, and real
-Karpenter-adapter lifecycles. Never run it against a production billing account
-or from a pull request.
+The default lifecycle suite performs a durable firewall create/delete
+conformance check and a cross-location zero-leftover audit before and after the run. Never run
+it against a production billing account or from a pull request.
+
+The wrapper journals its direct firewall mutation in
+`.e2e/live-suite/firewall-mutation.json` before dispatch and fsyncs both the
+file and its parent directory. After that boundary, create re-lists the
+deterministic name and either adopts one exact unassigned owned firewall or
+dispatches only from authoritative absence; delete re-reads the exact UUID,
+name, billing account, policy, and empty assignment set before dispatch. Its
+random ownership token, billing scope, normalized policy hash, and eventual
+UUID must all match authoritative readback before the firewall can be adopted.
+The POST response UUID is diagnostic only and never becomes the cleanup anchor.
+HTTP success, HTTP errors, timeouts, and interrupted response reads are all
+treated as ambiguous. An issued POST or DELETE is never replayed. Delete
+absence is persisted in the journal and completes only after three observations
+at least 30 seconds apart; reappearance resets that evidence while retaining
+the issued receipt, and restart resumes the persisted count.
+
+If the wrapper reports a permanently unresolved receipt:
+
+1. Stop every live-suite process. Remove `.e2e/live-suite/lock` only after
+   proving that it is stale.
+2. Keep the receipt. Compare its API URL, location, billing account, exact
+   firewall name, UUID when present, and policy hash with repeated authoritative
+   firewall-list reads.
+3. For `create-issued`, rerun the suite when the exact resource becomes visible;
+   it will adopt and clean up that resource without another POST. If the
+   provider confirms that the request never committed, only an operator may
+   archive the evidence and remove the receipt after a suitably spaced absence
+   audit.
+4. For `delete-issued`, never rerun DELETE through the harness. Rerun the suite
+   after the original delete becomes visible; repeated exact absence will clear
+   the receipt. If the resource remains, preserve the receipt while resolving
+   it with the provider.
+
+Never remove an issued receipt merely because one list response omits the
+resource. The journal contains no API token, but it is operational evidence and
+must not be committed.
+
+Receipt replacement fsyncs the mode-0600 file before atomic rename and then
+fsyncs its parent directory; receipt removal also fsyncs the parent. The
+black-box contract covers committed and uncommitted HTTP 4xx/5xx responses and
+transport disconnects for both POST and DELETE.
+
+The old direct Go module lifecycle diagnostics are retired. They used
+process-local cleanup for multi-resource VM, FIP, NLB, disk, and adapter
+sequences, so a committed HTTP error or process loss could strand resources.
+Use the guarded full-cluster E2E workflow below for component release
+acceptance; its controllers persist their own cloud-mutation receipts.
 
 ## Full-cluster release acceptance
 

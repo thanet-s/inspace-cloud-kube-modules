@@ -12,7 +12,7 @@ test:
 	GOWORK=$(GOWORK) go test ./...
 
 smoke:
-	GOWORK=$(GOWORK) go test ./pkg/bootstrap -run '^(TestReconcileBuildsBastionThenExactlyThreeControlPlaneVMs|TestReconcileStartsAllThreeControlPlaneCreatesBehindOneBarrier)$$' -count=1 -v
+	GOWORK=$(GOWORK) go test ./pkg/bootstrap -run '^(TestReconcileBuildsBastionThenExactlyThreeControlPlaneVMs|TestReconcileSequencesControlPlaneCreatesAfterPriorFirewallReadback)$$' -count=1 -v
 	GOWORK=$(GOWORK) go test ./pkg/cloudprovider -run '^(TestPublicLoadBalancerUsesExplicitOwnedFloatingIP|TestNodeLoadBalancerReconcileSmokeCreatesOwnedKarpenterAndDatapathResources)$$' -count=1 -v
 
 vet:
@@ -23,9 +23,8 @@ live-read:
 	GOWORK=$(GOWORK) go run ./cmd/inspace-discovery --location "$${INSPACE_LOCATION:-bkk01}" --smoke
 
 live-test:
-	@test "$$INSPACE_RUN_LIVE_TESTS" = "true" || (echo "INSPACE_RUN_LIVE_TESTS=true is required" >&2; exit 1)
-	@test "$$INSPACE_ALLOW_REMOTE_MUTATIONS" = "true" || (echo "INSPACE_ALLOW_REMOTE_MUTATIONS=true is required" >&2; exit 1)
-	GOWORK=$(GOWORK) go test -tags=live ./integration -run '^TestLiveLifecycle$$' -count=1 -v -timeout=30m
+	@echo "retired: unjournaled module live tests are unsafe; use root make live-test or make cluster-e2e" >&2
+	@exit 1
 
 build:
 	mkdir -p bin

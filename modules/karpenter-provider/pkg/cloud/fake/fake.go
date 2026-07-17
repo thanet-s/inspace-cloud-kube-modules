@@ -63,6 +63,12 @@ func (f *Cloud) CreateVM(ctx context.Context, request cloud.CreateVMRequest) (*c
 				if err := request.RecordCreatedVM(ctx, existing.UUID); err != nil {
 					return nil, err
 				}
+				if err := observeBaseFirewall(ctx, request, existing.UUID); err != nil {
+					return nil, err
+				}
+				if err := observeFloatingIPUpdate(ctx, request, existing); err != nil {
+					return nil, err
+				}
 			}
 			return existing, nil
 		}
@@ -86,6 +92,12 @@ func (f *Cloud) CreateVM(ctx context.Context, request cloud.CreateVMRequest) (*c
 					return nil, fmt.Errorf("missing durable created-VM anchor writer")
 				}
 				if err := request.RecordCreatedVM(ctx, existing.UUID); err != nil {
+					return nil, err
+				}
+				if err := observeBaseFirewall(ctx, request, existing.UUID); err != nil {
+					return nil, err
+				}
+				if err := observeFloatingIPUpdate(ctx, request, existing); err != nil {
 					return nil, err
 				}
 			}
@@ -133,8 +145,49 @@ func (f *Cloud) CreateVM(ctx context.Context, request cloud.CreateVMRequest) (*c
 		if err := request.RecordCreatedVM(ctx, id); err != nil {
 			return nil, err
 		}
+		if err := observeBaseFirewall(ctx, request, id); err != nil {
+			return nil, err
+		}
+		if err := observeFloatingIPUpdate(ctx, request, vm); err != nil {
+			return nil, err
+		}
 	}
 	return cloneVM(vm), nil
+}
+
+func observeBaseFirewall(ctx context.Context, request cloud.CreateVMRequest, vmUUID string) error {
+	if request.AuthorizeBaseFirewall == nil || request.ObserveBaseFirewall == nil {
+		return fmt.Errorf("missing durable base-firewall assignment callbacks")
+	}
+	fence := request.BaseFirewallAssignment
+	if request.BaseFirewallAssignment.Phase == cloud.FirewallAssignmentObserved {
+		return nil
+	}
+	if request.BaseFirewallAssignment.Phase != cloud.FirewallAssignmentIssued {
+		authorization, err := request.AuthorizeBaseFirewall(ctx, vmUUID)
+		if err != nil {
+			return err
+		}
+		fence = authorization.Fence
+	}
+	if fence.Phase == cloud.FirewallAssignmentObserved {
+		return nil
+	}
+	return request.ObserveBaseFirewall(ctx, vmUUID, fence.IssueID)
+}
+
+func observeFloatingIPUpdate(ctx context.Context, request cloud.CreateVMRequest, vm *cloud.VM) error {
+	if request.AuthorizeFloatingIPUpdate == nil || request.ObserveFloatingIPUpdate == nil || request.RejectFloatingIPUpdate == nil {
+		return fmt.Errorf("missing durable floating-IP update callbacks")
+	}
+	authorization, err := request.AuthorizeFloatingIPUpdate(ctx, vm.UUID, vm.PublicIPv4, vm.FloatingIPName, vm.BillingAccountID)
+	if err != nil {
+		return err
+	}
+	if authorization.Fence.Phase == cloud.FloatingIPUpdateObserved {
+		return nil
+	}
+	return request.ObserveFloatingIPUpdate(ctx, authorization.Fence)
 }
 
 func (f *Cloud) ProtectFencedCreate(_ context.Context, request cloud.FencedCreateCleanupRequest) error {
@@ -215,12 +268,12 @@ func (f *Cloud) ListVMs(_ context.Context, location, clusterName string) ([]*clo
 	return result, nil
 }
 
-func (f *Cloud) ValidateNodeClass(_ context.Context, location, networkUUID, controlPlaneVIP, privateLoadBalancerPoolStart, privateLoadBalancerPoolStop, hostPoolUUID, firewallUUID string) error {
+func (f *Cloud) ValidateNodeClass(_ context.Context, location string, billingAccountID int64, networkUUID, controlPlaneVIP, privateLoadBalancerPoolStart, privateLoadBalancerPoolStop, hostPoolUUID, firewallUUID string) error {
 	vip, err := netip.ParseAddr(controlPlaneVIP)
 	pool := inspacev1.PrivateLoadBalancerPool{Start: privateLoadBalancerPoolStart, Stop: privateLoadBalancerPoolStop}
 	reservedVIP := err == nil && (netip.MustParsePrefix(inspacev1.CiliumNativeRoutingPodCIDR).Contains(vip) || netip.MustParsePrefix(inspacev1.KubernetesServiceCIDR).Contains(vip))
-	if location == "" || networkUUID == "" || hostPoolUUID == "" || firewallUUID == "" || err != nil || !vip.Is4() || !vip.IsPrivate() || reservedVIP || pool.ValidateForSupervisor(vip) != nil {
-		return fmt.Errorf("location, network UUID, private control-plane VIP and Service pool, host pool UUID, and firewall UUID are required")
+	if location == "" || billingAccountID <= 0 || networkUUID == "" || hostPoolUUID == "" || firewallUUID == "" || err != nil || !vip.Is4() || !vip.IsPrivate() || reservedVIP || pool.ValidateForSupervisor(vip) != nil {
+		return fmt.Errorf("location, positive billing account ID, network UUID, private control-plane VIP and Service pool, host pool UUID, and firewall UUID are required")
 	}
 	return nil
 }

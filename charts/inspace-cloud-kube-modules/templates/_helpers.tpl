@@ -127,8 +127,8 @@ outside the two explicit source namespaces are intentionally left unchanged.
 {{- if eq .Values.global.inspace.apiSecret.name "inspace-rke2-agent-token" -}}
 {{- fail "global.inspace.apiSecret.name must not be the dedicated RKE2 agent-token Secret inspace-rke2-agent-token" -}}
 {{- end -}}
-{{- if or .Values.ccm.enabled .Values.karpenter.enabled -}}
-{{- $networkUUID := required "global.inspace.networkUUID is required when ccm.enabled=true or karpenter.enabled=true" .Values.global.inspace.networkUUID -}}
+{{- if or .Values.ccm.enabled .Values.csi.enabled .Values.karpenter.enabled -}}
+{{- $networkUUID := required "global.inspace.networkUUID is required when ccm.enabled=true, csi.enabled=true, or karpenter.enabled=true" .Values.global.inspace.networkUUID -}}
 {{- end -}}
 {{- if .Values.ccm.enabled -}}
 {{- $clusterID := required "global.inspace.clusterID is required when ccm.enabled=true" .Values.global.inspace.clusterID -}}

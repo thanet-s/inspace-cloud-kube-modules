@@ -23,10 +23,10 @@ var (
 	ErrCreateAttemptUnresolved = errors.New("issued VM create attempt requires operator resolution")
 	// ErrCreateAttemptRejected proves that this invocation did not obtain an
 	// accepted VM create: either the immediate Kubernetes authorization failed
-	// before the SDK call, or the API returned a definitive non-retryable
-	// rejection. The provider may durably mark the issued fence rejected; a
-	// crash before that mark remains safely unresolved.
-	ErrCreateAttemptRejected = errors.New("VM create attempt was definitively rejected")
+	// before the SDK call, or the SDK supplied positive local proof that no
+	// request was dispatched. HTTP responses, including every 4xx, are never
+	// rejection proof. A crash before the durable mark remains safely unresolved.
+	ErrCreateAttemptRejected = errors.New("VM create attempt was locally blocked before dispatch")
 )
 
 const (
@@ -85,10 +85,10 @@ type FencedCreateCleanupRequest struct {
 	POSTIssued                   bool
 	POSTRejected                 bool
 	AttemptResolved              bool
-	// CreatedVMUUID is the exact UUID returned by this fence's authorized
-	// create/adoption operation and persisted before any post-create cloud
-	// mutation. RollbackChosen is a separate irreversible CAS decision: the
-	// UUID anchor alone may only be protected/read, never cleaned up.
+	// CreatedVMUUID is the canonically verified launch UUID persisted only after
+	// exact v3 launch, billing-account, and configured-VPC proofs. A UUID from an
+	// SDK response is provisional and never grants mutation authority by itself.
+	// RollbackChosen is a separate irreversible CAS decision.
 	CreatedVMUUID       string
 	RollbackChosen      bool
 	DependentUnresolved bool
@@ -98,10 +98,27 @@ type FencedCreateCleanupRequest struct {
 	PublicIPv4          string
 	// Resolutions is the bounded durable history of exact ownership receipts
 	// persisted before cleanup deleted each target. Full dependent identity is
-	// retained so every historical target can be exact-read and idempotently
-	// deleted again during each final absence pass.
+	// retained so every historical target can be exact-read during each final
+	// absence pass without replaying a DELETE after canonical absence.
 	Resolutions []FencedCreateCleanupResolution
 	Baseline    CreateInventory
+	// BaseFirewallAssignment is the Kubernetes-durable authority for the one
+	// base-firewall assignment POST associated with CreatedVMUUID. An issued
+	// assignment may only be recovered with authoritative reads; it must never
+	// be replayed after a timeout, process restart, or controller failover.
+	BaseFirewallAssignment      FirewallAssignmentFence
+	AuthorizeBaseFirewall       func(context.Context, string) (FirewallAssignmentAuthorization, error)                      `json:"-"`
+	ObserveBaseFirewall         func(context.Context, string, string) error                                                 `json:"-"`
+	RejectBaseFirewall          func(context.Context, string, string) error                                                 `json:"-"`
+	AuthorizeBaseFirewallDetach func(context.Context, string) (FirewallDetachmentAuthorization, error)                      `json:"-"`
+	ObserveBaseFirewallDetach   func(context.Context, FirewallDetachmentFence) error                                        `json:"-"`
+	RejectBaseFirewallDetach    func(context.Context, FirewallDetachmentFence) error                                        `json:"-"`
+	AuthorizeFloatingIPUpdate   func(context.Context, string, string, string, int64) (FloatingIPUpdateAuthorization, error) `json:"-"`
+	ObserveFloatingIPUpdate     func(context.Context, FloatingIPUpdateFence) error                                          `json:"-"`
+	RejectFloatingIPUpdate      func(context.Context, FloatingIPUpdateFence) error                                          `json:"-"`
+	AuthorizeRemovalMutation    func(context.Context, RemovalMutation, bool) (RemovalMutationAuthorization, error)          `json:"-"`
+	ObserveRemovalMutation      func(context.Context, RemovalMutationFence) error                                           `json:"-"`
+	RejectRemovalMutation       func(context.Context, RemovalMutationFence) error                                           `json:"-"`
 }
 
 // FencedCreateCleanupResolution is exact cloud identity discovered during a
@@ -199,16 +216,148 @@ type CreateVMRequest struct {
 	// immediately before either adopting an existing exact VM or dispatching
 	// the SDK POST. It is process-local and excluded from request identity.
 	AuthorizeLaunch func(context.Context, CreateAuthorizationKind) error `json:"-"`
-	// RecordCreatedVM persists and exactly reads back the UUID returned by the
-	// authorized launch before protection, FIP, or materialization work. The
-	// sparse SDK response is sufficient authority to protect or roll back that
-	// exact VM, but never to delete an uncorrelated floating IP.
+	// RecordCreatedVM persists and exactly reads back a UUID only after the cloud
+	// adapter independently proves the complete v3 launch identity, billing
+	// account, and configured-VPC membership. Sparse SDK responses are discovery
+	// hints only and never authorize protection, rollback, or dependent mutation.
 	RecordCreatedVM func(context.Context, string) error `json:"-"`
 	// ChooseRollback irreversibly races materialization for the same anchored
 	// UUID. An optional resolution atomically adds an exact VM/FIP receipt; a
 	// nil resolution still authorizes security-priority deletion of the exact
 	// VM while dependent FIP discovery continues under the finalizer.
 	ChooseRollback func(context.Context, string, *FencedCreateCleanupResolution) error `json:"-"`
+	// BaseFirewallAssignment and its callbacks are a second durable mutation
+	// fence, scoped to the exact anchored VM. AuthorizeBaseFirewall persists and
+	// reads back an issued receipt before the adapter may POST. Observe and
+	// Reject transition that same exact issue after authoritative cloud evidence.
+	BaseFirewallAssignment      FirewallAssignmentFence                                                                     `json:"-"`
+	AuthorizeBaseFirewall       func(context.Context, string) (FirewallAssignmentAuthorization, error)                      `json:"-"`
+	ObserveBaseFirewall         func(context.Context, string, string) error                                                 `json:"-"`
+	RejectBaseFirewall          func(context.Context, string, string) error                                                 `json:"-"`
+	AuthorizeBaseFirewallDetach func(context.Context, string) (FirewallDetachmentAuthorization, error)                      `json:"-"`
+	ObserveBaseFirewallDetach   func(context.Context, FirewallDetachmentFence) error                                        `json:"-"`
+	RejectBaseFirewallDetach    func(context.Context, FirewallDetachmentFence) error                                        `json:"-"`
+	AuthorizeFloatingIPUpdate   func(context.Context, string, string, string, int64) (FloatingIPUpdateAuthorization, error) `json:"-"`
+	ObserveFloatingIPUpdate     func(context.Context, FloatingIPUpdateFence) error                                          `json:"-"`
+	RejectFloatingIPUpdate      func(context.Context, FloatingIPUpdateFence) error                                          `json:"-"`
+	AuthorizeRemovalMutation    func(context.Context, RemovalMutation, bool) (RemovalMutationAuthorization, error)          `json:"-"`
+	ObserveRemovalMutation      func(context.Context, RemovalMutationFence) error                                           `json:"-"`
+	RejectRemovalMutation       func(context.Context, RemovalMutationFence) error                                           `json:"-"`
+}
+
+type FirewallAssignmentPhase string
+
+const (
+	FirewallAssignmentIntent   FirewallAssignmentPhase = "intent"
+	FirewallAssignmentIssued   FirewallAssignmentPhase = "issued"
+	FirewallAssignmentRejected FirewallAssignmentPhase = "rejected"
+	FirewallAssignmentObserved FirewallAssignmentPhase = "observed"
+)
+
+// FirewallAssignmentFence is the non-secret, durable state needed by the
+// cloud adapter to distinguish a never-issued assignment from an ambiguous
+// issued one. The timestamps remain in the provider-owned annotation record;
+// the adapter needs only exact identity and phase.
+type FirewallAssignmentFence struct {
+	VMUUID       string
+	FirewallUUID string
+	Phase        FirewallAssignmentPhase
+	IssueID      string
+}
+
+// FirewallAssignmentAuthorization distinguishes the invocation that won new
+// POST authority from a retry that merely read an issued or observed receipt.
+// AssignFirewallToVM is permitted only when AllowPOST is true.
+type FirewallAssignmentAuthorization struct {
+	Fence     FirewallAssignmentFence
+	AllowPOST bool
+}
+
+// FirewallDetachmentFence is the durable, firewall-scoped receipt for one
+// exact base-firewall relationship DELETE. An issued receipt is read-only
+// after its owning invocation ends; authoritative relationship absence is the
+// only automatic success proof after an ambiguous cloud response.
+type FirewallDetachmentFence struct {
+	VMUUID       string
+	FirewallUUID string
+	Phase        FirewallAssignmentPhase
+	IssueID      string
+}
+
+type FirewallDetachmentAuthorization struct {
+	Fence       FirewallDetachmentFence
+	AllowDELETE bool
+}
+
+type FloatingIPUpdatePhase string
+
+const (
+	FloatingIPUpdateIssued   FloatingIPUpdatePhase = "issued"
+	FloatingIPUpdateRejected FloatingIPUpdatePhase = "rejected"
+	FloatingIPUpdateObserved FloatingIPUpdatePhase = "observed"
+)
+
+// FloatingIPUpdateFence is the exact durable receipt for the deterministic
+// metadata PATCH of one auto-reserved floating IP. HTTP status is never
+// terminal proof that the PATCH did not commit; an issued receipt is read-only
+// after its owning invocation ends.
+type FloatingIPUpdateFence struct {
+	VMUUID           string
+	Address          string
+	Name             string
+	BillingAccountID int64
+	Phase            FloatingIPUpdatePhase
+	IssueID          string
+}
+
+type FloatingIPUpdateAuthorization struct {
+	Fence     FloatingIPUpdateFence
+	AllowPOST bool
+}
+
+type RemovalMutationOperation string
+
+const (
+	RemovalMutationVMDelete           RemovalMutationOperation = "vm-delete"
+	RemovalMutationFloatingIPUnassign RemovalMutationOperation = "floating-ip-unassign"
+	RemovalMutationFloatingIPDelete   RemovalMutationOperation = "floating-ip-delete"
+)
+
+type RemovalMutationPhase string
+
+const (
+	RemovalMutationReady    RemovalMutationPhase = "ready"
+	RemovalMutationIssued   RemovalMutationPhase = "issued"
+	RemovalMutationRejected RemovalMutationPhase = "rejected"
+	RemovalMutationObserved RemovalMutationPhase = "observed"
+)
+
+// RemovalMutation is the exact non-secret identity of one destructive cloud
+// operation. Floating-IP fields are empty for a VM DELETE. The VM UUID remains
+// part of dependent identities after unassignment so an address can never be
+// reused as authority for another NodeClaim.
+type RemovalMutation struct {
+	Operation        RemovalMutationOperation
+	Location         string
+	VMUUID           string
+	Address          string
+	Name             string
+	BillingAccountID int64
+}
+
+// RemovalMutationFence is a Kubernetes-durable one-shot mutation receipt.
+// Issued remains read-only after any request may have reached InSpace. Only a
+// locally blocked request may transition to Rejected and obtain a later issue.
+type RemovalMutationFence struct {
+	RemovalMutation
+	Phase   RemovalMutationPhase
+	IssueID string
+}
+
+type RemovalMutationAuthorization struct {
+	Fence         RemovalMutationFence
+	Active        bool
+	AllowMutation bool
 }
 
 type CreateAuthorizationKind string
@@ -253,10 +402,17 @@ type VM struct {
 // has already disappeared, because a deterministic name alone is not durable
 // authority to mutate an account resource.
 type DeleteVMIdentity struct {
-	FloatingIPName   string
-	PublicIPv4       string
-	BillingAccountID int64
-	NetworkUUID      string
+	FloatingIPName              string
+	PublicIPv4                  string
+	BillingAccountID            int64
+	NetworkUUID                 string
+	FirewallUUID                string
+	AuthorizeBaseFirewallDetach func(context.Context, string) (FirewallDetachmentAuthorization, error)             `json:"-"`
+	ObserveBaseFirewallDetach   func(context.Context, FirewallDetachmentFence) error                               `json:"-"`
+	RejectBaseFirewallDetach    func(context.Context, FirewallDetachmentFence) error                               `json:"-"`
+	AuthorizeRemovalMutation    func(context.Context, RemovalMutation, bool) (RemovalMutationAuthorization, error) `json:"-"`
+	ObserveRemovalMutation      func(context.Context, RemovalMutationFence) error                                  `json:"-"`
+	RejectRemovalMutation       func(context.Context, RemovalMutationFence) error                                  `json:"-"`
 }
 
 func (v *VM) ImageID() string { return v.OSName + "@" + v.OSVersion }
@@ -277,5 +433,5 @@ type Cloud interface {
 // NodeClassValidator is implemented by production and fake clouds for the
 // readiness reconciler's read-only host-pool check.
 type NodeClassValidator interface {
-	ValidateNodeClass(ctx context.Context, location, networkUUID, controlPlaneVIP, privateLoadBalancerPoolStart, privateLoadBalancerPoolStop, hostPoolUUID, firewallUUID string) error
+	ValidateNodeClass(ctx context.Context, location string, billingAccountID int64, networkUUID, controlPlaneVIP, privateLoadBalancerPoolStart, privateLoadBalancerPoolStop, hostPoolUUID, firewallUUID string) error
 }

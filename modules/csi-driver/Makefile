@@ -20,9 +20,8 @@ smoke:
 	GOWORK=$(GOWORK) go test ./pkg/driver -run '^TestCSIRWOLifecycleSmoke$$' -count=1 -v
 
 live-test:
-	@test "$$INSPACE_RUN_LIVE_TESTS" = true || (echo 'set INSPACE_RUN_LIVE_TESTS=true' >&2; exit 1)
-	@test "$$INSPACE_ALLOW_REMOTE_MUTATIONS" = true || (echo 'set INSPACE_ALLOW_REMOTE_MUTATIONS=true' >&2; exit 1)
-	GOWORK=$(GOWORK) go test -tags=live ./pkg/cloud/inspace -run '^TestLiveDiskLifecycle$$' -count=1 -v
+	@echo 'retired: unjournaled module live tests are unsafe; use root make live-test or make cluster-e2e' >&2
+	@exit 1
 
 test:
 	GOWORK=$(GOWORK) go test ./...

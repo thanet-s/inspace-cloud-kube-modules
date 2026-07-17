@@ -77,6 +77,27 @@ func TestRemoteBaseURLRequiresHTTPS(t *testing.T) {
 	}
 }
 
+func TestHTTP408IsClassifiedRetryableWithoutAutomaticReplay(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		http.Error(w, "request outcome is ambiguous", http.StatusRequestTimeout)
+	}))
+	t.Cleanup(server.Close)
+	client, err := inspace.NewClient(inspace.Options{BaseURL: server.URL, APIKey: "test-key"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.ListLocations(context.Background())
+	var apiErr *inspace.APIError
+	if !errors.As(err, &apiErr) || !apiErr.Retryable || apiErr.StatusCode != http.StatusRequestTimeout {
+		t.Fatalf("ListLocations() error = %#v, want retryable HTTP 408", err)
+	}
+	if got := requests.Load(); got != 1 {
+		t.Fatalf("HTTP 408 request count = %d, want no automatic replay", got)
+	}
+}
+
 func TestCrossOriginRedirectNeverForwardsAPIKey(t *testing.T) {
 	var targetRequests atomic.Int32
 	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -103,6 +124,41 @@ func TestCrossOriginRedirectNeverForwardsAPIKey(t *testing.T) {
 	}
 	if got := targetRequests.Load(); got != 0 {
 		t.Fatalf("redirect target received %d requests, want 0", got)
+	}
+}
+
+func TestMutationRedirectIsNeverReplayed(t *testing.T) {
+	var sourceRequests atomic.Int32
+	var targetRequests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/bkk01/user-resource/vm":
+			sourceRequests.Add(1)
+			w.Header().Set("Location", "/redirected-mutation")
+			w.WriteHeader(http.StatusTemporaryRedirect)
+		case "/redirected-mutation":
+			targetRequests.Add(1)
+			w.WriteHeader(http.StatusCreated)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+	client, err := inspace.NewClient(inspace.Options{BaseURL: server.URL, APIKey: "test-key"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.CreateVM(context.Background(), "bkk01", inspace.CreateVMRequest{
+		Name: "redirected", OSName: "ubuntu", OSVersion: "24.04", DiskGiB: 40, VCPU: 2, MemoryMiB: 4096,
+	})
+	if !errors.Is(err, inspace.ErrMutationRedirect) {
+		t.Fatalf("CreateVM() error = %v, want ErrMutationRedirect", err)
+	}
+	if got := sourceRequests.Load(); got != 1 {
+		t.Fatalf("mutation source request count = %d, want 1", got)
+	}
+	if got := targetRequests.Load(); got != 0 {
+		t.Fatalf("mutation redirect target request count = %d, want 0", got)
 	}
 }
 

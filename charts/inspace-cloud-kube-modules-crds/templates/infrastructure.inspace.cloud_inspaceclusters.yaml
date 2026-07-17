@@ -247,3 +247,88 @@ spec:
                   type: string
                 message:
                   type: string
+                createAttempts:
+                  type: object
+                  maxProperties: 14
+                  additionalProperties:
+                    type: object
+                    required: [resourceKind, resourceName, intentHash, phase]
+                    properties:
+                      resourceKind:
+                        type: string
+                        enum: [virtual-machine, firewall, firewall-assignment, floating-ip-update]
+                      resourceName:
+                        type: string
+                        minLength: 1
+                        maxLength: 255
+                      intentHash:
+                        type: string
+                        pattern: '^[0-9a-f]{64}$'
+                      phase:
+                        type: string
+                        enum: [intent, issued, rejection-pending, materialized, adopted]
+                      issueID:
+                        type: string
+                        pattern: '^[0-9a-f]{32}$'
+                      issuedAt:
+                        type: string
+                        format: date-time
+                      absenceObservedAt:
+                        type: string
+                        format: date-time
+                      resourceUUID:
+                        type: string
+                        format: uuid
+                deleteAttempts:
+                  type: object
+                  maxProperties: 10
+                  additionalProperties:
+                    type: object
+                    required: [resourceKind, resourceName, location, owner, purpose, phase]
+                    properties:
+                      resourceKind:
+                        type: string
+                        enum: [virtual-machine, floating-ip, firewall]
+                      resourceName:
+                        type: string
+                        minLength: 1
+                        maxLength: 255
+                      resourceUUID:
+                        type: string
+                        format: uuid
+                      firewallUUID:
+                        type: string
+                        format: uuid
+                      relatedResourceUUID:
+                        type: string
+                        format: uuid
+                      location:
+                        type: string
+                        minLength: 1
+                        maxLength: 63
+                      owner:
+                        type: string
+                        minLength: 1
+                        maxLength: 64
+                      purpose:
+                        type: string
+                        enum: [destroy, malformed-create-rollback]
+                      phase:
+                        type: string
+                        enum: [rollback-fip-discovery, rollback-fip-after-vm, rollback-fip-unassign-intent, rollback-fip-unassign-issued, rollback-fip-delete-intent, rollback-fip-delete-issued, vm-delete-intent, vm-delete-issued, floating-ip-unassign-intent, floating-ip-unassign-issued, floating-ip-delete-intent, floating-ip-delete-issued, firewall-delete-intent, firewall-delete-issued, absent]
+                      issueID:
+                        type: string
+                        pattern: '^[0-9a-f]{32}$'
+                      issuedAt:
+                        type: string
+                        format: date-time
+                      absenceObservedAt:
+                        type: string
+                        format: date-time
+                      floatingIPName:
+                        type: string
+                        minLength: 1
+                        maxLength: 255
+                      floatingIPAddress:
+                        type: string
+                        format: ipv4

@@ -2,8 +2,10 @@ package cloudprovider
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -781,10 +783,25 @@ func aggregateAddSafetyNode(
 		BlockOwnerDeletion: &blockOwnerDeletion,
 	}}
 	nodeClassName := managedNodeLoadBalancerName(harness.provider.config.ClusterID, "node-lb")
+	nodeClass, err := harness.provider.dynamicClient.Resource(nodeClassGVR).Get(harness.ctx, nodeClassName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseFirewallUUID, found, err := unstructured.NestedString(nodeClass.Object, "spec", "firewallUUID")
+	if err != nil || !found {
+		t.Fatalf("managed NodeClass has no base firewall UUID: found=%v err=%v", found, err)
+	}
+	floatingIPName := managedNodeLoadBalancerFloatingIPName(harness.provider.config.ClusterID, claimName)
 	claim := &unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": "karpenter.sh/v1", "kind": "NodeClaim",
 		"metadata": map[string]any{
 			"name": claimName, "uid": string(claimUID),
+			"annotations": map[string]any{
+				karpenterPublicIPv4Annotation:     externalIP,
+				karpenterFloatingIPNameAnnotation: floatingIPName,
+				karpenterBillingAccountAnnotation: strconv.FormatInt(harness.provider.config.BillingAccountID, 10),
+				karpenterNodeNameAnnotation:       node.Name,
+			},
 			"labels": map[string]any{
 				karpenterNodePoolLabel:           shard,
 				nodeLoadBalancerNodeLabel:        "true",
@@ -804,16 +821,42 @@ func aggregateAddSafetyNode(
 	if _, err := harness.provider.dynamicClient.Resource(nodeClaimGVR).Create(harness.ctx, claim, metav1.CreateOptions{}); err != nil {
 		t.Fatal(err)
 	}
+	ownership, err := json.Marshal(publicNodeLocalVMOwnership{
+		Schema: "karpenter.inspace.cloud/v3", Cluster: harness.provider.config.ClusterID,
+		NodePool: shard, NodeClaim: claimName, VMName: node.Name,
+		FirewallProfile: nodeLoadBalancerFirewallMode, FirewallUUID: baseFirewallUUID,
+		NetworkUUID: harness.provider.config.NetworkUUID, BillingAccountID: harness.provider.config.BillingAccountID,
+		FloatingIPName: floatingIPName,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	harness.api.vms = append(harness.api.vms, inspace.VM{
+		UUID: vmUUID, Name: node.Name, Description: string(ownership), Status: "running",
+		BillingAccountID: harness.provider.config.BillingAccountID, NetworkUUID: harness.provider.config.NetworkUUID,
+		PrivateIPv4: internalIP,
+	})
 	harness.api.floatingIPs = append(harness.api.floatingIPs, inspace.FloatingIP{
-		Name: "karpenter-" + claimName, Address: externalIP,
+		Name: floatingIPName, Address: externalIP,
 		BillingAccountID: harness.provider.config.BillingAccountID, Type: "public", Enabled: true,
 		AssignedTo: vmUUID, AssignedToResourceType: "virtual_machine", AssignedToPrivateIP: internalIP,
 	})
-	if assignICMP {
-		nodeClass, err := harness.provider.dynamicClient.Resource(nodeClassGVR).Get(harness.ctx, nodeClassName, metav1.GetOptions{})
-		if err != nil {
-			t.Fatal(err)
+	baseFound := false
+	for index := range harness.api.firewalls {
+		if harness.api.firewalls[index].UUID != baseFirewallUUID {
+			continue
 		}
+		harness.api.firewalls[index].ResourcesAssigned = append(
+			harness.api.firewalls[index].ResourcesAssigned,
+			inspace.FirewallResource{ResourceType: "vm", ResourceUUID: vmUUID},
+		)
+		baseFound = true
+		break
+	}
+	if !baseFound {
+		t.Fatalf("base firewall %s not found", baseFirewallUUID)
+	}
+	if assignICMP {
 		icmpUUID := nodeClass.GetAnnotations()[annotationNodeLoadBalancerICMPFirewallUUID]
 		found := false
 		for index := range harness.api.firewalls {

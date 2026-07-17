@@ -25,7 +25,6 @@ const (
 	BastionRootDiskGiB    = 30
 	DefaultManagementCIDR = "0.0.0.0/0"
 
-	ownedVMDeletionTransitionTTL             = 5 * time.Minute
 	defaultProtectionAuditTimeout            = 15 * time.Second
 	defaultProtectionRequestTimeout          = 10 * time.Second
 	defaultProtectionReadbackMinInterval     = 500 * time.Millisecond
@@ -41,10 +40,13 @@ var (
 
 	// ErrRetryableAmbiguousVMDelete marks a VM DELETE whose commit status is
 	// uncertain and whose exact in-memory deletion intent must survive a retry.
-	ErrRetryableAmbiguousVMDelete = errors.New("bootstrap: retryable ambiguous VM deletion outcome")
+	ErrRetryableAmbiguousVMDelete  = errors.New("bootstrap: retryable ambiguous VM deletion outcome")
+	errManagedFirewallNotVisible   = errors.New("bootstrap: managed firewall row is not yet visible during assignment readback")
+	errOwnedVMMutationTargetAbsent = errors.New("bootstrap: owned VM mutation target is absent")
 )
 
 type API interface {
+	ListHostPools(context.Context, string) ([]inspace.HostPool, error)
 	GetNetwork(context.Context, string, string) (*inspace.Network, error)
 	ListLoadBalancers(context.Context, string) ([]inspace.LoadBalancer, error)
 	ListVMs(context.Context, string) ([]inspace.VM, error)
@@ -63,6 +65,9 @@ type API interface {
 
 type Reconciler struct {
 	API API
+	// StatusCompareAndSwap durably persists create/assignment intent, issue,
+	// and materialization receipts before cloud mutations can advance.
+	StatusCompareAndSwap StatusCompareAndSwapFunc
 	// BootstrapCacheKey deterministically derives the private cache's P-256
 	// CA and server key. Cached mode requires exactly 32 bytes. The raw key is
 	// never sent to a VM or exposed in Result.
@@ -87,9 +92,11 @@ type Reconciler struct {
 	ManagementCIDR     string
 	ManagementTCPPorts []int
 
-	pendingDeletionMu  sync.Mutex
-	pendingVMDeletions map[string]pendingVMDeletion
-	now                func() time.Time
+	// Fixed-node VM boot may overlap, but paid control-plane creates and InSpace
+	// firewall relationship writes to one shared firewall are sequenced through
+	// authoritative protection readback. Different firewall pairs remain independent.
+	firewallAssignmentGates sync.Map
+	statusMu                sync.Mutex
 
 	protectionAuditTimeout            time.Duration
 	protectionRequestTimeout          time.Duration
@@ -98,15 +105,7 @@ type Reconciler struct {
 	createdVMRecoveryTimeout          time.Duration
 	createdVMFloatingIPCleanupTimeout time.Duration
 	createdVMDeleteTimeout            time.Duration
-}
-
-type pendingVMDeletion struct {
-	Owner        string
-	Location     string
-	Name         string
-	UUID         string
-	FirewallUUID string
-	ExpiresAt    time.Time
+	vmAbsenceObservationMinInterval   time.Duration
 }
 
 type privateIPv4Range struct {
@@ -170,6 +169,13 @@ func (r *Reconciler) Reconcile(ctx context.Context, cluster *v1alpha1.InSpaceClu
 	if err := r.validateBastionAccess(); err != nil {
 		return Result{}, err
 	}
+	rollbackPending, err := r.resumeRollbackDeletes(ctx, cluster)
+	if err != nil {
+		return Result{}, err
+	}
+	if rollbackPending {
+		return Result{}, fmt.Errorf("%w: malformed-create rollback is awaiting exact floating-IP/VM absence", ErrCreateAttemptPending)
+	}
 	owner := ownerKey(cluster)
 	cacheTLS, err := r.bootstrapCacheTLS(cluster, owner)
 	if err != nil {
@@ -215,6 +221,9 @@ func (r *Reconciler) Reconcile(ctx context.Context, cluster *v1alpha1.InSpaceClu
 	}
 	configuredNetworkVMs, err := vmsOnConfiguredNetwork(vms, network)
 	if err != nil {
+		if r.hasUnresolvedVMCreate(cluster) {
+			return Result{}, fmt.Errorf("%w: VPC and VM inventory have not converged after an issued create: %v", ErrCreateAttemptPending, err)
+		}
 		return Result{}, err
 	}
 	byName, err := uniqueOwnedVMs(vms, owner, cluster.Metadata.Name)
@@ -334,19 +343,30 @@ func (r *Reconciler) Reconcile(ctx context.Context, cluster *v1alpha1.InSpaceClu
 		if err := r.rejectResidualFloatingIPNames(ctx, cluster.Spec.Location, resourceNames.BastionFloatingIP); err != nil {
 			return Result{}, err
 		}
-		created, createErr := r.API.CreateVM(ctx, cluster.Spec.Location, bastionRequest)
-		secured, secureErr := r.secureCreatedVMResponse(ctx, cluster, bastionFirewall, created, bastionRequest, resourceNames.BastionFloatingIP, network.Subnet, cluster.Spec.Endpoint.VirtualIPv4, privatePool)
-		if secureErr != nil || createErr != nil {
-			return Result{}, errors.Join(createErr, secureErr)
+		secured, created, createErr := r.ensureManagedVMCreate(
+			ctx, cluster, createAttemptBastionVM, bastionFirewall, nil, bastionRequest,
+			resourceNames.BastionFloatingIP, network.Subnet, cluster.Spec.Endpoint.VirtualIPv4, privatePool,
+		)
+		if createErr != nil {
+			return Result{}, createErr
 		}
 		bastion = secured
-		return baseResult(nil, "created and firewalled the private bastion; waiting for authoritative VM readback"), nil
+		if created {
+			return baseResult(nil, "created and firewalled the private bastion; waiting for authoritative VM readback"), nil
+		}
+	} else {
+		if _, _, err := r.ensureManagedVMCreate(
+			ctx, cluster, createAttemptBastionVM, bastionFirewall, bastion, bastionRequest,
+			resourceNames.BastionFloatingIP, network.Subnet, cluster.Spec.Endpoint.VirtualIPv4, privatePool,
+		); err != nil {
+			return Result{}, err
+		}
 	}
 	bastionFirewall, err = r.ensureManagedBastionFirewall(ctx, cluster, network.Subnet, owner, bastionFirewall)
 	if err != nil {
 		return Result{}, err
 	}
-	protected, err := r.ensureVMProtection(ctx, cluster, bastionFirewall, bastion)
+	protected, err := r.ensureVMProtection(ctx, cluster, createAttemptBastionFirewallAssignment, bastionFirewall, bastion)
 	if err != nil {
 		return Result{}, err
 	}
@@ -383,11 +403,6 @@ func (r *Reconciler) Reconcile(ctx context.Context, cluster *v1alpha1.InSpaceClu
 		desiredRequests[slot] = desired
 	}
 
-	type createOutcome struct {
-		vm  *inspace.VM
-		err error
-	}
-	outcomes := make([]createOutcome, ControlPlaneReplicas)
 	missing := 0
 	for slot := 0; slot < ControlPlaneReplicas; slot++ {
 		if controlled[slot] == nil {
@@ -408,52 +423,51 @@ func (r *Reconciler) Reconcile(ctx context.Context, cluster *v1alpha1.InSpaceClu
 		if err := r.rejectResidualFloatingIPNames(ctx, cluster.Spec.Location, missingFloatingIPNames...); err != nil {
 			return Result{}, err
 		}
-	}
-	var creates sync.WaitGroup
-	for slot := 0; slot < ControlPlaneReplicas; slot++ {
-		if controlled[slot] != nil {
-			continue
-		}
-		creates.Add(1)
-		go func(slot int) {
-			defer creates.Done()
-			if collisionErr := r.rejectResidualFloatingIPNames(ctx, cluster.Spec.Location, resourceNames.ControlPlaneFIP[slot]); collisionErr != nil {
-				outcomes[slot].err = collisionErr
-				return
-			}
-			created, createErr := r.API.CreateVM(ctx, cluster.Spec.Location, desiredRequests[slot])
-			secured, secureErr := r.secureCreatedVMResponse(ctx, cluster, nodeFirewall, created, desiredRequests[slot], resourceNames.ControlPlaneFIP[slot], network.Subnet, cluster.Spec.Endpoint.VirtualIPv4, privatePool)
-			if secureErr != nil || createErr != nil {
-				outcomes[slot].err = errors.Join(createErr, secureErr)
-				return
-			}
-			outcomes[slot].vm = secured
-		}(slot)
-	}
-	creates.Wait()
-	if missing != 0 {
-		var createErrs []error
 		for slot := 0; slot < ControlPlaneReplicas; slot++ {
-			if outcomes[slot].vm != nil {
-				controlled[slot] = outcomes[slot].vm
+			if controlled[slot] != nil {
+				if _, _, err := r.ensureManagedVMCreate(
+					ctx, cluster, controlPlaneCreateAttemptKey(slot), nodeFirewall, controlled[slot], desiredRequests[slot],
+					resourceNames.ControlPlaneFIP[slot], network.Subnet, cluster.Spec.Endpoint.VirtualIPv4, privatePool,
+				); err != nil {
+					return baseResult(controlled, "stopped ordered control-plane creation while validating an existing slot"), fmt.Errorf("bootstrap: control-plane slot %d: %w", slot, err)
+				}
+				if _, err := r.ensureVMProtection(ctx, cluster, controlPlaneFirewallAssignmentAttemptKey(slot), nodeFirewall, controlled[slot]); err != nil {
+					return baseResult(controlled, "stopped ordered control-plane creation until an existing slot is authoritatively firewalled"), fmt.Errorf("bootstrap: control-plane slot %d: %w", slot, err)
+				}
+				continue
 			}
-			if outcomes[slot].err != nil {
-				createErrs = append(createErrs, fmt.Errorf("bootstrap: control-plane slot %d: %w", slot, outcomes[slot].err))
+			// Re-check the exact slot immediately before its VM POST. More
+			// importantly, do not advance to the next slot until this create has
+			// completed its durable, authoritative restrictive-firewall proof.
+			if err := r.rejectResidualFloatingIPNames(ctx, cluster.Spec.Location, resourceNames.ControlPlaneFIP[slot]); err != nil {
+				return baseResult(controlled, "stopped ordered control-plane creation before a residual floating-IP collision"), fmt.Errorf("bootstrap: control-plane slot %d: %w", slot, err)
 			}
+			secured, _, err := r.ensureManagedVMCreate(
+				ctx, cluster, controlPlaneCreateAttemptKey(slot), nodeFirewall, nil, desiredRequests[slot],
+				resourceNames.ControlPlaneFIP[slot], network.Subnet, cluster.Spec.Endpoint.VirtualIPv4, privatePool,
+			)
+			if err != nil {
+				return baseResult(controlled, "stopped ordered control-plane creation until the current slot is authoritatively firewalled"), fmt.Errorf("bootstrap: control-plane slot %d: %w", slot, err)
+			}
+			controlled[slot] = secured
 		}
-		result := baseResult(controlled, "created and firewalled missing private RKE2 control-plane VMs in parallel; waiting for authoritative VM readback")
-		if len(createErrs) != 0 {
-			return result, errors.Join(createErrs...)
-		}
-		return result, nil
+		return baseResult(controlled, "created and firewalled missing private RKE2 control-plane VMs in deterministic slot order; VM boot may continue concurrently"), nil
 	}
 	nodeFirewall, err = r.ensureManagedNodeFirewall(ctx, cluster, network, owner, nodeFirewall)
 	if err != nil {
 		return Result{}, err
 	}
+	for slot := 0; slot < ControlPlaneReplicas; slot++ {
+		if _, _, err := r.ensureManagedVMCreate(
+			ctx, cluster, controlPlaneCreateAttemptKey(slot), nodeFirewall, controlled[slot], desiredRequests[slot],
+			resourceNames.ControlPlaneFIP[slot], network.Subnet, cluster.Spec.Endpoint.VirtualIPv4, privatePool,
+		); err != nil {
+			return Result{}, err
+		}
+	}
 	allProtected := true
 	for slot := 0; slot < ControlPlaneReplicas; slot++ {
-		protected, protectErr := r.ensureVMProtection(ctx, cluster, nodeFirewall, controlled[slot])
+		protected, protectErr := r.ensureVMProtection(ctx, cluster, controlPlaneFirewallAssignmentAttemptKey(slot), nodeFirewall, controlled[slot])
 		if protectErr != nil {
 			return Result{}, protectErr
 		}
@@ -515,6 +529,13 @@ func (r *Reconciler) Destroy(ctx context.Context, cluster *v1alpha1.InSpaceClust
 	if err := validateBastionFirewallAccess(r.ManagementCIDR, r.ManagementTCPPorts); err != nil {
 		return DestroyResult{}, err
 	}
+	rollbackPending, err := r.resumeRollbackDeletes(ctx, cluster)
+	if err != nil {
+		return DestroyResult{}, err
+	}
+	if rollbackPending {
+		return DestroyResult{Owner: ownerKey(cluster), Message: "waiting for durable malformed-create rollback"}, nil
+	}
 	owner := ownerKey(cluster)
 	result := DestroyResult{Owner: owner}
 	network, err := r.API.GetNetwork(ctx, cluster.Spec.Location, cluster.Spec.Network.UUID)
@@ -569,10 +590,12 @@ func (r *Reconciler) Destroy(ctx context.Context, cluster *v1alpha1.InSpaceClust
 	}
 	bastionIPName := resourceNames.BastionFloatingIP
 	floatingNames := []string{bastionIPName}
+	floatingDeleteKeys := map[string]string{bastionIPName: destroyFIPBastionKey}
 	floatingVMByName := map[string]*inspace.VM{bastionIPName: ownedVMs[bastionVMName]}
 	for slot := 0; slot < ControlPlaneReplicas; slot++ {
 		name := resourceNames.ControlPlaneFIP[slot]
 		floatingNames = append(floatingNames, name)
+		floatingDeleteKeys[name] = destroyFIPControlPlaneKey(slot)
 		floatingVMByName[name] = ownedVMs[controlPlaneNames[slot]]
 	}
 	for _, name := range floatingNames {
@@ -595,20 +618,56 @@ func (r *Reconciler) Destroy(ctx context.Context, cluster *v1alpha1.InSpaceClust
 	if err := validateManagedBastionFirewallForDestroy(bastionFirewall, cluster, network.Subnet, owner, resourceNames.BastionFirewall, r.ManagementCIDR); err != nil {
 		return result, err
 	}
-	pendingDeletions, err := r.activePendingVMDeletions(owner, cluster.Spec.Location, firewalls)
+	durableDeletions, err := durableVMDeleteAssignments(cluster, firewalls)
 	if err != nil {
 		return result, err
 	}
+	for key, deletion := range durableDeletions {
+		if deletion.Phase != deletePhaseVMIssued {
+			continue
+		}
+		absent, observeErr := r.observeExactVMDeletion(ctx, cluster, key)
+		if observeErr != nil {
+			return result, errors.Join(ErrRetryableAmbiguousVMDelete, observeErr)
+		}
+		if absent {
+			result.Message = "confirmed absent " + deletion.ResourceName
+		} else {
+			result.Message = "VM remains visible after exact deletion readback: " + deletion.ResourceName
+		}
+		return result, nil
+	}
+	for key, deletion := range durableDeletions {
+		if deletion.Phase != deletePhaseVMIntent || ownedVMs[deletion.ResourceName] != nil {
+			continue
+		}
+		absent, observeErr := r.observeExactVMDeletion(ctx, cluster, key)
+		if observeErr != nil {
+			return result, observeErr
+		}
+		if absent {
+			result.Message = "confirmed externally absent " + deletion.ResourceName
+		} else {
+			result.Message = "waiting for VM inventory to include exact deletion target " + deletion.ResourceName
+		}
+		return result, nil
+	}
 	nodeAllowed := controlPlaneUUIDSet(ownedVMs, controlPlaneNames)
 	bastionAllowed := bastionUUIDSet(ownedVMs, bastionVMName)
-	for _, deletion := range pendingDeletions {
+	for _, deletion := range durableDeletions {
 		switch {
 		case nodeFirewall != nil && deletion.FirewallUUID == nodeFirewall.UUID:
-			nodeAllowed[deletion.UUID] = true
+			nodeAllowed[deletion.ResourceUUID] = true
 		case bastionFirewall != nil && deletion.FirewallUUID == bastionFirewall.UUID:
-			bastionAllowed[deletion.UUID] = true
+			bastionAllowed[deletion.ResourceUUID] = true
 		default:
-			return result, fmt.Errorf("bootstrap: pending deletion for VM %q references an unexpected managed firewall", deletion.Name)
+			visible := false
+			for i := range firewalls {
+				visible = visible || strings.EqualFold(firewalls[i].UUID, deletion.FirewallUUID)
+			}
+			if visible {
+				return result, fmt.Errorf("bootstrap: durable deletion for VM %q references an unexpected managed firewall", deletion.ResourceName)
+			}
 		}
 	}
 	if err := validateOwnedFirewallAssignments(nodeFirewall, nodeAllowed); err != nil {
@@ -638,8 +697,29 @@ func (r *Reconciler) Destroy(ctx context.Context, cluster *v1alpha1.InSpaceClust
 
 	for _, name := range floatingNames {
 		item := floatingByName[name]
+		deleteKey := floatingDeleteKeys[name]
 		if item == nil {
+			if attempt, exists := r.deleteAttempt(cluster, deleteKey); exists {
+				if attempt.ResourceKind != deleteAttemptKindFloatingIP {
+					return result, fmt.Errorf("bootstrap: floating-IP removal slot %q contains resource kind %q", deleteKey, attempt.ResourceKind)
+				}
+				if attempt.Phase == deletePhaseAbsent {
+					continue
+				}
+				terminal, observeErr := r.observeDestroyRemovalTwice(ctx, cluster, deleteKey, func() (bool, error) {
+					return r.observeDestroyFloatingIPRemoval(ctx, cluster, deleteKey)
+				})
+				if observeErr != nil {
+					return result, observeErr
+				}
+				if terminal {
+					continue
+				}
+			}
 			continue
+		}
+		if attempt, exists := r.deleteAttempt(cluster, deleteKey); exists && attempt.Phase == deletePhaseAbsent {
+			return result, fmt.Errorf("bootstrap: floating IP %q reappeared after durable authoritative absence", name)
 		}
 		if item.Name == "" {
 			_, ready, renameErr := r.ensureOwnedAutoFloatingIP(ctx, cluster, name, floatingVMByName[name], item)
@@ -653,31 +733,25 @@ func (r *Reconciler) Destroy(ctx context.Context, cluster *v1alpha1.InSpaceClust
 			result.Message = "named " + name + " before cleanup"
 			return result, nil
 		}
-		if item.AssignedTo != "" {
-			updated, unassignErr := r.API.UnassignFloatingIP(ctx, cluster.Spec.Location, item.Address)
-			if unassignErr == nil {
-				if err := validateFloatingIPCleanupReadback(updated, cluster, name, item.Address); err != nil {
-					return result, err
-				}
-			} else if !inspace.IsNotFound(unassignErr) {
-				readback, readErr := r.findFloatingIPByAddress(ctx, cluster.Spec.Location, item.Address)
-				if readErr != nil || readback == nil {
-					return result, errors.Join(unassignErr, readErr)
-				}
-				if err := validateFloatingIPCleanupReadback(readback, cluster, name, item.Address); err != nil {
-					return result, errors.Join(unassignErr, err)
-				}
-			}
-			result.Message = "unassigned " + name
-			return result, nil
-		}
-		if deleteErr := r.API.DeleteFloatingIP(ctx, cluster.Spec.Location, item.Address); deleteErr != nil && !inspace.IsNotFound(deleteErr) {
-			readback, readErr := r.findFloatingIPByAddress(ctx, cluster.Spec.Location, item.Address)
-			if readErr != nil || readback != nil {
-				return result, errors.Join(deleteErr, readErr)
+		if _, exists := r.deleteAttempt(cluster, deleteKey); !exists {
+			if err := r.ensureDestroyFloatingIPRemoval(ctx, cluster, deleteKey, item); err != nil {
+				return result, err
 			}
 		}
-		result.Message = "deleted " + name
+		terminal, removalErr := r.reconcileDestroyFloatingIPRemoval(ctx, cluster, deleteKey)
+		if removalErr != nil {
+			return result, removalErr
+		}
+		if terminal {
+			result.Message = "deleted " + name
+		} else {
+			updated, _ := r.deleteAttempt(cluster, deleteKey)
+			if updated.Phase == deletePhaseFIPDeleteIntent && item.AssignedTo != "" {
+				result.Message = "unassigned " + name
+			} else {
+				result.Message = "advanced durable removal for " + name
+			}
+		}
 		return result, nil
 	}
 
@@ -694,35 +768,105 @@ func (r *Reconciler) Destroy(ctx context.Context, cluster *v1alpha1.InSpaceClust
 		} else if nodeFirewall != nil {
 			firewallUUID = nodeFirewall.UUID
 		}
-		r.rememberPendingVMDeletion(owner, cluster.Spec.Location, vm, firewallUUID)
-		deleteErr := r.API.DeleteVM(ctx, cluster.Spec.Location, vm.UUID)
-		switch {
-		case deleteErr == nil || inspace.IsNotFound(deleteErr):
-			r.refreshPendingVMDeletion(owner, cluster.Spec.Location, vm.UUID)
-		case deleteVMFailureProvesNoDispatch(deleteErr):
-			r.forgetPendingVMDeletion(owner, cluster.Spec.Location, vm.UUID)
-			return result, deleteErr
-		default:
-			r.refreshPendingVMDeletion(owner, cluster.Spec.Location, vm.UUID)
-			return result, fmt.Errorf("%w: %w", ErrRetryableAmbiguousVMDelete, deleteErr)
+		deleteKey, keyErr := deleteKeyForVMName(cluster, name)
+		if keyErr != nil {
+			return result, keyErr
 		}
-		result.Message = "deleted " + vm.Name
+		if deletion, exists := durableDeletions[deleteKey]; exists && deletion.Phase == deletePhaseAbsent {
+			return result, fmt.Errorf("bootstrap: VM %q reappeared after durable authoritative absence", name)
+		}
+		if err := r.ensureVMDeleteAttempt(ctx, cluster, deleteKey, deletePurposeDestroy, vm, firewallUUID, ""); err != nil {
+			return result, err
+		}
+		absent, deleteErr := r.reconcileVMDelete(ctx, cluster, deleteKey)
+		if deleteErr != nil {
+			return result, deleteErr
+		}
+		if absent {
+			result.Message = "confirmed absent " + vm.Name
+		} else {
+			result.Message = "issued exact deletion for " + vm.Name
+		}
 		return result, nil
 	}
-	for _, firewall := range []*inspace.Firewall{bastionFirewall, nodeFirewall} {
+	deleteKeys := []string{deleteAttemptBastion}
+	for slot := 0; slot < ControlPlaneReplicas; slot++ {
+		deleteKeys = append(deleteKeys, controlPlaneDeleteAttemptKey(slot))
+	}
+	for _, deleteKey := range deleteKeys {
+		deletion, exists := durableDeletions[deleteKey]
+		if !exists || deletion.Phase == deletePhaseAbsent {
+			continue
+		}
+		absent, deleteErr := r.reconcileVMDelete(ctx, cluster, deleteKey)
+		if deleteErr != nil {
+			return result, deleteErr
+		}
+		if absent {
+			result.Message = "confirmed absent " + deletion.ResourceName
+		} else {
+			result.Message = "waiting for authoritative VM absence before firewall teardown"
+		}
+		return result, nil
+	}
+	for _, removal := range []struct {
+		firewall *inspace.Firewall
+		key      string
+		name     string
+	}{
+		{firewall: bastionFirewall, key: destroyFirewallBastionKey, name: resourceNames.BastionFirewall},
+		{firewall: nodeFirewall, key: destroyFirewallNodesKey, name: resourceNames.NodeFirewall},
+	} {
+		firewall := removal.firewall
+		if firewall == nil {
+			if attempt, exists := r.deleteAttempt(cluster, removal.key); exists {
+				if attempt.ResourceKind != deleteAttemptKindFirewall {
+					return result, fmt.Errorf("bootstrap: firewall removal slot %q contains resource kind %q", removal.key, attempt.ResourceKind)
+				}
+				if attempt.Phase == deletePhaseAbsent {
+					continue
+				}
+				terminal, observeErr := r.observeDestroyRemovalTwice(ctx, cluster, removal.key, func() (bool, error) {
+					return r.observeDestroyFirewallRemoval(ctx, cluster, removal.key)
+				})
+				if observeErr != nil {
+					return result, observeErr
+				}
+				if terminal {
+					continue
+				}
+			}
+			continue
+		}
+		if attempt, exists := r.deleteAttempt(cluster, removal.key); exists && attempt.Phase == deletePhaseAbsent {
+			return result, fmt.Errorf("bootstrap: firewall %q reappeared after durable authoritative absence", removal.name)
+		}
 		if firewall != nil {
 			if len(firewall.ResourcesAssigned) != 0 {
 				result.Message = "waiting for firewall assignments to clear after VM deletion"
 				return result, nil
 			}
-			if err := r.API.DeleteFirewall(ctx, cluster.Spec.Location, firewall.UUID); err != nil && !inspace.IsNotFound(err) {
-				return result, err
+			if _, exists := r.deleteAttempt(cluster, removal.key); !exists {
+				if err := r.ensureDestroyFirewallRemoval(ctx, cluster, removal.key, firewall); err != nil {
+					return result, err
+				}
 			}
-			result.Message = "deleted " + firewall.EffectiveName()
+			terminal, removalErr := r.reconcileDestroyFirewallRemoval(ctx, cluster, removal.key)
+			if removalErr != nil {
+				return result, removalErr
+			}
+			if terminal {
+				result.Message = "confirmed absent " + firewall.EffectiveName()
+			} else {
+				result.Message = "issued exact deletion for " + firewall.EffectiveName()
+			}
 			return result, nil
 		}
 	}
 
+	if err := r.clearAllMutationAttempts(ctx, cluster); err != nil {
+		return result, err
+	}
 	result.Done = true
 	result.Message = "owned bastion and control-plane infrastructure is absent"
 	return result, nil
@@ -890,59 +1034,11 @@ func (r *Reconciler) canonicalOwnedVMDetails(ctx context.Context, location strin
 	return details, "", nil
 }
 
-func pendingVMDeletionKey(owner, location, uuid string) string {
-	return owner + "\x00" + location + "\x00" + uuid
-}
-
-func (r *Reconciler) currentTime() time.Time {
-	if r.now != nil {
-		return r.now()
-	}
-	return time.Now()
-}
-
 func configuredDuration(value, fallback time.Duration) time.Duration {
 	if value > 0 {
 		return value
 	}
 	return fallback
-}
-
-// rememberPendingVMDeletion retains only the exact canonical VM and managed
-// firewall identity that this Reconciler has just submitted for deletion. The
-// bounded transition lets a later pass distinguish delayed assignment cleanup
-// from a foreign UUID without treating arbitrary absent VMs as owned.
-func (r *Reconciler) rememberPendingVMDeletion(owner, location string, vm *inspace.VM, firewallUUID string) {
-	if vm == nil {
-		return
-	}
-	r.pendingDeletionMu.Lock()
-	defer r.pendingDeletionMu.Unlock()
-	if r.pendingVMDeletions == nil {
-		r.pendingVMDeletions = make(map[string]pendingVMDeletion)
-	}
-	r.pendingVMDeletions[pendingVMDeletionKey(owner, location, vm.UUID)] = pendingVMDeletion{
-		Owner: owner, Location: location, Name: vm.Name, UUID: vm.UUID, FirewallUUID: firewallUUID,
-		ExpiresAt: r.currentTime().Add(ownedVMDeletionTransitionTTL),
-	}
-}
-
-func (r *Reconciler) refreshPendingVMDeletion(owner, location, uuid string) {
-	r.pendingDeletionMu.Lock()
-	defer r.pendingDeletionMu.Unlock()
-	key := pendingVMDeletionKey(owner, location, uuid)
-	deletion, exists := r.pendingVMDeletions[key]
-	if !exists {
-		return
-	}
-	deletion.ExpiresAt = r.currentTime().Add(ownedVMDeletionTransitionTTL)
-	r.pendingVMDeletions[key] = deletion
-}
-
-func (r *Reconciler) forgetPendingVMDeletion(owner, location, uuid string) {
-	r.pendingDeletionMu.Lock()
-	defer r.pendingDeletionMu.Unlock()
-	delete(r.pendingVMDeletions, pendingVMDeletionKey(owner, location, uuid))
 }
 
 // deleteVMFailureProvesNoDispatch recognizes only the explicit local mutation
@@ -951,49 +1047,6 @@ func (r *Reconciler) forgetPendingVMDeletion(owner, location, uuid string) {
 // errors and cancellations, must retain the exact deletion transition.
 func deleteVMFailureProvesNoDispatch(err error) bool {
 	return errors.Is(err, inspace.ErrMutationBlocked)
-}
-
-// activePendingVMDeletions returns only unexpired transitions whose UUID still
-// appears exactly once as a VM assignment on the exact managed firewall that
-// protected it at deletion time. Cleared transitions are discarded. Any
-// wrong-firewall, wrong-type, duplicate, or expired residual assignment fails
-// closed instead of widening deletion authority.
-func (r *Reconciler) activePendingVMDeletions(owner, location string, firewalls []inspace.Firewall) ([]pendingVMDeletion, error) {
-	r.pendingDeletionMu.Lock()
-	defer r.pendingDeletionMu.Unlock()
-
-	now := r.currentTime()
-	active := make([]pendingVMDeletion, 0, len(r.pendingVMDeletions))
-	for key, deletion := range r.pendingVMDeletions {
-		if deletion.Owner != owner || deletion.Location != location {
-			continue
-		}
-		assignmentCount := 0
-		for i := range firewalls {
-			for _, resource := range firewalls[i].ResourcesAssigned {
-				if resource.ResourceUUID != deletion.UUID {
-					continue
-				}
-				assignmentCount++
-				if resource.ResourceType != "vm" || deletion.FirewallUUID == "" || firewalls[i].UUID != deletion.FirewallUUID {
-					return nil, fmt.Errorf("bootstrap: pending deletion for VM %q has assignment drift", deletion.Name)
-				}
-			}
-		}
-		if assignmentCount == 0 {
-			delete(r.pendingVMDeletions, key)
-			continue
-		}
-		if assignmentCount != 1 {
-			return nil, fmt.Errorf("bootstrap: pending deletion for VM %q has duplicate firewall assignments", deletion.Name)
-		}
-		if !now.Before(deletion.ExpiresAt) {
-			return nil, fmt.Errorf("bootstrap: pending deletion assignment for VM %q did not clear within %s", deletion.Name, ownedVMDeletionTransitionTTL)
-		}
-		active = append(active, deletion)
-	}
-	sort.Slice(active, func(i, j int) bool { return active[i].Name < active[j].Name })
-	return active, nil
 }
 
 // validateCreatedVMResponse only trusts fields that the create response
@@ -1051,87 +1104,496 @@ func validateCreatedVMResponse(vm *inspace.VM, desired inspace.CreateVMRequest, 
 	return nil
 }
 
-func (r *Reconciler) rollbackMalformedCreatedVM(ctx context.Context, cluster *v1alpha1.InSpaceCluster, vm *inspace.VM, desired inspace.CreateVMRequest, floatingIPName string, responseErr error) error {
+func (r *Reconciler) rollbackMalformedCreatedVM(ctx context.Context, cluster *v1alpha1.InSpaceCluster, attemptKey string, firewall *inspace.Firewall, vm *inspace.VM, desired inspace.CreateVMRequest, floatingIPName string, responseErr error) error {
 	if vm == nil || !vmUUIDPattern.MatchString(vm.UUID) || vm.Name != desired.Name {
 		return responseErr
 	}
-	cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), configuredDuration(r.createdVMFloatingIPCleanupTimeout, defaultCreatedVMFloatingIPCleanupTimeout))
-	cleanupErr := r.cleanupCreatedVMFloatingIP(cleanupCtx, cluster, vm, floatingIPName)
-	cleanupCancel()
-	deleteCtx, deleteCancel := context.WithTimeout(context.WithoutCancel(ctx), configuredDuration(r.createdVMDeleteTimeout, defaultCreatedVMDeleteTimeout))
-	rollbackErr := r.API.DeleteVM(deleteCtx, cluster.Spec.Location, vm.UUID)
-	deleteCancel()
-	return errors.Join(responseErr, cleanupErr, rollbackErr)
+	deleteKey, keyErr := vmDeleteAttemptKeyForCreateKey(attemptKey)
+	if keyErr != nil {
+		return errors.Join(responseErr, keyErr)
+	}
+	firewallUUID := ""
+	if firewall != nil {
+		firewallUUID = firewall.UUID
+	}
+	rollbackCtx := context.WithoutCancel(ctx)
+	if err := r.ensureVMDeleteAttempt(rollbackCtx, cluster, deleteKey, deletePurposeRollback, vm, firewallUUID, floatingIPName); err != nil {
+		return errors.Join(responseErr, err)
+	}
+	done, rollbackErr := r.reconcileRollbackDelete(rollbackCtx, cluster, deleteKey)
+	// Containment of a newly created but unprotected public VM is the one path
+	// that deliberately waits for the second observation in the initiating
+	// call. Each observation still performs independent exact-detail, location
+	// inventory, and configured-VPC reads. Ordinary destroy never blocks here;
+	// its second observation occurs in a later reconciliation.
+	if !done && rollbackErr == nil {
+		attempt, exists := r.deleteAttempt(cluster, deleteKey)
+		if exists && attempt.Phase == deletePhaseVMIssued && attempt.AbsenceObservedAt != "" {
+			firstObserved, parseErr := time.Parse(time.RFC3339Nano, attempt.AbsenceObservedAt)
+			if parseErr != nil || firstObserved.Location() != time.UTC {
+				return errors.Join(responseErr, fmt.Errorf("bootstrap: rollback VM absence timestamp is invalid"))
+			}
+			remaining := time.Until(firstObserved.Add(configuredDuration(r.vmAbsenceObservationMinInterval, defaultVMAbsenceObservationMinInterval)))
+			if remaining > 0 {
+				timer := time.NewTimer(remaining)
+				<-timer.C
+			}
+			done, rollbackErr = r.reconcileRollbackDelete(rollbackCtx, cluster, deleteKey)
+		}
+	}
+	if !done && rollbackErr == nil {
+		rollbackErr = fmt.Errorf("%w: malformed VM %s rollback is durably pending", ErrCreateAttemptPending, vm.UUID)
+	}
+	return errors.Join(responseErr, rollbackErr)
 }
 
-// secureCreatedVMResponse closes the public-exposure window opened by
-// ReservePublicIP before a create pass returns. A valid UUID from the just
-// issued POST authorizes restrictive firewall attachment even when other
-// response fields are sparse or contradictory. Destructive rollback remains
-// stricter: it requires the exact requested VM name or a canonical
-// name/ownership recovery.
-func (r *Reconciler) secureCreatedVMResponse(ctx context.Context, cluster *v1alpha1.InSpaceCluster, firewall *inspace.Firewall, vm *inspace.VM, desired inspace.CreateVMRequest, floatingIPName, subnet, virtualIPv4 string, privatePool privateIPv4Range) (*inspace.VM, error) {
-	responseErr := validateCreatedVMResponse(vm, desired, subnet, virtualIPv4, privatePool)
-	if vm == nil || !vmUUIDPattern.MatchString(vm.UUID) {
-		identity, discoveryErr := r.discoverCreatedVMIdentity(ctx, cluster, desired)
-		if discoveryErr != nil {
-			return nil, errors.Join(responseErr, fmt.Errorf("bootstrap: created VM protection is uncertain because the POST returned no usable UUID and exact-name discovery did not converge: %w", discoveryErr))
+func (r *Reconciler) ensureManagedVMCreate(
+	ctx context.Context,
+	cluster *v1alpha1.InSpaceCluster,
+	attemptKey string,
+	firewall *inspace.Firewall,
+	found *inspace.VM,
+	desired inspace.CreateVMRequest,
+	floatingIPName, subnet, virtualIPv4 string,
+	privatePool privateIPv4Range,
+) (*inspace.VM, bool, error) {
+	location := cluster.Spec.Location
+	billingAccountID := cluster.Spec.BillingAccountID
+	networkUUID := cluster.Spec.Network.UUID
+	hostPoolUUID := cluster.Spec.ControlPlane.Machine.HostPoolUUID
+	clusterName := cluster.Metadata.Name
+	intentHash, err := createIntentHash(createAttemptKindVM, desired.Name, desired)
+	if err != nil {
+		return nil, false, err
+	}
+	assignmentAttemptKey, err := firewallAssignmentAttemptKey(attemptKey)
+	if err != nil {
+		return nil, false, err
+	}
+	if found != nil {
+		network, networkErr := r.API.GetNetwork(ctx, cluster.Spec.Location, desired.NetworkUUID)
+		if networkErr != nil || network == nil {
+			return nil, false, errors.Join(errors.New("bootstrap: get VPC before adopting existing VM"), networkErr)
 		}
-		// The exact deterministic list identity is enough to install and prove the
-		// restrictive firewall. Do this before slower GetVM/GetNetwork ownership
-		// recovery so the VM is not left publicly exposed for that audit window.
-		if protectErr := r.protectReturnedVMUUID(ctx, cluster.Spec.Location, firewall, identity.UUID); protectErr != nil {
-			return nil, r.rollbackMalformedCreatedVM(ctx, cluster, identity, desired, floatingIPName, errors.Join(responseErr, protectErr))
+		if err := validateOwnedVM(found, desired, network); err != nil {
+			return nil, false, err
 		}
-		canonical, recoveryErr := r.recoverCreatedVM(ctx, cluster, desired, identity.UUID, subnet, virtualIPv4, privatePool)
+		attempt, exists := r.createAttempt(cluster, attemptKey)
+		if !exists || attempt.Phase == createAttemptPhaseIntent {
+			if err := r.recordAdoptedCreate(ctx, cluster, attemptKey, createAttemptKindVM, desired.Name, intentHash, found.UUID); err != nil {
+				return nil, false, err
+			}
+			return found, false, nil
+		}
+		if err := validateCreateAttempt(attempt, createAttemptKindVM, desired.Name, intentHash); err != nil {
+			return nil, false, err
+		}
+		if attempt.Phase == createAttemptPhaseIssued || attempt.Phase == createAttemptPhaseRejected {
+			if err := r.recordMaterializedCreate(ctx, cluster, attemptKey, createAttemptKindVM, desired.Name, intentHash, found.UUID); err != nil {
+				return nil, false, err
+			}
+			return found, false, nil
+		}
+		if !strings.EqualFold(attempt.ResourceUUID, found.UUID) {
+			return nil, false, fmt.Errorf("bootstrap: durable VM receipt for %q names UUID %s, authoritative readback returned %s", desired.Name, attempt.ResourceUUID, found.UUID)
+		}
+		return found, false, nil
+	}
+
+	attempt, exists := r.createAttempt(cluster, attemptKey)
+	if exists {
+		if err := validateCreateAttempt(attempt, createAttemptKindVM, desired.Name, intentHash); err != nil {
+			return nil, false, err
+		}
+		if attempt.Phase == createAttemptPhaseRejected {
+			if err := r.clearPreDispatchCreateRejection(ctx, cluster, attemptKey, createAttemptKindVM, desired.Name, intentHash); err != nil {
+				return nil, false, err
+			}
+			return nil, false, fmt.Errorf("%w: VM %q rejection is now authoritatively absent and may be retried", ErrCreateAttemptPending, desired.Name)
+		}
+		if attempt.Phase != createAttemptPhaseIntent {
+			identityUUID := attempt.ResourceUUID
+			var ownedIdentity *inspace.VM
+			if identityUUID == "" {
+				identity, discoveryErr := r.discoverCreatedVMIdentity(ctx, cluster, desired)
+				if discoveryErr != nil {
+					return nil, false, fmt.Errorf("%w: VM %q has no authoritative identity yet: %v", ErrCreateAttemptPending, desired.Name, discoveryErr)
+				}
+				ownedIdentity, discoveryErr = r.recoverCreatedVMOwnership(ctx, cluster, desired, identity.UUID)
+				if discoveryErr != nil {
+					return nil, false, fmt.Errorf("%w: VM %q exact recovery did not prove ownership: %v", ErrCreateAttemptPending, desired.Name, discoveryErr)
+				}
+				identityUUID = ownedIdentity.UUID
+				if err := r.recordMaterializedCreate(ctx, cluster, attemptKey, createAttemptKindVM, desired.Name, intentHash, identityUUID); err != nil {
+					return nil, false, err
+				}
+			}
+			if ownedIdentity == nil {
+				ownedIdentity, err = r.recoverCreatedVMOwnership(ctx, cluster, desired, identityUUID)
+				if err != nil {
+					return nil, false, fmt.Errorf("%w: VM %q exact recovery did not prove ownership: %v", ErrCreateAttemptPending, desired.Name, err)
+				}
+			}
+			// A valid UUID, even one durably returned by CreateVM, is only a
+			// readback anchor. Canonical VM fields and exact configured-VPC
+			// membership must prove ownership before any second cloud mutation.
+			if err := r.protectReturnedVMUUID(ctx, cluster, assignmentAttemptKey, firewall, ownedIdentity.UUID); err != nil {
+				return nil, false, err
+			}
+			canonical, recoveryErr := r.recoverCreatedVM(ctx, cluster, desired, identityUUID, subnet, virtualIPv4, privatePool)
+			if recoveryErr != nil {
+				return nil, false, r.rollbackMalformedCreatedVM(ctx, cluster, attemptKey, firewall, ownedIdentity, desired, floatingIPName,
+					fmt.Errorf("bootstrap: canonically owned VM %q did not match its requested shape/address: %w", desired.Name, recoveryErr))
+			}
+			return canonical, false, nil
+		}
+	}
+
+	allowed, err := r.authorizeCreate(ctx, cluster, attemptKey, createAttemptKindVM, desired.Name, intentHash)
+	if err != nil {
+		return nil, false, err
+	}
+	if !allowed {
+		return nil, false, fmt.Errorf("%w: VM %q cannot replay its issued create", ErrCreateAttemptPending, desired.Name)
+	}
+	// The issued receipt is necessary but not sufficient dispatch authority.
+	// Re-read every mutable cloud input after the CAS. This includes the exact
+	// VPC/subnet, host-pool catalog identity, managed firewall policy and
+	// assignment topology, and finally the unfiltered deterministic-name VM
+	// inventory. A stale pre-CAS snapshot can never authorize this paid POST.
+	preDispatchCandidate, preDispatchAbsent, preDispatchErr := r.readVMCreateDispatchAuthority(
+		ctx, cluster, location, billingAccountID, networkUUID, hostPoolUUID, clusterName,
+		firewall, desired, subnet,
+	)
+	if preDispatchErr != nil {
+		return nil, false, errors.Join(preDispatchErr,
+			fmt.Errorf("%w: VM %q create is issued without fresh absence authority", ErrCreateAttemptPending, desired.Name))
+	}
+	if !preDispatchAbsent {
+		ownedIdentity, ownershipErr := r.recoverCreatedVMOwnership(ctx, cluster, desired, preDispatchCandidate.UUID)
+		if ownershipErr != nil {
+			return nil, false, errors.Join(ownershipErr,
+				fmt.Errorf("%w: VM %q appeared after create authorization but ownership is unproven", ErrCreateAttemptPending, desired.Name))
+		}
+		if anchorErr := r.recordMaterializedCreate(ctx, cluster, attemptKey, createAttemptKindVM, desired.Name, intentHash, ownedIdentity.UUID); anchorErr != nil {
+			return nil, false, errors.Join(anchorErr,
+				fmt.Errorf("%w: VM %q pre-dispatch adoption was not durably anchored", ErrCreateAttemptPending, desired.Name))
+		}
+		if protectionErr := r.protectReturnedVMUUID(ctx, cluster, assignmentAttemptKey, firewall, ownedIdentity.UUID); protectionErr != nil {
+			return nil, false, protectionErr
+		}
+		canonical, recoveryErr := r.recoverCreatedVM(ctx, cluster, desired, ownedIdentity.UUID, subnet, virtualIPv4, privatePool)
 		if recoveryErr != nil {
-			cause := errors.Join(responseErr, fmt.Errorf("bootstrap: canonical created VM recovery after firewall protection: %w", recoveryErr))
-			return nil, r.rollbackMalformedCreatedVM(ctx, cluster, identity, desired, floatingIPName, cause)
+			return nil, false, r.rollbackMalformedCreatedVM(ctx, cluster, attemptKey, firewall, ownedIdentity, desired, floatingIPName,
+				fmt.Errorf("bootstrap: pre-dispatch adopted VM %q did not match its requested shape/address: %w", desired.Name, recoveryErr))
 		}
-		return canonical, nil
+		return canonical, false, nil
+	}
+	created, createErr := r.API.CreateVM(ctx, location, desired)
+	exactResponseUUID := created != nil && vmUUIDPattern.MatchString(created.UUID)
+	var anchorErr error
+	if createErr != nil && !exactResponseUUID && bootstrapMutationFailureProvesNoDispatch(createErr) {
+		if rejectionErr := r.recordPreDispatchCreateRejection(ctx, cluster, attemptKey, createAttemptKindVM, desired.Name, intentHash); rejectionErr != nil {
+			return nil, true, errors.Join(createErr, rejectionErr,
+				fmt.Errorf("%w: VM %q rejection receipt was not persisted", ErrCreateAttemptPending, desired.Name))
+		}
+		candidate, absent, readbackErr := r.readVMCreatePostError(ctx, cluster.Spec.Location, desired.Name)
+		if readbackErr != nil {
+			return nil, true, errors.Join(createErr, readbackErr,
+				fmt.Errorf("%w: VM %q rejection lacks authoritative non-commit proof", ErrCreateAttemptPending, desired.Name))
+		}
+		if absent {
+			clearErr := r.clearPreDispatchCreateRejection(ctx, cluster, attemptKey, createAttemptKindVM, desired.Name, intentHash)
+			return nil, true, errors.Join(createErr, clearErr)
+		}
+		canonical, recoveryErr := r.recoverCreatedVMOwnership(ctx, cluster, desired, candidate.UUID)
+		if recoveryErr != nil {
+			return nil, true, errors.Join(createErr, recoveryErr,
+				fmt.Errorf("%w: VM %q appeared after local rejection but ownership is unproven", ErrCreateAttemptPending, desired.Name))
+		}
+		anchorErr = r.recordMaterializedCreate(ctx, cluster, attemptKey, createAttemptKindVM, desired.Name, intentHash, canonical.UUID)
+		var protectionErr error
+		if anchorErr == nil {
+			protectionErr = r.protectReturnedVMUUID(ctx, cluster, assignmentAttemptKey, firewall, canonical.UUID)
+		}
+		return nil, true, errors.Join(createErr, anchorErr, protectionErr,
+			fmt.Errorf("%w: VM %q became visible after its rejection response", ErrCreateAttemptPending, desired.Name))
+	}
+	secured, secureErr := r.secureCreatedVMResponse(ctx, cluster, created, desired, subnet, virtualIPv4, privatePool)
+	if secured != nil {
+		// A CreateVM response UUID is provisional. Only the UUID returned by
+		// canonical ownership/billing/VPC recovery may become the durable
+		// materialized identity and authorize follow-up mutations.
+		anchorErr = r.recordMaterializedCreate(ctx, cluster, attemptKey, createAttemptKindVM, desired.Name, intentHash, secured.UUID)
+	}
+	if secured == nil || anchorErr != nil {
+		return nil, true, errors.Join(createErr, secureErr, anchorErr,
+			fmt.Errorf("%w: VM %q POST outcome requires authoritative recovery", ErrCreateAttemptPending, desired.Name))
+	}
+	protectionErr := r.protectReturnedVMUUID(ctx, cluster, assignmentAttemptKey, firewall, secured.UUID)
+	if protectionErr != nil || secureErr != nil {
+		return nil, true, r.rollbackMalformedCreatedVM(ctx, cluster, attemptKey, firewall, secured, desired, floatingIPName,
+			errors.Join(createErr, secureErr, protectionErr))
+	}
+	if createErr != nil {
+		return nil, true, errors.Join(createErr,
+			fmt.Errorf("%w: VM %q POST returned an error after canonical ownership and protection converged", ErrCreateAttemptPending, desired.Name))
+	}
+	return secured, true, nil
+}
+
+// readVMCreatePostError is the mandatory fresh authority after the SDK proves
+// locally that the VM POST was blocked before dispatch. A pre-POST snapshot is
+// not enough: an independently submitted matching VM may already be becoming
+// visible. One exact deterministic-name row therefore wins over the local
+// block, while only a successful fresh list with no such row permits the
+// pre-dispatch rejection receipt to be cleared. HTTP responses never enter
+// this path and can never be cleared by absence.
+func (r *Reconciler) readVMCreatePostError(ctx context.Context, location, name string) (*inspace.VM, bool, error) {
+	items, err := r.API.ListVMs(ctx, location)
+	if err != nil {
+		return nil, false, fmt.Errorf("bootstrap: list VMs after rejected create of %q: %w", name, err)
+	}
+	var found *inspace.VM
+	for i := range items {
+		if items[i].Name != name {
+			continue
+		}
+		if found != nil {
+			return nil, false, fmt.Errorf("bootstrap: multiple VMs named %q appeared after its create error", name)
+		}
+		copy := items[i]
+		found = &copy
+	}
+	if found == nil {
+		return nil, true, nil
+	}
+	if !vmUUIDPattern.MatchString(found.UUID) {
+		return nil, false, fmt.Errorf("bootstrap: VM %q appeared after its create error with invalid UUID %q", name, found.UUID)
+	}
+	return found, false, nil
+}
+
+// readVMCreateDispatchAuthority is the final post-CAS gate for a paid VM
+// create. Every value supplied by the earlier reconciliation snapshot is only
+// a candidate until independent cloud reads prove it again. The host-pool API
+// has no exact-detail endpoint, so its unfiltered catalog is treated as a set:
+// exactly one visible row must carry the configured UUID.
+func (r *Reconciler) readVMCreateDispatchAuthority(
+	ctx context.Context,
+	cluster *v1alpha1.InSpaceCluster,
+	location string,
+	billingAccountID int64,
+	networkUUID string,
+	hostPoolUUID string,
+	clusterName string,
+	capturedFirewall *inspace.Firewall,
+	desired inspace.CreateVMRequest,
+	capturedSubnet string,
+) (*inspace.VM, bool, error) {
+	if cluster == nil || location == "" || billingAccountID <= 0 || clusterName == "" ||
+		!vmUUIDPattern.MatchString(networkUUID) || !vmUUIDPattern.MatchString(hostPoolUUID) {
+		return nil, false, errors.New("bootstrap: VM create authority has invalid captured cluster identity")
+	}
+	if cluster.Metadata.Name != clusterName || cluster.Spec.Location != location ||
+		cluster.Spec.BillingAccountID != billingAccountID ||
+		!strings.EqualFold(cluster.Spec.Network.UUID, networkUUID) ||
+		!strings.EqualFold(cluster.Spec.ControlPlane.Machine.HostPoolUUID, hostPoolUUID) {
+		return nil, false, errors.New("bootstrap: cluster identity changed after VM create issue CAS")
+	}
+	if desired.BillingAccountID != billingAccountID || desired.BillingAccountID <= 0 ||
+		!strings.EqualFold(desired.NetworkUUID, networkUUID) ||
+		!strings.EqualFold(desired.DesignatedPoolUUID, hostPoolUUID) {
+		return nil, false, errors.New("bootstrap: VM request billing, VPC, or host-pool identity changed before dispatch")
 	}
 
-	protectErr := r.protectReturnedVMUUID(ctx, cluster.Spec.Location, firewall, vm.UUID)
-	if protectErr != nil {
-		cause := errors.Join(responseErr, protectErr)
-		if vm.Name == desired.Name {
-			return nil, r.rollbackMalformedCreatedVM(ctx, cluster, vm, desired, floatingIPName, cause)
-		}
-		return nil, errors.Join(cause, fmt.Errorf("bootstrap: returned VM UUID %s could not be protected and its mismatched name forbids destructive rollback", vm.UUID))
+	network, err := r.API.GetNetwork(ctx, location, networkUUID)
+	if err != nil {
+		return nil, false, fmt.Errorf("bootstrap: fresh configured VPC read before VM create: %w", err)
 	}
-	if responseErr == nil {
-		return vm, nil
+	if network == nil || !strings.EqualFold(network.UUID, networkUUID) || network.Subnet != capturedSubnet {
+		return nil, false, errors.New("bootstrap: configured VPC UUID/subnet changed before VM create")
+	}
+	if err := validatePrivateSubnet(network.Subnet); err != nil {
+		return nil, false, err
+	}
+	if err := validateNetworkCIDRs(network.Subnet, cluster.Spec.Network.PodCIDR, cluster.Spec.Network.ServiceCIDR); err != nil {
+		return nil, false, err
+	}
+	if err := validateVirtualIPv4(network.Subnet, cluster.Spec.Endpoint.VirtualIPv4); err != nil {
+		return nil, false, err
+	}
+	if _, err := validatePrivateLoadBalancerPool(
+		network.Subnet, cluster.Spec.Network.PodCIDR, cluster.Spec.Network.ServiceCIDR,
+		cluster.Spec.Endpoint.VirtualIPv4, cluster.Spec.Network.PrivateLoadBalancerPool.Start,
+		cluster.Spec.Network.PrivateLoadBalancerPool.Stop,
+	); err != nil {
+		return nil, false, err
 	}
 
-	canonical, recoveryErr := r.recoverCreatedVM(ctx, cluster, desired, vm.UUID, subnet, virtualIPv4, privatePool)
+	hostPools, err := r.API.ListHostPools(ctx, location)
+	if err != nil {
+		return nil, false, fmt.Errorf("bootstrap: fresh host-pool catalog before VM create: %w", err)
+	}
+	matchingHostPools := 0
+	for i := range hostPools {
+		if !strings.EqualFold(hostPools[i].UUID, hostPoolUUID) {
+			continue
+		}
+		matchingHostPools++
+		if !hostPools[i].IsVisible || hostPools[i].Name == "" {
+			return nil, false, fmt.Errorf("bootstrap: configured host pool %s is not a visible catalog identity", hostPoolUUID)
+		}
+	}
+	if matchingHostPools != 1 {
+		return nil, false, fmt.Errorf("bootstrap: host-pool catalog contains %d rows for %s, want one", matchingHostPools, hostPoolUUID)
+	}
+
+	if capturedFirewall == nil || !vmUUIDPattern.MatchString(capturedFirewall.UUID) {
+		return nil, false, errors.New("bootstrap: VM create lacks a captured managed firewall UUID")
+	}
+	firewalls, err := r.API.ListFirewalls(ctx, location)
+	if err != nil {
+		return nil, false, fmt.Errorf("bootstrap: fresh firewall inventory before VM create: %w", err)
+	}
+	resourceNames := currentBootstrapResourceNames(clusterName, ownerKey(cluster))
+	nodeFirewall, err := uniqueFirewallByName(firewalls, resourceNames.NodeFirewall)
+	if err != nil {
+		return nil, false, err
+	}
+	bastionFirewall, err := uniqueFirewallByName(firewalls, resourceNames.BastionFirewall)
+	if err != nil {
+		return nil, false, err
+	}
+	var targetFirewall *inspace.Firewall
+	switch {
+	case desired.Name == currentBastionName(clusterName):
+		targetFirewall = bastionFirewall
+		if err := validateManagedBastionFirewall(targetFirewall, cluster, network.Subnet, ownerKey(cluster), resourceNames.BastionFirewall, r.ManagementCIDR); err != nil {
+			return nil, false, err
+		}
+	case isCurrentControlPlaneName(clusterName, desired.Name):
+		targetFirewall = nodeFirewall
+		if err := validateManagedNodeFirewall(targetFirewall, cluster, network, ownerKey(cluster), resourceNames.NodeFirewall); err != nil {
+			return nil, false, err
+		}
+	default:
+		return nil, false, fmt.Errorf("bootstrap: VM create name %q is outside the managed bootstrap topology", desired.Name)
+	}
+	if targetFirewall == nil || !strings.EqualFold(targetFirewall.UUID, capturedFirewall.UUID) {
+		return nil, false, errors.New("bootstrap: managed firewall UUID changed before VM create")
+	}
+	exactFirewallRows := 0
+	for i := range firewalls {
+		if strings.EqualFold(firewalls[i].UUID, capturedFirewall.UUID) {
+			exactFirewallRows++
+		}
+	}
+	if exactFirewallRows != 1 {
+		return nil, false, fmt.Errorf("bootstrap: managed firewall UUID has %d exact inventory rows, want one", exactFirewallRows)
+	}
+
+	listedVMs, err := r.API.ListVMs(ctx, location)
+	if err != nil {
+		return nil, false, fmt.Errorf("bootstrap: fresh VM inventory for firewall assignment authority: %w", err)
+	}
+	if _, err := vmsOnConfiguredNetwork(listedVMs, network); err != nil {
+		return nil, false, fmt.Errorf("bootstrap: configured VPC membership changed before VM create: %w", err)
+	}
+	ownedVMs, err := uniqueOwnedVMs(listedVMs, ownerKey(cluster), clusterName)
+	if err != nil {
+		return nil, false, err
+	}
+	canonicalOwnedVMs := make(map[string]*inspace.VM, len(ownedVMs))
+	for name, listed := range ownedVMs {
+		if listed == nil {
+			return nil, false, fmt.Errorf("bootstrap: owned VM %q has an empty inventory row", name)
+		}
+		detail, detailErr := r.readExactOwnedVMMutationAuthority(ctx, cluster, listed.UUID, name)
+		if detailErr != nil {
+			return nil, false, fmt.Errorf("bootstrap: owned VM %q lacks post-CAS assignment authority: %w", name, detailErr)
+		}
+		canonicalOwnedVMs[name] = detail
+	}
+	ownedVMs = canonicalOwnedVMs
+	controlPlaneNames := currentControlPlaneNames(clusterName)
+	if err := validateOwnedFirewallAssignments(nodeFirewall, controlPlaneUUIDSet(ownedVMs, controlPlaneNames)); err != nil {
+		return nil, false, fmt.Errorf("bootstrap: node firewall assignment drift before VM create: %w", err)
+	}
+	if err := validateOwnedFirewallAssignments(bastionFirewall, bastionUUIDSet(ownedVMs, currentBastionName(clusterName))); err != nil {
+		return nil, false, fmt.Errorf("bootstrap: bastion firewall assignment drift before VM create: %w", err)
+	}
+	if err := validateReverseFirewallAssignments(
+		firewalls, nodeFirewall, bastionFirewall, ownedVMs,
+		currentBastionName(clusterName), controlPlaneNames,
+	); err != nil {
+		return nil, false, err
+	}
+
+	// Keep deterministic-name absence as the final cloud read immediately
+	// before POST. If a concurrent exact object appeared, the caller switches
+	// to canonical Get/List/VPC adoption and dispatches nothing.
+	return r.readVMCreatePostError(ctx, location, desired.Name)
+}
+
+func isCurrentControlPlaneName(clusterName, name string) bool {
+	for _, candidate := range currentControlPlaneNames(clusterName) {
+		if name == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+// secureCreatedVMResponse resolves a CreateVM response to canonical owned VM
+// state. Despite its historical name, this helper deliberately performs no
+// mutation: a syntactically valid response UUID or one exact-name list row is
+// only a lookup anchor. The caller must durably persist that identity before
+// attaching a firewall, updating a floating IP, or authorizing rollback.
+func (r *Reconciler) secureCreatedVMResponse(ctx context.Context, cluster *v1alpha1.InSpaceCluster, vm *inspace.VM, desired inspace.CreateVMRequest, subnet, virtualIPv4 string, privatePool privateIPv4Range) (*inspace.VM, error) {
+	responseErr := validateCreatedVMResponse(vm, desired, subnet, virtualIPv4, privatePool)
+	var provisionalErr error
+	if vm != nil && vmUUIDPattern.MatchString(vm.UUID) {
+		canonical, recoveryErr := r.recoverCreatedVM(ctx, cluster, desired, vm.UUID, subnet, virtualIPv4, privatePool)
+		if recoveryErr == nil {
+			return canonical, nil
+		}
+		ownedIdentity, ownershipErr := r.recoverCreatedVMOwnership(ctx, cluster, desired, vm.UUID)
+		if ownershipErr == nil {
+			return ownedIdentity, errors.Join(responseErr, fmt.Errorf("bootstrap: canonical created VM shape/address recovery: %w", recoveryErr))
+		}
+		// A stale or malformed response UUID is diagnostic only. The issued
+		// create fence prevents replay while deterministic-name discovery finds
+		// the actual canonically owned VM produced by this POST.
+		provisionalErr = errors.Join(recoveryErr, ownershipErr)
+	}
+
+	identity, discoveryErr := r.discoverCreatedVMIdentity(ctx, cluster, desired)
+	if discoveryErr != nil {
+		return nil, errors.Join(responseErr, provisionalErr,
+			fmt.Errorf("bootstrap: created VM ownership is uncertain because exact-name discovery did not converge: %w", discoveryErr))
+	}
+	canonical, recoveryErr := r.recoverCreatedVM(ctx, cluster, desired, identity.UUID, subnet, virtualIPv4, privatePool)
 	if recoveryErr == nil {
 		return canonical, nil
 	}
-	cause := errors.Join(responseErr, fmt.Errorf("bootstrap: canonical created VM recovery: %w", recoveryErr))
-	if vm.Name == desired.Name {
-		return nil, r.rollbackMalformedCreatedVM(ctx, cluster, vm, desired, floatingIPName, cause)
+	ownedIdentity, ownershipErr := r.recoverCreatedVMOwnership(ctx, cluster, desired, identity.UUID)
+	if ownershipErr != nil {
+		return nil, errors.Join(responseErr, provisionalErr,
+			fmt.Errorf("bootstrap: discovered created VM ownership recovery: %w", ownershipErr))
 	}
-	return nil, errors.Join(cause, fmt.Errorf("bootstrap: returned VM UUID %s is firewalled but ownership remains uncertain", vm.UUID))
+	return ownedIdentity, errors.Join(responseErr,
+		fmt.Errorf("bootstrap: canonical discovered VM shape/address recovery: %w", recoveryErr))
 }
 
-func (r *Reconciler) protectReturnedVMUUID(ctx context.Context, location string, firewall *inspace.Firewall, vmUUID string) error {
+func (r *Reconciler) protectReturnedVMUUID(ctx context.Context, cluster *v1alpha1.InSpaceCluster, assignmentAttemptKey string, firewall *inspace.Firewall, vmUUID string) error {
 	if firewall == nil || !vmUUIDPattern.MatchString(firewall.UUID) {
 		return errors.New("bootstrap: cannot protect a created VM without its validated managed firewall")
 	}
 	if !vmUUIDPattern.MatchString(vmUUID) {
 		return errors.New("bootstrap: cannot protect a created VM without its returned or recovered UUID")
 	}
-	assignCtx, assignCancel := context.WithTimeout(context.WithoutCancel(ctx), configuredDuration(r.protectionRequestTimeout, defaultProtectionRequestTimeout))
-	assignErr := r.API.AssignFirewallToVM(assignCtx, location, firewall.UUID, vmUUID)
-	assignCancel()
-	readbackErr := r.waitForExactFirewallAssignment(context.WithoutCancel(ctx), location, firewall, vmUUID)
-	if readbackErr == nil {
-		return nil
-	}
-	if assignErr == nil {
-		assignErr = errors.New("assignment call returned success without authoritative commit evidence")
-	}
-	return errors.Join(fmt.Errorf("bootstrap: assign managed firewall to newly created VM %s: %w", vmUUID, assignErr), readbackErr)
+	return r.ensureExactFirewallAssignment(context.WithoutCancel(ctx), cluster, assignmentAttemptKey, firewall, vmUUID)
 }
 
 // discoverCreatedVMIdentity obtains the minimum authoritative identity needed
@@ -1174,6 +1636,94 @@ func (r *Reconciler) discoverCreatedVMIdentity(ctx context.Context, cluster *v1a
 				return &inspace.VM{UUID: candidate.UUID, Name: desired.Name}, nil
 			}
 		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-recoveryCtx.Done():
+			timer.Stop()
+			return nil, errors.Join(lastErr, recoveryCtx.Err())
+		case <-timer.C:
+		}
+		if delay < maxDelay {
+			delay *= 2
+			if delay > maxDelay {
+				delay = maxDelay
+			}
+		}
+	}
+}
+
+// recoverCreatedVMOwnership proves only the fields that can safely authorize a
+// follow-up mutation or rollback. It intentionally does not require the
+// requested compute shape, disk, or private address: if InSpace materialized
+// those incorrectly, the exact controller description, positive billing ID,
+// deterministic name, UUID, and configured-VPC membership still prove which
+// malformed VM this controller owns and may contain/delete.
+func (r *Reconciler) recoverCreatedVMOwnership(
+	ctx context.Context,
+	cluster *v1alpha1.InSpaceCluster,
+	desired inspace.CreateVMRequest,
+	returnedUUID string,
+) (*inspace.VM, error) {
+	if !vmUUIDPattern.MatchString(returnedUUID) {
+		return nil, errors.New("bootstrap: created VM ownership recovery requires an exact UUID")
+	}
+	recoveryCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), configuredDuration(r.createdVMRecoveryTimeout, defaultCreatedVMRecoveryTimeout))
+	defer cancel()
+	requestTimeout := configuredDuration(r.protectionRequestTimeout, defaultProtectionRequestTimeout)
+	delay := configuredDuration(r.protectionReadbackMinInterval, defaultProtectionReadbackMinInterval)
+	maxDelay := configuredDuration(r.protectionReadbackMaxInterval, defaultProtectionReadbackMaxInterval)
+	if maxDelay < delay {
+		maxDelay = delay
+	}
+	var lastErr error
+	for {
+		requestCtx, requestCancel := context.WithTimeout(recoveryCtx, requestTimeout)
+		detail, detailErr := r.API.GetVM(requestCtx, cluster.Spec.Location, returnedUUID)
+		requestCancel()
+		if detailErr != nil || detail == nil {
+			lastErr = errors.Join(fmt.Errorf("get exact VM %q during ownership recovery", desired.Name), detailErr)
+		} else if !strings.EqualFold(detail.UUID, returnedUUID) || detail.Name != desired.Name {
+			lastErr = fmt.Errorf("bootstrap: exact VM readback for %q changed UUID/name identity", desired.Name)
+		} else if detail.Description != desired.Description {
+			lastErr = fmt.Errorf("bootstrap: exact VM %q lacks the requested ownership/spec description", desired.Name)
+		} else if detail.BillingAccountID != desired.BillingAccountID || desired.BillingAccountID <= 0 {
+			lastErr = fmt.Errorf("bootstrap: exact VM %q lacks positive requested billing ownership", desired.Name)
+		} else if detail.NetworkUUID != "" && !strings.EqualFold(detail.NetworkUUID, desired.NetworkUUID) {
+			lastErr = fmt.Errorf("bootstrap: exact VM %q reports another private network", desired.Name)
+		} else {
+			requestCtx, requestCancel = context.WithTimeout(recoveryCtx, requestTimeout)
+			listed, listErr := r.API.ListVMs(requestCtx, cluster.Spec.Location)
+			requestCancel()
+			if listErr != nil {
+				lastErr = fmt.Errorf("list VMs during ownership recovery for %q: %w", desired.Name, listErr)
+				goto retry
+			}
+			if listErr = validateUniqueVMInventoryIdentity(listed, detail, desired.BillingAccountID, desired.NetworkUUID); listErr != nil {
+				lastErr = fmt.Errorf("bootstrap: location inventory during ownership recovery for %q: %w", desired.Name, listErr)
+				goto retry
+			}
+			requestCtx, requestCancel = context.WithTimeout(recoveryCtx, requestTimeout)
+			network, networkErr := r.API.GetNetwork(requestCtx, cluster.Spec.Location, desired.NetworkUUID)
+			requestCancel()
+			if networkErr != nil || network == nil {
+				lastErr = errors.Join(errors.New("get configured VPC during VM ownership recovery"), networkErr)
+			} else if !strings.EqualFold(network.UUID, desired.NetworkUUID) {
+				lastErr = errors.New("bootstrap: configured VPC identity changed during VM ownership recovery")
+			} else {
+				memberships := 0
+				for _, vmUUID := range network.VMUUIDs {
+					if strings.EqualFold(vmUUID, returnedUUID) {
+						memberships++
+					}
+				}
+				if memberships == 1 {
+					return detail, nil
+				}
+				lastErr = fmt.Errorf("bootstrap: exact VM %q has %d configured-VPC memberships, want one", desired.Name, memberships)
+			}
+		}
+
+	retry:
 		timer := time.NewTimer(delay)
 		select {
 		case <-recoveryCtx.Done():
@@ -1240,134 +1790,261 @@ func (r *Reconciler) recoverCreatedVM(ctx context.Context, cluster *v1alpha1.InS
 	}
 }
 
-func (r *Reconciler) cleanupCreatedVMFloatingIP(ctx context.Context, cluster *v1alpha1.InSpaceCluster, vm *inspace.VM, expectedName string) error {
-	items, err := r.API.ListFloatingIPs(ctx, cluster.Spec.Location, nil)
+func (r *Reconciler) ensureManagedNodeFirewall(ctx context.Context, cluster *v1alpha1.InSpaceCluster, network *inspace.Network, owner string, found *inspace.Firewall) (*inspace.Firewall, error) {
+	expectedName := currentBootstrapResourceNames(cluster.Metadata.Name, owner).NodeFirewall
+	request := inspace.CreateFirewallRequest{
+		DisplayName: expectedName, Description: "Managed RKE2 node firewall for " + owner,
+		BillingAccountID: cluster.Spec.BillingAccountID,
+		Rules:            managedFirewallRules(network.Subnet, cluster.Spec.Network.PodCIDR, "", nil),
+	}
+	return r.ensureManagedFirewallCreate(ctx, cluster, createAttemptNodeFirewall, "node", request, found, network.Subnet, func(firewall *inspace.Firewall) error {
+		return validateManagedNodeFirewall(firewall, cluster, network, owner, expectedName)
+	})
+}
+
+func (r *Reconciler) ensureManagedBastionFirewall(ctx context.Context, cluster *v1alpha1.InSpaceCluster, privateSubnet, owner string, found *inspace.Firewall) (*inspace.Firewall, error) {
+	expectedName := currentBootstrapResourceNames(cluster.Metadata.Name, owner).BastionFirewall
+	request := inspace.CreateFirewallRequest{
+		DisplayName: expectedName, Description: "Managed RKE2 bastion firewall for " + owner,
+		BillingAccountID: cluster.Spec.BillingAccountID,
+		Rules:            managedBastionFirewallRules(r.ManagementCIDR, privateSubnet, !cluster.Spec.BootstrapCache.DirectDownload),
+	}
+	return r.ensureManagedFirewallCreate(ctx, cluster, createAttemptBastionFirewall, "bastion", request, found, privateSubnet, func(firewall *inspace.Firewall) error {
+		return validateManagedBastionFirewall(firewall, cluster, privateSubnet, owner, expectedName, r.ManagementCIDR)
+	})
+}
+
+func (r *Reconciler) ensureManagedFirewallCreate(
+	ctx context.Context,
+	cluster *v1alpha1.InSpaceCluster,
+	attemptKey string,
+	role string,
+	request inspace.CreateFirewallRequest,
+	found *inspace.Firewall,
+	capturedSubnet string,
+	validate func(*inspace.Firewall) error,
+) (*inspace.Firewall, error) {
+	location := cluster.Spec.Location
+	billingAccountID := cluster.Spec.BillingAccountID
+	networkUUID := cluster.Spec.Network.UUID
+	intentHash, err := createIntentHash(createAttemptKindFirewall, request.DisplayName, request)
 	if err != nil {
+		return nil, err
+	}
+	if found != nil {
+		if err := validate(found); err != nil {
+			return nil, err
+		}
+		attempt, exists := r.createAttempt(cluster, attemptKey)
+		if !exists || attempt.Phase == createAttemptPhaseIntent {
+			if err := r.recordAdoptedCreate(ctx, cluster, attemptKey, createAttemptKindFirewall, request.DisplayName, intentHash, found.UUID); err != nil {
+				return nil, err
+			}
+			return found, nil
+		}
+		if err := validateCreateAttempt(attempt, createAttemptKindFirewall, request.DisplayName, intentHash); err != nil {
+			return nil, err
+		}
+		if attempt.Phase == createAttemptPhaseIssued || attempt.Phase == createAttemptPhaseRejected {
+			if err := r.recordMaterializedCreate(ctx, cluster, attemptKey, createAttemptKindFirewall, request.DisplayName, intentHash, found.UUID); err != nil {
+				return nil, err
+			}
+			return found, nil
+		}
+		if !strings.EqualFold(attempt.ResourceUUID, found.UUID) {
+			return nil, fmt.Errorf("bootstrap: durable firewall receipt for %q names UUID %s, authoritative readback returned %s", request.DisplayName, attempt.ResourceUUID, found.UUID)
+		}
+		return found, nil
+	}
+	attempt, exists := r.createAttempt(cluster, attemptKey)
+	if exists {
+		if err := validateCreateAttempt(attempt, createAttemptKindFirewall, request.DisplayName, intentHash); err != nil {
+			return nil, err
+		}
+		if attempt.Phase == createAttemptPhaseRejected {
+			if err := r.clearPreDispatchCreateRejection(ctx, cluster, attemptKey, createAttemptKindFirewall, request.DisplayName, intentHash); err != nil {
+				return nil, err
+			}
+			return nil, fmt.Errorf("%w: firewall %q rejection is now authoritatively absent and may be retried", ErrCreateAttemptPending, request.DisplayName)
+		}
+	}
+
+	allowed, err := r.authorizeCreate(ctx, cluster, attemptKey, createAttemptKindFirewall, request.DisplayName, intentHash)
+	if err != nil {
+		return nil, err
+	}
+	if !allowed {
+		return nil, fmt.Errorf("%w: firewall %q is not yet visible", ErrCreateAttemptPending, request.DisplayName)
+	}
+	if err := r.validateFirewallCreateDispatchAuthority(
+		ctx, cluster, location, billingAccountID, networkUUID, capturedSubnet, role, request,
+	); err != nil {
+		return nil, errors.Join(err,
+			fmt.Errorf("%w: firewall %q create is issued without fresh VPC/policy authority", ErrCreateAttemptPending, request.DisplayName))
+	}
+	// Re-list after the durable issue CAS. Only a successful unique-name
+	// absence authorizes POST; an exact owned object is adopted, while read
+	// failure, duplicate identity, or policy/billing drift leaves the issue
+	// receipt unresolved and prevents replay.
+	preDispatchItems, preDispatchErr := r.API.ListFirewalls(ctx, location)
+	if preDispatchErr != nil {
+		return nil, errors.Join(preDispatchErr,
+			fmt.Errorf("%w: firewall %q create is issued without fresh absence authority", ErrCreateAttemptPending, request.DisplayName))
+	}
+	preDispatchFirewall, preDispatchErr := uniqueFirewallByName(preDispatchItems, request.DisplayName)
+	if preDispatchErr != nil {
+		return nil, errors.Join(preDispatchErr,
+			fmt.Errorf("%w: firewall %q create has ambiguous post-CAS identity", ErrCreateAttemptPending, request.DisplayName))
+	}
+	if preDispatchFirewall != nil {
+		if validationErr := validate(preDispatchFirewall); validationErr != nil {
+			return nil, errors.Join(validationErr,
+				fmt.Errorf("%w: firewall %q appeared after create authorization with foreign ownership", ErrCreateAttemptPending, request.DisplayName))
+		}
+		if materializeErr := r.recordMaterializedCreate(ctx, cluster, attemptKey, createAttemptKindFirewall, request.DisplayName, intentHash, preDispatchFirewall.UUID); materializeErr != nil {
+			return nil, errors.Join(materializeErr,
+				fmt.Errorf("%w: firewall %q pre-dispatch adoption was not durably anchored", ErrCreateAttemptPending, request.DisplayName))
+		}
+		return preDispatchFirewall, nil
+	}
+	created, createErr := r.API.CreateFirewall(ctx, location, request)
+	exactResponseUUID := created != nil && vmUUIDPattern.MatchString(created.UUID)
+	if createErr != nil && !exactResponseUUID && bootstrapMutationFailureProvesNoDispatch(createErr) {
+		if rejectionErr := r.recordPreDispatchCreateRejection(ctx, cluster, attemptKey, createAttemptKindFirewall, request.DisplayName, intentHash); rejectionErr != nil {
+			return nil, errors.Join(createErr, rejectionErr,
+				fmt.Errorf("%w: firewall %q rejection receipt was not persisted", ErrCreateAttemptPending, request.DisplayName))
+		}
+		items, readbackErr := r.API.ListFirewalls(ctx, location)
+		if readbackErr != nil {
+			return nil, errors.Join(createErr, readbackErr,
+				fmt.Errorf("%w: firewall %q rejection lacks authoritative non-commit proof", ErrCreateAttemptPending, request.DisplayName))
+		}
+		readback, identityErr := uniqueFirewallByName(items, request.DisplayName)
+		if identityErr != nil {
+			return nil, errors.Join(createErr, identityErr,
+				fmt.Errorf("%w: firewall %q rejection readback is ambiguous", ErrCreateAttemptPending, request.DisplayName))
+		}
+		if readback == nil {
+			clearErr := r.clearPreDispatchCreateRejection(ctx, cluster, attemptKey, createAttemptKindFirewall, request.DisplayName, intentHash)
+			return nil, errors.Join(createErr, clearErr)
+		}
+		if !vmUUIDPattern.MatchString(readback.UUID) {
+			return nil, errors.Join(createErr, fmt.Errorf("%w: firewall %q appeared after its create error with invalid UUID %q", ErrCreateAttemptPending, request.DisplayName, readback.UUID))
+		}
+		if validationErr := validate(readback); validationErr != nil {
+			return nil, errors.Join(createErr, validationErr,
+				fmt.Errorf("%w: firewall %q appeared after its create error with invalid ownership", ErrCreateAttemptPending, request.DisplayName))
+		}
+		if materializeErr := r.recordMaterializedCreate(ctx, cluster, attemptKey, createAttemptKindFirewall, request.DisplayName, intentHash, readback.UUID); materializeErr != nil {
+			return nil, errors.Join(createErr, materializeErr,
+				fmt.Errorf("%w: firewall %q committed but its receipt was not anchored", ErrCreateAttemptPending, request.DisplayName))
+		}
+		return readback, nil
+	}
+	responseErr := validateCreatedFirewallResponse(created, request.DisplayName, request.Description, request.BillingAccountID)
+	items, listErr := r.API.ListFirewalls(ctx, location)
+	if listErr != nil {
+		return nil, errors.Join(createErr, responseErr, listErr,
+			fmt.Errorf("%w: firewall %q readback failed after POST", ErrCreateAttemptPending, request.DisplayName))
+	}
+	readback, readbackErr := uniqueFirewallByName(items, request.DisplayName)
+	if readbackErr != nil {
+		return nil, readbackErr
+	}
+	if readback == nil {
+		return nil, errors.Join(createErr, responseErr,
+			fmt.Errorf("%w: created firewall %q is not yet visible", ErrCreateAttemptPending, request.DisplayName))
+	}
+	if err := validate(readback); err != nil {
+		return nil, errors.Join(createErr, responseErr, err)
+	}
+	// The POST response UUID is provisional. Only the unique deterministic-name
+	// readback with exact billing and policy can become mutation authority.
+	if anchorErr := r.recordMaterializedCreate(ctx, cluster, attemptKey, createAttemptKindFirewall, request.DisplayName, intentHash, readback.UUID); anchorErr != nil {
+		return nil, errors.Join(createErr, responseErr, anchorErr,
+			fmt.Errorf("%w: firewall %q canonical UUID receipt was not persisted", ErrCreateAttemptPending, request.DisplayName))
+	}
+	if createErr != nil {
+		return readback, errors.Join(createErr,
+			fmt.Errorf("%w: firewall %q POST returned an error after canonical materialization", ErrCreateAttemptPending, request.DisplayName))
+	}
+	return readback, nil
+}
+
+// validateFirewallCreateDispatchAuthority recomputes the complete desired
+// policy from a fresh exact VPC read after the durable issue CAS. This matters
+// even when the firewall name is absent: a moved/re-addressed VPC would make a
+// previously rendered private-prefix policy unsafe to create.
+func (r *Reconciler) validateFirewallCreateDispatchAuthority(
+	ctx context.Context,
+	cluster *v1alpha1.InSpaceCluster,
+	location string,
+	billingAccountID int64,
+	networkUUID string,
+	capturedSubnet string,
+	role string,
+	request inspace.CreateFirewallRequest,
+) error {
+	if cluster == nil || location == "" || billingAccountID <= 0 ||
+		!vmUUIDPattern.MatchString(networkUUID) || capturedSubnet == "" {
+		return errors.New("bootstrap: firewall create authority has invalid captured cluster/VPC identity")
+	}
+	if cluster.Spec.Location != location || cluster.Spec.BillingAccountID != billingAccountID ||
+		!strings.EqualFold(cluster.Spec.Network.UUID, networkUUID) {
+		return errors.New("bootstrap: cluster billing/location/VPC identity changed after firewall create issue CAS")
+	}
+	if request.BillingAccountID != billingAccountID || request.BillingAccountID <= 0 {
+		return errors.New("bootstrap: firewall request lacks exact positive billing-account authority")
+	}
+	network, err := r.API.GetNetwork(ctx, location, networkUUID)
+	if err != nil {
+		return fmt.Errorf("bootstrap: fresh configured VPC read before firewall create: %w", err)
+	}
+	if network == nil || !strings.EqualFold(network.UUID, networkUUID) || network.Subnet != capturedSubnet {
+		return errors.New("bootstrap: configured VPC UUID/subnet changed before firewall create")
+	}
+	if err := validatePrivateSubnet(network.Subnet); err != nil {
 		return err
 	}
-	var found *inspace.FloatingIP
-	validationVM := *vm
-	validationVM.PrivateIPv4 = ""
-	for i := range items {
-		item := &items[i]
-		if item.IsDeleted || item.AssignedTo != vm.UUID && item.Name != expectedName {
-			continue
-		}
-		if found != nil {
-			return fmt.Errorf("bootstrap: refusing rollback for VM %q with multiple floating IPs", vm.Name)
-		}
-		if item.Name != "" && item.Name != expectedName {
-			return fmt.Errorf("bootstrap: refusing rollback for VM %q with foreign floating IP name %q", vm.Name, item.Name)
-		}
-		if item.Name == "" {
-			if err := validateAutoAssignedFloatingIP(item, cluster, &validationVM); err != nil {
-				return err
-			}
-		} else if err := validateOwnedFloatingIP(item, cluster, expectedName, &validationVM); err != nil {
-			return err
-		}
-		found = item
+	if err := validateNetworkCIDRs(network.Subnet, cluster.Spec.Network.PodCIDR, cluster.Spec.Network.ServiceCIDR); err != nil {
+		return err
 	}
-	if found == nil {
-		return fmt.Errorf("bootstrap: waiting for VM %q auto floating IP before rollback", vm.Name)
+	if err := validateVirtualIPv4(network.Subnet, cluster.Spec.Endpoint.VirtualIPv4); err != nil {
+		return err
 	}
-	if found.Name == "" {
-		renamed, ready, renameErr := r.ensureOwnedAutoFloatingIP(ctx, cluster, expectedName, &validationVM, found)
-		if renameErr != nil {
-			return renameErr
-		}
-		if !ready || renamed == nil {
-			return fmt.Errorf("bootstrap: waiting to name VM %q auto floating IP before rollback", vm.Name)
-		}
-		found = renamed
+
+	owner := ownerKey(cluster)
+	names := currentBootstrapResourceNames(cluster.Metadata.Name, owner)
+	var expectedName, expectedDescription string
+	var expectedRules []inspace.FirewallRule
+	switch role {
+	case "node":
+		expectedName = names.NodeFirewall
+		expectedDescription = "Managed RKE2 node firewall for " + owner
+		expectedRules = managedFirewallRules(network.Subnet, cluster.Spec.Network.PodCIDR, "", nil)
+	case "bastion":
+		expectedName = names.BastionFirewall
+		expectedDescription = "Managed RKE2 bastion firewall for " + owner
+		expectedRules = managedBastionFirewallRules(r.ManagementCIDR, network.Subnet, !cluster.Spec.BootstrapCache.DirectDownload)
+	default:
+		return fmt.Errorf("bootstrap: unsupported managed firewall role %q", role)
 	}
-	if found.AssignedTo != "" {
-		updated, unassignErr := r.API.UnassignFloatingIP(ctx, cluster.Spec.Location, found.Address)
-		if unassignErr == nil {
-			if err := validateFloatingIPCleanupReadback(updated, cluster, expectedName, found.Address); err != nil {
-				return err
-			}
-		} else {
-			readback, readErr := r.findFloatingIPByAddress(ctx, cluster.Spec.Location, found.Address)
-			if readErr != nil || readback == nil {
-				return errors.Join(unassignErr, readErr)
-			}
-			if err := validateFloatingIPCleanupReadback(readback, cluster, expectedName, found.Address); err != nil {
-				return errors.Join(unassignErr, err)
-			}
-		}
+	if request.DisplayName != expectedName || request.Description != expectedDescription {
+		return errors.New("bootstrap: firewall deterministic identity changed before dispatch")
 	}
-	if deleteErr := r.API.DeleteFloatingIP(ctx, cluster.Spec.Location, found.Address); deleteErr != nil && !inspace.IsNotFound(deleteErr) {
-		readback, readErr := r.findFloatingIPByAddress(ctx, cluster.Spec.Location, found.Address)
-		if readErr != nil || readback != nil {
-			return errors.Join(deleteErr, readErr)
-		}
+	if !sameFirewallPolicy(request.Rules, expectedRules) {
+		return errors.New("bootstrap: desired firewall policy no longer matches the fresh VPC prefix")
 	}
 	return nil
 }
 
-func (r *Reconciler) ensureManagedNodeFirewall(ctx context.Context, cluster *v1alpha1.InSpaceCluster, network *inspace.Network, owner string, found *inspace.Firewall) (*inspace.Firewall, error) {
-	if found != nil {
-		return found, nil
-	}
-	expectedName := currentBootstrapResourceNames(cluster.Metadata.Name, owner).NodeFirewall
-	created, err := r.API.CreateFirewall(ctx, cluster.Spec.Location, inspace.CreateFirewallRequest{
-		DisplayName: expectedName, Description: "Managed RKE2 node firewall for " + owner,
-		BillingAccountID: cluster.Spec.BillingAccountID,
-		Rules:            managedFirewallRules(network.Subnet, cluster.Spec.Network.PodCIDR, "", nil),
-	})
-	if err != nil {
-		return nil, err
-	}
-	if err := validateCreatedFirewallResponse(
-		created, expectedName, "Managed RKE2 node firewall for "+owner, cluster.Spec.BillingAccountID,
-	); err != nil {
-		return nil, fmt.Errorf("bootstrap: create node firewall response: %w", err)
-	}
-	items, err := r.API.ListFirewalls(ctx, cluster.Spec.Location)
-	if err != nil {
-		return nil, err
-	}
-	readback, err := uniqueFirewallByName(items, expectedName)
-	if err != nil || readback == nil || readback.UUID != created.UUID {
-		return nil, errors.Join(errors.New("bootstrap: node firewall creation readback mismatch"), err)
-	}
-	if err := validateManagedNodeFirewall(readback, cluster, network, owner, expectedName); err != nil {
-		return nil, err
-	}
-	return readback, nil
-}
-
-func (r *Reconciler) ensureManagedBastionFirewall(ctx context.Context, cluster *v1alpha1.InSpaceCluster, privateSubnet, owner string, found *inspace.Firewall) (*inspace.Firewall, error) {
-	if found != nil {
-		return found, nil
-	}
-	expectedName := currentBootstrapResourceNames(cluster.Metadata.Name, owner).BastionFirewall
-	created, err := r.API.CreateFirewall(ctx, cluster.Spec.Location, inspace.CreateFirewallRequest{
-		DisplayName: expectedName, Description: "Managed RKE2 bastion firewall for " + owner,
-		BillingAccountID: cluster.Spec.BillingAccountID,
-		Rules:            managedBastionFirewallRules(r.ManagementCIDR, privateSubnet, !cluster.Spec.BootstrapCache.DirectDownload),
-	})
-	if err != nil {
-		return nil, err
-	}
-	if err := validateCreatedFirewallResponse(
-		created, expectedName, "Managed RKE2 bastion firewall for "+owner, cluster.Spec.BillingAccountID,
-	); err != nil {
-		return nil, fmt.Errorf("bootstrap: create bastion firewall response: %w", err)
-	}
-	items, err := r.API.ListFirewalls(ctx, cluster.Spec.Location)
-	if err != nil {
-		return nil, err
-	}
-	readback, err := uniqueFirewallByName(items, expectedName)
-	if err != nil || readback == nil || readback.UUID != created.UUID {
-		return nil, errors.Join(errors.New("bootstrap: bastion firewall creation readback mismatch"), err)
-	}
-	if err := validateManagedBastionFirewall(readback, cluster, privateSubnet, owner, expectedName, r.ManagementCIDR); err != nil {
-		return nil, err
-	}
-	return readback, nil
+func bootstrapMutationFailureProvesNoDispatch(err error) bool {
+	// Only the shared client's typed local mutation guard proves that no request
+	// reached the network. Every HTTP response, including an ordinary 4xx, is a
+	// post-dispatch outcome: the provider may have committed the mutation before
+	// returning it, and an immediate old/empty read can still be eventual
+	// consistency. Such outcomes must therefore keep their issued receipt.
+	return errors.Is(err, inspace.ErrMutationBlocked)
 }
 
 // validateCreatedFirewallResponse treats a firewall POST response as only a
@@ -1463,12 +2140,38 @@ func validateManagedBastionFirewallIdentity(firewall *inspace.Firewall, cluster 
 	return nil
 }
 
+type floatingIPUpdateIntent struct {
+	Location         string `json:"location"`
+	Address          string `json:"address"`
+	DesiredName      string `json:"desiredName"`
+	BillingAccountID int64  `json:"billingAccountID"`
+	VMUUID           string `json:"vmUUID"`
+}
+
 func (r *Reconciler) ensureOwnedAutoFloatingIP(ctx context.Context, cluster *v1alpha1.InSpaceCluster, name string, vm *inspace.VM, item *inspace.FloatingIP) (*inspace.FloatingIP, bool, error) {
 	if vm == nil {
 		return nil, false, errors.New("bootstrap: cannot discover an auto floating IP without its owned VM")
 	}
 	if item == nil {
 		return nil, false, nil
+	}
+	attemptKey, err := floatingIPUpdateAttemptKey(cluster, name)
+	if err != nil {
+		return nil, false, err
+	}
+	resourceName := item.Address + "/" + name
+	intentHash, err := createIntentHash(createAttemptKindFloatingIPUpdate, resourceName, floatingIPUpdateIntent{
+		Location: cluster.Spec.Location, Address: item.Address, DesiredName: name,
+		BillingAccountID: cluster.Spec.BillingAccountID, VMUUID: vm.UUID,
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	attempt, exists := r.createAttempt(cluster, attemptKey)
+	if exists {
+		if err := validateCreateAttempt(attempt, createAttemptKindFloatingIPUpdate, resourceName, intentHash); err != nil {
+			return nil, false, err
+		}
 	}
 	if item.Name == name {
 		if err := validateOwnedFloatingIP(item, cluster, name, vm); err != nil {
@@ -1477,40 +2180,316 @@ func (r *Reconciler) ensureOwnedAutoFloatingIP(ctx context.Context, cluster *v1a
 		if item.AssignedTo != vm.UUID {
 			return nil, false, fmt.Errorf("bootstrap: floating IP %q is not assigned to owned VM %q", name, vm.Name)
 		}
+		switch {
+		case !exists || attempt.Phase == createAttemptPhaseIntent:
+			if err := r.recordAdoptedCreate(ctx, cluster, attemptKey, createAttemptKindFloatingIPUpdate, resourceName, intentHash, vm.UUID); err != nil {
+				return nil, false, err
+			}
+		case attempt.Phase == createAttemptPhaseIssued || attempt.Phase == createAttemptPhaseRejected:
+			if err := r.recordMaterializedCreate(ctx, cluster, attemptKey, createAttemptKindFloatingIPUpdate, resourceName, intentHash, vm.UUID); err != nil {
+				return nil, false, err
+			}
+		case !strings.EqualFold(attempt.ResourceUUID, vm.UUID):
+			return nil, false, fmt.Errorf("bootstrap: durable floating-IP update receipt %q names VM %s, expected %s", attemptKey, attempt.ResourceUUID, vm.UUID)
+		}
 		return item, true, nil
 	}
 	if err := validateAutoAssignedFloatingIP(item, cluster, vm); err != nil {
 		return nil, false, err
 	}
-	updated, updateErr := r.API.UpdateFloatingIP(ctx, cluster.Spec.Location, item.Address, inspace.UpdateFloatingIPRequest{
+	if exists && attempt.Phase == createAttemptPhaseRejected {
+		if err := r.clearPreDispatchCreateRejection(ctx, cluster, attemptKey, createAttemptKindFloatingIPUpdate, resourceName, intentHash); err != nil {
+			return nil, false, err
+		}
+		return nil, false, nil
+	}
+	if exists && attempt.Phase != createAttemptPhaseIntent {
+		if attempt.Phase != createAttemptPhaseIssued {
+			return nil, false, fmt.Errorf("bootstrap: floating IP %q reverted after its durable update receipt reached phase %q", name, attempt.Phase)
+		}
+		readback, committed, readErr := r.readFloatingIPUpdateState(ctx, cluster, name, vm, item.Address)
+		if readErr != nil {
+			return nil, false, errors.Join(readErr,
+				fmt.Errorf("%w: floating-IP update %q cannot replay its issued PATCH", ErrCreateAttemptPending, attemptKey))
+		}
+		if !committed {
+			return nil, false, fmt.Errorf("%w: floating-IP update %q remains issued with the original state visible", ErrCreateAttemptPending, attemptKey)
+		}
+		if err := r.recordMaterializedCreate(ctx, cluster, attemptKey, createAttemptKindFloatingIPUpdate, resourceName, intentHash, vm.UUID); err != nil {
+			return nil, false, errors.Join(err,
+				fmt.Errorf("%w: floating-IP update %q committed but its receipt was not anchored", ErrCreateAttemptPending, attemptKey))
+		}
+		return readback, true, nil
+	}
+	allowed, err := r.authorizeCreate(ctx, cluster, attemptKey, createAttemptKindFloatingIPUpdate, resourceName, intentHash)
+	if err != nil {
+		return nil, false, err
+	}
+	if !allowed {
+		return nil, false, fmt.Errorf("%w: floating-IP update %q cannot replay its issued PATCH", ErrCreateAttemptPending, attemptKey)
+	}
+	// Re-prove both sides of the relationship after the issue CAS. The caller's
+	// VM and floating-IP snapshots are lookup hints only; a stale address/name,
+	// billing account, assignment, VM identity, or VPC membership must retain the
+	// issued receipt and prevent PATCH.
+	freshVM, authorityErr := r.readExactOwnedVMMutationAuthority(ctx, cluster, vm.UUID, vm.Name)
+	if authorityErr != nil {
+		return nil, false, errors.Join(authorityErr,
+			fmt.Errorf("%w: floating-IP update %q lacks fresh VM authority", ErrCreateAttemptPending, attemptKey))
+	}
+	freshItem, alreadyCommitted, authorityErr := r.readFloatingIPUpdateState(ctx, cluster, name, freshVM, item.Address)
+	if authorityErr != nil {
+		return nil, false, errors.Join(authorityErr,
+			fmt.Errorf("%w: floating-IP update %q lacks fresh address/assignment authority", ErrCreateAttemptPending, attemptKey))
+	}
+	if alreadyCommitted {
+		if materializeErr := r.recordMaterializedCreate(ctx, cluster, attemptKey, createAttemptKindFloatingIPUpdate, resourceName, intentHash, freshVM.UUID); materializeErr != nil {
+			return nil, false, errors.Join(materializeErr,
+				fmt.Errorf("%w: floating-IP update %q pre-dispatch adoption was not anchored", ErrCreateAttemptPending, attemptKey))
+		}
+		return freshItem, true, nil
+	}
+	updated, updateErr := r.API.UpdateFloatingIP(ctx, cluster.Spec.Location, freshItem.Address, inspace.UpdateFloatingIPRequest{
 		Name: name, BillingAccountID: cluster.Spec.BillingAccountID,
 	})
+	var responseErr error
 	if updateErr == nil {
-		if err := validateOwnedFloatingIP(updated, cluster, name, vm); err != nil {
-			return nil, false, fmt.Errorf("bootstrap: update floating IP %q response: %w", name, err)
+		if err := validateOwnedFloatingIP(updated, cluster, name, freshVM); err != nil {
+			responseErr = fmt.Errorf("bootstrap: update floating IP %q response: %w", name, err)
 		}
 	}
-	readback, readErr := r.findFloatingIP(ctx, cluster, name, vm, item.Address)
-	if readErr != nil || readback == nil {
-		return nil, false, errors.Join(updateErr, readErr, fmt.Errorf("bootstrap: floating IP %q update did not converge", name))
+	if updateErr != nil && bootstrapMutationFailureProvesNoDispatch(updateErr) {
+		if rejectionErr := r.recordPreDispatchCreateRejection(ctx, cluster, attemptKey, createAttemptKindFloatingIPUpdate, resourceName, intentHash); rejectionErr != nil {
+			return nil, false, errors.Join(updateErr, responseErr, rejectionErr,
+				fmt.Errorf("%w: floating-IP update %q rejection receipt was not persisted", ErrCreateAttemptPending, attemptKey))
+		}
 	}
-	return readback, true, nil
+	readback, committed, readErr := r.readFloatingIPUpdateState(ctx, cluster, name, freshVM, freshItem.Address)
+	if readErr == nil && committed {
+		if err := r.recordMaterializedCreate(ctx, cluster, attemptKey, createAttemptKindFloatingIPUpdate, resourceName, intentHash, freshVM.UUID); err != nil {
+			return nil, false, errors.Join(updateErr, responseErr, err,
+				fmt.Errorf("%w: floating-IP update %q committed but its receipt was not anchored", ErrCreateAttemptPending, attemptKey))
+		}
+		if responseErr != nil {
+			return nil, false, responseErr
+		}
+		return readback, true, nil
+	}
+	if updateErr != nil && bootstrapMutationFailureProvesNoDispatch(updateErr) && readErr == nil && !committed {
+		clearErr := r.clearPreDispatchCreateRejection(ctx, cluster, attemptKey, createAttemptKindFloatingIPUpdate, resourceName, intentHash)
+		return nil, false, errors.Join(updateErr, responseErr, clearErr)
+	}
+	if updateErr == nil {
+		updateErr = errors.New("floating-IP PATCH returned success without authoritative commit evidence")
+	}
+	return nil, false, errors.Join(updateErr, responseErr, readErr,
+		fmt.Errorf("%w: floating-IP update %q outcome is unresolved", ErrCreateAttemptPending, attemptKey))
 }
 
-func (r *Reconciler) ensureVMProtection(ctx context.Context, cluster *v1alpha1.InSpaceCluster, firewall *inspace.Firewall, vm *inspace.VM) (bool, error) {
-	if !firewallHasVM(firewall, vm.UUID) {
-		requestCtx, cancel := context.WithTimeout(ctx, configuredDuration(r.protectionRequestTimeout, defaultProtectionRequestTimeout))
-		assignErr := r.API.AssignFirewallToVM(requestCtx, cluster.Spec.Location, firewall.UUID, vm.UUID)
-		cancel()
-		if readbackErr := r.waitForExactFirewallAssignment(ctx, cluster.Spec.Location, firewall, vm.UUID); readbackErr != nil {
-			if assignErr == nil {
-				assignErr = errors.New("assignment call returned success without authoritative commit evidence")
-			}
-			return false, errors.Join(fmt.Errorf("bootstrap: assign firewall: %w", assignErr), readbackErr)
+// readFloatingIPUpdateState exact-reads the one address/name/VM ownership
+// tuple after PATCH. It reports committed only for the desired name and
+// reports false only when the exact original unnamed auto-assignment remains;
+// every missing, duplicate, foreign, or partially changed row is ambiguity.
+func (r *Reconciler) readFloatingIPUpdateState(ctx context.Context, cluster *v1alpha1.InSpaceCluster, name string, vm *inspace.VM, address string) (*inspace.FloatingIP, bool, error) {
+	items, err := r.API.ListFloatingIPs(ctx, cluster.Spec.Location, nil)
+	if err != nil {
+		return nil, false, fmt.Errorf("bootstrap: list floating IPs after update of %q: %w", name, err)
+	}
+	var found *inspace.FloatingIP
+	for i := range items {
+		item := &items[i]
+		if item.IsDeleted || (item.Address != address && item.Name != name && item.AssignedTo != vm.UUID) {
+			continue
 		}
-		return true, nil
+		if found != nil {
+			return nil, false, fmt.Errorf("bootstrap: multiple floating IP rows overlap update identity %q/%s/VM-%s", name, address, vm.UUID)
+		}
+		found = item
+	}
+	if found == nil {
+		return nil, false, fmt.Errorf("bootstrap: floating IP %s disappeared after update of %q", address, name)
+	}
+	if found.Address != address || found.AssignedTo != vm.UUID {
+		return nil, false, fmt.Errorf("bootstrap: floating IP %q update changed its exact address or VM assignment", name)
+	}
+	switch found.Name {
+	case name:
+		if err := validateOwnedFloatingIP(found, cluster, name, vm); err != nil {
+			return nil, false, err
+		}
+		return found, true, nil
+	case "":
+		if err := validateAutoAssignedFloatingIP(found, cluster, vm); err != nil {
+			return nil, false, err
+		}
+		return found, false, nil
+	default:
+		return nil, false, fmt.Errorf("bootstrap: floating IP %s changed to foreign name %q while updating %q", address, found.Name, name)
+	}
+}
+
+func (r *Reconciler) ensureVMProtection(ctx context.Context, cluster *v1alpha1.InSpaceCluster, attemptKey string, firewall *inspace.Firewall, vm *inspace.VM) (bool, error) {
+	if vm == nil || !vmUUIDPattern.MatchString(vm.UUID) {
+		return false, errors.New("bootstrap: cannot ensure firewall protection without an exact VM UUID")
+	}
+	if err := r.ensureExactFirewallAssignment(ctx, cluster, attemptKey, firewall, vm.UUID); err != nil {
+		return false, err
 	}
 	return true, nil
+}
+
+type firewallAssignmentIntent struct {
+	Location     string `json:"location"`
+	FirewallUUID string `json:"firewallUUID"`
+	VMUUID       string `json:"vmUUID"`
+}
+
+// ensureExactFirewallAssignment serializes one per-slot assignment POST behind
+// a durable issued receipt. Once issued, reconciliation is read-only until an
+// authoritative firewall list proves the exact firewall/VM/type tuple. This
+// prevents a committed-but-500 response from producing duplicate rows after a
+// process restart.
+func (r *Reconciler) ensureExactFirewallAssignment(
+	ctx context.Context,
+	cluster *v1alpha1.InSpaceCluster,
+	attemptKey string,
+	firewall *inspace.Firewall,
+	vmUUID string,
+) error {
+	if cluster == nil || firewall == nil || !vmUUIDPattern.MatchString(firewall.UUID) || !vmUUIDPattern.MatchString(vmUUID) {
+		return errors.New("bootstrap: exact firewall assignment requires a cluster and valid firewall/VM UUIDs")
+	}
+	resourceName := firewall.UUID + "/" + vmUUID
+	intentHash, err := createIntentHash(createAttemptKindFirewallAssignment, resourceName, firewallAssignmentIntent{
+		Location: cluster.Spec.Location, FirewallUUID: firewall.UUID, VMUUID: vmUUID,
+	})
+	if err != nil {
+		return err
+	}
+	attempt, exists := r.createAttempt(cluster, attemptKey)
+	if exists {
+		if err := validateCreateAttempt(attempt, createAttemptKindFirewallAssignment, resourceName, intentHash); err != nil {
+			return err
+		}
+	}
+	if firewallHasVM(firewall, vmUUID) {
+		switch {
+		case !exists || attempt.Phase == createAttemptPhaseIntent:
+			return r.recordAdoptedCreate(ctx, cluster, attemptKey, createAttemptKindFirewallAssignment, resourceName, intentHash, vmUUID)
+		case attempt.Phase == createAttemptPhaseIssued || attempt.Phase == createAttemptPhaseRejected:
+			return r.recordMaterializedCreate(ctx, cluster, attemptKey, createAttemptKindFirewallAssignment, resourceName, intentHash, vmUUID)
+		case !strings.EqualFold(attempt.ResourceUUID, vmUUID):
+			return fmt.Errorf("bootstrap: durable firewall-assignment receipt %q names VM %s, expected %s", attemptKey, attempt.ResourceUUID, vmUUID)
+		default:
+			return nil
+		}
+	}
+	if exists && attempt.Phase == createAttemptPhaseRejected {
+		if err := r.clearPreDispatchCreateRejection(ctx, cluster, attemptKey, createAttemptKindFirewallAssignment, resourceName, intentHash); err != nil {
+			return err
+		}
+		return fmt.Errorf("%w: firewall assignment %q rejection is now authoritatively absent and may be retried", ErrCreateAttemptPending, attemptKey)
+	}
+	if exists && attempt.Phase != createAttemptPhaseIntent {
+		if readbackErr := r.waitForExactFirewallAssignment(ctx, cluster.Spec.Location, firewall, vmUUID); readbackErr != nil {
+			return errors.Join(
+				fmt.Errorf("%w: firewall assignment %q cannot replay its issued POST", ErrCreateAttemptPending, attemptKey),
+				readbackErr,
+			)
+		}
+		if attempt.Phase == createAttemptPhaseIssued {
+			if err := r.recordMaterializedCreate(ctx, cluster, attemptKey, createAttemptKindFirewallAssignment, resourceName, intentHash, vmUUID); err != nil {
+				return errors.Join(err, fmt.Errorf("%w: firewall assignment %q read back but its receipt was not anchored", ErrCreateAttemptPending, attemptKey))
+			}
+		}
+		return nil
+	}
+	release := r.acquireFirewallAssignmentGate(cluster.Spec.Location, firewall.UUID)
+	defer release()
+	// The caller's firewall snapshot can predate another slot that completed
+	// while this goroutine waited. Re-read inside the per-firewall gate before
+	// minting the durable one-shot assignment issue.
+	readCtx, readCancel := context.WithTimeout(context.WithoutCancel(ctx), configuredDuration(r.protectionRequestTimeout, defaultProtectionRequestTimeout))
+	present, readErr := r.readExactFirewallAssignment(readCtx, cluster.Spec.Location, firewall, vmUUID)
+	readCancel()
+	if readErr != nil {
+		return fmt.Errorf("bootstrap: fresh in-gate firewall assignment read for %s: %w", resourceName, readErr)
+	}
+	if present {
+		return r.recordAdoptedCreate(ctx, cluster, attemptKey, createAttemptKindFirewallAssignment, resourceName, intentHash, vmUUID)
+	}
+
+	allowed, err := r.authorizeCreate(ctx, cluster, attemptKey, createAttemptKindFirewallAssignment, resourceName, intentHash)
+	if err != nil {
+		return err
+	}
+	if !allowed {
+		return fmt.Errorf("%w: firewall assignment %q cannot replay its issued POST", ErrCreateAttemptPending, attemptKey)
+	}
+	// The snapshots above predate the durable issue transition. Re-read the
+	// exact firewall policy/relation and the VM's canonical Get/List/VPC tuple
+	// after CAS before allowing a relationship POST.
+	present, authorityErr := r.readExactFirewallAssignment(ctx, cluster.Spec.Location, firewall, vmUUID)
+	if authorityErr != nil {
+		return errors.Join(authorityErr,
+			fmt.Errorf("%w: firewall assignment %q lacks fresh firewall authority", ErrCreateAttemptPending, attemptKey))
+	}
+	if present {
+		if materializeErr := r.recordMaterializedCreate(ctx, cluster, attemptKey, createAttemptKindFirewallAssignment, resourceName, intentHash, vmUUID); materializeErr != nil {
+			return errors.Join(materializeErr,
+				fmt.Errorf("%w: firewall assignment %q pre-dispatch adoption was not anchored", ErrCreateAttemptPending, attemptKey))
+		}
+		return nil
+	}
+	if _, authorityErr = r.readExactOwnedVMMutationAuthority(ctx, cluster, vmUUID, ""); authorityErr != nil {
+		return errors.Join(authorityErr,
+			fmt.Errorf("%w: firewall assignment %q lacks fresh VM authority", ErrCreateAttemptPending, attemptKey))
+	}
+	requestCtx, cancel := context.WithTimeout(ctx, configuredDuration(r.protectionRequestTimeout, defaultProtectionRequestTimeout))
+	assignErr := r.API.AssignFirewallToVM(requestCtx, cluster.Spec.Location, firewall.UUID, vmUUID)
+	cancel()
+	readbackErr := r.waitForExactFirewallAssignment(ctx, cluster.Spec.Location, firewall, vmUUID)
+	if readbackErr == nil {
+		if err := r.recordMaterializedCreate(ctx, cluster, attemptKey, createAttemptKindFirewallAssignment, resourceName, intentHash, vmUUID); err != nil {
+			return errors.Join(err, fmt.Errorf("%w: firewall assignment %q committed but its receipt was not anchored", ErrCreateAttemptPending, attemptKey))
+		}
+		return nil
+	}
+	if bootstrapMutationFailureProvesNoDispatch(assignErr) {
+		if rejectionErr := r.recordPreDispatchCreateRejection(ctx, cluster, attemptKey, createAttemptKindFirewallAssignment, resourceName, intentHash); rejectionErr != nil {
+			return errors.Join(fmt.Errorf("bootstrap: assign firewall: %w", assignErr), readbackErr, rejectionErr,
+				fmt.Errorf("%w: firewall assignment %q rejection receipt was not persisted", ErrCreateAttemptPending, attemptKey))
+		}
+		present, proofErr := r.readExactFirewallAssignment(ctx, cluster.Spec.Location, firewall, vmUUID)
+		if proofErr != nil {
+			return errors.Join(fmt.Errorf("bootstrap: assign firewall: %w", assignErr), readbackErr, proofErr,
+				fmt.Errorf("%w: firewall assignment %q rejection lacks authoritative outcome proof", ErrCreateAttemptPending, attemptKey))
+		}
+		if present {
+			if err := r.recordMaterializedCreate(ctx, cluster, attemptKey, createAttemptKindFirewallAssignment, resourceName, intentHash, vmUUID); err != nil {
+				return errors.Join(err, fmt.Errorf("%w: firewall assignment %q committed but its receipt was not anchored", ErrCreateAttemptPending, attemptKey))
+			}
+			return nil
+		}
+		clearErr := r.clearPreDispatchCreateRejection(ctx, cluster, attemptKey, createAttemptKindFirewallAssignment, resourceName, intentHash)
+		return errors.Join(fmt.Errorf("bootstrap: assign firewall: %w", assignErr), readbackErr, clearErr)
+	}
+	if assignErr == nil {
+		assignErr = errors.New("assignment call returned success without authoritative commit evidence")
+	}
+	return errors.Join(
+		fmt.Errorf("bootstrap: assign firewall: %w", assignErr),
+		readbackErr,
+		fmt.Errorf("%w: firewall assignment %q POST outcome is unresolved", ErrCreateAttemptPending, attemptKey),
+	)
+}
+
+func (r *Reconciler) acquireFirewallAssignmentGate(location, firewallUUID string) func() {
+	key := strings.ToLower(location) + "/" + strings.ToLower(firewallUUID)
+	gateValue, _ := r.firewallAssignmentGates.LoadOrStore(key, &sync.Mutex{})
+	gate := gateValue.(*sync.Mutex)
+	gate.Lock()
+	return gate.Unlock
 }
 
 func (r *Reconciler) waitForExactFirewallAssignment(ctx context.Context, location string, expectedFirewall *inspace.Firewall, vmUUID string) error {
@@ -1533,43 +2512,15 @@ func (r *Reconciler) waitForExactFirewallAssignment(ctx context.Context, locatio
 		if err != nil {
 			lastErr = fmt.Errorf("bootstrap: list firewalls for assignment readback: %w", err)
 		} else {
-			expectedRows := 0
-			assignmentRows := 0
-			for i := range items {
-				firewall := &items[i]
-				if firewall.UUID == expectedFirewall.UUID {
-					expectedRows++
-					if firewall.EffectiveName() != expectedFirewall.EffectiveName() || firewall.BillingAccountID != expectedFirewall.BillingAccountID {
-						return errors.New("bootstrap: managed firewall identity drifted during assignment readback")
-					}
-					if !sameFirewallPolicy(firewall.Rules, expectedFirewall.Rules) {
-						return errors.New("bootstrap: managed firewall policy drifted during assignment readback")
-					}
-				}
-				for _, resource := range firewall.ResourcesAssigned {
-					if resource.ResourceUUID != vmUUID {
-						continue
-					}
-					assignmentRows++
-					if resource.ResourceType != "vm" || firewall.UUID != expectedFirewall.UUID {
-						return fmt.Errorf("bootstrap: VM %s appeared on the wrong firewall or resource type during assignment readback", vmUUID)
-					}
-				}
-			}
-			if expectedRows > 1 {
-				return fmt.Errorf("bootstrap: expected one managed firewall row during assignment readback, got %d", expectedRows)
-			}
-			if expectedRows == 0 {
-				lastErr = errors.New("bootstrap: managed firewall row is not yet visible during assignment readback")
+			present, stateErr := exactFirewallAssignmentState(items, expectedFirewall, vmUUID)
+			if errors.Is(stateErr, errManagedFirewallNotVisible) {
+				lastErr = stateErr
+			} else if stateErr != nil {
+				return stateErr
+			} else if present {
+				return nil
 			} else {
-				switch assignmentRows {
-				case 1:
-					return nil
-				case 0:
-					lastErr = fmt.Errorf("bootstrap: VM %s firewall assignment is not yet visible", vmUUID)
-				default:
-					return fmt.Errorf("bootstrap: VM %s has duplicate firewall assignments during readback", vmUUID)
-				}
+				lastErr = fmt.Errorf("bootstrap: VM %s firewall assignment is not yet visible", vmUUID)
 			}
 		}
 		timer := time.NewTimer(delay)
@@ -1586,6 +2537,53 @@ func (r *Reconciler) waitForExactFirewallAssignment(ctx context.Context, locatio
 			}
 		}
 	}
+}
+
+func (r *Reconciler) readExactFirewallAssignment(ctx context.Context, location string, expectedFirewall *inspace.Firewall, vmUUID string) (bool, error) {
+	items, err := r.API.ListFirewalls(ctx, location)
+	if err != nil {
+		return false, fmt.Errorf("bootstrap: list firewalls for post-error assignment proof: %w", err)
+	}
+	return exactFirewallAssignmentState(items, expectedFirewall, vmUUID)
+}
+
+func exactFirewallAssignmentState(items []inspace.Firewall, expectedFirewall *inspace.Firewall, vmUUID string) (bool, error) {
+	if expectedFirewall == nil || !vmUUIDPattern.MatchString(expectedFirewall.UUID) || !vmUUIDPattern.MatchString(vmUUID) {
+		return false, errors.New("bootstrap: exact firewall assignment state requires valid firewall and VM UUIDs")
+	}
+	expectedRows := 0
+	assignmentRows := 0
+	for i := range items {
+		firewall := &items[i]
+		if firewall.UUID == expectedFirewall.UUID {
+			expectedRows++
+			if firewall.EffectiveName() != expectedFirewall.EffectiveName() || firewall.BillingAccountID != expectedFirewall.BillingAccountID {
+				return false, errors.New("bootstrap: managed firewall identity drifted during assignment readback")
+			}
+			if !sameFirewallPolicy(firewall.Rules, expectedFirewall.Rules) {
+				return false, errors.New("bootstrap: managed firewall policy drifted during assignment readback")
+			}
+		}
+		for _, resource := range firewall.ResourcesAssigned {
+			if resource.ResourceUUID != vmUUID {
+				continue
+			}
+			assignmentRows++
+			if resource.ResourceType != "vm" || firewall.UUID != expectedFirewall.UUID {
+				return false, fmt.Errorf("bootstrap: VM %s appeared on the wrong firewall or resource type during assignment readback", vmUUID)
+			}
+		}
+	}
+	if expectedRows == 0 {
+		return false, errManagedFirewallNotVisible
+	}
+	if expectedRows != 1 {
+		return false, fmt.Errorf("bootstrap: expected one managed firewall row during assignment readback, got %d", expectedRows)
+	}
+	// ResourcesAssigned is a set-valued relation. Exact duplicate VM/firewall
+	// rows are equivalent to one attachment; the loop above still rejects every
+	// wrong firewall and non-VM resource type.
+	return assignmentRows > 0, nil
 }
 
 func sameFirewallPolicy(actual, expected []inspace.FirewallRule) bool {
@@ -1905,21 +2903,23 @@ func validateOwnedVM(vm *inspace.VM, desired inspace.CreateVMRequest, network *i
 	if vm.VCPU != desired.VCPU || vm.MemoryMiB != desired.MemoryMiB || vm.OSName != desired.OSName || vm.OSVersion != desired.OSVersion || vm.DesignatedPoolUUID != desired.DesignatedPoolUUID {
 		return fmt.Errorf("bootstrap: refusing to adopt VM %q with immutable compute/image drift", vm.Name)
 	}
-	if vm.BillingAccountID != 0 && vm.BillingAccountID != desired.BillingAccountID {
-		return fmt.Errorf("bootstrap: refusing to adopt VM %q from another billing account", vm.Name)
+	if desired.BillingAccountID <= 0 || vm.BillingAccountID != desired.BillingAccountID {
+		return fmt.Errorf("bootstrap: refusing to adopt VM %q without exact positive billing-account ownership", vm.Name)
 	}
-	if vm.NetworkUUID != "" && vm.NetworkUUID != desired.NetworkUUID {
+	if vm.NetworkUUID != "" && !strings.EqualFold(vm.NetworkUUID, desired.NetworkUUID) {
 		return fmt.Errorf("bootstrap: refusing to adopt VM %q from another private network", vm.Name)
 	}
-	onNetwork := false
+	if network == nil || !strings.EqualFold(network.UUID, desired.NetworkUUID) {
+		return fmt.Errorf("bootstrap: refusing to adopt VM %q without the exact configured private network", vm.Name)
+	}
+	memberships := 0
 	for _, uuid := range network.VMUUIDs {
-		if uuid == vm.UUID {
-			onNetwork = true
-			break
+		if strings.EqualFold(uuid, vm.UUID) {
+			memberships++
 		}
 	}
-	if !onNetwork {
-		return fmt.Errorf("bootstrap: refusing to adopt VM %q not attached to the configured private network", vm.Name)
+	if memberships != 1 {
+		return fmt.Errorf("bootstrap: refusing to adopt VM %q with %d configured-network memberships, want one", vm.Name, memberships)
 	}
 	rootDiskMatches := false
 	for _, disk := range vm.Storage {
@@ -1934,36 +2934,105 @@ func validateOwnedVM(vm *inspace.VM, desired inspace.CreateVMRequest, network *i
 	return nil
 }
 
-func (r *Reconciler) findFloatingIP(ctx context.Context, cluster *v1alpha1.InSpaceCluster, name string, vm *inspace.VM, address string) (*inspace.FloatingIP, error) {
-	items, err := r.API.ListFloatingIPs(ctx, cluster.Spec.Location, nil)
+// validateUniqueVMInventoryIdentity makes an exact detail response usable as
+// mutation authority only when the unfiltered location inventory contains one
+// matching UUID/name row and no deterministic-name collision. List responses
+// may omit billing or network fields, but any value they do return must agree
+// with the authoritative detail and configured ownership tuple.
+func validateUniqueVMInventoryIdentity(items []inspace.VM, detail *inspace.VM, billingAccountID int64, networkUUID string) error {
+	if detail == nil || !vmUUIDPattern.MatchString(detail.UUID) || detail.Name == "" {
+		return errors.New("exact VM detail has an invalid UUID/name identity")
+	}
+	matches := 0
+	for i := range items {
+		candidate := &items[i]
+		if strings.EqualFold(candidate.UUID, detail.UUID) {
+			matches++
+			if candidate.Name != detail.Name ||
+				(candidate.BillingAccountID != 0 && candidate.BillingAccountID != billingAccountID) ||
+				(candidate.NetworkUUID != "" && !strings.EqualFold(candidate.NetworkUUID, networkUUID)) {
+				return fmt.Errorf("VM %s location inventory changed exact ownership", detail.UUID)
+			}
+			continue
+		}
+		if candidate.Name == detail.Name {
+			return fmt.Errorf("VM name %q is also held by UUID %q", detail.Name, candidate.UUID)
+		}
+	}
+	if matches != 1 {
+		return fmt.Errorf("location inventory contains %d exact rows for VM %s, want one", matches, detail.UUID)
+	}
+	return nil
+}
+
+// readExactOwnedVMMutationAuthority re-proves a bootstrap VM immediately after
+// a durable mutation issue CAS. A UUID saved before that transition is only a
+// lookup key: exact detail, unfiltered inventory uniqueness, positive billing,
+// controller ownership metadata, and one configured-VPC membership must all
+// agree before the VM may authorize a related cloud mutation.
+func (r *Reconciler) readExactOwnedVMMutationAuthority(
+	ctx context.Context,
+	cluster *v1alpha1.InSpaceCluster,
+	vmUUID, expectedName string,
+) (*inspace.VM, error) {
+	if cluster == nil || !vmUUIDPattern.MatchString(vmUUID) || cluster.Spec.BillingAccountID <= 0 ||
+		!vmUUIDPattern.MatchString(cluster.Spec.Network.UUID) {
+		return nil, errors.New("bootstrap: exact VM mutation authority requires a valid cluster, billing account, VPC, and VM UUID")
+	}
+	detail, err := r.API.GetVM(ctx, cluster.Spec.Location, vmUUID)
+	if err != nil {
+		if inspace.IsNotFound(err) {
+			return nil, fmt.Errorf("%w: %s", errOwnedVMMutationTargetAbsent, vmUUID)
+		}
+		return nil, fmt.Errorf("bootstrap: exact VM mutation-authority read for %s: %w", vmUUID, err)
+	}
+	if detail == nil || !strings.EqualFold(detail.UUID, vmUUID) || detail.Name == "" ||
+		(expectedName != "" && detail.Name != expectedName) {
+		return nil, fmt.Errorf("bootstrap: exact VM mutation-authority identity for %s changed", vmUUID)
+	}
+	if detail.BillingAccountID != cluster.Spec.BillingAccountID {
+		return nil, fmt.Errorf("bootstrap: VM %q lacks exact billing-account mutation authority", detail.Name)
+	}
+	if detail.NetworkUUID != "" && !strings.EqualFold(detail.NetworkUUID, cluster.Spec.Network.UUID) {
+		return nil, fmt.Errorf("bootstrap: VM %q reports another private network", detail.Name)
+	}
+
+	listed, err := r.API.ListVMs(ctx, cluster.Spec.Location)
+	if err != nil {
+		return nil, fmt.Errorf("bootstrap: unfiltered VM inventory for mutation target %s: %w", vmUUID, err)
+	}
+	if err := validateUniqueVMInventoryIdentity(listed, detail, cluster.Spec.BillingAccountID, cluster.Spec.Network.UUID); err != nil {
+		return nil, fmt.Errorf("bootstrap: VM %q lacks unique location mutation authority: %w", detail.Name, err)
+	}
+
+	network, err := r.API.GetNetwork(ctx, cluster.Spec.Location, cluster.Spec.Network.UUID)
+	if err != nil {
+		return nil, fmt.Errorf("bootstrap: configured VPC read for mutation target %s: %w", vmUUID, err)
+	}
+	if network == nil || !strings.EqualFold(network.UUID, cluster.Spec.Network.UUID) {
+		return nil, fmt.Errorf("bootstrap: configured VPC identity changed for mutation target %s", vmUUID)
+	}
+	memberships := 0
+	for _, candidateUUID := range network.VMUUIDs {
+		if strings.EqualFold(candidateUUID, vmUUID) {
+			memberships++
+		}
+	}
+	if memberships != 1 {
+		return nil, fmt.Errorf("bootstrap: VM %q has %d configured-VPC memberships, want one", detail.Name, memberships)
+	}
+
+	owned, controlPlaneNames, bastionName, err := uniqueDestroyVMs([]inspace.VM{*detail}, ownerKey(cluster), cluster.Metadata.Name)
 	if err != nil {
 		return nil, err
 	}
-	var found *inspace.FloatingIP
-	for i := range items {
-		if items[i].IsDeleted || items[i].Name != name && items[i].AssignedTo != vm.UUID {
-			continue
-		}
-		if items[i].Name != name {
-			return nil, fmt.Errorf("bootstrap: foreign floating IP name %q remains assigned to VM %q after update", items[i].Name, vm.Name)
-		}
-		if found != nil {
-			return nil, fmt.Errorf("bootstrap: multiple floating IPs resolve to owned slot %q", name)
-		}
-		found = &items[i]
+	if owned[detail.Name] == nil || !strings.EqualFold(owned[detail.Name].UUID, vmUUID) {
+		return nil, fmt.Errorf("bootstrap: VM %q is outside an owned bootstrap slot", detail.Name)
 	}
-	if found != nil {
-		if found.Address != address {
-			return nil, fmt.Errorf("bootstrap: floating IP %q update changed address from %s to %s", name, address, found.Address)
-		}
-		if err := validateOwnedFloatingIP(found, cluster, name, vm); err != nil {
-			return nil, err
-		}
-		if found.AssignedTo != vm.UUID {
-			return nil, fmt.Errorf("bootstrap: floating IP %q update lost its VM assignment", name)
-		}
+	if err := validateDestroyVMOwnership(owned, ownerKey(cluster), cluster.Metadata.Name, bastionName, controlPlaneNames); err != nil {
+		return nil, err
 	}
-	return found, nil
+	return detail, nil
 }
 
 func (r *Reconciler) findFloatingIPByAddress(ctx context.Context, location, address string) (*inspace.FloatingIP, error) {
@@ -2146,12 +3215,10 @@ func validateOwnedFirewallAssignments(firewall *inspace.Firewall, allowed map[st
 	if firewall == nil {
 		return nil
 	}
-	seen := make(map[string]bool, len(firewall.ResourcesAssigned))
 	for _, resource := range firewall.ResourcesAssigned {
-		if resource.ResourceType != "vm" || !allowed[resource.ResourceUUID] || seen[resource.ResourceUUID] {
-			return errors.New("firewall contains a foreign, non-VM, or duplicate assignment")
+		if resource.ResourceType != "vm" || !allowed[resource.ResourceUUID] {
+			return errors.New("firewall contains a foreign or non-VM assignment")
 		}
-		seen[resource.ResourceUUID] = true
 	}
 	return nil
 }
@@ -2195,9 +3262,12 @@ func validateReverseFirewallAssignments(firewalls []inspace.Firewall, nodeFirewa
 				return fmt.Errorf("bootstrap: owned %s VM %s is attached to foreign firewall %q", expected.role, resource.ResourceUUID, firewall.EffectiveName())
 			}
 			if previous, duplicate := seen[resource.ResourceUUID]; duplicate {
-				return fmt.Errorf("bootstrap: owned %s VM %s has duplicate firewall attachments %q and %q", expected.role, resource.ResourceUUID, previous, firewall.EffectiveName())
+				if previous == firewall.UUID {
+					continue
+				}
+				return fmt.Errorf("bootstrap: owned %s VM %s has firewall attachments on UUIDs %q and %q", expected.role, resource.ResourceUUID, previous, firewall.UUID)
 			}
-			seen[resource.ResourceUUID] = firewall.EffectiveName()
+			seen[resource.ResourceUUID] = firewall.UUID
 		}
 	}
 	return nil
@@ -2842,5 +3912,5 @@ func progressResult(vms []*inspace.VM, message string) Result {
 		}
 	}
 	sort.Strings(ids)
-	return Result{RequeueAfter: 20 * time.Second, MaxParallelControlPlaneCreates: ControlPlaneReplicas, ControlPlaneVMs: ids, Message: message}
+	return Result{RequeueAfter: 20 * time.Second, MaxParallelControlPlaneCreates: 1, ControlPlaneVMs: ids, Message: message}
 }

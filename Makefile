@@ -2,7 +2,7 @@ SHELL := /bin/sh
 
 MODULES := modules/client modules/cloud-provider modules/csi-driver modules/karpenter-provider
 
-.PHONY: all fmt test smoke cache-registry-smoke vet helm-verify helm-package e2e-static release-notes-verify verify images status live-audit live-test cluster-e2e cluster-e2e-init cluster-e2e-test cluster-e2e-shell cluster-e2e-destroy
+.PHONY: all fmt test smoke cache-registry-smoke vet helm-verify helm-package e2e-static live-harness-verify release-notes-verify verify images status live-audit live-test cluster-e2e cluster-e2e-init cluster-e2e-test cluster-e2e-shell cluster-e2e-destroy
 
 all: test
 
@@ -64,10 +64,13 @@ e2e-static:
 		bash -n "$$script"; \
 	done
 
+live-harness-verify:
+	python3 scripts/test-live-suite-mutation-safety.py
+
 release-notes-verify:
 	@./scripts/test-filter-release-notes.sh
 
-verify: test smoke vet helm-verify e2e-static release-notes-verify
+verify: test smoke vet helm-verify e2e-static live-harness-verify release-notes-verify
 
 images:
 	docker build --platform=linux/amd64 -f modules/cloud-provider/Dockerfile -t inspace-cloud-controller-manager:dev .

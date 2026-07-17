@@ -149,11 +149,14 @@ The provider uses a fail-closed sequence:
    `reserve_public_ip=true`. InSpace assigns one initially nameless Floating IP
    to the new VM for immediate cloud-init egress; the VM's `public_ipv4` field
    must remain empty.
-5. As the first post-POST mutation, assign the prevalidated firewall using the
-   returned VM UUID. Require authoritative read-back of the exact base policy
-   and assignment. Ordinary workers require exactly that one firewall. Public
-   node-load-balancer workers require the base exactly once and permit only one
-   audited CCM shard aggregate plus at most one audited cluster ICMP firewall.
+5. As the first post-POST mutation, persist the exact base-firewall assignment
+   issue on the NodeClaim and acquire its per-firewall slot in the fixed
+   `karpenter-inspace-firewall-mutations` Lease. Only the CAS-winning
+   invocation may assign the prevalidated firewall to the returned VM UUID.
+   Require authoritative read-back of the exact base policy and assignment.
+   Ordinary workers require exactly that one firewall. Public node-load-balancer
+   workers require the base exactly once and permit only one audited CCM shard
+   aggregate plus at most one audited cluster ICMP firewall.
 6. Read back the VM until its complete NodeClaim ownership/spec record, exact
    name, capacity, image, host pool, VPC, billing account, and one correctly
    sized primary root disk are persisted.
@@ -179,16 +182,18 @@ failures or fields that are still absent. Any launch-identity value that is
 already present but conflicts with the request fails immediately. Ambiguous VM
 create responses, restarts before Floating-IP rename, and inconclusive PATCH
 responses are recovered by reading the owned VM and its exact sole assignment;
-the provider does not issue another VM or Floating-IP create request. A fresh
-POST uses the preflight-validated firewall UUID for immediate protective
-attachment before canonical VM convergence. Cancellation after the POST does
-not cancel this bounded safety read-back. A valid UUID returned alongside any
-error is persisted before further cloud work and is authority only to protect
-or security-roll back that exact VM. Canonical v3 ownership is still required
-for adoption and normal ProviderID deletion; fenced rollback never treats the
-UUID as authority over an uncorrelated Floating IP. A nil/UUID-less response is
-recovered by deterministic reads without issuing a second POST, and the
-firewall is attached as soon as one unique valid UUID becomes visible. An existing owned VM is instead
+the provider does not issue another VM or Floating-IP create request. After the
+NodeClaim issue CAS, the provider repeats deterministic-name, ownership,
+floating-IP-collision, firewall, and VPC authority. One exact owned VM is
+adopted; only authoritative target absence permits POST. A fresh VM POST uses
+the preflight-validated firewall UUID. Its response UUID remains a
+read-only hint until canonical detail proves the complete v3 launch identity
+and billing account and the configured VPC contains it exactly once. Only then
+is that UUID durably anchored and allowed to reach the separately fenced,
+single-dispatch firewall and Floating-IP mutations. Cancellation after the
+POST does not cancel this bounded safety read-back. A foreign, sparse, nil, or
+UUID-less response is recovered by deterministic reads without issuing a
+second POST and never grants protection or rollback authority by itself. An existing owned VM is instead
 fully read and validated before any mutation. Conflicting policy or a foreign
 firewall outside the effective profile fails closed without deleting that
 established VM; if the VM has no base firewall and the intended assignment
@@ -197,7 +202,11 @@ exposed. A fresh successful POST whose firewall
 attachment or canonical ownership cannot be proven is rolled back. Cleanup
 first tries to retain the exact auto-FIP identity, then deletes the exact VM,
 proves Get/List/VPC absence, deletes only the correlated FIP, proves both VM
-and FIP-assignment absence, and finally detaches firewalls. If the address
+and FIP-assignment absence, and finally detaches only Karpenter's exact base
+firewall relationship. Every mutation is preceded by a fresh proof after its
+Kubernetes authorization CAS. Destructive absence requires three authoritative
+observations at least 30 seconds apart; reappearance resets the count. CCM
+removes its own ICMP, shard, and per-Service relationships. If the address
 remains invisible, security takes priority and the fresh public VM is deleted
 without guessing at a nameless FIP; its create-protection finalizer continues
 tracking every post-baseline dependent through the original ambiguity window.
@@ -208,8 +217,17 @@ fresh or late-ambiguously-committed VM whose private address equals its
 ownership-recorded supervisor VIP or falls inside its ownership-recorded
 Service VIP range is unsafe and is rolled back. The same drift on an
 established VM fails closed without destructive mutation; generic ownership
-mismatches are never deleted. Normal deletion preflights exact ownership,
-always dispatches the idempotent ProviderID UUID delete, proves core VM
+mismatches are never deleted. Normal deletion preflights exact ownership and
+persists `karpenter.inspace.cloud/removal-mutation-fence` before dispatching
+the exact ProviderID UUID delete from a fresh owned presence observation. The
+same immutable NodeClaim journal serializes VM delete, Floating-IP unassign,
+and Floating-IP delete. An issued step is read-only across every HTTP/transport
+result, restart, and competing controller; continued presence never grants a
+second dispatch. The issued receipt is durable, and a terminal removal result
+is persisted only after three complete authoritative absence observations at
+least 30 seconds apart. A restart before that terminal write starts the
+observation sequence again without replaying the mutation. The provider then
+proves core VM
 absence, cleans the exact named Floating IP, proves VM and assignment absence
 again, and only then detaches firewalls. One VM-detail 404 never authorizes
 dependent cleanup: an already-missing VM must be absent from `GetVM`,
@@ -223,6 +241,15 @@ inventory row can authorize orphan cleanup after the VM is already absent;
 an older v3 claim with only name/address may finish when two reads prove that
 no overlapping FIP exists, but it cannot mutate an active address. Legacy
 v1/v2 VM records retain their own address/account retry anchor.
+
+The fixed coordinator Lease contains independent non-expiring CAS receipts per
+base firewall. Same-firewall assignments and detachments serialize across
+NodeClaims, processes, and restarts; different firewalls can progress
+independently. A restarted controller is read-only for an already-issued slot,
+and elapsed time never grants mutation authority. Karpenter RBAC may patch or
+update only this fixed Lease and its leader-election Lease. Existing issued v2
+create fences are conservatively read-only because the older controller had no
+shared slot and may already have dispatched the assignment.
 
 `GetVM` and `ListVMs` repeat these checks through a bounded read-only snapshot.
 VM list rows are only discovery and collision evidence: exact per-VM detail is
@@ -363,7 +390,7 @@ provider ID.
 
 ## Recover an unresolved VM create fence
 
-An issued VM POST with neither a response UUID nor a provable cloud result is
+An issued VM POST with no canonically provable cloud result is
 intentionally permanent: empty lists cannot prove that a timed-out server-side
 operation will never commit. The provider keeps
 `karpenter.inspace.cloud/create-protection` and returns
@@ -488,22 +515,9 @@ make smoke
 make verify
 ```
 
-The real lifecycle test is separately gated and uses resource names beginning
-with `inspace-e2e-`. It creates a VM with `reserve_public_ip=true`, discovers
-and deterministically renames its exact auto-assigned Floating IP, verifies the
-empty VM `public_ipv4` field and existing firewall, exercises get/list/delete,
-audits VM-core-before-Floating-IP and firewall-last cleanup, and fails if a
-prefixed VM or Floating IP remains:
-
-```sh
-INSPACE_RUN_LIVE_TESTS=true \
-INSPACE_ALLOW_REMOTE_MUTATIONS=true \
-make live-test
-```
-
-It additionally requires `INSPACE_API_TOKEN`, `INSPACE_BILLING_ACCOUNT_ID`, `INSPACE_NETWORK_UUID`, `INSPACE_CONTROL_PLANE_VIP`, `INSPACE_PRIVATE_LOAD_BALANCER_POOL_START`, `INSPACE_PRIVATE_LOAD_BALANCER_POOL_STOP`, `INSPACE_FIREWALL_UUID`, and `INSPACE_AMD_HOST_POOL_UUID`. The live adapter lifecycle deliberately creates its worker on the `amd-epyc` class. The VPC, supervisor VIP, and Service range must satisfy the fixed pod/Service-CIDR constraints above. The supplied firewall must already satisfy the VPC/pod-CIDR TCP, UDP, and ICMP contract above with no public inbound rule; the live test performs a read-only preflight before creating resources. Normal `go test ./...` compiles this test but skips it before reading those values.
-
-That smaller test covers the InSpace API lifecycle only. The separate
+The former direct adapter lifecycle test is retired because process-local
+cleanup cannot safely recover a committed HTTP error or process loss. The
+guarded
 [full-cluster release acceptance test](../../test/e2e/README.md) deploys the
 fixed RKE2 control plane, Cilium, CCM, CSI, and Karpenter from exact released
 versions. Its host launcher invokes Docker only; provisioning, parallel waits,

@@ -29,11 +29,16 @@ import (
 const (
 	AnnotationCreateFence           = "karpenter.inspace.cloud/create-fence"
 	AnnotationCreateFenceResolution = "karpenter.inspace.cloud/create-fence-resolution"
+	AnnotationFloatingIPUpdateFence = "karpenter.inspace.cloud/floating-ip-update-fence"
+	AnnotationRemovalMutationFence  = "karpenter.inspace.cloud/removal-mutation-fence"
 	CreateFenceFinalizer            = "karpenter.inspace.cloud/create-protection"
-	createFenceSchema               = "karpenter.inspace.cloud/create-fence-v2"
+	createFenceSchema               = "karpenter.inspace.cloud/create-fence-v3"
+	legacyCreateFenceSchema         = "karpenter.inspace.cloud/create-fence-v2"
 	createFenceResolutionSchema     = "karpenter.inspace.cloud/create-fence-resolution-v1"
 	createFenceResolutionVM         = "vm"
 	createFenceResolutionNoResult   = "no-result"
+	floatingIPUpdateFenceSchema     = "karpenter.inspace.cloud/floating-ip-update-fence-v1"
+	removalMutationFenceSchema      = "karpenter.inspace.cloud/removal-mutation-fence-v1"
 	createFenceReserved             = "reserved"
 	createFenceIssued               = "issued"
 	createFenceRejected             = "rejected"
@@ -81,9 +86,10 @@ type createFenceRecord struct {
 	IssueID   string                           `json:"issueID,omitempty"`
 	StartedAt time.Time                        `json:"startedAt"`
 	IssuedAt  *time.Time                       `json:"issuedAt,omitempty"`
-	// CreatedVMUUID is the exact SDK create/adoption result anchored before
-	// any protection or materialization work. RollbackAt is an independent,
-	// irreversible decision which races materialization for this same UUID.
+	// CreatedVMUUID is the canonically verified launch identity anchored only
+	// after full v3, billing-account, and configured-VPC proof. An SDK response
+	// UUID is provisional until then. RollbackAt is an independent, irreversible
+	// decision which races materialization for this same UUID.
 	LaunchObservedAt     *time.Time `json:"launchObservedAt,omitempty"`
 	CreatedVMUUID        string     `json:"createdVMUUID,omitempty"`
 	RollbackAt           *time.Time `json:"rollbackAt,omitempty"`
@@ -96,24 +102,57 @@ type createFenceRecord struct {
 	// Cleanup* is a controller-persisted receipt for an exact orphan found
 	// during finalization. It is written and read back before the cloud adapter
 	// is permitted to delete that VM, and may advance across legacy duplicates.
-	CleanupResolvedAt     *time.Time                               `json:"cleanupResolvedAt,omitempty"`
-	CleanupVMUUID         string                                   `json:"cleanupVMUUID,omitempty"`
-	CleanupFloatingIPName string                                   `json:"cleanupFloatingIPName,omitempty"`
-	CleanupPublicIPv4     string                                   `json:"cleanupPublicIPv4,omitempty"`
-	CleanupResolutions    []cloudapi.FencedCreateCleanupResolution `json:"cleanupResolutions,omitempty"`
+	CleanupResolvedAt      *time.Time                               `json:"cleanupResolvedAt,omitempty"`
+	CleanupVMUUID          string                                   `json:"cleanupVMUUID,omitempty"`
+	CleanupFloatingIPName  string                                   `json:"cleanupFloatingIPName,omitempty"`
+	CleanupPublicIPv4      string                                   `json:"cleanupPublicIPv4,omitempty"`
+	CleanupResolutions     []cloudapi.FencedCreateCleanupResolution `json:"cleanupResolutions,omitempty"`
+	BaseFirewallAssignment *baseFirewallAssignmentRecord            `json:"baseFirewallAssignment,omitempty"`
+	// LegacyV2 remains persisted after migration so newly added mutation
+	// fences can conservatively treat a pre-upgrade attempt as possibly issued.
+	LegacyV2                        bool `json:"legacyV2MutationFence,omitempty"`
+	LegacyV2BaseFirewallMayBeIssued bool `json:"legacyV2BaseFirewallMayBeIssued,omitempty"`
+	LegacyV2FloatingIPMayBeIssued   bool `json:"legacyV2FloatingIPMayBeIssued,omitempty"`
+}
+
+type baseFirewallAssignmentRecord struct {
+	VMUUID       string                           `json:"vmUUID"`
+	FirewallUUID string                           `json:"firewallUUID"`
+	Phase        cloudapi.FirewallAssignmentPhase `json:"phase"`
+	IssueID      string                           `json:"issueID,omitempty"`
+	IntentAt     time.Time                        `json:"intentAt"`
+	IssuedAt     *time.Time                       `json:"issuedAt,omitempty"`
+	RejectedAt   *time.Time                       `json:"rejectedAt,omitempty"`
+	ObservedAt   *time.Time                       `json:"observedAt,omitempty"`
+}
+
+type floatingIPUpdateRecord struct {
+	Schema           string                         `json:"schema"`
+	Binding          createFenceBinding             `json:"binding"`
+	AttemptToken     string                         `json:"attemptToken"`
+	VMUUID           string                         `json:"vmUUID"`
+	Address          string                         `json:"address"`
+	Name             string                         `json:"name"`
+	BillingAccountID int64                          `json:"billingAccountID"`
+	Phase            cloudapi.FloatingIPUpdatePhase `json:"phase"`
+	IssueID          string                         `json:"issueID"`
+	IssuedAt         time.Time                      `json:"issuedAt"`
+	RejectedAt       *time.Time                     `json:"rejectedAt,omitempty"`
+	ObservedAt       *time.Time                     `json:"observedAt,omitempty"`
 }
 
 type createFence struct {
-	Token             string
-	StartedAt         time.Time
-	Baseline          cloudapi.CreateInventory
-	Issued            bool
-	IssuedAt          time.Time
-	Intent            cloudapi.CreateAuthorizationKind
-	IssueID           string
-	CreatedVMUUID     string
-	HasCleanupHistory bool
-	RollbackChosen    bool
+	Token                  string
+	StartedAt              time.Time
+	Baseline               cloudapi.CreateInventory
+	Issued                 bool
+	IssuedAt               time.Time
+	Intent                 cloudapi.CreateAuthorizationKind
+	IssueID                string
+	CreatedVMUUID          string
+	HasCleanupHistory      bool
+	RollbackChosen         bool
+	BaseFirewallAssignment cloudapi.FirewallAssignmentFence
 }
 
 type createFenceOperatorResolution struct {
@@ -174,23 +213,47 @@ type CreateFenceStore interface {
 	Ensure(context.Context, *karpv1.NodeClaim, createFenceBinding, createFenceCleanupIdentity, cloudapi.CreateInventory) (*karpv1.NodeClaim, createFence, bool, error)
 	Authorize(context.Context, *karpv1.NodeClaim, createFenceBinding, string, cloudapi.CreateAuthorizationKind) (*karpv1.NodeClaim, error)
 	RecordCreatedVM(context.Context, *karpv1.NodeClaim, createFenceBinding, string, string, string) (*karpv1.NodeClaim, error)
+	AuthorizeBaseFirewall(context.Context, *karpv1.NodeClaim, createFenceBinding, string, string) (*karpv1.NodeClaim, cloudapi.FirewallAssignmentAuthorization, error)
+	ObserveBaseFirewall(context.Context, *karpv1.NodeClaim, createFenceBinding, string, string, string) (*karpv1.NodeClaim, error)
+	RejectBaseFirewall(context.Context, *karpv1.NodeClaim, createFenceBinding, string, string, string) (*karpv1.NodeClaim, error)
+	AuthorizeBaseFirewallDetach(context.Context, *karpv1.NodeClaim, createFenceBinding, string, string) (cloudapi.FirewallDetachmentAuthorization, error)
+	ObserveBaseFirewallDetach(context.Context, *karpv1.NodeClaim, createFenceBinding, string, cloudapi.FirewallDetachmentFence) error
+	RejectBaseFirewallDetach(context.Context, *karpv1.NodeClaim, createFenceBinding, string, cloudapi.FirewallDetachmentFence) error
+	AuthorizeFloatingIPUpdate(context.Context, *karpv1.NodeClaim, createFenceBinding, string, string, string, string, int64) (*karpv1.NodeClaim, cloudapi.FloatingIPUpdateAuthorization, error)
+	ObserveFloatingIPUpdate(context.Context, *karpv1.NodeClaim, createFenceBinding, string, cloudapi.FloatingIPUpdateFence) (*karpv1.NodeClaim, error)
+	RejectFloatingIPUpdate(context.Context, *karpv1.NodeClaim, createFenceBinding, string, cloudapi.FloatingIPUpdateFence) (*karpv1.NodeClaim, error)
+	EnsureRemovalFence(context.Context, *karpv1.NodeClaim, createFenceBinding, string) (*karpv1.NodeClaim, error)
+	AuthorizeRemovalMutation(context.Context, *karpv1.NodeClaim, createFenceBinding, string, cloudapi.RemovalMutation, bool) (*karpv1.NodeClaim, cloudapi.RemovalMutationAuthorization, error)
+	ObserveRemovalMutation(context.Context, *karpv1.NodeClaim, createFenceBinding, string, cloudapi.RemovalMutationFence) (*karpv1.NodeClaim, error)
+	RejectRemovalMutation(context.Context, *karpv1.NodeClaim, createFenceBinding, string, cloudapi.RemovalMutationFence) (*karpv1.NodeClaim, error)
 	ChooseRollback(context.Context, *karpv1.NodeClaim, createFenceBinding, string, string, string, *cloudapi.FencedCreateCleanupResolution) (*karpv1.NodeClaim, error)
 	MarkRejected(context.Context, *karpv1.NodeClaim, createFenceBinding, string, string) (*karpv1.NodeClaim, error)
 	MarkMaterialized(context.Context, *karpv1.NodeClaim, createFenceBinding, string, *cloudapi.VM) (*karpv1.NodeClaim, error)
 }
 
 type kubernetesCreateFenceStore struct {
-	writer client.Client
-	reader client.Reader
-	now    func() time.Time
-	nonce  func() (string, error)
+	writer    client.Client
+	reader    client.Reader
+	namespace string
+	now       func() time.Time
+	nonce     func() (string, error)
 }
 
-func NewKubernetesCreateFenceStore(writer client.Client, reader client.Reader) (CreateFenceStore, error) {
+func NewKubernetesCreateFenceStore(writer client.Client, reader client.Reader, namespaces ...string) (CreateFenceStore, error) {
 	if writer == nil || reader == nil {
 		return nil, fmt.Errorf("Kubernetes writer and uncached reader are required for durable VM create fencing")
 	}
-	return &kubernetesCreateFenceStore{writer: writer, reader: reader, now: time.Now, nonce: createFenceNonce}, nil
+	if len(namespaces) > 1 {
+		return nil, fmt.Errorf("at most one controller namespace may be supplied for durable firewall coordination")
+	}
+	namespace := "karpenter"
+	if len(namespaces) == 1 {
+		namespace = strings.TrimSpace(namespaces[0])
+	}
+	if namespace == "" {
+		return nil, fmt.Errorf("controller namespace is required for durable firewall coordination")
+	}
+	return &kubernetesCreateFenceStore{writer: writer, reader: reader, namespace: namespace, now: time.Now, nonce: createFenceNonce}, nil
 }
 
 func detachedCreateFenceContext(ctx context.Context) (context.Context, context.CancelFunc) {
@@ -276,10 +339,21 @@ func (s *kubernetesCreateFenceStore) Authorize(ctx context.Context, claim *karpv
 	if err != nil {
 		return nil, fmt.Errorf("generating VM create authorization identity: %w", err)
 	}
+	assignmentIssueID, err := s.nonce()
+	if err != nil {
+		return nil, fmt.Errorf("generating base-firewall assignment authorization identity: %w", err)
+	}
+	if assignment := record.BaseFirewallAssignment; assignment == nil || assignment.Phase != cloudapi.FirewallAssignmentIntent ||
+		assignment.VMUUID != "" || assignment.FirewallUUID != record.Cleanup.FirewallUUID || assignment.IntentAt.IsZero() {
+		return nil, fmt.Errorf("NodeClaim %q lacks its durable pre-VM base-firewall assignment intent", claim.Name)
+	}
 	record.Phase = createFenceIssued
 	record.Intent = intent
 	record.IssueID = issueID
 	record.IssuedAt = &now
+	record.BaseFirewallAssignment.Phase = cloudapi.FirewallAssignmentIssued
+	record.BaseFirewallAssignment.IssueID = assignmentIssueID
+	record.BaseFirewallAssignment.IssuedAt = &now
 	encoded, err := json.Marshal(record)
 	if err != nil {
 		return nil, fmt.Errorf("encoding issued VM create fence: %w", err)
@@ -295,7 +369,8 @@ func (s *kubernetesCreateFenceStore) Authorize(ctx context.Context, claim *karpv
 		var readback karpv1.NodeClaim
 		if readErr := s.reader.Get(readCtx, types.NamespacedName{Name: claim.Name}, &readback); readErr == nil && readback.UID == current.UID {
 			if stored, parseErr := parseCreateFence(readback.Annotations[AnnotationCreateFence], binding); parseErr == nil &&
-				stored.Token == token && stored.Phase == createFenceIssued && stored.Intent == intent && stored.IssueID == issueID && stored.IssuedAt != nil && stored.IssuedAt.Equal(now) {
+				stored.Token == token && stored.Phase == createFenceIssued && stored.Intent == intent && stored.IssueID == issueID && stored.IssuedAt != nil && stored.IssuedAt.Equal(now) &&
+				stored.BaseFirewallAssignment != nil && stored.BaseFirewallAssignment.Phase == cloudapi.FirewallAssignmentIssued && stored.BaseFirewallAssignment.IssueID == assignmentIssueID {
 				return &readback, fmt.Errorf("%w: this invocation's issue CAS committed but its response failed before SDK dispatch: %w", cloudapi.ErrCreateAttemptRejected, err)
 			}
 		}
@@ -313,7 +388,8 @@ func (s *kubernetesCreateFenceStore) Authorize(ctx context.Context, claim *karpv
 	if err != nil {
 		return copy, fmt.Errorf("%w: issued NodeClaim %q readback is invalid before SDK dispatch: %w", cloudapi.ErrCreateAttemptRejected, claim.Name, err)
 	}
-	if issued.Token != token || issued.Phase != createFenceIssued || issued.Intent != intent || issued.IssueID != issueID || issued.IssuedAt == nil || !issued.IssuedAt.Equal(now) {
+	if issued.Token != token || issued.Phase != createFenceIssued || issued.Intent != intent || issued.IssueID != issueID || issued.IssuedAt == nil || !issued.IssuedAt.Equal(now) ||
+		issued.BaseFirewallAssignment == nil || issued.BaseFirewallAssignment.Phase != cloudapi.FirewallAssignmentIssued || issued.BaseFirewallAssignment.IssueID != assignmentIssueID {
 		return nil, fmt.Errorf("%w: NodeClaim %q immutable VM create issue is owned by another invocation or changed before SDK dispatch", cloudapi.ErrCreateAttemptPending, claim.Name)
 	}
 	return &readback, nil
@@ -344,16 +420,28 @@ func (s *kubernetesCreateFenceStore) RecordCreatedVM(
 		}
 		if record.CreatedVMUUID != "" {
 			if record.CreatedVMUUID == vmUUID && record.LaunchObservedAt != nil && !record.LaunchObservedAt.IsZero() {
-				return current, nil
+				if baseFirewallAssignmentMatches(record.BaseFirewallAssignment, vmUUID, record.Cleanup.FirewallUUID) {
+					return current, nil
+				}
+				return nil, fmt.Errorf("NodeClaim %q created VM lacks its pre-issued base-firewall assignment receipt", claim.Name)
+			} else {
+				return nil, fmt.Errorf("NodeClaim %q created VM identity changed from %s to %s", claim.Name, record.CreatedVMUUID, vmUUID)
 			}
-			return nil, fmt.Errorf("NodeClaim %q created VM identity changed from %s to %s", claim.Name, record.CreatedVMUUID, vmUUID)
+		} else {
+			if record.Phase != createFenceIssued || record.RollbackAt != nil {
+				return nil, fmt.Errorf("NodeClaim %q cannot anchor a created VM from phase %q or after rollback", claim.Name, record.Phase)
+			}
+			if assignment := record.BaseFirewallAssignment; assignment == nil || assignment.Phase != cloudapi.FirewallAssignmentIssued || assignment.VMUUID != "" ||
+				assignment.FirewallUUID != record.Cleanup.FirewallUUID || !createFenceKeyHashPattern.MatchString(assignment.IssueID) {
+				return nil, fmt.Errorf("NodeClaim %q cannot anchor a VM without its pre-issued base-firewall assignment", claim.Name)
+			}
+			now := s.now().UTC()
+			record.CreatedVMUUID = vmUUID
+			record.LaunchObservedAt = &now
+			if record.BaseFirewallAssignment.VMUUID == "" {
+				record.BaseFirewallAssignment.VMUUID = vmUUID
+			}
 		}
-		if record.Phase != createFenceIssued || record.RollbackAt != nil {
-			return nil, fmt.Errorf("NodeClaim %q cannot anchor a created VM from phase %q or after rollback", claim.Name, record.Phase)
-		}
-		now := s.now().UTC()
-		record.CreatedVMUUID = vmUUID
-		record.LaunchObservedAt = &now
 		encoded, err := json.Marshal(record)
 		if err != nil {
 			return nil, fmt.Errorf("encoding NodeClaim %q created VM anchor: %w", claim.Name, err)
@@ -374,7 +462,8 @@ func (s *kubernetesCreateFenceStore) RecordCreatedVM(
 			lastErr = errors.Join(lastErr, parseErr)
 			continue
 		}
-		if stored.Token == token && stored.IssueID == issueID && stored.CreatedVMUUID == vmUUID && stored.LaunchObservedAt != nil && !stored.LaunchObservedAt.IsZero() {
+		if stored.Token == token && stored.IssueID == issueID && stored.CreatedVMUUID == vmUUID && stored.LaunchObservedAt != nil && !stored.LaunchObservedAt.IsZero() &&
+			baseFirewallAssignmentMatches(stored.BaseFirewallAssignment, vmUUID, stored.Cleanup.FirewallUUID) {
 			return &readback, nil
 		}
 		if stored.CreatedVMUUID != "" || stored.Phase != createFenceIssued || stored.RollbackAt != nil {
@@ -382,6 +471,451 @@ func (s *kubernetesCreateFenceStore) RecordCreatedVM(
 		}
 	}
 	return nil, fmt.Errorf("persisting exact created VM anchor for NodeClaim %q did not converge: %w", claim.Name, lastErr)
+}
+
+func (s *kubernetesCreateFenceStore) AuthorizeBaseFirewall(
+	ctx context.Context,
+	claim *karpv1.NodeClaim,
+	binding createFenceBinding,
+	token, vmUUID string,
+) (*karpv1.NodeClaim, cloudapi.FirewallAssignmentAuthorization, error) {
+	vmUUID = strings.ToLower(vmUUID)
+	if !createFenceVMUUIDPattern.MatchString(vmUUID) {
+		return nil, cloudapi.FirewallAssignmentAuthorization{}, fmt.Errorf("base-firewall authorization requires a canonical VM UUID")
+	}
+	var lastErr error
+	for attempt := 0; attempt < 4; attempt++ {
+		current, readErr := s.getProtectedExact(ctx, claim, "authorize base-firewall assignment")
+		if readErr != nil {
+			return nil, cloudapi.FirewallAssignmentAuthorization{}, readErr
+		}
+		record, parseErr := parseCreateFence(current.Annotations[AnnotationCreateFence], binding)
+		if parseErr != nil {
+			return nil, cloudapi.FirewallAssignmentAuthorization{}, parseErr
+		}
+		if token == "" || record.Token != token || record.Phase != createFenceIssued || record.IssuedAt == nil ||
+			record.CreatedVMUUID != vmUUID || record.LaunchObservedAt == nil {
+			return nil, cloudapi.FirewallAssignmentAuthorization{}, fmt.Errorf("NodeClaim %q base-firewall assignment lacks the exact anchored VM attempt", claim.Name)
+		}
+		assignment := record.BaseFirewallAssignment
+		if assignment == nil {
+			now := s.now().UTC()
+			record.BaseFirewallAssignment = newBaseFirewallAssignmentIntent(record, vmUUID, now)
+			written, writeErr := s.persistBaseFirewallAssignment(ctx, current, binding, record, func(stored createFenceRecord) bool {
+				return stored.BaseFirewallAssignment != nil && stored.BaseFirewallAssignment.Phase == cloudapi.FirewallAssignmentIntent &&
+					baseFirewallAssignmentMatches(stored.BaseFirewallAssignment, vmUUID, stored.Cleanup.FirewallUUID)
+			})
+			if writeErr != nil {
+				lastErr = writeErr
+				continue
+			}
+			claim = written
+			continue
+		}
+		if !baseFirewallAssignmentMatches(assignment, vmUUID, record.Cleanup.FirewallUUID) {
+			return nil, cloudapi.FirewallAssignmentAuthorization{}, fmt.Errorf("NodeClaim %q base-firewall assignment identity changed", claim.Name)
+		}
+		switch assignment.Phase {
+		case cloudapi.FirewallAssignmentIssued:
+			authorization, slotErr := s.authorizeBaseFirewallAssignmentSlot(ctx, current, record, vmUUID)
+			return current, authorization, slotErr
+		case cloudapi.FirewallAssignmentObserved:
+			return current, cloudapi.FirewallAssignmentAuthorization{Fence: firewallAssignmentFenceFromRecord(record)}, nil
+		case cloudapi.FirewallAssignmentIntent, cloudapi.FirewallAssignmentRejected:
+		default:
+			return nil, cloudapi.FirewallAssignmentAuthorization{}, fmt.Errorf("NodeClaim %q has invalid base-firewall assignment phase %q", claim.Name, assignment.Phase)
+		}
+		if assignment.Phase == cloudapi.FirewallAssignmentRejected {
+			// Retire this exact terminal issue in the shared Lease before replacing
+			// the per-NodeClaim receipt. Otherwise a crash between replacement and
+			// slot takeover would erase the only durable proof that the old owner
+			// was safe to supersede.
+			if slotErr := s.finishFirewallMutationSlot(ctx, current, record, firewallMutationAssign, vmUUID, assignment.IssueID, cloudapi.FirewallAssignmentRejected); slotErr != nil {
+				return current, cloudapi.FirewallAssignmentAuthorization{Fence: firewallAssignmentFenceFromRecord(record)}, slotErr
+			}
+		}
+		issueID, nonceErr := s.nonce()
+		if nonceErr != nil {
+			return nil, cloudapi.FirewallAssignmentAuthorization{}, fmt.Errorf("generating base-firewall assignment issue identity: %w", nonceErr)
+		}
+		now := s.now().UTC()
+		assignment.Phase = cloudapi.FirewallAssignmentIssued
+		assignment.IssueID = issueID
+		assignment.IssuedAt = &now
+		assignment.RejectedAt = nil
+		assignment.ObservedAt = nil
+		written, writeErr := s.persistBaseFirewallAssignment(ctx, current, binding, record, func(stored createFenceRecord) bool {
+			value := stored.BaseFirewallAssignment
+			return baseFirewallAssignmentMatches(value, vmUUID, stored.Cleanup.FirewallUUID) && value.Phase == cloudapi.FirewallAssignmentIssued &&
+				value.IssueID == issueID && value.IssuedAt != nil && value.IssuedAt.Equal(now)
+		})
+		if writeErr == nil {
+			authorization, slotErr := s.authorizeBaseFirewallAssignmentSlot(ctx, written, record, vmUUID)
+			return written, authorization, slotErr
+		}
+		lastErr = writeErr
+		// A competing issued receipt must never receive a second POST authority.
+		var latest karpv1.NodeClaim
+		if readErr := s.reader.Get(ctx, types.NamespacedName{Name: claim.Name}, &latest); readErr == nil && latest.UID == current.UID {
+			if stored, decodeErr := parseCreateFence(latest.Annotations[AnnotationCreateFence], binding); decodeErr == nil && stored.BaseFirewallAssignment != nil &&
+				stored.BaseFirewallAssignment.Phase == cloudapi.FirewallAssignmentIssued && stored.BaseFirewallAssignment.IssueID != issueID {
+				return &latest, cloudapi.FirewallAssignmentAuthorization{Fence: firewallAssignmentFenceFromRecord(stored)}, nil
+			}
+		}
+	}
+	return nil, cloudapi.FirewallAssignmentAuthorization{}, fmt.Errorf("persisting issued base-firewall assignment for NodeClaim %q did not converge: %w", claim.Name, lastErr)
+}
+
+func (s *kubernetesCreateFenceStore) ObserveBaseFirewall(
+	ctx context.Context,
+	claim *karpv1.NodeClaim,
+	binding createFenceBinding,
+	token, vmUUID, issueID string,
+) (*karpv1.NodeClaim, error) {
+	return s.finishBaseFirewallAssignment(ctx, claim, binding, token, vmUUID, issueID, cloudapi.FirewallAssignmentObserved)
+}
+
+func (s *kubernetesCreateFenceStore) RejectBaseFirewall(
+	ctx context.Context,
+	claim *karpv1.NodeClaim,
+	binding createFenceBinding,
+	token, vmUUID, issueID string,
+) (*karpv1.NodeClaim, error) {
+	return s.finishBaseFirewallAssignment(ctx, claim, binding, token, vmUUID, issueID, cloudapi.FirewallAssignmentRejected)
+}
+
+func (s *kubernetesCreateFenceStore) finishBaseFirewallAssignment(
+	ctx context.Context,
+	claim *karpv1.NodeClaim,
+	binding createFenceBinding,
+	token, vmUUID, issueID string,
+	terminal cloudapi.FirewallAssignmentPhase,
+) (*karpv1.NodeClaim, error) {
+	vmUUID = strings.ToLower(vmUUID)
+	if !createFenceVMUUIDPattern.MatchString(vmUUID) || !createFenceKeyHashPattern.MatchString(issueID) ||
+		(terminal != cloudapi.FirewallAssignmentObserved && terminal != cloudapi.FirewallAssignmentRejected) {
+		return nil, fmt.Errorf("finishing base-firewall assignment requires canonical identity and terminal phase")
+	}
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		current, readErr := s.getProtectedExact(ctx, claim, "finish base-firewall assignment")
+		if readErr != nil {
+			return nil, readErr
+		}
+		record, parseErr := parseCreateFence(current.Annotations[AnnotationCreateFence], binding)
+		if parseErr != nil {
+			return nil, parseErr
+		}
+		assignment := record.BaseFirewallAssignment
+		if token == "" || record.Token != token || !baseFirewallAssignmentMatches(assignment, vmUUID, record.Cleanup.FirewallUUID) {
+			return nil, fmt.Errorf("NodeClaim %q base-firewall assignment identity changed", claim.Name)
+		}
+		if assignment.Phase == terminal && assignment.IssueID == issueID {
+			if slotErr := s.finishFirewallMutationSlot(ctx, current, record, firewallMutationAssign, vmUUID, issueID, terminal); slotErr != nil {
+				return current, slotErr
+			}
+			return current, nil
+		}
+		if assignment.Phase != cloudapi.FirewallAssignmentIssued || assignment.IssueID != issueID || assignment.IssuedAt == nil {
+			return nil, fmt.Errorf("NodeClaim %q base-firewall assignment does not match issued receipt %s", claim.Name, issueID)
+		}
+		now := s.now().UTC()
+		assignment.Phase = terminal
+		if terminal == cloudapi.FirewallAssignmentObserved {
+			assignment.ObservedAt = &now
+			assignment.RejectedAt = nil
+		} else {
+			assignment.RejectedAt = &now
+			assignment.ObservedAt = nil
+		}
+		written, writeErr := s.persistBaseFirewallAssignment(ctx, current, binding, record, func(stored createFenceRecord) bool {
+			value := stored.BaseFirewallAssignment
+			return baseFirewallAssignmentMatches(value, vmUUID, stored.Cleanup.FirewallUUID) && value.Phase == terminal && value.IssueID == issueID
+		})
+		if writeErr == nil {
+			stored, parseErr := parseCreateFence(written.Annotations[AnnotationCreateFence], binding)
+			if parseErr != nil {
+				return written, parseErr
+			}
+			if slotErr := s.finishFirewallMutationSlot(ctx, written, stored, firewallMutationAssign, vmUUID, issueID, terminal); slotErr != nil {
+				return written, slotErr
+			}
+			return written, nil
+		}
+		lastErr = writeErr
+	}
+	return nil, fmt.Errorf("persisting terminal base-firewall assignment for NodeClaim %q did not converge: %w", claim.Name, lastErr)
+}
+
+func (s *kubernetesCreateFenceStore) persistBaseFirewallAssignment(
+	ctx context.Context,
+	current *karpv1.NodeClaim,
+	binding createFenceBinding,
+	record createFenceRecord,
+	accept func(createFenceRecord) bool,
+) (*karpv1.NodeClaim, error) {
+	encoded, err := json.Marshal(record)
+	if err != nil {
+		return nil, fmt.Errorf("encoding NodeClaim %q base-firewall assignment fence: %w", current.Name, err)
+	}
+	copy := current.DeepCopy()
+	copy.Annotations[AnnotationCreateFence] = string(encoded)
+	updateErr := s.writer.Update(ctx, copy)
+	readCtx, cancel := detachedCreateFenceContext(ctx)
+	defer cancel()
+	var readback karpv1.NodeClaim
+	if readErr := s.reader.Get(readCtx, types.NamespacedName{Name: current.Name}, &readback); readErr != nil {
+		return nil, fmt.Errorf("writing and reading back NodeClaim %q base-firewall assignment fence: %w", current.Name, errors.Join(updateErr, readErr))
+	}
+	if readback.UID != current.UID || !controllerutil.ContainsFinalizer(&readback, CreateFenceFinalizer) {
+		return nil, fmt.Errorf("NodeClaim %q changed identity or lost protection during base-firewall assignment fencing", current.Name)
+	}
+	stored, parseErr := parseCreateFence(readback.Annotations[AnnotationCreateFence], binding)
+	if parseErr != nil {
+		return nil, errors.Join(updateErr, parseErr)
+	}
+	if accept(stored) {
+		return &readback, nil
+	}
+	if updateErr != nil {
+		return nil, updateErr
+	}
+	return nil, fmt.Errorf("NodeClaim %q base-firewall assignment fence changed during readback", current.Name)
+}
+
+func (s *kubernetesCreateFenceStore) AuthorizeFloatingIPUpdate(
+	ctx context.Context,
+	claim *karpv1.NodeClaim,
+	binding createFenceBinding,
+	token, vmUUID, address, name string,
+	billingAccountID int64,
+) (*karpv1.NodeClaim, cloudapi.FloatingIPUpdateAuthorization, error) {
+	desired, err := newFloatingIPUpdateFence(vmUUID, address, name, billingAccountID)
+	if err != nil {
+		return nil, cloudapi.FloatingIPUpdateAuthorization{}, err
+	}
+	var lastErr error
+	for attempt := 0; attempt < 4; attempt++ {
+		current, readErr := s.getProtectedExact(ctx, claim, "authorize floating-IP metadata update")
+		if readErr != nil {
+			return nil, cloudapi.FloatingIPUpdateAuthorization{}, readErr
+		}
+		createRecord, parseErr := parseCreateFence(current.Annotations[AnnotationCreateFence], binding)
+		if parseErr != nil {
+			return nil, cloudapi.FloatingIPUpdateAuthorization{}, parseErr
+		}
+		if token == "" || createRecord.Token != token || createRecord.CreatedVMUUID != desired.VMUUID || createRecord.LaunchObservedAt == nil {
+			return nil, cloudapi.FloatingIPUpdateAuthorization{}, fmt.Errorf("NodeClaim %q floating-IP update lacks the exact anchored VM attempt", claim.Name)
+		}
+
+		encoded := current.Annotations[AnnotationFloatingIPUpdateFence]
+		if encoded != "" {
+			record, decodeErr := decodeFloatingIPUpdateRecord(encoded, binding, token)
+			if decodeErr != nil {
+				return nil, cloudapi.FloatingIPUpdateAuthorization{}, decodeErr
+			}
+			if !floatingIPUpdateIdentityMatches(record, desired) {
+				return nil, cloudapi.FloatingIPUpdateAuthorization{}, fmt.Errorf("NodeClaim %q floating-IP update identity changed", claim.Name)
+			}
+			switch record.Phase {
+			case cloudapi.FloatingIPUpdateIssued, cloudapi.FloatingIPUpdateObserved:
+				return current, cloudapi.FloatingIPUpdateAuthorization{Fence: floatingIPUpdateFenceFromRecord(record)}, nil
+			case cloudapi.FloatingIPUpdateRejected:
+			default:
+				return nil, cloudapi.FloatingIPUpdateAuthorization{}, fmt.Errorf("NodeClaim %q has invalid floating-IP update phase %q", claim.Name, record.Phase)
+			}
+		}
+
+		issueID, nonceErr := s.nonce()
+		if nonceErr != nil {
+			return nil, cloudapi.FloatingIPUpdateAuthorization{}, fmt.Errorf("generating floating-IP update issue identity: %w", nonceErr)
+		}
+		now := s.now().UTC()
+		record := floatingIPUpdateRecord{
+			Schema: floatingIPUpdateFenceSchema, Binding: binding, AttemptToken: token,
+			VMUUID: desired.VMUUID, Address: desired.Address, Name: desired.Name, BillingAccountID: desired.BillingAccountID,
+			Phase: cloudapi.FloatingIPUpdateIssued, IssueID: issueID, IssuedAt: now,
+		}
+		written, writeErr := s.persistFloatingIPUpdate(ctx, current, record, func(stored floatingIPUpdateRecord) bool {
+			return stored.Phase == cloudapi.FloatingIPUpdateIssued && stored.IssueID == issueID && stored.IssuedAt.Equal(now)
+		})
+		if writeErr == nil {
+			// A live v2 attempt may have dispatched this PATCH before the new
+			// receipt existed. Synthesize an issued read-only receipt and wait for
+			// desired-state visibility rather than risk replaying it.
+			allowPOST := !createRecord.LegacyV2FloatingIPMayBeIssued
+			return written, cloudapi.FloatingIPUpdateAuthorization{Fence: floatingIPUpdateFenceFromRecord(record), AllowPOST: allowPOST}, nil
+		}
+		lastErr = writeErr
+		claim = current
+	}
+	return nil, cloudapi.FloatingIPUpdateAuthorization{}, fmt.Errorf("persisting issued floating-IP update for NodeClaim %q did not converge: %w", claim.Name, lastErr)
+}
+
+func (s *kubernetesCreateFenceStore) ObserveFloatingIPUpdate(
+	ctx context.Context,
+	claim *karpv1.NodeClaim,
+	binding createFenceBinding,
+	token string,
+	fence cloudapi.FloatingIPUpdateFence,
+) (*karpv1.NodeClaim, error) {
+	return s.finishFloatingIPUpdate(ctx, claim, binding, token, fence, cloudapi.FloatingIPUpdateObserved)
+}
+
+func (s *kubernetesCreateFenceStore) RejectFloatingIPUpdate(
+	ctx context.Context,
+	claim *karpv1.NodeClaim,
+	binding createFenceBinding,
+	token string,
+	fence cloudapi.FloatingIPUpdateFence,
+) (*karpv1.NodeClaim, error) {
+	return s.finishFloatingIPUpdate(ctx, claim, binding, token, fence, cloudapi.FloatingIPUpdateRejected)
+}
+
+func (s *kubernetesCreateFenceStore) finishFloatingIPUpdate(
+	ctx context.Context,
+	claim *karpv1.NodeClaim,
+	binding createFenceBinding,
+	token string,
+	fence cloudapi.FloatingIPUpdateFence,
+	terminal cloudapi.FloatingIPUpdatePhase,
+) (*karpv1.NodeClaim, error) {
+	if err := validateFloatingIPUpdateFence(fence); err != nil {
+		return nil, fmt.Errorf("finishing floating-IP update requires exact identity: %w", err)
+	}
+	if terminal != cloudapi.FloatingIPUpdateObserved && terminal != cloudapi.FloatingIPUpdateRejected {
+		return nil, fmt.Errorf("finishing floating-IP update requires a terminal phase, got %q", terminal)
+	}
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		current, readErr := s.getProtectedExact(ctx, claim, "finish floating-IP metadata update")
+		if readErr != nil {
+			return nil, readErr
+		}
+		record, decodeErr := decodeFloatingIPUpdateRecord(current.Annotations[AnnotationFloatingIPUpdateFence], binding, token)
+		if decodeErr != nil {
+			return nil, decodeErr
+		}
+		if !floatingIPUpdateIdentityMatches(record, fence) || record.IssueID != fence.IssueID {
+			return nil, fmt.Errorf("NodeClaim %q floating-IP update identity changed", claim.Name)
+		}
+		if record.Phase == terminal {
+			return current, nil
+		}
+		if record.Phase != cloudapi.FloatingIPUpdateIssued {
+			return nil, fmt.Errorf("NodeClaim %q floating-IP update does not match its issued receipt", claim.Name)
+		}
+		now := s.now().UTC()
+		record.Phase = terminal
+		if terminal == cloudapi.FloatingIPUpdateObserved {
+			record.ObservedAt = &now
+			record.RejectedAt = nil
+		} else {
+			record.RejectedAt = &now
+			record.ObservedAt = nil
+		}
+		written, writeErr := s.persistFloatingIPUpdate(ctx, current, record, func(stored floatingIPUpdateRecord) bool {
+			return stored.Phase == terminal && stored.IssueID == fence.IssueID && floatingIPUpdateIdentityMatches(stored, fence)
+		})
+		if writeErr == nil {
+			return written, nil
+		}
+		lastErr = writeErr
+		claim = current
+	}
+	return nil, fmt.Errorf("persisting terminal floating-IP update for NodeClaim %q did not converge: %w", claim.Name, lastErr)
+}
+
+func (s *kubernetesCreateFenceStore) persistFloatingIPUpdate(
+	ctx context.Context,
+	current *karpv1.NodeClaim,
+	record floatingIPUpdateRecord,
+	accept func(floatingIPUpdateRecord) bool,
+) (*karpv1.NodeClaim, error) {
+	encoded, err := json.Marshal(record)
+	if err != nil {
+		return nil, fmt.Errorf("encoding NodeClaim %q floating-IP update fence: %w", current.Name, err)
+	}
+	copy := current.DeepCopy()
+	if copy.Annotations == nil {
+		copy.Annotations = map[string]string{}
+	}
+	copy.Annotations[AnnotationFloatingIPUpdateFence] = string(encoded)
+	updateErr := s.writer.Update(ctx, copy)
+	readCtx, cancel := detachedCreateFenceContext(ctx)
+	defer cancel()
+	var readback karpv1.NodeClaim
+	if readErr := s.reader.Get(readCtx, types.NamespacedName{Name: current.Name}, &readback); readErr != nil {
+		return nil, fmt.Errorf("writing and reading back NodeClaim %q floating-IP update fence: %w", current.Name, errors.Join(updateErr, readErr))
+	}
+	if readback.UID != current.UID || !controllerutil.ContainsFinalizer(&readback, CreateFenceFinalizer) {
+		return nil, fmt.Errorf("NodeClaim %q changed identity or lost protection during floating-IP update fencing", current.Name)
+	}
+	stored, decodeErr := decodeFloatingIPUpdateRecord(readback.Annotations[AnnotationFloatingIPUpdateFence], record.Binding, record.AttemptToken)
+	if decodeErr != nil {
+		return nil, errors.Join(updateErr, decodeErr)
+	}
+	if accept(stored) {
+		return &readback, nil
+	}
+	if updateErr != nil {
+		return nil, updateErr
+	}
+	return nil, fmt.Errorf("NodeClaim %q floating-IP update fence changed during readback", current.Name)
+}
+
+func newFloatingIPUpdateFence(vmUUID, address, name string, billingAccountID int64) (cloudapi.FloatingIPUpdateFence, error) {
+	fence := cloudapi.FloatingIPUpdateFence{
+		VMUUID: strings.ToLower(vmUUID), Address: address, Name: name, BillingAccountID: billingAccountID,
+	}
+	if !createFenceVMUUIDPattern.MatchString(fence.VMUUID) || fence.Name == "" || len(fence.Name) > 128 || fence.BillingAccountID <= 0 {
+		return cloudapi.FloatingIPUpdateFence{}, fmt.Errorf("floating-IP update requires canonical VM, name, and billing identity")
+	}
+	parsed, err := netip.ParseAddr(fence.Address)
+	if err != nil || !parsed.Is4() || !parsed.IsGlobalUnicast() || parsed.IsPrivate() || parsed.String() != fence.Address {
+		return cloudapi.FloatingIPUpdateFence{}, fmt.Errorf("floating-IP update requires canonical public IPv4 address")
+	}
+	return fence, nil
+}
+
+func validateFloatingIPUpdateFence(fence cloudapi.FloatingIPUpdateFence) error {
+	desired, err := newFloatingIPUpdateFence(fence.VMUUID, fence.Address, fence.Name, fence.BillingAccountID)
+	if err != nil {
+		return err
+	}
+	if !createFenceKeyHashPattern.MatchString(fence.IssueID) ||
+		(fence.Phase != cloudapi.FloatingIPUpdateIssued && fence.Phase != cloudapi.FloatingIPUpdateRejected && fence.Phase != cloudapi.FloatingIPUpdateObserved) ||
+		desired.VMUUID != fence.VMUUID {
+		return fmt.Errorf("floating-IP update receipt has invalid phase or issue identity")
+	}
+	return nil
+}
+
+func decodeFloatingIPUpdateRecord(value string, binding createFenceBinding, token string) (floatingIPUpdateRecord, error) {
+	var record floatingIPUpdateRecord
+	if value == "" || json.Unmarshal([]byte(value), &record) != nil {
+		return floatingIPUpdateRecord{}, fmt.Errorf("durable floating-IP update fence is missing or malformed")
+	}
+	fence := floatingIPUpdateFenceFromRecord(record)
+	validTerminal := (record.Phase == cloudapi.FloatingIPUpdateIssued && record.RejectedAt == nil && record.ObservedAt == nil) ||
+		(record.Phase == cloudapi.FloatingIPUpdateRejected && record.RejectedAt != nil && !record.RejectedAt.IsZero() && record.ObservedAt == nil) ||
+		(record.Phase == cloudapi.FloatingIPUpdateObserved && record.ObservedAt != nil && !record.ObservedAt.IsZero() && record.RejectedAt == nil)
+	if record.Schema != floatingIPUpdateFenceSchema || record.Binding != binding || token == "" || record.AttemptToken != token ||
+		record.IssuedAt.IsZero() || !validTerminal || validateFloatingIPUpdateFence(fence) != nil {
+		return floatingIPUpdateRecord{}, fmt.Errorf("durable floating-IP update fence has incomplete or changed identity")
+	}
+	return record, nil
+}
+
+func floatingIPUpdateFenceFromRecord(record floatingIPUpdateRecord) cloudapi.FloatingIPUpdateFence {
+	return cloudapi.FloatingIPUpdateFence{
+		VMUUID: record.VMUUID, Address: record.Address, Name: record.Name, BillingAccountID: record.BillingAccountID,
+		Phase: record.Phase, IssueID: record.IssueID,
+	}
+}
+
+func floatingIPUpdateIdentityMatches(record floatingIPUpdateRecord, fence cloudapi.FloatingIPUpdateFence) bool {
+	return record.VMUUID == strings.ToLower(fence.VMUUID) && record.Address == fence.Address && record.Name == fence.Name && record.BillingAccountID == fence.BillingAccountID
 }
 
 func (s *kubernetesCreateFenceStore) ChooseRollback(
@@ -497,7 +1031,14 @@ func (s *kubernetesCreateFenceStore) MarkRejected(ctx context.Context, claim *ka
 		if record.Phase != createFenceIssued {
 			return nil, fmt.Errorf("NodeClaim %q cannot reject VM create from phase %q", claim.Name, record.Phase)
 		}
+		assignment := record.BaseFirewallAssignment
+		if assignment == nil || assignment.Phase != cloudapi.FirewallAssignmentIssued || assignment.VMUUID != "" {
+			return nil, fmt.Errorf("NodeClaim %q VM rejection lacks its unused base-firewall assignment issue", claim.Name)
+		}
+		now := s.now().UTC()
 		record.Phase = createFenceRejected
+		assignment.Phase = cloudapi.FirewallAssignmentRejected
+		assignment.RejectedAt = &now
 		encoded, err := json.Marshal(record)
 		if err != nil {
 			return nil, fmt.Errorf("encoding rejected VM create fence: %w", err)
@@ -552,6 +1093,16 @@ func (s *kubernetesCreateFenceStore) MarkMaterialized(ctx context.Context, claim
 		}
 		if err := validateMaterializedVM(record, vm); err != nil {
 			return nil, err
+		}
+		if !(record.LegacyV2 && record.Phase == createFenceMaterialized) {
+			update, updateErr := decodeFloatingIPUpdateRecord(current.Annotations[AnnotationFloatingIPUpdateFence], binding, token)
+			if updateErr != nil {
+				return nil, fmt.Errorf("NodeClaim %q cannot materialize without its durable floating-IP update receipt: %w", claim.Name, updateErr)
+			}
+			if update.Phase != cloudapi.FloatingIPUpdateObserved || update.VMUUID != vmUUID || update.Address != vm.PublicIPv4 ||
+				update.Name != vm.FloatingIPName || update.BillingAccountID != vm.BillingAccountID {
+				return nil, fmt.Errorf("NodeClaim %q floating-IP update receipt does not match materialized VM %s", claim.Name, vmUUID)
+			}
 		}
 		if record.CreatedVMUUID != vmUUID || record.LaunchObservedAt == nil {
 			return nil, fmt.Errorf("NodeClaim %q cannot materialize VM %s before the exact launch UUID is durable", claim.Name, vmUUID)
@@ -653,6 +1204,12 @@ func (s *kubernetesCreateFenceStore) persist(
 		copy.Annotations = map[string]string{}
 	}
 	copy.Annotations[AnnotationCreateFence] = string(encoded)
+	removalRecord := newRemovalMutationReadyRecord(binding, record.Token, record.StartedAt)
+	removalEncoded, err := json.Marshal(removalRecord)
+	if err != nil {
+		return nil, createFence{}, false, fmt.Errorf("encoding initial durable removal mutation fence: %w", err)
+	}
+	copy.Annotations[AnnotationRemovalMutationFence] = string(removalEncoded)
 	controllerutil.AddFinalizer(copy, CreateFenceFinalizer)
 	if err := s.writer.Update(ctx, copy); err != nil {
 		if apierrors.IsConflict(err) {
@@ -677,6 +1234,9 @@ func (s *kubernetesCreateFenceStore) persist(
 	if stored.Token != record.Token {
 		return nil, createFence{}, false, fmt.Errorf("NodeClaim %q durable VM create fence token changed during readback", current.Name)
 	}
+	if _, err := decodeRemovalMutationRecord(readback.Annotations[AnnotationRemovalMutationFence], binding, record.Token); err != nil {
+		return nil, createFence{}, false, fmt.Errorf("NodeClaim %q initial removal fence did not survive readback: %w", current.Name, err)
+	}
 	return &readback, fenceFromRecord(stored), true, nil
 }
 
@@ -684,6 +1244,9 @@ func decodeCreateFence(value string) (createFenceRecord, error) {
 	var record createFenceRecord
 	if value == "" || json.Unmarshal([]byte(value), &record) != nil {
 		return createFenceRecord{}, fmt.Errorf("durable VM create fence is missing or malformed")
+	}
+	if record.Schema == legacyCreateFenceSchema {
+		record = migrateLegacyCreateFence(record)
 	}
 	validPhase := (record.Phase == createFenceReserved && record.IssueID == "" && record.IssuedAt == nil && record.ObservedAt == nil && record.ObservedVMUUID == "") ||
 		(record.Phase == createFenceIssued && createFenceKeyHashPattern.MatchString(record.IssueID) && record.IssuedAt != nil && !record.IssuedAt.IsZero() && record.ObservedAt == nil && record.ObservedVMUUID == "") ||
@@ -693,10 +1256,27 @@ func decodeCreateFence(value string) (createFenceRecord, error) {
 		(record.Phase != createFenceReserved && (record.Intent == cloudapi.CreateAuthorizationPost || record.Intent == cloudapi.CreateAuthorizationAdoption))
 	validCreatedIdentity := (record.LaunchObservedAt == nil && record.CreatedVMUUID == "") ||
 		(record.LaunchObservedAt != nil && !record.LaunchObservedAt.IsZero() && createFenceVMUUIDPattern.MatchString(record.CreatedVMUUID) && record.CreatedVMUUID == strings.ToLower(record.CreatedVMUUID))
+	validBaseFirewallAssignment := false
+	if assignment := record.BaseFirewallAssignment; assignment != nil {
+		validIdentity := assignment.FirewallUUID == record.Cleanup.FirewallUUID && !assignment.IntentAt.IsZero() &&
+			((record.CreatedVMUUID == "" && assignment.VMUUID == "") || (record.CreatedVMUUID != "" && assignment.VMUUID == record.CreatedVMUUID))
+		switch assignment.Phase {
+		case cloudapi.FirewallAssignmentIntent:
+			validBaseFirewallAssignment = validIdentity && assignment.IssueID == "" && assignment.IssuedAt == nil && assignment.RejectedAt == nil && assignment.ObservedAt == nil
+		case cloudapi.FirewallAssignmentIssued:
+			validBaseFirewallAssignment = validIdentity && createFenceKeyHashPattern.MatchString(assignment.IssueID) && assignment.IssuedAt != nil && !assignment.IssuedAt.IsZero() && assignment.RejectedAt == nil && assignment.ObservedAt == nil
+		case cloudapi.FirewallAssignmentRejected:
+			validBaseFirewallAssignment = validIdentity && createFenceKeyHashPattern.MatchString(assignment.IssueID) && assignment.IssuedAt != nil && !assignment.IssuedAt.IsZero() && assignment.RejectedAt != nil && !assignment.RejectedAt.IsZero() && assignment.ObservedAt == nil
+		case cloudapi.FirewallAssignmentObserved:
+			validBaseFirewallAssignment = validIdentity && assignment.VMUUID != "" && createFenceKeyHashPattern.MatchString(assignment.IssueID) && assignment.IssuedAt != nil && !assignment.IssuedAt.IsZero() && assignment.RejectedAt == nil && assignment.ObservedAt != nil && !assignment.ObservedAt.IsZero()
+		default:
+			validBaseFirewallAssignment = false
+		}
+	}
 	validRollback := record.RollbackAt == nil || (!record.RollbackAt.IsZero() && record.Phase == createFenceIssued && record.CreatedVMUUID != "")
 	validCleanupResolution := (record.CleanupResolvedAt == nil && record.CleanupVMUUID == "" && record.CleanupFloatingIPName == "" && record.CleanupPublicIPv4 == "") ||
 		(record.CleanupResolvedAt != nil && !record.CleanupResolvedAt.IsZero() && createFenceVMUUIDPattern.MatchString(record.CleanupVMUUID) && record.CleanupFloatingIPName != "" && record.CleanupPublicIPv4 != "")
-	if record.Schema != createFenceSchema || !validPhase || !validIntent || !validCreatedIdentity || !validRollback || !validCleanupResolution || record.Binding.NodeClaimUID == "" || record.Binding.IdempotencyKeyHash == "" ||
+	if record.Schema != createFenceSchema || !validPhase || !validIntent || !validCreatedIdentity || !validBaseFirewallAssignment || !validRollback || !validCleanupResolution || record.Binding.NodeClaimUID == "" || record.Binding.IdempotencyKeyHash == "" ||
 		record.Binding.RequestHash == "" || record.Binding.SpecHash == "" || record.Binding.BootstrapHash == "" ||
 		record.Cleanup.ClusterName == "" || record.Cleanup.Location == "" || record.Cleanup.NetworkUUID == "" ||
 		record.Cleanup.ControlPlaneVIP == "" || record.Cleanup.PrivateLoadBalancerPoolStart == "" || record.Cleanup.PrivateLoadBalancerPoolStop == "" ||
@@ -717,7 +1297,7 @@ func decodeCreateFence(value string) (createFenceRecord, error) {
 		return createFenceRecord{}, fmt.Errorf("durable VM create fence baseline: %w", err)
 	}
 	if record.Phase == createFenceMaterialized {
-		if record.CreatedVMUUID == "" || record.CreatedVMUUID != record.ObservedVMUUID || record.RollbackAt != nil {
+		if record.CreatedVMUUID == "" || record.CreatedVMUUID != record.ObservedVMUUID || record.RollbackAt != nil || record.BaseFirewallAssignment == nil || record.BaseFirewallAssignment.Phase != cloudapi.FirewallAssignmentObserved {
 			return createFenceRecord{}, fmt.Errorf("materialized VM create fence does not match its launch anchor")
 		}
 		canonical, err := normalizeCleanupResolution(cloudapi.FencedCreateCleanupResolution{
@@ -727,16 +1307,19 @@ func decodeCreateFence(value string) (createFenceRecord, error) {
 			return createFenceRecord{}, fmt.Errorf("durable VM create fence has non-canonical materialized identity")
 		}
 	}
+	if record.Phase == createFenceIssued && record.BaseFirewallAssignment != nil && record.BaseFirewallAssignment.Phase == cloudapi.FirewallAssignmentIntent {
+		return createFenceRecord{}, fmt.Errorf("issued VM create fence retains an unissued base-firewall intent")
+	}
 	if len(record.CleanupResolutions) > cloudapi.MaxCreateCleanupResolutions {
 		return createFenceRecord{}, fmt.Errorf("durable VM create fence cleanup history exceeds %d exact receipts", cloudapi.MaxCreateCleanupResolutions)
 	}
 	if len(record.CleanupResolutions) != 0 && record.CleanupVMUUID == "" {
 		return createFenceRecord{}, fmt.Errorf("durable VM create fence cleanup history lacks an active exact receipt")
 	}
-	if record.Phase == createFenceReserved && (record.CreatedVMUUID != "" || record.RollbackAt != nil) {
+	if record.Phase == createFenceReserved && (record.CreatedVMUUID != "" || record.RollbackAt != nil || record.BaseFirewallAssignment == nil || record.BaseFirewallAssignment.Phase != cloudapi.FirewallAssignmentIntent) {
 		return createFenceRecord{}, fmt.Errorf("reserved VM create fence cannot contain accepted-launch identities")
 	}
-	if record.Phase == createFenceRejected && (record.CreatedVMUUID != "" || record.RollbackAt != nil) {
+	if record.Phase == createFenceRejected && (record.CreatedVMUUID != "" || record.RollbackAt != nil || record.BaseFirewallAssignment == nil || record.BaseFirewallAssignment.Phase != cloudapi.FirewallAssignmentRejected) {
 		return createFenceRecord{}, fmt.Errorf("rejected VM create fence cannot contain an accepted-launch identity")
 	}
 	for i, resolution := range record.CleanupResolutions {
@@ -788,6 +1371,54 @@ func decodeCreateFence(value string) (createFenceRecord, error) {
 	return record, nil
 }
 
+func migrateLegacyCreateFence(record createFenceRecord) createFenceRecord {
+	record.Schema = createFenceSchema
+	record.LegacyV2 = true
+	record.LegacyV2BaseFirewallMayBeIssued = record.Phase == createFenceIssued
+	record.LegacyV2FloatingIPMayBeIssued = record.Phase == createFenceIssued && record.CreatedVMUUID != ""
+	intentAt := record.StartedAt.UTC()
+	issueID := legacyBaseFirewallIssueID(record)
+	copyTime := func(value *time.Time, fallback time.Time) *time.Time {
+		if value != nil && !value.IsZero() {
+			copy := value.UTC()
+			return &copy
+		}
+		copy := fallback.UTC()
+		return &copy
+	}
+	switch record.Phase {
+	case createFenceReserved:
+		record.BaseFirewallAssignment = &baseFirewallAssignmentRecord{
+			FirewallUUID: record.Cleanup.FirewallUUID, Phase: cloudapi.FirewallAssignmentIntent, IntentAt: intentAt,
+		}
+	case createFenceIssued:
+		record.BaseFirewallAssignment = &baseFirewallAssignmentRecord{
+			VMUUID: record.CreatedVMUUID, FirewallUUID: record.Cleanup.FirewallUUID,
+			Phase: cloudapi.FirewallAssignmentIssued, IssueID: issueID, IntentAt: intentAt,
+			IssuedAt: copyTime(record.IssuedAt, intentAt),
+		}
+	case createFenceRejected:
+		rejectedAt := copyTime(record.IssuedAt, intentAt)
+		record.BaseFirewallAssignment = &baseFirewallAssignmentRecord{
+			FirewallUUID: record.Cleanup.FirewallUUID, Phase: cloudapi.FirewallAssignmentRejected,
+			IssueID: issueID, IntentAt: intentAt, IssuedAt: copyTime(record.IssuedAt, intentAt), RejectedAt: rejectedAt,
+		}
+	case createFenceMaterialized:
+		observedAt := copyTime(record.ObservedAt, intentAt)
+		record.BaseFirewallAssignment = &baseFirewallAssignmentRecord{
+			VMUUID: record.CreatedVMUUID, FirewallUUID: record.Cleanup.FirewallUUID,
+			Phase: cloudapi.FirewallAssignmentObserved, IssueID: issueID, IntentAt: intentAt,
+			IssuedAt: copyTime(record.IssuedAt, intentAt), ObservedAt: observedAt,
+		}
+	}
+	return record
+}
+
+func legacyBaseFirewallIssueID(record createFenceRecord) string {
+	sum := sha256.Sum256([]byte("legacy-base-firewall\x00" + record.Token + "\x00" + record.CreatedVMUUID + "\x00" + record.Cleanup.FirewallUUID))
+	return hex.EncodeToString(sum[:16])
+}
+
 func parseCreateFence(value string, expected createFenceBinding) (createFenceRecord, error) {
 	record, err := decodeCreateFence(value)
 	if err != nil {
@@ -804,18 +1435,44 @@ func newCreateFenceRecord(binding createFenceBinding, cleanup createFenceCleanup
 	if err != nil {
 		return createFenceRecord{}, fmt.Errorf("generating durable VM create fence token: %w", err)
 	}
+	now = now.UTC()
 	return createFenceRecord{
 		Schema: createFenceSchema, Binding: binding, Cleanup: cleanup,
-		Baseline: cloneCreateInventory(baseline), Token: token, Phase: createFenceReserved, StartedAt: now.UTC(),
+		Baseline: cloneCreateInventory(baseline), Token: token, Phase: createFenceReserved, StartedAt: now,
+		BaseFirewallAssignment: &baseFirewallAssignmentRecord{
+			FirewallUUID: cleanup.FirewallUUID, Phase: cloudapi.FirewallAssignmentIntent, IntentAt: now,
+		},
 	}, nil
+}
+
+func newBaseFirewallAssignmentIntent(record createFenceRecord, vmUUID string, now time.Time) *baseFirewallAssignmentRecord {
+	return &baseFirewallAssignmentRecord{
+		VMUUID: strings.ToLower(vmUUID), FirewallUUID: record.Cleanup.FirewallUUID,
+		Phase: cloudapi.FirewallAssignmentIntent, IntentAt: now.UTC(),
+	}
+}
+
+func baseFirewallAssignmentMatches(value *baseFirewallAssignmentRecord, vmUUID, firewallUUID string) bool {
+	return value != nil && value.VMUUID == strings.ToLower(vmUUID) && value.FirewallUUID == firewallUUID
+}
+
+func firewallAssignmentFenceFromRecord(record createFenceRecord) cloudapi.FirewallAssignmentFence {
+	if record.BaseFirewallAssignment == nil {
+		return cloudapi.FirewallAssignmentFence{}
+	}
+	return cloudapi.FirewallAssignmentFence{
+		VMUUID: record.BaseFirewallAssignment.VMUUID, FirewallUUID: record.BaseFirewallAssignment.FirewallUUID,
+		Phase: record.BaseFirewallAssignment.Phase, IssueID: record.BaseFirewallAssignment.IssueID,
+	}
 }
 
 func fenceFromRecord(record createFenceRecord) createFence {
 	fence := createFence{
 		Token: record.Token, StartedAt: record.StartedAt, Baseline: cloneCreateInventory(record.Baseline),
 		Issued: record.Phase != createFenceReserved, Intent: record.Intent, IssueID: record.IssueID, CreatedVMUUID: record.CreatedVMUUID,
-		HasCleanupHistory: len(record.CleanupResolutions) != 0,
-		RollbackChosen:    record.Phase == createFenceIssued && record.RollbackAt != nil,
+		HasCleanupHistory:      len(record.CleanupResolutions) != 0,
+		RollbackChosen:         record.Phase == createFenceIssued && record.RollbackAt != nil,
+		BaseFirewallAssignment: firewallAssignmentFenceFromRecord(record),
 	}
 	if record.IssuedAt != nil {
 		fence.IssuedAt = *record.IssuedAt
@@ -917,15 +1574,20 @@ func createFenceHash(value string) string {
 }
 
 type memoryCreateFenceStore struct {
-	mu      sync.Mutex
-	records map[types.UID]createFenceRecord
-	now     func() time.Time
-	nonce   func() (string, error)
+	mu                    sync.Mutex
+	records               map[types.UID]createFenceRecord
+	floatingIPUpdates     map[types.UID]floatingIPUpdateRecord
+	removalMutations      map[types.UID]removalMutationRecord
+	firewallMutationSlots map[string]firewallMutationSlotRecord
+	now                   func() time.Time
+	nonce                 func() (string, error)
 }
 
 func NewMemoryCreateFenceStore() CreateFenceStore {
 	return &memoryCreateFenceStore{
-		records: map[types.UID]createFenceRecord{}, now: time.Now, nonce: createFenceNonce,
+		records: map[types.UID]createFenceRecord{}, floatingIPUpdates: map[types.UID]floatingIPUpdateRecord{},
+		removalMutations:      map[types.UID]removalMutationRecord{},
+		firewallMutationSlots: map[string]firewallMutationSlotRecord{}, now: time.Now, nonce: createFenceNonce,
 	}
 }
 
@@ -968,7 +1630,8 @@ func (s *memoryCreateFenceStore) Ensure(_ context.Context, claim *karpv1.NodeCla
 		return nil, createFence{}, false, err
 	}
 	s.records[claim.UID] = record
-	return claimWithCreateFence(claim, record), fenceFromRecord(record), true, nil
+	s.removalMutations[claim.UID] = newRemovalMutationReadyRecord(binding, record.Token, record.StartedAt)
+	return claimWithRemovalMutation(claimWithCreateFence(claim, record), s.removalMutations[claim.UID]), fenceFromRecord(record), true, nil
 }
 
 func (s *memoryCreateFenceStore) Authorize(_ context.Context, claim *karpv1.NodeClaim, binding createFenceBinding, token string, intent cloudapi.CreateAuthorizationKind) (*karpv1.NodeClaim, error) {
@@ -998,10 +1661,20 @@ func (s *memoryCreateFenceStore) Authorize(_ context.Context, claim *karpv1.Node
 	if err != nil {
 		return nil, fmt.Errorf("generating VM create authorization identity: %w", err)
 	}
+	assignmentIssueID, err := s.nonce()
+	if err != nil {
+		return nil, fmt.Errorf("generating base-firewall assignment authorization identity: %w", err)
+	}
+	if assignment := record.BaseFirewallAssignment; assignment == nil || assignment.Phase != cloudapi.FirewallAssignmentIntent || assignment.VMUUID != "" || assignment.FirewallUUID != record.Cleanup.FirewallUUID {
+		return nil, fmt.Errorf("durable pre-VM base-firewall assignment intent is missing")
+	}
 	record.Phase = createFenceIssued
 	record.Intent = intent
 	record.IssueID = issueID
 	record.IssuedAt = &now
+	record.BaseFirewallAssignment.Phase = cloudapi.FirewallAssignmentIssued
+	record.BaseFirewallAssignment.IssueID = assignmentIssueID
+	record.BaseFirewallAssignment.IssuedAt = &now
 	s.records[claim.UID] = record
 	return claimWithCreateFence(claim, record), nil
 }
@@ -1022,6 +1695,9 @@ func (s *memoryCreateFenceStore) RecordCreatedVM(_ context.Context, claim *karpv
 	}
 	if record.CreatedVMUUID != "" {
 		if record.CreatedVMUUID == vmUUID {
+			if !baseFirewallAssignmentMatches(record.BaseFirewallAssignment, vmUUID, record.Cleanup.FirewallUUID) {
+				return nil, fmt.Errorf("created VM lacks its pre-issued base-firewall assignment receipt")
+			}
 			return claimWithCreateFence(claim, record), nil
 		}
 		return nil, fmt.Errorf("created VM identity changed")
@@ -1029,10 +1705,236 @@ func (s *memoryCreateFenceStore) RecordCreatedVM(_ context.Context, claim *karpv
 	if record.Phase != createFenceIssued || record.RollbackAt != nil {
 		return nil, fmt.Errorf("created VM anchor requires an exactly issued attempt")
 	}
+	if assignment := record.BaseFirewallAssignment; assignment == nil || assignment.Phase != cloudapi.FirewallAssignmentIssued || assignment.VMUUID != "" ||
+		assignment.FirewallUUID != record.Cleanup.FirewallUUID || !createFenceKeyHashPattern.MatchString(assignment.IssueID) {
+		return nil, fmt.Errorf("created VM anchor lacks its pre-issued base-firewall assignment")
+	}
 	now := s.now().UTC()
 	record.CreatedVMUUID = vmUUID
 	record.LaunchObservedAt = &now
+	record.BaseFirewallAssignment.VMUUID = vmUUID
 	s.records[claim.UID] = record
+	return claimWithCreateFence(claim, record), nil
+}
+
+func (s *memoryCreateFenceStore) AuthorizeBaseFirewall(_ context.Context, claim *karpv1.NodeClaim, binding createFenceBinding, token, vmUUID string) (*karpv1.NodeClaim, cloudapi.FirewallAssignmentAuthorization, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	vmUUID = strings.ToLower(vmUUID)
+	record, ok := s.records[claim.UID]
+	if !ok {
+		return nil, cloudapi.FirewallAssignmentAuthorization{}, fmt.Errorf("durable VM create fence is missing")
+	}
+	if _, err := parseCreateFence(mustEncodeCreateFence(record), binding); err != nil {
+		return nil, cloudapi.FirewallAssignmentAuthorization{}, err
+	}
+	if record.Token != token || record.Phase != createFenceIssued || record.IssuedAt == nil || record.CreatedVMUUID != vmUUID || record.LaunchObservedAt == nil {
+		return nil, cloudapi.FirewallAssignmentAuthorization{}, fmt.Errorf("base-firewall assignment requires the exact anchored VM attempt")
+	}
+	if record.BaseFirewallAssignment == nil {
+		now := s.now().UTC()
+		record.BaseFirewallAssignment = newBaseFirewallAssignmentIntent(record, vmUUID, now)
+	}
+	assignment := record.BaseFirewallAssignment
+	if !baseFirewallAssignmentMatches(assignment, vmUUID, record.Cleanup.FirewallUUID) {
+		return nil, cloudapi.FirewallAssignmentAuthorization{}, fmt.Errorf("base-firewall assignment identity changed")
+	}
+	if assignment.Phase == cloudapi.FirewallAssignmentIssued {
+		if record.LegacyV2BaseFirewallMayBeIssued {
+			return claimWithCreateFence(claim, record), cloudapi.FirewallAssignmentAuthorization{Fence: firewallAssignmentFenceFromRecord(record)}, nil
+		}
+		value, allow, err := s.acquireFirewallMutationSlot(claim, record, vmUUID, firewallMutationAssign, assignment.IssueID)
+		if err != nil {
+			return claimWithCreateFence(claim, record), cloudapi.FirewallAssignmentAuthorization{Fence: firewallAssignmentFenceFromRecord(record)}, err
+		}
+		return claimWithCreateFence(claim, record), cloudapi.FirewallAssignmentAuthorization{
+			Fence:     cloudapi.FirewallAssignmentFence{VMUUID: vmUUID, FirewallUUID: record.Cleanup.FirewallUUID, Phase: value.Phase, IssueID: value.IssueID},
+			AllowPOST: allow,
+		}, nil
+	}
+	if assignment.Phase == cloudapi.FirewallAssignmentObserved {
+		return claimWithCreateFence(claim, record), cloudapi.FirewallAssignmentAuthorization{Fence: firewallAssignmentFenceFromRecord(record)}, nil
+	}
+	if assignment.Phase != cloudapi.FirewallAssignmentIntent && assignment.Phase != cloudapi.FirewallAssignmentRejected {
+		return nil, cloudapi.FirewallAssignmentAuthorization{}, fmt.Errorf("invalid base-firewall assignment phase %q", assignment.Phase)
+	}
+	if assignment.Phase == cloudapi.FirewallAssignmentRejected {
+		if err := s.finishFirewallMutationSlot(record, claim, firewallMutationAssign, vmUUID, assignment.IssueID, cloudapi.FirewallAssignmentRejected); err != nil {
+			return nil, cloudapi.FirewallAssignmentAuthorization{}, err
+		}
+	}
+	issueID, err := s.nonce()
+	if err != nil {
+		return nil, cloudapi.FirewallAssignmentAuthorization{}, err
+	}
+	now := s.now().UTC()
+	assignment.Phase = cloudapi.FirewallAssignmentIssued
+	assignment.IssueID = issueID
+	assignment.IssuedAt = &now
+	assignment.RejectedAt = nil
+	assignment.ObservedAt = nil
+	s.records[claim.UID] = record
+	value, allow, err := s.acquireFirewallMutationSlot(claim, record, vmUUID, firewallMutationAssign, issueID)
+	if err != nil {
+		return claimWithCreateFence(claim, record), cloudapi.FirewallAssignmentAuthorization{Fence: firewallAssignmentFenceFromRecord(record)}, err
+	}
+	return claimWithCreateFence(claim, record), cloudapi.FirewallAssignmentAuthorization{
+		Fence:     cloudapi.FirewallAssignmentFence{VMUUID: vmUUID, FirewallUUID: record.Cleanup.FirewallUUID, Phase: value.Phase, IssueID: value.IssueID},
+		AllowPOST: allow,
+	}, nil
+}
+
+func (s *memoryCreateFenceStore) ObserveBaseFirewall(_ context.Context, claim *karpv1.NodeClaim, binding createFenceBinding, token, vmUUID, issueID string) (*karpv1.NodeClaim, error) {
+	return s.finishBaseFirewallAssignment(claim, binding, token, vmUUID, issueID, cloudapi.FirewallAssignmentObserved)
+}
+
+func (s *memoryCreateFenceStore) RejectBaseFirewall(_ context.Context, claim *karpv1.NodeClaim, binding createFenceBinding, token, vmUUID, issueID string) (*karpv1.NodeClaim, error) {
+	return s.finishBaseFirewallAssignment(claim, binding, token, vmUUID, issueID, cloudapi.FirewallAssignmentRejected)
+}
+
+func (s *memoryCreateFenceStore) AuthorizeFloatingIPUpdate(
+	_ context.Context,
+	claim *karpv1.NodeClaim,
+	binding createFenceBinding,
+	token, vmUUID, address, name string,
+	billingAccountID int64,
+) (*karpv1.NodeClaim, cloudapi.FloatingIPUpdateAuthorization, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	desired, err := newFloatingIPUpdateFence(vmUUID, address, name, billingAccountID)
+	if err != nil {
+		return nil, cloudapi.FloatingIPUpdateAuthorization{}, err
+	}
+	createRecord, ok := s.records[claim.UID]
+	if !ok {
+		return nil, cloudapi.FloatingIPUpdateAuthorization{}, fmt.Errorf("durable VM create fence is missing")
+	}
+	if _, err := parseCreateFence(mustEncodeCreateFence(createRecord), binding); err != nil {
+		return nil, cloudapi.FloatingIPUpdateAuthorization{}, err
+	}
+	if token == "" || createRecord.Token != token || createRecord.CreatedVMUUID != desired.VMUUID || createRecord.LaunchObservedAt == nil {
+		return nil, cloudapi.FloatingIPUpdateAuthorization{}, fmt.Errorf("floating-IP update lacks the exact anchored VM attempt")
+	}
+	if record, exists := s.floatingIPUpdates[claim.UID]; exists {
+		if !floatingIPUpdateIdentityMatches(record, desired) {
+			return nil, cloudapi.FloatingIPUpdateAuthorization{}, fmt.Errorf("floating-IP update identity changed")
+		}
+		switch record.Phase {
+		case cloudapi.FloatingIPUpdateIssued, cloudapi.FloatingIPUpdateObserved:
+			return claimWithFloatingIPUpdate(claim, createRecord, record), cloudapi.FloatingIPUpdateAuthorization{Fence: floatingIPUpdateFenceFromRecord(record)}, nil
+		case cloudapi.FloatingIPUpdateRejected:
+		default:
+			return nil, cloudapi.FloatingIPUpdateAuthorization{}, fmt.Errorf("invalid floating-IP update phase %q", record.Phase)
+		}
+	}
+	issueID, err := s.nonce()
+	if err != nil {
+		return nil, cloudapi.FloatingIPUpdateAuthorization{}, fmt.Errorf("generating floating-IP update issue identity: %w", err)
+	}
+	now := s.now().UTC()
+	record := floatingIPUpdateRecord{
+		Schema: floatingIPUpdateFenceSchema, Binding: binding, AttemptToken: token,
+		VMUUID: desired.VMUUID, Address: desired.Address, Name: desired.Name, BillingAccountID: desired.BillingAccountID,
+		Phase: cloudapi.FloatingIPUpdateIssued, IssueID: issueID, IssuedAt: now,
+	}
+	s.floatingIPUpdates[claim.UID] = record
+	return claimWithFloatingIPUpdate(claim, createRecord, record), cloudapi.FloatingIPUpdateAuthorization{
+		Fence: floatingIPUpdateFenceFromRecord(record), AllowPOST: !createRecord.LegacyV2FloatingIPMayBeIssued,
+	}, nil
+}
+
+func (s *memoryCreateFenceStore) ObserveFloatingIPUpdate(_ context.Context, claim *karpv1.NodeClaim, binding createFenceBinding, token string, fence cloudapi.FloatingIPUpdateFence) (*karpv1.NodeClaim, error) {
+	return s.finishFloatingIPUpdate(claim, binding, token, fence, cloudapi.FloatingIPUpdateObserved)
+}
+
+func (s *memoryCreateFenceStore) RejectFloatingIPUpdate(_ context.Context, claim *karpv1.NodeClaim, binding createFenceBinding, token string, fence cloudapi.FloatingIPUpdateFence) (*karpv1.NodeClaim, error) {
+	return s.finishFloatingIPUpdate(claim, binding, token, fence, cloudapi.FloatingIPUpdateRejected)
+}
+
+func (s *memoryCreateFenceStore) finishFloatingIPUpdate(
+	claim *karpv1.NodeClaim,
+	binding createFenceBinding,
+	token string,
+	fence cloudapi.FloatingIPUpdateFence,
+	terminal cloudapi.FloatingIPUpdatePhase,
+) (*karpv1.NodeClaim, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := validateFloatingIPUpdateFence(fence); err != nil {
+		return nil, err
+	}
+	if terminal != cloudapi.FloatingIPUpdateObserved && terminal != cloudapi.FloatingIPUpdateRejected {
+		return nil, fmt.Errorf("invalid floating-IP update terminal phase %q", terminal)
+	}
+	createRecord, ok := s.records[claim.UID]
+	if !ok {
+		return nil, fmt.Errorf("durable VM create fence is missing")
+	}
+	if _, err := parseCreateFence(mustEncodeCreateFence(createRecord), binding); err != nil {
+		return nil, err
+	}
+	record, ok := s.floatingIPUpdates[claim.UID]
+	if !ok || createRecord.Token != token || !floatingIPUpdateIdentityMatches(record, fence) || record.IssueID != fence.IssueID {
+		return nil, fmt.Errorf("floating-IP update identity changed")
+	}
+	if record.Phase == terminal {
+		return claimWithFloatingIPUpdate(claim, createRecord, record), nil
+	}
+	if record.Phase != cloudapi.FloatingIPUpdateIssued {
+		return nil, fmt.Errorf("floating-IP update does not match its issued receipt")
+	}
+	now := s.now().UTC()
+	record.Phase = terminal
+	if terminal == cloudapi.FloatingIPUpdateObserved {
+		record.ObservedAt = &now
+		record.RejectedAt = nil
+	} else {
+		record.RejectedAt = &now
+		record.ObservedAt = nil
+	}
+	s.floatingIPUpdates[claim.UID] = record
+	return claimWithFloatingIPUpdate(claim, createRecord, record), nil
+}
+
+func (s *memoryCreateFenceStore) finishBaseFirewallAssignment(claim *karpv1.NodeClaim, binding createFenceBinding, token, vmUUID, issueID string, terminal cloudapi.FirewallAssignmentPhase) (*karpv1.NodeClaim, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	vmUUID = strings.ToLower(vmUUID)
+	record, ok := s.records[claim.UID]
+	if !ok {
+		return nil, fmt.Errorf("durable VM create fence is missing")
+	}
+	if _, err := parseCreateFence(mustEncodeCreateFence(record), binding); err != nil {
+		return nil, err
+	}
+	assignment := record.BaseFirewallAssignment
+	if record.Token != token || !baseFirewallAssignmentMatches(assignment, vmUUID, record.Cleanup.FirewallUUID) {
+		return nil, fmt.Errorf("base-firewall assignment identity changed")
+	}
+	if assignment.Phase == terminal && assignment.IssueID == issueID {
+		if err := s.finishFirewallMutationSlot(record, claim, firewallMutationAssign, vmUUID, issueID, terminal); err != nil {
+			return nil, err
+		}
+		return claimWithCreateFence(claim, record), nil
+	}
+	if assignment.Phase != cloudapi.FirewallAssignmentIssued || assignment.IssueID != issueID || assignment.IssuedAt == nil {
+		return nil, fmt.Errorf("base-firewall assignment does not match its issued receipt")
+	}
+	now := s.now().UTC()
+	assignment.Phase = terminal
+	if terminal == cloudapi.FirewallAssignmentObserved {
+		assignment.ObservedAt = &now
+		assignment.RejectedAt = nil
+	} else if terminal == cloudapi.FirewallAssignmentRejected {
+		assignment.RejectedAt = &now
+		assignment.ObservedAt = nil
+	} else {
+		return nil, fmt.Errorf("invalid base-firewall assignment terminal phase %q", terminal)
+	}
+	s.records[claim.UID] = record
+	if err := s.finishFirewallMutationSlot(record, claim, firewallMutationAssign, vmUUID, issueID, terminal); err != nil {
+		return nil, err
+	}
 	return claimWithCreateFence(claim, record), nil
 }
 
@@ -1088,7 +1990,14 @@ func (s *memoryCreateFenceStore) MarkRejected(_ context.Context, claim *karpv1.N
 	if record.Token != token || record.IssueID != issueID || record.Phase != createFenceIssued || record.IssuedAt == nil || record.CreatedVMUUID != "" || record.RollbackAt != nil || len(record.CleanupResolutions) != 0 {
 		return nil, fmt.Errorf("VM create attempt cannot be rejected unless it is exactly issued")
 	}
+	assignment := record.BaseFirewallAssignment
+	if assignment == nil || assignment.Phase != cloudapi.FirewallAssignmentIssued || assignment.VMUUID != "" {
+		return nil, fmt.Errorf("VM rejection lacks its unused base-firewall assignment issue")
+	}
+	now := s.now().UTC()
 	record.Phase = createFenceRejected
+	assignment.Phase = cloudapi.FirewallAssignmentRejected
+	assignment.RejectedAt = &now
 	s.records[claim.UID] = record
 	return claimWithCreateFence(claim, record), nil
 }
@@ -1108,6 +2017,13 @@ func (s *memoryCreateFenceStore) MarkMaterialized(_ context.Context, claim *karp
 	}
 	if err := validateMaterializedVM(record, vm); err != nil {
 		return nil, err
+	}
+	if !(record.LegacyV2 && record.Phase == createFenceMaterialized) {
+		update, ok := s.floatingIPUpdates[claim.UID]
+		if !ok || update.Phase != cloudapi.FloatingIPUpdateObserved || update.VMUUID != strings.ToLower(vm.UUID) ||
+			update.Address != vm.PublicIPv4 || update.Name != vm.FloatingIPName || update.BillingAccountID != vm.BillingAccountID {
+			return nil, fmt.Errorf("materialized VM lacks its exact observed floating-IP update receipt")
+		}
 	}
 	if record.Phase == createFenceMaterialized {
 		return claimWithCreateFence(claim, record), nil
@@ -1141,6 +2057,10 @@ func validateMaterializedVM(record createFenceRecord, vm *cloudapi.VM) error {
 	}
 	if vm.FloatingIPName == "" || vm.PublicIPv4 == "" {
 		return fmt.Errorf("materialized VM lacks durable floating-IP name or address")
+	}
+	if record.BaseFirewallAssignment == nil || record.BaseFirewallAssignment.Phase != cloudapi.FirewallAssignmentObserved ||
+		record.BaseFirewallAssignment.VMUUID != strings.ToLower(vm.UUID) || record.BaseFirewallAssignment.FirewallUUID != record.Cleanup.FirewallUUID {
+		return fmt.Errorf("materialized VM lacks a durable observed base-firewall assignment")
 	}
 	publicIP, err := netip.ParseAddr(vm.PublicIPv4)
 	if err != nil || !publicIP.Is4() || !publicIP.IsGlobalUnicast() || publicIP.IsPrivate() {
@@ -1221,6 +2141,16 @@ func claimWithCreateFence(claim *karpv1.NodeClaim, record createFenceRecord) *ka
 	}
 	copy.Annotations[AnnotationCreateFence] = mustEncodeCreateFence(record)
 	controllerutil.AddFinalizer(copy, CreateFenceFinalizer)
+	return copy
+}
+
+func claimWithFloatingIPUpdate(claim *karpv1.NodeClaim, createRecord createFenceRecord, update floatingIPUpdateRecord) *karpv1.NodeClaim {
+	copy := claimWithCreateFence(claim, createRecord)
+	encoded, err := json.Marshal(update)
+	if err != nil {
+		panic(err)
+	}
+	copy.Annotations[AnnotationFloatingIPUpdateFence] = string(encoded)
 	return copy
 }
 

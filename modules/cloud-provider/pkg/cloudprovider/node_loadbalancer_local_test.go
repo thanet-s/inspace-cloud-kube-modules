@@ -3,6 +3,7 @@ package cloudprovider
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"reflect"
 	"sort"
 	"strings"
@@ -247,7 +248,7 @@ func TestPublicNodeLocalManualNodeLifecycleUsesExistingFIP(t *testing.T) {
 	service := publicNodeLocalTestService("edge", "edge-service-uid", "edge", corev1.ProtocolTCP, 443)
 	node := publicNodeLocalTestNode("edge-0", vmUUID, privateIP, publicIP)
 	api := &fakeAPI{
-		vms: []inspace.VM{{UUID: vmUUID, Name: node.Name, Hostname: node.Name, PrivateIPv4: privateIP}},
+		vms: []inspace.VM{{UUID: vmUUID, Name: node.Name, Hostname: node.Name, PrivateIPv4: privateIP, BillingAccountID: 42, NetworkUUID: testNetworkUUID}},
 		floatingIPs: []inspace.FloatingIP{{
 			Address: publicIP, BillingAccountID: 42, Type: "public", Enabled: true,
 			AssignedTo: vmUUID, AssignedToResourceType: "virtual_machine", AssignedToPrivateIP: privateIP,
@@ -353,6 +354,59 @@ func TestPublicNodeLocalManualNodeLifecycleUsesExistingFIP(t *testing.T) {
 	}
 }
 
+func TestPublicNodeLocalManualAuthorizationRequiresExactAccountVPCMembership(t *testing.T) {
+	ctx := context.Background()
+	const vmUUID = "21111111-2222-4333-8444-555555555555"
+	node := publicNodeLocalTestNode("edge-identity", vmUUID, "10.0.0.31", "203.0.113.31")
+
+	tests := []struct {
+		name     string
+		mutate   func(*fakeAPI)
+		wantAuth bool
+		wantErr  bool
+	}{
+		{name: "exact membership", wantAuth: true},
+		{name: "zero billing account", mutate: func(api *fakeAPI) { api.vms[0].BillingAccountID = 0 }},
+		{name: "foreign billing account", mutate: func(api *fakeAPI) { api.vms[0].BillingAccountID = 99 }},
+		{name: "foreign VM network", mutate: func(api *fakeAPI) { api.vms[0].NetworkUUID = "99999999-9999-4999-8999-999999999999" }},
+		{name: "foreign canonical network", mutate: func(api *fakeAPI) {
+			api.network = &inspace.Network{UUID: "99999999-9999-4999-8999-999999999999", VMUUIDs: []string{vmUUID}}
+		}},
+		{name: "missing canonical membership", mutate: func(api *fakeAPI) {
+			api.network = &inspace.Network{UUID: testNetworkUUID}
+		}},
+		{name: "duplicate canonical membership", mutate: func(api *fakeAPI) {
+			api.network = &inspace.Network{UUID: testNetworkUUID, VMUUIDs: []string{vmUUID, vmUUID}}
+		}},
+		{name: "canonical membership read outage", mutate: func(api *fakeAPI) {
+			api.networkErr = errors.New("network read unavailable")
+		}, wantErr: true},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			api := &fakeAPI{vms: []inspace.VM{{
+				UUID: vmUUID, Name: node.Name, Hostname: node.Name,
+				BillingAccountID: 42, NetworkUUID: testNetworkUUID,
+			}}}
+			if test.mutate != nil {
+				test.mutate(api)
+			}
+			provider := newTestProvider(t, api)
+			authorized, patched, err := (&nodeLoadBalancerController{provider: provider}).authorizePublicNodeLocalNode(ctx, node, "edge")
+			if test.wantErr {
+				if err == nil || authorized || patched {
+					t.Fatalf("authorization = authorized:%t patched:%t err:%v", authorized, patched, err)
+				}
+				return
+			}
+			if err != nil || authorized != test.wantAuth || patched {
+				t.Fatalf("authorization = authorized:%t patched:%t err:%v", authorized, patched, err)
+			}
+		})
+	}
+}
+
 func TestPublicNodeLocalRejectsUnfencedPreexistingAssignment(t *testing.T) {
 	ctx := context.Background()
 	const (
@@ -365,7 +419,7 @@ func TestPublicNodeLocalRejectsUnfencedPreexistingAssignment(t *testing.T) {
 	service.Finalizers = []string{publicNodeLocalFinalizer}
 	node := publicNodeLocalTestNode("edge-unfenced", vmUUID, privateIP, publicIP)
 	api := &fakeAPI{
-		vms: []inspace.VM{{UUID: vmUUID, Name: node.Name, Hostname: node.Name, PrivateIPv4: privateIP}},
+		vms: []inspace.VM{{UUID: vmUUID, Name: node.Name, Hostname: node.Name, PrivateIPv4: privateIP, BillingAccountID: 42, NetworkUUID: testNetworkUUID}},
 		floatingIPs: []inspace.FloatingIP{{
 			Address: publicIP, BillingAccountID: 42, Type: "public", Enabled: true,
 			AssignedTo: vmUUID, AssignedToResourceType: "virtual_machine", AssignedToPrivateIP: privateIP,
@@ -420,7 +474,7 @@ func TestPublicNodeLocalFreshFenceResumesAssignmentAfterRestart(t *testing.T) {
 	service.Finalizers = []string{publicNodeLocalFinalizer}
 	node := publicNodeLocalTestNode("edge-restart", vmUUID, privateIP, publicIP)
 	api := &fakeAPI{
-		vms: []inspace.VM{{UUID: vmUUID, Name: node.Name, Hostname: node.Name, PrivateIPv4: privateIP}},
+		vms: []inspace.VM{{UUID: vmUUID, Name: node.Name, Hostname: node.Name, PrivateIPv4: privateIP, BillingAccountID: 42, NetworkUUID: testNetworkUUID}},
 		floatingIPs: []inspace.FloatingIP{{
 			Address: publicIP, BillingAccountID: 42, Type: "public", Enabled: true,
 			AssignedTo: vmUUID, AssignedToResourceType: "virtual_machine", AssignedToPrivateIP: privateIP,
@@ -494,7 +548,7 @@ func TestPublicNodeLocalPublishedRestartClearsFreshAssignmentFence(t *testing.T)
 	service.Finalizers = []string{publicNodeLocalFinalizer}
 	node := publicNodeLocalTestNode("edge-published-restart", vmUUID, privateIP, publicIP)
 	api := &fakeAPI{
-		vms: []inspace.VM{{UUID: vmUUID, Name: node.Name, Hostname: node.Name, PrivateIPv4: privateIP}},
+		vms: []inspace.VM{{UUID: vmUUID, Name: node.Name, Hostname: node.Name, PrivateIPv4: privateIP, BillingAccountID: 42, NetworkUUID: testNetworkUUID}},
 		floatingIPs: []inspace.FloatingIP{{
 			Address: publicIP, BillingAccountID: 42, Type: "public", Enabled: true,
 			AssignedTo: vmUUID, AssignedToResourceType: "virtual_machine", AssignedToPrivateIP: privateIP,
@@ -564,8 +618,8 @@ func TestPublicNodeLocalFreshFenceResumesPartialMultiNodeAssignment(t *testing.T
 	}
 	api := &fakeAPI{
 		vms: []inspace.VM{
-			{UUID: firstVM, Name: first.Name, Hostname: first.Name, PrivateIPv4: "10.0.0.71"},
-			{UUID: secondVM, Name: second.Name, Hostname: second.Name, PrivateIPv4: "10.0.0.72"},
+			{UUID: firstVM, Name: first.Name, Hostname: first.Name, PrivateIPv4: "10.0.0.71", BillingAccountID: 42, NetworkUUID: testNetworkUUID},
+			{UUID: secondVM, Name: second.Name, Hostname: second.Name, PrivateIPv4: "10.0.0.72", BillingAccountID: 42, NetworkUUID: testNetworkUUID},
 		},
 		floatingIPs: []inspace.FloatingIP{
 			{Address: firstPublic, BillingAccountID: 42, Type: "public", Enabled: true, AssignedTo: firstVM, AssignedToResourceType: "virtual_machine", AssignedToPrivateIP: "10.0.0.71"},
@@ -676,7 +730,7 @@ func TestPublicNodeLocalKarpenterAuthorizationRequiresLaunchProfileAndMirrorsPro
 		t.Fatal(err)
 	}
 	api := &fakeAPI{
-		vms:       []inspace.VM{{UUID: vmUUID, Name: nodeName, Hostname: nodeName, PrivateIPv4: privateIP, Description: string(description)}},
+		vms:       []inspace.VM{{UUID: vmUUID, Name: nodeName, Hostname: nodeName, PrivateIPv4: privateIP, BillingAccountID: 42, NetworkUUID: testNetworkUUID, Description: string(description)}},
 		firewalls: []inspace.Firewall{publicNodeLocalTestBaseFirewall(vmUUID)},
 		floatingIPs: []inspace.FloatingIP{{
 			Address: publicIP, BillingAccountID: 42, Type: "public", Enabled: true,

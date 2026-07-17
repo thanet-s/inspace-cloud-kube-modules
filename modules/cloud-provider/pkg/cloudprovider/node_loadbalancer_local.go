@@ -48,6 +48,8 @@ type publicNodeLocalVMOwnership struct {
 	FirewallUUID     string `json:"firewallUUID"`
 	NetworkUUID      string `json:"networkUUID"`
 	BillingAccountID int64  `json:"billingAccountID"`
+	FloatingIPName   string `json:"floatingIPName"`
+	PublicIPv4       string `json:"publicIPv4"`
 }
 
 func publicNodeLocalRequested(service *corev1.Service) bool {
@@ -638,11 +640,30 @@ func (c *nodeLoadBalancerController) authorizePublicNodeLocalNode(
 	if err != nil {
 		return false, false, fmt.Errorf("public-node-local: read canonical VM ownership for Node %s: %w", node.Name, err)
 	}
+	if vm == nil || vm.UUID != providerIdentity.UUID ||
+		vm.BillingAccountID != c.provider.config.BillingAccountID ||
+		!strings.EqualFold(vm.NetworkUUID, c.provider.config.NetworkUUID) {
+		return false, false, nil
+	}
+	network, err := c.provider.api.GetNetwork(ctx, providerIdentity.Location, c.provider.config.NetworkUUID)
+	if err != nil {
+		return false, false, fmt.Errorf("public-node-local: read canonical VPC membership for Node %s: %w", node.Name, err)
+	}
+	if network == nil || !strings.EqualFold(network.UUID, c.provider.config.NetworkUUID) {
+		return false, false, nil
+	}
+	memberships := 0
+	for _, vmUUID := range network.VMUUIDs {
+		if vmUUID == providerIdentity.UUID {
+			memberships++
+		}
+	}
+	if memberships != 1 {
+		return false, false, nil
+	}
 	var ownership publicNodeLocalVMOwnership
 	ownershipErr := error(nil)
-	if vm == nil || vm.UUID != providerIdentity.UUID {
-		ownershipErr = errors.New("canonical VM identity does not match the Node providerID")
-	} else if vm.Description != "" {
+	if vm.Description != "" {
 		if parseErr := json.Unmarshal([]byte(vm.Description), &ownership); parseErr != nil &&
 			strings.Contains(vm.Description, "karpenter.inspace.cloud/") {
 			ownershipErr = parseErr
@@ -771,12 +792,26 @@ func (c *nodeLoadBalancerController) publicNodeLocalTrustedBaseFirewall(
 	ctx context.Context,
 	nodeClass *unstructured.Unstructured,
 ) (string, error) {
-	if nodeClass == nil || c.provider.config.NodeLoadBalancer.DefaultNodeClass == "" {
-		return "", errors.New("configured default NodeClass is required")
+	if nodeClass == nil {
+		return "", errors.New("NodeClass is required")
 	}
 	reservePublic, found, err := unstructured.NestedBool(nodeClass.Object, "spec", "reservePublicIPv4")
 	if err != nil || !found || !reservePublic {
 		return "", errors.New("spec.reservePublicIPv4 must be true")
+	}
+	return c.trustedNodeLoadBalancerBaseFirewall(ctx, nodeClass)
+}
+
+// trustedNodeLoadBalancerBaseFirewall binds a derived public NodeClass back to
+// the configured private-worker security boundary. Both NodeClass status
+// objects must confirm the same canonical firewall UUID before a VM ownership
+// record may use it as authorization for any additional public firewall.
+func (c *nodeLoadBalancerController) trustedNodeLoadBalancerBaseFirewall(
+	ctx context.Context,
+	nodeClass *unstructured.Unstructured,
+) (string, error) {
+	if nodeClass == nil || c.provider.config.NodeLoadBalancer.DefaultNodeClass == "" {
+		return "", errors.New("configured default NodeClass is required")
 	}
 	localFirewallUUID, found, err := unstructured.NestedString(nodeClass.Object, "spec", "firewallUUID")
 	if err != nil || !found || !validNodeLoadBalancerCloudUUID(localFirewallUUID) {
@@ -810,6 +845,43 @@ func (c *nodeLoadBalancerController) publicNodeLocalTrustedBaseFirewall(
 		return "", fmt.Errorf("spec.firewallUUID %s does not match trusted default NodeClass firewall %s", localFirewallUUID, baseFirewallUUID)
 	}
 	return baseFirewallUUID, nil
+}
+
+// auditManagedNodeLoadBalancerBaseFirewall proves the live cloud security
+// boundary for one managed VM. NodeClass spec/status and the VM description
+// identify the intended firewall, but only this fresh inventory read proves
+// that the UUID still has our billing identity, exact private-worker policy,
+// and exactly one attachment row for the VM being authorized.
+func (c *nodeLoadBalancerController) auditManagedNodeLoadBalancerBaseFirewall(
+	ctx context.Context,
+	vmUUID, baseFirewallUUID, subnet string,
+) error {
+	base, err := c.exactNodeLoadBalancerFirewallFresh(ctx, baseFirewallUUID)
+	if err != nil {
+		return err
+	}
+	if base.BillingAccountID != c.provider.config.BillingAccountID {
+		return fmt.Errorf("trusted base firewall %s has foreign billing identity", baseFirewallUUID)
+	}
+	if err := bootstrap.ValidateDefaultNodeFirewallPolicy(base, subnet, cloudv1.CiliumNativeRoutingPodCIDR); err != nil {
+		return fmt.Errorf("trusted base firewall %s policy drifted: %w", baseFirewallUUID, err)
+	}
+	assignments := 0
+	for _, relation := range base.ResourcesAssigned {
+		if !strings.EqualFold(relation.ResourceType, "vm") || !validNodeLoadBalancerCloudUUID(relation.ResourceUUID) {
+			return fmt.Errorf("trusted base firewall %s has malformed assignment %#v", baseFirewallUUID, relation)
+		}
+		if strings.EqualFold(relation.ResourceUUID, vmUUID) {
+			if relation.ResourceUUID != vmUUID {
+				return fmt.Errorf("trusted base firewall %s has non-canonical VM assignment %q", baseFirewallUUID, relation.ResourceUUID)
+			}
+			assignments++
+		}
+	}
+	if assignments != 1 {
+		return fmt.Errorf("VM %s must have exactly one trusted base firewall %s assignment, got %d", vmUUID, baseFirewallUUID, assignments)
+	}
+	return nil
 }
 
 func (c *nodeLoadBalancerController) auditPublicNodeLocalVMFirewalls(
@@ -860,25 +932,16 @@ func (c *nodeLoadBalancerController) auditPublicNodeLocalVMFirewalls(
 				return fmt.Errorf("trusted base firewall %s has foreign billing identity", baseFirewallUUID)
 			}
 		}
-		assignmentCount := 0
-		for _, resource := range firewall.ResourcesAssigned {
-			if !strings.EqualFold(resource.ResourceUUID, vmUUID) {
-				continue
-			}
-			if !strings.EqualFold(resource.ResourceType, "vm") {
-				return fmt.Errorf("VM UUID %s appears on firewall %s with resource type %q", vmUUID, firewall.UUID, resource.ResourceType)
-			}
-			assignmentCount++
+		assignments, assignmentErr := nodeLoadBalancerFirewallVMAssignments(firewall)
+		if assignmentErr != nil {
+			return assignmentErr
 		}
-		if assignmentCount == 0 {
+		if _, assigned := assignments[strings.ToLower(vmUUID)]; !assigned {
 			continue
 		}
 		if firewall.UUID == baseFirewallUUID {
-			baseAssignments += assignmentCount
+			baseAssignments++
 			continue
-		}
-		if assignmentCount != 1 {
-			return fmt.Errorf("VM %s has duplicate assignment to additional firewall %s", vmUUID, firewall.UUID)
 		}
 		if err := inspace.ValidateNodeLoadBalancerServiceFirewall(
 			firewall,
@@ -1388,16 +1451,38 @@ func (c *nodeLoadBalancerController) assignPublicNodeLocalFirewallWithFence(
 		!nodeLoadBalancerFirewallOwnedByService(*firewall, c.provider.config.ClusterID, string(service.UID), c.provider.config.BillingAccountID) {
 		return errors.New("public-node-local: refuse assignment without exact Service firewall ownership and policy")
 	}
+	converged, err := c.reconcileNodeLoadBalancerFirewallRelation(
+		ctx,
+		c.serviceFirewallRelationOwner(service),
+		nil,
+	)
+	if err != nil || !converged {
+		return err
+	}
+	assignments, err := nodeLoadBalancerFirewallVMAssignments(*firewall)
+	if err != nil {
+		return err
+	}
 	for _, address := range addresses {
 		vmUUID, _ := nodeLoadBalancerVMUUID(address.Node)
-		if firewallAssignedToVM(*firewall, vmUUID) {
+		if _, assigned := assignments[strings.ToLower(vmUUID)]; assigned {
 			continue
 		}
 		if err := c.validatePublicNodeLocalAssignmentState(ctx, service, intent, desired, firewall.UUID, addresses, true, false); err != nil {
 			return err
 		}
-		if err := c.provider.api.AssignFirewallToVM(ctx, c.provider.config.Location, firewall.UUID, vmUUID); err != nil {
-			return fmt.Errorf("public-node-local: assign firewall %s to VM %s: %w", firewall.UUID, vmUUID, err)
+		converged, relationErr := c.reconcileNodeLoadBalancerFirewallRelation(
+			ctx,
+			c.serviceFirewallRelationOwner(service),
+			&nodeLoadBalancerFirewallRelationFence{
+				operation: nodeLoadBalancerFirewallRelationAssign, firewallUUID: firewall.UUID, vmUUID: vmUUID,
+			},
+		)
+		if relationErr != nil {
+			return fmt.Errorf("public-node-local: assign firewall %s to VM %s: %w", firewall.UUID, vmUUID, relationErr)
+		}
+		if !converged {
+			return nil
 		}
 	}
 	return nil
@@ -1625,6 +1710,9 @@ func (c *nodeLoadBalancerController) publicNodeLocalFirewallAssignmentsMatch(
 		current.Annotations[annotationNodeLoadBalancerFirewallHash] != desired.Hash {
 		return false, errors.New("public-node-local: firewall assignment readback is not bound to the exact current Service ledger and policy")
 	}
+	if current.Annotations[annotationNodeLoadBalancerFirewallRelationIssued] != "" {
+		return false, nil
+	}
 	desiredVMs := make(map[string]struct{}, len(nodes))
 	for _, node := range nodes {
 		vmUUID, ok := nodeLoadBalancerVMUUID(node)
@@ -1651,7 +1739,11 @@ func (c *nodeLoadBalancerController) publicNodeLocalFirewallAssignmentsMatch(
 		if err != nil {
 			return false, err
 		}
-		if len(stale) != 0 || len(firewall.ResourcesAssigned) != len(desiredVMs) {
+		normalizedAssignments, err := nodeLoadBalancerFirewallVMAssignments(firewall)
+		if err != nil {
+			return false, err
+		}
+		if len(stale) != 0 || len(normalizedAssignments) != len(desiredVMs) {
 			return false, nil
 		}
 	}
@@ -1900,6 +1992,17 @@ func (c *nodeLoadBalancerController) cleanupPublicNodeLocal(ctx context.Context,
 		c.requeuePublicNodeLocal(key)
 		return nil
 	}
+	if waiting, completed, err := c.resumeOwnedServiceFirewallDelete(ctx, service); err != nil || waiting {
+		if waiting {
+			c.requeuePublicNodeLocal(key)
+		}
+		return err
+	} else if completed {
+		service, err = c.getExactParentService(ctx, service)
+		if err != nil {
+			return err
+		}
+	}
 	owned, err := c.ownedServiceFirewalls(ctx, service)
 	if err != nil {
 		return err
@@ -1965,6 +2068,10 @@ func (c *nodeLoadBalancerController) cleanupPublicNodeLocal(ctx context.Context,
 		if len(copy.Status.LoadBalancer.Ingress) != 0 {
 			return false, errors.New("public-node-local: public status remains during finalization")
 		}
+		if copy.Annotations[annotationNodeLoadBalancerFWDeleteTarget] != "" ||
+			copy.Annotations[annotationNodeLoadBalancerFWDeleteIssued] != "" {
+			return false, errors.New("public-node-local: refusing finalization while firewall deletion remains fenced")
+		}
 		changed := containsString(copy.Finalizers, publicNodeLocalFinalizer)
 		copy.Finalizers = removeString(copy.Finalizers, publicNodeLocalFinalizer)
 		for _, annotation := range []string{
@@ -1993,6 +2100,8 @@ func (c *nodeLoadBalancerController) cleanupPublicNodeLocal(ctx context.Context,
 			annotationNodeLoadBalancerWithdrawFWDetachAt,
 			annotationPublicNodeLocalAssignPolicy,
 			annotationPublicNodeLocalAssignVMs,
+			annotationNodeLoadBalancerFWDeleteTarget,
+			annotationNodeLoadBalancerFWDeleteIssued,
 		} {
 			if copy.Annotations[annotation] != "" {
 				delete(copy.Annotations, annotation)

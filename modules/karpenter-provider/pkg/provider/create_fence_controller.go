@@ -11,6 +11,7 @@ import (
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
 	controllerruntime "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
@@ -33,13 +34,24 @@ type CreateFenceController struct {
 	kubeClient client.Client
 	apiReader  client.Reader
 	cloud      cloudapi.Cloud
+	namespace  string
 }
 
-func NewCreateFenceController(kubeClient client.Client, apiReader client.Reader, cloud cloudapi.Cloud) (*CreateFenceController, error) {
+func NewCreateFenceController(kubeClient client.Client, apiReader client.Reader, cloud cloudapi.Cloud, namespaces ...string) (*CreateFenceController, error) {
 	if kubeClient == nil || apiReader == nil || cloud == nil {
 		return nil, fmt.Errorf("Kubernetes client, uncached API reader, and cloud are required for VM create-protection finalization")
 	}
-	return &CreateFenceController{kubeClient: kubeClient, apiReader: apiReader, cloud: cloud}, nil
+	if len(namespaces) > 1 {
+		return nil, fmt.Errorf("at most one controller namespace may be supplied for durable firewall coordination")
+	}
+	namespace := "karpenter"
+	if len(namespaces) == 1 {
+		namespace = strings.TrimSpace(namespaces[0])
+	}
+	if namespace == "" {
+		return nil, fmt.Errorf("controller namespace is required for durable firewall coordination")
+	}
+	return &CreateFenceController{kubeClient: kubeClient, apiReader: apiReader, cloud: cloud, namespace: namespace}, nil
 }
 
 func (c *CreateFenceController) Name() string { return "inspace.nodeclaim.create-protection" }
@@ -69,6 +81,19 @@ func (c *CreateFenceController) Reconcile(ctx context.Context, nodeClaim *karpv1
 
 	deleting := !nodeClaim.DeletionTimestamp.IsZero()
 	rollbackChosen := record.Phase == createFenceIssued && record.RollbackAt != nil
+	assignmentStore := &kubernetesCreateFenceStore{writer: c.kubeClient, reader: c.apiReader, namespace: c.namespace, now: time.Now, nonce: createFenceNonce}
+	if encoded := nodeClaim.Annotations[AnnotationRemovalMutationFence]; encoded == "" {
+		if deleting || rollbackChosen {
+			return reconcile.Result{}, fmt.Errorf("NodeClaim %q lacks a removal mutation fence established before deletion/rollback", nodeClaim.Name)
+		}
+		updated, ensureErr := assignmentStore.EnsureRemovalFence(ctx, nodeClaim, record.Binding, record.Token)
+		if ensureErr != nil {
+			return reconcile.Result{}, fmt.Errorf("initializing NodeClaim %q removal mutation fence: %w", nodeClaim.Name, ensureErr)
+		}
+		nodeClaim = updated
+	} else if _, decodeErr := decodeRemovalMutationRecord(encoded, record.Binding, record.Token); decodeErr != nil {
+		return reconcile.Result{}, fmt.Errorf("NodeClaim %q removal mutation fence: %w", nodeClaim.Name, decodeErr)
+	}
 
 	if record.Phase == createFenceIssued && record.IssuedAt == nil {
 		return reconcile.Result{}, fmt.Errorf("issued NodeClaim %q fence has no durable issue time", nodeClaim.Name)
@@ -90,7 +115,7 @@ func (c *CreateFenceController) Reconcile(ctx context.Context, nodeClaim *karpv1
 				break
 			}
 		}
-		store := &kubernetesCreateFenceStore{writer: c.kubeClient, reader: c.apiReader, now: time.Now, nonce: createFenceNonce}
+		store := &kubernetesCreateFenceStore{writer: c.kubeClient, reader: c.apiReader, namespace: c.namespace, now: time.Now, nonce: createFenceNonce}
 		rollbackCtx, cancel := detachedCreateFenceContext(ctx)
 		_, rollbackErr := store.ChooseRollback(rollbackCtx, nodeClaim, record.Binding, record.Token, record.IssueID, record.CreatedVMUUID, anchorReceipt)
 		cancel()
@@ -145,6 +170,95 @@ func (c *CreateFenceController) Reconcile(ctx context.Context, nodeClaim *karpv1
 		ObservedVMUUID:      strings.ToLower(record.ObservedVMUUID),
 		FloatingIPName:      record.FloatingIPName, PublicIPv4: record.PublicIPv4,
 		Resolutions: resolutions, Baseline: cloneCreateInventory(record.Baseline),
+		BaseFirewallAssignment: firewallAssignmentFenceFromRecord(record),
+	}
+	cleanup.AuthorizeBaseFirewall = func(authorizeCtx context.Context, vmUUID string) (cloudapi.FirewallAssignmentAuthorization, error) {
+		updated, authorization, authorizeErr := assignmentStore.AuthorizeBaseFirewall(authorizeCtx, nodeClaim, record.Binding, record.Token, vmUUID)
+		if updated != nil {
+			nodeClaim = updated
+		}
+		return authorization, authorizeErr
+	}
+	cleanup.ObserveBaseFirewall = func(observeCtx context.Context, vmUUID, issueID string) error {
+		observeCtx, cancel := detachedCreateFenceContext(observeCtx)
+		defer cancel()
+		updated, observeErr := assignmentStore.ObserveBaseFirewall(observeCtx, nodeClaim, record.Binding, record.Token, vmUUID, issueID)
+		if observeErr == nil {
+			nodeClaim = updated
+		}
+		return observeErr
+	}
+	cleanup.RejectBaseFirewall = func(rejectCtx context.Context, vmUUID, issueID string) error {
+		rejectCtx, cancel := detachedCreateFenceContext(rejectCtx)
+		defer cancel()
+		updated, rejectErr := assignmentStore.RejectBaseFirewall(rejectCtx, nodeClaim, record.Binding, record.Token, vmUUID, issueID)
+		if rejectErr == nil {
+			nodeClaim = updated
+		}
+		return rejectErr
+	}
+	cleanup.AuthorizeBaseFirewallDetach = func(authorizeCtx context.Context, vmUUID string) (cloudapi.FirewallDetachmentAuthorization, error) {
+		return assignmentStore.AuthorizeBaseFirewallDetach(authorizeCtx, nodeClaim, record.Binding, record.Token, vmUUID)
+	}
+	cleanup.ObserveBaseFirewallDetach = func(observeCtx context.Context, detachFence cloudapi.FirewallDetachmentFence) error {
+		observeCtx, cancel := detachedCreateFenceContext(observeCtx)
+		defer cancel()
+		return assignmentStore.ObserveBaseFirewallDetach(observeCtx, nodeClaim, record.Binding, record.Token, detachFence)
+	}
+	cleanup.RejectBaseFirewallDetach = func(rejectCtx context.Context, detachFence cloudapi.FirewallDetachmentFence) error {
+		rejectCtx, cancel := detachedCreateFenceContext(rejectCtx)
+		defer cancel()
+		return assignmentStore.RejectBaseFirewallDetach(rejectCtx, nodeClaim, record.Binding, record.Token, detachFence)
+	}
+	cleanup.AuthorizeFloatingIPUpdate = func(authorizeCtx context.Context, vmUUID, address, name string, billingAccountID int64) (cloudapi.FloatingIPUpdateAuthorization, error) {
+		updated, authorization, authorizeErr := assignmentStore.AuthorizeFloatingIPUpdate(authorizeCtx, nodeClaim, record.Binding, record.Token, vmUUID, address, name, billingAccountID)
+		if updated != nil {
+			nodeClaim = updated
+		}
+		return authorization, authorizeErr
+	}
+	cleanup.ObserveFloatingIPUpdate = func(observeCtx context.Context, updateFence cloudapi.FloatingIPUpdateFence) error {
+		observeCtx, cancel := detachedCreateFenceContext(observeCtx)
+		defer cancel()
+		updated, observeErr := assignmentStore.ObserveFloatingIPUpdate(observeCtx, nodeClaim, record.Binding, record.Token, updateFence)
+		if updated != nil {
+			nodeClaim = updated
+		}
+		return observeErr
+	}
+	cleanup.RejectFloatingIPUpdate = func(rejectCtx context.Context, updateFence cloudapi.FloatingIPUpdateFence) error {
+		rejectCtx, cancel := detachedCreateFenceContext(rejectCtx)
+		defer cancel()
+		updated, rejectErr := assignmentStore.RejectFloatingIPUpdate(rejectCtx, nodeClaim, record.Binding, record.Token, updateFence)
+		if updated != nil {
+			nodeClaim = updated
+		}
+		return rejectErr
+	}
+	cleanup.AuthorizeRemovalMutation = func(authorizeCtx context.Context, mutation cloudapi.RemovalMutation, present bool) (cloudapi.RemovalMutationAuthorization, error) {
+		updated, authorization, authorizeErr := assignmentStore.AuthorizeRemovalMutation(authorizeCtx, nodeClaim, record.Binding, record.Token, mutation, present)
+		if updated != nil {
+			nodeClaim = updated
+		}
+		return authorization, authorizeErr
+	}
+	cleanup.ObserveRemovalMutation = func(observeCtx context.Context, removalFence cloudapi.RemovalMutationFence) error {
+		observeCtx, cancel := detachedCreateFenceContext(observeCtx)
+		defer cancel()
+		updated, observeErr := assignmentStore.ObserveRemovalMutation(observeCtx, nodeClaim, record.Binding, record.Token, removalFence)
+		if updated != nil {
+			nodeClaim = updated
+		}
+		return observeErr
+	}
+	cleanup.RejectRemovalMutation = func(rejectCtx context.Context, removalFence cloudapi.RemovalMutationFence) error {
+		rejectCtx, cancel := detachedCreateFenceContext(rejectCtx)
+		defer cancel()
+		updated, rejectErr := assignmentStore.RejectRemovalMutation(rejectCtx, nodeClaim, record.Binding, record.Token, removalFence)
+		if updated != nil {
+			nodeClaim = updated
+		}
+		return rejectErr
 	}
 	if record.CleanupVMUUID != "" {
 		cleanup.ObservedVMUUID = record.CleanupVMUUID
@@ -168,7 +282,10 @@ func (c *CreateFenceController) Reconcile(ctx context.Context, nodeClaim *karpv1
 		// deletes the exact UUID instead of exposing it indefinitely.
 		if record.Phase == createFenceIssued && record.CreatedVMUUID != "" {
 			if protectErr := c.cloud.ProtectFencedCreate(ctx, cleanup); protectErr != nil {
-				store := &kubernetesCreateFenceStore{writer: c.kubeClient, reader: c.apiReader, now: time.Now, nonce: createFenceNonce}
+				if errors.Is(protectErr, cloudapi.ErrCreateAttemptPending) {
+					return reconcile.Result{RequeueAfter: createFenceCleanupRequeue}, nil
+				}
+				store := &kubernetesCreateFenceStore{writer: c.kubeClient, reader: c.apiReader, namespace: c.namespace, now: time.Now, nonce: createFenceNonce}
 				rollbackCtx, cancel := detachedCreateFenceContext(ctx)
 				_, rollbackErr := store.ChooseRollback(rollbackCtx, nodeClaim, record.Binding, record.Token, record.IssueID, record.CreatedVMUUID, nil)
 				cancel()
@@ -240,7 +357,7 @@ func (c *CreateFenceController) resolveOperatorCreateFence(
 	if record.IssueID == "" || resolution.IssueID != record.IssueID {
 		return reconcile.Result{}, fmt.Errorf("NodeClaim %q operator resolution issue ID does not match the exact durable attempt", nodeClaim.Name)
 	}
-	store := &kubernetesCreateFenceStore{writer: c.kubeClient, reader: c.apiReader, now: time.Now, nonce: createFenceNonce}
+	store := &kubernetesCreateFenceStore{writer: c.kubeClient, reader: c.apiReader, namespace: c.namespace, now: time.Now, nonce: createFenceNonce}
 	switch resolution.Result {
 	case createFenceResolutionVM:
 		if record.Phase == createFenceMaterialized && record.CreatedVMUUID == resolution.VMUUID ||
@@ -420,16 +537,41 @@ func (c *CreateFenceController) persistCleanupResolution(
 }
 
 func (c *CreateFenceController) removeProtection(ctx context.Context, nodeClaim *karpv1.NodeClaim) error {
-	stored := nodeClaim.DeepCopy()
-	controllerutil.RemoveFinalizer(nodeClaim, CreateFenceFinalizer)
-	delete(nodeClaim.Annotations, AnnotationCreateFence)
-	if err := c.kubeClient.Patch(ctx, nodeClaim, client.MergeFromWithOptions(stored, client.MergeFromWithOptimisticLock{})); err != nil {
-		if apierrors.IsConflict(err) {
-			return fmt.Errorf("NodeClaim %q create-protection CAS conflicted: %w", nodeClaim.Name, err)
+	key := types.NamespacedName{Name: nodeClaim.Name}
+	uid := nodeClaim.UID
+	auditedFence := nodeClaim.Annotations[AnnotationCreateFence]
+	auditedResolution := nodeClaim.Annotations[AnnotationCreateFenceResolution]
+	writeCtx, cancel := detachedCreateFenceContext(ctx)
+	defer cancel()
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var exact karpv1.NodeClaim
+		if err := c.apiReader.Get(writeCtx, key, &exact); err != nil {
+			return client.IgnoreNotFound(err)
 		}
-		return client.IgnoreNotFound(err)
+		if exact.UID != uid {
+			return fmt.Errorf("NodeClaim %q UID changed before create-protection release", nodeClaim.Name)
+		}
+		if !controllerutil.ContainsFinalizer(&exact, CreateFenceFinalizer) {
+			return nil
+		}
+		// Cloud absence was proved against auditedFence. A concurrent Karpenter
+		// status/finalizer write is safe to merge around, but a changed fence may
+		// describe a newly discovered VM or dependent and requires a fresh cloud
+		// cleanup pass before this finalizer can be released.
+		if exact.DeletionTimestamp.IsZero() || exact.Annotations[AnnotationCreateFence] != auditedFence ||
+			exact.Annotations[AnnotationCreateFenceResolution] != auditedResolution {
+			return fmt.Errorf("NodeClaim %q create-protection state changed after cloud cleanup audit", nodeClaim.Name)
+		}
+		stored := exact.DeepCopy()
+		updated := exact.DeepCopy()
+		controllerutil.RemoveFinalizer(updated, CreateFenceFinalizer)
+		delete(updated.Annotations, AnnotationCreateFence)
+		return c.kubeClient.Patch(writeCtx, updated, client.MergeFromWithOptions(stored, client.MergeFromWithOptimisticLock{}))
+	})
+	if apierrors.IsConflict(err) {
+		return fmt.Errorf("NodeClaim %q create-protection CAS did not converge after bounded retries: %w", nodeClaim.Name, err)
 	}
-	return nil
+	return client.IgnoreNotFound(err)
 }
 
 func (c *CreateFenceController) Register(_ context.Context, m manager.Manager) error {
