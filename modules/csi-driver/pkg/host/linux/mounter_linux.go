@@ -6,8 +6,10 @@ package linux
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -33,7 +35,7 @@ func New() (host.Mounter, error) {
 }
 
 func (m *Mounter) Probe(context.Context) error {
-	for _, command := range []string{"blkid", "mkfs.ext4", "mount", "umount"} {
+	for _, command := range []string{"blkid", "lsblk", "mkfs.ext4", "mount", "umount"} {
 		if _, err := exec.LookPath(command); err != nil {
 			return fmt.Errorf("required host command %q is unavailable: %w", command, err)
 		}
@@ -173,6 +175,9 @@ func (m *Mounter) FormatAndMount(ctx context.Context, devicePath, target, fsType
 		}
 		return fmt.Errorf("%w: %s", host.ErrMountConflict, target)
 	}
+	if err := inspectWholeDiskMountSafety(ctx, devicePath); err != nil {
+		return err
+	}
 	filesystem, err := probeFilesystem(ctx, devicePath)
 	if err != nil {
 		return err
@@ -196,6 +201,74 @@ func (m *Mounter) FormatAndMount(ctx context.Context, devicePath, target, fsType
 	args = append(args, "--", devicePath, target)
 	if _, err := run(ctx, "mount", args...); err != nil {
 		return fmt.Errorf("mount ext4 device: %w", err)
+	}
+	return nil
+}
+
+type lsblkDevice struct {
+	Path        string        `json:"path"`
+	Type        string        `json:"type"`
+	Mountpoints []*string     `json:"mountpoints"`
+	Children    []lsblkDevice `json:"children"`
+}
+
+type lsblkOutput struct {
+	Blockdevices []lsblkDevice `json:"blockdevices"`
+}
+
+// inspectWholeDiskMountSafety refuses to format or stage a system disk, a
+// partitioned disk, or a disk mounted anywhere else on the node. A forged CSI
+// volume handle can otherwise resolve to the node's primary virtio disk; blkid
+// commonly reports no filesystem for a partitioned whole disk, which must not
+// be interpreted as authority to run mkfs.ext4 -F.
+func inspectWholeDiskMountSafety(ctx context.Context, devicePath string) error {
+	output, err := run(ctx, "lsblk", "--json", "--paths", "--output", "PATH,TYPE,MOUNTPOINTS", devicePath)
+	if err != nil {
+		return fmt.Errorf("inspect block-device topology: %w", err)
+	}
+	return validateWholeDiskMountSafety([]byte(output), devicePath)
+}
+
+func validateWholeDiskMountSafety(data []byte, expectedPath string) error {
+	var topology lsblkOutput
+	decoder := json.NewDecoder(strings.NewReader(string(data)))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&topology); err != nil {
+		return fmt.Errorf("decode lsblk topology: %w", err)
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return errors.New("decode lsblk topology: trailing data")
+	}
+	if len(topology.Blockdevices) != 1 {
+		return fmt.Errorf("%w: lsblk returned %d roots for %s", host.ErrMountConflict, len(topology.Blockdevices), expectedPath)
+	}
+	device := topology.Blockdevices[0]
+	if filepath.Clean(device.Path) != filepath.Clean(expectedPath) {
+		return fmt.Errorf(
+			"%w: lsblk returned device %q for %q",
+			host.ErrMountConflict,
+			device.Path,
+			expectedPath,
+		)
+	}
+	if device.Type != "disk" {
+		return fmt.Errorf("%w: block device %s has type %q, want whole disk", host.ErrMountConflict, expectedPath, device.Type)
+	}
+	if device.Mountpoints == nil {
+		return fmt.Errorf("%w: lsblk omitted mountpoint authority for %s", host.ErrMountConflict, expectedPath)
+	}
+	for _, mountpoint := range device.Mountpoints {
+		if mountpoint != nil && strings.TrimSpace(*mountpoint) != "" {
+			return fmt.Errorf("%w: block device %s is already mounted at %s", host.ErrMountConflict, expectedPath, *mountpoint)
+		}
+	}
+	if len(device.Children) != 0 {
+		return fmt.Errorf(
+			"%w: block device %s has %d child device(s); refusing whole-disk formatting",
+			host.ErrMountConflict,
+			expectedPath,
+			len(device.Children),
+		)
 	}
 	return nil
 }

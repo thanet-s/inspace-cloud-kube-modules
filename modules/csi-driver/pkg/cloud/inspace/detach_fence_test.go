@@ -39,12 +39,15 @@ func (a *detachFenceAPI) CreateDisk(context.Context, string, sdk.CreateDiskReque
 func (a *detachFenceAPI) GetDisk(context.Context, string, string) (*sdk.Disk, error) {
 	return &sdk.Disk{
 		UUID: testDiskID, DisplayName: "pvc", SizeGiB: 1, Status: "Active", BillingAccountID: 42,
-		Snapshots: []sdk.DiskSnapshot{},
+		SourceImageType: "EMPTY", Snapshots: []sdk.DiskSnapshot{},
 	}, nil
 }
 
 func (a *detachFenceAPI) ListDisks(context.Context, string) ([]sdk.Disk, error) {
-	return []sdk.Disk{{UUID: testDiskID, DisplayName: "pvc", SizeGiB: 1, Status: "Active", BillingAccountID: 42}}, nil
+	return []sdk.Disk{{
+		UUID: testDiskID, DisplayName: "pvc", SizeGiB: 1, Status: "Active", BillingAccountID: 42,
+		SourceImageType: "EMPTY",
+	}}, nil
 }
 
 func (a *detachFenceAPI) DeleteDisk(context.Context, string, string) error {

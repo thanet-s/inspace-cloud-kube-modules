@@ -129,6 +129,64 @@ def _karpenter_vm_ownership(
     return description
 
 
+def _select_owned_csi_disks(
+    disks: list[dict],
+    *,
+    known_disk_ids: set[str],
+    disk_uuid: str,
+    disk_name: str,
+    billing_account: int,
+) -> list[dict]:
+    """Select only the exact named EMPTY disk owned by the E2E PVC.
+
+    VM boot disks are returned by InSpace without display_name and with
+    source_image_type=OS_BASE.  Their lifecycle belongs to their VM and the
+    complete-account inventory, never to the CSI disk journal.  Conversely, a
+    journaled UUID or deterministic PVC name is an ownership claim: if that
+    row does not have the complete CSI identity, abort instead of silently
+    ignoring or adopting it.
+    """
+    exact_claims = set(known_disk_ids)
+    if disk_uuid:
+        exact_claims.add(disk_uuid)
+    selected = []
+    for disk in disks:
+        candidate_uuid = disk.get("uuid")
+        claimed_by_uuid = candidate_uuid in exact_claims
+        claimed_by_name = bool(disk_name) and disk.get("display_name") == disk_name
+        if not claimed_by_uuid and not claimed_by_name:
+            continue
+        if not disk_name:
+            raise SystemExit(
+                "journaled CSI disk UUID is active without its deterministic PVC name"
+            )
+        if disk.get("display_name") != disk_name:
+            raise SystemExit(
+                "journaled CSI disk UUID does not have the deterministic PVC name"
+            )
+        if disk.get("billing_account_id") != billing_account:
+            raise SystemExit(
+                "claimed CSI disk does not belong to the configured billing account"
+            )
+        if disk.get("source_image_type") != "EMPTY":
+            raise SystemExit(
+                "claimed CSI disk is not an EMPTY block-storage disk"
+            )
+        if disk_uuid and candidate_uuid != disk_uuid:
+            raise SystemExit(
+                "deterministic PVC disk name resolves to a different disk UUID"
+            )
+        selected.append(
+            {
+                "uuid": candidate_uuid,
+                "name": disk.get("display_name"),
+            }
+        )
+    if len(selected) > 1:
+        raise SystemExit("multiple active disks satisfy the CSI ownership identity")
+    return selected
+
+
 def audit_once(state: dict, owner: str, cluster: str, nodepool: str) -> dict:
     service_lb = state.get("serviceLoadBalancerName", "")
     service_ip = state.get("serviceFloatingIPName", "")
@@ -270,17 +328,13 @@ def audit_once(state: dict, owner: str, cluster: str, nodepool: str) -> dict:
     ]
 
     all_disks = list(active_resources("storage/disks"))
-    disks = [
-        {"uuid": disk.get("uuid"), "name": disk.get("display_name")}
-        for disk in all_disks
-        if disk.get("uuid") in known_disk_ids
-        or (disk_uuid and disk.get("uuid") == disk_uuid)
-        or (
-            disk_name
-            and disk.get("display_name") == disk_name
-            and disk.get("billing_account_id") == billing_account
-        )
-    ]
+    disks = _select_owned_csi_disks(
+        all_disks,
+        known_disk_ids=known_disk_ids,
+        disk_uuid=disk_uuid,
+        disk_name=disk_name,
+        billing_account=billing_account,
+    )
     result = {
         "vms": sorted(vms, key=lambda item: (item["uuid"], item["name"])),
         "firewalls": sorted(

@@ -283,7 +283,23 @@ def test_list_identity_contracts() -> None:
     firewall_uuid = "33333333-3333-4333-8333-333333333333"
     load_balancer_uuid = "44444444-4444-4444-8444-444444444444"
     disk_uuid = "55555555-5555-4555-8555-555555555555"
+    boot_disk_uuid = "77777777-7777-4777-8777-777777777777"
+    storage_pool_uuid = "88888888-8888-4888-8888-888888888888"
     package_uuid = "66666666-6666-4666-8666-666666666666"
+    boot_disk = {
+        "uuid": boot_disk_uuid,
+        "user_id": 7,
+        "billing_account_id": 8,
+        "status": "Active",
+        "size_gb": 60,
+        "source_image_type": "OS_BASE",
+        "source_image": "ubuntu-24.04",
+        "created_at": "2026-07-17T10:00:00Z",
+        "updated_at": "2026-07-17T10:01:00Z",
+        "read_only_bootable": False,
+        "snapshots": [],
+        "storage_pool_uuid": storage_pool_uuid,
+    }
     valid_lists = {
         "user-resource/vm/list": [
             {
@@ -320,7 +336,15 @@ def test_list_identity_contracts() -> None:
                 "forwarding_rules": [],
             }
         ],
-        "storage/disks": [{"uuid": disk_uuid, "display_name": ""}],
+        "storage/disks": [
+            {
+                "uuid": disk_uuid,
+                "display_name": "pvc-unit-test",
+                "billing_account_id": 8,
+                "source_image_type": "EMPTY",
+            },
+            boot_disk,
+        ],
         "storage/bucket/list": [{"name": "unit-bucket"}],
         "user-resource/service/packages": [{"uuid": package_uuid}],
     }
@@ -371,6 +395,41 @@ def test_list_identity_contracts() -> None:
         "updated_at": "2026-07-17T09:54:01Z",
     }
     invalid_rows = (
+        (
+            "storage/disks",
+            [{"uuid": disk_uuid, "display_name": None}],
+            "disk null display name",
+        ),
+        (
+            "storage/disks",
+            [
+                {
+                    "uuid": disk_uuid,
+                    "display_name": "",
+                    "billing_account_id": 8,
+                    "source_image_type": "EMPTY",
+                }
+            ],
+            "unnamed EMPTY disk",
+        ),
+        (
+            "storage/disks",
+            [{**boot_disk, "source_image_type": "EMPTY"}],
+            "markerless EMPTY disk",
+        ),
+        (
+            "storage/disks",
+            [{**boot_disk, "status": "Provisioning"}],
+            "non-Active markerless OS-base disk",
+        ),
+        (
+            "storage/disks",
+            [
+                boot_disk,
+                {"uuid": boot_disk_uuid, "display_name": "duplicate-disk"},
+            ],
+            "duplicate named and markerless disk identity",
+        ),
         (
             "user-resource/vm/list",
             [{"uuid": vm_uuid, "name": "unit-vm"}],
@@ -461,6 +520,184 @@ def test_list_identity_contracts() -> None:
                 route, value
             ),
             label,
+        )
+    for missing_field in (
+        "user_id",
+        "billing_account_id",
+        "status",
+        "size_gb",
+        "source_image_type",
+        "source_image",
+        "created_at",
+        "updated_at",
+        "read_only_bootable",
+        "snapshots",
+        "storage_pool_uuid",
+    ):
+        incomplete = dict(boot_disk)
+        del incomplete[missing_field]
+        reject(
+            lambda incomplete=incomplete: StrictInSpaceAPI._validate_endpoint_value(  # noqa: SLF001
+                "storage/disks", [incomplete]
+            ),
+            f"incomplete markerless OS-base disk missing {missing_field}",
+        )
+
+
+def test_unnamed_boot_disk_inventory_and_csi_ownership() -> None:
+    account_inventory = load_script(
+        "strict_unnamed_disk_inventory_test", "account-inventory.py"
+    )
+    boot_uuid = "11111111-aaaa-4111-8111-111111111111"
+    csi_uuid = "22222222-bbbb-4222-8222-222222222222"
+    deleted_uuid = "33333333-cccc-4333-8333-333333333333"
+    original_api_get = account_inventory.api_get
+    original_locations = account_inventory.locations
+    account_inventory.locations = lambda: ["bkk01", "hkt01"]
+
+    def inventory_api_get(path: str, location: str | None = None):
+        if path == "storage/disks" and location == "bkk01":
+            return [
+                {
+                    "uuid": boot_uuid,
+                    "status": "Active",
+                    "source_image_type": "OS_BASE",
+                },
+                {
+                    "uuid": csi_uuid,
+                    "status": "Active",
+                    "display_name": "pvc-unit-test",
+                    "source_image_type": "EMPTY",
+                },
+                {
+                    "uuid": deleted_uuid,
+                    "status": "deleted",
+                    "source_image_type": "OS_BASE",
+                },
+            ]
+        return []
+
+    account_inventory.api_get = inventory_api_get
+    try:
+        complete = account_inventory.inventory()
+    finally:
+        account_inventory.api_get = original_api_get
+        account_inventory.locations = original_locations
+    require(
+        complete["disks"]
+        == [f"bkk01:{boot_uuid}", f"bkk01:{csi_uuid}"],
+        "full account inventory did not retain an active unnamed boot-disk UUID",
+    )
+
+    cloud_audit = load_script(
+        "strict_unnamed_disk_cloud_audit_test", "cloud-audit.py"
+    )
+    billing_account = 42
+    disk_name = "pvc-unit-test"
+    boot = {
+        "uuid": boot_uuid,
+        "billing_account_id": billing_account,
+        "status": "Active",
+        "source_image_type": "OS_BASE",
+    }
+    csi = {
+        "uuid": csi_uuid,
+        "display_name": disk_name,
+        "billing_account_id": billing_account,
+        "status": "Active",
+        "source_image_type": "EMPTY",
+    }
+    selected = cloud_audit._select_owned_csi_disks(  # noqa: SLF001
+        [boot, csi],
+        known_disk_ids={csi_uuid},
+        disk_uuid=csi_uuid,
+        disk_name=disk_name,
+        billing_account=billing_account,
+    )
+    require(
+        selected == [{"uuid": csi_uuid, "name": disk_name}],
+        "deterministic audit included a VM boot disk in CSI ownership",
+    )
+    require(
+        cloud_audit._select_owned_csi_disks(  # noqa: SLF001
+            [boot],
+            known_disk_ids=set(),
+            disk_uuid="",
+            disk_name=disk_name,
+            billing_account=billing_account,
+        )
+        == [],
+        "an unclaimed VM boot disk entered the deterministic disk audit",
+    )
+
+    def reject_claim(disks, known, expected_uuid, expected_name, label):
+        try:
+            cloud_audit._select_owned_csi_disks(  # noqa: SLF001
+                disks,
+                known_disk_ids=known,
+                disk_uuid=expected_uuid,
+                disk_name=expected_name,
+                billing_account=billing_account,
+            )
+        except SystemExit:
+            return
+        raise AssertionError(label)
+
+    reject_claim(
+        [boot],
+        {boot_uuid},
+        boot_uuid,
+        disk_name,
+        "journaled boot-disk UUID was accepted as CSI ownership",
+    )
+    reject_claim(
+        [{**csi, "billing_account_id": billing_account + 1}],
+        {csi_uuid},
+        csi_uuid,
+        disk_name,
+        "wrong-account disk was accepted as CSI ownership",
+    )
+    reject_claim(
+        [{**csi, "source_image_type": "OS_BASE"}],
+        {csi_uuid},
+        csi_uuid,
+        disk_name,
+        "named OS-base disk was accepted as CSI ownership",
+    )
+    other_uuid = "44444444-dddd-4444-8444-444444444444"
+    reject_claim(
+        [{**csi, "uuid": other_uuid}],
+        {csi_uuid},
+        csi_uuid,
+        disk_name,
+        "deterministic PVC name overrode the persisted disk UUID",
+    )
+
+    with tempfile.TemporaryDirectory() as temporary:
+        state_path = pathlib.Path(temporary) / "state.json"
+        state = {"knownDiskUUIDs": []}
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        state_path.chmod(0o600)
+        result = {
+            "vms": [],
+            "firewalls": [],
+            "floatingIPs": [],
+            "loadBalancers": [],
+            "disks": selected,
+            "count": len(selected),
+            "strictReadCount": 3,
+        }
+        cloud_audit.persist_audit_identities(
+            state_path,
+            state,
+            result,
+            allow_missing_state=False,
+        )
+        persisted = json.loads(state_path.read_text(encoding="utf-8"))
+        require(
+            persisted.get("knownDiskUUIDs") == [csi_uuid]
+            and boot_uuid not in persisted.get("knownDiskUUIDs", []),
+            "boot-disk UUID entered the durable CSI ownership journal",
         )
 
 
@@ -724,6 +961,7 @@ def main() -> None:
     test_transport_and_json_boundary()
     test_proxy_bypass_and_exact_absence()
     test_list_identity_contracts()
+    test_unnamed_boot_disk_inventory_and_csi_ownership()
     test_stable_zero_proofs()
     test_cloud_audit_expectations()
     print("strict InSpace E2E API tests passed")

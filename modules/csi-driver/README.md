@@ -63,9 +63,15 @@ controller reads that Node's `spec.providerID` and requires an ID shaped like
 accepted for diagnostics, but raw VM UUIDs and account-wide VM-name fallback
 are rejected. Before every disk mutation, canonical detail reads must echo the
 exact disk UUID and configured positive billing account; an omitted billing
-field is rejected. Target VM detail must likewise echo the provider UUID,
-billing account, and `INSPACE_NETWORK_UUID`; the unfiltered VM inventory must
-contain that UUID exactly once and the exact VPC must contain it exactly once.
+field is rejected. Mutable CSI disks must also retain a non-empty display name,
+`source_image_type: EMPTY`, no source image, and
+`read_only_bootable: false`. Every authoritative VM-storage read rejects the
+disk if it is marked as that VM's primary storage. These checks prevent a
+manually constructed volume handle from importing or mutating a VM boot disk;
+supported dynamically provisioned RWO disks are named, empty, and non-primary.
+Target VM detail must likewise echo the provider UUID, billing account, and
+`INSPACE_NETWORK_UUID`; the unfiltered VM inventory must contain that UUID
+exactly once and the exact VPC must contain it exactly once.
 Discovery lists never authorize a mutation by themselves. Attachment discovery
 exact-reads the union of every location-wide VM row and every configured-VPC
 member. A disk visible on a VM outside the configured VPC therefore blocks
@@ -76,6 +82,13 @@ unpublish for a deleted Kubernetes Node is treated as an idempotent no-op; it
 never detaches a different VM's disk. The driver never
 identifies a node by a public or private IP address; public IPv4 egress does not
 change CSI identity or topology.
+
+Static and imported PV handles are unsupported. Disk shape and VM relationships
+prevent a handle from targeting OS, image-backed, bootable, or primary storage,
+but they do not prove which controller originally created an otherwise valid
+named `EMPTY` non-primary disk in the same billing account. Treat cluster-wide
+PV creation, CSI mutation-fence Lease access, and the controller's InSpace
+credential as administrator privileges.
 
 Only `topology.inspace.cloud/location=<configured-location>` is accepted.
 Unknown, empty, or conflicting topology segments are rejected.

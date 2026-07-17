@@ -273,7 +273,45 @@ def _validate_disk_rows(rows: list[Any]) -> None:
         if not isinstance(row, dict):
             raise StrictAPIError(f"{label} is not an object")
         identities.append(_canonical_uuid(row.get("uuid"), label))
-        _required_string(row, "display_name", label, allow_empty=True)
+        if "display_name" in row:
+            # CSI and user-created EMPTY disks are name-addressable.  An empty
+            # or non-string value is not equivalent to the live boot-disk
+            # representation, which omits this field altogether.
+            _required_string(row, "display_name", label)
+            continue
+
+        # InSpace omits display_name from the location disk inventory for a
+        # VM's OS_BASE primary disk.  Accept only the complete live boot-disk
+        # shape; otherwise an incomplete or unnamed EMPTY CSI row could become
+        # invisible to deterministic ownership discovery.
+        for field in ("user_id", "billing_account_id", "size_gb"):
+            value = row.get(field)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise StrictAPIError(
+                    f"{label} unnamed OS-base disk lacks positive integer field {field}"
+                )
+        if row.get("status") != "Active":
+            raise StrictAPIError(
+                f"{label} unnamed OS-base disk is not explicitly Active"
+            )
+        if row.get("source_image_type") != "OS_BASE":
+            raise StrictAPIError(
+                f"{label} unnamed disk is not explicitly sourced from OS_BASE"
+            )
+        _required_string(row, "source_image", label)
+        _canonical_uuid(
+            row.get("storage_pool_uuid"),
+            f"{label} storage pool",
+        )
+        if row.get("read_only_bootable") is not False:
+            raise StrictAPIError(
+                f"{label} unnamed OS-base disk lacks explicit non-bootable readback"
+            )
+        snapshots = _required_list(row, "snapshots", label)
+        if any(not isinstance(snapshot, dict) for snapshot in snapshots):
+            raise StrictAPIError(f"{label} snapshots contain a non-object")
+        _required_string(row, "created_at", label)
+        _required_string(row, "updated_at", label)
     _reject_duplicate_identities(identities, "disk UUID")
 
 
