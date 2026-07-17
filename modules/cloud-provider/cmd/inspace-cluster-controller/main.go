@@ -35,14 +35,23 @@ type infrastructureReconciler interface {
 }
 
 type controllerLoopOptions struct {
-	Once           bool
-	UntilReady     bool
-	DeleteOwned    bool
-	Interval       time.Duration
-	OutputFormat   string
-	StandardOutput io.Writer
-	StandardError  io.Writer
+	Once                  bool
+	UntilReady            bool
+	DeleteOwned           bool
+	Interval              time.Duration
+	IssuedVMCreateTimeout time.Duration
+	OperationTimeout      time.Duration
+	OutputFormat          string
+	StandardOutput        io.Writer
+	StandardError         io.Writer
 }
+
+// The shared HTTP client permits a synchronous VM create to run for up to five
+// minutes. Keep an equally long post-timeout recovery window before a one-shot
+// bootstrap exits, so a server-side create that finishes after the client
+// disconnects can still be adopted and protected without replaying the POST.
+const defaultIssuedVMCreateTimeout = 10 * time.Minute
+const defaultOperationTimeout = 30 * time.Minute
 
 var bootstrapCacheImageNames = []string{
 	"inspace-cloud-controller-manager",
@@ -111,11 +120,25 @@ func run() error {
 	var managementCIDR string
 	var managementTCPPorts string
 	var deleteOwned bool
+	var issuedVMCreateTimeout time.Duration
+	var operationTimeout time.Duration
 	flag.StringVar(&configPath, "cluster-config", "", "path to an InSpaceCluster YAML file")
 	flag.BoolVar(&once, "once", false, "perform one reconciliation and exit")
 	flag.DurationVar(&interval, "interval", 20*time.Second, "minimum reconciliation interval")
 	flag.BoolVar(&version, "version", false, "print version")
 	flag.BoolVar(&untilReady, "until-ready", false, "reconcile until infrastructure is ready, then exit")
+	flag.DurationVar(
+		&issuedVMCreateTimeout,
+		"issued-vm-create-timeout",
+		defaultIssuedVMCreateTimeout,
+		"maximum durable issue age for an authoritatively absent VM create in --until-ready mode",
+	)
+	flag.DurationVar(
+		&operationTimeout,
+		"operation-timeout",
+		defaultOperationTimeout,
+		"overall deadline for --until-ready or multi-pass --delete",
+	)
 	flag.StringVar(&output, "output", "text", "result output format: text or json")
 	flag.StringVar(&sshPublicKeyFile, "ssh-public-key-file", "", "path to one OpenSSH public key (never a private key)")
 	flag.StringVar(&sshUsername, "ssh-username", "", "required for creation: bastion SSH username created by InSpace")
@@ -132,6 +155,12 @@ func run() error {
 	}
 	if once && untilReady {
 		return errors.New("--once and --until-ready are mutually exclusive")
+	}
+	if issuedVMCreateTimeout <= 0 {
+		return errors.New("--issued-vm-create-timeout must be positive")
+	}
+	if operationTimeout <= 0 {
+		return errors.New("--operation-timeout must be positive")
 	}
 	if output != "text" && output != "json" {
 		return errors.New("--output must be text or json")
@@ -195,21 +224,67 @@ func run() error {
 	defer cancel()
 	return runControllerLoop(ctx, reconciler, &cluster, rke2Token, controllerLoopOptions{
 		Once: once, UntilReady: untilReady, DeleteOwned: deleteOwned,
-		Interval: interval, OutputFormat: output,
+		Interval: interval, IssuedVMCreateTimeout: issuedVMCreateTimeout, OperationTimeout: operationTimeout, OutputFormat: output,
 		StandardOutput: os.Stdout, StandardError: os.Stderr,
 	})
 }
 
 func runControllerLoop(ctx context.Context, reconciler infrastructureReconciler, cluster *v1alpha1.InSpaceCluster, rke2Token string, options controllerLoopOptions) error {
+	loopCtx := ctx
+	operationTimeout := options.OperationTimeout
+	var lastOperationError error
+	var lastProgress string
+	boundedOperation := !options.Once && (options.UntilReady || options.DeleteOwned)
+	if boundedOperation {
+		if operationTimeout <= 0 {
+			operationTimeout = defaultOperationTimeout
+		}
+		var cancel context.CancelFunc
+		loopCtx, cancel = context.WithTimeout(ctx, operationTimeout)
+		defer cancel()
+	}
+	operationDeadlineError := func() error {
+		if boundedOperation && errors.Is(loopCtx.Err(), context.DeadlineExceeded) {
+			operation := "bootstrap"
+			if options.DeleteOwned {
+				operation = "delete"
+			}
+			deadlineErr := fmt.Errorf("%s operation exceeded its %s deadline: %w", operation, operationTimeout, context.DeadlineExceeded)
+			if lastOperationError != nil {
+				return errors.Join(deadlineErr, fmt.Errorf("last unresolved cloud error: %w", lastOperationError))
+			}
+			if lastProgress != "" {
+				return fmt.Errorf("%w; last progress: %s", deadlineErr, lastProgress)
+			}
+			return deadlineErr
+		}
+		return nil
+	}
+
 	for {
+		if deadlineErr := operationDeadlineError(); deadlineErr != nil {
+			return deadlineErr
+		}
 		if options.DeleteOwned {
-			result, destroyErr := reconciler.Destroy(ctx, cluster)
+			result, destroyErr := reconciler.Destroy(loopCtx, cluster)
+			if destroyErr != nil {
+				lastOperationError = destroyErr
+			} else {
+				lastOperationError = nil
+				lastProgress = result.Message
+			}
+			if deadlineErr := operationDeadlineError(); deadlineErr != nil {
+				return deadlineErr
+			}
 			if destroyErr != nil {
 				if options.Once || !isRetryable(destroyErr) {
 					return destroyErr
 				}
 				fmt.Fprintf(options.StandardError, "transient destroy error; retrying: %v\n", destroyErr)
-				if !waitFor(ctx, options.Interval) {
+				if !waitFor(loopCtx, options.Interval) {
+					if deadlineErr := operationDeadlineError(); deadlineErr != nil {
+						return deadlineErr
+					}
 					return nil
 				}
 				continue
@@ -220,18 +295,55 @@ func runControllerLoop(ctx context.Context, reconciler infrastructureReconciler,
 			if options.Once || result.Done {
 				return nil
 			}
-			if !waitFor(ctx, options.Interval) {
+			if !waitFor(loopCtx, options.Interval) {
+				if deadlineErr := operationDeadlineError(); deadlineErr != nil {
+					return deadlineErr
+				}
 				return nil
 			}
 			continue
 		}
-		result, reconcileErr := reconciler.Reconcile(ctx, cluster, rke2Token)
+		result, reconcileErr := reconciler.Reconcile(loopCtx, cluster, rke2Token)
+		if reconcileErr != nil {
+			lastOperationError = reconcileErr
+		} else {
+			lastOperationError = nil
+			lastProgress = result.Message
+		}
+		if deadlineErr := operationDeadlineError(); deadlineErr != nil {
+			return deadlineErr
+		}
 		if reconcileErr != nil {
 			if options.Once || !isRetryable(reconcileErr) {
 				return reconcileErr
 			}
+			retryAfter := options.Interval
+			if options.UntilReady {
+				var absentCreate *bootstrap.IssuedVMCreateAbsentError
+				if errors.As(reconcileErr, &absentCreate) {
+					timeout := options.IssuedVMCreateTimeout
+					if timeout <= 0 {
+						timeout = defaultIssuedVMCreateTimeout
+					}
+					remaining := time.Until(absentCreate.IssuedAt.Add(timeout))
+					if remaining <= 0 {
+						return fmt.Errorf(
+							"issued VM create %q exceeded its %s authoritative-absence deadline; refusing to replay: %w",
+							absentCreate.ResourceName,
+							timeout,
+							reconcileErr,
+						)
+					}
+					if retryAfter <= 0 || remaining < retryAfter {
+						retryAfter = remaining
+					}
+				}
+			}
 			fmt.Fprintf(options.StandardError, "transient reconciliation error; retrying: %v\n", reconcileErr)
-			if !waitFor(ctx, options.Interval) {
+			if !waitFor(loopCtx, retryAfter) {
+				if deadlineErr := operationDeadlineError(); deadlineErr != nil {
+					return deadlineErr
+				}
 				return nil
 			}
 			continue
@@ -251,8 +363,11 @@ func runControllerLoop(ctx context.Context, reconciler infrastructureReconciler,
 		}
 		timer := time.NewTimer(wait)
 		select {
-		case <-ctx.Done():
+		case <-loopCtx.Done():
 			timer.Stop()
+			if deadlineErr := operationDeadlineError(); deadlineErr != nil {
+				return deadlineErr
+			}
 			return nil
 		case <-timer.C:
 		}

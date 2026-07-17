@@ -20,6 +20,8 @@ import (
 )
 
 const (
+	maxKubernetesLeaseResponseBytes    = 1 << 20
+	maxKubernetesLeaseListItems        = 4096
 	mutationFenceManagedLabel          = "storage.inspace.cloud/mutation-fence"
 	mutationFenceKeyAnnotation         = "storage.inspace.cloud/fence-key"
 	mutationFenceIntentAnnotation      = "storage.inspace.cloud/fence-intent"
@@ -88,7 +90,7 @@ func (r *KubernetesNodeResolver) List(ctx context.Context, prefix string) ([]mut
 		return nil, kubernetesFenceStatusError("list", status)
 	}
 	var list kubernetesLeaseList
-	if err := json.Unmarshal(data, &list); err != nil {
+	if err := decodeKubernetesLeaseJSON(data, &list); err != nil {
 		return nil, fmt.Errorf("%w: decode Kubernetes mutation Lease list: %v", cloud.ErrUnavailable, err)
 	}
 	result := make([]mutationFence, 0, len(list.Items))
@@ -388,10 +390,194 @@ func validateMutationFence(fence mutationFence) error {
 
 func decodeMutationLease(data []byte) (kubernetesLease, error) {
 	var lease kubernetesLease
-	if err := json.Unmarshal(data, &lease); err != nil {
+	if err := decodeKubernetesLeaseJSON(data, &lease); err != nil {
 		return kubernetesLease{}, fmt.Errorf("%w: decode Kubernetes mutation Lease: %v", cloud.ErrUnavailable, err)
 	}
 	return lease, nil
+}
+
+// decodeKubernetesLeaseJSON rejects ambiguous objects before encoding/json can
+// apply its default last-key-wins behavior. The token pass also proves that the
+// response contains exactly one complete JSON value.
+func decodeKubernetesLeaseJSON(data []byte, destination any) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	if err := validateKubernetesLeaseJSONValue(decoder); err != nil {
+		return err
+	}
+	if token, err := decoder.Token(); err != io.EOF {
+		if err != nil {
+			return fmt.Errorf("invalid trailing JSON: %w", err)
+		}
+		return fmt.Errorf("unexpected trailing JSON token %v", token)
+	}
+	if err := validateKubernetesLeaseSchemaFields(data, destination); err != nil {
+		return err
+	}
+	if err := json.Unmarshal(data, destination); err != nil {
+		return err
+	}
+	return nil
+}
+
+// encoding/json matches struct fields case-insensitively. Check the fixed
+// Lease schema separately so differently cased keys cannot target the same
+// fence/CAS field while annotation and label map keys remain case-sensitive.
+func validateKubernetesLeaseSchemaFields(data []byte, destination any) error {
+	switch destination.(type) {
+	case *kubernetesLease:
+		return validateKubernetesLeaseObject(data)
+	case *kubernetesLeaseList:
+		object, err := decodeSchemaObject(data, []string{"items"})
+		if err != nil {
+			return err
+		}
+		itemsJSON, exists := object["items"]
+		if !exists {
+			return errors.New("Kubernetes Lease list response is missing items")
+		}
+		return validateKubernetesLeaseListItems(itemsJSON)
+	default:
+		return errors.New("unsupported Kubernetes Lease response destination")
+	}
+}
+
+func validateKubernetesLeaseObject(data []byte) error {
+	object, err := decodeSchemaObject(data, []string{"apiVersion", "kind", "metadata", "spec"})
+	if err != nil {
+		return err
+	}
+	metadataJSON, exists := object["metadata"]
+	if !exists {
+		return errors.New("Kubernetes Lease response is missing metadata")
+	}
+	if _, err := decodeSchemaObject(metadataJSON, []string{
+		"name", "namespace", "uid", "resourceVersion", "labels", "annotations",
+	}); err != nil {
+		return fmt.Errorf("Lease metadata: %w", err)
+	}
+	if specJSON, exists := object["spec"]; exists {
+		if _, err := decodeSchemaObject(specJSON, []string{"holderIdentity", "leaseDurationSeconds"}); err != nil {
+			return fmt.Errorf("Lease spec: %w", err)
+		}
+	}
+	return nil
+}
+
+func validateKubernetesLeaseListItems(data []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	token, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	if delimiter, ok := token.(json.Delim); !ok || delimiter != '[' {
+		return errors.New("Kubernetes Lease list items must be a non-null JSON array")
+	}
+	for index := 0; decoder.More(); index++ {
+		if index >= maxKubernetesLeaseListItems {
+			return fmt.Errorf("Kubernetes Lease list exceeds %d items", maxKubernetesLeaseListItems)
+		}
+		var item json.RawMessage
+		if err := decoder.Decode(&item); err != nil {
+			return err
+		}
+		if err := validateKubernetesLeaseObject(item); err != nil {
+			return fmt.Errorf("Lease list item %d: %w", index, err)
+		}
+	}
+	end, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	if end != json.Delim(']') {
+		return errors.New("invalid Kubernetes Lease list items terminator")
+	}
+	return nil
+}
+
+func decodeSchemaObject(data []byte, fields []string) (map[string]json.RawMessage, error) {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || trimmed[0] != '{' {
+		return nil, errors.New("expected a non-null JSON object")
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return nil, err
+	}
+	canonical := make(map[string]json.RawMessage, len(fields))
+	for key, value := range raw {
+		for _, field := range fields {
+			if !strings.EqualFold(key, field) {
+				continue
+			}
+			if key != field {
+				return nil, fmt.Errorf(
+					"non-canonical JSON schema field %q; expected %q",
+					key,
+					field,
+				)
+			}
+			canonical[field] = value
+			break
+		}
+	}
+	return canonical, nil
+}
+
+func validateKubernetesLeaseJSONValue(decoder *json.Decoder) error {
+	token, err := decoder.Token()
+	if err != nil {
+		return fmt.Errorf("invalid JSON: %w", err)
+	}
+	delimiter, isDelimiter := token.(json.Delim)
+	if !isDelimiter {
+		return nil
+	}
+	switch delimiter {
+	case '{':
+		seen := make(map[string]struct{})
+		for decoder.More() {
+			keyToken, err := decoder.Token()
+			if err != nil {
+				return fmt.Errorf("invalid JSON object key: %w", err)
+			}
+			key, ok := keyToken.(string)
+			if !ok {
+				return errors.New("invalid JSON object key")
+			}
+			if _, duplicate := seen[key]; duplicate {
+				return fmt.Errorf("duplicate JSON object key %q", key)
+			}
+			seen[key] = struct{}{}
+			if err := validateKubernetesLeaseJSONValue(decoder); err != nil {
+				return err
+			}
+		}
+		end, err := decoder.Token()
+		if err != nil {
+			return fmt.Errorf("invalid JSON object: %w", err)
+		}
+		if end != json.Delim('}') {
+			return errors.New("invalid JSON object terminator")
+		}
+		return nil
+	case '[':
+		for decoder.More() {
+			if err := validateKubernetesLeaseJSONValue(decoder); err != nil {
+				return err
+			}
+		}
+		end, err := decoder.Token()
+		if err != nil {
+			return fmt.Errorf("invalid JSON array: %w", err)
+		}
+		if end != json.Delim(']') {
+			return errors.New("invalid JSON array terminator")
+		}
+		return nil
+	default:
+		return fmt.Errorf("unexpected JSON delimiter %q", delimiter)
+	}
 }
 
 func (r *KubernetesNodeResolver) getMutationLease(ctx context.Context, name string) (kubernetesLease, int, error) {
@@ -451,9 +637,31 @@ func (r *KubernetesNodeResolver) mutationLeaseRequest(ctx context.Context, metho
 		return 0, nil, fmt.Errorf("%w: Kubernetes mutation Lease request: %v", cloud.ErrUnavailable, err)
 	}
 	defer resp.Body.Close()
-	data, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.ContentLength > maxKubernetesLeaseResponseBytes {
+		return resp.StatusCode, nil, fmt.Errorf(
+			"%w: Kubernetes mutation Lease response exceeds %d bytes",
+			cloud.ErrUnavailable,
+			maxKubernetesLeaseResponseBytes,
+		)
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxKubernetesLeaseResponseBytes+1))
 	if err != nil {
 		return resp.StatusCode, nil, fmt.Errorf("%w: read Kubernetes mutation Lease response: %v", cloud.ErrUnavailable, err)
+	}
+	if len(data) > maxKubernetesLeaseResponseBytes {
+		return resp.StatusCode, nil, fmt.Errorf(
+			"%w: Kubernetes mutation Lease response exceeds %d bytes",
+			cloud.ErrUnavailable,
+			maxKubernetesLeaseResponseBytes,
+		)
+	}
+	if resp.ContentLength >= 0 && int64(len(data)) != resp.ContentLength {
+		return resp.StatusCode, nil, fmt.Errorf(
+			"%w: Kubernetes mutation Lease response body length %d does not match declared Content-Length %d",
+			cloud.ErrUnavailable,
+			len(data),
+			resp.ContentLength,
+		)
 	}
 	return resp.StatusCode, data, nil
 }

@@ -221,7 +221,10 @@ go run ./cmd/inspace-cluster-controller \
   --ssh-public-key-file "$HOME/.ssh/id_rsa.pub" \
   --ssh-username inspacee2e \
   --management-tcp-ports 22 \
-  --until-ready --output=json
+  --until-ready \
+  --issued-vm-create-timeout 10m \
+  --operation-timeout 30m \
+  --output=json
 ```
 
 The SSH username/key and TCP/22 are required because every cluster has the
@@ -241,6 +244,14 @@ This makes a same-name VM from another namespace a fail-closed collision, not
 an adoption candidate. An uncertain API response is resolved by listing and
 validating the exact deterministic name and owner/spec record on the next loop,
 not by blindly repeating the POST.
+The issued-create timeout is measured from the durable issue timestamp, so it
+survives process restart and leaves a full recovery window after the client's
+five-minute synchronous VM-create timeout. The overall operation timeout also
+bounds unresolved firewall, floating-IP, readback, and progress states.
+Either expiry returns nonzero with every receipt intact; a caller may then run
+guarded owned teardown or obtain provider-side resolution without risking a
+duplicate mutation. Continuous mode and `--once` do not install the overall
+deadline.
 
 New control-plane owner/spec records use schema v8 because kube-vip's explicit
 5/3/1-second election timing and 500-millisecond ARP cadence are part of their
@@ -297,8 +308,15 @@ UUID, wrong deterministic name, different firewall, or duplicate assignment.
 go run ./cmd/inspace-cluster-controller \
   --cluster-config ./examples/inspacecluster.yaml \
   --management-tcp-ports 22 \
-  --delete --output=json
+  --delete \
+  --operation-timeout 30m \
+  --output=json
 ```
+
+Multi-pass deletion uses the same overall deadline. If InSpace cannot resolve
+an issued destructive request inside that window, the command exits nonzero
+and retains its exact no-replay receipt. Re-running teardown resumes
+authoritative readback; it does not send the destructive request again.
 
 `infrastructureReady=true` means the bastion, three control-plane VMs, four
 floating addresses, and both firewall assignments exist in the API. It does

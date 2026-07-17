@@ -18,10 +18,12 @@ import (
 )
 
 const (
-	defaultUserAgent     = "cloud-provider-inspace/dev"
-	defaultHTTPTimeout   = 5 * time.Minute
-	defaultReadTimeout   = 30 * time.Second
-	maxResponseBodyBytes = 4 << 20
+	defaultUserAgent           = "cloud-provider-inspace/dev"
+	defaultHTTPTimeout         = 5 * time.Minute
+	defaultReadTimeout         = 30 * time.Second
+	maxResponseBodyBytes       = 4 << 20
+	warrenCorrelationIDHeader  = "X-Warren-Correlation-Id"
+	maxWarrenCorrelationIDSize = 128
 )
 
 var (
@@ -38,9 +40,10 @@ var (
 	// changing endpoint identity. Controllers use successful GETs as
 	// authoritative presence/absence evidence, so even a same-origin redirect
 	// must be handled as an error rather than rebound to the original request.
-	ErrReadRedirect = errors.New("inspace: read redirect blocked")
-	locationPattern = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
-	uuidPattern     = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
+	ErrReadRedirect            = errors.New("inspace: read redirect blocked")
+	locationPattern            = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
+	uuidPattern                = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
+	warrenCorrelationIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]*$`)
 )
 
 // Options configures a Client. Mutating requests are safe by default: they are
@@ -236,64 +239,72 @@ func (c *Client) doBody(ctx context.Context, method, path string, query url.Valu
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
+		// net/http can return both a response and an error when redirect policy
+		// rejects the response. Preserve the provider-generated diagnostic
+		// correlation ID without weakening the no-redirect mutation contract.
+		if resp != nil {
+			if resp.Body != nil {
+				_ = resp.Body.Close()
+			}
+			return &APIError{
+				StatusCode:    resp.StatusCode,
+				Method:        method,
+				Path:          path,
+				Message:       err.Error(),
+				Retryable:     retryableAPIStatus(resp.StatusCode),
+				CorrelationID: validatedWarrenCorrelationID(resp.Header),
+				cause:         err,
+			}
+		}
 		return fmt.Errorf("inspace: %s %s: %w", method, path, err)
 	}
 	defer resp.Body.Close()
+	correlationID := validatedWarrenCorrelationID(resp.Header)
 	if resp.ContentLength > maxResponseBodyBytes {
-		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			return newIncompleteAPIError(
-				method,
-				path,
-				resp.StatusCode,
-				fmt.Sprintf("declared response body exceeds %d bytes and was not trusted", maxResponseBodyBytes),
-			)
-		}
-		return fmt.Errorf("inspace: read %s %s response: declared body exceeds %d bytes", method, path, maxResponseBodyBytes)
+		return newIncompleteAPIError(
+			method,
+			path,
+			resp.StatusCode,
+			fmt.Sprintf("declared response body exceeds %d bytes and was not trusted", maxResponseBodyBytes),
+			correlationID,
+			nil,
+		)
 	}
 	data, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBodyBytes+1))
 	if err != nil {
-		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			return newIncompleteAPIError(
-				method,
-				path,
-				resp.StatusCode,
-				fmt.Sprintf("response body could not be read completely: %v", err),
-			)
-		}
-		return fmt.Errorf("inspace: read %s %s response: %w", method, path, err)
-	}
-	if len(data) > maxResponseBodyBytes {
-		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			return newIncompleteAPIError(
-				method,
-				path,
-				resp.StatusCode,
-				fmt.Sprintf("response body exceeds %d bytes and was not trusted", maxResponseBodyBytes),
-			)
-		}
-		return fmt.Errorf("inspace: read %s %s response: body exceeds %d bytes", method, path, maxResponseBodyBytes)
-	}
-	if resp.ContentLength > 0 && int64(len(data)) != resp.ContentLength {
-		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			return newIncompleteAPIError(
-				method,
-				path,
-				resp.StatusCode,
-				fmt.Sprintf("response body length %d does not match declared length %d", len(data), resp.ContentLength),
-			)
-		}
-		return fmt.Errorf(
-			"inspace: read %s %s response: body length %d does not match declared length %d",
+		return newIncompleteAPIError(
 			method,
 			path,
-			len(data),
-			resp.ContentLength,
+			resp.StatusCode,
+			fmt.Sprintf("response body could not be read completely: %v", err),
+			correlationID,
+			err,
+		)
+	}
+	if len(data) > maxResponseBodyBytes {
+		return newIncompleteAPIError(
+			method,
+			path,
+			resp.StatusCode,
+			fmt.Sprintf("response body exceeds %d bytes and was not trusted", maxResponseBodyBytes),
+			correlationID,
+			nil,
+		)
+	}
+	if resp.ContentLength > 0 && int64(len(data)) != resp.ContentLength {
+		return newIncompleteAPIError(
+			method,
+			path,
+			resp.StatusCode,
+			fmt.Sprintf("response body length %d does not match declared length %d", len(data), resp.ContentLength),
+			correlationID,
+			nil,
 		)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return newAPIError(method, path, resp.StatusCode, data)
+		return newAPIError(method, path, resp.StatusCode, data, correlationID)
 	}
-	if err := validateSuccessResponse(method, path, resp.StatusCode, out != nil, data); err != nil {
+	if err := validateSuccessResponse(method, path, resp.StatusCode, out != nil, data, correlationID); err != nil {
 		return err
 	}
 	if out == nil {
@@ -301,22 +312,22 @@ func (c *Client) doBody(ctx context.Context, method, path string, query url.Valu
 	}
 	trimmed := bytes.TrimSpace(data)
 	if len(trimmed) == 0 {
-		return fmt.Errorf("inspace: decode %s %s response: expected a non-empty JSON value", method, path)
+		return newMalformedResponseAPIError(method, path, resp.StatusCode, "expected a non-empty JSON value", correlationID, nil)
 	}
 	if bytes.Equal(trimmed, []byte("null")) {
-		return fmt.Errorf("inspace: decode %s %s response: expected a non-null JSON value", method, path)
+		return newMalformedResponseAPIError(method, path, resp.StatusCode, "expected a non-null JSON value", correlationID, nil)
 	}
 	if err := validateJSONNoDuplicateObjectKeys(trimmed); err != nil {
-		return fmt.Errorf("inspace: decode %s %s response: %w", method, path, err)
+		return newMalformedResponseAPIError(method, path, resp.StatusCode, err.Error(), correlationID, err)
 	}
 	if trimmed[0] == '{' {
 		var object map[string]json.RawMessage
 		if err := json.Unmarshal(trimmed, &object); err == nil && len(object) == 0 {
-			return fmt.Errorf("inspace: decode %s %s response: expected a non-empty JSON object", method, path)
+			return newMalformedResponseAPIError(method, path, resp.StatusCode, "expected a non-empty JSON object", correlationID, nil)
 		}
 	}
 	if err := json.Unmarshal(trimmed, out); err != nil {
-		return fmt.Errorf("inspace: decode %s %s response: %w", method, path, err)
+		return newMalformedResponseAPIError(method, path, resp.StatusCode, err.Error(), correlationID, err)
 	}
 	return nil
 }
@@ -469,46 +480,117 @@ var endpointContracts = []endpointContract{
 	{http.MethodDelete, "/v1/{location}/network/load_balancers/{uuid}/forwarding_rules/{uuid}", statusOKOnly, successEmpty},
 }
 
-func validateSuccessResponse(method, path string, status int, expectsJSON bool, data []byte) error {
+func validateSuccessResponse(method, path string, status int, expectsJSON bool, data []byte, correlationID string) error {
 	contract, ok := endpointSuccessContract(method, path)
 	if !ok {
 		return &APIError{
-			StatusCode: status,
-			Method:     method,
-			Path:       path,
-			Message:    "successful response has no registered SDK endpoint contract",
+			StatusCode:    status,
+			Method:        method,
+			Path:          path,
+			Message:       "successful response has no registered SDK endpoint contract",
+			CorrelationID: correlationID,
 		}
 	}
 	if !containsHTTPStatus(contract.statuses, status) {
 		return &APIError{
-			StatusCode: status,
-			Method:     method,
-			Path:       path,
-			Message:    fmt.Sprintf("unexpected successful HTTP status %d for this endpoint; allowed statuses are %v", status, contract.statuses),
+			StatusCode:    status,
+			Method:        method,
+			Path:          path,
+			Message:       fmt.Sprintf("unexpected successful HTTP status %d for this endpoint; allowed statuses are %v", status, contract.statuses),
+			CorrelationID: correlationID,
 		}
 	}
 	if expectsJSON != (contract.body == successJSON) {
-		return fmt.Errorf(
-			"inspace: internal response contract mismatch for %s %s: JSON output=%t",
-			method,
-			path,
-			expectsJSON,
-		)
+		return &APIError{
+			StatusCode:    status,
+			Method:        method,
+			Path:          path,
+			Message:       fmt.Sprintf("internal response contract mismatch: JSON output=%t", expectsJSON),
+			CorrelationID: correlationID,
+		}
 	}
 	trimmed := bytes.TrimSpace(data)
 	switch contract.body {
 	case successEmpty:
 		if len(trimmed) != 0 {
-			return fmt.Errorf("inspace: decode %s %s response: expected an empty success body", method, path)
+			return newMalformedResponseAPIError(
+				method,
+				path,
+				status,
+				"expected an empty success body",
+				correlationID,
+				nil,
+			)
 		}
 	case successEmptyOrJSON:
 		if len(trimmed) != 0 {
 			if err := validateJSONNoDuplicateObjectKeys(trimmed); err != nil {
-				return fmt.Errorf("inspace: decode %s %s optional success response: %w", method, path, err)
+				return newMalformedResponseAPIError(
+					method,
+					path,
+					status,
+					fmt.Sprintf("invalid optional success response: %v", err),
+					correlationID,
+					err,
+				)
 			}
 		}
 	}
 	return nil
+}
+
+func validWarrenCorrelationID(value string) bool {
+	return value != "" &&
+		len(value) <= maxWarrenCorrelationIDSize &&
+		warrenCorrelationIDPattern.MatchString(value)
+}
+
+// validatedWarrenCorrelationID accepts exactly one compact ASCII identifier.
+// The header is provider-generated diagnostic metadata, never dispatch or
+// idempotency authority. Ambiguous, oversized, or log-unsafe values are
+// discarded instead of being reflected into controller logs.
+func validatedWarrenCorrelationID(header http.Header) string {
+	values := header.Values(warrenCorrelationIDHeader)
+	if len(values) != 1 || !validWarrenCorrelationID(values[0]) {
+		return ""
+	}
+	return values[0]
+}
+
+func newMalformedResponseAPIError(
+	method, path string,
+	status int,
+	message, correlationID string,
+	cause error,
+) *APIError {
+	return &APIError{
+		StatusCode:            status,
+		Method:                method,
+		Path:                  path,
+		Message:               message,
+		Retryable:             retryableHTTPResponseFailure(status, cause),
+		CorrelationID:         correlationID,
+		ResponseBodyMalformed: true,
+		cause:                 cause,
+	}
+}
+
+func newIncompleteAPIError(
+	method, path string,
+	status int,
+	message, correlationID string,
+	cause error,
+) *APIError {
+	return &APIError{
+		StatusCode:             status,
+		Method:                 method,
+		Path:                   path,
+		Message:                message,
+		Retryable:              retryableHTTPResponseFailure(status, cause),
+		CorrelationID:          correlationID,
+		ResponseBodyIncomplete: true,
+		cause:                  cause,
+	}
 }
 
 func containsHTTPStatus(statuses []int, candidate int) bool {
@@ -609,16 +691,22 @@ func validatedRequiredListIdentity(kind, value string) (string, error) {
 	return strings.ToLower(value), nil
 }
 
-// APIError is a normalized non-2xx API response. Retryable is only a scheduling
-// hint: for POST, PUT, PATCH, and DELETE, no HTTP status proves that the
-// mutation did not commit. Callers must resolve the outcome by authoritative
-// readback before replaying or releasing durable ownership.
+// APIError is a normalized HTTP response failure. It covers non-2xx responses
+// as well as malformed, incomplete, or endpoint-incompatible successful
+// responses. Retryable is only a scheduling hint: for POST, PUT, PATCH, and
+// DELETE, no HTTP status proves that the mutation did not commit. Callers must
+// resolve the outcome by authoritative readback before replaying or releasing
+// durable ownership.
 type APIError struct {
 	StatusCode int
 	Method     string
 	Path       string
 	Message    string
 	Retryable  bool
+	// CorrelationID is provider-generated diagnostic metadata from the
+	// X-Warren-Correlation-Id response header. It is strictly validated before
+	// storage and must never be used as mutation or idempotency authority.
+	CorrelationID string
 	// ResponseBodyIncomplete is true when response headers were observed but
 	// the error body could not be read in full. Status still provides a retry
 	// scheduling hint, but an incomplete 400/404 body must never become
@@ -639,13 +727,28 @@ type APIError struct {
 	// RequestedAddress is populated only by an exact floating-IP lookup.
 	// Floating IP identity is its canonical public address, not a UUID.
 	RequestedAddress string
+	cause            error
 }
 
 func (e *APIError) Error() string {
-	return fmt.Sprintf("inspace: %s %s returned HTTP %d: %s", e.Method, e.Path, e.StatusCode, e.Message)
+	message := fmt.Sprintf("inspace: %s %s returned HTTP %d: %s", e.Method, e.Path, e.StatusCode, e.Message)
+	switch {
+	case e.CorrelationID == "":
+		return message
+	case validWarrenCorrelationID(e.CorrelationID):
+		return fmt.Sprintf("%s [correlation-id=%s]", message, e.CorrelationID)
+	default:
+		// APIError is exported and callers can construct it directly. Keep
+		// Error() log-safe even when a caller bypasses constructor validation.
+		return message + " [correlation-id=<redacted>]"
+	}
 }
 
-func newAPIError(method, path string, status int, data []byte) *APIError {
+func (e *APIError) Unwrap() error {
+	return e.cause
+}
+
+func newAPIError(method, path string, status int, data []byte, correlationID string) *APIError {
 	message := strings.TrimSpace(string(data))
 	var payload struct {
 		Error   any            `json:"error"`
@@ -680,18 +783,8 @@ func newAPIError(method, path string, status int, data []byte) *APIError {
 		Path:                  path,
 		Message:               message,
 		Retryable:             retryableAPIStatus(status),
+		CorrelationID:         correlationID,
 		ResponseBodyMalformed: malformed,
-	}
-}
-
-func newIncompleteAPIError(method, path string, status int, message string) *APIError {
-	return &APIError{
-		StatusCode:             status,
-		Method:                 method,
-		Path:                   path,
-		Message:                message,
-		Retryable:              retryableAPIStatus(status),
-		ResponseBodyIncomplete: true,
 	}
 }
 
@@ -699,6 +792,14 @@ func retryableAPIStatus(status int) bool {
 	return status == http.StatusRequestTimeout ||
 		status == http.StatusTooManyRequests ||
 		status >= 500
+}
+
+func retryableHTTPResponseFailure(status int, cause error) bool {
+	if retryableAPIStatus(status) {
+		return true
+	}
+	var networkErr net.Error
+	return errors.As(cause, &networkErr) && (networkErr.Timeout() || networkErr.Temporary())
 }
 
 func bindExactLookupError(err error, requestedUUID string) error {

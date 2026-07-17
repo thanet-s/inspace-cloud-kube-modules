@@ -90,8 +90,13 @@ type createFenceRecord struct {
 	// after full v3, billing-account, and configured-VPC proof. An SDK response
 	// UUID is provisional until then. RollbackAt is an independent, irreversible
 	// decision which races materialization for this same UUID.
-	LaunchObservedAt     *time.Time `json:"launchObservedAt,omitempty"`
-	CreatedVMUUID        string     `json:"createdVMUUID,omitempty"`
+	LaunchObservedAt *time.Time `json:"launchObservedAt,omitempty"`
+	CreatedVMUUID    string     `json:"createdVMUUID,omitempty"`
+	// ProtectionFailureAt starts a durable, restart-stable grace period when
+	// protection readback reports pending but no dependent mutation remains
+	// issued. It prevents an observed-then-drifted firewall or floating IP from
+	// leaving the anchored public VM exposed forever.
+	ProtectionFailureAt  *time.Time `json:"protectionFailureAt,omitempty"`
 	RollbackAt           *time.Time `json:"rollbackAt,omitempty"`
 	DependentUnresolved  bool       `json:"dependentUnresolved,omitempty"`
 	DependentsResolvedAt *time.Time `json:"dependentsResolvedAt,omitempty"`
@@ -918,6 +923,127 @@ func floatingIPUpdateIdentityMatches(record floatingIPUpdateRecord, fence clouda
 	return record.VMUUID == strings.ToLower(fence.VMUUID) && record.Address == fence.Address && record.Name == fence.Name && record.BillingAccountID == fence.BillingAccountID
 }
 
+func (s *kubernetesCreateFenceStore) RecordProtectionFailure(
+	ctx context.Context,
+	claim *karpv1.NodeClaim,
+	binding createFenceBinding,
+	token, issueID, vmUUID string,
+) (*karpv1.NodeClaim, time.Time, error) {
+	vmUUID = strings.ToLower(vmUUID)
+	if !createFenceVMUUIDPattern.MatchString(vmUUID) || !createFenceKeyHashPattern.MatchString(issueID) {
+		return nil, time.Time{}, fmt.Errorf("recording protection failure requires canonical VM and issue identities")
+	}
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		current, readErr := s.getProtectedExact(ctx, claim, "record protection failure")
+		if readErr != nil {
+			return nil, time.Time{}, readErr
+		}
+		record, parseErr := parseCreateFence(current.Annotations[AnnotationCreateFence], binding)
+		if parseErr != nil {
+			return nil, time.Time{}, parseErr
+		}
+		if token == "" || record.Token != token || record.IssueID != issueID || record.Phase != createFenceIssued ||
+			record.IssuedAt == nil || record.CreatedVMUUID != vmUUID || record.LaunchObservedAt == nil || record.RollbackAt != nil {
+			return nil, time.Time{}, fmt.Errorf("NodeClaim %q protection failure does not match its exact live anchored create attempt", claim.Name)
+		}
+		if record.ProtectionFailureAt != nil {
+			return current, record.ProtectionFailureAt.UTC(), nil
+		}
+		now := s.now().UTC()
+		record.ProtectionFailureAt = &now
+		encoded, err := json.Marshal(record)
+		if err != nil {
+			return nil, time.Time{}, fmt.Errorf("encoding NodeClaim %q protection failure: %w", claim.Name, err)
+		}
+		copy := current.DeepCopy()
+		copy.Annotations[AnnotationCreateFence] = string(encoded)
+		writeErr := s.writer.Update(ctx, copy)
+		var readback karpv1.NodeClaim
+		if readErr := s.reader.Get(ctx, types.NamespacedName{Name: claim.Name}, &readback); readErr != nil {
+			lastErr = errors.Join(writeErr, readErr)
+			continue
+		}
+		if readback.UID != current.UID || !controllerutil.ContainsFinalizer(&readback, CreateFenceFinalizer) {
+			return nil, time.Time{}, fmt.Errorf("NodeClaim %q changed identity or lost protection while recording protection failure", claim.Name)
+		}
+		stored, parseErr := parseCreateFence(readback.Annotations[AnnotationCreateFence], binding)
+		if parseErr != nil {
+			lastErr = errors.Join(writeErr, parseErr)
+			continue
+		}
+		if stored.Token == token && stored.IssueID == issueID && stored.Phase == createFenceIssued &&
+			stored.CreatedVMUUID == vmUUID && stored.RollbackAt == nil && stored.ProtectionFailureAt != nil {
+			return &readback, stored.ProtectionFailureAt.UTC(), nil
+		}
+		if stored.RollbackAt != nil || stored.Phase != createFenceIssued || stored.CreatedVMUUID != vmUUID {
+			return nil, time.Time{}, fmt.Errorf("NodeClaim %q changed terminal state before protection failure committed", claim.Name)
+		}
+		lastErr = errors.Join(writeErr, fmt.Errorf("protection failure readback did not contain the durable marker"))
+	}
+	return nil, time.Time{}, fmt.Errorf("persisting protection failure for NodeClaim %q did not converge: %w", claim.Name, lastErr)
+}
+
+func (s *kubernetesCreateFenceStore) ClearProtectionFailure(
+	ctx context.Context,
+	claim *karpv1.NodeClaim,
+	binding createFenceBinding,
+	token, issueID, vmUUID string,
+) (*karpv1.NodeClaim, error) {
+	vmUUID = strings.ToLower(vmUUID)
+	if !createFenceVMUUIDPattern.MatchString(vmUUID) || !createFenceKeyHashPattern.MatchString(issueID) {
+		return nil, fmt.Errorf("clearing protection failure requires canonical VM and issue identities")
+	}
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		current, readErr := s.getProtectedExact(ctx, claim, "clear protection failure")
+		if readErr != nil {
+			return nil, readErr
+		}
+		record, parseErr := parseCreateFence(current.Annotations[AnnotationCreateFence], binding)
+		if parseErr != nil {
+			return nil, parseErr
+		}
+		if token == "" || record.Token != token || record.IssueID != issueID || record.Phase != createFenceIssued ||
+			record.IssuedAt == nil || record.CreatedVMUUID != vmUUID || record.LaunchObservedAt == nil || record.RollbackAt != nil {
+			return nil, fmt.Errorf("NodeClaim %q protection recovery does not match its exact live anchored create attempt", claim.Name)
+		}
+		if record.ProtectionFailureAt == nil {
+			return current, nil
+		}
+		record.ProtectionFailureAt = nil
+		encoded, err := json.Marshal(record)
+		if err != nil {
+			return nil, fmt.Errorf("encoding NodeClaim %q protection recovery: %w", claim.Name, err)
+		}
+		copy := current.DeepCopy()
+		copy.Annotations[AnnotationCreateFence] = string(encoded)
+		writeErr := s.writer.Update(ctx, copy)
+		var readback karpv1.NodeClaim
+		if readErr := s.reader.Get(ctx, types.NamespacedName{Name: claim.Name}, &readback); readErr != nil {
+			lastErr = errors.Join(writeErr, readErr)
+			continue
+		}
+		if readback.UID != current.UID || !controllerutil.ContainsFinalizer(&readback, CreateFenceFinalizer) {
+			return nil, fmt.Errorf("NodeClaim %q changed identity or lost protection while clearing protection failure", claim.Name)
+		}
+		stored, parseErr := parseCreateFence(readback.Annotations[AnnotationCreateFence], binding)
+		if parseErr != nil {
+			lastErr = errors.Join(writeErr, parseErr)
+			continue
+		}
+		if stored.Token == token && stored.IssueID == issueID && stored.Phase == createFenceIssued &&
+			stored.CreatedVMUUID == vmUUID && stored.RollbackAt == nil && stored.ProtectionFailureAt == nil {
+			return &readback, nil
+		}
+		if stored.RollbackAt != nil || stored.Phase != createFenceIssued || stored.CreatedVMUUID != vmUUID {
+			return nil, fmt.Errorf("NodeClaim %q changed terminal state before protection recovery committed", claim.Name)
+		}
+		lastErr = errors.Join(writeErr, fmt.Errorf("protection failure marker remained after recovery CAS"))
+	}
+	return nil, fmt.Errorf("clearing protection failure for NodeClaim %q did not converge: %w", claim.Name, lastErr)
+}
+
 func (s *kubernetesCreateFenceStore) ChooseRollback(
 	ctx context.Context,
 	claim *karpv1.NodeClaim,
@@ -967,6 +1093,7 @@ func (s *kubernetesCreateFenceStore) ChooseRollback(
 			now := s.now().UTC()
 			record.RollbackAt = &now
 		}
+		record.ProtectionFailureAt = nil
 		if canonical != nil {
 			if err := applyCleanupResolution(&record, *canonical); err != nil {
 				return nil, err
@@ -1118,6 +1245,7 @@ func (s *kubernetesCreateFenceStore) MarkMaterialized(ctx context.Context, claim
 		}
 		now := s.now().UTC()
 		record.Phase = createFenceMaterialized
+		record.ProtectionFailureAt = nil
 		record.ObservedAt = &now
 		record.ObservedVMUUID = vmUUID
 		record.FloatingIPName = vm.FloatingIPName
@@ -1274,9 +1402,11 @@ func decodeCreateFence(value string) (createFenceRecord, error) {
 		}
 	}
 	validRollback := record.RollbackAt == nil || (!record.RollbackAt.IsZero() && record.Phase == createFenceIssued && record.CreatedVMUUID != "")
+	validProtectionFailure := record.ProtectionFailureAt == nil ||
+		(!record.ProtectionFailureAt.IsZero() && record.Phase == createFenceIssued && record.CreatedVMUUID != "" && record.RollbackAt == nil)
 	validCleanupResolution := (record.CleanupResolvedAt == nil && record.CleanupVMUUID == "" && record.CleanupFloatingIPName == "" && record.CleanupPublicIPv4 == "") ||
 		(record.CleanupResolvedAt != nil && !record.CleanupResolvedAt.IsZero() && createFenceVMUUIDPattern.MatchString(record.CleanupVMUUID) && record.CleanupFloatingIPName != "" && record.CleanupPublicIPv4 != "")
-	if record.Schema != createFenceSchema || !validPhase || !validIntent || !validCreatedIdentity || !validBaseFirewallAssignment || !validRollback || !validCleanupResolution || record.Binding.NodeClaimUID == "" || record.Binding.IdempotencyKeyHash == "" ||
+	if record.Schema != createFenceSchema || !validPhase || !validIntent || !validCreatedIdentity || !validBaseFirewallAssignment || !validRollback || !validProtectionFailure || !validCleanupResolution || record.Binding.NodeClaimUID == "" || record.Binding.IdempotencyKeyHash == "" ||
 		record.Binding.RequestHash == "" || record.Binding.SpecHash == "" || record.Binding.BootstrapHash == "" ||
 		record.Cleanup.ClusterName == "" || record.Cleanup.Location == "" || record.Cleanup.NetworkUUID == "" ||
 		record.Cleanup.ControlPlaneVIP == "" || record.Cleanup.PrivateLoadBalancerPoolStart == "" || record.Cleanup.PrivateLoadBalancerPoolStop == "" ||
@@ -1959,6 +2089,7 @@ func (s *memoryCreateFenceStore) ChooseRollback(_ context.Context, claim *karpv1
 		record.DependentUnresolved = resolution == nil
 		record.DependentsResolvedAt = nil
 	}
+	record.ProtectionFailureAt = nil
 	if resolution != nil {
 		canonical, err := normalizeCleanupResolution(*resolution)
 		if err != nil {
@@ -2040,6 +2171,7 @@ func (s *memoryCreateFenceStore) MarkMaterialized(_ context.Context, claim *karp
 	if record.Phase != createFenceMaterialized {
 		now := s.now().UTC()
 		record.Phase = createFenceMaterialized
+		record.ProtectionFailureAt = nil
 		record.ObservedAt = &now
 		record.ObservedVMUUID = strings.ToLower(vm.UUID)
 		record.FloatingIPName = vm.FloatingIPName

@@ -99,6 +99,167 @@ func TestHTTP408IsClassifiedRetryableWithoutAutomaticReplay(t *testing.T) {
 	}
 }
 
+func TestWarrenCorrelationIDIsCapturedAcrossHTTPResponseFailures(t *testing.T) {
+	const correlationID = "cfg-11fpn2khl8b"
+	tests := []struct {
+		name      string
+		transport roundTripFunc
+	}{
+		{
+			name: "non-2xx response",
+			transport: func(req *http.Request) (*http.Response, error) {
+				resp := response(req, `{"message":"provider failure"}`)
+				resp.StatusCode = http.StatusInternalServerError
+				resp.Header.Set("X-Warren-Correlation-Id", correlationID)
+				return resp, nil
+			},
+		},
+		{
+			name: "incomplete response body",
+			transport: func(req *http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusInternalServerError,
+					Header:     http.Header{"X-Warren-Correlation-Id": {correlationID}},
+					Body: io.NopCloser(io.MultiReader(
+						strings.NewReader(`{"message":"partial`),
+						failingReader{},
+					)),
+					Request: req,
+				}, nil
+			},
+		},
+		{
+			name: "malformed successful response",
+			transport: func(req *http.Request) (*http.Response, error) {
+				resp := response(req, `{"broken":`)
+				resp.Header.Set("X-Warren-Correlation-Id", correlationID)
+				return resp, nil
+			},
+		},
+		{
+			name: "unexpected successful status",
+			transport: func(req *http.Request) (*http.Response, error) {
+				resp := response(req, `[]`)
+				resp.StatusCode = http.StatusAccepted
+				resp.Header.Set("X-Warren-Correlation-Id", correlationID)
+				return resp, nil
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			client, err := inspace.NewClient(inspace.Options{
+				BaseURL:    "https://api.example.invalid",
+				APIKey:     "test-key",
+				HTTPClient: &http.Client{Transport: test.transport},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = client.ListLocations(context.Background())
+			var apiErr *inspace.APIError
+			if !errors.As(err, &apiErr) {
+				t.Fatalf("ListLocations() error = %#v, want APIError", err)
+			}
+			if apiErr.CorrelationID != correlationID {
+				t.Fatalf("CorrelationID = %q, want %q", apiErr.CorrelationID, correlationID)
+			}
+			if !strings.Contains(err.Error(), "correlation-id="+correlationID) {
+				t.Fatalf("error omitted validated correlation ID: %v", err)
+			}
+		})
+	}
+}
+
+func TestWarrenCorrelationIDValidationAndRedaction(t *testing.T) {
+	tests := []struct {
+		name        string
+		values      []string
+		want        string
+		mustNotLeak []string
+	}{
+		{name: "valid", values: []string{"vm-create:abc_123.4"}, want: "vm-create:abc_123.4"},
+		{name: "whitespace", values: []string{"private diagnostic"}, mustNotLeak: []string{"private diagnostic"}},
+		{name: "separator", values: []string{"private/diagnostic"}, mustNotLeak: []string{"private/diagnostic"}},
+		{name: "oversized", values: []string{strings.Repeat("x", 129)}, mustNotLeak: []string{strings.Repeat("x", 129)}},
+		{name: "multiple", values: []string{"first-private", "second-private"}, mustNotLeak: []string{"first-private", "second-private"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			transport := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				resp := response(req, `{"message":"provider failure"}`)
+				resp.StatusCode = http.StatusInternalServerError
+				for _, value := range test.values {
+					resp.Header.Add("X-Warren-Correlation-Id", value)
+				}
+				return resp, nil
+			})
+			client, err := inspace.NewClient(inspace.Options{
+				BaseURL:    "https://api.example.invalid",
+				APIKey:     "test-key",
+				HTTPClient: &http.Client{Transport: transport},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = client.ListLocations(context.Background())
+			var apiErr *inspace.APIError
+			if !errors.As(err, &apiErr) {
+				t.Fatalf("ListLocations() error = %#v, want APIError", err)
+			}
+			if apiErr.CorrelationID != test.want {
+				t.Fatalf("CorrelationID = %q, want %q", apiErr.CorrelationID, test.want)
+			}
+			for _, secret := range test.mustNotLeak {
+				if strings.Contains(err.Error(), secret) {
+					t.Fatalf("unsafe correlation value leaked through error: %q", err.Error())
+				}
+			}
+		})
+	}
+
+	injected := &inspace.APIError{
+		StatusCode:    http.StatusInternalServerError,
+		Method:        http.MethodPost,
+		Path:          "/v1/bkk01/user-resource/vm",
+		Message:       "failure",
+		CorrelationID: "unsafe\nforged-log-line",
+	}
+	if got := injected.Error(); strings.Contains(got, "forged-log-line") || !strings.Contains(got, "correlation-id=<redacted>") {
+		t.Fatalf("directly constructed APIError was not redacted: %q", got)
+	}
+}
+
+func TestCorrelationMetadataIsDiagnosticOnlyAndNeverSent(t *testing.T) {
+	transport := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		for _, header := range []string{"X-Warren-Correlation-Id", "Idempotency-Key", "X-Idempotency-Key"} {
+			if value := req.Header.Get(header); value != "" {
+				t.Errorf("request sent unsupported %s header %q", header, value)
+			}
+		}
+		resp := response(req, `{"message":"provider failure"}`)
+		resp.StatusCode = http.StatusInternalServerError
+		resp.Header.Set("X-Warren-Correlation-Id", "vm-create-audit-1")
+		return resp, nil
+	})
+	client, err := inspace.NewClient(inspace.Options{
+		BaseURL:                   "https://api.example.invalid",
+		APIKey:                    "test-key",
+		HTTPClient:                &http.Client{Transport: transport},
+		DangerouslyAllowMutations: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.CreateVM(context.Background(), "bkk01", inspace.CreateVMRequest{
+		Name: "worker", OSName: "ubuntu", OSVersion: "24.04", DiskGiB: 40, VCPU: 2, MemoryMiB: 4096,
+	})
+	var apiErr *inspace.APIError
+	if !errors.As(err, &apiErr) || apiErr.CorrelationID != "vm-create-audit-1" {
+		t.Fatalf("CreateVM() error = %#v, want diagnostic correlation metadata", err)
+	}
+}
+
 func TestListResponsesRejectEmptyOrNullHTTP200Bodies(t *testing.T) {
 	calls := []struct {
 		name string
@@ -1421,6 +1582,7 @@ func TestMutationRedirectIsNeverReplayed(t *testing.T) {
 		case "/v1/bkk01/user-resource/vm":
 			sourceRequests.Add(1)
 			w.Header().Set("Location", "/redirected-mutation")
+			w.Header().Set("X-Warren-Correlation-Id", "vm-redirect-audit-1")
 			w.WriteHeader(http.StatusTemporaryRedirect)
 		case "/redirected-mutation":
 			targetRequests.Add(1)
@@ -1439,6 +1601,10 @@ func TestMutationRedirectIsNeverReplayed(t *testing.T) {
 	})
 	if !errors.Is(err, inspace.ErrMutationRedirect) {
 		t.Fatalf("CreateVM() error = %v, want ErrMutationRedirect", err)
+	}
+	var apiErr *inspace.APIError
+	if !errors.As(err, &apiErr) || apiErr.CorrelationID != "vm-redirect-audit-1" {
+		t.Fatalf("CreateVM() redirect error = %#v, want response correlation metadata", err)
 	}
 	if got := sourceRequests.Load(); got != 1 {
 		t.Fatalf("mutation source request count = %d, want 1", got)
@@ -1660,6 +1826,10 @@ func TestReadRequestCancellationInterruptsResponseBody(t *testing.T) {
 	_, err = client.ListLocations(ctx)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("ListLocations() error = %v, want context deadline exceeded", err)
+	}
+	var apiErr *inspace.APIError
+	if !errors.As(err, &apiErr) || !apiErr.Retryable || !apiErr.ResponseBodyIncomplete {
+		t.Fatalf("ListLocations() error = %#v, want retryable incomplete APIError", err)
 	}
 }
 

@@ -16,6 +16,7 @@ import (
 
 	"sigs.k8s.io/yaml"
 
+	inspace "github.com/thanet-s/inspace-cloud-kube-modules/modules/client"
 	"github.com/thanet-s/inspace-cloud-kube-modules/modules/cloud-provider/api/v1alpha1"
 	"github.com/thanet-s/inspace-cloud-kube-modules/modules/cloud-provider/pkg/bootstrap"
 )
@@ -117,6 +118,7 @@ func cloneTestStatus(status v1alpha1.InSpaceClusterStatus) v1alpha1.InSpaceClust
 
 type sequenceReconciler struct {
 	reconcileResults []bootstrap.Result
+	reconcileErrors  []error
 	destroyResults   []bootstrap.DestroyResult
 	destroyErrors    []error
 	reconcileCalls   int
@@ -124,12 +126,20 @@ type sequenceReconciler struct {
 }
 
 func (s *sequenceReconciler) Reconcile(context.Context, *v1alpha1.InSpaceCluster, string) (bootstrap.Result, error) {
-	if s.reconcileCalls >= len(s.reconcileResults) {
+	index := s.reconcileCalls
+	if index >= len(s.reconcileResults) && index >= len(s.reconcileErrors) {
 		return bootstrap.Result{}, errors.New("unexpected extra reconcile call")
 	}
-	result := s.reconcileResults[s.reconcileCalls]
 	s.reconcileCalls++
-	return result, nil
+	var result bootstrap.Result
+	if index < len(s.reconcileResults) {
+		result = s.reconcileResults[index]
+	}
+	var err error
+	if index < len(s.reconcileErrors) {
+		err = s.reconcileErrors[index]
+	}
+	return result, err
 }
 
 func (s *sequenceReconciler) Destroy(context.Context, *v1alpha1.InSpaceCluster) (bootstrap.DestroyResult, error) {
@@ -147,6 +157,24 @@ func (s *sequenceReconciler) Destroy(context.Context, *v1alpha1.InSpaceCluster) 
 		err = s.destroyErrors[index]
 	}
 	return result, err
+}
+
+type deadlineCrossingReconciler struct {
+	err            error
+	reconcileCalls int
+	destroyCalls   int
+}
+
+func (r *deadlineCrossingReconciler) Reconcile(ctx context.Context, _ *v1alpha1.InSpaceCluster, _ string) (bootstrap.Result, error) {
+	r.reconcileCalls++
+	<-ctx.Done()
+	return bootstrap.Result{Message: "deadline-crossing bootstrap progress"}, r.err
+}
+
+func (r *deadlineCrossingReconciler) Destroy(ctx context.Context, _ *v1alpha1.InSpaceCluster) (bootstrap.DestroyResult, error) {
+	r.destroyCalls++
+	<-ctx.Done()
+	return bootstrap.DestroyResult{Message: "deadline-crossing delete progress"}, r.err
 }
 
 func TestParseTCPPorts(t *testing.T) {
@@ -301,7 +329,7 @@ func TestUntilReadyLoopRetriesStaleVMDetailProgressAndConverges(t *testing.T) {
 	defer cancel()
 
 	err := runControllerLoop(ctx, reconciler, &v1alpha1.InSpaceCluster{}, "token", controllerLoopOptions{
-		UntilReady: true, Interval: time.Nanosecond, OutputFormat: "json",
+		UntilReady: true, Interval: time.Nanosecond, OperationTimeout: time.Second, OutputFormat: "json",
 		StandardOutput: &stdout, StandardError: &stderr,
 	})
 	if err != nil {
@@ -319,6 +347,182 @@ func TestUntilReadyLoopRetriesStaleVMDetailProgressAndConverges(t *testing.T) {
 	}
 }
 
+func TestUntilReadyLoopStopsAfterIssuedVMCreateAbsenceDeadline(t *testing.T) {
+	issuedAt := time.Now().UTC().Add(-2 * time.Minute)
+	pending := &bootstrap.IssuedVMCreateAbsentError{
+		AttemptKey:   "vm/control-plane-1",
+		ResourceName: "unit-cp1",
+		IssuedAt:     issuedAt,
+	}
+	reconciler := &sequenceReconciler{reconcileErrors: []error{pending}}
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+
+	err := runControllerLoop(context.Background(), reconciler, &v1alpha1.InSpaceCluster{}, "token", controllerLoopOptions{
+		UntilReady: true, Interval: time.Second, IssuedVMCreateTimeout: time.Minute, OutputFormat: "json",
+		StandardOutput: &stdout, StandardError: &stderr,
+	})
+	if err == nil || !errors.Is(err, bootstrap.ErrCreateAttemptPending) ||
+		!strings.Contains(err.Error(), "refusing to replay") ||
+		!strings.Contains(err.Error(), "unit-cp1") {
+		t.Fatalf("expired issued-create error = %v", err)
+	}
+	if reconciler.reconcileCalls != 1 || reconciler.destroyCalls != 0 {
+		t.Fatalf("expired loop calls: reconcile=%d destroy=%d", reconciler.reconcileCalls, reconciler.destroyCalls)
+	}
+	if stdout.Len() != 0 || stderr.Len() != 0 {
+		t.Fatalf("expired loop output: stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}
+}
+
+func TestIssuedVMCreateAbsenceDeadlineLeavesPostHTTPTimeoutRecoveryWindow(t *testing.T) {
+	if defaultIssuedVMCreateTimeout <= 5*time.Minute {
+		t.Fatalf(
+			"default issued VM create timeout = %s, want a recovery window beyond the 5m HTTP timeout",
+			defaultIssuedVMCreateTimeout,
+		)
+	}
+}
+
+func TestUntilReadyLoopRetainsNoReplayWaitBeforeIssuedVMCreateDeadline(t *testing.T) {
+	pending := &bootstrap.IssuedVMCreateAbsentError{
+		AttemptKey:   "vm/control-plane-1",
+		ResourceName: "unit-cp1",
+		IssuedAt:     time.Now().UTC(),
+	}
+	reconciler := &sequenceReconciler{
+		reconcileResults: []bootstrap.Result{{}, {Ready: true, Owner: "owner", Message: "ready"}},
+		reconcileErrors:  []error{pending, nil},
+	}
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	err := runControllerLoop(ctx, reconciler, &v1alpha1.InSpaceCluster{}, "token", controllerLoopOptions{
+		UntilReady: true, Interval: time.Nanosecond, IssuedVMCreateTimeout: time.Minute, OutputFormat: "json",
+		StandardOutput: &stdout, StandardError: &stderr,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reconciler.reconcileCalls != 2 || reconciler.destroyCalls != 0 {
+		t.Fatalf("recovering loop calls: reconcile=%d destroy=%d", reconciler.reconcileCalls, reconciler.destroyCalls)
+	}
+	if !strings.Contains(stderr.String(), "transient reconciliation error; retrying") ||
+		!strings.Contains(stdout.String(), `"ready":true`) {
+		t.Fatalf("recovering loop output: stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}
+}
+
+func TestUntilReadyLoopReturnsOverallOperationDeadline(t *testing.T) {
+	reconciler := &sequenceReconciler{reconcileResults: []bootstrap.Result{{
+		Owner: "owner", RequeueAfter: time.Hour, Message: "still bootstrapping",
+	}}}
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+
+	err := runControllerLoop(context.Background(), reconciler, &v1alpha1.InSpaceCluster{}, "token", controllerLoopOptions{
+		UntilReady: true, Interval: time.Hour, OperationTimeout: 10 * time.Millisecond, OutputFormat: "json",
+		StandardOutput: &stdout, StandardError: &stderr,
+	})
+	if err == nil || !errors.Is(err, context.DeadlineExceeded) ||
+		!strings.Contains(err.Error(), "bootstrap operation") ||
+		!strings.Contains(err.Error(), "last progress: still bootstrapping") {
+		t.Fatalf("bootstrap operation deadline error = %v", err)
+	}
+	if reconciler.reconcileCalls != 1 || reconciler.destroyCalls != 0 {
+		t.Fatalf("bootstrap deadline calls: reconcile=%d destroy=%d", reconciler.reconcileCalls, reconciler.destroyCalls)
+	}
+	if !strings.Contains(stdout.String(), "still bootstrapping") || stderr.Len() != 0 {
+		t.Fatalf("bootstrap deadline output: stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}
+}
+
+func TestOverallOperationDeadlinePreservesLastCloudErrorAndCorrelationID(t *testing.T) {
+	apiErr := &inspace.APIError{
+		StatusCode:    500,
+		Method:        "POST",
+		Path:          "/v1/bkk01/user-resource/vm",
+		Message:       "provider failure",
+		Retryable:     true,
+		CorrelationID: "cfg-deadline-test-1",
+	}
+	reconciler := &sequenceReconciler{reconcileErrors: []error{apiErr}}
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+
+	err := runControllerLoop(context.Background(), reconciler, &v1alpha1.InSpaceCluster{}, "token", controllerLoopOptions{
+		UntilReady: true, Interval: time.Hour, OperationTimeout: 10 * time.Millisecond, OutputFormat: "json",
+		StandardOutput: &stdout, StandardError: &stderr,
+	})
+	if err == nil || !errors.Is(err, context.DeadlineExceeded) || !errors.Is(err, apiErr) ||
+		!strings.Contains(err.Error(), "correlation-id=cfg-deadline-test-1") {
+		t.Fatalf("operation deadline lost its last cloud error: %v", err)
+	}
+	if reconciler.reconcileCalls != 1 || stdout.Len() != 0 ||
+		!strings.Contains(stderr.String(), "provider failure") {
+		t.Fatalf(
+			"deadline cloud error state: calls=%d stdout=%q stderr=%q",
+			reconciler.reconcileCalls,
+			stdout.String(),
+			stderr.String(),
+		)
+	}
+}
+
+func TestOverallOperationDeadlinePreservesErrorReturnedByCrossingCall(t *testing.T) {
+	for _, test := range []struct {
+		name          string
+		options       controllerLoopOptions
+		wantReconcile int
+		wantDestroy   int
+	}{
+		{
+			name:          "bootstrap",
+			options:       controllerLoopOptions{UntilReady: true},
+			wantReconcile: 1,
+		},
+		{
+			name:        "delete",
+			options:     controllerLoopOptions{DeleteOwned: true},
+			wantDestroy: 1,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			apiErr := &inspace.APIError{
+				StatusCode:    500,
+				Method:        "POST",
+				Path:          "/v1/bkk01/user-resource/vm",
+				Message:       "provider failed as operation deadline expired",
+				Retryable:     true,
+				CorrelationID: "cfg-crossing-deadline-1",
+			}
+			reconciler := &deadlineCrossingReconciler{err: apiErr}
+			var stdout bytes.Buffer
+			var stderr bytes.Buffer
+			options := test.options
+			options.Interval = time.Hour
+			options.OperationTimeout = 10 * time.Millisecond
+			options.OutputFormat = "json"
+			options.StandardOutput = &stdout
+			options.StandardError = &stderr
+
+			err := runControllerLoop(context.Background(), reconciler, &v1alpha1.InSpaceCluster{}, "token", options)
+			if err == nil || !errors.Is(err, context.DeadlineExceeded) || !errors.Is(err, apiErr) ||
+				!strings.Contains(err.Error(), "correlation-id=cfg-crossing-deadline-1") {
+				t.Fatalf("deadline-crossing call lost its current cloud error: %v", err)
+			}
+			if reconciler.reconcileCalls != test.wantReconcile || reconciler.destroyCalls != test.wantDestroy {
+				t.Fatalf("calls: reconcile=%d destroy=%d", reconciler.reconcileCalls, reconciler.destroyCalls)
+			}
+			if stdout.Len() != 0 || stderr.Len() != 0 {
+				t.Fatalf("deadline-crossing call emitted output: stdout=%q stderr=%q", stdout.String(), stderr.String())
+			}
+		})
+	}
+}
+
 func TestDeleteLoopRetriesStaleVMDetailProgressAndConverges(t *testing.T) {
 	reconciler := &sequenceReconciler{destroyResults: []bootstrap.DestroyResult{
 		{Owner: "owner", Remaining: []string{"vm/rke2-owner-bastion"}, Message: "waiting for stale VM list entry"},
@@ -330,7 +534,7 @@ func TestDeleteLoopRetriesStaleVMDetailProgressAndConverges(t *testing.T) {
 	defer cancel()
 
 	err := runControllerLoop(ctx, reconciler, &v1alpha1.InSpaceCluster{}, "", controllerLoopOptions{
-		DeleteOwned: true, Interval: time.Nanosecond, OutputFormat: "json",
+		DeleteOwned: true, Interval: time.Nanosecond, OperationTimeout: time.Second, OutputFormat: "json",
 		StandardOutput: &stdout, StandardError: &stderr,
 	})
 	if err != nil {
@@ -346,6 +550,63 @@ func TestDeleteLoopRetriesStaleVMDetailProgressAndConverges(t *testing.T) {
 	if stderr.Len() != 0 {
 		t.Fatalf("delete wrote an error for non-error progress: %q", stderr.String())
 	}
+}
+
+func TestDeleteLoopReturnsOverallOperationDeadline(t *testing.T) {
+	reconciler := &sequenceReconciler{destroyResults: []bootstrap.DestroyResult{{
+		Owner: "owner", Remaining: []string{"vm/unit-cp1"}, Message: "still deleting",
+	}}}
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+
+	err := runControllerLoop(context.Background(), reconciler, &v1alpha1.InSpaceCluster{}, "", controllerLoopOptions{
+		DeleteOwned: true, Interval: time.Hour, OperationTimeout: 10 * time.Millisecond, OutputFormat: "json",
+		StandardOutput: &stdout, StandardError: &stderr,
+	})
+	if err == nil || !errors.Is(err, context.DeadlineExceeded) ||
+		!strings.Contains(err.Error(), "delete operation") {
+		t.Fatalf("delete operation deadline error = %v", err)
+	}
+	if reconciler.destroyCalls != 1 || reconciler.reconcileCalls != 0 {
+		t.Fatalf("delete deadline calls: reconcile=%d destroy=%d", reconciler.reconcileCalls, reconciler.destroyCalls)
+	}
+	if !strings.Contains(stdout.String(), "still deleting") || stderr.Len() != 0 {
+		t.Fatalf("delete deadline output: stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}
+}
+
+func TestOperationDeadlineDoesNotChangeOnceOrContinuousModes(t *testing.T) {
+	t.Run("once", func(t *testing.T) {
+		reconciler := &sequenceReconciler{reconcileResults: []bootstrap.Result{{Message: "one pass"}}}
+		var stdout bytes.Buffer
+		var stderr bytes.Buffer
+
+		err := runControllerLoop(context.Background(), reconciler, &v1alpha1.InSpaceCluster{}, "token", controllerLoopOptions{
+			Once: true, Interval: time.Hour, OperationTimeout: time.Nanosecond, OutputFormat: "json",
+			StandardOutput: &stdout, StandardError: &stderr,
+		})
+		if err != nil || reconciler.reconcileCalls != 1 || !strings.Contains(stdout.String(), "one pass") {
+			t.Fatalf("once mode: calls=%d stdout=%q error=%v", reconciler.reconcileCalls, stdout.String(), err)
+		}
+	})
+
+	t.Run("continuous", func(t *testing.T) {
+		reconciler := &sequenceReconciler{reconcileResults: []bootstrap.Result{{
+			RequeueAfter: time.Hour, Message: "continuous pass",
+		}}}
+		var stdout bytes.Buffer
+		var stderr bytes.Buffer
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+		defer cancel()
+
+		err := runControllerLoop(ctx, reconciler, &v1alpha1.InSpaceCluster{}, "token", controllerLoopOptions{
+			Interval: time.Hour, OperationTimeout: time.Nanosecond, OutputFormat: "json",
+			StandardOutput: &stdout, StandardError: &stderr,
+		})
+		if err != nil || reconciler.reconcileCalls != 1 || !strings.Contains(stdout.String(), "continuous pass") {
+			t.Fatalf("continuous mode: calls=%d stdout=%q error=%v", reconciler.reconcileCalls, stdout.String(), err)
+		}
+	})
 }
 
 func TestDeleteLoopRetriesRawEOFAmbiguousOutcomeAndConverges(t *testing.T) {

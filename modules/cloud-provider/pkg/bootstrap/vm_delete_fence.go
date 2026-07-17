@@ -933,7 +933,7 @@ func (r *Reconciler) clearCompletedRollback(ctx context.Context, cluster *v1alph
 		}
 		if assignment, exists := status.CreateAttempts[assignmentKey]; exists {
 			resourceName := attempt.FirewallUUID + "/" + attempt.ResourceUUID
-			if assignment.ResourceKind != createAttemptKindFirewallAssignment || assignment.ResourceName != resourceName {
+			if assignment.ResourceKind != createAttemptKindFirewallAssignment || !strings.EqualFold(assignment.ResourceName, resourceName) {
 				return fmt.Errorf("bootstrap: refusing to reset firewall assignment slot %q with mismatched exact identity", assignmentKey)
 			}
 		}

@@ -106,7 +106,12 @@ type FencedCreateCleanupRequest struct {
 	// base-firewall assignment POST associated with CreatedVMUUID. An issued
 	// assignment may only be recovered with authoritative reads; it must never
 	// be replayed after a timeout, process restart, or controller failover.
-	BaseFirewallAssignment      FirewallAssignmentFence
+	BaseFirewallAssignment FirewallAssignmentFence
+	// FloatingIPUpdate is the Kubernetes-durable authority for the deterministic
+	// metadata PATCH of the created VM's auto-reserved public address. Protection
+	// reconciliation uses issued and observed receipts only for readback; it
+	// never grants a second PATCH.
+	FloatingIPUpdate            FloatingIPUpdateFence
 	AuthorizeBaseFirewall       func(context.Context, string) (FirewallAssignmentAuthorization, error)                      `json:"-"`
 	ObserveBaseFirewall         func(context.Context, string, string) error                                                 `json:"-"`
 	RejectBaseFirewall          func(context.Context, string, string) error                                                 `json:"-"`
@@ -402,11 +407,16 @@ type VM struct {
 // has already disappeared, because a deterministic name alone is not durable
 // authority to mutate an account resource.
 type DeleteVMIdentity struct {
-	FloatingIPName              string
-	PublicIPv4                  string
-	BillingAccountID            int64
-	NetworkUUID                 string
-	FirewallUUID                string
+	FloatingIPName   string
+	PublicIPv4       string
+	BillingAccountID int64
+	NetworkUUID      string
+	FirewallUUID     string
+	// FloatingIPUpdate is populated only by fenced rollback with an exact issued
+	// or observed metadata-PATCH receipt. It lets cleanup accept either coherent
+	// pre-PATCH blank/zero metadata or the complete desired metadata without
+	// replaying the PATCH; partial and foreign states remain rejected.
+	FloatingIPUpdate            FloatingIPUpdateFence
 	AuthorizeBaseFirewallDetach func(context.Context, string) (FirewallDetachmentAuthorization, error)             `json:"-"`
 	ObserveBaseFirewallDetach   func(context.Context, FirewallDetachmentFence) error                               `json:"-"`
 	RejectBaseFirewallDetach    func(context.Context, FirewallDetachmentFence) error                               `json:"-"`

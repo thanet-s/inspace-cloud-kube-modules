@@ -36,6 +36,46 @@ const (
 
 var ErrCreateAttemptPending = errors.New("bootstrap: cloud mutation is durably issued and awaiting authoritative recovery")
 
+// IssuedVMCreateAbsentError identifies one durably issued VM POST whose exact
+// deterministic-name result is still absent from authoritative inventory.
+// It remains ErrCreateAttemptPending so callers must never replay the POST.
+// IssuedAt is the durable issue time, allowing a supervising one-shot command
+// to enforce a restart-stable deadline without changing reconciliation safety.
+type IssuedVMCreateAbsentError struct {
+	AttemptKey   string
+	ResourceName string
+	IssuedAt     time.Time
+}
+
+func (e *IssuedVMCreateAbsentError) Error() string {
+	return fmt.Sprintf(
+		"bootstrap: issued VM create %q (attempt %q, issued %s) remains authoritatively absent",
+		e.ResourceName,
+		e.AttemptKey,
+		e.IssuedAt.UTC().Format(time.RFC3339Nano),
+	)
+}
+
+func (e *IssuedVMCreateAbsentError) Unwrap() error { return ErrCreateAttemptPending }
+
+func issuedVMCreateAbsentError(
+	attemptKey string,
+	attempt v1alpha1.ResourceCreateAttemptStatus,
+) error {
+	issuedAt, err := time.Parse(time.RFC3339Nano, attempt.IssuedAt)
+	if err != nil || issuedAt.Location() != time.UTC {
+		return errors.Join(
+			ErrCreateAttemptPending,
+			fmt.Errorf("bootstrap: issued VM create attempt %q has an invalid durable issue time", attemptKey),
+		)
+	}
+	return &IssuedVMCreateAbsentError{
+		AttemptKey:   attemptKey,
+		ResourceName: attempt.ResourceName,
+		IssuedAt:     issuedAt,
+	}
+}
+
 // StatusCompareAndSwapFunc persists one InSpaceCluster status transition and
 // returns its authoritative readback. Kubernetes-backed controllers implement
 // this with status resourceVersion CAS; the standalone bootstrap command uses

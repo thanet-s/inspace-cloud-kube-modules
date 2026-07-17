@@ -362,7 +362,7 @@ func TestFloatingIPRemovalDriftAfterCASRejectsUndispatchedReceipt(t *testing.T) 
 				},
 			}
 
-			err := adapter.deleteOwnedFloatingIP(context.Background(), "bkk01", "network-1", address, vmUUID, authority)
+			err := adapter.deleteOwnedFloatingIP(context.Background(), "bkk01", "network-1", address, vmUUID, authority, nil)
 			if !errors.Is(err, cloudapi.ErrCreateAttemptPending) || !strings.Contains(err.Error(), "fresh mutation-target proof") {
 				t.Fatalf("removal error = %v, want post-CAS proof failure", err)
 			}
