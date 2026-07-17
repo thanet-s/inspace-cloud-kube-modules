@@ -15,9 +15,10 @@ import (
 // mutationFence is a durable authorization for one cloud mutation. Receipt and
 // Observation may advance by compare-and-swap, but Key, Intent, and Attempt
 // never change. A fence is removed only after authoritative
-// readback proves the desired state, or a typed local pre-dispatch guard proves
-// that no cloud request was sent. Every HTTP status remains post-dispatch
-// ambiguous and therefore retains the fence.
+// readback proves the desired state, or the current invocation proves that the
+// cloud mutation method was never reached (for example, a typed local guard or
+// a failed authority read before the call). Every HTTP status returned by a
+// mutation remains post-dispatch ambiguous and therefore retains the fence.
 // A controller crash after Lease creation but before the cloud POST is
 // deliberately indistinguishable from a lost POST response: the Lease remains
 // fail-closed until an operator inspects cloud state and removes that exact

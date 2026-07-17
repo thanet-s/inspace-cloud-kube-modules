@@ -2619,6 +2619,7 @@ func TestNodeLoadBalancerEmergencyWithdrawalResolvesPendingAssignBeforeDelete(t 
 		issueID:      strings.Repeat("a", 32),
 		issuedAt:     time.Now().UTC().Format(time.RFC3339Nano),
 	}.String()
+	copy.Annotations[annotationNodeLoadBalancerFirewallRelationOwnerUID] = string(copy.UID)
 	if _, err := fixture.provider.kubeClient.CoreV1().Services(copy.Namespace).Update(
 		fixture.ctx, copy, metav1.UpdateOptions{},
 	); err != nil {
@@ -4483,13 +4484,37 @@ func nodeLoadBalancerSafetyFirewallByUUID(t *testing.T, firewalls []inspace.Fire
 }
 
 func newNodeLoadBalancerTestDynamicClient(objects ...runtime.Object) *fake.FakeDynamicClient {
-	return fake.NewSimpleDynamicClientWithCustomListKinds(
+	nextUID := 0
+	seeded := make([]runtime.Object, 0, len(objects))
+	for _, object := range objects {
+		copy := object.DeepCopyObject()
+		if resource, ok := copy.(*unstructured.Unstructured); ok && resource.GetUID() == "" {
+			nextUID++
+			resource.SetUID(types.UID(fmt.Sprintf("test-%s-%d", resource.GetName(), nextUID)))
+		}
+		seeded = append(seeded, copy)
+	}
+	client := fake.NewSimpleDynamicClientWithCustomListKinds(
 		runtime.NewScheme(),
 		map[schema.GroupVersionResource]string{
 			nodePoolGVR: "NodePoolList", nodeClaimGVR: "NodeClaimList",
 		},
-		objects...,
+		seeded...,
 	)
+	client.PrependReactor("create", "*", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		createAction, ok := action.(k8stesting.CreateAction)
+		if !ok {
+			return false, nil, nil
+		}
+		object, ok := createAction.GetObject().(*unstructured.Unstructured)
+		if !ok || object.GetUID() != "" {
+			return false, nil, nil
+		}
+		nextUID++
+		object.SetUID(types.UID(fmt.Sprintf("test-%s-%d", object.GetName(), nextUID)))
+		return false, nil, nil
+	})
+	return client
 }
 
 func installNodeLoadBalancerSafetyIdentity(

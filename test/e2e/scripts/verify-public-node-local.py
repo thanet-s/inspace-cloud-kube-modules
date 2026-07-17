@@ -28,7 +28,10 @@ DATAPATH_CLASS = "inspace.cloud/node-datapath"
 DATAPATH_LABEL = "inspace.cloud/node-lb-datapath"
 SERVICE_ID_LABEL = "inspace.cloud/node-lb-service-id"
 DATAPATH_POOL_ANNOTATION = "service.inspace.cloud/public-node-local-pool"
-IMMUTABLE_INVENTORY_KEYS = {"vms", "firewalls", "floatingIPs", "loadBalancers", "disks"}
+IMMUTABLE_INVENTORY_KEYS = {
+    "vms", "networks", "firewalls", "floatingIPs", "loadBalancers", "disks",
+    "buckets", "servicePackages",
+}
 VM_UUID_PATTERN = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
 )

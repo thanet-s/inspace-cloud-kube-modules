@@ -182,10 +182,12 @@ func (r *Reconciler) issueDestroyRemoval(ctx context.Context, cluster *v1alpha1.
 	})
 }
 
-func (r *Reconciler) resetLocallyBlockedRemoval(ctx context.Context, cluster *v1alpha1.InSpaceCluster, key, issuedPhase, intentPhase string) error {
-	return r.mutateDeleteAttempt(ctx, cluster, key, func(attempt *v1alpha1.ResourceDeleteAttemptStatus) error {
+func (r *Reconciler) resetPreDispatchDeleteIssue(ctx context.Context, cluster *v1alpha1.InSpaceCluster, key, issuedPhase, intentPhase string) error {
+	persistCtx, cancel := r.detachedStatusMutationContext(ctx)
+	defer cancel()
+	return r.mutateDeleteAttempt(persistCtx, cluster, key, func(attempt *v1alpha1.ResourceDeleteAttemptStatus) error {
 		if attempt.Phase != issuedPhase {
-			return fmt.Errorf("bootstrap: removal attempt %q changed after local rejection", key)
+			return fmt.Errorf("bootstrap: removal attempt %q changed before pre-dispatch reset", key)
 		}
 		setDeleteAttemptPhase(attempt, intentPhase)
 		return nil
@@ -356,10 +358,8 @@ func (r *Reconciler) reconcileDestroyFloatingIPRemoval(ctx context.Context, clus
 		}
 		item, authorityErr := r.authorizeDestroyFloatingIPDispatch(ctx, cluster, key, deletePhaseFIPUnassignIssued)
 		if authorityErr != nil {
-			// A post-CAS read failure or ownership drift is not proof that the
-			// cloud request was locally blocked. Retain the issued lock so a
-			// restart cannot replay against a changed target.
-			return false, errors.Join(authorityErr,
+			resetErr := r.resetPreDispatchDeleteIssue(ctx, cluster, key, deletePhaseFIPUnassignIssued, deletePhaseFIPUnassignIntent)
+			return false, errors.Join(authorityErr, resetErr,
 				fmt.Errorf("%w: floating-IP unassign %q lacks post-CAS authority", ErrCreateAttemptPending, key))
 		}
 		if item == nil || item.AssignedTo == "" {
@@ -369,7 +369,7 @@ func (r *Reconciler) reconcileDestroyFloatingIPRemoval(ctx context.Context, clus
 		}
 		_, mutationErr := r.API.UnassignFloatingIP(ctx, cluster.Spec.Location, item.Address)
 		if deleteVMFailureProvesNoDispatch(mutationErr) {
-			return false, errors.Join(mutationErr, r.resetLocallyBlockedRemoval(ctx, cluster, key, deletePhaseFIPUnassignIssued, deletePhaseFIPUnassignIntent))
+			return false, errors.Join(mutationErr, r.resetPreDispatchDeleteIssue(ctx, cluster, key, deletePhaseFIPUnassignIssued, deletePhaseFIPUnassignIntent))
 		}
 		terminal, observeErr := r.observeDestroyRemovalTwice(ctx, cluster, key, func() (bool, error) {
 			return r.observeDestroyFloatingIPRemoval(ctx, cluster, key)
@@ -384,7 +384,8 @@ func (r *Reconciler) reconcileDestroyFloatingIPRemoval(ctx context.Context, clus
 		}
 		item, authorityErr := r.authorizeDestroyFloatingIPDispatch(ctx, cluster, key, deletePhaseFIPDeleteIssued)
 		if authorityErr != nil {
-			return false, errors.Join(authorityErr,
+			resetErr := r.resetPreDispatchDeleteIssue(ctx, cluster, key, deletePhaseFIPDeleteIssued, deletePhaseFIPDeleteIntent)
+			return false, errors.Join(authorityErr, resetErr,
 				fmt.Errorf("%w: floating-IP delete %q lacks post-CAS authority", ErrCreateAttemptPending, key))
 		}
 		if item == nil {
@@ -394,7 +395,7 @@ func (r *Reconciler) reconcileDestroyFloatingIPRemoval(ctx context.Context, clus
 		}
 		mutationErr := r.API.DeleteFloatingIP(ctx, cluster.Spec.Location, item.Address)
 		if deleteVMFailureProvesNoDispatch(mutationErr) {
-			return false, errors.Join(mutationErr, r.resetLocallyBlockedRemoval(ctx, cluster, key, deletePhaseFIPDeleteIssued, deletePhaseFIPDeleteIntent))
+			return false, errors.Join(mutationErr, r.resetPreDispatchDeleteIssue(ctx, cluster, key, deletePhaseFIPDeleteIssued, deletePhaseFIPDeleteIntent))
 		}
 		terminal, observeErr := r.observeDestroyRemovalTwice(ctx, cluster, key, func() (bool, error) {
 			return r.observeDestroyFloatingIPRemoval(ctx, cluster, key)
@@ -495,7 +496,8 @@ func (r *Reconciler) reconcileDestroyFirewallRemoval(ctx context.Context, cluste
 		}
 		firewall, authorityErr := r.readDestroyFirewallAuthority(ctx, cluster, key, issuedAttempt)
 		if authorityErr != nil {
-			return false, errors.Join(authorityErr,
+			resetErr := r.resetPreDispatchDeleteIssue(ctx, cluster, key, deletePhaseFirewallDeleteIssued, deletePhaseFirewallDeleteIntent)
+			return false, errors.Join(authorityErr, resetErr,
 				fmt.Errorf("%w: firewall delete %q lacks post-CAS authority", ErrCreateAttemptPending, key))
 		}
 		if firewall == nil {
@@ -505,7 +507,7 @@ func (r *Reconciler) reconcileDestroyFirewallRemoval(ctx context.Context, cluste
 		}
 		mutationErr := r.API.DeleteFirewall(ctx, cluster.Spec.Location, firewall.UUID)
 		if deleteVMFailureProvesNoDispatch(mutationErr) {
-			return false, errors.Join(mutationErr, r.resetLocallyBlockedRemoval(ctx, cluster, key, deletePhaseFirewallDeleteIssued, deletePhaseFirewallDeleteIntent))
+			return false, errors.Join(mutationErr, r.resetPreDispatchDeleteIssue(ctx, cluster, key, deletePhaseFirewallDeleteIssued, deletePhaseFirewallDeleteIntent))
 		}
 		terminal, observeErr := r.observeDestroyRemovalTwice(ctx, cluster, key, func() (bool, error) {
 			return r.observeDestroyFirewallRemoval(ctx, cluster, key)

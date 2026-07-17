@@ -1574,7 +1574,7 @@ def main() -> None:
     )
     require("public-Proxy/private-VIP" in readme and
             "defaults them to `public-node-shared`" in readme and
-            "complete billable-resource" in readme,
+            "complete cloud-resource" in readme,
             "E2E documentation must describe the live Node-LB default and exact cleanup proof")
     private_services = [
         manifest_document(workload, "Service", "inspace-e2e-private-a"),
@@ -1777,8 +1777,9 @@ def main() -> None:
         with tempfile.TemporaryDirectory() as directory:
             immutable_baseline = pathlib.Path(directory) / "baseline-inventory.json"
             immutable_baseline.write_text(json.dumps({
-                "vms": [], "firewalls": [], "floatingIPs": [],
-                "loadBalancers": [], "disks": [],
+                "vms": [], "networks": [], "firewalls": [], "floatingIPs": [],
+                "loadBalancers": [], "disks": [], "buckets": [],
+                "servicePackages": [],
             }), encoding="utf-8")
             immutable_baseline.chmod(0o600)
             try:
@@ -1983,10 +1984,13 @@ def main() -> None:
         immutable_baseline = pathlib.Path(directory) / "baseline-inventory.json"
         immutable_baseline.write_text(json.dumps({
             "vms": [],
+            "networks": [],
             "firewalls": [],
             "floatingIPs": [],
             "loadBalancers": ["baseline-nlb"],
             "disks": [],
+            "buckets": [],
+            "servicePackages": [],
         }), encoding="utf-8")
         immutable_baseline.chmod(0o600)
         service_cloud_module.require_exact_load_balancer_inventory(
@@ -2660,8 +2664,9 @@ def main() -> None:
             "CSI proof must require one attachment on the sole Karpenter worker")
 
     for resource_path in (
-        "user-resource/vm/list", "network/firewalls", "network/ip_addresses",
-        "network/load_balancers", "storage/disks",
+        "user-resource/vm/list", "network/networks", "network/firewalls",
+        "network/ip_addresses", "network/load_balancers", "storage/disks",
+        "storage/bucket/list", "user-resource/service/packages",
     ):
         require(resource_path in account_inventory,
                 f"full account inventory is missing {resource_path}")
@@ -2669,10 +2674,53 @@ def main() -> None:
             "refusing to replace an existing baseline inventory" in account_inventory and
             "baseline inventory must be a mode-0600 regular file" in account_inventory,
             "full account inventory must reject malformed API/baseline state")
-    require("Capture every API-visible billable resource before mutation" in playbook and
+    require("Capture every API-visible cloud resource before mutation" in playbook and
             "Require the dedicated test account to contain no billable resources" in playbook and
+            "counts.networks" in playbook and "INSPACE_NETWORK_UUID" in playbook and
             "Require the complete isolated-account inventory to match its baseline" in cleanup,
-            "release acceptance must compare the entire isolated account to its empty baseline")
+            "release acceptance must compare the entire isolated account to its immutable baseline")
+    account_inventory_module = load_script_module(
+        "e2e_account_inventory_static", ROOT / "scripts/account-inventory.py"
+    )
+    original_inventory_api_get = account_inventory_module.api_get
+    original_inventory_locations = account_inventory_module.locations
+    account_inventory_module.locations = lambda: ["bkk01", "hkt01"]
+
+    def inventory_api_get(path, location=None):
+        if path == "user-resource/vm/list" and location == "bkk01":
+            return [{"uuid": "vm-a"}]
+        if path == "network/networks" and location == "bkk01":
+            return [
+                {"uuid": "network-a"},
+                {"uuid": "network-tombstone", "status": "deleted"},
+            ]
+        if path == "network/networks" and location == "hkt01":
+            return [{"uuid": "network-deleted", "is_deleted": True}]
+        if path == "storage/bucket/list" and location is None:
+            return [
+                {"name": "bucket-a"},
+                {"name": "bucket-tombstone", "status": "deleted"},
+            ]
+        if path == "user-resource/service/packages" and location is None:
+            return [
+                {"uuid": "package-a"},
+                {"uuid": "package-deleted", "is_deleted": True},
+            ]
+        return []
+
+    account_inventory_module.api_get = inventory_api_get
+    try:
+        complete_inventory = account_inventory_module.inventory()
+        require(
+            complete_inventory["vms"] == ["bkk01:vm-a"]
+            and complete_inventory["networks"] == ["bkk01:network-a"]
+            and complete_inventory["buckets"] == ["global:bucket-a"]
+            and complete_inventory["servicePackages"] == ["global:package-a"],
+            "complete account inventory must scope stable location/global identities and ignore only explicit tombstones",
+        )
+    finally:
+        account_inventory_module.api_get = original_inventory_api_get
+        account_inventory_module.locations = original_inventory_locations
     require("def active_resources(" in cloud_audit and
             'item.get("is_deleted") is True' in cloud_audit and
             cloud_audit.count("active_resources(") == 6,

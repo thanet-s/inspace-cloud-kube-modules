@@ -2412,18 +2412,24 @@ func (c *nodeLoadBalancerController) createServiceFirewallFromIssuedIntent(
 	service *corev1.Service,
 	desired desiredNodeLoadBalancerFirewall,
 ) error {
-	current, err := c.getExactParentService(ctx, service)
-	if err != nil {
-		return fmt.Errorf("node load balancer: revalidate issued firewall create attempt: %w", err)
-	}
-	currentDesired, err := c.desiredServiceFirewall(current)
-	if err != nil {
-		return err
-	}
 	token := service.Annotations[annotationNodeLoadBalancerPendingFWIssued]
 	issuedAt := service.Annotations[annotationNodeLoadBalancerPendingFWIssuedAt]
 	if err := validateNodeLoadBalancerFirewallCreateIssued(token, issuedAt); err != nil {
 		return err
+	}
+	rejectUndispatched := func(rejection error) error {
+		return errors.Join(
+			rejection,
+			c.resetServiceFirewallCreateAfterProvenNonDispatch(ctx, service),
+		)
+	}
+	current, err := c.getExactParentService(ctx, service)
+	if err != nil {
+		return rejectUndispatched(fmt.Errorf("node load balancer: revalidate issued firewall create attempt: %w", err))
+	}
+	currentDesired, err := c.desiredServiceFirewall(current)
+	if err != nil {
+		return rejectUndispatched(err)
 	}
 	if current.DeletionTimestamp != nil || !isNodeLoadBalancerService(current) ||
 		current.Annotations[annotationNodeLoadBalancerPendingFWName] != desired.Request.DisplayName ||
@@ -2431,11 +2437,11 @@ func (c *nodeLoadBalancerController) createServiceFirewallFromIssuedIntent(
 		current.Annotations[annotationNodeLoadBalancerPendingFWIssued] != token ||
 		current.Annotations[annotationNodeLoadBalancerPendingFWIssuedAt] != issuedAt ||
 		currentDesired.Hash != desired.Hash || currentDesired.Request.DisplayName != desired.Request.DisplayName {
-		return errors.New("node load balancer: firewall create-issued attempt became stale before the cloud API call")
+		return rejectUndispatched(errors.New("node load balancer: firewall create-issued attempt became stale before the cloud API call"))
 	}
 	observed, absent, err := c.exactNodeLoadBalancerFirewallNameFresh(ctx, desired.Request.DisplayName)
 	if err != nil {
-		return fmt.Errorf("node load balancer: authorize Service firewall create after issue: %w", err)
+		return rejectUndispatched(fmt.Errorf("node load balancer: authorize Service firewall create after issue: %w", err))
 	}
 	if !absent {
 		if observed == nil || !validNodeLoadBalancerCloudUUID(observed.UUID) ||
@@ -2445,17 +2451,17 @@ func (c *nodeLoadBalancerController) createServiceFirewallFromIssuedIntent(
 				string(current.UID),
 				c.provider.config.BillingAccountID,
 			) || !nodeLoadBalancerFirewallMatches(*observed, desired) {
-			return fmt.Errorf(
+			return rejectUndispatched(fmt.Errorf(
 				"node load balancer: deterministic Service firewall name %q became foreign after create issue",
 				desired.Request.DisplayName,
-			)
+			))
 		}
 		committed, recoveryErr := c.resolveServiceFirewallCreateReadback(ctx, current, desired)
 		if recoveryErr != nil {
-			return recoveryErr
+			return rejectUndispatched(recoveryErr)
 		}
 		if !committed {
-			return errors.New("node load balancer: observed Service firewall was not durably promoted")
+			return rejectUndispatched(errors.New("node load balancer: observed Service firewall was not durably promoted"))
 		}
 		return nil
 	}
@@ -2463,8 +2469,7 @@ func (c *nodeLoadBalancerController) createServiceFirewallFromIssuedIntent(
 	if err != nil {
 		createErr := fmt.Errorf("node load balancer: create Service firewall: %w", err)
 		if nodeLoadBalancerMutationKnownPreDispatch(err) {
-			_, clearErr := c.clearPendingFirewallMetadata(ctx, current)
-			return errors.Join(createErr, clearErr)
+			return errors.Join(createErr, c.resetServiceFirewallCreateAfterProvenNonDispatch(ctx, service))
 		}
 		committed, recoveryErr := c.resolveServiceFirewallCreateReadback(ctx, current, desired)
 		if recoveryErr != nil {
@@ -2647,6 +2652,54 @@ func (c *nodeLoadBalancerController) clearPendingFirewallMetadata(ctx context.Co
 		return false, fmt.Errorf("node load balancer: clear provisional firewall identity: %w", err)
 	}
 	return changed, nil
+}
+
+// resetServiceFirewallCreateAfterProvenNonDispatch resets only the exact
+// create-issued receipt won by this invocation. Callers have proof that no
+// provider HTTP mutation was dispatched: either final authority rejected the
+// operation before the SDK call, or the SDK returned ErrMutationBlocked. The
+// staged deterministic identity remains intact for a safe later retry.
+func (c *nodeLoadBalancerController) resetServiceFirewallCreateAfterProvenNonDispatch(
+	ctx context.Context,
+	service *corev1.Service,
+) error {
+	if service == nil {
+		return errors.New("node load balancer: cannot reset a missing Service firewall create receipt")
+	}
+	expectedName := service.Annotations[annotationNodeLoadBalancerPendingFWName]
+	expectedStarted := service.Annotations[annotationNodeLoadBalancerPendingFWStarted]
+	expectedPendingUUID := service.Annotations[annotationNodeLoadBalancerPendingFirewall]
+	expectedIssued := service.Annotations[annotationNodeLoadBalancerPendingFWIssued]
+	expectedIssuedAt := service.Annotations[annotationNodeLoadBalancerPendingFWIssuedAt]
+	expectedDelete := service.Annotations[annotationNodeLoadBalancerPendingFWDelete]
+	if expectedName == "" || expectedStarted == "" || expectedPendingUUID != "" || expectedDelete != "" {
+		return errors.New("node load balancer: incomplete Service firewall create receipt for pre-dispatch reset")
+	}
+	if err := validateNodeLoadBalancerFirewallCreateIssued(expectedIssued, expectedIssuedAt); err != nil {
+		return err
+	}
+	resetCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), durableReceiptWriteTimeout)
+	defer cancel()
+	_, changed, err := c.updateExactParentService(resetCtx, service, func(copy *corev1.Service) (bool, error) {
+		if copy.Annotations[annotationNodeLoadBalancerPendingFWName] != expectedName ||
+			copy.Annotations[annotationNodeLoadBalancerPendingFWStarted] != expectedStarted ||
+			copy.Annotations[annotationNodeLoadBalancerPendingFirewall] != expectedPendingUUID ||
+			copy.Annotations[annotationNodeLoadBalancerPendingFWIssued] != expectedIssued ||
+			copy.Annotations[annotationNodeLoadBalancerPendingFWIssuedAt] != expectedIssuedAt ||
+			copy.Annotations[annotationNodeLoadBalancerPendingFWDelete] != expectedDelete {
+			return false, errors.New("node load balancer: Service firewall create receipt changed before pre-dispatch reset")
+		}
+		delete(copy.Annotations, annotationNodeLoadBalancerPendingFWIssued)
+		delete(copy.Annotations, annotationNodeLoadBalancerPendingFWIssuedAt)
+		return true, nil
+	})
+	if err != nil {
+		return fmt.Errorf("node load balancer: reset proven non-dispatched Service firewall create receipt: %w", err)
+	}
+	if !changed {
+		return errors.New("node load balancer: proven non-dispatched Service firewall create receipt was not reset")
+	}
+	return nil
 }
 
 func (c *nodeLoadBalancerController) promotePendingFirewallMetadata(
@@ -3093,7 +3146,8 @@ func (c *nodeLoadBalancerController) serviceFirewallAssignmentsMatch(
 	if firewallUUID == "" || current.Annotations[annotationNodeLoadBalancerFirewallUUID] != firewallUUID {
 		return false, errors.New("node load balancer: firewall assignment readback is not bound to current metadata")
 	}
-	if current.Annotations[annotationNodeLoadBalancerFirewallRelationIssued] != "" {
+	if current.Annotations[annotationNodeLoadBalancerFirewallRelationIssued] != "" ||
+		current.Annotations[annotationNodeLoadBalancerFirewallRelationOwnerUID] != "" {
 		return false, nil
 	}
 	expectedHash := current.Annotations[annotationNodeLoadBalancerFirewallHash]
@@ -3470,6 +3524,7 @@ func (c *nodeLoadBalancerController) clearInvalidServiceFirewallMetadata(ctx con
 			annotationNodeLoadBalancerFirewallChecked,
 			annotationNodeLoadBalancerPreviousFirewall,
 			annotationNodeLoadBalancerFirewallRelationIssued,
+			annotationNodeLoadBalancerFirewallRelationOwnerUID,
 		} {
 			if _, exists := copy.Annotations[key]; exists {
 				delete(copy.Annotations, key)
@@ -4263,6 +4318,9 @@ func (c *nodeLoadBalancerController) managedNodeLoadBalancerVMIdentityAuthoritat
 	}
 	if vm == nil || vm.UUID != identity.UUID {
 		return nil, "canonical VM UUID does not exactly match the Node providerID", nil
+	}
+	if strings.EqualFold(strings.TrimSpace(vm.Status), "deleted") {
+		return nil, "canonical VM is an HTTP 200 deleted tombstone", nil
 	}
 	if vm.BillingAccountID != c.provider.config.BillingAccountID {
 		return nil, "canonical VM billing account does not match the configured account", nil
@@ -5180,7 +5238,8 @@ func (c *nodeLoadBalancerController) cleanupService(ctx context.Context, service
 		}
 		if copy.Annotations[annotationNodeLoadBalancerFirewallAssigning] != "" ||
 			copy.Annotations[annotationNodeLoadBalancerFirewallAssignAt] != "" ||
-			copy.Annotations[annotationNodeLoadBalancerFirewallRelationIssued] != "" {
+			copy.Annotations[annotationNodeLoadBalancerFirewallRelationIssued] != "" ||
+			copy.Annotations[annotationNodeLoadBalancerFirewallRelationOwnerUID] != "" {
 			return false, errors.New("node load balancer: refusing finalization while firewall assignment remains fenced")
 		}
 		changed := containsString(copy.Finalizers, nodeLoadBalancerFinalizer)
@@ -5212,6 +5271,7 @@ func (c *nodeLoadBalancerController) cleanupService(ctx context.Context, service
 			annotationNodeLoadBalancerFirewallAssigning,
 			annotationNodeLoadBalancerFirewallAssignAt,
 			annotationNodeLoadBalancerFirewallRelationIssued,
+			annotationNodeLoadBalancerFirewallRelationOwnerUID,
 			annotationNodeLoadBalancerFWDeleteTarget,
 			annotationNodeLoadBalancerFWDeleteIssued,
 		} {
@@ -5742,18 +5802,24 @@ func (c *nodeLoadBalancerController) deleteOwnedServiceFirewall(ctx context.Cont
 	if !winner {
 		return false, nil
 	}
+	rejectUndispatched := func(rejection error) (bool, error) {
+		return false, errors.Join(
+			rejection,
+			c.resetServiceFirewallDeleteAfterProvenNonDispatch(ctx, issuedService, uuid, issuedAt),
+		)
+	}
 	authorizedService, authorityErr := c.getExactParentService(ctx, issuedService)
 	if authorityErr != nil {
-		return false, fmt.Errorf("node load balancer: re-read Service owner after firewall delete issue: %w", authorityErr)
+		return rejectUndispatched(fmt.Errorf("node load balancer: re-read Service owner after firewall delete issue: %w", authorityErr))
 	}
 	if authorizedService.UID != issuedService.UID ||
 		authorizedService.Annotations[annotationNodeLoadBalancerFWDeleteTarget] != uuid ||
 		authorizedService.Annotations[annotationNodeLoadBalancerFWDeleteIssued] != issuedAt {
-		return false, errors.New("node load balancer: Service firewall delete authority changed after issue")
+		return rejectUndispatched(errors.New("node load balancer: Service firewall delete authority changed after issue"))
 	}
 	authorizedFirewall, authorityErr := c.exactNodeLoadBalancerFirewallFresh(ctx, uuid)
 	if authorityErr != nil {
-		return false, fmt.Errorf("node load balancer: re-read Service firewall after delete issue: %w", authorityErr)
+		return rejectUndispatched(fmt.Errorf("node load balancer: re-read Service firewall after delete issue: %w", authorityErr))
 	}
 	if !nodeLoadBalancerFirewallAuthorityUnchanged(*firewall, *authorizedFirewall) ||
 		!nodeLoadBalancerFirewallOwnedByService(
@@ -5762,31 +5828,56 @@ func (c *nodeLoadBalancerController) deleteOwnedServiceFirewall(ctx context.Cont
 			string(authorizedService.UID),
 			c.provider.config.BillingAccountID,
 		) {
-		return false, errors.New("node load balancer: Service firewall lost exact ownership or stable policy after delete issue")
+		return rejectUndispatched(errors.New("node load balancer: Service firewall lost exact ownership or stable policy after delete issue"))
 	}
 	postIssueAssignments, authorityErr := nodeLoadBalancerFirewallAssignmentVMs(*authorizedFirewall)
 	if authorityErr != nil {
-		return false, authorityErr
+		return rejectUndispatched(authorityErr)
 	}
 	if len(postIssueAssignments) != 0 {
-		return false, errors.New("node load balancer: Service firewall gained assignments after delete issue")
+		return rejectUndispatched(errors.New("node load balancer: Service firewall gained assignments after delete issue"))
 	}
 	deleteErr := c.provider.api.DeleteFirewall(ctx, c.provider.config.Location, uuid)
 	if nodeLoadBalancerMutationKnownPreDispatch(deleteErr) {
-		_, _, resetErr := c.updateExactParentService(ctx, issuedService, func(copy *corev1.Service) (bool, error) {
-			if copy.Annotations[annotationNodeLoadBalancerFWDeleteTarget] != uuid ||
-				copy.Annotations[annotationNodeLoadBalancerFWDeleteIssued] != issuedAt {
-				return false, errors.New("node load balancer: Service firewall delete receipt changed before pre-dispatch rejection")
-			}
-			delete(copy.Annotations, annotationNodeLoadBalancerFWDeleteIssued)
-			return true, nil
-		})
-		return false, errors.Join(fmt.Errorf("node load balancer: delete firewall %s: %w", uuid, deleteErr), resetErr)
+		return false, errors.Join(
+			fmt.Errorf("node load balancer: delete firewall %s: %w", uuid, deleteErr),
+			c.resetServiceFirewallDeleteAfterProvenNonDispatch(ctx, issuedService, uuid, issuedAt),
+		)
 	}
 	if deleteErr != nil {
 		return false, fmt.Errorf("node load balancer: delete firewall %s: %w", uuid, deleteErr)
 	}
 	return false, nil
+}
+
+func (c *nodeLoadBalancerController) resetServiceFirewallDeleteAfterProvenNonDispatch(
+	ctx context.Context,
+	service *corev1.Service,
+	uuid, issuedAt string,
+) error {
+	if service == nil || !validNodeLoadBalancerCloudUUID(uuid) || issuedAt == "" {
+		return errors.New("node load balancer: incomplete Service firewall delete receipt for pre-dispatch reset")
+	}
+	if _, err := time.Parse(time.RFC3339Nano, issuedAt); err != nil {
+		return fmt.Errorf("node load balancer: invalid Service firewall delete issue timestamp: %w", err)
+	}
+	resetCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), durableReceiptWriteTimeout)
+	defer cancel()
+	_, changed, err := c.updateExactParentService(resetCtx, service, func(copy *corev1.Service) (bool, error) {
+		if copy.Annotations[annotationNodeLoadBalancerFWDeleteTarget] != uuid ||
+			copy.Annotations[annotationNodeLoadBalancerFWDeleteIssued] != issuedAt {
+			return false, errors.New("node load balancer: Service firewall delete receipt changed before pre-dispatch reset")
+		}
+		delete(copy.Annotations, annotationNodeLoadBalancerFWDeleteIssued)
+		return true, nil
+	})
+	if err != nil {
+		return fmt.Errorf("node load balancer: reset proven non-dispatched Service firewall delete receipt: %w", err)
+	}
+	if !changed {
+		return errors.New("node load balancer: proven non-dispatched Service firewall delete receipt was not reset")
+	}
+	return nil
 }
 
 // nodeLoadBalancerFirewallDeleteReceipt validates the exact durable state used

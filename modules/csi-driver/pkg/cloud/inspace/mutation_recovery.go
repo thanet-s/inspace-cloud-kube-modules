@@ -130,6 +130,19 @@ func (a *Adapter) mutationReadbackContext(parent context.Context) (context.Conte
 	return context.WithTimeout(context.WithoutCancel(parent), a.readback)
 }
 
+func (a *Adapter) deleteMutationFenceDetached(parent context.Context, fence mutationFence) error {
+	deleteCtx, cancel := a.mutationReadbackContext(parent)
+	defer cancel()
+	return a.fences.Delete(deleteCtx, fence)
+}
+
+func (a *Adapter) clearUndispatchedDiskCreateFence(parent context.Context, fence mutationFence, cause error) error {
+	if deleteErr := a.deleteMutationFenceDetached(parent, fence); deleteErr != nil {
+		return errors.Join(cause, fmt.Errorf("clear undispatched disk-create fence: %w", deleteErr))
+	}
+	return cause
+}
+
 func (a *Adapter) destructiveReadbackContext(parent context.Context) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.WithoutCancel(parent), a.destructive)
 }
@@ -210,6 +223,26 @@ func (a *Adapter) finishFencedDisk(ctx context.Context, intent diskCreateIntent,
 	if err != nil {
 		return cloud.Volume{}, err
 	}
+	return a.completeFencedDisk(ctx, intent, fence, ready)
+}
+
+// finishUndispatchedFencedDisk adopts a disk discovered after this invocation
+// won the create Lease but before it called CreateDisk. Ownership/readiness
+// failures are therefore proven pre-dispatch and must not strand the Lease.
+// Delete is exact-CAS against fence, so a receipt advanced by another actor is
+// preserved and reported instead of being removed.
+func (a *Adapter) finishUndispatchedFencedDisk(ctx context.Context, intent diskCreateIntent, fence mutationFence, disk sdk.Disk) (cloud.Volume, error) {
+	if err := validateDiskCreateReadback(disk, intent); err != nil {
+		return cloud.Volume{}, a.clearUndispatchedDiskCreateFence(ctx, fence, err)
+	}
+	ready, err := a.waitForDiskReady(ctx, intent, disk)
+	if err != nil {
+		return cloud.Volume{}, a.clearUndispatchedDiskCreateFence(ctx, fence, err)
+	}
+	return a.completeFencedDisk(ctx, intent, fence, ready)
+}
+
+func (a *Adapter) completeFencedDisk(ctx context.Context, intent diskCreateIntent, fence mutationFence, ready sdk.Disk) (cloud.Volume, error) {
 	canonical, err := a.fences.SetReceipt(ctx, fence, strings.ToLower(ready.UUID))
 	if err != nil {
 		return cloud.Volume{}, fmt.Errorf("%w: persist canonical disk-create receipt after authoritative readback: %v", cloud.ErrUnavailable, err)
@@ -325,7 +358,16 @@ func (a *Adapter) waitForDiskAbsent(ctx context.Context, location, volumeID stri
 			if err := validateExactDisk(*disk, volumeID, a.billing); err != nil {
 				return mutationFence{}, err
 			}
-			lastObservation = fmt.Errorf("disk %s remains visible by exact GET", volumeID)
+			// InSpace retains an exact, account-bound tombstone after a
+			// successful delete: GetDisk continues returning HTTP 200 with
+			// status Deleted while ListDisks omits the disk. Treat only that
+			// canonical terminal state as exact-endpoint absence. Every other
+			// status remains visible and resets the destructive absence proof.
+			if diskDeletedTombstone(*disk) {
+				getAbsent = true
+			} else {
+				lastObservation = fmt.Errorf("disk %s remains visible by exact GET with status %q", volumeID, disk.Status)
+			}
 		}
 
 		listAbsent := false
@@ -810,7 +852,7 @@ func (a *Adapter) prepareAttachmentFence(ctx context.Context, intent diskAttachm
 
 func (a *Adapter) finishAttachmentMutation(ctx context.Context, intent diskAttachmentIntent, fence mutationFence, mutationErr error) error {
 	if errors.Is(mutationErr, sdk.ErrMutationBlocked) {
-		if err := a.fences.Delete(context.WithoutCancel(ctx), fence); err != nil {
+		if err := a.deleteMutationFenceDetached(ctx, fence); err != nil {
 			return errors.Join(mutationErr, fmt.Errorf("clear locally blocked disk attachment fence: %w", err))
 		}
 		return mutationErr

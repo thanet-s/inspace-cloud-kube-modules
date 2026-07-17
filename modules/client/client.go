@@ -290,8 +290,10 @@ func newAPIError(method, path string, status int, data []byte) *APIError {
 }
 
 // IsNotFound reports whether err represents an absent resource. InSpace uses
-// HTTP 400 with a "No such ... exists" message for some already-deleted VM
-// lookups, so that exact semantic response is normalized alongside HTTP 404.
+// HTTP 400 with a "No such virtual machine exists" message for some
+// already-deleted VM lookups, so that exact semantic response is normalized
+// alongside HTTP 404. Other "No such ... exists" errors can describe billing,
+// network, or authorization state and must remain ordinary failures.
 func IsNotFound(err error) bool {
 	var apiErr *APIError
 	if !errors.As(err, &apiErr) {
@@ -302,5 +304,27 @@ func IsNotFound(err error) bool {
 	}
 	message := strings.ToLower(strings.TrimSpace(apiErr.Message))
 	message = strings.TrimSpace(strings.TrimPrefix(message, "error:"))
-	return apiErr.StatusCode == http.StatusBadRequest && strings.HasPrefix(message, "no such ") && strings.Contains(message, " exist")
+	if apiErr.StatusCode != http.StatusBadRequest {
+		return false
+	}
+	return exactInSpaceMissingVMPhrase(message, "no such virtual machine exists") ||
+		exactInSpaceMissingVMPhrase(message, "no such vm exists")
+}
+
+func exactInSpaceMissingVMPhrase(message, phrase string) bool {
+	if message == phrase {
+		return true
+	}
+	if !strings.HasPrefix(message, phrase) || len(message) == len(phrase) {
+		return false
+	}
+	// Live responses use ':' before the UUID; the published InSpace API spec
+	// uses '.'. Require the entire suffix to be one canonical UUID; accepting
+	// arbitrary prose after either separator could turn an authorization or
+	// billing error into destructive absence authority.
+	if message[len(phrase)] != ':' && message[len(phrase)] != '.' {
+		return false
+	}
+	suffix := strings.TrimSpace(message[len(phrase)+1:])
+	return uuidPattern.MatchString(suffix)
 }

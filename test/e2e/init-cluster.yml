@@ -229,7 +229,7 @@
         that: (e2e_baseline_audit.stdout | from_json).count == 0
         fail_msg: "The deterministic E2E identity already owns cloud resources; refusing adoption"
 
-    - name: Capture every API-visible billable resource before mutation
+    - name: Capture every API-visible cloud resource before mutation
       ansible.builtin.command:
         argv:
           - /opt/e2e/scripts/account-inventory.py
@@ -247,10 +247,18 @@
           ((e2e_baseline_inventory.stdout | from_json).counts.firewalls | int) == 0 and
           ((e2e_baseline_inventory.stdout | from_json).counts.floatingIPs | int) == 0 and
           ((e2e_baseline_inventory.stdout | from_json).counts.loadBalancers | int) == 0 and
-          ((e2e_baseline_inventory.stdout | from_json).counts.disks | int) == 0
+          ((e2e_baseline_inventory.stdout | from_json).counts.disks | int) == 0 and
+          ((e2e_baseline_inventory.stdout | from_json).counts.buckets | int) == 0 and
+          ((e2e_baseline_inventory.stdout | from_json).counts.servicePackages | int) == 0 and
+          ((e2e_baseline_inventory.stdout | from_json).counts.networks | int) == 1 and
+          (e2e_baseline_inventory.stdout | from_json).networks ==
+            [lookup('env', 'INSPACE_LOCATION') ~ ':' ~ lookup('env', 'INSPACE_NETWORK_UUID')]
         fail_msg: >-
           The release E2E account is not empty; no mutation is allowed outside a
-          dedicated account with zero VMs, firewalls, FIPs, NLBs, and disks.
+          dedicated account with zero VMs, firewalls, FIPs, NLBs, disks,
+          object-storage buckets, and managed-service packages. Exactly the
+          configured prepared VPC, and no other private network, must be present
+          as immutable user-owned baseline state.
 
     - name: Initialize the fail-closed ownership journal
       ansible.builtin.copy:

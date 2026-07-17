@@ -54,6 +54,41 @@ func TestInstancesV2MetadataUsesCanonicalProviderID(t *testing.T) {
 	}
 }
 
+func TestInstancesV2TreatsHTTP200DeletedVMTombstonesAsAbsent(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		node *corev1.Node
+	}{
+		{
+			name: "exact provider ID",
+			node: &corev1.Node{Spec: corev1.NodeSpec{ProviderID: "inspace://bkk01/" + testVMUUID}},
+		},
+		{
+			name: "name inventory",
+			node: &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "deleted-worker"}},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			api := &fakeAPI{vms: []inspace.VM{{
+				UUID: testVMUUID, Name: "deleted-worker", Hostname: "deleted-worker", Status: "Deleted",
+				BillingAccountID: 42, NetworkUUID: testNetworkUUID,
+			}}}
+			provider := newTestProvider(t, api)
+
+			exists, err := provider.InstanceExists(context.Background(), test.node)
+			if err != nil || exists {
+				t.Fatalf("InstanceExists() = %t, %v; want false, nil for deleted tombstone", exists, err)
+			}
+			if _, err := provider.InstanceMetadata(context.Background(), test.node); !errors.Is(err, cloud.InstanceNotFound) {
+				t.Fatalf("InstanceMetadata() error = %v, want cloud.InstanceNotFound", err)
+			}
+			if _, err := provider.InstanceShutdown(context.Background(), test.node); !errors.Is(err, cloud.InstanceNotFound) {
+				t.Fatalf("InstanceShutdown() error = %v, want cloud.InstanceNotFound", err)
+			}
+		})
+	}
+}
+
 func TestNodeLoadBalancerConfigDefaultsNodesPerShardToOne(t *testing.T) {
 	provider, err := New(&fakeAPI{}, Config{
 		Location: "bkk01", Region: "thailand", NetworkUUID: testNetworkUUID,
@@ -214,6 +249,121 @@ func TestEnsureLoadBalancerCreatesTCPRulesAndOwnedName(t *testing.T) {
 	}
 	if len(status.Ingress) != 1 || status.Ingress[0].IP != "203.0.113.20" {
 		t.Fatalf("status = %#v", status)
+	}
+}
+
+type splitVMReadbackAPI struct {
+	*fakeAPI
+	exact  inspace.VM
+	listed []inspace.VM
+}
+
+func (a *splitVMReadbackAPI) GetVM(_ context.Context, _ string, uuid string) (*inspace.VM, error) {
+	if uuid != a.exact.UUID {
+		return nil, &inspace.APIError{StatusCode: 404, Method: "GET", Path: "/vm", Message: "not found"}
+	}
+	copy := a.exact
+	return &copy, nil
+}
+
+func (a *splitVMReadbackAPI) ListVMs(context.Context, string) ([]inspace.VM, error) {
+	return append([]inspace.VM(nil), a.listed...), nil
+}
+
+func TestStandardNLBTargetAuthorityAcceptsSparseVMNetworkWithExactVPCMembership(t *testing.T) {
+	sparse := inspace.VM{
+		UUID: testVMUUID, Name: "worker-0", Status: "running", BillingAccountID: 42,
+		// The live detail and list responses can omit network_uuid.
+		NetworkUUID: "",
+	}
+	api := &splitVMReadbackAPI{
+		fakeAPI: &fakeAPI{network: &inspace.Network{
+			UUID: testNetworkUUID, Subnet: "10.0.0.0/24", VMUUIDs: []string{testVMUUID},
+		}},
+		exact: sparse, listed: []inspace.VM{sparse},
+	}
+	provider := newTestProvider(t, api)
+	targets, err := provider.targetUUIDsFromNodes(context.Background(), []*corev1.Node{
+		readyNode("worker-0", "inspace://bkk01/"+testVMUUID),
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(targets) != 1 || targets[0] != testVMUUID {
+		t.Fatalf("targets = %#v, want [%s]", targets, testVMUUID)
+	}
+	if err := provider.authorizeStandardNLBTargetVMPreDispatch(context.Background(), testVMUUID); err != nil {
+		t.Fatalf("pre-dispatch sparse VM authority: %v", err)
+	}
+}
+
+func TestStandardNLBTargetAuthorityRejectsVMVPCDisagreement(t *testing.T) {
+	baseVM := inspace.VM{UUID: testVMUUID, Name: "worker-0", Status: "running", BillingAccountID: 42}
+	tests := []struct {
+		name    string
+		exact   inspace.VM
+		listed  []inspace.VM
+		network *inspace.Network
+	}{
+		{
+			name: "contradictory exact network field",
+			exact: func() inspace.VM {
+				vm := baseVM
+				vm.NetworkUUID = "99999999-2222-4333-8444-555555555555"
+				return vm
+			}(),
+			listed:  []inspace.VM{baseVM},
+			network: &inspace.Network{UUID: testNetworkUUID, VMUUIDs: []string{testVMUUID}},
+		},
+		{
+			name:  "contradictory list network field",
+			exact: baseVM,
+			listed: []inspace.VM{func() inspace.VM {
+				vm := baseVM
+				vm.NetworkUUID = "99999999-2222-4333-8444-555555555555"
+				return vm
+			}()},
+			network: &inspace.Network{UUID: testNetworkUUID, VMUUIDs: []string{testVMUUID}},
+		},
+		{
+			name: "missing exact VPC membership", exact: baseVM, listed: []inspace.VM{baseVM},
+			network: &inspace.Network{UUID: testNetworkUUID},
+		},
+		{
+			name: "duplicate exact VPC membership", exact: baseVM, listed: []inspace.VM{baseVM},
+			network: &inspace.Network{UUID: testNetworkUUID, VMUUIDs: []string{testVMUUID, testVMUUID}},
+		},
+		{
+			name: "exact deleted tombstone",
+			exact: func() inspace.VM {
+				vm := baseVM
+				vm.Status = "Deleted"
+				return vm
+			}(),
+			listed:  []inspace.VM{baseVM},
+			network: &inspace.Network{UUID: testNetworkUUID, VMUUIDs: []string{testVMUUID}},
+		},
+		{
+			name:  "listed deleted tombstone",
+			exact: baseVM,
+			listed: []inspace.VM{func() inspace.VM {
+				vm := baseVM
+				vm.Status = "deleted"
+				return vm
+			}()},
+			network: &inspace.Network{UUID: testNetworkUUID, VMUUIDs: []string{testVMUUID}},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			api := &splitVMReadbackAPI{
+				fakeAPI: &fakeAPI{network: test.network}, exact: test.exact, listed: test.listed,
+			}
+			provider := newTestProvider(t, api)
+			if err := provider.authorizeStandardNLBTargetVMPreDispatch(context.Background(), testVMUUID); err == nil {
+				t.Fatal("VPC disagreement authorized an NLB target mutation")
+			}
+		})
 	}
 }
 

@@ -1266,13 +1266,15 @@ func (r *Reconciler) ensureManagedVMCreate(
 		firewall, desired, subnet,
 	)
 	if preDispatchErr != nil {
-		return nil, false, errors.Join(preDispatchErr,
+		resetErr := r.resetPreDispatchCreateIssue(ctx, cluster, attemptKey, createAttemptKindVM, desired.Name, intentHash)
+		return nil, false, errors.Join(preDispatchErr, resetErr,
 			fmt.Errorf("%w: VM %q create is issued without fresh absence authority", ErrCreateAttemptPending, desired.Name))
 	}
 	if !preDispatchAbsent {
 		ownedIdentity, ownershipErr := r.recoverCreatedVMOwnership(ctx, cluster, desired, preDispatchCandidate.UUID)
 		if ownershipErr != nil {
-			return nil, false, errors.Join(ownershipErr,
+			resetErr := r.resetPreDispatchCreateIssue(ctx, cluster, attemptKey, createAttemptKindVM, desired.Name, intentHash)
+			return nil, false, errors.Join(ownershipErr, resetErr,
 				fmt.Errorf("%w: VM %q appeared after create authorization but ownership is unproven", ErrCreateAttemptPending, desired.Name))
 		}
 		if anchorErr := r.recordMaterializedCreate(ctx, cluster, attemptKey, createAttemptKindVM, desired.Name, intentHash, ownedIdentity.UUID); anchorErr != nil {
@@ -1879,7 +1881,8 @@ func (r *Reconciler) ensureManagedFirewallCreate(
 	if err := r.validateFirewallCreateDispatchAuthority(
 		ctx, cluster, location, billingAccountID, networkUUID, capturedSubnet, role, request,
 	); err != nil {
-		return nil, errors.Join(err,
+		resetErr := r.resetPreDispatchCreateIssue(ctx, cluster, attemptKey, createAttemptKindFirewall, request.DisplayName, intentHash)
+		return nil, errors.Join(err, resetErr,
 			fmt.Errorf("%w: firewall %q create is issued without fresh VPC/policy authority", ErrCreateAttemptPending, request.DisplayName))
 	}
 	// Re-list after the durable issue CAS. Only a successful unique-name
@@ -1888,17 +1891,20 @@ func (r *Reconciler) ensureManagedFirewallCreate(
 	// receipt unresolved and prevents replay.
 	preDispatchItems, preDispatchErr := r.API.ListFirewalls(ctx, location)
 	if preDispatchErr != nil {
-		return nil, errors.Join(preDispatchErr,
+		resetErr := r.resetPreDispatchCreateIssue(ctx, cluster, attemptKey, createAttemptKindFirewall, request.DisplayName, intentHash)
+		return nil, errors.Join(preDispatchErr, resetErr,
 			fmt.Errorf("%w: firewall %q create is issued without fresh absence authority", ErrCreateAttemptPending, request.DisplayName))
 	}
 	preDispatchFirewall, preDispatchErr := uniqueFirewallByName(preDispatchItems, request.DisplayName)
 	if preDispatchErr != nil {
-		return nil, errors.Join(preDispatchErr,
+		resetErr := r.resetPreDispatchCreateIssue(ctx, cluster, attemptKey, createAttemptKindFirewall, request.DisplayName, intentHash)
+		return nil, errors.Join(preDispatchErr, resetErr,
 			fmt.Errorf("%w: firewall %q create has ambiguous post-CAS identity", ErrCreateAttemptPending, request.DisplayName))
 	}
 	if preDispatchFirewall != nil {
 		if validationErr := validate(preDispatchFirewall); validationErr != nil {
-			return nil, errors.Join(validationErr,
+			resetErr := r.resetPreDispatchCreateIssue(ctx, cluster, attemptKey, createAttemptKindFirewall, request.DisplayName, intentHash)
+			return nil, errors.Join(validationErr, resetErr,
 				fmt.Errorf("%w: firewall %q appeared after create authorization with foreign ownership", ErrCreateAttemptPending, request.DisplayName))
 		}
 		if materializeErr := r.recordMaterializedCreate(ctx, cluster, attemptKey, createAttemptKindFirewall, request.DisplayName, intentHash, preDispatchFirewall.UUID); materializeErr != nil {
@@ -2234,12 +2240,14 @@ func (r *Reconciler) ensureOwnedAutoFloatingIP(ctx context.Context, cluster *v1a
 	// issued receipt and prevent PATCH.
 	freshVM, authorityErr := r.readExactOwnedVMMutationAuthority(ctx, cluster, vm.UUID, vm.Name)
 	if authorityErr != nil {
-		return nil, false, errors.Join(authorityErr,
+		resetErr := r.resetPreDispatchCreateIssue(ctx, cluster, attemptKey, createAttemptKindFloatingIPUpdate, resourceName, intentHash)
+		return nil, false, errors.Join(authorityErr, resetErr,
 			fmt.Errorf("%w: floating-IP update %q lacks fresh VM authority", ErrCreateAttemptPending, attemptKey))
 	}
 	freshItem, alreadyCommitted, authorityErr := r.readFloatingIPUpdateState(ctx, cluster, name, freshVM, item.Address)
 	if authorityErr != nil {
-		return nil, false, errors.Join(authorityErr,
+		resetErr := r.resetPreDispatchCreateIssue(ctx, cluster, attemptKey, createAttemptKindFloatingIPUpdate, resourceName, intentHash)
+		return nil, false, errors.Join(authorityErr, resetErr,
 			fmt.Errorf("%w: floating-IP update %q lacks fresh address/assignment authority", ErrCreateAttemptPending, attemptKey))
 	}
 	if alreadyCommitted {
@@ -2431,7 +2439,8 @@ func (r *Reconciler) ensureExactFirewallAssignment(
 	// after CAS before allowing a relationship POST.
 	present, authorityErr := r.readExactFirewallAssignment(ctx, cluster.Spec.Location, firewall, vmUUID)
 	if authorityErr != nil {
-		return errors.Join(authorityErr,
+		resetErr := r.resetPreDispatchCreateIssue(ctx, cluster, attemptKey, createAttemptKindFirewallAssignment, resourceName, intentHash)
+		return errors.Join(authorityErr, resetErr,
 			fmt.Errorf("%w: firewall assignment %q lacks fresh firewall authority", ErrCreateAttemptPending, attemptKey))
 	}
 	if present {
@@ -2442,7 +2451,8 @@ func (r *Reconciler) ensureExactFirewallAssignment(
 		return nil
 	}
 	if _, authorityErr = r.readExactOwnedVMMutationAuthority(ctx, cluster, vmUUID, ""); authorityErr != nil {
-		return errors.Join(authorityErr,
+		resetErr := r.resetPreDispatchCreateIssue(ctx, cluster, attemptKey, createAttemptKindFirewallAssignment, resourceName, intentHash)
+		return errors.Join(authorityErr, resetErr,
 			fmt.Errorf("%w: firewall assignment %q lacks fresh VM authority", ErrCreateAttemptPending, attemptKey))
 	}
 	requestCtx, cancel := context.WithTimeout(ctx, configuredDuration(r.protectionRequestTimeout, defaultProtectionRequestTimeout))
@@ -2894,6 +2904,9 @@ func validateOwnedVM(vm *inspace.VM, desired inspace.CreateVMRequest, network *i
 	if vm == nil || !vmUUIDPattern.MatchString(vm.UUID) {
 		return fmt.Errorf("bootstrap: refusing to adopt VM %q with an invalid UUID", desired.Name)
 	}
+	if strings.EqualFold(strings.TrimSpace(vm.Status), "deleted") {
+		return fmt.Errorf("bootstrap: refusing to adopt VM %q from an HTTP 200 deleted tombstone", desired.Name)
+	}
 	if vm.Name != desired.Name {
 		return fmt.Errorf("bootstrap: refusing to adopt VM %q under unexpected name %q", desired.Name, vm.Name)
 	}
@@ -2948,6 +2961,9 @@ func validateUniqueVMInventoryIdentity(items []inspace.VM, detail *inspace.VM, b
 		candidate := &items[i]
 		if strings.EqualFold(candidate.UUID, detail.UUID) {
 			matches++
+			if strings.EqualFold(strings.TrimSpace(candidate.Status), "deleted") {
+				return fmt.Errorf("VM %s location inventory contains an HTTP 200 deleted tombstone", detail.UUID)
+			}
 			if candidate.Name != detail.Name ||
 				(candidate.BillingAccountID != 0 && candidate.BillingAccountID != billingAccountID) ||
 				(candidate.NetworkUUID != "" && !strings.EqualFold(candidate.NetworkUUID, networkUUID)) {
@@ -2989,6 +3005,9 @@ func (r *Reconciler) readExactOwnedVMMutationAuthority(
 	if detail == nil || !strings.EqualFold(detail.UUID, vmUUID) || detail.Name == "" ||
 		(expectedName != "" && detail.Name != expectedName) {
 		return nil, fmt.Errorf("bootstrap: exact VM mutation-authority identity for %s changed", vmUUID)
+	}
+	if strings.EqualFold(strings.TrimSpace(detail.Status), "deleted") {
+		return nil, fmt.Errorf("bootstrap: exact VM mutation target %s is an HTTP 200 deleted tombstone", vmUUID)
 	}
 	if detail.BillingAccountID != cluster.Spec.BillingAccountID {
 		return nil, fmt.Errorf("bootstrap: VM %q lacks exact billing-account mutation authority", detail.Name)

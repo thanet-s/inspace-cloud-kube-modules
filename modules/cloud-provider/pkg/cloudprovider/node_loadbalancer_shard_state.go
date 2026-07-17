@@ -217,10 +217,22 @@ func (c *nodeLoadBalancerController) updateManagedNodePoolAnnotations(
 	shard string,
 	mutate func(map[string]string) (bool, error),
 ) (*unstructured.Unstructured, bool, error) {
+	return c.updateManagedNodePoolAnnotationsForUID(ctx, shard, "", mutate)
+}
+
+func (c *nodeLoadBalancerController) updateManagedNodePoolAnnotationsForUID(
+	ctx context.Context,
+	shard string,
+	expectedUID types.UID,
+	mutate func(map[string]string) (bool, error),
+) (*unstructured.Unstructured, bool, error) {
 	resource := c.provider.dynamicClient.Resource(nodePoolGVR)
 	pool, err := resource.Get(ctx, shard, metav1.GetOptions{})
 	if err != nil {
 		return nil, false, fmt.Errorf("node load balancer: get NodePool %s for shard firewall state: %w", shard, err)
+	}
+	if expectedUID != "" && pool.GetUID() != expectedUID {
+		return nil, false, fmt.Errorf("node load balancer: NodePool %s identity changed before exact receipt transition", shard)
 	}
 	labels := pool.GetLabels()
 	if labels[nodeLoadBalancerManagedLabel] != "true" ||
@@ -381,10 +393,22 @@ func (c *nodeLoadBalancerController) recordManagedNodePoolFirewallAbsence(
 	shard, countAnnotation, checkedAnnotation string,
 	now, notBefore time.Time,
 ) (confirmed, changed bool, err error) {
+	return c.recordManagedNodePoolFirewallAbsenceForUID(
+		ctx, shard, "", countAnnotation, checkedAnnotation, now, notBefore,
+	)
+}
+
+func (c *nodeLoadBalancerController) recordManagedNodePoolFirewallAbsenceForUID(
+	ctx context.Context,
+	shard string,
+	expectedUID types.UID,
+	countAnnotation, checkedAnnotation string,
+	now, notBefore time.Time,
+) (confirmed, changed bool, err error) {
 	if now.Before(notBefore) {
 		return false, false, nil
 	}
-	_, changed, err = c.updateManagedNodePoolAnnotations(ctx, shard, func(values map[string]string) (bool, error) {
+	_, changed, err = c.updateManagedNodePoolAnnotationsForUID(ctx, shard, expectedUID, func(values map[string]string) (bool, error) {
 		count := 0
 		if raw := values[countAnnotation]; raw != "" {
 			parsed, parseErr := strconv.Atoi(raw)
@@ -420,7 +444,16 @@ func (c *nodeLoadBalancerController) clearManagedNodePoolFirewallAbsence(
 	shard string,
 	pairs ...string,
 ) (bool, error) {
-	_, changed, err := c.updateManagedNodePoolAnnotations(ctx, shard, func(values map[string]string) (bool, error) {
+	return c.clearManagedNodePoolFirewallAbsenceForUID(ctx, shard, "", pairs...)
+}
+
+func (c *nodeLoadBalancerController) clearManagedNodePoolFirewallAbsenceForUID(
+	ctx context.Context,
+	shard string,
+	expectedUID types.UID,
+	pairs ...string,
+) (bool, error) {
+	_, changed, err := c.updateManagedNodePoolAnnotationsForUID(ctx, shard, expectedUID, func(values map[string]string) (bool, error) {
 		changed := false
 		for _, key := range pairs {
 			if values[key] != "" {
@@ -456,11 +489,13 @@ func nodeLoadBalancerShardFirewallMutationExpected(annotations map[string]string
 func (c *nodeLoadBalancerController) issueShardFirewallMutation(
 	ctx context.Context,
 	shard string,
+	ownerUID types.UID,
 	expectedStaged map[string]string,
 	issuedAt string,
 	clearCreateAbsence bool,
 ) (map[string]string, error) {
-	if expectedStaged[annotationNodeLoadBalancerShardFWPendingHash] == "" ||
+	if ownerUID == "" ||
+		expectedStaged[annotationNodeLoadBalancerShardFWPendingHash] == "" ||
 		expectedStaged[annotationNodeLoadBalancerShardFWPendingLedger] == "" ||
 		expectedStaged[annotationNodeLoadBalancerShardFWPendingAt] == "" ||
 		expectedStaged[annotationNodeLoadBalancerShardFWIssuedAt] != "" ||
@@ -470,7 +505,7 @@ func (c *nodeLoadBalancerController) issueShardFirewallMutation(
 	if _, err := time.Parse(time.RFC3339Nano, issuedAt); err != nil {
 		return nil, fmt.Errorf("node load balancer: invalid shard firewall issue timestamp: %w", err)
 	}
-	issuedPool, changed, err := c.updateManagedNodePoolAnnotations(ctx, shard, func(values map[string]string) (bool, error) {
+	issuedPool, changed, err := c.updateManagedNodePoolAnnotationsForUID(ctx, shard, ownerUID, func(values map[string]string) (bool, error) {
 		for _, key := range nodeLoadBalancerShardFirewallMutationReceiptKeys {
 			if values[key] != expectedStaged[key] {
 				return false, errors.New("node load balancer: shard firewall staged mutation changed before authority issuance")
@@ -557,10 +592,14 @@ func (c *nodeLoadBalancerController) authorizeShardFirewallPolicyMutationPreDisp
 func (c *nodeLoadBalancerController) transitionShardFirewallMutation(
 	ctx context.Context,
 	shard string,
+	ownerUID types.UID,
 	expected map[string]string,
 	committed *inspace.Firewall,
 ) error {
-	updated, changed, err := c.updateManagedNodePoolAnnotations(ctx, shard, func(values map[string]string) (bool, error) {
+	if ownerUID == "" {
+		return errors.New("node load balancer: shard firewall mutation transition lacks its exact NodePool UID")
+	}
+	updated, changed, err := c.updateManagedNodePoolAnnotationsForUID(ctx, shard, ownerUID, func(values map[string]string) (bool, error) {
 		for _, key := range nodeLoadBalancerShardFirewallMutationReceiptKeys {
 			if values[key] != expected[key] {
 				return false, errors.New("node load balancer: shard firewall mutation receipt changed before exact transition")
@@ -619,9 +658,59 @@ func (c *nodeLoadBalancerController) transitionShardFirewallMutation(
 	return nil
 }
 
+// resetShardFirewallMutationAfterProvenNonDispatch returns the exact issued
+// shard policy transaction to its staged state. Callers have won issuance and
+// proved that no provider HTTP mutation was dispatched, either through final
+// authority rejection or the SDK's typed ErrMutationBlocked result.
+func (c *nodeLoadBalancerController) resetShardFirewallMutationAfterProvenNonDispatch(
+	ctx context.Context,
+	shard string,
+	ownerUID types.UID,
+	expected map[string]string,
+) error {
+	if ownerUID == "" ||
+		expected[annotationNodeLoadBalancerShardFWIssuedAt] == "" ||
+		expected[annotationNodeLoadBalancerShardFWPendingHash] == "" ||
+		expected[annotationNodeLoadBalancerShardFWPendingLedger] == "" ||
+		expected[annotationNodeLoadBalancerShardFWPendingAt] == "" {
+		return errors.New("node load balancer: incomplete shard firewall mutation receipt for pre-dispatch reset")
+	}
+	resetCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), durableReceiptWriteTimeout)
+	defer cancel()
+	updated, changed, err := c.updateManagedNodePoolAnnotationsForUID(resetCtx, shard, ownerUID, func(values map[string]string) (bool, error) {
+		for _, key := range nodeLoadBalancerShardFirewallMutationReceiptKeys {
+			if values[key] != expected[key] {
+				return false, errors.New("node load balancer: shard firewall mutation receipt changed before pre-dispatch reset")
+			}
+		}
+		delete(values, annotationNodeLoadBalancerShardFWIssuedAt)
+		return true, nil
+	})
+	if err != nil {
+		return fmt.Errorf("node load balancer: reset proven non-dispatched shard firewall mutation receipt: %w", err)
+	}
+	if !changed || updated == nil {
+		return errors.New("node load balancer: proven non-dispatched shard firewall mutation receipt was not reset")
+	}
+	annotations := updated.GetAnnotations()
+	if annotations[annotationNodeLoadBalancerShardFWIssuedAt] != "" {
+		return errors.New("node load balancer: shard firewall mutation reset retained issued authority")
+	}
+	for _, key := range nodeLoadBalancerShardFirewallMutationReceiptKeys {
+		if key == annotationNodeLoadBalancerShardFWIssuedAt {
+			continue
+		}
+		if annotations[key] != expected[key] {
+			return errors.New("node load balancer: shard firewall mutation reset changed its staged identity")
+		}
+	}
+	return nil
+}
+
 func (c *nodeLoadBalancerController) resolveShardFirewallCreateReadback(
 	ctx context.Context,
 	shard string,
+	ownerUID types.UID,
 	expected map[string]string,
 	desired nodeLoadBalancerShardFirewallPolicy,
 ) (*inspace.Firewall, bool, error) {
@@ -653,7 +742,7 @@ func (c *nodeLoadBalancerController) resolveShardFirewallCreateReadback(
 			) != nil {
 			return nil, false, fmt.Errorf("node load balancer: stable shard firewall name %q resolved to a foreign or third-state resource after create response", desired.Request.DisplayName)
 		}
-		if err := c.transitionShardFirewallMutation(ctx, shard, expected, observed); err != nil {
+		if err := c.transitionShardFirewallMutation(ctx, shard, ownerUID, expected, observed); err != nil {
 			return nil, false, err
 		}
 		return observed, true, nil
@@ -664,6 +753,7 @@ func (c *nodeLoadBalancerController) resolveShardFirewallCreateReadback(
 func (c *nodeLoadBalancerController) resolveShardFirewallUpdateReadback(
 	ctx context.Context,
 	shard string,
+	ownerUID types.UID,
 	expected map[string]string,
 	desired nodeLoadBalancerShardFirewallPolicy,
 ) (*inspace.Firewall, bool, error) {
@@ -717,7 +807,7 @@ func (c *nodeLoadBalancerController) resolveShardFirewallUpdateReadback(
 		); err != nil {
 			return nil, false, fmt.Errorf("node load balancer: pending shard firewall readback lost exact ownership: %w", err)
 		}
-		if err := c.transitionShardFirewallMutation(ctx, shard, expected, byUUID); err != nil {
+		if err := c.transitionShardFirewallMutation(ctx, shard, ownerUID, expected, byUUID); err != nil {
 			return nil, false, err
 		}
 		return byUUID, true, nil
@@ -796,6 +886,10 @@ func (c *nodeLoadBalancerController) reconcileShardFirewallPolicy(
 		pool.GetDeletionTimestamp() != nil {
 		return state, fmt.Errorf("node load balancer: NodePool %s is not an authoritative live shard-state anchor", shard)
 	}
+	ownerUID := pool.GetUID()
+	if ownerUID == "" {
+		return state, fmt.Errorf("node load balancer: NodePool %s has an empty UID", shard)
+	}
 	annotations, err := nodeLoadBalancerShardFirewallAnnotations(pool)
 	if err != nil {
 		return state, err
@@ -850,8 +944,8 @@ func (c *nodeLoadBalancerController) reconcileShardFirewallPolicy(
 		if byName != nil {
 			return state, fmt.Errorf("node load balancer: persisted shard firewall %s is absent but stable name resolves to different UUID %s", appliedUUID, byName.UUID)
 		}
-		confirmed, _, absenceErr := c.recordManagedNodePoolFirewallAbsence(
-			ctx, shard,
+		confirmed, _, absenceErr := c.recordManagedNodePoolFirewallAbsenceForUID(
+			ctx, shard, ownerUID,
 			annotationNodeLoadBalancerShardFWAbsent,
 			annotationNodeLoadBalancerShardFWAbsentChecked,
 			time.Now().UTC(), time.Time{},
@@ -862,7 +956,7 @@ func (c *nodeLoadBalancerController) reconcileShardFirewallPolicy(
 		if !confirmed {
 			return state, nil
 		}
-		_, _, clearErr := c.updateManagedNodePoolAnnotations(ctx, shard, func(values map[string]string) (bool, error) {
+		_, _, clearErr := c.updateManagedNodePoolAnnotationsForUID(ctx, shard, ownerUID, func(values map[string]string) (bool, error) {
 			if values[annotationNodeLoadBalancerShardFirewallUUID] != appliedUUID {
 				return false, errors.New("node load balancer: applied shard firewall identity changed during absence proof")
 			}
@@ -880,8 +974,8 @@ func (c *nodeLoadBalancerController) reconcileShardFirewallPolicy(
 		return state, clearErr
 	case appliedUUID != "":
 		current = byUUID
-		if _, clearErr := c.clearManagedNodePoolFirewallAbsence(
-			ctx, shard,
+		if _, clearErr := c.clearManagedNodePoolFirewallAbsenceForUID(
+			ctx, shard, ownerUID,
 			annotationNodeLoadBalancerShardFWAbsent,
 			annotationNodeLoadBalancerShardFWAbsentChecked,
 		); clearErr != nil {
@@ -896,8 +990,8 @@ func (c *nodeLoadBalancerController) reconcileShardFirewallPolicy(
 		current = byName
 	}
 	if current != nil {
-		if _, clearErr := c.clearManagedNodePoolFirewallAbsence(
-			ctx, shard,
+		if _, clearErr := c.clearManagedNodePoolFirewallAbsenceForUID(
+			ctx, shard, ownerUID,
 			annotationNodeLoadBalancerShardFWCreateAbsent,
 			annotationNodeLoadBalancerShardFWCreateChecked,
 		); clearErr != nil {
@@ -928,7 +1022,7 @@ func (c *nodeLoadBalancerController) reconcileShardFirewallPolicy(
 		pendingLedger := annotations[annotationNodeLoadBalancerShardFWPendingLedger]
 		switch {
 		case pendingHash != "" && actualHash == pendingHash:
-			if _, changed, promoteErr := c.updateManagedNodePoolAnnotations(ctx, shard, func(values map[string]string) (bool, error) {
+			if _, changed, promoteErr := c.updateManagedNodePoolAnnotationsForUID(ctx, shard, ownerUID, func(values map[string]string) (bool, error) {
 				values[annotationNodeLoadBalancerShardFirewallUUID] = current.UUID
 				values[annotationNodeLoadBalancerShardFirewallHash] = pendingHash
 				values[annotationNodeLoadBalancerShardFirewallLedger] = pendingLedger
@@ -946,7 +1040,7 @@ func (c *nodeLoadBalancerController) reconcileShardFirewallPolicy(
 				return state, nil
 			}
 		case appliedHash == "" && actualHash == desired.Hash:
-			if _, changed, adoptErr := c.updateManagedNodePoolAnnotations(ctx, shard, func(values map[string]string) (bool, error) {
+			if _, changed, adoptErr := c.updateManagedNodePoolAnnotationsForUID(ctx, shard, ownerUID, func(values map[string]string) (bool, error) {
 				values[annotationNodeLoadBalancerShardFirewallUUID] = current.UUID
 				values[annotationNodeLoadBalancerShardFirewallHash] = desired.Hash
 				values[annotationNodeLoadBalancerShardFirewallLedger] = desiredLedger
@@ -976,7 +1070,7 @@ func (c *nodeLoadBalancerController) reconcileShardFirewallPolicy(
 			return state, fmt.Errorf("node load balancer: persisted shard firewall %s is absent from authoritative readback", annotations[annotationNodeLoadBalancerShardFirewallUUID])
 		}
 		if annotations[annotationNodeLoadBalancerShardFWPendingHash] == "" {
-			_, _, err = c.updateManagedNodePoolAnnotations(ctx, shard, func(values map[string]string) (bool, error) {
+			_, _, err = c.updateManagedNodePoolAnnotationsForUID(ctx, shard, ownerUID, func(values map[string]string) (bool, error) {
 				values[annotationNodeLoadBalancerShardFWPendingHash] = desired.Hash
 				values[annotationNodeLoadBalancerShardFWPendingLedger] = desiredLedger
 				values[annotationNodeLoadBalancerShardFWPendingAt] = time.Now().UTC().Format(time.RFC3339Nano)
@@ -991,7 +1085,7 @@ func (c *nodeLoadBalancerController) reconcileShardFirewallPolicy(
 			if annotations[annotationNodeLoadBalancerShardFWIssuedAt] != "" {
 				return state, errors.New("node load balancer: waiting for an issued shard firewall create before changing desired policy")
 			}
-			_, _, err = c.updateManagedNodePoolAnnotations(ctx, shard, func(values map[string]string) (bool, error) {
+			_, _, err = c.updateManagedNodePoolAnnotationsForUID(ctx, shard, ownerUID, func(values map[string]string) (bool, error) {
 				values[annotationNodeLoadBalancerShardFWPendingHash] = desired.Hash
 				values[annotationNodeLoadBalancerShardFWPendingLedger] = desiredLedger
 				values[annotationNodeLoadBalancerShardFWPendingAt] = time.Now().UTC().Format(time.RFC3339Nano)
@@ -1013,14 +1107,18 @@ func (c *nodeLoadBalancerController) reconcileShardFirewallPolicy(
 		}
 		now := time.Now().UTC().Format(time.RFC3339Nano)
 		expectedStaged := nodeLoadBalancerShardFirewallMutationExpected(annotations, "")
-		expectedMutation, issueErr := c.issueShardFirewallMutation(ctx, shard, expectedStaged, now, true)
+		expectedMutation, issueErr := c.issueShardFirewallMutation(ctx, shard, ownerUID, expectedStaged, now, true)
 		if issueErr != nil {
 			return state, issueErr
 		}
+		rejectUndispatched := func(rejection error) (nodeLoadBalancerShardFirewallState, error) {
+			resetErr := c.resetShardFirewallMutationAfterProvenNonDispatch(ctx, shard, ownerUID, expectedMutation)
+			state.MutationIssued = resetErr != nil
+			return state, errors.Join(rejection, resetErr)
+		}
 		observed, absent, authorityErr := c.exactNodeLoadBalancerFirewallNameFresh(ctx, desired.Request.DisplayName)
 		if authorityErr != nil {
-			state.MutationIssued = true
-			return state, fmt.Errorf("node load balancer: authorize shard firewall create after issue: %w", authorityErr)
+			return rejectUndispatched(fmt.Errorf("node load balancer: authorize shard firewall create after issue: %w", authorityErr))
 		}
 		if !absent {
 			if observed == nil || !validNodeLoadBalancerCloudUUID(observed.UUID) ||
@@ -1032,22 +1130,19 @@ func (c *nodeLoadBalancerController) reconcileShardFirewallPolicy(
 					desired.Request.BillingAccountID,
 					desired.Hash,
 				) != nil {
-				state.MutationIssued = true
-				return state, fmt.Errorf(
+				return rejectUndispatched(fmt.Errorf(
 					"node load balancer: stable shard firewall name %q became foreign after create issue",
 					desired.Request.DisplayName,
-				)
+				))
 			}
 			observed, committed, recoveryErr := c.resolveShardFirewallCreateReadback(
-				ctx, shard, expectedMutation, *desired,
+				ctx, shard, ownerUID, expectedMutation, *desired,
 			)
 			if recoveryErr != nil {
-				state.MutationIssued = true
-				return state, recoveryErr
+				return rejectUndispatched(recoveryErr)
 			}
 			if !committed {
-				state.MutationIssued = true
-				return state, errors.New("node load balancer: observed shard firewall was not durably promoted")
+				return rejectUndispatched(errors.New("node load balancer: observed shard firewall was not durably promoted"))
 			}
 			state.Firewall = observed
 			state.AppliedHash = desired.Hash
@@ -1056,19 +1151,23 @@ func (c *nodeLoadBalancerController) reconcileShardFirewallPolicy(
 			return state, nil
 		}
 		if authorityErr := c.authorizeShardFirewallPolicyMutationPreDispatch(
-			ctx, shard, pool.GetUID(), expectedMutation, *desired, desiredLedger,
+			ctx, shard, ownerUID, expectedMutation, *desired, desiredLedger,
 		); authorityErr != nil {
-			state.MutationIssued = true
-			return state, fmt.Errorf("node load balancer: reject shard firewall create at final authority: %w", authorityErr)
+			return rejectUndispatched(fmt.Errorf("node load balancer: reject shard firewall create at final authority: %w", authorityErr))
 		}
 		created, createErr := c.provider.api.CreateFirewall(ctx, c.provider.config.Location, desired.Request)
 		if createErr != nil {
 			wrappedErr := fmt.Errorf("node load balancer: create shard firewall: %w", createErr)
 			if nodeLoadBalancerMutationKnownPreDispatch(createErr) {
-				return state, errors.Join(wrappedErr, c.transitionShardFirewallMutation(ctx, shard, expectedMutation, nil))
+				resetErr := c.resetShardFirewallMutationAfterProvenNonDispatch(ctx, shard, ownerUID, expectedMutation)
+				state.MutationIssued = resetErr != nil
+				return state, errors.Join(
+					wrappedErr,
+					resetErr,
+				)
 			}
 			observed, committed, recoveryErr := c.resolveShardFirewallCreateReadback(
-				ctx, shard, expectedMutation, *desired,
+				ctx, shard, ownerUID, expectedMutation, *desired,
 			)
 			if recoveryErr != nil {
 				return state, errors.Join(wrappedErr, recoveryErr)
@@ -1088,7 +1187,7 @@ func (c *nodeLoadBalancerController) reconcileShardFirewallPolicy(
 		); responseErr != nil {
 			wrappedErr := fmt.Errorf("node load balancer: created shard firewall response: %w", responseErr)
 			observed, committed, recoveryErr := c.resolveShardFirewallCreateReadback(
-				ctx, shard, expectedMutation, *desired,
+				ctx, shard, ownerUID, expectedMutation, *desired,
 			)
 			if recoveryErr != nil {
 				return state, errors.Join(wrappedErr, recoveryErr)
@@ -1105,7 +1204,7 @@ func (c *nodeLoadBalancerController) reconcileShardFirewallPolicy(
 		// The response UUID is provisional only. Canonical identity is promoted
 		// exclusively from a unique deterministic-name ListFirewalls readback.
 		observed, committed, recoveryErr := c.resolveShardFirewallCreateReadback(
-			ctx, shard, expectedMutation, *desired,
+			ctx, shard, ownerUID, expectedMutation, *desired,
 		)
 		if recoveryErr != nil {
 			state.MutationIssued = true
@@ -1125,13 +1224,13 @@ func (c *nodeLoadBalancerController) reconcileShardFirewallPolicy(
 	if state.AppliedHash == desired.Hash && state.AppliedLedger == desiredLedger {
 		state.PolicyReady = true
 	} else if state.AppliedHash == desired.Hash && annotations[annotationNodeLoadBalancerShardFWPendingHash] == "" {
-		_, _, err = c.updateManagedNodePoolAnnotations(ctx, shard, func(values map[string]string) (bool, error) {
+		_, _, err = c.updateManagedNodePoolAnnotationsForUID(ctx, shard, ownerUID, func(values map[string]string) (bool, error) {
 			values[annotationNodeLoadBalancerShardFirewallLedger] = desiredLedger
 			return true, nil
 		})
 		return state, err
 	} else if annotations[annotationNodeLoadBalancerShardFWPendingHash] == "" {
-		_, _, err = c.updateManagedNodePoolAnnotations(ctx, shard, func(values map[string]string) (bool, error) {
+		_, _, err = c.updateManagedNodePoolAnnotationsForUID(ctx, shard, ownerUID, func(values map[string]string) (bool, error) {
 			values[annotationNodeLoadBalancerShardFWPendingHash] = desired.Hash
 			values[annotationNodeLoadBalancerShardFWPendingLedger] = desiredLedger
 			values[annotationNodeLoadBalancerShardFWPendingAt] = time.Now().UTC().Format(time.RFC3339Nano)
@@ -1145,7 +1244,7 @@ func (c *nodeLoadBalancerController) reconcileShardFirewallPolicy(
 			if annotations[annotationNodeLoadBalancerShardFWIssuedAt] != "" {
 				return state, errors.New("node load balancer: waiting for issued shard firewall update to resolve")
 			}
-			_, _, err = c.updateManagedNodePoolAnnotations(ctx, shard, func(values map[string]string) (bool, error) {
+			_, _, err = c.updateManagedNodePoolAnnotationsForUID(ctx, shard, ownerUID, func(values map[string]string) (bool, error) {
 				values[annotationNodeLoadBalancerShardFWPendingHash] = desired.Hash
 				values[annotationNodeLoadBalancerShardFWPendingLedger] = desiredLedger
 				values[annotationNodeLoadBalancerShardFWPendingAt] = time.Now().UTC().Format(time.RFC3339Nano)
@@ -1170,24 +1269,26 @@ func (c *nodeLoadBalancerController) reconcileShardFirewallPolicy(
 		}
 		now := time.Now().UTC().Format(time.RFC3339Nano)
 		expectedStaged := nodeLoadBalancerShardFirewallMutationExpected(annotations, "")
-		expectedMutation, issueErr := c.issueShardFirewallMutation(ctx, shard, expectedStaged, now, false)
+		expectedMutation, issueErr := c.issueShardFirewallMutation(ctx, shard, ownerUID, expectedStaged, now, false)
 		if issueErr != nil {
 			return state, issueErr
 		}
+		rejectUndispatched := func(rejection error) (nodeLoadBalancerShardFirewallState, error) {
+			resetErr := c.resetShardFirewallMutationAfterProvenNonDispatch(ctx, shard, ownerUID, expectedMutation)
+			state.MutationIssued = resetErr != nil
+			return state, errors.Join(rejection, resetErr)
+		}
 		if authorityErr := c.authorizeShardFirewallPolicyMutationPreDispatch(
-			ctx, shard, pool.GetUID(), expectedMutation, *desired, desiredLedger,
+			ctx, shard, ownerUID, expectedMutation, *desired, desiredLedger,
 		); authorityErr != nil {
-			state.MutationIssued = true
-			return state, fmt.Errorf("node load balancer: reject shard firewall update at final authority: %w", authorityErr)
+			return rejectUndispatched(fmt.Errorf("node load balancer: reject shard firewall update at final authority: %w", authorityErr))
 		}
 		fresh, authorityErr := c.exactNodeLoadBalancerFirewallFresh(ctx, state.Firewall.UUID)
 		if authorityErr != nil {
-			state.MutationIssued = true
-			return state, fmt.Errorf("node load balancer: authorize shard firewall update after issue: %w", authorityErr)
+			return rejectUndispatched(fmt.Errorf("node load balancer: authorize shard firewall update after issue: %w", authorityErr))
 		}
 		if !nodeLoadBalancerFirewallAuthorityUnchanged(*state.Firewall, *fresh) {
-			state.MutationIssued = true
-			return state, errors.New("node load balancer: shard firewall changed after update issue")
+			return rejectUndispatched(errors.New("node load balancer: shard firewall changed after update issue"))
 		}
 		if err := inspace.ValidateNodeLoadBalancerShardFirewall(
 			*fresh,
@@ -1196,25 +1297,28 @@ func (c *nodeLoadBalancerController) reconcileShardFirewallPolicy(
 			desired.Request.BillingAccountID,
 			expectedMutation[annotationNodeLoadBalancerShardFirewallHash],
 		); err != nil {
-			state.MutationIssued = true
-			return state, fmt.Errorf("node load balancer: shard firewall lost exact applied-policy authority after update issue: %w", err)
+			return rejectUndispatched(fmt.Errorf("node load balancer: shard firewall lost exact applied-policy authority after update issue: %w", err))
 		}
 		// Keep the live Service policy check adjacent to the provider boundary;
 		// the cloud read above may itself take long enough for policy to change.
 		if authorityErr := c.authorizeShardFirewallPolicyMutationPreDispatch(
-			ctx, shard, pool.GetUID(), expectedMutation, *desired, desiredLedger,
+			ctx, shard, ownerUID, expectedMutation, *desired, desiredLedger,
 		); authorityErr != nil {
-			state.MutationIssued = true
-			return state, fmt.Errorf("node load balancer: reject shard firewall update at final authority: %w", authorityErr)
+			return rejectUndispatched(fmt.Errorf("node load balancer: reject shard firewall update at final authority: %w", authorityErr))
 		}
 		updated, updateErr := c.provider.api.UpdateFirewall(ctx, c.provider.config.Location, state.Firewall.UUID, request)
 		if updateErr != nil {
 			wrappedErr := fmt.Errorf("node load balancer: update shard firewall %s: %w", state.Firewall.UUID, updateErr)
 			if nodeLoadBalancerMutationKnownPreDispatch(updateErr) {
-				return state, errors.Join(wrappedErr, c.transitionShardFirewallMutation(ctx, shard, expectedMutation, nil))
+				resetErr := c.resetShardFirewallMutationAfterProvenNonDispatch(ctx, shard, ownerUID, expectedMutation)
+				state.MutationIssued = resetErr != nil
+				return state, errors.Join(
+					wrappedErr,
+					resetErr,
+				)
 			}
 			observed, committed, recoveryErr := c.resolveShardFirewallUpdateReadback(
-				ctx, shard, expectedMutation, *desired,
+				ctx, shard, ownerUID, expectedMutation, *desired,
 			)
 			if recoveryErr != nil {
 				state.MutationIssued = true
@@ -1233,7 +1337,7 @@ func (c *nodeLoadBalancerController) reconcileShardFirewallPolicy(
 		if responseErr := validateUpdatedNodeLoadBalancerShardFirewallResponse(updated, state.Firewall.UUID, *desired); responseErr != nil {
 			wrappedErr := fmt.Errorf("node load balancer: updated shard firewall response: %w", responseErr)
 			observed, committed, recoveryErr := c.resolveShardFirewallUpdateReadback(
-				ctx, shard, expectedMutation, *desired,
+				ctx, shard, ownerUID, expectedMutation, *desired,
 			)
 			if recoveryErr != nil {
 				state.MutationIssued = true

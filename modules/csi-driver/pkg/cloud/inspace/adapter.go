@@ -171,20 +171,26 @@ func (a *Adapter) EnsureVolume(ctx context.Context, spec cloud.VolumeSpec) (clou
 	// become visible. Re-read the unfiltered location inventory after winning
 	// the durable issue and before the paid POST. Only exact deterministic-name
 	// absence authorizes CreateDisk; an exact owned match is adopted read-only,
-	// while every foreign, duplicate, or failed read retains the fence.
+	// while every foreign, duplicate, or failed read blocks the POST and clears
+	// only this invocation's proven-undispatched fence.
 	postFenceDisks, postFenceErr := a.api.ListDisks(ctx, spec.Location)
 	if postFenceErr != nil {
-		return cloud.Volume{}, fmt.Errorf(
+		// This invocation acquired the fence and has not called CreateDisk yet.
+		// A failed post-CAS GET is therefore proven pre-dispatch, not an
+		// ambiguous mutation outcome. Retaining the Lease here would permanently
+		// suppress every future create after one transient read failure.
+		authorityErr := fmt.Errorf(
 			"%w: post-fence disk-create authority is unavailable behind durable fence %s: %v",
 			cloud.ErrUnavailable, mutationFenceLeaseName(fence.Key), normalizeAPIError(postFenceErr),
 		)
+		return cloud.Volume{}, a.clearUndispatchedDiskCreateFence(ctx, fence, authorityErr)
 	}
 	if existing, found, findErr := uniqueNamedDisk(postFenceDisks, spec.Name); findErr != nil {
-		return cloud.Volume{}, findErr
+		return cloud.Volume{}, a.clearUndispatchedDiskCreateFence(ctx, fence, findErr)
 	} else if found {
 		readbackCtx, cancel := a.mutationReadbackContext(ctx)
 		defer cancel()
-		return a.finishFencedDisk(readbackCtx, intent, fence, existing)
+		return a.finishUndispatchedFencedDisk(readbackCtx, intent, fence, existing)
 	}
 
 	created, createErr := a.api.CreateDisk(ctx, spec.Location, sdk.CreateDiskRequest{
@@ -196,7 +202,7 @@ func (a *Adapter) EnsureVolume(ctx context.Context, spec cloud.VolumeSpec) (clou
 	readbackCtx, cancel := a.mutationReadbackContext(ctx)
 	defer cancel()
 	if errors.Is(createErr, sdk.ErrMutationBlocked) {
-		if deleteErr := a.fences.Delete(context.WithoutCancel(ctx), fence); deleteErr != nil {
+		if deleteErr := a.deleteMutationFenceDetached(ctx, fence); deleteErr != nil {
 			return cloud.Volume{}, errors.Join(createErr, fmt.Errorf("clear locally blocked disk-create fence: %w", deleteErr))
 		}
 		return cloud.Volume{}, createErr
@@ -226,9 +232,10 @@ func (a *Adapter) DeleteVolume(ctx context.Context, location, volumeID string) e
 	}
 	disk, err := a.api.GetDisk(ctx, location, volumeID)
 	missing := sdk.IsNotFound(err)
+	deletedTombstone := false
 	if err != nil && !missing {
 		if issueDelete {
-			if deleteErr := a.fences.Delete(context.WithoutCancel(ctx), deleteFence); deleteErr != nil {
+			if deleteErr := a.deleteMutationFenceDetached(ctx, deleteFence); deleteErr != nil {
 				return errors.Join(normalizeAPIError(err), fmt.Errorf("clear unissued disk-delete fence: %w", deleteErr))
 			}
 		}
@@ -236,7 +243,7 @@ func (a *Adapter) DeleteVolume(ctx context.Context, location, volumeID string) e
 	}
 	if !missing && disk == nil {
 		if issueDelete {
-			if deleteErr := a.fences.Delete(context.WithoutCancel(ctx), deleteFence); deleteErr != nil {
+			if deleteErr := a.deleteMutationFenceDetached(ctx, deleteFence); deleteErr != nil {
 				return errors.Join(errors.New("InSpace API returned an empty disk response"), deleteErr)
 			}
 		}
@@ -245,17 +252,18 @@ func (a *Adapter) DeleteVolume(ctx context.Context, location, volumeID string) e
 	if !missing {
 		if ownershipErr := validateExactDisk(*disk, volumeID, a.billing); ownershipErr != nil {
 			if issueDelete {
-				if deleteErr := a.fences.Delete(context.WithoutCancel(ctx), deleteFence); deleteErr != nil {
+				if deleteErr := a.deleteMutationFenceDetached(ctx, deleteFence); deleteErr != nil {
 					return errors.Join(ownershipErr, fmt.Errorf("clear unissued disk-delete fence: %w", deleteErr))
 				}
 			}
 			return ownershipErr
 		}
+		deletedTombstone = diskDeletedTombstone(*disk)
 	}
 	createFence, err := a.matchingDiskCreateFence(ctx, location, volumeID, disk)
 	if err != nil {
 		if issueDelete {
-			if deleteErr := a.fences.Delete(context.WithoutCancel(ctx), deleteFence); deleteErr != nil {
+			if deleteErr := a.deleteMutationFenceDetached(ctx, deleteFence); deleteErr != nil {
 				return errors.Join(err, fmt.Errorf("clear unissued disk-delete fence: %w", deleteErr))
 			}
 		}
@@ -263,7 +271,7 @@ func (a *Adapter) DeleteVolume(ctx context.Context, location, volumeID string) e
 	}
 	readbackCtx, cancel := a.destructiveReadbackContext(ctx)
 	defer cancel()
-	if missing || !issueDelete {
+	if missing || deletedTombstone || !issueDelete {
 		resolvedFence, err := a.waitForDiskAbsent(readbackCtx, location, volumeID, deleteFence)
 		if err != nil {
 			return fmt.Errorf(
@@ -338,7 +346,7 @@ func (a *Adapter) DeleteVolume(ctx context.Context, location, volumeID string) e
 	}
 	mutationErr := a.api.DeleteDisk(ctx, location, volumeID)
 	if errors.Is(mutationErr, sdk.ErrMutationBlocked) {
-		if deleteErr := a.fences.Delete(context.WithoutCancel(ctx), deleteFence); deleteErr != nil {
+		if deleteErr := a.deleteMutationFenceDetached(ctx, deleteFence); deleteErr != nil {
 			return errors.Join(mutationErr, fmt.Errorf("clear locally blocked disk-delete fence: %w", deleteErr))
 		}
 		return mutationErr
@@ -383,23 +391,23 @@ func (a *Adapter) AttachVolume(ctx context.Context, location, volumeID, nodeID s
 	}
 	attachedVM, err := a.attachedVM(ctx, location, volumeID)
 	if err != nil {
-		if deleteErr := a.fences.Delete(context.WithoutCancel(ctx), fence); deleteErr != nil {
+		if deleteErr := a.deleteMutationFenceDetached(ctx, fence); deleteErr != nil {
 			return errors.Join(err, fmt.Errorf("clear unissued disk-attach fence: %w", deleteErr))
 		}
 		return err
 	}
 	switch {
 	case attachedVM == vmUUID:
-		return a.fences.Delete(ctx, fence)
+		return a.deleteMutationFenceDetached(ctx, fence)
 	case attachedVM != "":
-		if deleteErr := a.fences.Delete(ctx, fence); deleteErr != nil {
+		if deleteErr := a.deleteMutationFenceDetached(ctx, fence); deleteErr != nil {
 			return errors.Join(fmt.Errorf("%w: %s", cloud.ErrVolumeAttachedElsewhere, attachedVM), deleteErr)
 		}
 		return fmt.Errorf("%w: %s", cloud.ErrVolumeAttachedElsewhere, attachedVM)
 	}
 	targetVM, err := a.getOwnedVM(ctx, location, vmUUID)
 	if err != nil {
-		if deleteErr := a.fences.Delete(context.WithoutCancel(ctx), fence); deleteErr != nil {
+		if deleteErr := a.deleteMutationFenceDetached(ctx, fence); deleteErr != nil {
 			return errors.Join(err, fmt.Errorf("clear unissued disk-attach fence: %w", deleteErr))
 		}
 		return err
@@ -408,33 +416,33 @@ func (a *Adapter) AttachVolume(ctx context.Context, location, volumeID, nodeID s
 		if rows == 1 {
 			// Canonical detail is newer than the stale list discovery. The
 			// desired state already exists, so no attach POST is necessary.
-			return a.fences.Delete(ctx, fence)
+			return a.deleteMutationFenceDetached(ctx, fence)
 		}
 		err := fmt.Errorf("InSpace exact VM %s reported %d attachment rows for disk %s", vmUUID, rows, volumeID)
-		if deleteErr := a.fences.Delete(context.WithoutCancel(ctx), fence); deleteErr != nil {
+		if deleteErr := a.deleteMutationFenceDetached(ctx, fence); deleteErr != nil {
 			return errors.Join(err, deleteErr)
 		}
 		return err
 	}
 	// Exact disk ownership is the final read before the attachment mutation.
 	if _, err := a.getOwnedDisk(ctx, location, volumeID); err != nil {
-		if deleteErr := a.fences.Delete(context.WithoutCancel(ctx), fence); deleteErr != nil {
+		if deleteErr := a.deleteMutationFenceDetached(ctx, fence); deleteErr != nil {
 			return errors.Join(err, fmt.Errorf("clear unissued disk-attach fence: %w", deleteErr))
 		}
 		return err
 	}
 	finalAttachedVM, err := a.attachedVM(ctx, location, volumeID)
 	if err != nil {
-		if deleteErr := a.fences.Delete(context.WithoutCancel(ctx), fence); deleteErr != nil {
+		if deleteErr := a.deleteMutationFenceDetached(ctx, fence); deleteErr != nil {
 			return errors.Join(err, fmt.Errorf("clear unissued disk-attach fence after final attachment read: %w", deleteErr))
 		}
 		return err
 	}
 	if finalAttachedVM == vmUUID {
-		return a.fences.Delete(ctx, fence)
+		return a.deleteMutationFenceDetached(ctx, fence)
 	}
 	if finalAttachedVM != "" {
-		if deleteErr := a.fences.Delete(context.WithoutCancel(ctx), fence); deleteErr != nil {
+		if deleteErr := a.deleteMutationFenceDetached(ctx, fence); deleteErr != nil {
 			return errors.Join(fmt.Errorf("%w: %s", cloud.ErrVolumeAttachedElsewhere, finalAttachedVM), deleteErr)
 		}
 		return fmt.Errorf("%w: %s", cloud.ErrVolumeAttachedElsewhere, finalAttachedVM)
@@ -500,23 +508,23 @@ func (a *Adapter) DetachVolume(ctx context.Context, location, volumeID, nodeID s
 	// cloud mutation has been issued, so clearing this fence is safe.
 	current, err := a.attachedVM(ctx, location, volumeID)
 	if err != nil {
-		if deleteErr := a.fences.Delete(context.WithoutCancel(ctx), fence); deleteErr != nil {
+		if deleteErr := a.deleteMutationFenceDetached(ctx, fence); deleteErr != nil {
 			return errors.Join(err, fmt.Errorf("clear unissued disk-detach fence: %w", deleteErr))
 		}
 		return err
 	}
 	if current == "" {
-		return a.fences.Delete(ctx, fence)
+		return a.deleteMutationFenceDetached(ctx, fence)
 	}
 	if current != attachedVM {
-		if deleteErr := a.fences.Delete(ctx, fence); deleteErr != nil {
+		if deleteErr := a.deleteMutationFenceDetached(ctx, fence); deleteErr != nil {
 			return errors.Join(fmt.Errorf("%w: disk %s moved from VM %s to VM %s", cloud.ErrVolumeAttachedElsewhere, volumeID, attachedVM, current), deleteErr)
 		}
 		return fmt.Errorf("%w: disk %s moved from VM %s to VM %s", cloud.ErrVolumeAttachedElsewhere, volumeID, attachedVM, current)
 	}
 	targetVM, err := a.getOwnedVM(ctx, location, attachedVM)
 	if err != nil {
-		if deleteErr := a.fences.Delete(context.WithoutCancel(ctx), fence); deleteErr != nil {
+		if deleteErr := a.deleteMutationFenceDetached(ctx, fence); deleteErr != nil {
 			return errors.Join(err, fmt.Errorf("clear unissued disk-detach fence: %w", deleteErr))
 		}
 		return err
@@ -525,33 +533,33 @@ func (a *Adapter) DetachVolume(ctx context.Context, location, volumeID, nodeID s
 		if rows == 0 {
 			// Canonical detail is newer than stale discovery: the disk is
 			// already detached, so complete the unissued fence.
-			return a.fences.Delete(ctx, fence)
+			return a.deleteMutationFenceDetached(ctx, fence)
 		}
 		err := fmt.Errorf("InSpace exact VM %s reported %d attachment rows for disk %s", attachedVM, rows, volumeID)
-		if deleteErr := a.fences.Delete(context.WithoutCancel(ctx), fence); deleteErr != nil {
+		if deleteErr := a.deleteMutationFenceDetached(ctx, fence); deleteErr != nil {
 			return errors.Join(err, deleteErr)
 		}
 		return err
 	}
 	// Exact disk ownership is the final read before the detach mutation.
 	if _, err := a.getOwnedDisk(ctx, location, volumeID); err != nil {
-		if deleteErr := a.fences.Delete(context.WithoutCancel(ctx), fence); deleteErr != nil {
+		if deleteErr := a.deleteMutationFenceDetached(ctx, fence); deleteErr != nil {
 			return errors.Join(err, fmt.Errorf("clear unissued disk-detach fence: %w", deleteErr))
 		}
 		return err
 	}
 	finalAttachedVM, err := a.attachedVM(ctx, location, volumeID)
 	if err != nil {
-		if deleteErr := a.fences.Delete(context.WithoutCancel(ctx), fence); deleteErr != nil {
+		if deleteErr := a.deleteMutationFenceDetached(ctx, fence); deleteErr != nil {
 			return errors.Join(err, fmt.Errorf("clear unissued disk-detach fence after final attachment read: %w", deleteErr))
 		}
 		return err
 	}
 	if finalAttachedVM == "" {
-		return a.fences.Delete(ctx, fence)
+		return a.deleteMutationFenceDetached(ctx, fence)
 	}
 	if finalAttachedVM != attachedVM {
-		if deleteErr := a.fences.Delete(context.WithoutCancel(ctx), fence); deleteErr != nil {
+		if deleteErr := a.deleteMutationFenceDetached(ctx, fence); deleteErr != nil {
 			return errors.Join(fmt.Errorf("%w: disk %s moved from VM %s to VM %s", cloud.ErrVolumeAttachedElsewhere, volumeID, attachedVM, finalAttachedVM), deleteErr)
 		}
 		return fmt.Errorf("%w: disk %s moved from VM %s to VM %s", cloud.ErrVolumeAttachedElsewhere, volumeID, attachedVM, finalAttachedVM)
@@ -733,7 +741,14 @@ func (a *Adapter) getOwnedDisk(ctx context.Context, location, diskUUID string) (
 	if err := validateExactDisk(*disk, diskUUID, a.billing); err != nil {
 		return sdk.Disk{}, err
 	}
+	if diskDeletedTombstone(*disk) {
+		return sdk.Disk{}, cloud.ErrNotFound
+	}
 	return *disk, nil
+}
+
+func diskDeletedTombstone(disk sdk.Disk) bool {
+	return strings.EqualFold(strings.TrimSpace(disk.Status), "deleted")
 }
 
 func validateExactDisk(disk sdk.Disk, expectedUUID string, billingAccountID int64) error {
@@ -753,9 +768,9 @@ func validateExactDisk(disk sdk.Disk, expectedUUID string, billingAccountID int6
 
 // getOwnedVM requires three independent canonical ownership signals before a
 // VM may participate in an attachment mutation: one unfiltered ListVMs row,
-// exact detail with positive billing/VPC identity, and exactly one membership
-// in the configured VPC. Sparse or lagging discovery is never mutation
-// authority.
+// exact detail with positive billing identity and no contradictory VPC value,
+// and exactly one membership in the configured VPC. Sparse or lagging
+// discovery is never mutation authority.
 func (a *Adapter) getOwnedVM(ctx context.Context, location, vmUUID string) (sdk.VM, error) {
 	vm, err := a.getVPCVM(ctx, location, vmUUID)
 	if err != nil {
@@ -824,10 +839,18 @@ func (a *Adapter) validateExactVM(vm sdk.VM, expectedUUID string) error {
 	if !uuidPattern.MatchString(expectedUUID) || !uuidPattern.MatchString(actualUUID) || actualUUID != expectedUUID {
 		return fmt.Errorf("%w: exact VM read returned UUID %q for %q", cloud.ErrInvalidNode, vm.UUID, expectedUUID)
 	}
+	if strings.EqualFold(strings.TrimSpace(vm.Status), "deleted") {
+		return fmt.Errorf("%w: exact VM %s is a deleted tombstone", cloud.ErrInvalidNode, actualUUID)
+	}
 	if vm.BillingAccountID != a.billing {
 		return fmt.Errorf("%w: VM %s billing account is %d, expected %d", cloud.ErrPermissionDenied, actualUUID, vm.BillingAccountID, a.billing)
 	}
-	if a.network != "" && !strings.EqualFold(strings.TrimSpace(vm.NetworkUUID), a.network) {
+	// InSpace VM detail/list responses currently omit network_uuid. Treat an
+	// omitted value as sparse discovery rather than contrary evidence: callers
+	// must independently prove exactly one membership in the configured VPC via
+	// GetNetwork before this detail can authorize a VM mutation. A present value
+	// is still useful corroboration and must agree exactly.
+	if vmNetwork := strings.TrimSpace(vm.NetworkUUID); a.network != "" && vmNetwork != "" && !strings.EqualFold(vmNetwork, a.network) {
 		return fmt.Errorf("%w: VM %s network is %q, expected %q", cloud.ErrInvalidNode, actualUUID, vm.NetworkUUID, a.network)
 	}
 	return nil

@@ -414,11 +414,33 @@ func TestReadDeadlineSurvivesSameOriginRedirect(t *testing.T) {
 }
 
 func TestIsNotFoundNormalizesInSpaceMissingResourceResponse(t *testing.T) {
-	if !inspace.IsNotFound(&inspace.APIError{StatusCode: http.StatusBadRequest, Message: "Error: No such virtual machine exists: deadbeef"}) {
-		t.Fatal("expected InSpace's missing-VM HTTP 400 response to normalize as not found")
+	for _, message := range []string{
+		"Error: No such virtual machine exists: deadbeef-1111-4222-8333-444444444444",
+		"No such virtual machine exists. DEADBEEF-1111-4222-8333-444444444444",
+		"No such virtual machine exists",
+		"No such VM exists: deadbeef-1111-4222-8333-444444444444",
+	} {
+		if !inspace.IsNotFound(&inspace.APIError{StatusCode: http.StatusBadRequest, Message: message}) {
+			t.Fatalf("expected InSpace's missing-VM HTTP 400 response %q to normalize as not found", message)
+		}
 	}
-	if inspace.IsNotFound(&inspace.APIError{StatusCode: http.StatusBadRequest, Message: "invalid request"}) {
-		t.Fatal("generic HTTP 400 must not normalize as not found")
+	for _, message := range []string{
+		"invalid request",
+		"No such billing account exists: 42",
+		"No such network exists: deadbeef",
+		"No such disk exists: deadbeef",
+		"No such virtual machine exists for billing account 42",
+		"No such VM exists but remains attached",
+		"No such virtual machine exists-or-is-authorized",
+		"No such virtual machine exists: for another billing account",
+		"No such virtual machine exists. access denied",
+		"No such virtual machine exists:",
+		"No such virtual machine exists: deadbeef",
+		"No such virtual machine exists: deadbeef-1111-4222-8333-444444444444 trailing prose",
+	} {
+		if inspace.IsNotFound(&inspace.APIError{StatusCode: http.StatusBadRequest, Message: message}) {
+			t.Fatalf("non-VM HTTP 400 %q must not normalize as not found", message)
+		}
 	}
 }
 

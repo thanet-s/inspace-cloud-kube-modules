@@ -641,8 +641,9 @@ func (c *nodeLoadBalancerController) authorizePublicNodeLocalNode(
 		return false, false, fmt.Errorf("public-node-local: read canonical VM ownership for Node %s: %w", node.Name, err)
 	}
 	if vm == nil || vm.UUID != providerIdentity.UUID ||
+		strings.EqualFold(strings.TrimSpace(vm.Status), "deleted") ||
 		vm.BillingAccountID != c.provider.config.BillingAccountID ||
-		!strings.EqualFold(vm.NetworkUUID, c.provider.config.NetworkUUID) {
+		(vm.NetworkUUID != "" && !strings.EqualFold(vm.NetworkUUID, c.provider.config.NetworkUUID)) {
 		return false, false, nil
 	}
 	network, err := c.provider.api.GetNetwork(ctx, providerIdentity.Location, c.provider.config.NetworkUUID)
@@ -1710,7 +1711,8 @@ func (c *nodeLoadBalancerController) publicNodeLocalFirewallAssignmentsMatch(
 		current.Annotations[annotationNodeLoadBalancerFirewallHash] != desired.Hash {
 		return false, errors.New("public-node-local: firewall assignment readback is not bound to the exact current Service ledger and policy")
 	}
-	if current.Annotations[annotationNodeLoadBalancerFirewallRelationIssued] != "" {
+	if current.Annotations[annotationNodeLoadBalancerFirewallRelationIssued] != "" ||
+		current.Annotations[annotationNodeLoadBalancerFirewallRelationOwnerUID] != "" {
 		return false, nil
 	}
 	desiredVMs := make(map[string]struct{}, len(nodes))

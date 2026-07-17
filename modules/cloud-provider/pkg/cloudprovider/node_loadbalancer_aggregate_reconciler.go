@@ -12,6 +12,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/cache"
 
 	inspace "github.com/thanet-s/inspace-cloud-kube-modules/modules/client"
@@ -1397,9 +1398,13 @@ func (c *nodeLoadBalancerController) deleteAggregateShardFirewall(ctx context.Co
 		pool.GetDeletionTimestamp() == nil {
 		return false, fmt.Errorf("node load balancer: shard state anchor %s is not an exactly owned deleting NodePool", shard)
 	}
+	ownerUID := pool.GetUID()
+	if ownerUID == "" {
+		return false, fmt.Errorf("node load balancer: shard state anchor %s has an empty UID", shard)
+	}
 	converged, err := c.reconcileNodeLoadBalancerFirewallRelation(
 		ctx,
-		c.shardFirewallRelationOwner(shard),
+		c.shardFirewallRelationOwnerForUID(shard, ownerUID),
 		nil,
 	)
 	if err != nil || !converged {
@@ -1521,7 +1526,7 @@ func (c *nodeLoadBalancerController) deleteAggregateShardFirewall(ctx context.Co
 				candidate = pendingUUID
 			}
 			if candidate != "" {
-				_, changed, stageErr := c.updateManagedNodePoolAnnotations(ctx, shard, func(values map[string]string) (bool, error) {
+				_, changed, stageErr := c.updateManagedNodePoolAnnotationsForUID(ctx, shard, ownerUID, func(values map[string]string) (bool, error) {
 					if existing := values[annotationNodeLoadBalancerShardFWDeleteTarget]; existing != "" {
 						if existing != candidate {
 							return false, fmt.Errorf("node load balancer: concurrent shard firewall delete targets %s, not %s", existing, candidate)
@@ -1553,8 +1558,8 @@ func (c *nodeLoadBalancerController) deleteAggregateShardFirewall(ctx context.Co
 			}
 			notBefore = issuedAt.Add(nodeLoadBalancerShardFirewallMutationTimeout)
 		}
-		confirmed, _, confirmErr := c.recordManagedNodePoolFirewallAbsence(
-			ctx, shard,
+		confirmed, _, confirmErr := c.recordManagedNodePoolFirewallAbsenceForUID(
+			ctx, shard, ownerUID,
 			annotationNodeLoadBalancerShardFWCleanupAbsent,
 			annotationNodeLoadBalancerShardFWCleanupCheck,
 			time.Now().UTC(), notBefore,
@@ -1562,7 +1567,7 @@ func (c *nodeLoadBalancerController) deleteAggregateShardFirewall(ctx context.Co
 		if confirmErr != nil || !confirmed {
 			return false, confirmErr
 		}
-		_, _, clearErr := c.updateManagedNodePoolAnnotations(ctx, shard, func(values map[string]string) (bool, error) {
+		_, _, clearErr := c.updateManagedNodePoolAnnotationsForUID(ctx, shard, ownerUID, func(values map[string]string) (bool, error) {
 			if values[annotationNodeLoadBalancerShardFirewallUUID] != appliedUUID ||
 				values[annotationNodeLoadBalancerShardFWPendingUUID] != pendingUUID ||
 				values[annotationNodeLoadBalancerShardFWCleanupSeen] != cleanupUUID ||
@@ -1596,6 +1601,7 @@ func (c *nodeLoadBalancerController) deleteAggregateShardFirewall(ctx context.Co
 				annotationNodeLoadBalancerShardFWDeleteTarget,
 				annotationNodeLoadBalancerShardFWDeleteIssued,
 				annotationNodeLoadBalancerFirewallRelationIssued,
+				annotationNodeLoadBalancerFirewallRelationOwnerUID,
 			} {
 				delete(values, key)
 			}
@@ -1606,16 +1612,16 @@ func (c *nodeLoadBalancerController) deleteAggregateShardFirewall(ctx context.Co
 		}
 		return true, nil
 	}
-	if _, clearErr := c.clearManagedNodePoolFirewallAbsence(
-		ctx, shard,
+	if _, clearErr := c.clearManagedNodePoolFirewallAbsenceForUID(
+		ctx, shard, ownerUID,
 		annotationNodeLoadBalancerShardFWCleanupAbsent,
 		annotationNodeLoadBalancerShardFWCleanupCheck,
 	); clearErr != nil {
 		return false, clearErr
 	}
 	if deleteTarget != "" {
-		changed, clearErr := c.clearManagedNodePoolFirewallAbsence(
-			ctx, shard,
+		changed, clearErr := c.clearManagedNodePoolFirewallAbsenceForUID(
+			ctx, shard, ownerUID,
 			annotationNodeLoadBalancerShardFWCleanupAbsent,
 			annotationNodeLoadBalancerShardFWCleanupCheck,
 		)
@@ -1641,7 +1647,7 @@ func (c *nodeLoadBalancerController) deleteAggregateShardFirewall(ctx context.Co
 		// destructive cleanup. If the controller crashes after DELETE, this
 		// receipt distinguishes an observed/deleted resource from a POST that may
 		// still commit for the first time later.
-		_, _, persistErr := c.updateManagedNodePoolAnnotations(ctx, shard, func(values map[string]string) (bool, error) {
+		_, _, persistErr := c.updateManagedNodePoolAnnotationsForUID(ctx, shard, ownerUID, func(values map[string]string) (bool, error) {
 			if values[annotationNodeLoadBalancerShardFirewallUUID] != appliedUUID ||
 				values[annotationNodeLoadBalancerShardFWPendingUUID] != pendingUUID ||
 				values[annotationNodeLoadBalancerShardFWIssuedAt] != annotations[annotationNodeLoadBalancerShardFWIssuedAt] {
@@ -1665,7 +1671,7 @@ func (c *nodeLoadBalancerController) deleteAggregateShardFirewall(ctx context.Co
 		for _, vmUUID := range assignments {
 			converged, relationErr := c.reconcileNodeLoadBalancerFirewallRelation(
 				ctx,
-				c.shardFirewallRelationOwner(shard),
+				c.shardFirewallRelationOwnerForUID(shard, ownerUID),
 				&nodeLoadBalancerFirewallRelationFence{
 					operation: nodeLoadBalancerFirewallRelationUnassign, firewallUUID: firewall.UUID, vmUUID: vmUUID,
 				},
@@ -1682,7 +1688,7 @@ func (c *nodeLoadBalancerController) deleteAggregateShardFirewall(ctx context.Co
 		return false, nil
 	}
 	issuedAt := time.Now().UTC().Format(time.RFC3339Nano)
-	_, winner, issueErr := c.updateManagedNodePoolAnnotations(ctx, shard, func(values map[string]string) (bool, error) {
+	_, winner, issueErr := c.updateManagedNodePoolAnnotationsForUID(ctx, shard, ownerUID, func(values map[string]string) (bool, error) {
 		storedTarget, storedIssued, parseErr := nodeLoadBalancerFirewallDeleteReceipt(
 			values,
 			annotationNodeLoadBalancerShardFWDeleteTarget,
@@ -1711,16 +1717,23 @@ func (c *nodeLoadBalancerController) deleteAggregateShardFirewall(ctx context.Co
 	if !winner {
 		return false, nil
 	}
+	rejectUndispatched := func(rejection error) (bool, error) {
+		return false, errors.Join(
+			rejection,
+			c.resetShardFirewallDeleteAfterProvenNonDispatch(ctx, shard, ownerUID, firewall.UUID, issuedAt),
+		)
+	}
 	authorizedPool, authorityErr := c.provider.dynamicClient.Resource(nodePoolGVR).Get(ctx, shard, metav1.GetOptions{})
 	if authorityErr != nil {
-		return false, fmt.Errorf("node load balancer: re-read shard owner after firewall delete issue: %w", authorityErr)
+		return rejectUndispatched(fmt.Errorf("node load balancer: re-read shard owner after firewall delete issue: %w", authorityErr))
 	}
 	authorizedAnnotations, authorityErr := nodeLoadBalancerShardFirewallAnnotations(authorizedPool)
 	if authorityErr != nil {
-		return false, authorityErr
+		return rejectUndispatched(authorityErr)
 	}
 	authorizedLabels := authorizedPool.GetLabels()
-	if authorizedLabels[nodeLoadBalancerManagedLabel] != "true" ||
+	if authorizedPool.GetUID() != ownerUID ||
+		authorizedLabels[nodeLoadBalancerManagedLabel] != "true" ||
 		authorizedLabels[nodeLoadBalancerClusterLabel] != c.provider.config.ClusterID ||
 		authorizedLabels[nodeLoadBalancerShardLabel] != shard ||
 		!containsString(authorizedPool.GetFinalizers(), nodeLoadBalancerNodePoolFinalizer) ||
@@ -1729,18 +1742,18 @@ func (c *nodeLoadBalancerController) deleteAggregateShardFirewall(ctx context.Co
 		authorizedAnnotations[annotationNodeLoadBalancerShardFWCleanupSeen] != cleanupUUID ||
 		authorizedAnnotations[annotationNodeLoadBalancerShardFWDeleteTarget] != firewall.UUID ||
 		authorizedAnnotations[annotationNodeLoadBalancerShardFWDeleteIssued] != issuedAt {
-		return false, errors.New("node load balancer: shard firewall delete authority changed after issue")
+		return rejectUndispatched(errors.New("node load balancer: shard firewall delete authority changed after issue"))
 	}
 	authorizedFirewall, authorityErr := c.exactNodeLoadBalancerFirewallFresh(ctx, firewall.UUID)
 	if authorityErr != nil {
-		return false, fmt.Errorf("node load balancer: re-read shard firewall after delete issue: %w", authorityErr)
+		return rejectUndispatched(fmt.Errorf("node load balancer: re-read shard firewall after delete issue: %w", authorityErr))
 	}
 	if !nodeLoadBalancerFirewallAuthorityUnchanged(*firewall, *authorizedFirewall) {
-		return false, errors.New("node load balancer: shard firewall changed after delete issue")
+		return rejectUndispatched(errors.New("node load balancer: shard firewall changed after delete issue"))
 	}
 	authorizedHash, authorityErr := inspace.NodeLoadBalancerShardFirewallSpecHash(authorizedFirewall.Rules)
 	if authorityErr != nil {
-		return false, authorityErr
+		return rejectUndispatched(authorityErr)
 	}
 	if authorityErr := inspace.ValidateNodeLoadBalancerShardFirewall(
 		*authorizedFirewall,
@@ -1749,31 +1762,62 @@ func (c *nodeLoadBalancerController) deleteAggregateShardFirewall(ctx context.Co
 		c.provider.config.BillingAccountID,
 		authorizedHash,
 	); authorityErr != nil {
-		return false, fmt.Errorf("node load balancer: shard firewall lost exact ownership after delete issue: %w", authorityErr)
+		return rejectUndispatched(fmt.Errorf("node load balancer: shard firewall lost exact ownership after delete issue: %w", authorityErr))
 	}
 	postIssueAssignments, authorityErr := nodeLoadBalancerFirewallAssignmentVMs(*authorizedFirewall)
 	if authorityErr != nil {
-		return false, authorityErr
+		return rejectUndispatched(authorityErr)
 	}
 	if len(postIssueAssignments) != 0 {
-		return false, errors.New("node load balancer: shard firewall gained assignments after delete issue")
+		return rejectUndispatched(errors.New("node load balancer: shard firewall gained assignments after delete issue"))
 	}
 	deleteErr := c.provider.api.DeleteFirewall(ctx, c.provider.config.Location, firewall.UUID)
 	if nodeLoadBalancerMutationKnownPreDispatch(deleteErr) {
-		_, _, resetErr := c.updateManagedNodePoolAnnotations(ctx, shard, func(values map[string]string) (bool, error) {
-			if values[annotationNodeLoadBalancerShardFWDeleteTarget] != firewall.UUID ||
-				values[annotationNodeLoadBalancerShardFWDeleteIssued] != issuedAt {
-				return false, errors.New("node load balancer: shard firewall delete receipt changed before pre-dispatch rejection")
-			}
-			delete(values, annotationNodeLoadBalancerShardFWDeleteIssued)
-			return true, nil
-		})
-		return false, errors.Join(deleteErr, resetErr)
+		return false, errors.Join(
+			deleteErr,
+			c.resetShardFirewallDeleteAfterProvenNonDispatch(ctx, shard, ownerUID, firewall.UUID, issuedAt),
+		)
 	}
 	if deleteErr != nil {
 		return false, deleteErr
 	}
 	return false, nil
+}
+
+func (c *nodeLoadBalancerController) resetShardFirewallDeleteAfterProvenNonDispatch(
+	ctx context.Context,
+	shard string,
+	ownerUID types.UID,
+	uuid, issuedAt string,
+) error {
+	if ownerUID == "" || !validNodeLoadBalancerCloudUUID(uuid) || issuedAt == "" {
+		return errors.New("node load balancer: incomplete shard firewall delete receipt for pre-dispatch reset")
+	}
+	if _, err := time.Parse(time.RFC3339Nano, issuedAt); err != nil {
+		return fmt.Errorf("node load balancer: invalid shard firewall delete issue timestamp: %w", err)
+	}
+	resetCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), durableReceiptWriteTimeout)
+	defer cancel()
+	updated, changed, err := c.updateManagedNodePoolAnnotationsForUID(resetCtx, shard, ownerUID, func(values map[string]string) (bool, error) {
+		if values[annotationNodeLoadBalancerShardFWDeleteTarget] != uuid ||
+			values[annotationNodeLoadBalancerShardFWDeleteIssued] != issuedAt {
+			return false, errors.New("node load balancer: shard firewall delete receipt changed before pre-dispatch reset")
+		}
+		delete(values, annotationNodeLoadBalancerShardFWDeleteIssued)
+		return true, nil
+	})
+	if err != nil {
+		return fmt.Errorf("node load balancer: reset proven non-dispatched shard firewall delete receipt: %w", err)
+	}
+	if !changed || updated == nil {
+		return errors.New("node load balancer: proven non-dispatched shard firewall delete receipt was not reset")
+	}
+	annotations := updated.GetAnnotations()
+	if annotations[annotationNodeLoadBalancerShardFWDeleteTarget] != uuid ||
+		annotations[annotationNodeLoadBalancerShardFWDeleteIssued] != "" {
+		return errors.New("node load balancer: shard firewall delete receipt reset changed its staged target")
+	}
+	return nil
 }
 
 // ensureAggregateCleanupShardAnchors completes the durable NodePool-to-Service
