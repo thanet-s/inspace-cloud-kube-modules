@@ -7,6 +7,7 @@ import importlib.util
 import json
 import os
 import pathlib
+import tempfile
 import threading
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -434,6 +435,45 @@ def test_stable_zero_proofs() -> None:
         and calls == ["exact", "exact", "exact"],
         "stable final zero did not require three exact corroboration passes",
     )
+
+    with tempfile.TemporaryDirectory() as temporary:
+        missing_state = pathlib.Path(temporary) / "state.json"
+        cloud_audit.persist_audit_identities(
+            missing_state,
+            {},
+            stable,
+            allow_missing_state=True,
+        )
+        require(
+            not missing_state.exists(),
+            "zero preflight must not synthesize an ownership journal",
+        )
+        try:
+            cloud_audit.persist_audit_identities(
+                missing_state,
+                {},
+                present,
+                allow_missing_state=True,
+            )
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError(
+                "preflight accepted owned resources without a journal"
+            )
+        try:
+            cloud_audit.persist_audit_identities(
+                missing_state,
+                {},
+                stable,
+                allow_missing_state=False,
+            )
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError(
+                "post-mutation audit accepted a missing ownership journal"
+            )
 
 
 def main() -> None:

@@ -3631,6 +3631,9 @@ def main() -> None:
         pass
     else:
         require(False, "cloud audit must reject non-object API resources")
+    require("preflight found owned resources without an ownership journal" in cloud_audit and
+            "allow_missing_state=allow_missing_state" in cloud_audit,
+            "missing-state preflight must accept only a stable zero without weakening later audits")
     require("Require gratuitous ARP to update the existing VIP neighbor" in playbook and
             "Flush the VIP neighbor and prove fresh ARP" in playbook,
             "private L2 failover must separately prove GARP update and fresh ARP resolution")
