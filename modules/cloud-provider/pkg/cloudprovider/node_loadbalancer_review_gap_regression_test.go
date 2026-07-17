@@ -14,6 +14,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	k8stesting "k8s.io/client-go/testing"
 
@@ -331,6 +332,281 @@ func TestAggregateNewShardICMPAttachPreservesEstablishedShard(t *testing.T) {
 	}
 	if storedB.Labels[nodeLoadBalancerReadyLabel] == "true" || len(harness.fixture.service(t, serviceB.Name).Status.LoadBalancer.Ingress) != 0 {
 		t.Fatalf("new shard was advertised in the ICMP attach pass: node=%#v status=%#v", storedB.Labels, harness.fixture.service(t, serviceB.Name).Status.LoadBalancer)
+	}
+}
+
+func TestAggregateNewShardNotReadyICMPDefersAttachAndPreservesEstablishedShard(t *testing.T) {
+	harness := newAggregateSafetySyncHarness(t, nodeLoadBalancerTestService(
+		"aggregate-not-ready-established-a",
+		"83838383-8383-4383-8484-838383838383",
+		corev1.ProtocolTCP,
+		11543,
+	))
+	defer harness.controller.queue.ShutDown()
+	harness.converge(t)
+	harness.ensureDatapathUID(t)
+
+	serviceB := nodeLoadBalancerTestService(
+		"aggregate-not-ready-new-b",
+		"84848484-8484-4484-8585-848484848484",
+		corev1.ProtocolTCP,
+		12543,
+	)
+	serviceB.Annotations[annotationNodeLoadBalancerMode] = nodeLoadBalancerModeDedicated
+	serviceB.Annotations[annotationNodeLoadBalancerCPU] = "1"
+	serviceB.Annotations[annotationNodeLoadBalancerMemory] = "4Gi"
+	if _, err := harness.provider.kubeClient.CoreV1().Services(serviceB.Namespace).Create(
+		harness.ctx, serviceB.DeepCopy(), metav1.CreateOptions{},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := harness.serviceIndexer.Add(serviceB.DeepCopy()); err != nil {
+		t.Fatal(err)
+	}
+	keyB := serviceB.Namespace + "/" + serviceB.Name
+	var shardB string
+	harness.fixture.syncUntil(t, []string{keyB}, 32, func() bool {
+		stored := harness.fixture.service(t, serviceB.Name)
+		shardB = stored.Annotations[annotationNodeLoadBalancerShard]
+		if !isManagedNodeLoadBalancerShardName(shardB) || shardB == harness.shard {
+			return false
+		}
+		_, err := harness.provider.dynamicClient.Resource(nodePoolGVR).Get(harness.ctx, shardB, metav1.GetOptions{})
+		return err == nil
+	}, nil)
+
+	const vmB = "bcbcbcbc-bcbc-4bcb-8bcb-bcbcbcbcbcbc"
+	nodeB := aggregateAddSafetyNode(
+		t, harness, shardB, "aggregate-not-ready-new-b-node", vmB,
+		"10.0.0.31", "203.0.113.21", false,
+	)
+	setAggregateTestNodeReady(t, harness, nodeB.Name, corev1.ConditionFalse)
+
+	assignmentsBefore := len(harness.api.assignedFirewalls)
+	if err := harness.controller.sync(harness.ctx, keyB); err != nil {
+		t.Fatal(err)
+	}
+	harness.fixture.refreshListers(t)
+	if len(harness.api.assignedFirewalls) != assignmentsBefore {
+		t.Fatalf("NotReady shard triggered an ICMP attachment: %#v", harness.api.assignedFirewalls[assignmentsBefore:])
+	}
+	if !harness.fixture.servicePublished(t, harness.serviceName) {
+		t.Fatal("NotReady new shard withdrew the established shard Service")
+	}
+	nodeA, err := harness.provider.kubeClient.CoreV1().Nodes().Get(harness.ctx, harness.nodeName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	storedB, err := harness.provider.kubeClient.CoreV1().Nodes().Get(harness.ctx, nodeB.Name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nodeA.Labels[nodeLoadBalancerReadyLabel] != "true" ||
+		storedB.Labels[nodeLoadBalancerReadyLabel] == "true" ||
+		len(harness.fixture.service(t, serviceB.Name).Status.LoadBalancer.Ingress) != 0 {
+		t.Fatalf(
+			"NotReady attachment fence state: established=%#v new=%#v status=%#v",
+			nodeA.Labels,
+			storedB.Labels,
+			harness.fixture.service(t, serviceB.Name).Status.LoadBalancer,
+		)
+	}
+
+	setAggregateTestNodeReady(t, harness, nodeB.Name, corev1.ConditionTrue)
+	if err := harness.controller.sync(harness.ctx, keyB); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(harness.api.assignedFirewalls) - assignmentsBefore; got != 1 {
+		t.Fatalf("healthy new shard ICMP attachment count = %d, want 1", got)
+	}
+	if !harness.fixture.servicePublished(t, harness.serviceName) {
+		t.Fatal("healthy new shard ICMP attachment withdrew the established shard Service")
+	}
+}
+
+func TestAggregateNewShardHealthFlipAtICMPAuthorityPreservesEstablishedShard(t *testing.T) {
+	harness := newAggregateSafetySyncHarness(t, nodeLoadBalancerTestService(
+		"aggregate-health-flip-established-a",
+		"83838383-8383-4383-8686-838383838383",
+		corev1.ProtocolTCP,
+		11643,
+	))
+	defer harness.controller.queue.ShutDown()
+	harness.converge(t)
+	harness.ensureDatapathUID(t)
+
+	serviceB := nodeLoadBalancerTestService(
+		"aggregate-health-flip-new-b",
+		"84848484-8484-4484-8787-848484848484",
+		corev1.ProtocolTCP,
+		12643,
+	)
+	serviceB.Annotations[annotationNodeLoadBalancerMode] = nodeLoadBalancerModeDedicated
+	serviceB.Annotations[annotationNodeLoadBalancerCPU] = "1"
+	serviceB.Annotations[annotationNodeLoadBalancerMemory] = "4Gi"
+	if _, err := harness.provider.kubeClient.CoreV1().Services(serviceB.Namespace).Create(
+		harness.ctx, serviceB.DeepCopy(), metav1.CreateOptions{},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := harness.serviceIndexer.Add(serviceB.DeepCopy()); err != nil {
+		t.Fatal(err)
+	}
+	keyB := serviceB.Namespace + "/" + serviceB.Name
+	var shardB string
+	harness.fixture.syncUntil(t, []string{keyB}, 32, func() bool {
+		stored := harness.fixture.service(t, serviceB.Name)
+		shardB = stored.Annotations[annotationNodeLoadBalancerShard]
+		if !isManagedNodeLoadBalancerShardName(shardB) || shardB == harness.shard {
+			return false
+		}
+		_, err := harness.provider.dynamicClient.Resource(nodePoolGVR).Get(harness.ctx, shardB, metav1.GetOptions{})
+		return err == nil
+	}, nil)
+
+	const vmB = "bdbdbdbd-bdbd-4bdb-8bdb-bdbdbdbdbdbd"
+	nodeB := aggregateAddSafetyNode(
+		t, harness, shardB, "aggregate-health-flip-new-b-node", vmB,
+		"10.0.0.32", "203.0.113.22", false,
+	)
+	flipped := false
+	dynamicClient, ok := harness.provider.dynamicClient.(interface {
+		PrependReactor(string, string, k8stesting.ReactionFunc)
+	})
+	if !ok {
+		t.Fatalf("test dynamic client does not support reactors: %T", harness.provider.dynamicClient)
+	}
+	dynamicClient.PrependReactor("update", "*", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		update, ok := action.(k8stesting.UpdateAction)
+		if !ok || action.GetResource() != nodeClassGVR {
+			return false, nil, nil
+		}
+		object, ok := update.GetObject().(*unstructured.Unstructured)
+		if !ok || object.GetAnnotations()[annotationNodeLoadBalancerFirewallRelationIssued] == "" || flipped {
+			return false, nil, nil
+		}
+		flipped = true
+		setAggregateTestNodeReady(t, harness, nodeB.Name, corev1.ConditionFalse)
+		return false, nil, nil
+	})
+
+	assignmentsBefore := len(harness.api.assignedFirewalls)
+	if err := harness.controller.sync(harness.ctx, keyB); err != nil {
+		t.Fatal(err)
+	}
+	harness.fixture.refreshListers(t)
+	if !flipped {
+		t.Fatal("test did not flip Node health after the relation fence was persisted")
+	}
+	if len(harness.api.assignedFirewalls) != assignmentsBefore {
+		t.Fatalf("health-flipped shard crossed ICMP assignment: %#v", harness.api.assignedFirewalls[assignmentsBefore:])
+	}
+	if !harness.fixture.servicePublished(t, harness.serviceName) {
+		t.Fatal("health flip at final ICMP authority withdrew the established shard Service")
+	}
+	nodeA, err := harness.provider.kubeClient.CoreV1().Nodes().Get(harness.ctx, harness.nodeName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nodeA.Labels[nodeLoadBalancerReadyLabel] != "true" {
+		t.Fatalf("health flip closed established Node A: %#v", nodeA.Labels)
+	}
+
+	setAggregateTestNodeReady(t, harness, nodeB.Name, corev1.ConditionTrue)
+	if err := harness.controller.sync(harness.ctx, keyB); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(harness.api.assignedFirewalls) - assignmentsBefore; got != 1 {
+		t.Fatalf("recovered health-flipped shard ICMP attachment count = %d, want 1", got)
+	}
+	if !harness.fixture.servicePublished(t, harness.serviceName) {
+		t.Fatal("recovered ICMP attachment withdrew the established shard Service")
+	}
+}
+
+func TestClusterICMPHealthDeferralSurfacesReceiptClearFailure(t *testing.T) {
+	harness := newAggregateSafetySyncHarness(t, nodeLoadBalancerTestService(
+		"aggregate-health-clear-failure",
+		"84848484-8484-4484-8888-848484848484",
+		corev1.ProtocolTCP,
+		12743,
+	))
+	defer harness.controller.queue.ShutDown()
+	harness.converge(t)
+
+	const vmB = "bebebebe-bebe-4ebe-8ebe-bebebebebebe"
+	nodeB := aggregateAddSafetyNode(
+		t, harness, harness.shard, "aggregate-health-clear-failure-node", vmB,
+		"10.0.0.33", "203.0.113.23", false,
+	)
+	clusterNodes, err := harness.controller.authorizedNodesForCluster(harness.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nodeClassName := managedNodeLoadBalancerName(harness.provider.config.ClusterID, "node-lb")
+	dynamicClient, ok := harness.provider.dynamicClient.(interface {
+		PrependReactor(string, string, k8stesting.ReactionFunc)
+	})
+	if !ok {
+		t.Fatalf("test dynamic client does not support reactors: %T", harness.provider.dynamicClient)
+	}
+	const clearFailureMessage = "injected NodeClass relation receipt clear failure"
+	flipped := false
+	clearAttempted := false
+	dynamicClient.PrependReactor("update", "*", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		update, ok := action.(k8stesting.UpdateAction)
+		if !ok || action.GetResource() != nodeClassGVR {
+			return false, nil, nil
+		}
+		object, ok := update.GetObject().(*unstructured.Unstructured)
+		if !ok {
+			return false, nil, nil
+		}
+		issued := object.GetAnnotations()[annotationNodeLoadBalancerFirewallRelationIssued]
+		if issued != "" && !flipped {
+			flipped = true
+			setAggregateTestNodeReady(t, harness, nodeB.Name, corev1.ConditionFalse)
+			return false, nil, nil
+		}
+		if issued == "" && flipped && !clearAttempted {
+			clearAttempted = true
+			return true, nil, errors.New(clearFailureMessage)
+		}
+		return false, nil, nil
+	})
+
+	assignmentsBefore := len(harness.api.assignedFirewalls)
+	firewall, ready, err := harness.controller.ensureClusterICMPFirewall(
+		harness.ctx,
+		nodeClassName,
+		clusterNodes,
+	)
+	if err == nil || !strings.Contains(err.Error(), clearFailureMessage) {
+		t.Fatalf("receipt clear failure error = %v", err)
+	}
+	if firewall != nil || ready {
+		t.Fatalf("receipt clear failure returned firewall=%#v ready=%t", firewall, ready)
+	}
+	if !flipped || !clearAttempted {
+		t.Fatalf("health/clear hooks: flipped=%t clearAttempted=%t", flipped, clearAttempted)
+	}
+	if len(harness.api.assignedFirewalls) != assignmentsBefore {
+		t.Fatalf("receipt clear failure crossed ICMP assignment: %#v", harness.api.assignedFirewalls[assignmentsBefore:])
+	}
+	var deferred *nodeLoadBalancerFirewallVMHealthDeferredError
+	if errors.As(err, &deferred) {
+		t.Fatalf("receipt clear failure was classified as a cleared health deferral: %v", err)
+	}
+	stored, err := harness.provider.dynamicClient.Resource(nodeClassGVR).Get(
+		harness.ctx,
+		nodeClassName,
+		metav1.GetOptions{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.GetAnnotations()[annotationNodeLoadBalancerFirewallRelationIssued] == "" {
+		t.Fatal("failed receipt clearance unexpectedly removed the exact issued fence")
 	}
 }
 
@@ -881,6 +1157,40 @@ func aggregateAddSafetyNode(
 		t.Fatal(err)
 	}
 	return node
+}
+
+func setAggregateTestNodeReady(
+	t *testing.T,
+	harness *aggregateSafetySyncHarness,
+	name string,
+	status corev1.ConditionStatus,
+) {
+	t.Helper()
+	node, err := harness.provider.kubeClient.CoreV1().Nodes().Get(harness.ctx, name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated := node.DeepCopy()
+	found := false
+	for index := range updated.Status.Conditions {
+		if updated.Status.Conditions[index].Type != corev1.NodeReady {
+			continue
+		}
+		updated.Status.Conditions[index].Status = status
+		found = true
+		break
+	}
+	if !found {
+		t.Fatalf("Node %s has no Ready condition", name)
+	}
+	if _, err := harness.provider.kubeClient.CoreV1().Nodes().UpdateStatus(
+		harness.ctx,
+		updated,
+		metav1.UpdateOptions{},
+	); err != nil {
+		t.Fatal(err)
+	}
+	harness.fixture.refreshListers(t)
 }
 
 func retainedIdentityTestNodeClaim(

@@ -255,7 +255,7 @@ func contractHandler(t *testing.T) http.HandlerFunc {
 			if got.DisplayName != "k8s-owned" || got.NetworkUUID != networkUUID || len(got.Rules) != 1 || got.Rules[0].TargetPort != 30443 {
 				t.Errorf("CreateLoadBalancer body = %#v", got)
 			}
-			writeLiteral(w, http.StatusCreated, loadBalancerLiteral())
+			writeLiteral(w, http.StatusOK, loadBalancerLiteral())
 		case "GET /v1/bkk01/network/load_balancers":
 			writeLiteral(w, http.StatusOK, "["+loadBalancerLiteral()+"]")
 		case "GET /v1/bkk01/network/load_balancers/" + lbUUID:
@@ -265,9 +265,11 @@ func contractHandler(t *testing.T) http.HandlerFunc {
 		case "POST /v1/bkk01/network/load_balancers/" + lbUUID + "/forwarding_rules":
 			// The official response example contains only the two ports.
 			writeLiteral(w, http.StatusOK, `{"source_port":6443,"target_port":6443}`)
-		case "DELETE /v1/bkk01/network/load_balancers/" + lbUUID + "/targets/" + vmUUID,
-			"DELETE /v1/bkk01/network/load_balancers/" + lbUUID + "/forwarding_rules/" + ruleUUID,
-			"DELETE /v1/bkk01/network/load_balancers/" + lbUUID:
+		case "DELETE /v1/bkk01/network/load_balancers/" + lbUUID + "/targets/" + vmUUID:
+			w.WriteHeader(http.StatusNoContent)
+		case "DELETE /v1/bkk01/network/load_balancers/" + lbUUID + "/forwarding_rules/" + ruleUUID:
+			w.WriteHeader(http.StatusNoContent)
+		case "DELETE /v1/bkk01/network/load_balancers/" + lbUUID:
 			w.WriteHeader(http.StatusOK)
 		case "GET /v1/bkk01/network/firewalls":
 			writeLiteral(w, http.StatusOK, `[{"uuid":"`+firewallUUID+`","display_name":"k8s-firewall","billing_account_id":129673,"rules":[{"protocol":"tcp","direction":"inbound","port_start":6443,"port_end":6443,"endpoint_spec_type":"ip_prefixes","endpoint_spec":["10.4.200.0/24"]}],"resources_assigned":[]}]`)

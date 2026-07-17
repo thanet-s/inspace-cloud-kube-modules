@@ -247,15 +247,15 @@ def test_proxy_bypass_and_exact_absence() -> None:
                 json.dumps(
                     {
                         "error": "No such virtual machine exists: "
-                        + vm_uuid.upper()
+                        + vm_uuid
                     }
                 ).encode(),
             )
-            require(
-                api.client().exact_absent(
+            reject(
+                lambda: api.client().exact_absent(
                     f"user-resource/vm?uuid={vm_uuid}", location="bkk01"
                 ),
-                "bound exact VM HTTP 400 was not recognized as absence",
+                "legacy one-field VM HTTP 400",
             )
             Handler.routes[vm_route] = (
                 400,
@@ -389,7 +389,10 @@ def test_proxy_bypass_and_exact_absence() -> None:
                 (
                     "nested HTTP 400 with a matching legacy sibling",
                     {
-                        "errors": {"Error": "validation failed"},
+                        "errors": {
+                            "Error": "No such virtual machine exists: "
+                            + vm_uuid
+                        },
                         "error": "No such virtual machine exists: "
                         + vm_uuid,
                     },
@@ -448,6 +451,27 @@ def test_proxy_bypass_and_exact_absence() -> None:
                     + b'","Error":"No such virtual machine exists: '
                     + vm_uuid.encode()
                     + b'"}}',
+                ),
+                (
+                    "nested HTTP 400 with trailing JSON",
+                    b'{"errors":{"Error":"No such virtual machine exists: '
+                    + vm_uuid.encode()
+                    + b'"}} trailing',
+                ),
+                (
+                    "malformed nested HTTP 400 JSON",
+                    b'{"errors":{"Error":"No such virtual machine exists: '
+                    + vm_uuid.encode(),
+                ),
+                (
+                    "plain-text VM HTTP 400",
+                    b"No such virtual machine exists: " + vm_uuid.encode(),
+                ),
+                (
+                    "JSON-string VM HTTP 400",
+                    json.dumps(
+                        "No such virtual machine exists: " + vm_uuid
+                    ).encode(),
                 ),
             ):
                 Handler.routes[vm_route] = (400, {}, body)

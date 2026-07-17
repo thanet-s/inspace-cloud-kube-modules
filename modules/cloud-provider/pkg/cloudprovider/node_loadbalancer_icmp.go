@@ -498,6 +498,14 @@ func (c *nodeLoadBalancerController) ensureClusterICMPFirewall(
 				assignmentsReady = false
 				continue
 			}
+			// A newly registered Karpenter Node can be ownership-valid before its
+			// kubelet is Ready. Keep it in the retention set, but do not start an
+			// ICMP relation mutation until it is healthy. This startup state must
+			// not close already advertised shards.
+			if !nodeLoadBalancerNodeHealthy(node) {
+				assignmentsReady = false
+				continue
+			}
 			converged, relationErr := c.reconcileNodeLoadBalancerFirewallRelation(
 				ctx,
 				c.clusterICMPFirewallRelationOwnerForUID(nodeClassName, ownerUID),
@@ -506,6 +514,14 @@ func (c *nodeLoadBalancerController) ensureClusterICMPFirewall(
 				},
 			)
 			if relationErr != nil {
+				// Health can change after the precheck but before the final
+				// authority read. An unadvertised VM becoming unavailable is a
+				// deferred attachment, not cluster-wide corruption, but only
+				// after its one-shot relation receipt was durably cleared.
+				var healthDeferred *nodeLoadBalancerFirewallVMHealthDeferredError
+				if errors.As(relationErr, &healthDeferred) {
+					return firewall, false, nil
+				}
 				return nil, false, fmt.Errorf("node load balancer: assign cluster ICMP firewall %s to VM %s: %w", firewall.UUID, vmUUID, relationErr)
 			}
 			assignmentsReady = false

@@ -23,6 +23,25 @@ const (
 	annotationNodeLoadBalancerFirewallRelationVMAbsent = "service.inspace.cloud/node-lb-firewall-relation-vm-absence"
 )
 
+var errNodeLoadBalancerFirewallVMNotHealthy = errors.New("node load balancer: firewall relation VM is not healthy")
+
+// nodeLoadBalancerFirewallVMHealthDeferredError is emitted only after final
+// authority rejected an assignment for health and the exact issued receipt was
+// durably cleared. Callers may preserve established datapaths for this marker;
+// the underlying health error alone is not sufficient because receipt cleanup
+// can fail independently.
+type nodeLoadBalancerFirewallVMHealthDeferredError struct {
+	cause error
+}
+
+func (err *nodeLoadBalancerFirewallVMHealthDeferredError) Error() string {
+	return err.cause.Error()
+}
+
+func (err *nodeLoadBalancerFirewallVMHealthDeferredError) Unwrap() error {
+	return err.cause
+}
+
 type nodeLoadBalancerFirewallRelationOperation string
 
 const (
@@ -955,6 +974,13 @@ func requireAuthorizedNodeLoadBalancerFirewallVM(nodes []*corev1.Node, vmUUID st
 			matches++
 		}
 	}
+	if matches == 0 {
+		return fmt.Errorf(
+			"%w: VM %s has 0 healthy authoritative managed Nodes, want exactly one",
+			errNodeLoadBalancerFirewallVMNotHealthy,
+			vmUUID,
+		)
+	}
 	if matches != 1 {
 		return fmt.Errorf("VM %s has %d healthy authoritative managed Nodes, want exactly one", vmUUID, matches)
 	}
@@ -1212,8 +1238,12 @@ func (c *nodeLoadBalancerController) reconcileNodeLoadBalancerFirewallRelation(
 		clearErr := clearNodeLoadBalancerFirewallRelationFence(ctx, owner, issuedOwnerUID, *issuedFence)
 		if clearErr != nil {
 			clearErr = fmt.Errorf("node load balancer: clear proven-undispatched %s firewall relation fence: %w", owner.description, clearErr)
+			return false, errors.Join(rejection, clearErr)
 		}
-		return false, errors.Join(rejection, clearErr)
+		if errors.Is(authorityErr, errNodeLoadBalancerFirewallVMNotHealthy) {
+			return false, &nodeLoadBalancerFirewallVMHealthDeferredError{cause: rejection}
+		}
+		return false, rejection
 	}
 	authorityBefore, err := exactNodeLoadBalancerFirewallFromItems(items, issuedFence.firewallUUID)
 	if err != nil {
