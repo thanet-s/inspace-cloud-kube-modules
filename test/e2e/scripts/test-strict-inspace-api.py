@@ -4,12 +4,14 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import os
 import pathlib
 import tempfile
 import threading
 import urllib.request
+from contextlib import redirect_stderr, redirect_stdout
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from strict_inspace_api import StrictAPIError, StrictInSpaceAPI
@@ -510,11 +512,155 @@ def test_stable_zero_proofs() -> None:
             )
 
 
+def test_cloud_audit_expectations() -> None:
+    cloud_audit = load_script(
+        "strict_cloud_audit_expectation_test", "cloud-audit.py"
+    )
+    owner = "unit-owner"
+    cluster = "unit-cluster"
+    state = {"clusterResourceName": cluster}
+    bootstrap = {
+        "vms": [
+            {
+                "uuid": f"00000000-0000-4000-8000-00000000000{slot}",
+                "name": f"{cluster}-cp{slot}",
+            }
+            for slot in range(3)
+        ]
+        + [
+            {
+                "uuid": "00000000-0000-4000-8000-000000000003",
+                "name": f"{cluster}-bastion",
+            }
+        ],
+        "firewalls": [
+            {"uuid": "firewall-nodes", "name": f"{cluster}-nodes-{owner}"},
+            {"uuid": "firewall-bastion", "name": f"{cluster}-bastion-{owner}"},
+        ],
+        "floatingIPs": [
+            {
+                "address": f"203.0.113.{10 + slot}",
+                "name": f"{cluster}-cp{slot}-ip",
+                "assigned_to": f"00000000-0000-4000-8000-00000000000{slot}",
+            }
+            for slot in range(3)
+        ]
+        + [
+            {
+                "address": "203.0.113.13",
+                "name": f"{cluster}-bastion-ip",
+                "assigned_to": "00000000-0000-4000-8000-000000000003",
+            }
+        ],
+        "loadBalancers": [],
+        "disks": [],
+        "count": 10,
+        "strictReadCount": 3,
+    }
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    with redirect_stdout(stdout), redirect_stderr(stderr):
+        status = cloud_audit.emit_audit_result(
+            bootstrap,
+            "bootstrap-only",
+            state=state,
+            owner=owner,
+            cluster=cluster,
+        )
+    require(status == 0, "bootstrap-only expectation rejected its target state")
+    require(
+        stdout.getvalue() == json.dumps(bootstrap, sort_keys=True) + "\n",
+        "bootstrap-only success did not print canonical audit JSON",
+    )
+    require(stderr.getvalue() == "", "bootstrap-only success wrote an error")
+
+    nonconverged = {**bootstrap, "disks": [{"uuid": "disk", "name": "pvc"}]}
+    nonconverged["count"] = 11
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    with redirect_stdout(stdout), redirect_stderr(stderr):
+        status = cloud_audit.emit_audit_result(
+            nonconverged,
+            "bootstrap-only",
+            state=state,
+            owner=owner,
+            cluster=cluster,
+        )
+    require(status == 1, "bootstrap-only expectation accepted an owned disk")
+    require(
+        stdout.getvalue() == json.dumps(nonconverged, sort_keys=True) + "\n",
+        "nonconvergence did not preserve canonical audit JSON on stdout",
+    )
+
+    zero = {
+        "vms": [],
+        "firewalls": [],
+        "floatingIPs": [],
+        "loadBalancers": [],
+        "disks": [],
+        "count": 0,
+        "strictReadCount": 3,
+    }
+    require(
+        cloud_audit.expectation_converged(
+            zero,
+            "zero",
+            state=state,
+            owner=owner,
+            cluster=cluster,
+        ),
+        "zero expectation rejected a stable empty audit",
+    )
+    require(
+        not cloud_audit.expectation_converged(
+            bootstrap,
+            "zero",
+            state=state,
+            owner=owner,
+            cluster=cluster,
+        ),
+        "zero expectation accepted remaining bootstrap resources",
+    )
+    malformed_bootstrap = {
+        **bootstrap,
+        "vms": [
+            {key: value for key, value in item.items() if key != "uuid"}
+            for item in bootstrap["vms"]
+        ],
+    }
+    require(
+        not cloud_audit.expectation_converged(
+            malformed_bootstrap,
+            "bootstrap-only",
+            state=state,
+            owner=owner,
+            cluster=cluster,
+        ),
+        "bootstrap-only expectation accepted VM records without identities",
+    )
+    malformed = {**zero, "strictReadCount": "3"}
+    stdout = io.StringIO()
+    with redirect_stdout(stdout), redirect_stderr(io.StringIO()):
+        status = cloud_audit.emit_audit_result(
+            malformed,
+            "zero",
+            state=state,
+            owner=owner,
+            cluster=cluster,
+        )
+    require(status == 1, "zero expectation accepted a malformed stable-read count")
+    require(
+        stdout.getvalue() == json.dumps(malformed, sort_keys=True) + "\n",
+        "malformed nonconvergence did not preserve audit JSON on stdout",
+    )
+
+
 def main() -> None:
     test_transport_and_json_boundary()
     test_proxy_bypass_and_exact_absence()
     test_list_identity_contracts()
     test_stable_zero_proofs()
+    test_cloud_audit_expectations()
     print("strict InSpace E2E API tests passed")
 
 

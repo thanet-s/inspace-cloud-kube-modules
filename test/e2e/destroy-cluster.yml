@@ -436,22 +436,13 @@
           - "{{ e2e_cleanup_state.clusterName }}"
           - --nodepool
           - "{{ e2e_cleanup_state.nodePoolName }}"
+          - --expect
+          - bootstrap-only
       register: e2e_cleanup_owner_audit
       changed_when: false
       retries: 180
       delay: 10
-      until: >-
-        (e2e_cleanup_owner_audit.stdout | from_json).disks | length == 0 and
-        (e2e_cleanup_owner_audit.stdout | from_json).vms | length == 4 and
-        ((e2e_cleanup_owner_audit.stdout | from_json).vms |
-          rejectattr('name', 'match', '^(' + e2e_cleanup_state.clusterResourceName + '-cp[0-2]|' + e2e_cleanup_state.clusterResourceName + '-bastion|rke2-' + e2e_cleanup_state.owner + '-(cp-[0-2]|bastion))$') |
-          list | length) == 0 and
-        ((e2e_cleanup_owner_audit.stdout | from_json).floatingIPs |
-          rejectattr('name', 'match', '^(' + e2e_cleanup_state.clusterResourceName + '-(cp[0-2]|bastion)-ip|rke2-' + e2e_cleanup_state.owner + '-(cp-[0-2]|bastion)-ip)$') |
-          list | length) == 0 and
-        (e2e_cleanup_owner_audit.stdout | from_json).floatingIPs | length == 4 and
-        (e2e_cleanup_owner_audit.stdout | from_json).firewalls | length == 2 and
-        (e2e_cleanup_owner_audit.stdout | from_json).loadBalancers | length == 0
+      until: e2e_cleanup_owner_audit.rc == 0
       no_log: true
       when: e2e_cleanup_state.kubernetesOwnersPossible | default(false) | bool
 
@@ -540,11 +531,13 @@
           - "{{ e2e_cleanup_state.clusterName }}"
           - --nodepool
           - "{{ e2e_cleanup_state.nodePoolName }}"
+          - --expect
+          - zero
       register: e2e_final_audit
       changed_when: false
       retries: 90
       delay: 10
-      until: (e2e_final_audit.stdout | from_json).count == 0
+      until: e2e_final_audit.rc == 0
       no_log: true
 
     - name: Require the complete isolated-account inventory to match its baseline

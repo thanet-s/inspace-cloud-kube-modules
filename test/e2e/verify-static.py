@@ -1678,9 +1678,9 @@ def main() -> None:
         init_playbook, "Install released CCM CSI and Karpenter controllers", 4
     )
     require(
-        "e2e_release_images.charts['inspace-cloud-kube-modules-crds'].relativePath"
+        "e2e_install_release_images.charts['inspace-cloud-kube-modules-crds'].relativePath"
         in crd_install
-        and "e2e_release_images.charts['inspace-cloud-kube-modules'].relativePath"
+        and "e2e_install_release_images.charts['inspace-cloud-kube-modules'].relativePath"
         in modules_install
         and "oci://ghcr.io/thanet-s/charts/" not in crd_install + modules_install,
         "live E2E must install both locally verified release chart archives",
@@ -1887,13 +1887,13 @@ def main() -> None:
         provision_play, "Prove exact and ordered three-control-plane provisioning", 4
     )
     for clause in (
-        "e2e_bootstrap_result.controlPlaneVMs | length == 3",
-        "e2e_bootstrap_result.controlPlaneVMs | unique | length == 3",
-        "e2e_bootstrap_result.maxParallelControlPlaneCreates | int == 1",
-        "e2e_bootstrap_result.bootstrapCacheEndpoint == 'https://cache.' + e2e_cluster_name + '.inspace.internal:8443'",
-        "e2e_bootstrap_result.bootstrapCacheRegistry == 'cache.' + e2e_cluster_name + '.inspace.internal:8443'",
-        "e2e_bootstrap_result.bootstrapCacheAddress == e2e_bootstrap_result.bastionPrivateIPv4",
-        "e2e_bootstrap_result.bootstrapCacheCABundle is match('^-----BEGIN CERTIFICATE-----\\n')",
+        "e2e_provision_result.controlPlaneVMs | length == 3",
+        "e2e_provision_result.controlPlaneVMs | unique | length == 3",
+        "e2e_provision_result.maxParallelControlPlaneCreates | int == 1",
+        "e2e_provision_result.bootstrapCacheEndpoint == 'https://cache.' + e2e_cluster_name + '.inspace.internal:8443'",
+        "e2e_provision_result.bootstrapCacheRegistry == 'cache.' + e2e_cluster_name + '.inspace.internal:8443'",
+        "e2e_provision_result.bootstrapCacheAddress == e2e_provision_result.bastionPrivateIPv4",
+        "e2e_provision_result.bootstrapCacheCABundle is match('^-----BEGIN CERTIFICATE-----\\n')",
     ):
         require(f"\n          - {clause}" in ordered_assertion,
                 f"ordered provisioning assertion lacks exact clause: {clause}")
@@ -1901,11 +1901,11 @@ def main() -> None:
         provision_play, "Bind the ordered-create contract to the authoritative three VM identities", 4
     )
     for clause in (
-        "e2e_state.controlPlanes | length == 3",
-        "e2e_state.controlPlanes | map(attribute='uuid') | list | unique | length == 3",
-        "e2e_state.controlPlanes | map(attribute='uuid') | list | difference(e2e_bootstrap_result.controlPlaneVMs) | length == 0",
-        "e2e_bootstrap_result.controlPlaneVMs | difference(e2e_state.controlPlanes | map(attribute='uuid') | list) | length == 0",
-        "e2e_bootstrap_result.maxParallelControlPlaneCreates | int == 1",
+        "e2e_provision_state.controlPlanes | length == 3",
+        "e2e_provision_state.controlPlanes | map(attribute='uuid') | list | unique | length == 3",
+        "e2e_provision_state.controlPlanes | map(attribute='uuid') | list | difference(e2e_provision_result.controlPlaneVMs) | length == 0",
+        "e2e_provision_result.controlPlaneVMs | difference(e2e_provision_state.controlPlanes | map(attribute='uuid') | list) | length == 0",
+        "e2e_provision_result.maxParallelControlPlaneCreates | int == 1",
     ):
         require(f"\n          - {clause}" in authoritative_ordered_binding,
                 f"authoritative ordered-create binding lacks exact clause: {clause}")
@@ -2077,8 +2077,8 @@ def main() -> None:
 
     for marker in (
         "maxParallelControlPlaneCreates | int == 1",
-        "e2e_bootstrap_result.apiLoadBalancerUUID is not defined",
-        "e2e_bootstrap_result.bastionVMUUID | length > 0",
+        "e2e_provision_result.apiLoadBalancerUUID is not defined",
+        "e2e_provision_result.bastionVMUUID | length > 0",
         "controlPlaneVMs | length == 3",
         "groups: rke2_control_plane",
         "groups: rke2_bastion",
@@ -2152,9 +2152,9 @@ def main() -> None:
             "E2E NodePool must retain bounded headroom for scale-out experiments")
     require("bootstrapCache:" in nodeclass and
             "directDownload: false" in nodeclass and
-            'address: "{{ e2e_bootstrap_result.bootstrapCacheAddress }}"' in nodeclass and
-            "caBundle: {{ e2e_bootstrap_result.bootstrapCacheCABundle | to_json }}" in nodeclass,
-            "E2E NodeClass must consume the reconciler's bastion address and public cache CA")
+            'address: "{{ e2e_state.bootstrapCacheAddress }}"' in nodeclass and
+            "caBundle: {{ e2e_state.bootstrapCacheCABundle | to_json }}" in nodeclass,
+            "E2E NodeClass must consume the persisted bastion address and public cache CA")
     require("hostPoolSelector" not in nodeclass and
             "key: inspace.cloud/host-class" in nodeclass and
             "values: [amd-epyc]" in nodeclass and
@@ -3064,7 +3064,7 @@ def main() -> None:
             "bastion health acceptance must not use an early-closing grep pipeline under pipefail")
     require('test "$cache_address" = "{{ e2e_private_ip }}"' in bastion_cache,
             "bastion cache acceptance must use the allocator-assigned bastion private address")
-    require('e2e_node_name: "{{ e2e_state.bastionName }}"' in playbook,
+    require('e2e_node_name: "{{ e2e_provision_state.bastionName }}"' in playbook,
             "dynamic bastion inventory must use the discovered exact VM name")
     for field in (
         '"bootstrapCacheAddress": bastion_private',
@@ -3672,10 +3672,21 @@ def main() -> None:
             "recovery must restore its private API tunnel before probing Kubernetes")
     require(re.search(r"preserving\s+cloud infrastructure is the fail-closed outcome", cleanup) is not None,
             "cleanup must fail closed when ownership is uncertain")
-    require("e2e_cleanup_state.clusterResourceName + '-cp[0-2]|'" in cleanup and
-            "e2e_cleanup_state.clusterResourceName + '-bastion|rke2-'" in cleanup and
-            "e2e_cleanup_state.owner + '-(cp-[0-2]|bastion))$'" in cleanup,
-            "controller uninstall must permit only current or fully legacy bootstrap VM names")
+    owner_audit_task = named_yaml_sequence_item(
+        cleanup,
+        "Wait until CCM CSI and Karpenter removed all non-control-plane cloud resources",
+        4,
+    )
+    final_audit_task = named_yaml_sequence_item(
+        cleanup, "Require the final deterministic cloud audit to converge to zero", 4
+    )
+    require(
+        "\n          - --expect\n          - bootstrap-only" in owner_audit_task
+        and "\n      until: e2e_cleanup_owner_audit.rc == 0" in owner_audit_task
+        and "\n          - --expect\n          - zero" in final_audit_task
+        and "\n      until: e2e_final_audit.rc == 0" in final_audit_task,
+        "cleanup retries must use cloud-audit semantic exit statuses without parsing failed stdout",
+    )
     print("E2E static contract verified (no live resources touched)")
 
 
