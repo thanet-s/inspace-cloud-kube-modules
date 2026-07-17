@@ -309,7 +309,7 @@ func contractHandler(t *testing.T) http.HandlerFunc {
 			if r.URL.Query().Get("billing_account_id") != "129673" || r.URL.Query().Get("vm_uuid") != vmUUID {
 				t.Errorf("floating IP query = %s", r.URL.RawQuery)
 			}
-			writeLiteral(w, http.StatusOK, "["+floatingIPLiteral(false)+"]")
+			writeLiteral(w, http.StatusOK, "["+floatingIPLiteral(true)+"]")
 		case "GET /v1/bkk01/network/ip_addresses/" + floatingIP:
 			writeLiteral(w, http.StatusOK, floatingIPLiteral(false))
 		case "POST /v1/bkk01/network/ip_addresses/" + floatingIP + "/assign":
@@ -342,7 +342,10 @@ func floatingIPLiteral(assigned bool) string {
 	if assigned {
 		assignment = `"assigned_to":"` + vmUUID + `","assigned_to_resource_type":"virtual_machine","assigned_to_private_ip":"10.4.200.10"`
 	}
-	return `{"address":"` + floatingIP + `","name":"k8s-ip","billing_account_id":129673,"type":"public","enabled":true,"is_deleted":false,"is_virtual":false,` + assignment + `}`
+	return `{"uuid":"77777777-8888-4999-8aaa-bbbbbbbbbbbb","id":73,"address":"` + floatingIP +
+		`","user_id":268,"name":"k8s-ip","billing_account_id":129673,"type":"public","enabled":true,` +
+		`"is_deleted":false,"is_ipv6":false,"is_virtual":false,"created_at":"2026-07-17T08:00:00Z",` +
+		`"updated_at":"2026-07-17T08:00:00Z",` + assignment + `}`
 }
 
 func assertForm(t *testing.T, r *http.Request, want url.Values) {

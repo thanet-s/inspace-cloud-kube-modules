@@ -1,6 +1,11 @@
 package inspace
 
-import "encoding/json"
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"strings"
+)
 
 // Location identifies an InSpace data-centre/resource location.
 type Location struct {
@@ -258,6 +263,7 @@ type FloatingIP struct {
 	Name                   string `json:"name,omitempty"`
 	Enabled                bool   `json:"enabled"`
 	IsDeleted              bool   `json:"is_deleted"`
+	IsIPv6                 bool   `json:"is_ipv6"`
 	IsVirtual              bool   `json:"is_virtual"`
 	AssignedTo             string `json:"assigned_to,omitempty"`
 	AssignedToResourceType string `json:"assigned_to_resource_type,omitempty"`
@@ -266,12 +272,41 @@ type FloatingIP struct {
 	UpdatedAt              string `json:"updated_at,omitempty"`
 	UnassignedAt           string `json:"unassigned_at,omitempty"`
 	assignedToPresent      bool
+	assignedTypePresent    bool
+	assignedPrivatePresent bool
+	assignmentCorroborated bool
+	stableIdentityPresent  bool
+	isIPv6Present          bool
+	isVirtualPresent       bool
+}
+
+var canonicalFloatingIPResponseFields = []string{
+	"uuid",
+	"id",
+	"address",
+	"user_id",
+	"billing_account_id",
+	"type",
+	"name",
+	"enabled",
+	"is_deleted",
+	"is_ipv6",
+	"is_virtual",
+	"assigned_to",
+	"assigned_to_resource_type",
+	"assigned_to_private_ip",
+	"created_at",
+	"updated_at",
+	"unassigned_at",
 }
 
 // UnmarshalJSON preserves the distinction between the documented
-// "assigned_to": null value and an omitted assignment field. Read endpoints
-// may omit assigned_to after a completed unassignment and return unassigned_at
-// instead; mutation responses must still report assignment state explicitly.
+// "assigned_to": null value and an omitted assignment tuple. Live read
+// endpoints can omit all three assignment fields for an unassigned address.
+// Callers must corroborate that sparse representation before treating it as
+// authoritative. Non-canonical spellings are rejected because encoding/json's
+// case-insensitive field matching could otherwise populate a relationship
+// value while the presence bits still report it as absent.
 func (f *FloatingIP) UnmarshalJSON(data []byte) error {
 	type floatingIPWithoutMethods FloatingIP
 	var decoded floatingIPWithoutMethods
@@ -282,8 +317,40 @@ func (f *FloatingIP) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(data, &fields); err != nil {
 		return err
 	}
+	for key := range fields {
+		for _, canonical := range canonicalFloatingIPResponseFields {
+			if key != canonical && strings.EqualFold(key, canonical) {
+				return fmt.Errorf("inspace: non-canonical floating IP response field %q; want %q", key, canonical)
+			}
+		}
+	}
 	*f = FloatingIP(decoded)
 	_, f.assignedToPresent = fields["assigned_to"]
+	_, f.assignedTypePresent = fields["assigned_to_resource_type"]
+	_, f.assignedPrivatePresent = fields["assigned_to_private_ip"]
+	_, f.isIPv6Present = fields["is_ipv6"]
+	_, f.isVirtualPresent = fields["is_virtual"]
+	f.stableIdentityPresent = true
+	for _, required := range []string{
+		"uuid",
+		"id",
+		"address",
+		"user_id",
+		"billing_account_id",
+		"type",
+		"name",
+		"enabled",
+		"is_deleted",
+		"is_ipv6",
+		"created_at",
+		"updated_at",
+	} {
+		value, ok := fields[required]
+		if !ok || bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+			f.stableIdentityPresent = false
+			break
+		}
+	}
 	return nil
 }
 

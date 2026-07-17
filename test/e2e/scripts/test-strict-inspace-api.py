@@ -336,7 +336,40 @@ def test_list_identity_contracts() -> None:
             }
         ],
     )
+    StrictInSpaceAPI._validate_endpoint_value(  # noqa: SLF001
+        "network/ip_addresses",
+        [
+            {
+                "address": "203.0.113.12",
+                "name": "live-newly-created",
+                "uuid": "77777777-7777-4777-8777-777777777777",
+                "id": 7,
+                "user_id": 8,
+                "billing_account_id": 9,
+                "type": "public",
+                "enabled": True,
+                "is_deleted": False,
+                "is_ipv6": False,
+                "created_at": "2026-07-17T09:54:00Z",
+                "updated_at": "2026-07-17T09:54:01Z",
+            }
+        ],
+    )
 
+    markerless_sparse_floating_ip = {
+        "address": "203.0.113.12",
+        "name": "live-newly-created",
+        "uuid": "77777777-7777-4777-8777-777777777777",
+        "id": 7,
+        "user_id": 8,
+        "billing_account_id": 9,
+        "type": "public",
+        "enabled": True,
+        "is_deleted": False,
+        "is_ipv6": False,
+        "created_at": "2026-07-17T09:54:00Z",
+        "updated_at": "2026-07-17T09:54:01Z",
+    }
     invalid_rows = (
         (
             "user-resource/vm/list",
@@ -351,7 +384,39 @@ def test_list_identity_contracts() -> None:
         (
             "network/ip_addresses",
             [{"address": "203.0.113.10", "name": ""}],
-            "floating-IP assignment and unassignment-marker omission",
+            "markerless sparse floating-IP stable identity omission",
+        ),
+        (
+            "network/ip_addresses",
+            [
+                {
+                    **markerless_sparse_floating_ip,
+                    "assigned_to_resource_type": None,
+                }
+            ],
+            "markerless sparse floating-IP null assignment type presence",
+        ),
+        (
+            "network/ip_addresses",
+            [
+                {
+                    **markerless_sparse_floating_ip,
+                    "assigned_to_private_ip": "",
+                }
+            ],
+            "markerless sparse floating-IP empty private-address presence",
+        ),
+        (
+            "network/ip_addresses",
+            [
+                {
+                    "address": "203.0.113.10",
+                    "name": "",
+                    "assigned_to": None,
+                    "ASSIGNED_TO": vm_uuid,
+                }
+            ],
+            "floating-IP non-canonical assignment field",
         ),
         (
             "network/ip_addresses",
