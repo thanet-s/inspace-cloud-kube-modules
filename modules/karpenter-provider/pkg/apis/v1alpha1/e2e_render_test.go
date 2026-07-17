@@ -157,6 +157,18 @@ func TestClusterE2EProvisionsInOrderAndWaitsForThreeControlPlanesInParallel(t *t
 		"e2e_bootstrap_result.maxParallelControlPlaneCreates | int == 1",
 	)
 
+	bastion := exactAnsiblePlay(t, plays, "Establish the pinned public bastion")
+	if bastion.Hosts != "rke2_bastion" {
+		t.Fatalf("bastion play hosts=%q, want rke2_bastion", bastion.Hosts)
+	}
+	if got, ok := bastion.Vars["e2e_release_images"].(string); !ok ||
+		got != "{{ hostvars['localhost']['e2e_release_images'] }}" {
+		t.Fatalf(
+			"bastion release-image manifest=%v, want the immutable localhost fact",
+			bastion.Vars["e2e_release_images"],
+		)
+	}
+
 	controlPlaneWait := exactAnsiblePlay(t, plays, "Wait for all RKE2 servers independently and in parallel through the bastion")
 	if controlPlaneWait.Hosts != "rke2_control_plane" || controlPlaneWait.Strategy != "free" {
 		t.Fatalf("control-plane wait play hosts/strategy=%q/%q, want rke2_control_plane/free", controlPlaneWait.Hosts, controlPlaneWait.Strategy)
@@ -434,6 +446,7 @@ type ansiblePlay struct {
 	Name      string           `json:"name"`
 	Hosts     string           `json:"hosts"`
 	Strategy  string           `json:"strategy"`
+	Vars      map[string]any   `json:"vars"`
 	Tasks     []map[string]any `json:"tasks"`
 	HasSerial bool             `json:"-"`
 }

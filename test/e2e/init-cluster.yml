@@ -514,6 +514,8 @@
 - name: Establish the pinned public bastion
   hosts: rke2_bastion
   gather_facts: false
+  vars:
+    e2e_release_images: "{{ hostvars['localhost']['e2e_release_images'] }}"
   tasks:
     - name: Prove the bastion FIP answers ICMP from the management client
       ansible.builtin.command:
