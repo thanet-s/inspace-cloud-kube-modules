@@ -92,13 +92,13 @@ func TestClusterE2EProvisionsInOrderAndWaitsForThreeControlPlanesInParallel(t *t
 	}
 	for _, expected := range []string{
 		"Run the bootstrap reconciler synchronously to readiness",
-		"e2e_bootstrap_result.controlPlaneVMs | length == 3",
-		"e2e_bootstrap_result.controlPlaneVMs | unique | length == 3",
-		"e2e_bootstrap_result.maxParallelControlPlaneCreates | int == 1",
-		"e2e_bootstrap_result.apiLoadBalancerUUID is not defined",
-		"e2e_bootstrap_result.registrationLoadBalancerUUID is not defined",
-		"e2e_bootstrap_result.privateRegistrationEndpoint == 'https://' + e2e_virtual_ip + ':9345'",
-		"e2e_bootstrap_result.bastionVMUUID | length > 0",
+		"e2e_provision_result.controlPlaneVMs | length == 3",
+		"e2e_provision_result.controlPlaneVMs | unique | length == 3",
+		"e2e_provision_result.maxParallelControlPlaneCreates | int == 1",
+		"e2e_provision_result.apiLoadBalancerUUID is not defined",
+		"e2e_provision_result.registrationLoadBalancerUUID is not defined",
+		"e2e_provision_result.privateRegistrationEndpoint == 'https://' + e2e_virtual_ip + ':9345'",
+		"e2e_provision_result.bastionVMUUID | length > 0",
 		"groups['rke2_control_plane'] | length == 3",
 		"hosts: rke2_control_plane",
 		"strategy: free",
@@ -144,29 +144,33 @@ func TestClusterE2EProvisionsInOrderAndWaitsForThreeControlPlanesInParallel(t *t
 	}
 	orderedContract := exactAnsibleTask(t, provision, "Prove exact and ordered three-control-plane provisioning")
 	requireTaskAssertions(t, orderedContract,
-		"e2e_bootstrap_result.controlPlaneVMs | length == 3",
-		"e2e_bootstrap_result.controlPlaneVMs | unique | length == 3",
-		"e2e_bootstrap_result.maxParallelControlPlaneCreates | int == 1",
+		"e2e_provision_result.controlPlaneVMs | length == 3",
+		"e2e_provision_result.controlPlaneVMs | unique | length == 3",
+		"e2e_provision_result.maxParallelControlPlaneCreates | int == 1",
 	)
 	authoritativeBinding := exactAnsibleTask(t, provision, "Bind the ordered-create contract to the authoritative three VM identities")
 	requireTaskAssertions(t, authoritativeBinding,
-		"e2e_state.controlPlanes | length == 3",
-		"e2e_state.controlPlanes | map(attribute='uuid') | list | unique | length == 3",
-		"e2e_state.controlPlanes | map(attribute='uuid') | list | difference(e2e_bootstrap_result.controlPlaneVMs) | length == 0",
-		"e2e_bootstrap_result.controlPlaneVMs | difference(e2e_state.controlPlanes | map(attribute='uuid') | list) | length == 0",
-		"e2e_bootstrap_result.maxParallelControlPlaneCreates | int == 1",
+		"e2e_provision_state.controlPlanes | length == 3",
+		"e2e_provision_state.controlPlanes | map(attribute='uuid') | list | unique | length == 3",
+		"e2e_provision_state.controlPlanes | map(attribute='uuid') | list | difference(e2e_provision_result.controlPlaneVMs) | length == 0",
+		"e2e_provision_result.controlPlaneVMs | difference(e2e_provision_state.controlPlanes | map(attribute='uuid') | list) | length == 0",
+		"e2e_provision_result.maxParallelControlPlaneCreates | int == 1",
+	)
+	addBastion := exactAnsibleTask(t, provision, "Add the exact public bastion host")
+	addBastionConfig := requireTaskMapping(t, addBastion, "ansible.builtin.add_host")
+	requireMappingString(
+		t,
+		addBastionConfig,
+		"e2e_cache_release_images",
+		"{{ e2e_bootstrap_release_images }}",
 	)
 
 	bastion := exactAnsiblePlay(t, plays, "Establish the pinned public bastion")
 	if bastion.Hosts != "rke2_bastion" {
 		t.Fatalf("bastion play hosts=%q, want rke2_bastion", bastion.Hosts)
 	}
-	if got, ok := bastion.Vars["e2e_release_images"].(string); !ok ||
-		got != "{{ hostvars['localhost']['e2e_release_images'] }}" {
-		t.Fatalf(
-			"bastion release-image manifest=%v, want the immutable localhost fact",
-			bastion.Vars["e2e_release_images"],
-		)
+	if _, exists := bastion.Vars["e2e_release_images"]; exists {
+		t.Fatal("bastion play must receive its immutable manifest through add_host, not a cross-play localhost fact")
 	}
 
 	controlPlaneWait := exactAnsiblePlay(t, plays, "Wait for all RKE2 servers independently and in parallel through the bastion")
@@ -281,6 +285,24 @@ func TestClusterE2EProvisionsInOrderAndWaitsForThreeControlPlanesInParallel(t *t
 	requireTaskNumber(t, readyz, "retries", 120)
 	requireTaskNumber(t, readyz, "delay", 10)
 	requireTaskScalar(t, readyz, "until", "e2e_local_readyz.rc == 0")
+	configure := exactAnsiblePlay(t, plays, "Configure the tunneled private API and install the released controllers")
+	requireMappingString(t, configure.Vars, "e2e_ssh_config", "{{ lookup('env', 'E2E_STATE_DIR') }}/ssh-config")
+	requireMappingString(t, configure.Vars, "e2e_release_images_file", "{{ lookup('env', 'E2E_STATE_DIR') }}/release-images.json")
+	if _, exists := configure.Vars["e2e_bootstrap_result"]; exists {
+		t.Fatal("controller-install play must not rely on a bootstrap-result fact from an earlier play")
+	}
+	revalidate := exactAnsibleTask(t, configure, "Revalidate immutable release artifacts before Kubernetes mutations")
+	revalidateCommand := requireTaskMapping(t, revalidate, "ansible.builtin.command")
+	requireMappingStringSequence(t, revalidateCommand, "argv", []string{
+		"/opt/e2e/scripts/verify-release-images.py",
+		"--artifact-root",
+		"{{ e2e_state_dir }}",
+		"--output",
+		"{{ e2e_release_images_file }}",
+		"--expect-environment-prefix",
+		"INSPACE_E2E_",
+	})
+	exactAnsibleTask(t, configure, "Load the independently revalidated controller image digests")
 	assertOrdered(t, playbook,
 		"Run the bootstrap reconciler synchronously to readiness",
 		"Prove exact and ordered three-control-plane provisioning",
@@ -296,7 +318,7 @@ func TestClusterE2ERendersRKE2WorkerAndCiliumKubeProxyReplacement(t *testing.T) 
 	for _, expected := range []string{
 		"rke2:",
 		"version: v1.35.6+rke2r1",
-		"server: {{ e2e_bootstrap_result.privateRegistrationEndpoint }}",
+		"server: {{ e2e_state.privateRegistrationEndpoint }}",
 		"name: inspace-rke2-agent-token",
 		"key: inspace.cloud/instance-cpu",
 		`values: ["1"]`,
@@ -423,10 +445,48 @@ func TestClusterE2ECleanupIsBoundedFailClosedAndOrdered(t *testing.T) {
 		"until: e2e_cleanup_worker_quiesced.rc == 0",
 		"Destroy only bootstrap-controller-owned infrastructure synchronously",
 		"retries: 90",
-		"until: (e2e_final_audit.stdout | from_json).count == 0",
+		"until: e2e_cleanup_owner_audit.rc == 0",
+		"until: e2e_final_audit.rc == 0",
 	} {
 		mustContain(t, "cleanup playbook", cleanup, expected)
 	}
+	cleanupPlay := exactAnsiblePlay(
+		t,
+		parseAnsiblePlays(t, cleanup),
+		"Quiesce Kubernetes owners before deleting the RKE2 control plane",
+	)
+	ownerAudit := exactAnsibleTask(t, cleanupPlay, "Wait until CCM CSI and Karpenter removed all non-control-plane cloud resources")
+	ownerAuditCommand := requireTaskMapping(t, ownerAudit, "ansible.builtin.command")
+	requireMappingStringSequence(t, ownerAuditCommand, "argv", []string{
+		"/opt/e2e/scripts/cloud-audit.py",
+		"--state",
+		"{{ e2e_state_file }}",
+		"--owner",
+		"{{ e2e_cleanup_state.owner }}",
+		"--cluster",
+		"{{ e2e_cleanup_state.clusterName }}",
+		"--nodepool",
+		"{{ e2e_cleanup_state.nodePoolName }}",
+		"--expect",
+		"bootstrap-only",
+	})
+	requireTaskScalar(t, ownerAudit, "until", "e2e_cleanup_owner_audit.rc == 0")
+	finalAudit := exactAnsibleTask(t, cleanupPlay, "Require the final deterministic cloud audit to converge to zero")
+	finalAuditCommand := requireTaskMapping(t, finalAudit, "ansible.builtin.command")
+	requireMappingStringSequence(t, finalAuditCommand, "argv", []string{
+		"/opt/e2e/scripts/cloud-audit.py",
+		"--state",
+		"{{ e2e_state_file }}",
+		"--owner",
+		"{{ e2e_cleanup_state.owner }}",
+		"--cluster",
+		"{{ e2e_cleanup_state.clusterName }}",
+		"--nodepool",
+		"{{ e2e_cleanup_state.nodePoolName }}",
+		"--expect",
+		"zero",
+	})
+	requireTaskScalar(t, finalAudit, "until", "e2e_final_audit.rc == 0")
 	assertOrdered(t, cleanup,
 		"Refuse cloud deletion while Kubernetes API reachability is uncertain",
 		"Delete workload owners before infrastructure owners",

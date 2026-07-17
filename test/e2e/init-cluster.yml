@@ -69,7 +69,6 @@
     - name: Record deterministic lifecycle facts
       ansible.builtin.set_fact:
         e2e_owner: "{{ ('inspace-e2e/' + e2e_cluster_resource_name) | hash('sha256') | truncate(16, true, '') }}"
-        e2e_ssh_public_key: "{{ lookup('file', lookup('env', 'E2E_PUBLIC_KEY')) | trim }}"
 
     - name: Check whether an RKE2 token already exists for a resumed run
       ansible.builtin.stat:
@@ -177,24 +176,24 @@
 
     - name: Load the immutable controller image digests
       ansible.builtin.set_fact:
-        e2e_release_images: "{{ lookup('file', e2e_release_images_file) | from_json }}"
+        e2e_bootstrap_release_images: "{{ lookup('file', e2e_release_images_file) | from_json }}"
 
     - name: Require the complete immutable controller image manifest
       ansible.builtin.assert:
         that:
-          - e2e_release_images.schema == 'inspace-e2e-release-artifacts-v2'
-          - e2e_release_images.version == lookup('env', 'INSPACE_E2E_VERSION')
-          - e2e_release_images.tag == 'v' + lookup('env', 'INSPACE_E2E_VERSION')
-          - e2e_release_images.revision == lookup('env', 'INSPACE_E2E_RELEASE_REVISION')
-          - "e2e_release_images.platform == {'os': 'linux', 'architecture': 'amd64'}"
-          - e2e_release_images.images.keys() | list | sort == ['inspace-cloud-controller-manager', 'inspace-csi-driver', 'karpenter-provider-inspace']
-          - e2e_release_images.images.values() | map(attribute='releaseDigest') | select('match', '^sha256:[0-9a-f]{64}$') | list | length == 3
-          - e2e_release_images.images.values() | map(attribute='platformDigest') | select('match', '^sha256:[0-9a-f]{64}$') | list | length == 3
-          - e2e_release_images.charts.keys() | list | sort == ['inspace-cloud-kube-modules', 'inspace-cloud-kube-modules-crds']
-          - e2e_release_images.charts['inspace-cloud-kube-modules-crds'].revision == lookup('env', 'INSPACE_E2E_RELEASE_REVISION')
-          - e2e_release_images.charts['inspace-cloud-kube-modules'].revision == lookup('env', 'INSPACE_E2E_RELEASE_REVISION')
-          - e2e_release_images.charts['inspace-cloud-kube-modules-crds'].sha256 == lookup('env', 'INSPACE_E2E_CRDS_CHART_DIGEST')
-          - e2e_release_images.charts['inspace-cloud-kube-modules'].sha256 == lookup('env', 'INSPACE_E2E_MODULES_CHART_DIGEST')
+          - e2e_bootstrap_release_images.schema == 'inspace-e2e-release-artifacts-v2'
+          - e2e_bootstrap_release_images.version == lookup('env', 'INSPACE_E2E_VERSION')
+          - e2e_bootstrap_release_images.tag == 'v' + lookup('env', 'INSPACE_E2E_VERSION')
+          - e2e_bootstrap_release_images.revision == lookup('env', 'INSPACE_E2E_RELEASE_REVISION')
+          - "e2e_bootstrap_release_images.platform == {'os': 'linux', 'architecture': 'amd64'}"
+          - e2e_bootstrap_release_images.images.keys() | list | sort == ['inspace-cloud-controller-manager', 'inspace-csi-driver', 'karpenter-provider-inspace']
+          - e2e_bootstrap_release_images.images.values() | map(attribute='releaseDigest') | select('match', '^sha256:[0-9a-f]{64}$') | list | length == 3
+          - e2e_bootstrap_release_images.images.values() | map(attribute='platformDigest') | select('match', '^sha256:[0-9a-f]{64}$') | list | length == 3
+          - e2e_bootstrap_release_images.charts.keys() | list | sort == ['inspace-cloud-kube-modules', 'inspace-cloud-kube-modules-crds']
+          - e2e_bootstrap_release_images.charts['inspace-cloud-kube-modules-crds'].revision == lookup('env', 'INSPACE_E2E_RELEASE_REVISION')
+          - e2e_bootstrap_release_images.charts['inspace-cloud-kube-modules'].revision == lookup('env', 'INSPACE_E2E_RELEASE_REVISION')
+          - e2e_bootstrap_release_images.charts['inspace-cloud-kube-modules-crds'].sha256 == lookup('env', 'INSPACE_E2E_CRDS_CHART_DIGEST')
+          - e2e_bootstrap_release_images.charts['inspace-cloud-kube-modules'].sha256 == lookup('env', 'INSPACE_E2E_MODULES_CHART_DIGEST')
     - name: Inspect the pinned kube-vip release before infrastructure creation
       ansible.builtin.command:
         argv:
@@ -351,9 +350,9 @@
         INSPACE_BOOTSTRAP_CACHE_NOT_BEFORE: "{{ lookup('file', e2e_bootstrap_cache_not_before_file) | trim }}"
         INSPACE_BOOTSTRAP_CACHE_IMAGE_DIGESTS: >-
           {{ {
-            'inspace-cloud-controller-manager': e2e_release_images.images['inspace-cloud-controller-manager'].platformDigest,
-            'inspace-csi-driver': e2e_release_images.images['inspace-csi-driver'].platformDigest,
-            'karpenter-provider-inspace': e2e_release_images.images['karpenter-provider-inspace'].platformDigest
+            'inspace-cloud-controller-manager': e2e_bootstrap_release_images.images['inspace-cloud-controller-manager'].platformDigest,
+            'inspace-csi-driver': e2e_bootstrap_release_images.images['inspace-csi-driver'].platformDigest,
+            'karpenter-provider-inspace': e2e_bootstrap_release_images.images['karpenter-provider-inspace'].platformDigest
           } | to_json }}
       register: e2e_bootstrap_wait
       changed_when: true
@@ -361,18 +360,18 @@
 
     - name: Decode the final reconciler result
       ansible.builtin.set_fact:
-        e2e_bootstrap_result: >-
+        e2e_provision_result: >-
           {{ (e2e_bootstrap_wait.stdout_lines | select('match', '^\{') | list | last) | from_json }}
 
     - name: Persist the reconciler result for authoritative cloud binding
       ansible.builtin.copy:
-        content: "{{ e2e_bootstrap_result | to_nice_json }}\n"
+        content: "{{ e2e_provision_result | to_nice_json }}\n"
         dest: "{{ e2e_bootstrap_result_file }}"
         mode: "0600"
 
     - name: Persist the public bootstrap cache CA for certificate verification
       ansible.builtin.copy:
-        content: "{{ e2e_bootstrap_result.bootstrapCacheCABundle }}"
+        content: "{{ e2e_provision_result.bootstrapCacheCABundle }}"
         dest: "{{ e2e_bootstrap_cache_ca_file }}"
         mode: "0600"
 
@@ -409,25 +408,25 @@
     - name: Prove exact and ordered three-control-plane provisioning
       ansible.builtin.assert:
         that:
-          - e2e_bootstrap_result.ready | bool
-          - e2e_bootstrap_result.controlPlaneVMs | length == 3
-          - e2e_bootstrap_result.controlPlaneVMs | unique | length == 3
-          - e2e_bootstrap_result.maxParallelControlPlaneCreates | int == 1
-          - e2e_bootstrap_result.controlPlaneEndpoint == 'https://' + e2e_virtual_ip + ':6443'
-          - e2e_bootstrap_result.privateControlPlaneEndpoint == 'https://' + e2e_virtual_ip + ':6443'
-          - e2e_bootstrap_result.privateRegistrationEndpoint == 'https://' + e2e_virtual_ip + ':9345'
-          - e2e_bootstrap_result.bastionVMUUID | length > 0
-          - e2e_bootstrap_result.bastionFirewallUUID | length > 0
-          - e2e_bootstrap_result.bastionPublicIPv4 | length > 0
-          - e2e_bootstrap_result.bastionPrivateIPv4 | length > 0
-          - e2e_bootstrap_result.bootstrapCacheEndpoint == 'https://cache.' + e2e_cluster_name + '.inspace.internal:8443'
-          - e2e_bootstrap_result.bootstrapCacheRegistry == 'cache.' + e2e_cluster_name + '.inspace.internal:8443'
-          - e2e_bootstrap_result.bootstrapCacheAddress == e2e_bootstrap_result.bastionPrivateIPv4
-          - e2e_bootstrap_result.bootstrapCacheCABundle is match('^-----BEGIN CERTIFICATE-----\n')
-          - e2e_bootstrap_result.bootstrapCacheCABundle is search('-----END CERTIFICATE-----\n$')
-          - e2e_bootstrap_result.apiLoadBalancerUUID is not defined
-          - e2e_bootstrap_result.registrationLoadBalancerUUID is not defined
-          - e2e_bootstrap_result.allocatedEndpointIPv4 is not defined
+          - e2e_provision_result.ready | bool
+          - e2e_provision_result.controlPlaneVMs | length == 3
+          - e2e_provision_result.controlPlaneVMs | unique | length == 3
+          - e2e_provision_result.maxParallelControlPlaneCreates | int == 1
+          - e2e_provision_result.controlPlaneEndpoint == 'https://' + e2e_virtual_ip + ':6443'
+          - e2e_provision_result.privateControlPlaneEndpoint == 'https://' + e2e_virtual_ip + ':6443'
+          - e2e_provision_result.privateRegistrationEndpoint == 'https://' + e2e_virtual_ip + ':9345'
+          - e2e_provision_result.bastionVMUUID | length > 0
+          - e2e_provision_result.bastionFirewallUUID | length > 0
+          - e2e_provision_result.bastionPublicIPv4 | length > 0
+          - e2e_provision_result.bastionPrivateIPv4 | length > 0
+          - e2e_provision_result.bootstrapCacheEndpoint == 'https://cache.' + e2e_cluster_name + '.inspace.internal:8443'
+          - e2e_provision_result.bootstrapCacheRegistry == 'cache.' + e2e_cluster_name + '.inspace.internal:8443'
+          - e2e_provision_result.bootstrapCacheAddress == e2e_provision_result.bastionPrivateIPv4
+          - e2e_provision_result.bootstrapCacheCABundle is match('^-----BEGIN CERTIFICATE-----\n')
+          - e2e_provision_result.bootstrapCacheCABundle is search('-----END CERTIFICATE-----\n$')
+          - e2e_provision_result.apiLoadBalancerUUID is not defined
+          - e2e_provision_result.registrationLoadBalancerUUID is not defined
+          - e2e_provision_result.allocatedEndpointIPv4 is not defined
         fail_msg: "Bootstrap did not prove three fixed RKE2 control planes with one-at-a-time protected creation"
 
     - name: Bind the result to exact VPC VMs egress FIPs firewalls and zero control NLBs
@@ -444,16 +443,16 @@
 
     - name: Reload the exact private bootstrap topology
       ansible.builtin.set_fact:
-        e2e_state: "{{ lookup('file', e2e_state_file) | from_json }}"
+        e2e_provision_state: "{{ lookup('file', e2e_state_file) | from_json }}"
 
     - name: Bind the ordered-create contract to the authoritative three VM identities
       ansible.builtin.assert:
         that:
-          - e2e_state.controlPlanes | length == 3
-          - e2e_state.controlPlanes | map(attribute='uuid') | list | unique | length == 3
-          - e2e_state.controlPlanes | map(attribute='uuid') | list | difference(e2e_bootstrap_result.controlPlaneVMs) | length == 0
-          - e2e_bootstrap_result.controlPlaneVMs | difference(e2e_state.controlPlanes | map(attribute='uuid') | list) | length == 0
-          - e2e_bootstrap_result.maxParallelControlPlaneCreates | int == 1
+          - e2e_provision_state.controlPlanes | length == 3
+          - e2e_provision_state.controlPlanes | map(attribute='uuid') | list | unique | length == 3
+          - e2e_provision_state.controlPlanes | map(attribute='uuid') | list | difference(e2e_provision_result.controlPlaneVMs) | length == 0
+          - e2e_provision_result.controlPlaneVMs | difference(e2e_provision_state.controlPlanes | map(attribute='uuid') | list) | length == 0
+          - e2e_provision_result.maxParallelControlPlaneCreates | int == 1
         fail_msg: "The ordered-create result is not the authoritative three-control-plane VM set"
 
     - name: Render the pinned bastion and private-node SSH configuration
@@ -473,13 +472,14 @@
         ansible_host: e2e-bastion
         ansible_user: "{{ e2e_ssh_user }}"
         ansible_ssh_common_args: "-F {{ e2e_ssh_config }}"
-        e2e_public_ip: "{{ e2e_state.bastionPublicIPv4 }}"
-        e2e_private_ip: "{{ e2e_state.bastionPrivateIPv4 }}"
-        e2e_node_name: "{{ e2e_state.bastionName }}"
-        e2e_cache_address: "{{ e2e_state.bootstrapCacheAddress }}"
-        e2e_cache_endpoint: "{{ e2e_state.bootstrapCacheEndpoint }}"
-        e2e_cache_registry: "{{ e2e_state.bootstrapCacheRegistry }}"
-        e2e_cache_ca_bundle: "{{ e2e_state.bootstrapCacheCABundle }}"
+        e2e_public_ip: "{{ e2e_provision_state.bastionPublicIPv4 }}"
+        e2e_private_ip: "{{ e2e_provision_state.bastionPrivateIPv4 }}"
+        e2e_node_name: "{{ e2e_provision_state.bastionName }}"
+        e2e_cache_address: "{{ e2e_provision_state.bootstrapCacheAddress }}"
+        e2e_cache_endpoint: "{{ e2e_provision_state.bootstrapCacheEndpoint }}"
+        e2e_cache_registry: "{{ e2e_provision_state.bootstrapCacheRegistry }}"
+        e2e_cache_ca_bundle: "{{ e2e_provision_state.bootstrapCacheCABundle }}"
+        e2e_cache_release_images: "{{ e2e_bootstrap_release_images }}"
 
     - name: Add exactly three dynamic RKE2 control-plane hosts
       ansible.builtin.add_host:
@@ -493,11 +493,11 @@
         e2e_private_ip: "{{ item.privateIPv4 }}"
         e2e_public_ip: "{{ item.publicIPv4 }}"
         e2e_known_hosts: "{{ e2e_state_dir }}/known-hosts-cp-{{ e2e_cp_index }}"
-        e2e_cache_address: "{{ e2e_state.bootstrapCacheAddress }}"
-        e2e_cache_endpoint: "{{ e2e_state.bootstrapCacheEndpoint }}"
-        e2e_cache_registry: "{{ e2e_state.bootstrapCacheRegistry }}"
-        e2e_cache_ca_bundle: "{{ e2e_state.bootstrapCacheCABundle }}"
-      loop: "{{ e2e_state.controlPlanes }}"
+        e2e_cache_address: "{{ e2e_provision_state.bootstrapCacheAddress }}"
+        e2e_cache_endpoint: "{{ e2e_provision_state.bootstrapCacheEndpoint }}"
+        e2e_cache_registry: "{{ e2e_provision_state.bootstrapCacheRegistry }}"
+        e2e_cache_ca_bundle: "{{ e2e_provision_state.bootstrapCacheCABundle }}"
+      loop: "{{ e2e_provision_state.controlPlanes }}"
       loop_control:
         index_var: e2e_cp_index
         label: "{{ item.uuid }}"
@@ -508,14 +508,12 @@
           - /opt/e2e/scripts/state-update.py
           - "{{ e2e_state_file }}"
           - maxParallelControlPlaneCreates
-          - "{{ e2e_bootstrap_result.maxParallelControlPlaneCreates | int | string }}"
+          - "{{ e2e_provision_result.maxParallelControlPlaneCreates | int | string }}"
       changed_when: true
 
 - name: Establish the pinned public bastion
   hosts: rke2_bastion
   gather_facts: false
-  vars:
-    e2e_release_images: "{{ hostvars['localhost']['e2e_release_images'] }}"
   tasks:
     - name: Prove the bastion FIP answers ICMP from the management client
       ansible.builtin.command:
@@ -676,15 +674,15 @@
         verify_product_digest \
           thanet-s/inspace-cloud-controller-manager \
           {{ lookup('env', 'INSPACE_E2E_VERSION') | quote }} \
-          {{ e2e_release_images.images['inspace-cloud-controller-manager'].platformDigest | quote }}
+          {{ e2e_cache_release_images.images['inspace-cloud-controller-manager'].platformDigest | quote }}
         verify_product_digest \
           thanet-s/inspace-csi-driver \
           {{ lookup('env', 'INSPACE_E2E_VERSION') | quote }} \
-          {{ e2e_release_images.images['inspace-csi-driver'].platformDigest | quote }}
+          {{ e2e_cache_release_images.images['inspace-csi-driver'].platformDigest | quote }}
         verify_product_digest \
           thanet-s/karpenter-provider-inspace \
           {{ lookup('env', 'INSPACE_E2E_VERSION') | quote }} \
-          {{ e2e_release_images.images['karpenter-provider-inspace'].platformDigest | quote }}
+          {{ e2e_cache_release_images.images['karpenter-provider-inspace'].platformDigest | quote }}
         image_count=0
         while IFS="$(printf '\t')" read -r _ target; do
           test -n "$target" || continue
@@ -1154,7 +1152,9 @@
   vars:
     e2e_state_dir: "{{ lookup('env', 'E2E_STATE_DIR') }}"
     e2e_state_file: "{{ lookup('env', 'E2E_STATE_DIR') }}/state.json"
+    e2e_release_images_file: "{{ lookup('env', 'E2E_STATE_DIR') }}/release-images.json"
     e2e_kubeconfig: "{{ lookup('env', 'E2E_STATE_DIR') }}/kubeconfig.yaml"
+    e2e_ssh_config: "{{ lookup('env', 'E2E_STATE_DIR') }}/ssh-config"
     e2e_cluster_name: "inspace-e2e-{{ lookup('env', 'E2E_RUN_ID') }}"
     e2e_nodeclass_name: "inspace-e2e-workers-{{ lookup('env', 'E2E_RUN_ID') }}"
     e2e_nodepool_name: "general"
@@ -1162,9 +1162,6 @@
     e2e_ssh_user: "{{ lookup('env', 'INSPACE_E2E_SSH_USERNAME') | default('inspacee2e', true) }}"
     e2e_ssh_public_key: "{{ lookup('file', lookup('env', 'E2E_PUBLIC_KEY')) | trim }}"
     e2e_state: "{{ lookup('file', lookup('env', 'E2E_STATE_DIR') + '/state.json') | from_json }}"
-    e2e_bootstrap_result:
-      firewallUUID: "{{ e2e_state.firewallUUID }}"
-      privateRegistrationEndpoint: "{{ e2e_state.privateRegistrationEndpoint }}"
   environment:
     KUBECONFIG: "{{ e2e_kubeconfig }}"
   tasks:
@@ -1179,6 +1176,22 @@
         that:
           - groups['rke2_control_plane'] | length == 3
           - e2e_readiness_files.results | selectattr('stat.exists') | list | length == 3
+
+    - name: Revalidate immutable release artifacts before Kubernetes mutations
+      ansible.builtin.command:
+        argv:
+          - /opt/e2e/scripts/verify-release-images.py
+          - --artifact-root
+          - "{{ e2e_state_dir }}"
+          - --output
+          - "{{ e2e_release_images_file }}"
+          - --expect-environment-prefix
+          - INSPACE_E2E_
+      changed_when: false
+
+    - name: Load the independently revalidated controller image digests
+      ansible.builtin.set_fact:
+        e2e_install_release_images: "{{ lookup('file', e2e_release_images_file) | from_json }}"
 
     - name: Require private API and registration VIP reachability from the VPC bastion
       ansible.builtin.command:
@@ -1624,7 +1637,7 @@
           - upgrade
           - --install
           - inspace-crds
-          - "{{ e2e_state_dir }}/{{ e2e_release_images.charts['inspace-cloud-kube-modules-crds'].relativePath }}"
+          - "{{ e2e_state_dir }}/{{ e2e_install_release_images.charts['inspace-cloud-kube-modules-crds'].relativePath }}"
           - --namespace
           - kube-system
           - --wait
@@ -1639,7 +1652,7 @@
           - upgrade
           - --install
           - inspace
-          - "{{ e2e_state_dir }}/{{ e2e_release_images.charts['inspace-cloud-kube-modules'].relativePath }}"
+          - "{{ e2e_state_dir }}/{{ e2e_install_release_images.charts['inspace-cloud-kube-modules'].relativePath }}"
           - --namespace
           - kube-system
           - --wait
@@ -1668,11 +1681,11 @@
           - --set
           - "karpenter.defaultNodeClass={{ e2e_nodeclass_name }}"
           - --set-string
-          - "ccm.image.digest={{ e2e_release_images.images['inspace-cloud-controller-manager'].platformDigest }}"
+          - "ccm.image.digest={{ e2e_install_release_images.images['inspace-cloud-controller-manager'].platformDigest }}"
           - --set-string
-          - "csi.image.digest={{ e2e_release_images.images['inspace-csi-driver'].platformDigest }}"
+          - "csi.image.digest={{ e2e_install_release_images.images['inspace-csi-driver'].platformDigest }}"
           - --set-string
-          - "karpenter.image.digest={{ e2e_release_images.images['karpenter-provider-inspace'].platformDigest }}"
+          - "karpenter.image.digest={{ e2e_install_release_images.images['karpenter-provider-inspace'].platformDigest }}"
       changed_when: true
 
     - name: Wait for all released controller workloads
@@ -1690,9 +1703,9 @@
         set -euo pipefail
         version={{ lookup('env', 'INSPACE_E2E_VERSION') | quote }}
         registry={{ e2e_state.bootstrapCacheRegistry | quote }}
-        ccm_digest={{ e2e_release_images.images['inspace-cloud-controller-manager'].platformDigest | quote }}
-        csi_digest={{ e2e_release_images.images['inspace-csi-driver'].platformDigest | quote }}
-        karpenter_digest={{ e2e_release_images.images['karpenter-provider-inspace'].platformDigest | quote }}
+        ccm_digest={{ e2e_install_release_images.images['inspace-cloud-controller-manager'].platformDigest | quote }}
+        csi_digest={{ e2e_install_release_images.images['inspace-csi-driver'].platformDigest | quote }}
+        karpenter_digest={{ e2e_install_release_images.images['karpenter-provider-inspace'].platformDigest | quote }}
         test "$(helm -n kube-system get values inspace -o json | jq -r '.global.inspace.systemImageRegistry')" = "$registry"
         test "$(kubectl -n kube-system get deployment/inspace-ccm -o json | jq -r '.spec.template.spec.containers[] | select(.name=="cloud-controller-manager") | .image')" = \
           "$registry/thanet-s/inspace-cloud-controller-manager@$ccm_digest"

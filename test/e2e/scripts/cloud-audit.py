@@ -7,6 +7,7 @@ import json
 import os
 import pathlib
 import re
+import sys
 import time
 import urllib.parse
 import uuid
@@ -479,12 +480,161 @@ def persist_audit_identities(
     )
 
 
-def main() -> None:
+def _valid_expectation_result(result: object) -> bool:
+    if not isinstance(result, dict):
+        return False
+    resource_keys = ("vms", "firewalls", "floatingIPs", "loadBalancers", "disks")
+    if any(not isinstance(result.get(key), list) for key in resource_keys):
+        return False
+    count = result.get("count")
+    strict_read_count = result.get("strictReadCount")
+    return (
+        isinstance(count, int)
+        and not isinstance(count, bool)
+        and count == sum(len(result[key]) for key in resource_keys)
+        and isinstance(strict_read_count, int)
+        and not isinstance(strict_read_count, bool)
+        and strict_read_count >= 3
+        and all(
+            isinstance(item, dict)
+            for key in resource_keys
+            for item in result[key]
+        )
+    )
+
+
+def expectation_converged(
+    result: object,
+    expectation: str,
+    *,
+    state: dict,
+    owner: str,
+    cluster: str,
+) -> bool:
+    """Return whether one stable audit satisfies a cleanup retry target."""
+    if not _valid_expectation_result(result):
+        return False
+    assert isinstance(result, dict)
+    if expectation == "zero":
+        return result["count"] == 0
+    if expectation != "bootstrap-only":
+        raise ValueError(f"unknown cloud audit expectation: {expectation}")
+
+    resource_name = state.get("clusterResourceName", cluster)
+    if (
+        not isinstance(resource_name, str)
+        or not resource_name
+        or not isinstance(owner, str)
+        or not owner
+    ):
+        return False
+
+    def exactly_one_per_role(
+        items: list[dict], roles: tuple[set[str], ...]
+    ) -> bool:
+        names = [item.get("name") for item in items]
+        return (
+            len(names) == len(roles)
+            and all(isinstance(name, str) and name for name in names)
+            and all(
+                sum(name in alternatives for name in names) == 1
+                for alternatives in roles
+            )
+        )
+
+    vm_roles = (
+        *(
+            {f"{resource_name}-cp{slot}", f"rke2-{owner}-cp-{slot}"}
+            for slot in range(3)
+        ),
+        {f"{resource_name}-bastion", f"rke2-{owner}-bastion"},
+    )
+    floating_ip_roles = (
+        *(
+            {
+                f"{resource_name}-cp{slot}-ip",
+                f"rke2-{owner}-cp-{slot}-ip",
+            }
+            for slot in range(3)
+        ),
+        {
+            f"{resource_name}-bastion-ip",
+            f"rke2-{owner}-bastion-ip",
+        },
+    )
+    firewall_roles = (
+        {
+            f"{resource_name}-nodes-{owner}",
+            f"rke2-{owner}-nodes",
+            f"k3s-{owner}-nodes",
+        },
+        {
+            f"{resource_name}-bastion-{owner}",
+            f"rke2-{owner}-bastion",
+        },
+    )
+    return (
+        result["disks"] == []
+        and result["loadBalancers"] == []
+        and all(
+            isinstance(item.get("uuid"), str) and bool(item["uuid"])
+            for item in result["vms"]
+        )
+        and all(
+            isinstance(item.get("address"), str) and bool(item["address"])
+            for item in result["floatingIPs"]
+        )
+        and all(
+            isinstance(item.get("uuid"), str) and bool(item["uuid"])
+            for item in result["firewalls"]
+        )
+        and exactly_one_per_role(result["vms"], vm_roles)
+        and exactly_one_per_role(result["floatingIPs"], floating_ip_roles)
+        and exactly_one_per_role(result["firewalls"], firewall_roles)
+    )
+
+
+def emit_audit_result(
+    result: dict,
+    expectation: str | None,
+    *,
+    state: dict,
+    owner: str,
+    cluster: str,
+) -> int:
+    """Print the canonical audit record and encode convergence in the status."""
+    print(json.dumps(result, sort_keys=True))
+    if expectation is None:
+        return 0
+    if expectation_converged(
+        result,
+        expectation,
+        state=state,
+        owner=owner,
+        cluster=cluster,
+    ):
+        return 0
+    print(
+        f"cloud audit has not converged to expectation {expectation!r}",
+        file=sys.stderr,
+    )
+    return 1
+
+
+def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--state", required=True)
     parser.add_argument("--owner", required=True)
     parser.add_argument("--cluster", required=True)
     parser.add_argument("--nodepool", required=True)
+    parser.add_argument(
+        "--expect",
+        choices=("bootstrap-only", "zero"),
+        help=(
+            "return status 1 until the stable audit contains only bootstrap "
+            "resources or no owned resources; JSON is always written to stdout"
+        ),
+    )
     args = parser.parse_args()
 
     state_path = pathlib.Path(args.state)
@@ -510,8 +660,14 @@ def main() -> None:
         result,
         allow_missing_state=allow_missing_state,
     )
-    print(json.dumps(result, sort_keys=True))
+    return emit_audit_result(
+        result,
+        args.expect,
+        state=state,
+        owner=args.owner,
+        cluster=args.cluster,
+    )
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
