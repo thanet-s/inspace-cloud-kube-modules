@@ -1007,7 +1007,7 @@ func TestMutationSuccessResponseShapeAndStatusAreFailClosed(t *testing.T) {
 		}
 	}
 
-	for _, status := range []int{http.StatusOK, http.StatusAccepted, http.StatusNoContent, http.StatusPartialContent} {
+	for _, status := range []int{http.StatusAccepted, http.StatusNoContent, http.StatusPartialContent} {
 		t.Run("object/"+http.StatusText(status), func(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 				w.WriteHeader(status)
@@ -1064,9 +1064,10 @@ func TestMutationSuccessResponseShapeAndStatusAreFailClosed(t *testing.T) {
 
 func TestDeleteEndpointsRequireTheirDocumentedSuccessStatus(t *testing.T) {
 	tests := []struct {
-		name    string
-		allowed []int
-		call    func(context.Context, *inspace.Client) error
+		name         string
+		allowed      []int
+		acceptedBody string
+		call         func(context.Context, *inspace.Client) error
 	}{
 		{name: "DeleteVM", allowed: []int{http.StatusOK, http.StatusNoContent}, call: func(ctx context.Context, client *inspace.Client) error {
 			return client.DeleteVM(ctx, "bkk01", vmUUID)
@@ -1074,13 +1075,13 @@ func TestDeleteEndpointsRequireTheirDocumentedSuccessStatus(t *testing.T) {
 		{name: "DeleteDisk", allowed: []int{http.StatusNoContent}, call: func(ctx context.Context, client *inspace.Client) error {
 			return client.DeleteDisk(ctx, "bkk01", diskUUID)
 		}},
-		{name: "DeleteFloatingIP", allowed: []int{http.StatusOK}, call: func(ctx context.Context, client *inspace.Client) error {
+		{name: "DeleteFloatingIP", allowed: []int{http.StatusOK}, acceptedBody: "true", call: func(ctx context.Context, client *inspace.Client) error {
 			return client.DeleteFloatingIP(ctx, "bkk01", floatingIP)
 		}},
 		{name: "DeleteFirewall", allowed: []int{http.StatusNoContent}, call: func(ctx context.Context, client *inspace.Client) error {
 			return client.DeleteFirewall(ctx, "bkk01", firewallUUID)
 		}},
-		{name: "UnassignFirewallFromVM", allowed: []int{http.StatusNoContent}, call: func(ctx context.Context, client *inspace.Client) error {
+		{name: "UnassignFirewallFromVM", allowed: []int{http.StatusOK, http.StatusNoContent}, call: func(ctx context.Context, client *inspace.Client) error {
 			return client.UnassignFirewallFromVM(ctx, "bkk01", firewallUUID, vmUUID)
 		}},
 		{name: "DeleteLoadBalancer", allowed: []int{http.StatusOK}, call: func(ctx context.Context, client *inspace.Client) error {
@@ -1098,6 +1099,7 @@ func TestDeleteEndpointsRequireTheirDocumentedSuccessStatus(t *testing.T) {
 			t.Run(test.name+"/accepted-"+strconv.Itoa(allowed), func(t *testing.T) {
 				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 					w.WriteHeader(allowed)
+					_, _ = io.WriteString(w, test.acceptedBody)
 				}))
 				t.Cleanup(server.Close)
 				client, err := inspace.NewClient(inspace.Options{BaseURL: server.URL, APIKey: "test-key"})
@@ -1142,6 +1144,244 @@ func TestLoadBalancerChildDelete204DoesNotBroadenParentDelete(t *testing.T) {
 	var apiErr *inspace.APIError
 	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusNoContent {
 		t.Fatalf("DeleteLoadBalancer() HTTP 204 error = %#v, want typed rejection", err)
+	}
+}
+
+func TestDeleteFloatingIPRequiresExactLiveJSONTrueReceipt(t *testing.T) {
+	tests := []struct {
+		name          string
+		status        int
+		body          string
+		wantErr       bool
+		wantMalformed bool
+	}{
+		{name: "live exact true", status: http.StatusOK, body: "true"},
+		{name: "empty", status: http.StatusOK, wantErr: true, wantMalformed: true},
+		{name: "false", status: http.StatusOK, body: "false", wantErr: true, wantMalformed: true},
+		{name: "null", status: http.StatusOK, body: "null", wantErr: true, wantMalformed: true},
+		{name: "number", status: http.StatusOK, body: "1", wantErr: true, wantMalformed: true},
+		{name: "string", status: http.StatusOK, body: `"true"`, wantErr: true, wantMalformed: true},
+		{name: "object", status: http.StatusOK, body: `{"success":true}`, wantErr: true, wantMalformed: true},
+		{name: "duplicate object keys", status: http.StatusOK, body: `{"success":true,"success":true}`, wantErr: true, wantMalformed: true},
+		{name: "array", status: http.StatusOK, body: `[true]`, wantErr: true, wantMalformed: true},
+		{name: "malformed", status: http.StatusOK, body: "tru", wantErr: true, wantMalformed: true},
+		{name: "trailing object", status: http.StatusOK, body: `true{}`, wantErr: true, wantMalformed: true},
+		{name: "second value", status: http.StatusOK, body: `true true`, wantErr: true, wantMalformed: true},
+		{name: "leading whitespace", status: http.StatusOK, body: " true", wantErr: true, wantMalformed: true},
+		{name: "trailing newline", status: http.StatusOK, body: "true\n", wantErr: true, wantMalformed: true},
+		{name: "201", status: http.StatusCreated, body: "true", wantErr: true},
+		{name: "202", status: http.StatusAccepted, body: "true", wantErr: true},
+		{name: "204", status: http.StatusNoContent, wantErr: true},
+		{name: "206", status: http.StatusPartialContent, body: "true", wantErr: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			transport := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				resp := response(req, test.body)
+				resp.StatusCode = test.status
+				resp.Header.Set("Content-Type", "application/json")
+				return resp, nil
+			})
+			client, err := inspace.NewClient(inspace.Options{
+				BaseURL:                   "https://api.example.invalid",
+				APIKey:                    "test-key",
+				HTTPClient:                &http.Client{Transport: transport},
+				DangerouslyAllowMutations: true,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = client.DeleteFloatingIP(context.Background(), "bkk01", floatingIP)
+			if !test.wantErr {
+				if err != nil {
+					t.Fatalf("DeleteFloatingIP() rejected live receipt: %v", err)
+				}
+				return
+			}
+			var apiErr *inspace.APIError
+			if !errors.As(err, &apiErr) || apiErr.StatusCode != test.status {
+				t.Fatalf("DeleteFloatingIP() error = %#v, want typed HTTP %d rejection", err, test.status)
+			}
+			if apiErr.ResponseBodyMalformed != test.wantMalformed {
+				t.Fatalf("DeleteFloatingIP() malformed = %t, want %t: %v", apiErr.ResponseBodyMalformed, test.wantMalformed, err)
+			}
+		})
+	}
+}
+
+func TestFirewallVMUnassignAcceptsOnlyEmpty200Or204(t *testing.T) {
+	tests := []struct {
+		name          string
+		status        int
+		body          string
+		wantErr       bool
+		wantMalformed bool
+	}{
+		{name: "live empty 200", status: http.StatusOK},
+		{name: "documented empty 204", status: http.StatusNoContent},
+		{name: "200 whitespace", status: http.StatusOK, body: " ", wantErr: true, wantMalformed: true},
+		{name: "200 newline", status: http.StatusOK, body: "\n", wantErr: true, wantMalformed: true},
+		{name: "200 true", status: http.StatusOK, body: "true", wantErr: true, wantMalformed: true},
+		{name: "200 object", status: http.StatusOK, body: `{}`, wantErr: true, wantMalformed: true},
+		{name: "204 true", status: http.StatusNoContent, body: "true", wantErr: true, wantMalformed: true},
+		{name: "201 empty", status: http.StatusCreated, wantErr: true},
+		{name: "202 empty", status: http.StatusAccepted, wantErr: true},
+		{name: "206 empty", status: http.StatusPartialContent, wantErr: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			transport := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				resp := response(req, test.body)
+				resp.StatusCode = test.status
+				resp.Header.Set("Content-Type", "text/plain")
+				return resp, nil
+			})
+			client, err := inspace.NewClient(inspace.Options{
+				BaseURL:                   "https://api.example.invalid",
+				APIKey:                    "test-key",
+				HTTPClient:                &http.Client{Transport: transport},
+				DangerouslyAllowMutations: true,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = client.UnassignFirewallFromVM(context.Background(), "bkk01", firewallUUID, vmUUID)
+			if !test.wantErr {
+				if err != nil {
+					t.Fatalf("UnassignFirewallFromVM() rejected allowed response: %v", err)
+				}
+				return
+			}
+			var apiErr *inspace.APIError
+			if !errors.As(err, &apiErr) || apiErr.StatusCode != test.status {
+				t.Fatalf("UnassignFirewallFromVM() error = %#v, want typed HTTP %d rejection", err, test.status)
+			}
+			if apiErr.ResponseBodyMalformed != test.wantMalformed {
+				t.Fatalf("UnassignFirewallFromVM() malformed = %t, want %t: %v", apiErr.ResponseBodyMalformed, test.wantMalformed, err)
+			}
+		})
+	}
+}
+
+func TestLiveDeleteResponseContractsRemainRouteIsolated(t *testing.T) {
+	t.Run("relationship 200 does not broaden parent firewall delete", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		}))
+		t.Cleanup(server.Close)
+		client, err := inspace.NewClient(inspace.Options{BaseURL: server.URL, APIKey: "test-key"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = client.DeleteFirewall(context.Background(), "bkk01", firewallUUID)
+		var apiErr *inspace.APIError
+		if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusOK {
+			t.Fatalf("DeleteFirewall() HTTP 200 error = %#v, want typed status rejection", err)
+		}
+	})
+
+	t.Run("floating IP true receipt does not broaden parent NLB delete", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, "true")
+		}))
+		t.Cleanup(server.Close)
+		client, err := inspace.NewClient(inspace.Options{BaseURL: server.URL, APIKey: "test-key"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = client.DeleteLoadBalancer(context.Background(), "bkk01", lbUUID)
+		if err == nil || !strings.Contains(err.Error(), "expected an empty success body") {
+			t.Fatalf("DeleteLoadBalancer() accepted floating-IP receipt: %v", err)
+		}
+	})
+}
+
+func TestLiveVMAndFirewallCreateAcceptOnly200Or201JSON(t *testing.T) {
+	port := int32(443)
+	firewallRule := inspace.FirewallRule{
+		Protocol: "tcp", Direction: "inbound", PortStart: &port, PortEnd: &port, EndpointSpecType: "any",
+	}
+	calls := []struct {
+		name string
+		body string
+		call func(context.Context, *inspace.Client) error
+	}{
+		{
+			name: "VM",
+			body: `{"uuid":"` + vmUUID + `"}`,
+			call: func(ctx context.Context, client *inspace.Client) error {
+				_, err := client.CreateVM(ctx, "bkk01", inspace.CreateVMRequest{
+					Name: "worker", OSName: "ubuntu", OSVersion: "24.04", DiskGiB: 40, VCPU: 2, MemoryMiB: 4096,
+				})
+				return err
+			},
+		},
+		{
+			name: "firewall",
+			body: `{"uuid":"` + firewallUUID + `"}`,
+			call: func(ctx context.Context, client *inspace.Client) error {
+				_, err := client.CreateFirewall(ctx, "bkk01", inspace.CreateFirewallRequest{
+					DisplayName: "owned", Rules: []inspace.FirewallRule{firewallRule},
+				})
+				return err
+			},
+		},
+	}
+	statuses := []struct {
+		status  int
+		wantErr bool
+	}{
+		{status: http.StatusOK},
+		{status: http.StatusCreated},
+		{status: http.StatusAccepted, wantErr: true},
+		{status: http.StatusNoContent, wantErr: true},
+		{status: http.StatusPartialContent, wantErr: true},
+	}
+	for _, call := range calls {
+		for _, status := range statuses {
+			t.Run(call.name+"/"+strconv.Itoa(status.status), func(t *testing.T) {
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(status.status)
+					_, _ = io.WriteString(w, call.body)
+				}))
+				t.Cleanup(server.Close)
+				client, err := inspace.NewClient(inspace.Options{BaseURL: server.URL, APIKey: "test-key"})
+				if err != nil {
+					t.Fatal(err)
+				}
+				err = call.call(context.Background(), client)
+				if !status.wantErr {
+					if err != nil {
+						t.Fatalf("%s create rejected HTTP %d: %v", call.name, status.status, err)
+					}
+					return
+				}
+				var apiErr *inspace.APIError
+				if !errors.As(err, &apiErr) || apiErr.StatusCode != status.status {
+					t.Fatalf("%s create HTTP %d error = %#v, want typed status rejection", call.name, status.status, err)
+				}
+			})
+		}
+
+		for _, malformed := range []string{"", "null", "{}", `{"uuid":"` + vmUUID + `"}{}`, `{"uuid":"` + vmUUID + `","uuid":"` + vmUUID + `"}`} {
+			t.Run(call.name+"/HTTP-200-body-"+malformed, func(t *testing.T) {
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusOK)
+					_, _ = io.WriteString(w, malformed)
+				}))
+				t.Cleanup(server.Close)
+				client, err := inspace.NewClient(inspace.Options{BaseURL: server.URL, APIKey: "test-key"})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := call.call(context.Background(), client); err == nil {
+					t.Fatalf("%s create accepted malformed HTTP 200 JSON %q", call.name, malformed)
+				}
+			})
+		}
 	}
 }
 
@@ -1315,29 +1555,27 @@ func TestEveryMutationEndpointRejectsUndocumentedSuccessStatuses(t *testing.T) {
 
 func TestBodylessMutationEndpointsRejectNonEmptySuccessBodies(t *testing.T) {
 	tests := []struct {
-		name   string
-		status int
-		call   func(context.Context, *inspace.Client) error
+		name      string
+		status    int
+		wantError string
+		call      func(context.Context, *inspace.Client) error
 	}{
-		{name: "DeleteDisk", status: http.StatusNoContent, call: func(ctx context.Context, client *inspace.Client) error {
+		{name: "DeleteDisk", status: http.StatusNoContent, wantError: "expected an empty success body", call: func(ctx context.Context, client *inspace.Client) error {
 			return client.DeleteDisk(ctx, "bkk01", diskUUID)
 		}},
-		{name: "DeleteFloatingIP", status: http.StatusOK, call: func(ctx context.Context, client *inspace.Client) error {
-			return client.DeleteFloatingIP(ctx, "bkk01", floatingIP)
-		}},
-		{name: "DeleteFirewall", status: http.StatusNoContent, call: func(ctx context.Context, client *inspace.Client) error {
+		{name: "DeleteFirewall", status: http.StatusNoContent, wantError: "expected an empty success body", call: func(ctx context.Context, client *inspace.Client) error {
 			return client.DeleteFirewall(ctx, "bkk01", firewallUUID)
 		}},
-		{name: "UnassignFirewallFromVM", status: http.StatusNoContent, call: func(ctx context.Context, client *inspace.Client) error {
+		{name: "UnassignFirewallFromVM", status: http.StatusOK, wantError: "expected exactly zero success body bytes", call: func(ctx context.Context, client *inspace.Client) error {
 			return client.UnassignFirewallFromVM(ctx, "bkk01", firewallUUID, vmUUID)
 		}},
-		{name: "DeleteLoadBalancer", status: http.StatusOK, call: func(ctx context.Context, client *inspace.Client) error {
+		{name: "DeleteLoadBalancer", status: http.StatusOK, wantError: "expected an empty success body", call: func(ctx context.Context, client *inspace.Client) error {
 			return client.DeleteLoadBalancer(ctx, "bkk01", lbUUID)
 		}},
-		{name: "RemoveLoadBalancerTarget", status: http.StatusNoContent, call: func(ctx context.Context, client *inspace.Client) error {
+		{name: "RemoveLoadBalancerTarget", status: http.StatusNoContent, wantError: "expected an empty success body", call: func(ctx context.Context, client *inspace.Client) error {
 			return client.RemoveLoadBalancerTarget(ctx, "bkk01", lbUUID, vmUUID)
 		}},
-		{name: "RemoveLoadBalancerRule", status: http.StatusNoContent, call: func(ctx context.Context, client *inspace.Client) error {
+		{name: "RemoveLoadBalancerRule", status: http.StatusNoContent, wantError: "expected an empty success body", call: func(ctx context.Context, client *inspace.Client) error {
 			return client.RemoveLoadBalancerRule(ctx, "bkk01", lbUUID, ruleUUID)
 		}},
 	}
@@ -1358,7 +1596,7 @@ func TestBodylessMutationEndpointsRejectNonEmptySuccessBodies(t *testing.T) {
 				t.Fatal(err)
 			}
 			err = test.call(context.Background(), client)
-			if err == nil || !strings.Contains(err.Error(), "expected an empty success body") {
+			if err == nil || !strings.Contains(err.Error(), test.wantError) {
 				t.Fatalf("%s accepted non-empty HTTP %d success body: %v", test.name, test.status, err)
 			}
 		})

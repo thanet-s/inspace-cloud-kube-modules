@@ -295,8 +295,10 @@ func contractHandler(t *testing.T) http.HandlerFunc {
 				t.Errorf("firewall assign query = %s", r.URL.RawQuery)
 			}
 			writeLiteral(w, http.StatusOK, `[{"resource_type":"vm","resource_uuid":"`+vmUUID+`"}]`)
-		case "DELETE /v1/bkk01/network/firewalls/" + firewallUUID + "/vms",
-			"DELETE /v1/bkk01/network/firewalls/" + firewallUUID:
+		case "DELETE /v1/bkk01/network/firewalls/" + firewallUUID + "/vms":
+			w.Header().Set("Content-Type", "text/plain")
+			w.WriteHeader(http.StatusOK)
+		case "DELETE /v1/bkk01/network/firewalls/" + firewallUUID:
 			w.WriteHeader(http.StatusNoContent)
 		case "POST /v1/bkk01/network/ip_addresses":
 			writeLiteral(w, http.StatusCreated, floatingIPLiteral(false))
@@ -319,7 +321,7 @@ func contractHandler(t *testing.T) http.HandlerFunc {
 		case "POST /v1/bkk01/network/ip_addresses/" + floatingIP + "/unassign":
 			writeLiteral(w, http.StatusOK, floatingIPLiteral(false))
 		case "DELETE /v1/bkk01/network/ip_addresses/" + floatingIP:
-			w.WriteHeader(http.StatusOK)
+			writeLiteral(w, http.StatusOK, "true")
 		default:
 			t.Errorf("unexpected request %s %s", r.Method, r.URL.String())
 			http.NotFound(w, r)
