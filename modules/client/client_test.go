@@ -435,6 +435,14 @@ func TestFloatingIPResponsesRequireExplicitCoherentAssignmentState(t *testing.T)
 			_, err := client.UnassignFloatingIP(ctx, "bkk01", floatingIP)
 			return err
 		}},
+		{name: "unassign mutation omits assigned_to with historical timestamp", status: http.StatusOK, body: `{"address":"` + floatingIP + `","unassigned_at":"2026-07-17T09:54:01Z"}`, call: func(ctx context.Context, client *inspace.Client) error {
+			_, err := client.UnassignFloatingIP(ctx, "bkk01", floatingIP)
+			return err
+		}},
+		{name: "omitted assignment retains resource type", status: http.StatusOK, body: `[{"address":"` + floatingIP + `","unassigned_at":"2026-07-17T09:54:01Z","assigned_to_resource_type":"virtual_machine"}]`, call: func(ctx context.Context, client *inspace.Client) error {
+			_, err := client.ListFloatingIPs(ctx, "bkk01", nil)
+			return err
+		}},
 		{name: "unassigned row retains resource type", status: http.StatusOK, body: `[{"address":"` + floatingIP + `","assigned_to":null,"assigned_to_resource_type":"virtual_machine"}]`, call: func(ctx context.Context, client *inspace.Client) error {
 			_, err := client.ListFloatingIPs(ctx, "bkk01", nil)
 			return err
@@ -465,6 +473,47 @@ func TestFloatingIPResponsesRequireExplicitCoherentAssignmentState(t *testing.T)
 			}
 			if err := test.call(context.Background(), client); err == nil {
 				t.Fatalf("accepted malformed floating-IP response %s", test.body)
+			}
+		})
+	}
+}
+
+func TestFloatingIPReadResponsesAcceptLiveUnassignedRepresentation(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		call func(context.Context, *inspace.Client) error
+	}{
+		{
+			name: "list",
+			body: `[{"address":"` + floatingIP + `","unassigned_at":"2026-07-17T09:54:01Z"}]`,
+			call: func(ctx context.Context, client *inspace.Client) error {
+				_, err := client.ListFloatingIPs(ctx, "bkk01", nil)
+				return err
+			},
+		},
+		{
+			name: "exact read",
+			body: `{"address":"` + floatingIP + `","unassigned_at":"2026-07-17 09:54:01"}`,
+			call: func(ctx context.Context, client *inspace.Client) error {
+				_, err := client.GetFloatingIP(ctx, "bkk01", floatingIP)
+				return err
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusOK)
+				_, _ = io.WriteString(w, test.body)
+			}))
+			t.Cleanup(server.Close)
+			client, err := inspace.NewClient(inspace.Options{BaseURL: server.URL, APIKey: "test-key"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := test.call(context.Background(), client); err != nil {
+				t.Fatalf("rejected live unassigned floating-IP response %s: %v", test.body, err)
 			}
 		})
 	}
@@ -1049,12 +1098,6 @@ func TestBodylessMutationEndpointsRejectNonEmptySuccessBodies(t *testing.T) {
 		status int
 		call   func(context.Context, *inspace.Client) error
 	}{
-		{name: "DeleteVM/200", status: http.StatusOK, call: func(ctx context.Context, client *inspace.Client) error {
-			return client.DeleteVM(ctx, "bkk01", vmUUID)
-		}},
-		{name: "DeleteVM/204", status: http.StatusNoContent, call: func(ctx context.Context, client *inspace.Client) error {
-			return client.DeleteVM(ctx, "bkk01", vmUUID)
-		}},
 		{name: "DeleteDisk", status: http.StatusNoContent, call: func(ctx context.Context, client *inspace.Client) error {
 			return client.DeleteDisk(ctx, "bkk01", diskUUID)
 		}},
@@ -1096,6 +1139,47 @@ func TestBodylessMutationEndpointsRejectNonEmptySuccessBodies(t *testing.T) {
 			err = test.call(context.Background(), client)
 			if err == nil || !strings.Contains(err.Error(), "expected an empty success body") {
 				t.Fatalf("%s accepted non-empty HTTP %d success body: %v", test.name, test.status, err)
+			}
+		})
+	}
+}
+
+func TestDeleteVMAcceptsOnlyEmptyOrWellFormedOptionalJSONSuccess(t *testing.T) {
+	tests := []struct {
+		name    string
+		status  int
+		body    string
+		wantErr bool
+	}{
+		{name: "empty 200", status: http.StatusOK},
+		{name: "empty 204", status: http.StatusNoContent},
+		{name: "live JSON 200", status: http.StatusOK, body: `{"success":true}`},
+		{name: "truncated JSON", status: http.StatusOK, body: `{"success":`, wantErr: true},
+		{name: "trailing JSON", status: http.StatusOK, body: `{"success":true}{}`, wantErr: true},
+		{name: "duplicate JSON key", status: http.StatusOK, body: `{"success":true,"success":false}`, wantErr: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			transport := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				resp := response(req, test.body)
+				resp.StatusCode = test.status
+				return resp, nil
+			})
+			client, err := inspace.NewClient(inspace.Options{
+				BaseURL:                   "https://api.example.invalid",
+				APIKey:                    "test-key",
+				HTTPClient:                &http.Client{Transport: transport},
+				DangerouslyAllowMutations: true,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = client.DeleteVM(context.Background(), "bkk01", vmUUID)
+			if test.wantErr && err == nil {
+				t.Fatal("accepted malformed optional VM DELETE response")
+			}
+			if !test.wantErr && err != nil {
+				t.Fatalf("rejected valid optional VM DELETE response: %v", err)
 			}
 		})
 	}

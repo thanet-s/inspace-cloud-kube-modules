@@ -401,6 +401,7 @@ type successBodyContract uint8
 const (
 	successJSON successBodyContract = iota
 	successEmpty
+	successEmptyOrJSON
 )
 
 type endpointContract struct {
@@ -454,11 +455,11 @@ var endpointContracts = []endpointContract{
 	{http.MethodPut, "/v1/{location}/network/firewalls/{uuid}", statusOKOnly, successJSON},
 	{http.MethodPatch, "/v1/{location}/network/ip_addresses/{address}", statusOKOnly, successJSON},
 
-	// The VM API reference does not state the success code. InSpace's live API
-	// and recorded contract return 204, but 200 is also a conventional empty
-	// delete response. Accept only those two and let authoritative readback
-	// establish whether the VM is gone.
-	{http.MethodDelete, "/v1/{location}/user-resource/vm", statusOKOrNoContent, successEmpty},
+	// The VM API reference does not state a success response. The live API can
+	// return either an empty 204 or a JSON-bearing 200. The body is never used
+	// as deletion proof: every production caller performs authoritative exact
+	// absence readback after dispatch.
+	{http.MethodDelete, "/v1/{location}/user-resource/vm", statusOKOrNoContent, successEmptyOrJSON},
 	{http.MethodDelete, "/v1/{location}/storage/disks/{uuid}", statusNoContentOnly, successEmpty},
 	{http.MethodDelete, "/v1/{location}/network/ip_addresses/{address}", statusOKOnly, successEmpty},
 	{http.MethodDelete, "/v1/{location}/network/firewalls/{uuid}", statusNoContentOnly, successEmpty},
@@ -494,8 +495,18 @@ func validateSuccessResponse(method, path string, status int, expectsJSON bool, 
 			expectsJSON,
 		)
 	}
-	if contract.body == successEmpty && len(bytes.TrimSpace(data)) != 0 {
-		return fmt.Errorf("inspace: decode %s %s response: expected an empty success body", method, path)
+	trimmed := bytes.TrimSpace(data)
+	switch contract.body {
+	case successEmpty:
+		if len(trimmed) != 0 {
+			return fmt.Errorf("inspace: decode %s %s response: expected an empty success body", method, path)
+		}
+	case successEmptyOrJSON:
+		if len(trimmed) != 0 {
+			if err := validateJSONNoDuplicateObjectKeys(trimmed); err != nil {
+				return fmt.Errorf("inspace: decode %s %s optional success response: %w", method, path, err)
+			}
+		}
 	}
 	return nil
 }

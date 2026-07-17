@@ -31,7 +31,7 @@ func (c *Client) ListFloatingIPs(ctx context.Context, location string, filters *
 	var result []FloatingIP
 	err = c.do(ctx, http.MethodGet, path, query, nil, &result)
 	return validatedListResponse(result, err, http.MethodGet, path, func(address FloatingIP) (string, error) {
-		if err := validateFloatingIPResponseIdentity(&address, ""); err != nil {
+		if err := validateFloatingIPResponseIdentity(&address, "", true); err != nil {
 			return "", err
 		}
 		return address.Address, nil
@@ -51,7 +51,7 @@ func (c *Client) GetFloatingIP(ctx context.Context, location, address string) (*
 	if err != nil {
 		err = bindExactFloatingIPLookupError(err, address)
 	} else {
-		err = validateFloatingIPResponseIdentity(&result, address)
+		err = validateFloatingIPResponseIdentity(&result, address, true)
 	}
 	return &result, err
 }
@@ -67,7 +67,7 @@ func (c *Client) CreateFloatingIP(ctx context.Context, location string, input Cr
 	var result FloatingIP
 	err = c.doJSON(ctx, http.MethodPost, path, nil, input, &result)
 	if err == nil {
-		err = validateFloatingIPResponseIdentity(&result, "")
+		err = validateFloatingIPResponseIdentity(&result, "", false)
 	}
 	return &result, err
 }
@@ -92,7 +92,7 @@ func (c *Client) UpdateFloatingIP(ctx context.Context, location, address string,
 	var result FloatingIP
 	err = c.doJSON(ctx, http.MethodPatch, path, nil, input, &result)
 	if err == nil {
-		err = validateFloatingIPResponseIdentity(&result, address)
+		err = validateFloatingIPResponseIdentity(&result, address, false)
 	}
 	return &result, err
 }
@@ -118,7 +118,7 @@ func (c *Client) AssignFloatingIP(ctx context.Context, location, address, resour
 		"assigned_to": resourceUUID, "assigned_to_resource_type": resourceType,
 	}, &result)
 	if err == nil {
-		err = validateFloatingIPResponseIdentity(&result, address)
+		err = validateFloatingIPResponseIdentity(&result, address, false)
 	}
 	if err == nil && (!strings.EqualFold(result.AssignedTo, resourceUUID) || result.AssignedToResourceType != resourceType) {
 		err = fmt.Errorf(
@@ -143,7 +143,7 @@ func (c *Client) UnassignFloatingIP(ctx context.Context, location, address strin
 	var result FloatingIP
 	err = c.doJSON(ctx, http.MethodPost, path, nil, nil, &result)
 	if err == nil {
-		err = validateFloatingIPResponseIdentity(&result, address)
+		err = validateFloatingIPResponseIdentity(&result, address, false)
 	}
 	if err == nil && (result.AssignedTo != "" || result.AssignedToResourceType != "") {
 		err = fmt.Errorf(
@@ -174,7 +174,7 @@ func validatePublicIPv4(value string) error {
 	return nil
 }
 
-func validateFloatingIPResponseIdentity(result *FloatingIP, expectedAddress string) error {
+func validateFloatingIPResponseIdentity(result *FloatingIP, expectedAddress string, allowOmittedUnassigned bool) error {
 	if result == nil {
 		return errors.New("inspace: floating IP response is nil")
 	}
@@ -190,7 +190,17 @@ func validateFloatingIPResponseIdentity(result *FloatingIP, expectedAddress stri
 		}
 	}
 	if !result.assignedToPresent {
-		return errors.New("inspace: malformed floating IP response: assigned_to field is omitted")
+		if !allowOmittedUnassigned || result.UnassignedAt == "" {
+			return errors.New("inspace: malformed floating IP response: assigned_to field is omitted without authoritative unassignment")
+		}
+		if result.AssignedToResourceType != "" || result.AssignedToPrivateIP != "" {
+			return fmt.Errorf(
+				"inspace: malformed omitted-assignment floating IP response: resource type/private IP is %q/%q",
+				result.AssignedToResourceType,
+				result.AssignedToPrivateIP,
+			)
+		}
+		return nil
 	}
 	if result.AssignedTo == "" {
 		if result.AssignedToResourceType != "" || result.AssignedToPrivateIP != "" {

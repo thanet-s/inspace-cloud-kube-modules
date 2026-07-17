@@ -269,8 +269,9 @@ type FloatingIP struct {
 }
 
 // UnmarshalJSON preserves the distinction between the documented
-// "assigned_to": null value and an omitted assignment field. Controllers must
-// not interpret a partial HTTP 200 object as authoritative unassignment.
+// "assigned_to": null value and an omitted assignment field. Read endpoints
+// may omit assigned_to after a completed unassignment and return unassigned_at
+// instead; mutation responses must still report assignment state explicitly.
 func (f *FloatingIP) UnmarshalJSON(data []byte) error {
 	type floatingIPWithoutMethods FloatingIP
 	var decoded floatingIPWithoutMethods

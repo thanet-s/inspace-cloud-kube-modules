@@ -170,7 +170,14 @@ def _validate_floating_ip_rows(rows: list[Any]) -> None:
         identities.append(_canonical_ip(row.get("address"), label))
         _required_string(row, "name", label, allow_empty=True)
         if "assigned_to" not in row:
-            raise StrictAPIError(f"{label} omits assignment state")
+            _required_string(row, "unassigned_at", label)
+            if row.get("assigned_to_resource_type") not in (None, ""):
+                raise StrictAPIError(f"{label} has contradictory assignment type")
+            if row.get("assigned_to_private_ip") not in (None, ""):
+                raise StrictAPIError(
+                    f"{label} has contradictory assigned private address"
+                )
+            continue
         if row["assigned_to"] is not None and not isinstance(row["assigned_to"], str):
             raise StrictAPIError(f"{label} has malformed assignment state")
         if row["assigned_to"]:
@@ -178,6 +185,10 @@ def _validate_floating_ip_rows(rows: list[Any]) -> None:
             _required_string(row, "assigned_to_resource_type", label)
         elif row.get("assigned_to_resource_type") not in (None, ""):
             raise StrictAPIError(f"{label} has contradictory assignment type")
+        elif row.get("assigned_to_private_ip") not in (None, ""):
+            raise StrictAPIError(
+                f"{label} has contradictory assigned private address"
+            )
     _reject_duplicate_identities(identities, "floating-IP address")
 
 
