@@ -4,15 +4,23 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 )
 
 func (c *Client) ListLocations(ctx context.Context) ([]Location, error) {
+	const path = "/v1/config/locations"
 	var result []Location
-	err := c.do(ctx, http.MethodGet, "/v1/config/locations", nil, nil, &result)
-	return result, err
+	err := c.do(ctx, http.MethodGet, path, nil, nil, &result)
+	return validatedListResponse(result, err, http.MethodGet, path, func(location Location) (string, error) {
+		if !locationPattern.MatchString(location.Slug) {
+			return "", errors.New("inspace: invalid location slug")
+		}
+		return location.Slug, nil
+	})
 }
 
 func (c *Client) ListHostPools(ctx context.Context, location string) ([]HostPool, error) {
@@ -22,7 +30,9 @@ func (c *Client) ListHostPools(ctx context.Context, location string) ([]HostPool
 	}
 	var result []HostPool
 	err = c.do(ctx, http.MethodGet, path, nil, nil, &result)
-	return result, err
+	return validatedListResponse(result, err, http.MethodGet, path, func(pool HostPool) (string, error) {
+		return validatedUUIDListIdentity("host pool", pool.UUID)
+	})
 }
 
 func (c *Client) ListVMs(ctx context.Context, location string) ([]VM, error) {
@@ -32,7 +42,15 @@ func (c *Client) ListVMs(ctx context.Context, location string) ([]VM, error) {
 	}
 	var result []VM
 	err = c.do(ctx, http.MethodGet, path, nil, nil, &result)
-	return result, err
+	return validatedListResponse(result, err, http.MethodGet, path, func(vm VM) (string, error) {
+		if strings.TrimSpace(vm.Name) == "" {
+			return "", errors.New("inspace: VM list row has an empty name")
+		}
+		if strings.TrimSpace(vm.Status) == "" {
+			return "", errors.New("inspace: VM list row has an empty status")
+		}
+		return validatedUUIDListIdentity("VM", vm.UUID)
+	})
 }
 
 func (c *Client) GetVM(ctx context.Context, location, uuid string) (*VM, error) {
@@ -45,6 +63,11 @@ func (c *Client) GetVM(ctx context.Context, location, uuid string) (*VM, error) 
 	}
 	var result VM
 	err = c.do(ctx, http.MethodGet, path, url.Values{"uuid": {uuid}}, nil, &result)
+	if err != nil {
+		err = bindExactLookupError(err, uuid)
+	} else if !strings.EqualFold(result.UUID, uuid) {
+		err = fmt.Errorf("inspace: exact VM response UUID %q does not match requested UUID %q", result.UUID, uuid)
+	}
 	return &result, err
 }
 
@@ -95,6 +118,9 @@ func (c *Client) CreateVM(ctx context.Context, location string, input CreateVMRe
 	}
 	var result VM
 	err = c.do(ctx, http.MethodPost, path, nil, form, &result)
+	if err == nil {
+		err = validateResponseUUID("created VM", result.UUID)
+	}
 	return &result, err
 }
 

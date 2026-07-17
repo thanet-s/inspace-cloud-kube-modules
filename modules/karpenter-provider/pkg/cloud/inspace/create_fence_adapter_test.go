@@ -1284,6 +1284,90 @@ func TestObservedCleanupDeletesDuplicateAndRequiresGlobalRescan(t *testing.T) {
 	}
 }
 
+func TestFencedCleanupFinalReceiptSnapshotsAreReadOnlyExactAndRejectResurrection(t *testing.T) {
+	const vmUUID = "11111111-1111-4111-8111-111111111111"
+	cleanup := fencedCleanupRequest(true)
+	resolution := cloudapi.FencedCreateCleanupResolution{
+		VMUUID: vmUUID, FloatingIPName: floatingIPName(cleanup.ClusterName, cleanup.NodeClaimName), PublicIPv4: "203.0.113.10",
+	}
+	cleanup.Resolutions = []cloudapi.FencedCreateCleanupResolution{resolution}
+
+	t.Run("three clean snapshots perform exact reads without mutation", func(t *testing.T) {
+		api := &fakeAPI{firewalls: []sdk.Firewall{secureFirewall()}}
+		adapter, _ := New(api)
+		for confirmation := 0; confirmation < createAbsenceConfirmations; confirmation++ {
+			if err := adapter.auditFencedCleanupReceiptSnapshot(context.Background(), cleanup, nil, nil); err != nil {
+				t.Fatalf("receipt snapshot %d = %v", confirmation+1, err)
+			}
+		}
+		if api.vmGetCalls != createAbsenceConfirmations || api.firewallListCalls != createAbsenceConfirmations {
+			t.Fatalf("read-only receipt snapshots GETs=%d firewall lists=%d, want %d each",
+				api.vmGetCalls, api.firewallListCalls, createAbsenceConfirmations)
+		}
+		if api.deleteVMCalls != 0 || api.floatingIPAssignCalls != 0 || api.floatingIPUpdateCalls != 0 ||
+			api.deleteFloatingIPContextCanceled || len(api.operations) != 0 {
+			t.Fatalf("read-only receipt snapshots mutated cloud: VM deletes=%d FIP assigns=%d FIP updates=%d operations=%v",
+				api.deleteVMCalls, api.floatingIPAssignCalls, api.floatingIPUpdateCalls, api.operations)
+		}
+	})
+
+	t.Run("exact-only VM resurrection remains pending", func(t *testing.T) {
+		api := &fakeAPI{}
+		adapter, _ := New(api)
+		configureFastNetworkReadback(adapter, boundedReadbackTestTimeout)
+		created, err := adapter.CreateVM(context.Background(), testRequest())
+		if err != nil {
+			t.Fatal(err)
+		}
+		candidate := cleanup
+		candidate.Resolutions = []cloudapi.FencedCreateCleanupResolution{{
+			VMUUID: created.UUID, FloatingIPName: created.FloatingIPName, PublicIPv4: created.PublicIPv4,
+		}}
+		api.operations = nil
+		err = adapter.auditFencedCleanupReceiptSnapshot(context.Background(), candidate, nil, nil)
+		if !errors.Is(err, cloudapi.ErrCreateAttemptPending) || !strings.Contains(err.Error(), "exact detail") {
+			t.Fatalf("exact-only resurrection error = %v, want pending exact-detail rejection", err)
+		}
+		if api.deleteVMCalls != 0 || len(api.operations) != 0 {
+			t.Fatalf("exact-only resurrection audit mutated cloud: deletes=%d operations=%v", api.deleteVMCalls, api.operations)
+		}
+	})
+
+	t.Run("floating IP resurrection remains pending", func(t *testing.T) {
+		api := &fakeAPI{firewalls: []sdk.Firewall{secureFirewall()}}
+		adapter, _ := New(api)
+		addresses := []sdk.FloatingIP{{
+			Address: resolution.PublicIPv4, Name: resolution.FloatingIPName, BillingAccountID: cleanup.BillingAccountID,
+			Enabled: true, Type: "public",
+		}}
+		candidate := cleanup
+		candidate.Resolutions = []cloudapi.FencedCreateCleanupResolution{resolution}
+		err := adapter.auditFencedCleanupReceiptSnapshot(context.Background(), candidate, nil, addresses)
+		if !errors.Is(err, cloudapi.ErrCreateAttemptPending) || !strings.Contains(err.Error(), "floating IP") {
+			t.Fatalf("floating-IP resurrection error = %v, want pending rejection", err)
+		}
+		if api.deleteVMCalls != 0 || len(api.operations) != 0 {
+			t.Fatalf("floating-IP resurrection audit mutated cloud: deletes=%d operations=%v", api.deleteVMCalls, api.operations)
+		}
+	})
+
+	t.Run("firewall relation resurrection remains pending", func(t *testing.T) {
+		firewall := secureFirewall()
+		firewall.ResourcesAssigned = []sdk.FirewallResource{{ResourceType: "vm", ResourceUUID: vmUUID}}
+		api := &fakeAPI{firewalls: []sdk.Firewall{firewall}}
+		adapter, _ := New(api)
+		candidate := cleanup
+		candidate.Resolutions = []cloudapi.FencedCreateCleanupResolution{resolution}
+		err := adapter.auditFencedCleanupReceiptSnapshot(context.Background(), candidate, nil, nil)
+		if !errors.Is(err, cloudapi.ErrCreateAttemptPending) || !strings.Contains(err.Error(), "firewall relations") {
+			t.Fatalf("firewall resurrection error = %v, want pending rejection", err)
+		}
+		if api.deleteVMCalls != 0 || len(api.operations) != 0 {
+			t.Fatalf("firewall resurrection audit mutated cloud: deletes=%d operations=%v", api.deleteVMCalls, api.operations)
+		}
+	})
+}
+
 func TestCleanupHistoricalReceiptRemainsPendingWhenListHidesTarget(t *testing.T) {
 	api := &fakeAPI{}
 	adapter, _ := New(api)
@@ -1354,7 +1438,7 @@ func TestProtectFencedCreateRejectsForeignSameVPCVMBeforeFirewallMutation(t *tes
 		t.Fatal(err)
 	}
 	api.vms[0].Description = string(encoded)
-	api.firewalls[0].ResourcesAssigned = nil
+	api.firewalls[0].ResourcesAssigned = []sdk.FirewallResource{}
 	api.operations = nil
 	api.firewallAssignCalls = 0
 
@@ -1386,7 +1470,7 @@ func TestProtectFencedCreateRejectsInactiveOrDriftedAnchorBeforeFirewallMutation
 				t.Fatal(err)
 			}
 			test.mutate(&api.vms[0])
-			api.firewalls[0].ResourcesAssigned = nil
+			api.firewalls[0].ResourcesAssigned = []sdk.FirewallResource{}
 			api.operations = nil
 			api.firewallAssignCalls = 0
 			api.floatingIPUpdateCalls = 0
@@ -1415,7 +1499,7 @@ func TestProtectFencedCreateReattachesFirewallToExactOwnedSameVPCVM(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	api.firewalls[0].ResourcesAssigned = nil
+	api.firewalls[0].ResourcesAssigned = []sdk.FirewallResource{}
 	api.operations = nil
 	api.firewallAssignCalls = 0
 	api.firewallListCalls = 0
@@ -1443,6 +1527,30 @@ func TestPrepareCreateFailsClosedOnVPCOnlyCanonical404(t *testing.T) {
 	}
 	if api.createCalls != 0 {
 		t.Fatalf("VPC-only/Get404 uncertainty reached %d VM POSTs", api.createCalls)
+	}
+}
+
+func TestPrepareCreateAndVMAbsenceRejectMissingVPCMembershipField(t *testing.T) {
+	api := &fakeAPI{network: &sdk.Network{UUID: testRequest().NetworkUUID, Subnet: "10.0.0.0/24"}}
+	adapter, _ := New(api)
+
+	if _, err := adapter.PrepareCreate(context.Background(), testRequest()); !errors.Is(err, cloudapi.ErrOwnershipMismatch) ||
+		!strings.Contains(err.Error(), "omitted VM membership") {
+		t.Fatalf("PrepareCreate() error = %v, want missing-membership rejection", err)
+	}
+	if api.createCalls != 0 {
+		t.Fatalf("missing VPC membership reached %d VM POSTs", api.createCalls)
+	}
+
+	present, err := adapter.networkContainsVM(
+		context.Background(),
+		testRequest().Location,
+		testRequest().NetworkUUID,
+		"99999999-9999-4999-8999-999999999999",
+	)
+	if err == nil || !errors.Is(err, cloudapi.ErrOwnershipMismatch) ||
+		!strings.Contains(err.Error(), "omitted VM membership") || present {
+		t.Fatalf("networkContainsVM() = present=%t error=%v, want fail-closed missing-membership result", present, err)
 	}
 }
 
@@ -1644,7 +1752,7 @@ func TestDeleteDoesNotDispatchFromMultiIndexAbsenceSnapshot(t *testing.T) {
 	api.floatingIPs[0].AssignedToResourceType = ""
 	api.getVMErrorByUUID = map[string]error{created.UUID: &sdk.APIError{StatusCode: 404}}
 	api.hideVMsThroughCall = api.vmListCalls + 100
-	api.network = &sdk.Network{UUID: testRequest().NetworkUUID, Subnet: "10.0.0.0/24"}
+	api.network = &sdk.Network{UUID: testRequest().NetworkUUID, Subnet: "10.0.0.0/24", VMUUIDs: []string{}}
 	identity := cloudapi.DeleteVMIdentity{
 		FloatingIPName: created.FloatingIPName, PublicIPv4: created.PublicIPv4,
 		BillingAccountID: created.BillingAccountID, NetworkUUID: testRequest().NetworkUUID, FirewallUUID: testRequest().FirewallUUID,

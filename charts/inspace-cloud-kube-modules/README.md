@@ -370,6 +370,21 @@ enabling this value. The bastion registry is private and read-only: its TLS
 frontend accepts only `GET` and `HEAD`, and it must not be exposed through a
 public load balancer.
 
+## CSI controller timeouts
+
+The chart sets both `csi.sidecars.provisioner.timeoutSeconds` and
+`csi.sidecars.attacher.timeoutSeconds` to `600`. This allows up to two minutes
+for preflight reads and durable-fence acquisition. Immediately before any
+CreateDisk, DeleteDisk, AttachDisk, or DetachDisk call, the driver requires
+480 seconds to remain: five minutes for the shared client's HTTP mutation
+deadline, two minutes for destructive recovery, and one minute for final
+readback and Kubernetes Lease persistence. If less remains, no cloud mutation
+is issued and only that invocation's exact undispatched Lease is cleared. The
+chart accepts larger values up to 3600 seconds, but rejects values below 600
+seconds. Shortening either sidecar deadline can cancel and strand the original
+no-replay Lease or cause overlapping retries while the mutation proof is still
+running.
+
 ## Install
 
 ```sh

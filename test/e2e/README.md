@@ -3,10 +3,12 @@
 This is the destructive release-acceptance suite for the complete InSpace
 stack. The host entrypoint is intentionally only a Docker launcher: Ansible,
 Helm, kubectl, SSH, curl, provisioning, live assertions, and cleanup all run
-inside a purpose-built Ubuntu 26.04 controller image. The destructive image
-copies its bootstrap binary from the exact published CCM image tag; a separate
-non-live target compiles local source for CI. The host needs no Go toolchain,
-and nothing is installed or executed directly on it except Docker.
+inside a purpose-built Ubuntu 26.04 controller image. A non-mutating verifier
+stage validates the published OCI index and selects its unique linux/amd64
+child; the destructive image copies its bootstrap binary from that immutable
+CCM platform digest. A separate non-live target compiles local source for CI.
+The host needs Docker and Git but no Go, Helm, kubectl, Ansible, or cloud
+toolchain.
 
 The test creates exactly three fixed RKE2 `v1.35.6+rke2r1` control-plane VMs.
 The product bootstrap reconciler launches missing control-plane VMs in slot
@@ -273,7 +275,10 @@ reuse an initialized run. A durable pre-mutation checkpoint allows a missing
 journal to be classified as safe only before any remote call could mutate
 state; once mutation may have started, missing or unreadable ownership state
 preserves resources and fails closed. Explicit retention is persisted
-independently of the journal and always wins over an old zero audit.
+independently of the journal and always wins over an old zero audit. Ownership
+JSON, phase/retention markers, pre-mutation checkpoints, and final-audit state
+all fsync their replacement before the parent directory, so a host crash cannot
+reorder mutation authority ahead of its local evidence.
 
 The default `all` phase runs `init-cluster.yml`, then `test.yml`, and finally
 `destroy-cluster.yml`. It attempts destruction after completion or failure and
@@ -328,9 +333,9 @@ make cluster-e2e-destroy
 
 ## Run
 
-Publish the exact release candidate first. Put the isolated account values in
-the ignored, mode-`0600` root `.env`, then export the destructive confirmation
-and released SemVer:
+Publish the exact release candidate first and check out its annotated tag with
+a clean worktree. Put the isolated account values in the ignored, mode-`0600`
+root `.env`, then export the destructive confirmation and released SemVer:
 
 ```sh
 export INSPACE_E2E_VERSION='<published-version>'
@@ -341,7 +346,30 @@ make cluster-e2e
 `make cluster-e2e` selects the default `all` phase, which initializes the
 cluster, runs the acceptance tests, and destroys the cluster with a final zero
 audit. The equivalent direct command is `./test/e2e/run.sh all`; omitting the
-argument also selects `all`.
+argument also selects `all`. The `all`, `init`, `test`, and `shell` launchers
+require `HEAD` to equal the annotated `v$INSPACE_E2E_VERSION` tag and require a
+clean worktree. The source gate also requires the local annotated tag object
+and peeled commit to exactly match the canonical GitHub tag. Before
+provisioning, the verifier downloads `SHA256SUMS`, both chart archives, and all
+three image-digest records from the exact GitHub release. It checks strict
+asset URLs and sizes, verifies each chart checksum, requires `helm pull` of the
+OCI version to produce byte-identical packages, and validates chart
+name/version/appVersion/source/revision metadata. For every product image it binds the
+release-recorded index digest, selects the unique linux/amd64 child, and checks
+the child image config's source, version, and revision labels against the
+peeled release commit.
+
+The complete artifact manifest and both verified chart archives are durably
+copied into the run state before cloud mutation. The version-scoped runner is
+built from the CCM child digest and binds the source revision, every image
+digest, and both chart checksums. Cluster initialization installs the verified
+local chart archives, seeds product cache sources by platform digest, and
+proves live container image IDs. `destroy` intentionally performs no GitHub,
+GHCR, or checkout verification: it requires the preserved version-scoped
+runner and validates its built-in binding against the persisted run manifest.
+Do not remove that runner image before the run is destroyed; a missing or
+mismatched cleanup harness fails closed instead of rebuilding teardown logic
+from unrelated source.
 
 For development and test debugging, run the phases separately:
 

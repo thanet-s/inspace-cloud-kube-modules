@@ -26,6 +26,26 @@ func (a *vmTombstoneAPI) GetVM(ctx context.Context, location, uuid string) (*ins
 	return a.API.GetVM(ctx, location, uuid)
 }
 
+type overriddenVPCMembershipAPI struct {
+	API
+	members []string
+	omit    bool
+}
+
+func (a *overriddenVPCMembershipAPI) GetNetwork(ctx context.Context, location, uuid string) (*inspace.Network, error) {
+	network, err := a.API.GetNetwork(ctx, location, uuid)
+	if network != nil {
+		copy := *network
+		if a.omit {
+			copy.VMUUIDs = nil
+		} else {
+			copy.VMUUIDs = append([]string{}, a.members...)
+		}
+		network = &copy
+	}
+	return network, err
+}
+
 type boundedVMDeleteAPI struct {
 	API
 
@@ -100,6 +120,58 @@ func TestVMDeleteRejectsForeignHTTP200DeletedTombstone(t *testing.T) {
 	}
 	if attempt := cluster.Status.DeleteAttempts[deleteAttemptBastion]; attempt.Phase != deletePhaseVMIssued || attempt.AbsenceObservedAt != "" {
 		t.Fatalf("foreign tombstone advanced deletion: %#v", attempt)
+	}
+}
+
+func TestVMDeleteAbsenceRejectsInvalidVPCMembershipSnapshot(t *testing.T) {
+	api := newFakeAPI()
+	cluster := testCluster()
+	reconciler := testReconciler(api)
+	reconcileUntilReady(t, reconciler, cluster)
+	vm := *mustVM(t, api.vms, currentBastionName(cluster.Metadata.Name))
+	resourceNames := currentBootstrapResourceNames(cluster.Metadata.Name, ownerKey(cluster))
+	firewall := mustFirewall(t, api.firewalls, resourceNames.BastionFirewall)
+	if err := reconciler.ensureVMDeleteAttempt(
+		context.Background(),
+		cluster,
+		deleteAttemptBastion,
+		deletePurposeDestroy,
+		&vm,
+		firewall.UUID,
+		"",
+	); err != nil {
+		t.Fatal(err)
+	}
+	api.removeVMFromReadback(vm.UUID)
+	const unrelated = "cccccccc-1111-4222-8333-dddddddddddd"
+	tests := []struct {
+		name    string
+		members []string
+		omit    bool
+	}{
+		{name: "omitted collection", omit: true},
+		{name: "empty or null member", members: []string{""}},
+		{name: "malformed unrelated member", members: []string{"bad"}},
+		{name: "case-fold duplicate unrelated member", members: []string{unrelated, strings.ToUpper(unrelated)}},
+		{name: "duplicate target member", members: []string{vm.UUID, vm.UUID}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			reconciler.API = &overriddenVPCMembershipAPI{API: api, members: test.members, omit: test.omit}
+			attempt := cluster.Status.DeleteAttempts[deleteAttemptBastion]
+			absent, err := reconciler.corroborateVMDeletionAbsence(
+				context.Background(),
+				cluster,
+				deleteAttemptBastion,
+				attempt,
+			)
+			if err == nil || absent {
+				t.Fatalf("corroborateVMDeletionAbsence() = absent=%t error=%v, want fail-closed membership rejection", absent, err)
+			}
+			if current := cluster.Status.DeleteAttempts[deleteAttemptBastion]; current.AbsenceObservedAt != "" {
+				t.Fatalf("invalid VPC membership advanced absence receipt: %#v", current)
+			}
+		})
 	}
 }
 

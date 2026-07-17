@@ -28,10 +28,118 @@ const (
 	testLBUUID      = "bbbbbbbb-2222-4333-8444-cccccccccccc"
 )
 
+func bindTestExactLookupError(err error, requestedUUID string) error {
+	var apiErr *inspace.APIError
+	if !errors.As(err, &apiErr) {
+		return err
+	}
+	bound := *apiErr
+	bound.ExactLookup = true
+	bound.RequestedUUID = requestedUUID
+	return &bound
+}
+
+func exactVMNotFound(uuid string) error {
+	return bindTestExactLookupError(&inspace.APIError{
+		StatusCode: 404,
+		Method:     "GET",
+		Path:       "/v1/bkk01/user-resource/vm",
+		Message:    "not found",
+	}, uuid)
+}
+
+func exactLoadBalancerNotFound(uuid string) error {
+	return bindTestExactLookupError(&inspace.APIError{
+		StatusCode: 404,
+		Method:     "GET",
+		Path:       "/v1/bkk01/network/load_balancers/" + uuid,
+		Message:    "not found",
+	}, uuid)
+}
+
+func exactFloatingIPNotFound(address string) error {
+	return &inspace.APIError{
+		StatusCode:       404,
+		Method:           "GET",
+		Path:             "/v1/bkk01/network/ip_addresses/" + address,
+		Message:          "not found",
+		ExactLookup:      true,
+		RequestedAddress: address,
+	}
+}
+
+type exactVMResponseAPI struct {
+	*fakeAPI
+	response *inspace.VM
+}
+
+func (a *exactVMResponseAPI) GetVM(context.Context, string, string) (*inspace.VM, error) {
+	if a.response == nil {
+		return nil, nil
+	}
+	copy := *a.response
+	return &copy, nil
+}
+
+type resolvedVMReadErrorAPI struct {
+	*fakeAPI
+	listErr         error
+	getErr          error
+	listResponse    []inspace.VM
+	overrideList    bool
+	overrideNetwork bool
+	getResponse     *inspace.VM
+	overrideGet     bool
+}
+
+func (a *resolvedVMReadErrorAPI) ListVMs(ctx context.Context, location string) ([]inspace.VM, error) {
+	if a.listErr != nil {
+		return nil, a.listErr
+	}
+	if a.overrideList {
+		if a.listResponse == nil {
+			return nil, nil
+		}
+		return append([]inspace.VM{}, a.listResponse...), nil
+	}
+	return a.fakeAPI.ListVMs(ctx, location)
+}
+
+func (a *resolvedVMReadErrorAPI) GetVM(ctx context.Context, location, uuid string) (*inspace.VM, error) {
+	if a.getErr != nil {
+		return nil, bindTestExactLookupError(a.getErr, uuid)
+	}
+	if a.overrideGet {
+		if a.getResponse == nil {
+			return nil, nil
+		}
+		copy := *a.getResponse
+		return &copy, nil
+	}
+	return a.fakeAPI.GetVM(ctx, location, uuid)
+}
+
+func (a *resolvedVMReadErrorAPI) GetNetwork(ctx context.Context, location, uuid string) (*inspace.Network, error) {
+	if !a.overrideNetwork {
+		return a.fakeAPI.GetNetwork(ctx, location, uuid)
+	}
+	if a.fakeAPI.networkErr != nil {
+		return nil, a.fakeAPI.networkErr
+	}
+	if a.fakeAPI.network == nil {
+		return nil, nil
+	}
+	copy := *a.fakeAPI.network
+	if a.fakeAPI.network.VMUUIDs != nil {
+		copy.VMUUIDs = append([]string{}, a.fakeAPI.network.VMUUIDs...)
+	}
+	return &copy, nil
+}
+
 func TestInstancesV2MetadataUsesCanonicalProviderID(t *testing.T) {
 	api := &fakeAPI{vms: []inspace.VM{{
 		UUID: testVMUUID, Name: "worker-0", Hostname: "worker-0", Status: "running",
-		VCPU: 4, MemoryMiB: 8192, PrivateIPv4: "10.0.0.10",
+		VCPU: 4, MemoryMiB: 8192, PrivateIPv4: "10.0.0.10", BillingAccountID: 42, NetworkUUID: testNetworkUUID,
 	}}, floatingIPs: []inspace.FloatingIP{{
 		Address: "203.0.113.10", BillingAccountID: 42, Type: "public", Enabled: true,
 		AssignedTo: testVMUUID, AssignedToResourceType: "virtual_machine", AssignedToPrivateIP: "10.0.0.10",
@@ -54,29 +162,272 @@ func TestInstancesV2MetadataUsesCanonicalProviderID(t *testing.T) {
 	}
 }
 
-func TestInstancesV2TreatsHTTP200DeletedVMTombstonesAsAbsent(t *testing.T) {
-	for _, test := range []struct {
-		name string
-		node *corev1.Node
+func TestInstanceExistsOnlyNormalizesExactVMAbsence(t *testing.T) {
+	notFound := func(path string) error {
+		return &inspace.APIError{StatusCode: 404, Method: "GET", Path: path, Message: "not found"}
+	}
+	active := inspace.VM{
+		UUID: testVMUUID, Name: "worker-0", Hostname: "worker-0", Status: "running",
+		BillingAccountID: 42, NetworkUUID: testNetworkUUID,
+	}
+	tests := []struct {
+		name      string
+		api       API
+		node      *corev1.Node
+		wantError bool
 	}{
 		{
-			name: "exact provider ID",
+			name: "corroborated exact GetVM 404 is absence",
+			api: &resolvedVMReadErrorAPI{
+				fakeAPI: &fakeAPI{network: &inspace.Network{
+					UUID: testNetworkUUID, VMUUIDs: []string{},
+				}},
+				getErr:       notFound("/v1/bkk01/user-resource/vm"),
+				overrideList: true,
+				listResponse: []inspace.VM{},
+			},
 			node: &corev1.Node{Spec: corev1.NodeSpec{ProviderID: "inspace://bkk01/" + testVMUUID}},
 		},
 		{
-			name: "name inventory",
-			node: &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "deleted-worker"}},
+			name: "name-discovered exact GetVM 404 remains a split-view error",
+			api: &resolvedVMReadErrorAPI{
+				fakeAPI: &fakeAPI{vms: []inspace.VM{active}},
+				getErr:  notFound("/v1/bkk01/user-resource/vm"),
+			},
+			node:      &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "worker-0"}},
+			wantError: true,
+		},
+		{
+			name: "ListVMs 404 remains an error",
+			api: &resolvedVMReadErrorAPI{
+				fakeAPI: &fakeAPI{},
+				listErr: notFound("/v1/bkk01/user-resource/vm/list"),
+			},
+			node:      &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "worker-0"}},
+			wantError: true,
+		},
+		{
+			name: "GetNetwork 404 remains an error",
+			api: &exactVMResponseAPI{
+				fakeAPI:  &fakeAPI{networkErr: notFound("/v1/bkk01/network/network/" + testNetworkUUID)},
+				response: &active,
+			},
+			node:      &corev1.Node{Spec: corev1.NodeSpec{ProviderID: "inspace://bkk01/" + testVMUUID}},
+			wantError: true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			provider := newTestProvider(t, test.api)
+			exists, err := provider.InstanceExists(context.Background(), test.node)
+			if test.wantError {
+				if err == nil || exists {
+					t.Fatalf("InstanceExists() = %t, %v; want false and propagated API error", exists, err)
+				}
+				return
+			}
+			if err != nil || exists {
+				t.Fatalf("InstanceExists() = %t, %v; want false, nil", exists, err)
+			}
+		})
+	}
+}
+
+func TestInstanceExistsCorroboratesProviderIDExactVMAbsence(t *testing.T) {
+	notFound := &inspace.APIError{
+		StatusCode: 404, Method: "GET", Path: "/v1/bkk01/user-resource/vm", Message: "not found",
+	}
+	boundMissingVM := &inspace.APIError{
+		StatusCode: 400, Method: "GET", Path: "/v1/bkk01/user-resource/vm",
+		Message: "No such virtual machine exists: " + testVMUUID, RequestedUUID: testVMUUID,
+	}
+	otherVM := inspace.VM{UUID: "99999999-1111-4222-8333-444444444444"}
+	tests := []struct {
+		name         string
+		getErr       error
+		getResponse  *inspace.VM
+		listResponse []inspace.VM
+		listErr      error
+		network      *inspace.Network
+		networkErr   error
+		wantAbsent   bool
+	}{
+		{
+			name:   "HTTP 404 with independent omissions",
+			getErr: notFound, listResponse: []inspace.VM{otherVM},
+			network:    &inspace.Network{UUID: testNetworkUUID, VMUUIDs: []string{otherVM.UUID}},
+			wantAbsent: true,
+		},
+		{
+			name:   "bound HTTP 400 with independent omissions",
+			getErr: boundMissingVM, listResponse: []inspace.VM{},
+			network:    &inspace.Network{UUID: testNetworkUUID, VMUUIDs: []string{}},
+			wantAbsent: true,
+		},
+		{
+			name: "HTTP 200 deleted tombstone with independent omissions",
+			getResponse: &inspace.VM{
+				UUID: testVMUUID, Status: "Deleted", BillingAccountID: 42,
+			},
+			listResponse: []inspace.VM{},
+			network:      &inspace.Network{UUID: testNetworkUUID, VMUUIDs: []string{}},
+			wantAbsent:   true,
+		},
+		{
+			name: "HTTP 200 deleted tombstone still in VM inventory",
+			getResponse: &inspace.VM{
+				UUID: testVMUUID, Status: "Deleted", BillingAccountID: 42,
+			},
+			listResponse: []inspace.VM{{UUID: testVMUUID}},
+			network:      &inspace.Network{UUID: testNetworkUUID, VMUUIDs: []string{}},
+		},
+		{
+			name: "HTTP 200 deleted tombstone still in configured VPC",
+			getResponse: &inspace.VM{
+				UUID: testVMUUID, Status: "Deleted", BillingAccountID: 42,
+			},
+			listResponse: []inspace.VM{},
+			network:      &inspace.Network{UUID: testNetworkUUID, VMUUIDs: []string{testVMUUID}},
+		},
+		{
+			name:   "nil VM inventory",
+			getErr: notFound, listResponse: nil,
+			network: &inspace.Network{UUID: testNetworkUUID, VMUUIDs: []string{}},
+		},
+		{
+			name:   "VM inventory error",
+			getErr: notFound, listErr: errors.New("inventory unavailable"),
+			network: &inspace.Network{UUID: testNetworkUUID, VMUUIDs: []string{}},
+		},
+		{
+			name:   "VM inventory still contains target",
+			getErr: notFound, listResponse: []inspace.VM{{UUID: testVMUUID}},
+			network: &inspace.Network{UUID: testNetworkUUID, VMUUIDs: []string{}},
+		},
+		{
+			name:   "VM inventory malformed identity",
+			getErr: notFound, listResponse: []inspace.VM{{UUID: "bad"}},
+			network: &inspace.Network{UUID: testNetworkUUID, VMUUIDs: []string{}},
+		},
+		{
+			name:   "VM inventory duplicate identity",
+			getErr: notFound, listResponse: []inspace.VM{otherVM, inspace.VM{UUID: strings.ToUpper(otherVM.UUID)}},
+			network: &inspace.Network{UUID: testNetworkUUID, VMUUIDs: []string{}},
+		},
+		{
+			name:   "configured VPC error",
+			getErr: notFound, listResponse: []inspace.VM{},
+			networkErr: errors.New("VPC unavailable"),
+		},
+		{
+			name:   "configured VPC empty response",
+			getErr: notFound, listResponse: []inspace.VM{},
+		},
+		{
+			name:   "configured VPC wrong identity",
+			getErr: notFound, listResponse: []inspace.VM{},
+			network: &inspace.Network{
+				UUID: "99999999-2222-4333-8444-555555555555", VMUUIDs: []string{},
+			},
+		},
+		{
+			name:   "configured VPC membership omitted",
+			getErr: notFound, listResponse: []inspace.VM{},
+			network: &inspace.Network{UUID: testNetworkUUID},
+		},
+		{
+			name:   "configured VPC still contains target",
+			getErr: notFound, listResponse: []inspace.VM{},
+			network: &inspace.Network{UUID: testNetworkUUID, VMUUIDs: []string{testVMUUID}},
+		},
+		{
+			name:   "configured VPC malformed member",
+			getErr: notFound, listResponse: []inspace.VM{},
+			network: &inspace.Network{UUID: testNetworkUUID, VMUUIDs: []string{"bad"}},
+		},
+		{
+			name:   "configured VPC duplicate member",
+			getErr: notFound, listResponse: []inspace.VM{},
+			network: &inspace.Network{UUID: testNetworkUUID, VMUUIDs: []string{otherVM.UUID, strings.ToUpper(otherVM.UUID)}},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			api := &resolvedVMReadErrorAPI{
+				fakeAPI: &fakeAPI{network: test.network, networkErr: test.networkErr},
+				getErr:  test.getErr, getResponse: test.getResponse,
+				listErr: test.listErr, listResponse: test.listResponse,
+				overrideGet: test.getResponse != nil, overrideList: true, overrideNetwork: true,
+			}
+			provider := newTestProvider(t, api)
+			node := &corev1.Node{Spec: corev1.NodeSpec{ProviderID: "inspace://bkk01/" + testVMUUID}}
+
+			exists, err := provider.InstanceExists(context.Background(), node)
+			if test.wantAbsent {
+				if err != nil || exists {
+					t.Fatalf("InstanceExists() = %t, %v; want false, nil", exists, err)
+				}
+				if _, metadataErr := provider.InstanceMetadata(context.Background(), node); !errors.Is(metadataErr, cloud.InstanceNotFound) {
+					t.Fatalf("InstanceMetadata() error = %v, want cloud.InstanceNotFound", metadataErr)
+				}
+				if _, shutdownErr := provider.InstanceShutdown(context.Background(), node); !errors.Is(shutdownErr, cloud.InstanceNotFound) {
+					t.Fatalf("InstanceShutdown() error = %v, want cloud.InstanceNotFound", shutdownErr)
+				}
+				return
+			}
+			if err == nil || exists {
+				t.Fatalf("InstanceExists() = %t, %v; want false and fail-closed corroboration error", exists, err)
+			}
+		})
+	}
+}
+
+func TestInstanceExistsWithoutProviderIDNeverAuthorizesNameOmission(t *testing.T) {
+	provider := newTestProvider(t, &fakeAPI{})
+	node := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: "initializing-worker"},
+		Spec: corev1.NodeSpec{Taints: []corev1.Taint{{
+			Key: "node.cloudprovider.kubernetes.io/uninitialized", Effect: corev1.TaintEffectNoSchedule,
+		}}},
+	}
+	exists, err := provider.InstanceExists(context.Background(), node)
+	if err == nil || exists {
+		t.Fatalf("InstanceExists() = %t, %v; want fail-closed error before providerID initialization", exists, err)
+	}
+}
+
+func TestInstancesV2TreatsHTTP200DeletedVMTombstonesAsAbsent(t *testing.T) {
+	for _, test := range []struct {
+		name                    string
+		node                    *corev1.Node
+		wantInstanceExistsError bool
+	}{
+		{
+			name:                    "exact provider ID",
+			node:                    &corev1.Node{Spec: corev1.NodeSpec{ProviderID: "inspace://bkk01/" + testVMUUID}},
+			wantInstanceExistsError: true,
+		},
+		{
+			name:                    "name inventory",
+			node:                    &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "deleted-worker"}},
+			wantInstanceExistsError: true,
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			api := &fakeAPI{vms: []inspace.VM{{
 				UUID: testVMUUID, Name: "deleted-worker", Hostname: "deleted-worker", Status: "Deleted",
-				BillingAccountID: 42, NetworkUUID: testNetworkUUID,
-			}}}
+				// Real deleted tombstones can omit network_uuid after their VPC
+				// membership has already disappeared.
+				BillingAccountID: 42,
+			}}, networkErr: errors.New("deleted tombstone must not require an active VPC membership")}
 			provider := newTestProvider(t, api)
 
 			exists, err := provider.InstanceExists(context.Background(), test.node)
-			if err != nil || exists {
+			if test.wantInstanceExistsError {
+				if err == nil || exists {
+					t.Fatalf("InstanceExists() = %t, %v; want fail-closed error without providerID", exists, err)
+				}
+			} else if err != nil || exists {
 				t.Fatalf("InstanceExists() = %t, %v; want false, nil for deleted tombstone", exists, err)
 			}
 			if _, err := provider.InstanceMetadata(context.Background(), test.node); !errors.Is(err, cloud.InstanceNotFound) {
@@ -86,6 +437,185 @@ func TestInstancesV2TreatsHTTP200DeletedVMTombstonesAsAbsent(t *testing.T) {
 				t.Fatalf("InstanceShutdown() error = %v, want cloud.InstanceNotFound", err)
 			}
 		})
+	}
+}
+
+func TestInstancesV2SparseActiveVMRequiresCanonicalConfiguredVPCMembership(t *testing.T) {
+	base := inspace.VM{
+		UUID: testVMUUID, Name: "worker-0", Hostname: "worker-0", Status: "running",
+		BillingAccountID: 42,
+		// The live VM detail/list responses can omit network_uuid.
+		NetworkUUID: "",
+	}
+	tests := []struct {
+		name          string
+		vmNetworkUUID string
+		network       *inspace.Network
+		networkErr    error
+		wantExists    bool
+	}{
+		{
+			name:       "one canonical membership",
+			network:    &inspace.Network{UUID: testNetworkUUID, VMUUIDs: []string{testVMUUID}},
+			wantExists: true,
+		},
+		{
+			name:    "membership omitted",
+			network: &inspace.Network{UUID: testNetworkUUID},
+		},
+		{
+			name:    "membership absent",
+			network: &inspace.Network{UUID: testNetworkUUID, VMUUIDs: []string{}},
+		},
+		{
+			name:          "claimed VM network does not replace membership",
+			vmNetworkUUID: testNetworkUUID,
+			network:       &inspace.Network{UUID: testNetworkUUID, VMUUIDs: []string{}},
+		},
+		{
+			name:    "membership duplicated",
+			network: &inspace.Network{UUID: testNetworkUUID, VMUUIDs: []string{testVMUUID, testVMUUID}},
+		},
+		{
+			name:    "membership contains empty or null unrelated member",
+			network: &inspace.Network{UUID: testNetworkUUID, VMUUIDs: []string{testVMUUID, ""}},
+		},
+		{
+			name:    "membership contains malformed unrelated member",
+			network: &inspace.Network{UUID: testNetworkUUID, VMUUIDs: []string{testVMUUID, "bad"}},
+		},
+		{
+			name: "membership contains case-fold duplicate unrelated member",
+			network: &inspace.Network{UUID: testNetworkUUID, VMUUIDs: []string{
+				testVMUUID,
+				"cccccccc-1111-4222-8333-dddddddddddd",
+				"CCCCCCCC-1111-4222-8333-DDDDDDDDDDDD",
+			}},
+		},
+		{
+			name:    "membership is not canonical",
+			network: &inspace.Network{UUID: testNetworkUUID, VMUUIDs: []string{strings.ToUpper(testVMUUID)}},
+		},
+		{
+			name:    "wrong VPC identity",
+			network: &inspace.Network{UUID: "99999999-2222-4333-8444-555555555555", VMUUIDs: []string{testVMUUID}},
+		},
+		{
+			name:       "VPC read HTTP error",
+			networkErr: &inspace.APIError{StatusCode: 503, Method: "GET", Path: "/network", Message: "unavailable"},
+		},
+	}
+	for _, mode := range []string{"exact provider ID", "name inventory"} {
+		t.Run(mode, func(t *testing.T) {
+			for _, test := range tests {
+				t.Run(test.name, func(t *testing.T) {
+					fake := &fakeAPI{network: test.network, networkErr: test.networkErr}
+					response := base
+					response.NetworkUUID = test.vmNetworkUUID
+					var api API = fake
+					node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "worker-0"}}
+					if mode == "exact provider ID" {
+						api = &exactVMResponseAPI{fakeAPI: fake, response: &response}
+						node.Spec.ProviderID = "inspace://bkk01/" + testVMUUID
+					} else {
+						fake.vms = []inspace.VM{response}
+					}
+					provider := newTestProvider(t, api)
+
+					exists, err := provider.InstanceExists(context.Background(), node)
+					if test.wantExists {
+						if err != nil || !exists {
+							t.Fatalf("InstanceExists() = %t, %v; want true, nil", exists, err)
+						}
+						return
+					}
+					if err == nil || exists || errors.Is(err, cloud.InstanceNotFound) {
+						t.Fatalf("InstanceExists() = %t, %v; want fail-closed VPC validation", exists, err)
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestInstancesV2NameResolutionRequiresExactVMNameAgreement(t *testing.T) {
+	discovered := inspace.VM{
+		UUID: testVMUUID, Name: "worker-0", Hostname: "worker-0", Status: "running",
+		BillingAccountID: 42,
+	}
+	exact := discovered
+	exact.Name = "renamed-worker"
+	exact.Hostname = "renamed-worker"
+	api := &splitVMReadbackAPI{
+		fakeAPI: &fakeAPI{network: &inspace.Network{
+			UUID: testNetworkUUID, VMUUIDs: []string{testVMUUID},
+		}},
+		exact: exact, listed: []inspace.VM{discovered},
+	}
+	provider := newTestProvider(t, api)
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "worker-0"}}
+
+	exists, err := provider.InstanceExists(context.Background(), node)
+	if err == nil || exists || errors.Is(err, cloud.InstanceNotFound) {
+		t.Fatalf("InstanceExists() = %t, %v; want fail-closed list/detail name disagreement", exists, err)
+	}
+}
+
+func TestInstancesV2RejectsMalformedOrForeignExactVMResponses(t *testing.T) {
+	base := inspace.VM{
+		UUID: testVMUUID, Status: "running", BillingAccountID: 42, NetworkUUID: testNetworkUUID,
+	}
+	for _, test := range []struct {
+		name     string
+		response *inspace.VM
+	}{
+		{name: "empty response"},
+		{name: "sparse deleted tombstone", response: &inspace.VM{Status: "Deleted"}},
+		{name: "wrong UUID", response: func() *inspace.VM {
+			vm := base
+			vm.UUID = "99999999-1111-4222-8333-444444444444"
+			return &vm
+		}()},
+		{name: "wrong billing account", response: func() *inspace.VM {
+			vm := base
+			vm.BillingAccountID++
+			return &vm
+		}()},
+		{name: "wrong VPC", response: func() *inspace.VM {
+			vm := base
+			vm.NetworkUUID = "99999999-2222-4333-8444-555555555555"
+			return &vm
+		}()},
+		{name: "missing status", response: func() *inspace.VM {
+			vm := base
+			vm.Status = ""
+			return &vm
+		}()},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			provider := newTestProvider(t, &exactVMResponseAPI{fakeAPI: &fakeAPI{}, response: test.response})
+			node := &corev1.Node{Spec: corev1.NodeSpec{ProviderID: "inspace://bkk01/" + testVMUUID}}
+
+			exists, err := provider.InstanceExists(context.Background(), node)
+			if err == nil || exists || errors.Is(err, cloud.InstanceNotFound) {
+				t.Fatalf("InstanceExists() = %t, %v; want fail-closed response validation", exists, err)
+			}
+			if _, err := provider.InstanceMetadata(context.Background(), node); err == nil || errors.Is(err, cloud.InstanceNotFound) {
+				t.Fatalf("InstanceMetadata() error = %v, want fail-closed response validation", err)
+			}
+		})
+	}
+}
+
+func TestInstancesV2NameResolutionRejectsSparseDeletedTombstone(t *testing.T) {
+	provider := newTestProvider(t, &fakeAPI{vms: []inspace.VM{{
+		UUID: testVMUUID, Name: "worker-0", Hostname: "worker-0", Status: "Deleted",
+	}}})
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "worker-0"}}
+
+	exists, err := provider.InstanceExists(context.Background(), node)
+	if err == nil || exists || errors.Is(err, cloud.InstanceNotFound) {
+		t.Fatalf("InstanceExists() = %t, %v; want sparse name tombstone rejection", exists, err)
 	}
 }
 
@@ -107,7 +637,7 @@ func TestNodeLoadBalancerConfigDefaultsNodesPerShardToOne(t *testing.T) {
 func TestInstancesV2MetadataPreservesKarpenterInstanceType(t *testing.T) {
 	api := &fakeAPI{vms: []inspace.VM{{
 		UUID: testVMUUID, Name: "worker-0", Hostname: "worker-0", Status: "running",
-		VCPU: 4, MemoryMiB: 8192, PrivateIPv4: "10.0.0.10",
+		VCPU: 4, MemoryMiB: 8192, PrivateIPv4: "10.0.0.10", BillingAccountID: 42, NetworkUUID: testNetworkUUID,
 		Description: `{"schema":"karpenter.inspace.cloud/v1","instanceType":"is-general-4c-8g"}`,
 	}}}
 	provider := newTestProvider(t, api)
@@ -260,7 +790,7 @@ type splitVMReadbackAPI struct {
 
 func (a *splitVMReadbackAPI) GetVM(_ context.Context, _ string, uuid string) (*inspace.VM, error) {
 	if uuid != a.exact.UUID {
-		return nil, &inspace.APIError{StatusCode: 404, Method: "GET", Path: "/vm", Message: "not found"}
+		return nil, exactVMNotFound(uuid)
 	}
 	copy := a.exact
 	return &copy, nil
@@ -1113,7 +1643,9 @@ func (f *fakeAPI) GetNetwork(_ context.Context, _, uuid string) (*inspace.Networ
 	}
 	if f.network != nil {
 		copy := *f.network
-		copy.VMUUIDs = append([]string(nil), f.network.VMUUIDs...)
+		if f.network.VMUUIDs != nil {
+			copy.VMUUIDs = append([]string{}, f.network.VMUUIDs...)
+		}
 		return &copy, nil
 	}
 	inventory := f.vmInventory()
@@ -1157,7 +1689,7 @@ func (f *fakeAPI) GetVM(_ context.Context, _ string, uuid string) (*inspace.VM, 
 			UUID: uuid, Status: "running", BillingAccountID: 42, NetworkUUID: testNetworkUUID,
 		}, nil
 	}
-	return nil, &inspace.APIError{StatusCode: 404, Method: "GET", Path: "/vm", Message: "not found"}
+	return nil, exactVMNotFound(uuid)
 }
 func (f *fakeAPI) ListLoadBalancers(context.Context, string) ([]inspace.LoadBalancer, error) {
 	items := make([]inspace.LoadBalancer, len(f.lbs))
@@ -1180,12 +1712,12 @@ func (f *fakeAPI) GetLoadBalancer(_ context.Context, _ string, uuid string) (*in
 			if copy.BillingAccountID == 0 {
 				copy.BillingAccountID = 42
 			}
-			copy.ForwardingRules = append([]inspace.LoadBalancerRule(nil), f.lbs[index].ForwardingRules...)
-			copy.Targets = append([]inspace.LoadBalancerTarget(nil), f.lbs[index].Targets...)
+			copy.ForwardingRules = append([]inspace.LoadBalancerRule{}, f.lbs[index].ForwardingRules...)
+			copy.Targets = append([]inspace.LoadBalancerTarget{}, f.lbs[index].Targets...)
 			return &copy, nil
 		}
 	}
-	return nil, &inspace.APIError{StatusCode: 404, Method: "GET", Path: "/network/load_balancers/" + uuid, Message: "not found"}
+	return nil, exactLoadBalancerNotFound(uuid)
 }
 func (f *fakeAPI) CreateLoadBalancer(_ context.Context, _ string, request inspace.CreateLoadBalancerRequest) (*inspace.LoadBalancer, error) {
 	f.creates = append(f.creates, request)
@@ -1268,6 +1800,15 @@ func (f *fakeAPI) RemoveLoadBalancerRule(_ context.Context, _, loadBalancerUUID,
 func (f *fakeAPI) ListFloatingIPs(context.Context, string, *inspace.FloatingIPFilters) ([]inspace.FloatingIP, error) {
 	return f.floatingIPs, nil
 }
+func (f *fakeAPI) GetFloatingIP(_ context.Context, _ string, address string) (*inspace.FloatingIP, error) {
+	for index := range f.floatingIPs {
+		if f.floatingIPs[index].Address == address {
+			copy := f.floatingIPs[index]
+			return &copy, nil
+		}
+	}
+	return nil, exactFloatingIPNotFound(address)
+}
 func (f *fakeAPI) CreateFloatingIP(_ context.Context, _ string, request inspace.CreateFloatingIPRequest) (*inspace.FloatingIP, error) {
 	item := inspace.FloatingIP{Name: request.Name, Address: "203.0.113.20", BillingAccountID: request.BillingAccountID, Type: "public", Enabled: true}
 	if f.mutateCreateFloatingIPResponse != nil {
@@ -1315,7 +1856,11 @@ func (f *fakeAPI) DeleteFloatingIP(_ context.Context, _, address string) error {
 }
 
 func (f *fakeAPI) ListFirewalls(context.Context, string) ([]inspace.Firewall, error) {
-	return append([]inspace.Firewall(nil), f.firewalls...), nil
+	items := append([]inspace.Firewall(nil), f.firewalls...)
+	for index := range items {
+		items[index].ResourcesAssigned = append([]inspace.FirewallResource{}, f.firewalls[index].ResourcesAssigned...)
+	}
+	return items, nil
 }
 
 func (f *fakeAPI) CreateFirewall(_ context.Context, _ string, request inspace.CreateFirewallRequest) (*inspace.Firewall, error) {

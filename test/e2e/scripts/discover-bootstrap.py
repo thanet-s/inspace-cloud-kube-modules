@@ -7,21 +7,14 @@ import json
 import os
 import pathlib
 import re
-import ssl
-import tempfile
 import urllib.parse
-import urllib.request
+
+from durable_io import atomic_write_json
+from strict_inspace_api import location_api_get
 
 
 def api_get(path: str):
-    base = os.environ["INSPACE_API_URL"].rstrip("/")
-    location = os.environ["INSPACE_LOCATION"]
-    request = urllib.request.Request(
-        f"{base}/v1/{location}/{path}",
-        headers={"apikey": os.environ["INSPACE_API_TOKEN"], "User-Agent": "inspace-rke2-e2e-bootstrap/1"},
-    )
-    with urllib.request.urlopen(request, timeout=60, context=ssl.create_default_context()) as response:
-        return json.load(response)
+    return location_api_get(path, user_agent="inspace-rke2-e2e-bootstrap/2")
 
 
 VM_UUID_PATTERN = re.compile(
@@ -74,7 +67,12 @@ def require_public_ipv4(value: object, label: str) -> str:
 
 
 def require_private_ipv4(value: object, subnet: ipaddress.IPv4Network, label: str) -> str:
-    address = ipaddress.ip_address(str(value))
+    try:
+        address = ipaddress.ip_address(str(value))
+    except ValueError as error:
+        raise SystemExit(
+            f"{label} must be private IPv4 inside the configured VPC"
+        ) from error
     if address.version != 4 or not address.is_private or address not in subnet:
         raise SystemExit(f"{label} must be private IPv4 inside the configured VPC")
     return str(address)
@@ -205,22 +203,6 @@ def validate_bastion_firewall(
             raise SystemExit(f"bastion {protocol} egress must be unrestricted")
 
 
-def atomic_write(path: pathlib.Path, value) -> None:
-    fd, temporary = tempfile.mkstemp(prefix=path.name + ".", dir=path.parent)
-    try:
-        os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as stream:
-            json.dump(value, stream, indent=2, sort_keys=True)
-            stream.write("\n")
-        os.replace(temporary, path)
-    except BaseException:
-        try:
-            os.unlink(temporary)
-        except FileNotFoundError:
-            pass
-        raise
-
-
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--state", required=True)
@@ -260,34 +242,53 @@ def main() -> None:
     ):
         raise SystemExit("private Service VIP range must be usable inside the VPC and exclude the control-plane VIP")
 
-    def in_private_service_pool(value: object) -> bool:
-        try:
-            address = ipaddress.ip_address(str(value))
-        except ValueError:
-            return False
-        return address.version == 4 and int(pool_start) <= int(address) <= int(pool_stop)
-
     vms = api_get("user-resource/vm/list")
     if not isinstance(vms, list):
         raise SystemExit("VM list was not an array")
-    if any(
-        (vm.get("network_uuid") == network_uuid or vm.get("uuid") in network_member_ids)
-        and in_private_service_pool(vm.get("private_ipv4"))
-        for vm in vms
+    listed_member_vms = [vm for vm in vms if vm.get("uuid") in network_member_ids]
+    if (
+        len(listed_member_vms) != len(network_member_ids)
+        or {vm.get("uuid") for vm in listed_member_vms} != network_member_ids
+        or any(
+            vm.get("network_uuid") == network_uuid
+            and vm.get("uuid") not in network_member_ids
+            for vm in vms
+        )
     ):
-        raise SystemExit("operator-reserved private Service VIP range collides with a VPC VM")
+        raise SystemExit(
+            "configured VPC membership and strict VM list are not a bijection"
+        )
+    vpc_vm_by_name = canonical_owned_vm_details(listed_member_vms)
+    for name, vm in vpc_vm_by_name.items():
+        validate_optional_vm_network_uuid(vm, network_uuid, name)
+        private_address = require_private_ipv4(
+            vm.get("private_ipv4"),
+            subnet,
+            f"{name} private address",
+        )
+        if (
+            int(pool_start)
+            <= int(ipaddress.ip_address(private_address))
+            <= int(pool_stop)
+        ):
+            raise SystemExit(
+                "operator-reserved private Service VIP range collides with a VPC VM"
+            )
     cluster_resource_name = require_cluster_resource_name(state["clusterResourceName"])
     expected_cp_names = [f"{cluster_resource_name}-cp{index}" for index in range(3)]
     bastion_name, bastion_firewall_name, bastion_fip_name = bastion_resource_names(
         cluster_resource_name, owner
     )
-    listed_owned_vms = [
-        vm for vm in vms
-        if vm.get("name") in {*expected_cp_names, bastion_name}
-    ]
-    if len(listed_owned_vms) != 4 or {vm.get("name") for vm in listed_owned_vms} != {*expected_cp_names, bastion_name}:
-        raise SystemExit("expected exactly three control planes and one deterministic bastion")
-    vm_by_name = canonical_owned_vm_details(listed_owned_vms)
+    expected_owned_names = {*expected_cp_names, bastion_name}
+    vm_by_name = {
+        name: vm
+        for name, vm in vpc_vm_by_name.items()
+        if name in expected_owned_names
+    }
+    if len(vm_by_name) != 4 or set(vm_by_name) != expected_owned_names:
+        raise SystemExit(
+            "expected exactly three control planes and one deterministic bastion"
+        )
     owned_vms = list(vm_by_name.values())
     result_cp_ids = result.get("controlPlaneVMs")
     if not isinstance(result_cp_ids, list) or len(result_cp_ids) != 3 or len(set(result_cp_ids)) != 3:
@@ -526,7 +527,7 @@ def main() -> None:
         "bootstrapCacheRegistry": cache_registry,
         "bootstrapCacheCABundle": cache_ca_bundle,
     })
-    atomic_write(state_path, state)
+    atomic_write_json(state_path, state)
     print(json.dumps({"controlPlanes": control_planes, "bastion": {
         "uuid": bastion["uuid"], "name": bastion_name,
         "privateIPv4": bastion_private, "publicIPv4": bastion_public,

@@ -123,6 +123,28 @@ test "$(grep -Fc '        fsGroup: 65532' "$tmpdir/csi-controller.yaml")" -eq 1
 test "$(grep -Fc '            runAsGroup: 65532' "$tmpdir/csi-controller.yaml")" -eq 1
 test "$(grep -Fc '            - name: INSPACE_NETWORK_UUID' "$tmpdir/csi-controller.yaml")" -eq 1
 grep -Fx '              value: "11111111-1111-4111-8111-111111111111"' "$tmpdir/csi-controller.yaml" >/dev/null
+test "$(grep -Fc '            - --timeout=600s' "$tmpdir/csi-controller.yaml")" -eq 2
+
+helm template bootstrap "$chart" --namespace kube-system --values "$values" \
+  --set csi.sidecars.provisioner.timeoutSeconds=720 \
+  --show-only templates/csi-controller.yaml >"$tmpdir/csi-controller-long-timeout.yaml"
+test "$(grep -Fc '            - --timeout=720s' "$tmpdir/csi-controller-long-timeout.yaml")" -eq 1
+test "$(grep -Fc '            - --timeout=600s' "$tmpdir/csi-controller-long-timeout.yaml")" -eq 1
+helm template bootstrap "$chart" --namespace kube-system --values "$values" \
+  --set csi.sidecars.attacher.timeoutSeconds=720 \
+  --show-only templates/csi-controller.yaml >"$tmpdir/csi-controller-long-attacher-timeout.yaml"
+test "$(grep -Fc '            - --timeout=720s' "$tmpdir/csi-controller-long-attacher-timeout.yaml")" -eq 1
+test "$(grep -Fc '            - --timeout=600s' "$tmpdir/csi-controller-long-attacher-timeout.yaml")" -eq 1
+if helm template invalid "$chart" --namespace kube-system --values "$values" \
+  --set csi.sidecars.provisioner.timeoutSeconds=599 >/dev/null 2>&1; then
+  echo "unsafe CSI provisioner timeout unexpectedly rendered" >&2
+  exit 1
+fi
+if helm template invalid "$chart" --namespace kube-system --values "$values" \
+  --set csi.sidecars.attacher.timeoutSeconds=599 >/dev/null 2>&1; then
+  echo "unsafe CSI attacher timeout unexpectedly rendered" >&2
+  exit 1
+fi
 
 helm template bootstrap "$chart" --namespace kube-system --values "$values" \
   --show-only templates/karpenter-deployment.yaml >"$tmpdir/karpenter.yaml"
@@ -213,6 +235,7 @@ grep -Fx '    resources: ["tokenreviews"]' "$standalone_ccm" >/dev/null
 grep -Fx '    resources: ["subjectaccessreviews"]' "$standalone_ccm" >/dev/null
 require_toleration "$standalone_csi"
 require_toleration "$standalone_karpenter"
+test "$(grep -Fc '            - --timeout=600s' "$standalone_csi")" -eq 2
 grep -F '            - name: INSPACE_NETWORK_UUID' "$standalone_karpenter" >/dev/null
 grep -F '            - name: INSPACE_CONTROL_PLANE_VIP' "$standalone_karpenter" >/dev/null
 

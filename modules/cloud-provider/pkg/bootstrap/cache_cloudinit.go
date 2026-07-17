@@ -13,15 +13,19 @@ import (
 )
 
 type CacheBastionCloudInitInput struct {
-	NodeName          string
-	PrivateSubnet     string
-	CacheHostname     string
-	RKE2Version       string
-	ModuleVersion     string
-	Disable           []string
-	CACertificate     string
-	ServerCertificate string
-	ServerPrivateKey  string
+	NodeName      string
+	PrivateSubnet string
+	CacheHostname string
+	RKE2Version   string
+	ModuleVersion string
+	// ModuleImageDigests optionally pins the three released module sources to
+	// their linux/amd64 platform manifests while retaining version-tagged
+	// targets inside the private bootstrap registry.
+	ModuleImageDigests map[string]string
+	Disable            []string
+	CACertificate      string
+	ServerCertificate  string
+	ServerPrivateKey   string
 	// SkipOSUpgrade removes only apt-get upgrade from the bounded package
 	// stage. Repository setup, apt-get update, and required installs remain.
 	SkipOSUpgrade bool
@@ -56,7 +60,12 @@ func RenderCacheBastionCloudInitJSON(input CacheBastionCloudInitInput) (string, 
 	if err := validateCacheTLSMaterial(input); err != nil {
 		return "", err
 	}
-	imageManifest, err := renderCacheImageManifest(input.RKE2Version, input.ModuleVersion, input.Disable)
+	imageManifest, err := renderCacheImageManifestWithDigests(
+		input.RKE2Version,
+		input.ModuleVersion,
+		input.Disable,
+		input.ModuleImageDigests,
+	)
 	if err != nil {
 		return "", err
 	}

@@ -653,13 +653,12 @@ func (c *nodeLoadBalancerController) authorizePublicNodeLocalNode(
 	if network == nil || !strings.EqualFold(network.UUID, c.provider.config.NetworkUUID) {
 		return false, false, nil
 	}
-	memberships := 0
-	for _, vmUUID := range network.VMUUIDs {
-		if vmUUID == providerIdentity.UUID {
-			memberships++
-		}
+	members, membershipErr := canonicalConfiguredVPCVMUUIDs(providerIdentity.Location, network)
+	if membershipErr != nil {
+		return false, false, fmt.Errorf("public-node-local: canonical VPC membership for Node %s is invalid: %w", node.Name, membershipErr)
 	}
-	if memberships != 1 {
+	member, present := members[providerIdentity.UUID]
+	if !present || member != providerIdentity.UUID {
 		return false, false, nil
 	}
 	var ownership publicNodeLocalVMOwnership
@@ -1280,7 +1279,11 @@ func (c *nodeLoadBalancerController) publicNodeLocalServiceStillExposed(
 		return false, fmt.Errorf("public-node-local: inspect conflict peer firewalls: %w", err)
 	}
 	for _, firewall := range owned {
-		if len(firewall.ResourcesAssigned) != 0 {
+		assignments, assignmentErr := nodeLoadBalancerFirewallVMAssignments(firewall)
+		if assignmentErr != nil {
+			return false, assignmentErr
+		}
+		if len(assignments) != 0 {
 			return true, nil
 		}
 	}

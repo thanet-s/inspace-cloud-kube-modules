@@ -147,6 +147,28 @@ func (a *Adapter) destructiveReadbackContext(parent context.Context) (context.Co
 	return context.WithTimeout(context.WithoutCancel(parent), a.destructive)
 }
 
+// requireMutationDispatchReserve is the final local guard before a cloud
+// mutation. The reserve contains the shared client's five-minute mutation
+// deadline, the driver's two-minute destructive recovery window, and one
+// minute for authoritative readback and durable Lease persistence. Unbounded
+// contexts have no caller deadline to exhaust and are accepted.
+func requireMutationDispatchReserve(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	deadline, bounded := ctx.Deadline()
+	if !bounded {
+		return nil
+	}
+	if remaining := time.Until(deadline); remaining < minimumMutationDispatchReserve {
+		return fmt.Errorf(
+			"%w: CSI mutation requires 480s of deadline reserve at dispatch; only %s remains",
+			cloud.ErrUnavailable, remaining.Round(time.Millisecond),
+		)
+	}
+	return nil
+}
+
 func (a *Adapter) beginDiskCreateFence(ctx context.Context, intent diskCreateIntent) (mutationFence, bool, error) {
 	key := diskCreateFenceKey(intent.Location, intent.Name)
 	if current, err := a.fences.Get(ctx, key); err != nil {
@@ -697,6 +719,10 @@ func (a *Adapter) observeDetachState(ctx context.Context, intent diskAttachmentI
 	default:
 		if err := a.validateExactVM(*vm, intent.PreviousVMUUID); err != nil {
 			exactStateErr = err
+			break
+		}
+		if relationErr := requireExactVMAttachmentCollection(*vm, intent.DiskUUID); relationErr != nil {
+			exactStateErr = relationErr
 			break
 		}
 		rows := 0

@@ -130,6 +130,7 @@ type API interface {
 	AddLoadBalancerRule(context.Context, string, string, inspace.LoadBalancerRule) (*inspace.LoadBalancerRule, error)
 	RemoveLoadBalancerRule(context.Context, string, string, string) error
 	ListFloatingIPs(context.Context, string, *inspace.FloatingIPFilters) ([]inspace.FloatingIP, error)
+	GetFloatingIP(context.Context, string, string) (*inspace.FloatingIP, error)
 	CreateFloatingIP(context.Context, string, inspace.CreateFloatingIPRequest) (*inspace.FloatingIP, error)
 	AssignFloatingIP(context.Context, string, string, string, string) (*inspace.FloatingIP, error)
 	UnassignFloatingIP(context.Context, string, string) (*inspace.FloatingIP, error)
@@ -179,6 +180,24 @@ type Provider struct {
 	endpointSlicesSynced         cache.InformerSynced
 	standardNLBNow               func() time.Time
 	standardNLBAbsentDelay       time.Duration
+}
+
+// exactVMReadAbsenceError distinguishes absence returned by the one canonical
+// providerID GetVM request from other InstanceNotFound outcomes. InstanceExists
+// must corroborate this evidence before returning false, while metadata and
+// shutdown callers may continue to recognize it as cloud.InstanceNotFound.
+type exactVMReadAbsenceError struct {
+	location string
+	uuid     string
+	cause    error
+}
+
+func (e *exactVMReadAbsenceError) Error() string {
+	return fmt.Sprintf("cloudprovider: exact VM %s/%s is absent: %v", e.location, e.uuid, e.cause)
+}
+
+func (e *exactVMReadAbsenceError) Unwrap() []error {
+	return []error{cloud.InstanceNotFound, e.cause}
 }
 
 func New(api API, config Config) (*Provider, error) {
@@ -358,7 +377,21 @@ func (p *Provider) Routes() (cloud.Routes, bool)             { return nil, false
 
 func (p *Provider) InstanceExists(ctx context.Context, node *corev1.Node) (bool, error) {
 	_, err := p.resolveVM(ctx, node)
-	if inspace.IsNotFound(err) || errors.Is(err, cloud.InstanceNotFound) {
+	var exactAbsence *exactVMReadAbsenceError
+	if errors.As(err, &exactAbsence) {
+		if corroborationErr := p.corroborateExactVMAbsence(ctx, exactAbsence.location, exactAbsence.uuid); corroborationErr != nil {
+			return false, corroborationErr
+		}
+		return false, nil
+	}
+	if errors.Is(err, cloud.InstanceNotFound) {
+		// External cloud-node-lifecycle can call InstanceExists before the
+		// cloud-node controller has initialized providerID, and it deletes a
+		// NotReady Node immediately after one false result. A name-list omission
+		// alone must therefore remain uncertainty rather than absence.
+		if node == nil || node.Spec.ProviderID == "" {
+			return false, errors.New("cloudprovider: cannot establish VM absence for a Node without providerID")
+		}
 		return false, nil
 	}
 	return err == nil, err
@@ -493,12 +526,25 @@ func (p *Provider) resolveVM(ctx context.Context, node *corev1.Node) (*inspace.V
 		if err != nil {
 			return nil, fmt.Errorf("cloudprovider: parse provider ID: %w", err)
 		}
+		if id.String() != node.Spec.ProviderID || id.Location != p.config.Location {
+			return nil, fmt.Errorf("cloudprovider: provider ID %q is not canonical for configured location %q", node.Spec.ProviderID, p.config.Location)
+		}
 		vm, err := p.api.GetVM(ctx, id.Location, id.UUID)
 		if err != nil {
+			if inspace.IsNotFound(err) {
+				return nil, &exactVMReadAbsenceError{location: id.Location, uuid: id.UUID, cause: err}
+			}
 			return nil, err
 		}
-		if vm == nil || strings.EqualFold(strings.TrimSpace(vm.Status), "deleted") {
-			return nil, cloud.InstanceNotFound
+		if err := p.validateResolvedVM(ctx, vm, id.UUID); err != nil {
+			return nil, err
+		}
+		if strings.EqualFold(strings.TrimSpace(vm.Status), "deleted") {
+			return nil, &exactVMReadAbsenceError{
+				location: id.Location,
+				uuid:     id.UUID,
+				cause:    errors.New("HTTP-200 VM detail is a deleted tombstone"),
+			}
 		}
 		return vm, nil
 	}
@@ -508,12 +554,13 @@ func (p *Provider) resolveVM(ctx context.Context, node *corev1.Node) (*inspace.V
 	}
 	var matches []*inspace.VM
 	for i := range vms {
-		if strings.EqualFold(strings.TrimSpace(vms[i].Status), "deleted") {
+		if vms[i].Name != node.Name && vms[i].Hostname != node.Name {
 			continue
 		}
-		if vms[i].Name == node.Name || vms[i].Hostname == node.Name {
-			matches = append(matches, &vms[i])
+		if err := p.validateResolvedVMIdentity(&vms[i], ""); err != nil {
+			return nil, fmt.Errorf("cloudprovider: validate VM inventory row matching node name %q: %w", node.Name, err)
 		}
+		matches = append(matches, &vms[i])
 	}
 	if len(matches) == 0 {
 		return nil, cloud.InstanceNotFound
@@ -521,7 +568,163 @@ func (p *Provider) resolveVM(ctx context.Context, node *corev1.Node) (*inspace.V
 	if len(matches) != 1 {
 		return nil, fmt.Errorf("cloudprovider: node name %q matches %d VMs", node.Name, len(matches))
 	}
-	return matches[0], nil
+	discovered := matches[0]
+	vm, err := p.api.GetVM(ctx, p.config.Location, discovered.UUID)
+	if err != nil {
+		// The positive inventory row and an exact-read absence are contradictory
+		// API views. Preserve that split view as an error so cloud-node-lifecycle
+		// cannot delete a Kubernetes Node during transient detail inconsistency.
+		return nil, fmt.Errorf("cloudprovider: read exact VM discovered for node name %q: %w", node.Name, err)
+	}
+	if err := p.validateResolvedVM(ctx, vm, discovered.UUID); err != nil {
+		return nil, fmt.Errorf("cloudprovider: validate exact VM discovered for node name %q: %w", node.Name, err)
+	}
+	if vm.Name != node.Name && vm.Hostname != node.Name {
+		return nil, fmt.Errorf(
+			"cloudprovider: exact VM %s no longer matches discovered node name %q",
+			vm.UUID,
+			node.Name,
+		)
+	}
+	if strings.EqualFold(strings.TrimSpace(vm.Status), "deleted") {
+		return nil, cloud.InstanceNotFound
+	}
+	return vm, nil
+}
+
+func (p *Provider) corroborateExactVMAbsence(ctx context.Context, location, vmUUID string) error {
+	vms, err := p.api.ListVMs(ctx, location)
+	if err != nil {
+		return fmt.Errorf("cloudprovider: corroborate exact VM %s absence with VM inventory: %w", vmUUID, err)
+	}
+	if vms == nil {
+		return fmt.Errorf("cloudprovider: corroborate exact VM %s absence: VM inventory returned an empty response", vmUUID)
+	}
+	listed := make(map[string]struct{}, len(vms))
+	for index := range vms {
+		if _, err := providerid.New(location, vms[index].UUID); err != nil {
+			return fmt.Errorf(
+				"cloudprovider: corroborate exact VM %s absence: VM inventory row %d has invalid UUID %q: %w",
+				vmUUID,
+				index,
+				vms[index].UUID,
+				err,
+			)
+		}
+		canonical := strings.ToLower(vms[index].UUID)
+		if _, duplicate := listed[canonical]; duplicate {
+			return fmt.Errorf("cloudprovider: corroborate exact VM %s absence: VM inventory duplicates UUID %s", vmUUID, canonical)
+		}
+		listed[canonical] = struct{}{}
+	}
+	if _, present := listed[strings.ToLower(vmUUID)]; present {
+		return fmt.Errorf("cloudprovider: exact VM %s read is absent but VM inventory still contains it", vmUUID)
+	}
+
+	network, err := p.api.GetNetwork(ctx, location, p.config.NetworkUUID)
+	if err != nil {
+		return fmt.Errorf("cloudprovider: corroborate exact VM %s absence with configured VPC: %w", vmUUID, err)
+	}
+	if network == nil {
+		return fmt.Errorf("cloudprovider: corroborate exact VM %s absence: configured VPC returned an empty response", vmUUID)
+	}
+	if network.UUID != p.config.NetworkUUID {
+		return fmt.Errorf(
+			"cloudprovider: corroborate exact VM %s absence: configured VPC identity is %q, expected %q",
+			vmUUID,
+			network.UUID,
+			p.config.NetworkUUID,
+		)
+	}
+	members, membershipErr := canonicalConfiguredVPCVMUUIDs(location, network)
+	if membershipErr != nil {
+		return fmt.Errorf(
+			"cloudprovider: corroborate exact VM %s absence: configured VPC membership is invalid: %w",
+			vmUUID,
+			membershipErr,
+		)
+	}
+	if _, present := members[strings.ToLower(vmUUID)]; present {
+		return fmt.Errorf("cloudprovider: exact VM %s read is absent but configured VPC still contains it", vmUUID)
+	}
+	return nil
+}
+
+func (p *Provider) validateResolvedVM(ctx context.Context, vm *inspace.VM, expectedUUID string) error {
+	if err := p.validateResolvedVMIdentity(vm, expectedUUID); err != nil {
+		return err
+	}
+	// Deleted VM detail/list tombstones can outlive their VPC membership and
+	// omit network_uuid. Their exact UUID, billing account, and terminal status
+	// are sufficient only to report InstanceNotFound; they never authorize an
+	// active-node result or a cloud mutation.
+	if strings.EqualFold(strings.TrimSpace(vm.Status), "deleted") {
+		return nil
+	}
+	// VM network_uuid is useful corroboration but is not authoritative by
+	// itself. InSpace active VM detail/list responses can omit it, and malformed
+	// HTTP-200 rows can claim it. Independently prove one canonical membership
+	// in the configured VPC before exposing any active VM through InstancesV2.
+	network, err := p.api.GetNetwork(ctx, p.config.Location, p.config.NetworkUUID)
+	if err != nil {
+		return fmt.Errorf("cloudprovider: read configured VPC for VM %s: %w", vm.UUID, err)
+	}
+	if network == nil {
+		return fmt.Errorf("cloudprovider: configured VPC read for VM %s returned an empty response", vm.UUID)
+	}
+	if network.UUID != p.config.NetworkUUID {
+		return fmt.Errorf(
+			"cloudprovider: configured VPC read for VM %s returned identity %q, expected %q",
+			vm.UUID,
+			network.UUID,
+			p.config.NetworkUUID,
+		)
+	}
+	members, membershipErr := canonicalConfiguredVPCVMUUIDs(p.config.Location, network)
+	if membershipErr != nil {
+		return fmt.Errorf("cloudprovider: configured VPC membership for VM %s is invalid: %w", vm.UUID, membershipErr)
+	}
+	canonicalVMUUID := strings.ToLower(vm.UUID)
+	member, present := members[canonicalVMUUID]
+	if !present || member != canonicalVMUUID {
+		return fmt.Errorf(
+			"cloudprovider: VM %s lacks one exact canonical configured-VPC membership",
+			vm.UUID,
+		)
+	}
+	return nil
+}
+
+func (p *Provider) validateResolvedVMIdentity(vm *inspace.VM, expectedUUID string) error {
+	if vm == nil {
+		return errors.New("cloudprovider: exact VM read returned an empty response")
+	}
+	if _, err := providerid.New(p.config.Location, vm.UUID); err != nil {
+		return fmt.Errorf("cloudprovider: VM response has invalid UUID %q: %w", vm.UUID, err)
+	}
+	if expectedUUID != "" && !strings.EqualFold(vm.UUID, expectedUUID) {
+		return fmt.Errorf("cloudprovider: exact VM response UUID %q does not match requested UUID %q", vm.UUID, expectedUUID)
+	}
+	if strings.TrimSpace(vm.Status) == "" {
+		return fmt.Errorf("cloudprovider: VM %s response omitted status", vm.UUID)
+	}
+	if p.config.BillingAccountID <= 0 || vm.BillingAccountID != p.config.BillingAccountID {
+		return fmt.Errorf(
+			"cloudprovider: VM %s belongs to billing account %d, expected %d",
+			vm.UUID,
+			vm.BillingAccountID,
+			p.config.BillingAccountID,
+		)
+	}
+	if vm.NetworkUUID != "" && !strings.EqualFold(vm.NetworkUUID, p.config.NetworkUUID) {
+		return fmt.Errorf(
+			"cloudprovider: VM %s belongs to network %q, expected %q",
+			vm.UUID,
+			vm.NetworkUUID,
+			p.config.NetworkUUID,
+		)
+	}
+	return nil
 }
 
 func (p *Provider) GetLoadBalancerName(_ context.Context, _ string, service *corev1.Service) string {
@@ -2018,11 +2221,10 @@ func (p *Provider) findOwnedFloatingIP(ctx context.Context, service *corev1.Serv
 	return found, nil
 }
 
-// readExactOwnedStandardNLBFloatingIP scans the unfiltered address inventory,
-// because the API exposes no exact-address GET. A removal is absent only when
-// neither the fenced address nor the deterministic ownership name is active.
-// Renames, account drift, and name reuse are positive conflicts and retain the
-// receipt rather than becoming false negative evidence.
+// readExactOwnedStandardNLBFloatingIP corroborates the exact-address endpoint
+// with the unfiltered inventory. A 404 or exact tombstone is negative evidence
+// only when neither the fenced address nor the deterministic ownership name is
+// active in the list. Any split view retains the durable receipt.
 func (p *Provider) readExactOwnedStandardNLBFloatingIP(
 	ctx context.Context,
 	service *corev1.Service,
@@ -2032,9 +2234,22 @@ func (p *Provider) readExactOwnedStandardNLBFloatingIP(
 	if err != nil || !parsed.Is4() || !parsed.IsGlobalUnicast() || parsed.IsPrivate() || parsed.String() != address {
 		return nil, false, errors.New("cloudprovider: exact public NLB floating-IP read requires a canonical global IPv4 address")
 	}
-	items, err := p.api.ListFloatingIPs(ctx, p.config.Location, nil)
-	if err != nil {
-		return nil, false, fmt.Errorf("cloudprovider: list exact public NLB floating IP %s: %w", address, err)
+	exactRead, exactErr := p.api.GetFloatingIP(ctx, p.config.Location, address)
+	exactAbsent := false
+	if exactErr != nil {
+		if !inspace.IsNotFound(exactErr) {
+			return nil, false, fmt.Errorf("cloudprovider: read exact public NLB floating IP %s: %w", address, exactErr)
+		}
+		exactAbsent = true
+	} else {
+		if exactRead == nil || exactRead.Address != address {
+			return nil, false, fmt.Errorf("cloudprovider: exact floating IP response does not match requested address %s", address)
+		}
+		exactAbsent = exactRead.IsDeleted
+	}
+	items, listErr := p.api.ListFloatingIPs(ctx, p.config.Location, nil)
+	if listErr != nil {
+		return nil, false, fmt.Errorf("cloudprovider: list exact public NLB floating IP %s: %w", address, listErr)
 	}
 	expectedName := p.floatingIPName(service)
 	var exact *inspace.FloatingIP
@@ -2061,14 +2276,29 @@ func (p *Provider) readExactOwnedStandardNLBFloatingIP(
 		}
 		named = item
 	}
-	if exact == nil {
+	if exactAbsent {
+		if exact != nil {
+			return nil, false, fmt.Errorf(
+				"cloudprovider: exact floating IP %s is absent or deleted but remains active in list readback",
+				address,
+			)
+		}
 		if named != nil {
 			return nil, false, fmt.Errorf(
-				"cloudprovider: fenced floating IP %s is absent but ownership name %q now resolves to %s",
+				"cloudprovider: exact floating IP %s is absent or deleted but ownership name %q resolves to %s",
 				address, expectedName, named.Address,
 			)
 		}
 		return nil, true, nil
+	}
+	if exactRead == nil {
+		return nil, false, fmt.Errorf("cloudprovider: exact floating IP %s returned no object", address)
+	}
+	if err := p.validateServiceFloatingIPIdentity(exactRead, service); err != nil {
+		return nil, false, err
+	}
+	if exact == nil {
+		return nil, false, fmt.Errorf("cloudprovider: exact floating IP %s is active but absent from list readback", address)
 	}
 	if err := p.validateServiceFloatingIPIdentity(exact, service); err != nil {
 		return nil, false, err
@@ -2076,7 +2306,10 @@ func (p *Provider) readExactOwnedStandardNLBFloatingIP(
 	if named == nil || named.Address != address {
 		return nil, false, fmt.Errorf("cloudprovider: exact floating IP %s is present but missing from its deterministic ownership name", address)
 	}
-	return exact, false, nil
+	if !standardNLBFloatingIPMutationStateEqual(exactRead, exact) {
+		return nil, false, fmt.Errorf("cloudprovider: exact and list floating IP state disagree for %s", address)
+	}
+	return exactRead, false, nil
 }
 
 func (p *Provider) ensurePublicFloatingIP(ctx context.Context, service *corev1.Service, loadBalancer *inspace.LoadBalancer) (*inspace.FloatingIP, error) {
@@ -2263,6 +2496,9 @@ func (p *Provider) readExactOwnedStandardNLB(
 	if err := p.validateOwnedLoadBalancerIdentity(service, exact); err != nil {
 		return nil, false, err
 	}
+	if err := requireStandardNLBRelationshipCollections(exact); err != nil {
+		return nil, false, err
+	}
 	if exactInList == nil || named == nil {
 		return nil, false, fmt.Errorf("cloudprovider: exact public NLB %s is present but missing from its deterministic-name list readback", loadBalancerUUID)
 	}
@@ -2336,6 +2572,9 @@ func standardNLBMutationStateEqual(before, after *inspace.LoadBalancer) bool {
 		before.PrivateAddress != after.PrivateAddress || before.IsDeleted != after.IsDeleted {
 		return false
 	}
+	if err := requireStandardNLBRelationshipCollections(after); err != nil {
+		return false
+	}
 	beforeTargets := append([]inspace.LoadBalancerTarget(nil), before.Targets...)
 	afterTargets := append([]inspace.LoadBalancerTarget(nil), after.Targets...)
 	sort.Slice(beforeTargets, func(i, j int) bool {
@@ -2356,7 +2595,22 @@ func standardNLBMutationStateEqual(before, after *inspace.LoadBalancer) bool {
 		right := standardNLBInitialRuleKey(afterRules[j].Protocol, afterRules[j].SourcePort, afterRules[j].TargetPort) + "\x00" + afterRules[j].UUID
 		return left < right
 	})
-	return reflect.DeepEqual(beforeTargets, afterTargets) && reflect.DeepEqual(beforeRules, afterRules)
+	targetsEqual := before.Targets == nil || reflect.DeepEqual(beforeTargets, afterTargets)
+	rulesEqual := before.ForwardingRules == nil || reflect.DeepEqual(beforeRules, afterRules)
+	return targetsEqual && rulesEqual
+}
+
+func requireStandardNLBRelationshipCollections(lb *inspace.LoadBalancer) error {
+	if lb == nil {
+		return errors.New("cloudprovider: exact public NLB relationship read returned an empty response")
+	}
+	if lb.ForwardingRules == nil {
+		return fmt.Errorf("cloudprovider: exact public NLB %s omitted forwarding_rules", lb.UUID)
+	}
+	if lb.Targets == nil {
+		return fmt.Errorf("cloudprovider: exact public NLB %s omitted targets", lb.UUID)
+	}
+	return nil
 }
 
 func standardNLBFloatingIPMutationStateEqual(before, after *inspace.FloatingIP) bool {
@@ -2826,20 +3080,15 @@ func (p *Provider) validateStandardNLBTargetVMCloudAuthority(ctx context.Context
 	if network == nil || network.UUID != p.config.NetworkUUID {
 		return errors.New("cloudprovider: public NLB target VPC identity changed")
 	}
-	memberships := 0
-	exactMembership := false
-	for _, candidate := range network.VMUUIDs {
-		if !strings.EqualFold(candidate, vmUUID) {
-			continue
-		}
-		memberships++
-		exactMembership = exactMembership || candidate == vmUUID
+	members, membershipErr := canonicalConfiguredVPCVMUUIDs(p.config.Location, network)
+	if membershipErr != nil {
+		return fmt.Errorf("cloudprovider: public NLB target VPC membership is invalid: %w", membershipErr)
 	}
-	if memberships != 1 || !exactMembership {
+	member, present := members[vmUUID]
+	if !present || member != vmUUID {
 		return fmt.Errorf(
-			"cloudprovider: public NLB target VM %s lacks unique exact VPC membership (memberships=%d)",
+			"cloudprovider: public NLB target VM %s lacks unique exact VPC membership",
 			vmUUID,
-			memberships,
 		)
 	}
 	return nil
@@ -2990,6 +3239,9 @@ func standardNLBInitialRuleKey(protocol string, sourcePort, targetPort int32) st
 }
 
 func standardNLBTargetVisible(lb *inspace.LoadBalancer, targetUUID string) (bool, error) {
+	if lb == nil || lb.Targets == nil {
+		return false, errors.New("cloudprovider: exact public NLB target relationship was omitted")
+	}
 	visible := false
 	for _, target := range lb.Targets {
 		if target.TargetUUID != targetUUID {
@@ -3007,6 +3259,9 @@ func standardNLBTargetVisible(lb *inspace.LoadBalancer, targetUUID string) (bool
 }
 
 func standardNLBRuleVisible(lb *inspace.LoadBalancer, desired inspace.LoadBalancerRule) (bool, error) {
+	if lb == nil || lb.ForwardingRules == nil {
+		return false, errors.New("cloudprovider: exact public NLB forwarding-rule relationship was omitted")
+	}
 	visible := false
 	for _, rule := range lb.ForwardingRules {
 		if rule.SourcePort != desired.SourcePort {

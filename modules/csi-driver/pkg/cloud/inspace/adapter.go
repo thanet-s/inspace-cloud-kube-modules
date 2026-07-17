@@ -16,9 +16,36 @@ import (
 	"github.com/thanet-s/inspace-cloud-kube-modules/modules/csi-driver/pkg/cloud"
 )
 
-const gib = int64(1024 * 1024 * 1024)
+const (
+	gib                               = int64(1024 * 1024 * 1024)
+	defaultMutationReadbackTimeout    = 30 * time.Second
+	defaultDestructiveAbsenceInterval = 30 * time.Second
+	defaultDestructiveReadbackTimeout = 2 * time.Minute
+	minimumMutationDispatchReserve    = 8 * time.Minute
+)
 
 var uuidPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+
+// canonicalNetworkVMMembers validates one complete network membership
+// snapshot. A nil slice is omitted authority rather than an empty VPC, and
+// duplicates are ambiguous even when only an unrelated VM is duplicated.
+func canonicalNetworkVMMembers(vmUUIDs []string) (map[string]struct{}, error) {
+	if vmUUIDs == nil {
+		return nil, errors.New("network VM membership is omitted")
+	}
+	members := make(map[string]struct{}, len(vmUUIDs))
+	for _, raw := range vmUUIDs {
+		vmUUID := strings.ToLower(strings.TrimSpace(raw))
+		if !uuidPattern.MatchString(vmUUID) {
+			return nil, fmt.Errorf("network contains invalid VM UUID %q", raw)
+		}
+		if _, duplicate := members[vmUUID]; duplicate {
+			return nil, fmt.Errorf("network contains VM %s more than once", vmUUID)
+		}
+		members[vmUUID] = struct{}{}
+	}
+	return members, nil
+}
 
 // API is the location-aware subset of the shared SDK used by CSI. Keeping it
 // narrow makes idempotency and attachment behavior testable without HTTP.
@@ -81,13 +108,13 @@ func New(api API, nodes NodeResolver, cfg Config) (*Adapter, error) {
 		cfg.PollInterval = 2 * time.Second
 	}
 	if cfg.MutationReadbackTimeout <= 0 {
-		cfg.MutationReadbackTimeout = 30 * time.Second
+		cfg.MutationReadbackTimeout = defaultMutationReadbackTimeout
 	}
 	if cfg.DestructiveAbsenceInterval <= 0 {
-		cfg.DestructiveAbsenceInterval = 30 * time.Second
+		cfg.DestructiveAbsenceInterval = defaultDestructiveAbsenceInterval
 	}
 	if cfg.DestructiveReadbackTimeout <= 0 {
-		cfg.DestructiveReadbackTimeout = 2 * time.Minute
+		cfg.DestructiveReadbackTimeout = defaultDestructiveReadbackTimeout
 	}
 	if cfg.DestructiveReadbackTimeout <= 3*cfg.DestructiveAbsenceInterval {
 		return nil, errors.New("destructive readback timeout must exceed three destructive absence intervals")
@@ -193,6 +220,9 @@ func (a *Adapter) EnsureVolume(ctx context.Context, spec cloud.VolumeSpec) (clou
 		return a.finishUndispatchedFencedDisk(readbackCtx, intent, fence, existing)
 	}
 
+	if reserveErr := requireMutationDispatchReserve(ctx); reserveErr != nil {
+		return cloud.Volume{}, a.clearUndispatchedDiskCreateFence(ctx, fence, reserveErr)
+	}
 	created, createErr := a.api.CreateDisk(ctx, spec.Location, sdk.CreateDiskRequest{
 		DisplayName:      spec.Name,
 		SizeGiB:          sizeGiB,
@@ -259,6 +289,14 @@ func (a *Adapter) DeleteVolume(ctx context.Context, location, volumeID string) e
 			return ownershipErr
 		}
 		deletedTombstone = diskDeletedTombstone(*disk)
+		if issueDelete && !deletedTombstone {
+			if relationErr := requireExactDiskSnapshotCollection(*disk, volumeID); relationErr != nil {
+				if deleteErr := a.deleteMutationFenceDetached(ctx, deleteFence); deleteErr != nil {
+					return errors.Join(relationErr, fmt.Errorf("clear unissued disk-delete fence: %w", deleteErr))
+				}
+				return relationErr
+			}
+		}
 	}
 	createFence, err := a.matchingDiskCreateFence(ctx, location, volumeID, disk)
 	if err != nil {
@@ -294,20 +332,20 @@ func (a *Adapter) DeleteVolume(ctx context.Context, location, volumeID string) e
 		return nil
 	}
 	if len(disk.Snapshots) != 0 {
-		if deleteErr := a.fences.Delete(readbackCtx, deleteFence); deleteErr != nil {
+		if deleteErr := a.deleteMutationFenceDetached(ctx, deleteFence); deleteErr != nil {
 			return errors.Join(fmt.Errorf("%w: disk %s has %d snapshot(s)", cloud.ErrSnapshotsPresent, volumeID, len(disk.Snapshots)), deleteErr)
 		}
 		return fmt.Errorf("%w: disk %s has %d snapshot(s)", cloud.ErrSnapshotsPresent, volumeID, len(disk.Snapshots))
 	}
 	attachedVM, err := a.attachedVM(ctx, location, volumeID)
 	if err != nil {
-		if deleteErr := a.fences.Delete(readbackCtx, deleteFence); deleteErr != nil {
+		if deleteErr := a.deleteMutationFenceDetached(ctx, deleteFence); deleteErr != nil {
 			return errors.Join(err, fmt.Errorf("clear unissued disk-delete fence: %w", deleteErr))
 		}
 		return err
 	}
 	if attachedVM != "" {
-		if deleteErr := a.fences.Delete(readbackCtx, deleteFence); deleteErr != nil {
+		if deleteErr := a.deleteMutationFenceDetached(ctx, deleteFence); deleteErr != nil {
 			return errors.Join(fmt.Errorf("%w: %s", cloud.ErrVolumeAttachedElsewhere, attachedVM), deleteErr)
 		}
 		return fmt.Errorf("%w: %s", cloud.ErrVolumeAttachedElsewhere, attachedVM)
@@ -317,13 +355,19 @@ func (a *Adapter) DeleteVolume(ctx context.Context, location, volumeID string) e
 	// paid destructive mutation.
 	freshDisk, err := a.getOwnedDisk(ctx, location, volumeID)
 	if err != nil {
-		if deleteErr := a.fences.Delete(readbackCtx, deleteFence); deleteErr != nil {
+		if deleteErr := a.deleteMutationFenceDetached(ctx, deleteFence); deleteErr != nil {
 			return errors.Join(err, fmt.Errorf("clear unissued disk-delete fence: %w", deleteErr))
 		}
 		return err
 	}
+	if relationErr := requireExactDiskSnapshotCollection(freshDisk, volumeID); relationErr != nil {
+		if deleteErr := a.deleteMutationFenceDetached(ctx, deleteFence); deleteErr != nil {
+			return errors.Join(relationErr, fmt.Errorf("clear unissued disk-delete fence: %w", deleteErr))
+		}
+		return relationErr
+	}
 	if len(freshDisk.Snapshots) != 0 {
-		if deleteErr := a.fences.Delete(readbackCtx, deleteFence); deleteErr != nil {
+		if deleteErr := a.deleteMutationFenceDetached(ctx, deleteFence); deleteErr != nil {
 			return errors.Join(fmt.Errorf("%w: disk %s has %d snapshot(s)", cloud.ErrSnapshotsPresent, volumeID, len(freshDisk.Snapshots)), deleteErr)
 		}
 		return fmt.Errorf("%w: disk %s has %d snapshot(s)", cloud.ErrSnapshotsPresent, volumeID, len(freshDisk.Snapshots))
@@ -333,17 +377,29 @@ func (a *Adapter) DeleteVolume(ctx context.Context, location, volumeID string) e
 	// proof as the final authority before DeleteDisk.
 	attachedVM, err = a.attachedVM(ctx, location, volumeID)
 	if err != nil {
-		if deleteErr := a.fences.Delete(readbackCtx, deleteFence); deleteErr != nil {
+		if deleteErr := a.deleteMutationFenceDetached(ctx, deleteFence); deleteErr != nil {
 			return errors.Join(err, fmt.Errorf("clear unissued disk-delete fence after final attachment read: %w", deleteErr))
 		}
 		return err
 	}
 	if attachedVM != "" {
-		if deleteErr := a.fences.Delete(readbackCtx, deleteFence); deleteErr != nil {
+		if deleteErr := a.deleteMutationFenceDetached(ctx, deleteFence); deleteErr != nil {
 			return errors.Join(fmt.Errorf("%w: %s", cloud.ErrVolumeAttachedElsewhere, attachedVM), deleteErr)
 		}
 		return fmt.Errorf("%w: %s", cloud.ErrVolumeAttachedElsewhere, attachedVM)
 	}
+	if reserveErr := requireMutationDispatchReserve(ctx); reserveErr != nil {
+		if deleteErr := a.deleteMutationFenceDetached(ctx, deleteFence); deleteErr != nil {
+			return errors.Join(reserveErr, fmt.Errorf("clear undispatched disk-delete fence: %w", deleteErr))
+		}
+		return reserveErr
+	}
+	// The earlier destructive context supports pre-existing-fence and tombstone
+	// recovery. A newly dispatched DELETE gets a fresh full recovery window
+	// after the provider call returns; otherwise a five-minute HTTP request
+	// could consume the entire two-minute absence-proof context before readback
+	// even begins.
+	cancel()
 	mutationErr := a.api.DeleteDisk(ctx, location, volumeID)
 	if errors.Is(mutationErr, sdk.ErrMutationBlocked) {
 		if deleteErr := a.deleteMutationFenceDetached(ctx, deleteFence); deleteErr != nil {
@@ -351,7 +407,9 @@ func (a *Adapter) DeleteVolume(ctx context.Context, location, volumeID string) e
 		}
 		return mutationErr
 	}
-	resolvedFence, err := a.waitForDiskAbsent(readbackCtx, location, volumeID, deleteFence)
+	postMutationCtx, postMutationCancel := a.destructiveReadbackContext(ctx)
+	defer postMutationCancel()
+	resolvedFence, err := a.waitForDiskAbsent(postMutationCtx, location, volumeID, deleteFence)
 	if err != nil {
 		return fmt.Errorf(
 			"%w: disk deletion remains ambiguous behind durable fence %s; operator must inspect cloud state before removing it: %v",
@@ -360,11 +418,11 @@ func (a *Adapter) DeleteVolume(ctx context.Context, location, volumeID string) e
 	}
 	deleteFence = resolvedFence
 	if createFence != nil {
-		if err := a.fences.Delete(readbackCtx, *createFence); err != nil {
+		if err := a.fences.Delete(postMutationCtx, *createFence); err != nil {
 			return fmt.Errorf("%w: complete matching disk-create fence after deletion: %v", cloud.ErrUnavailable, err)
 		}
 	}
-	if err := a.fences.Delete(readbackCtx, deleteFence); err != nil {
+	if err := a.fences.Delete(postMutationCtx, deleteFence); err != nil {
 		return fmt.Errorf("%w: complete disk-delete fence after absence proof: %v", cloud.ErrUnavailable, err)
 	}
 	return nil
@@ -412,6 +470,12 @@ func (a *Adapter) AttachVolume(ctx context.Context, location, volumeID, nodeID s
 		}
 		return err
 	}
+	if relationErr := requireExactVMAttachmentCollection(targetVM, volumeID); relationErr != nil {
+		if deleteErr := a.deleteMutationFenceDetached(ctx, fence); deleteErr != nil {
+			return errors.Join(relationErr, fmt.Errorf("clear unissued disk-attach fence: %w", deleteErr))
+		}
+		return relationErr
+	}
 	if rows := vmDiskRows(targetVM, volumeID); rows != 0 {
 		if rows == 1 {
 			// Canonical detail is newer than the stale list discovery. The
@@ -446,6 +510,12 @@ func (a *Adapter) AttachVolume(ctx context.Context, location, volumeID, nodeID s
 			return errors.Join(fmt.Errorf("%w: %s", cloud.ErrVolumeAttachedElsewhere, finalAttachedVM), deleteErr)
 		}
 		return fmt.Errorf("%w: %s", cloud.ErrVolumeAttachedElsewhere, finalAttachedVM)
+	}
+	if reserveErr := requireMutationDispatchReserve(ctx); reserveErr != nil {
+		if deleteErr := a.deleteMutationFenceDetached(ctx, fence); deleteErr != nil {
+			return errors.Join(reserveErr, fmt.Errorf("clear undispatched disk-attach fence: %w", deleteErr))
+		}
+		return reserveErr
 	}
 	storage, mutationErr := a.api.AttachDisk(ctx, location, vmUUID, volumeID)
 	if mutationErr == nil && (storage == nil || !strings.EqualFold(storage.UUID, volumeID)) {
@@ -529,6 +599,12 @@ func (a *Adapter) DetachVolume(ctx context.Context, location, volumeID, nodeID s
 		}
 		return err
 	}
+	if relationErr := requireExactVMAttachmentCollection(targetVM, volumeID); relationErr != nil {
+		if deleteErr := a.deleteMutationFenceDetached(ctx, fence); deleteErr != nil {
+			return errors.Join(relationErr, fmt.Errorf("clear unissued disk-detach fence: %w", deleteErr))
+		}
+		return relationErr
+	}
 	if rows := vmDiskRows(targetVM, volumeID); rows != 1 {
 		if rows == 0 {
 			// Canonical detail is newer than stale discovery: the disk is
@@ -563,6 +639,12 @@ func (a *Adapter) DetachVolume(ctx context.Context, location, volumeID, nodeID s
 			return errors.Join(fmt.Errorf("%w: disk %s moved from VM %s to VM %s", cloud.ErrVolumeAttachedElsewhere, volumeID, attachedVM, finalAttachedVM), deleteErr)
 		}
 		return fmt.Errorf("%w: disk %s moved from VM %s to VM %s", cloud.ErrVolumeAttachedElsewhere, volumeID, attachedVM, finalAttachedVM)
+	}
+	if reserveErr := requireMutationDispatchReserve(ctx); reserveErr != nil {
+		if deleteErr := a.deleteMutationFenceDetached(ctx, fence); deleteErr != nil {
+			return errors.Join(reserveErr, fmt.Errorf("clear undispatched disk-detach fence: %w", deleteErr))
+		}
+		return reserveErr
 	}
 	mutationErr := a.api.DetachDisk(ctx, location, attachedVM, volumeID)
 	return a.finishAttachmentMutation(ctx, intent, fence, mutationErr)
@@ -612,20 +694,12 @@ func (a *Adapter) attachedVM(ctx context.Context, location, diskUUID string) (st
 	if !strings.EqualFold(strings.TrimSpace(network.UUID), a.network) {
 		return "", fmt.Errorf("InSpace exact network read returned UUID %q for %q", network.UUID, a.network)
 	}
-	if network.VMUUIDs == nil {
-		return "", errors.New("InSpace exact network response omitted VM membership while checking disk attachment")
+	members, err := canonicalNetworkVMMembers(network.VMUUIDs)
+	if err != nil {
+		return "", fmt.Errorf("InSpace network %s has invalid VM membership while checking disk attachment: %w", a.network, err)
 	}
-	members := make(map[string]struct{}, len(network.VMUUIDs))
 	inspect := make(map[string]struct{}, len(vms)+len(network.VMUUIDs))
-	for _, vmUUID := range network.VMUUIDs {
-		vmUUID = strings.ToLower(strings.TrimSpace(vmUUID))
-		if !uuidPattern.MatchString(vmUUID) {
-			return "", fmt.Errorf("InSpace network %s contains invalid VM UUID %q", a.network, vmUUID)
-		}
-		if _, duplicate := members[vmUUID]; duplicate {
-			return "", fmt.Errorf("InSpace network %s contains VM %s more than once", a.network, vmUUID)
-		}
-		members[vmUUID] = struct{}{}
+	for vmUUID := range members {
 		inspect[vmUUID] = struct{}{}
 	}
 	listed := make(map[string]struct{}, len(vms))
@@ -657,6 +731,9 @@ func (a *Adapter) attachedVM(ctx context.Context, location, diskUUID string) (st
 		}
 		if vm == nil || !strings.EqualFold(strings.TrimSpace(vm.UUID), vmUUID) {
 			return "", fmt.Errorf("InSpace exact VM read changed identity for %s while checking disk %s", vmUUID, diskUUID)
+		}
+		if relationErr := requireExactVMAttachmentCollection(*vm, diskUUID); relationErr != nil {
+			return "", relationErr
 		}
 		rows := vmDiskRows(*vm, diskUUID)
 		if rows > 1 {
@@ -692,6 +769,24 @@ func vmDiskRows(vm sdk.VM, diskUUID string) int {
 		}
 	}
 	return rows
+}
+
+func requireExactDiskSnapshotCollection(disk sdk.Disk, diskUUID string) error {
+	if disk.Snapshots == nil {
+		return fmt.Errorf("InSpace exact disk %s omitted snapshots; refusing to treat the relationship as empty", diskUUID)
+	}
+	return nil
+}
+
+func requireExactVMAttachmentCollection(vm sdk.VM, diskUUID string) error {
+	if vm.Storage == nil {
+		return fmt.Errorf(
+			"InSpace exact VM %s omitted storage while checking disk %s; refusing to treat the relationship as empty",
+			vm.UUID,
+			diskUUID,
+		)
+	}
+	return nil
 }
 
 func (a *Adapter) waitForDiskReady(ctx context.Context, intent diskCreateIntent, disk sdk.Disk) (sdk.Disk, error) {
@@ -814,21 +909,16 @@ func (a *Adapter) getVPCVM(ctx context.Context, location, vmUUID string) (sdk.VM
 	if err != nil {
 		return sdk.VM{}, normalizeAPIError(err)
 	}
-	if network == nil || !strings.EqualFold(strings.TrimSpace(network.UUID), a.network) || network.VMUUIDs == nil {
+	if network == nil || !strings.EqualFold(strings.TrimSpace(network.UUID), a.network) {
 		return sdk.VM{}, fmt.Errorf("%w: configured VPC %s lacks exact membership authority", cloud.ErrInvalidNode, a.network)
 	}
-	memberships := 0
-	for _, member := range network.VMUUIDs {
-		member = strings.ToLower(strings.TrimSpace(member))
-		if !uuidPattern.MatchString(member) {
-			return sdk.VM{}, fmt.Errorf("%w: configured VPC %s contains invalid VM UUID %q", cloud.ErrInvalidNode, a.network, member)
-		}
-		if strings.EqualFold(member, vmUUID) {
-			memberships++
-		}
+	members, err := canonicalNetworkVMMembers(network.VMUUIDs)
+	if err != nil {
+		return sdk.VM{}, fmt.Errorf("%w: configured VPC %s has invalid VM membership: %v", cloud.ErrInvalidNode, a.network, err)
 	}
-	if memberships != 1 {
-		return sdk.VM{}, fmt.Errorf("%w: VM %s has %d configured-VPC memberships, want one", cloud.ErrInvalidNode, vmUUID, memberships)
+	canonicalVMUUID := strings.ToLower(strings.TrimSpace(vmUUID))
+	if _, member := members[canonicalVMUUID]; !member {
+		return sdk.VM{}, fmt.Errorf("%w: VM %s has 0 configured-VPC memberships, want one", cloud.ErrInvalidNode, vmUUID)
 	}
 	return *vm, nil
 }

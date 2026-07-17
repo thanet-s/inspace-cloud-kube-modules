@@ -96,6 +96,80 @@ type deletedDiskTombstoneAPI struct {
 	tombstone *sdk.Disk
 }
 
+type diskReadErrorAPI struct {
+	*fakeAPI
+	err error
+}
+
+type omittedExactRelationshipAPI struct {
+	*fakeAPI
+	omitDiskSnapshots      bool
+	omitDiskSnapshotsOnGet int
+	diskGets               int
+	omitVMStorage          bool
+}
+
+func (a *omittedExactRelationshipAPI) GetDisk(
+	ctx context.Context,
+	location, id string,
+) (*sdk.Disk, error) {
+	a.diskGets++
+	disk, err := a.fakeAPI.GetDisk(ctx, location, id)
+	if err == nil && disk != nil &&
+		(a.omitDiskSnapshots || a.diskGets == a.omitDiskSnapshotsOnGet) {
+		disk.Snapshots = nil
+	}
+	return disk, err
+}
+
+func (a *omittedExactRelationshipAPI) GetVM(
+	ctx context.Context,
+	location, id string,
+) (*sdk.VM, error) {
+	vm, err := a.fakeAPI.GetVM(ctx, location, id)
+	if err == nil && vm != nil && a.omitVMStorage {
+		vm.Storage = nil
+	}
+	return vm, err
+}
+
+type delayedDeleteAPI struct {
+	*fakeAPI
+	delay time.Duration
+}
+
+type delayedVMListErrorAPI struct {
+	*fakeAPI
+	delay time.Duration
+	err   error
+}
+
+func (a *delayedVMListErrorAPI) ListVMs(ctx context.Context, _ string) ([]sdk.VM, error) {
+	timer := time.NewTimer(a.delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-timer.C:
+		return nil, a.err
+	}
+}
+
+func (a *delayedDeleteAPI) DeleteDisk(ctx context.Context, location, id string) error {
+	timer := time.NewTimer(a.delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+	}
+	return a.fakeAPI.DeleteDisk(ctx, location, id)
+}
+
+func (a *diskReadErrorAPI) GetDisk(context.Context, string, string) (*sdk.Disk, error) {
+	return nil, a.err
+}
+
 func (a *deletedDiskTombstoneAPI) GetDisk(ctx context.Context, location, id string) (*sdk.Disk, error) {
 	if a.tombstone != nil {
 		copy := *a.tombstone
@@ -123,7 +197,7 @@ func (a *deletedDiskTombstoneAPI) DeleteDisk(ctx context.Context, location, id s
 
 func (a *transientDiskOmissionAPI) GetDisk(ctx context.Context, location, id string) (*sdk.Disk, error) {
 	if a.round < a.hiddenRounds {
-		return nil, apiNotFound("disk")
+		return nil, exactAPINotFound("disk", id)
 	}
 	return a.fakeAPI.GetDisk(ctx, location, id)
 }
@@ -218,10 +292,11 @@ func (f *fakeAPI) GetDisk(_ context.Context, _ string, id string) (*sdk.Disk, er
 			if copy.BillingAccountID == 0 && !f.preserveDiskBilling {
 				copy.BillingAccountID = 42
 			}
+			copy.Snapshots = append([]sdk.DiskSnapshot{}, f.disks[i].Snapshots...)
 			return &copy, nil
 		}
 	}
-	return nil, apiNotFound("disk")
+	return nil, exactAPINotFound("disk", id)
 }
 
 func (f *fakeAPI) ListDisks(context.Context, string) ([]sdk.Disk, error) {
@@ -306,10 +381,11 @@ func (f *fakeAPI) GetVM(_ context.Context, _ string, id string) (*sdk.VM, error)
 			if copy.NetworkUUID == "" && !f.preserveVMNetwork {
 				copy.NetworkUUID = testNetwork
 			}
+			copy.Storage = append([]sdk.VMStorage{}, f.vms[i].Storage...)
 			return &copy, nil
 		}
 	}
-	return nil, apiNotFound("VM")
+	return nil, exactAPINotFound("VM", id)
 }
 
 func (f *fakeAPI) GetNetwork(_ context.Context, _ string, id string) (*sdk.Network, error) {
@@ -321,7 +397,7 @@ func (f *fakeAPI) GetNetwork(_ context.Context, _ string, id string) (*sdk.Netwo
 	case f.omitNetworkMembership:
 		members = nil
 	case f.networkVMUUIDs != nil:
-		members = append([]string(nil), f.networkVMUUIDs...)
+		members = append([]string{}, f.networkVMUUIDs...)
 	default:
 		members = make([]string, 0, len(f.vms))
 		for _, vm := range f.vms {
@@ -494,6 +570,65 @@ func TestEnsureVolumeRoundsGiBAndReconcilesByName(t *testing.T) {
 	}
 }
 
+func TestDeleteVolumeRejectsOmittedExactRelationshipCollectionsBeforeMutation(t *testing.T) {
+	ownedDisk := sdk.Disk{
+		UUID: testDiskID, DisplayName: "pvc", SizeGiB: 1, Status: "Active", BillingAccountID: 42,
+	}
+
+	t.Run("snapshots", func(t *testing.T) {
+		for _, exactGet := range []int{1, 2} {
+			t.Run(fmt.Sprintf("exact read %d", exactGet), func(t *testing.T) {
+				base := &fakeAPI{disks: []sdk.Disk{ownedDisk}}
+				api := &omittedExactRelationshipAPI{
+					fakeAPI: base, omitDiskSnapshotsOnGet: exactGet,
+				}
+				store := newMemoryMutationFenceStore()
+				resolver := &fencedNodeResolver{nodeResolver: nodeResolver{}, memoryMutationFenceStore: store}
+
+				err := newFencedAdapter(t, api, resolver, time.Second).DeleteVolume(
+					context.Background(),
+					testLocation,
+					testDiskID,
+				)
+				if err == nil || !strings.Contains(err.Error(), "omitted snapshots") {
+					t.Fatalf("DeleteVolume omitted snapshots error = %v", err)
+				}
+				if base.mutationCalls() != 0 {
+					t.Fatalf("omitted snapshots caused %d cloud mutation(s)", base.mutationCalls())
+				}
+				if fence, getErr := store.Get(context.Background(), diskAttachmentFenceKey(testLocation, testDiskID)); getErr != nil || fence != nil {
+					t.Fatalf("omitted snapshots retained unissued fence=%#v err=%v", fence, getErr)
+				}
+			})
+		}
+	})
+
+	t.Run("VM storage", func(t *testing.T) {
+		base := &fakeAPI{
+			disks: []sdk.Disk{ownedDisk},
+			vms:   []sdk.VM{{UUID: testVM1, BillingAccountID: 42, NetworkUUID: testNetwork}},
+		}
+		api := &omittedExactRelationshipAPI{fakeAPI: base, omitVMStorage: true}
+		store := newMemoryMutationFenceStore()
+		resolver := &fencedNodeResolver{nodeResolver: nodeResolver{}, memoryMutationFenceStore: store}
+
+		err := newFencedAdapter(t, api, resolver, time.Second).DeleteVolume(
+			context.Background(),
+			testLocation,
+			testDiskID,
+		)
+		if err == nil || !strings.Contains(err.Error(), "omitted storage") {
+			t.Fatalf("DeleteVolume omitted VM storage error = %v", err)
+		}
+		if base.mutationCalls() != 0 {
+			t.Fatalf("omitted VM storage caused %d cloud mutation(s)", base.mutationCalls())
+		}
+		if fence, getErr := store.Get(context.Background(), diskAttachmentFenceKey(testLocation, testDiskID)); getErr != nil || fence != nil {
+			t.Fatalf("omitted VM storage retained unissued fence=%#v err=%v", fence, getErr)
+		}
+	})
+}
+
 func TestEnsureVolumeRechecksDeterministicNameAfterFenceCAS(t *testing.T) {
 	spec := cloud.VolumeSpec{Name: "pvc-post-cas", Location: testLocation, CapacityBytes: gib}
 	owned := sdk.Disk{
@@ -625,6 +760,129 @@ func (s *advanceReceiptBeforeFenceDeleteStore) Delete(ctx context.Context, fence
 	return s.mutationFenceStore.Delete(ctx, fence)
 }
 
+type replaceBeforeFenceDeleteStore struct {
+	mutationFenceStore
+	replacement mutationFence
+	replaced    bool
+	sawDeadline bool
+}
+
+func (s *replaceBeforeFenceDeleteStore) Delete(ctx context.Context, fence mutationFence) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	deadline, ok := ctx.Deadline()
+	if !ok || time.Until(deadline) <= 0 {
+		return errors.New("CSI fence delete lacks a live bounded context")
+	}
+	s.sawDeadline = true
+	if !s.replaced {
+		current, err := s.mutationFenceStore.Get(ctx, fence.Key)
+		if err != nil {
+			return err
+		}
+		if current == nil {
+			return errors.New("CSI mutation fence disappeared before replacement")
+		}
+		if err := s.mutationFenceStore.Delete(ctx, *current); err != nil {
+			return err
+		}
+		s.replacement = *current
+		s.replacement.Attempt = strings.Repeat("f", 32)
+		stored, acquired, err := s.mutationFenceStore.Create(ctx, s.replacement)
+		if err != nil || !acquired || stored == nil {
+			return errors.Join(err, errors.New("install replacement CSI mutation fence"))
+		}
+		s.replaced = true
+	}
+	return s.mutationFenceStore.Delete(ctx, fence)
+}
+
+func TestDeleteVolumePredispatchCleanupRefreshesExpiredContextAndPreservesChangedFence(t *testing.T) {
+	ownedDisk := sdk.Disk{
+		UUID: testDiskID, DisplayName: "pvc-expired-delete-cleanup", SizeGiB: 1,
+		Status: "Active", BillingAccountID: 42,
+	}
+	readErr := errors.New("VM inventory unavailable after slow preflight")
+
+	for _, mode := range []string{"exact cleanup", "advanced receipt retained", "replacement retained"} {
+		t.Run(mode, func(t *testing.T) {
+			baseAPI := &fakeAPI{disks: []sdk.Disk{ownedDisk}}
+			api := &delayedVMListErrorAPI{
+				fakeAPI: baseAPI,
+				delay:   30 * time.Millisecond,
+				err:     readErr,
+			}
+			baseStore := newMemoryMutationFenceStore()
+			resolver := &fencedNodeResolver{
+				nodeResolver:             nodeResolver{},
+				memoryMutationFenceStore: baseStore,
+			}
+			adapter := newFencedAdapter(t, api, resolver, time.Second)
+			// DeleteVolume creates this context before attachment discovery. The
+			// delayed list error therefore arrives only after this original
+			// destructive context has expired, while detached fence cleanup still
+			// receives the adapter's fresh one-second mutation-readback window.
+			adapter.destructive = 5 * time.Millisecond
+
+			var (
+				sawLiveCleanup func() bool
+				replacement    *replaceBeforeFenceDeleteStore
+			)
+			switch mode {
+			case "exact cleanup":
+				store := &deadlineCheckingMutationFenceStore{mutationFenceStore: baseStore}
+				adapter.fences = store
+				sawLiveCleanup = func() bool { return store.sawDeadline }
+			case "advanced receipt retained":
+				store := &advanceReceiptBeforeFenceDeleteStore{
+					mutationFenceStore: baseStore,
+					receipt:            testVM2,
+				}
+				adapter.fences = store
+				sawLiveCleanup = func() bool { return store.sawDeadline && store.advanced }
+			case "replacement retained":
+				replacement = &replaceBeforeFenceDeleteStore{mutationFenceStore: baseStore}
+				adapter.fences = replacement
+				sawLiveCleanup = func() bool { return replacement.sawDeadline && replacement.replaced }
+			default:
+				t.Fatalf("unsupported test mode %q", mode)
+			}
+
+			err := adapter.DeleteVolume(context.Background(), testLocation, testDiskID)
+			if !errors.Is(err, readErr) {
+				t.Fatalf("DeleteVolume() error = %v, want slow preflight error", err)
+			}
+			if baseAPI.deleteCalls != 0 {
+				t.Fatalf("slow preflight issued %d DeleteDisk call(s)", baseAPI.deleteCalls)
+			}
+			if !sawLiveCleanup() {
+				t.Fatal("pre-dispatch cleanup did not use a fresh live bounded context")
+			}
+
+			key := diskAttachmentFenceKey(testLocation, testDiskID)
+			fence, getErr := baseStore.Get(context.Background(), key)
+			if getErr != nil {
+				t.Fatal(getErr)
+			}
+			switch mode {
+			case "exact cleanup":
+				if fence != nil {
+					t.Fatalf("exact undispatched delete fence = %#v, want cleared", fence)
+				}
+			case "advanced receipt retained":
+				if fence == nil || fence.Receipt != testVM2 {
+					t.Fatalf("advanced delete fence = %#v, want receipt %s retained", fence, testVM2)
+				}
+			case "replacement retained":
+				if fence == nil || !sameMutationFenceState(*fence, replacement.replacement) {
+					t.Fatalf("replacement delete fence = %#v, want %#v retained", fence, replacement.replacement)
+				}
+			}
+		})
+	}
+}
+
 func TestDetachedFenceDeleteSurvivesCancellationWithReadbackBound(t *testing.T) {
 	base := newMemoryMutationFenceStore()
 	candidate, err := newMutationFence("disk-create/bkk01/canceled-delete", diskCreateIntent{
@@ -658,6 +916,7 @@ func TestAttachmentPredispatchCleanupSurvivesCancellationAndPreservesAdvancedRec
 	vm := func(uuid string, attached bool) sdk.VM {
 		result := sdk.VM{
 			UUID: uuid, Status: "Active", BillingAccountID: 42, NetworkUUID: testNetwork,
+			Storage: []sdk.VMStorage{},
 		}
 		if attached {
 			result.Storage = []sdk.VMStorage{{UUID: testDiskID}}
@@ -820,6 +1079,118 @@ func TestAttachmentPredispatchCleanupSurvivesCancellationAndPreservesAdvancedRec
 					}
 				} else if fence != nil {
 					t.Fatalf("proven-undispatched fence = %#v, want cleared", fence)
+				}
+			})
+		}
+	}
+}
+
+func TestMutationDispatchReserveBlocksAllFourMutationsAndClearsOnlyExactFence(t *testing.T) {
+	ownedDisk := sdk.Disk{
+		UUID: testDiskID, DisplayName: "pvc-reserve", SizeGiB: 1,
+		Status: "Active", BillingAccountID: 42,
+	}
+	targetVM := sdk.VM{
+		UUID: testVM1, Status: "Active", BillingAccountID: 42, NetworkUUID: testNetwork,
+	}
+	type operationCase struct {
+		name     string
+		fenceKey string
+		api      func() *fakeAPI
+		run      func(context.Context, *Adapter) error
+	}
+	tests := []operationCase{
+		{
+			name:     "create",
+			fenceKey: diskCreateFenceKey(testLocation, "pvc-reserve"),
+			api:      func() *fakeAPI { return &fakeAPI{} },
+			run: func(ctx context.Context, adapter *Adapter) error {
+				_, err := adapter.EnsureVolume(ctx, cloud.VolumeSpec{
+					Name: "pvc-reserve", Location: testLocation, CapacityBytes: gib,
+				})
+				return err
+			},
+		},
+		{
+			name:     "delete",
+			fenceKey: diskAttachmentFenceKey(testLocation, testDiskID),
+			api: func() *fakeAPI {
+				return &fakeAPI{disks: []sdk.Disk{ownedDisk}, vms: []sdk.VM{targetVM}}
+			},
+			run: func(ctx context.Context, adapter *Adapter) error {
+				return adapter.DeleteVolume(ctx, testLocation, testDiskID)
+			},
+		},
+		{
+			name:     "attach",
+			fenceKey: diskAttachmentFenceKey(testLocation, testDiskID),
+			api: func() *fakeAPI {
+				return &fakeAPI{disks: []sdk.Disk{ownedDisk}, vms: []sdk.VM{targetVM}}
+			},
+			run: func(ctx context.Context, adapter *Adapter) error {
+				return adapter.AttachVolume(ctx, testLocation, testDiskID, "worker-1")
+			},
+		},
+		{
+			name:     "detach",
+			fenceKey: diskAttachmentFenceKey(testLocation, testDiskID),
+			api: func() *fakeAPI {
+				attached := targetVM
+				attached.Storage = []sdk.VMStorage{{UUID: testDiskID}}
+				return &fakeAPI{disks: []sdk.Disk{ownedDisk}, vms: []sdk.VM{attached}}
+			},
+			run: func(ctx context.Context, adapter *Adapter) error {
+				return adapter.DetachVolume(ctx, testLocation, testDiskID, "worker-1")
+			},
+		},
+	}
+
+	for _, test := range tests {
+		for _, replaceFence := range []bool{false, true} {
+			mode := "exact cleanup"
+			if replaceFence {
+				mode = "foreign replacement retained"
+			}
+			t.Run(test.name+"/"+mode, func(t *testing.T) {
+				api := test.api()
+				baseStore := newMemoryMutationFenceStore()
+				resolver := &fencedNodeResolver{
+					nodeResolver: nodeResolver{
+						"worker-1": fmt.Sprintf("inspace://%s/%s", testLocation, testVM1),
+					},
+					memoryMutationFenceStore: baseStore,
+				}
+				adapter := newFencedAdapter(t, api, resolver, time.Second)
+				var replacementStore *replaceBeforeFenceDeleteStore
+				if replaceFence {
+					replacementStore = &replaceBeforeFenceDeleteStore{mutationFenceStore: baseStore}
+					adapter.fences = replacementStore
+				}
+
+				ctx, cancel := context.WithTimeout(
+					context.Background(), minimumMutationDispatchReserve-time.Minute,
+				)
+				err := test.run(ctx, adapter)
+				cancel()
+				if !errors.Is(err, cloud.ErrUnavailable) || !strings.Contains(err.Error(), "requires 480s") {
+					t.Fatalf("short-deadline error = %v, want local 480s reserve rejection", err)
+				}
+				if api.mutationCalls() != 0 {
+					t.Fatalf("short deadline issued %d cloud mutation(s)", api.mutationCalls())
+				}
+				fence, getErr := baseStore.Get(context.Background(), test.fenceKey)
+				if getErr != nil {
+					t.Fatal(getErr)
+				}
+				if !replaceFence {
+					if fence != nil {
+						t.Fatalf("undispatched fence = %#v, want cleared", fence)
+					}
+					return
+				}
+				if !replacementStore.replaced || fence == nil ||
+					!sameMutationFenceState(*fence, replacementStore.replacement) {
+					t.Fatalf("foreign replacement fence = %#v, replacement=%#v", fence, replacementStore.replacement)
 				}
 			})
 		}
@@ -1147,6 +1518,30 @@ func TestDeleteRefusesSnapshotsAndAttachedDisks(t *testing.T) {
 	}
 }
 
+func TestDiskReadDoesNotNormalizeMissingVMHTTP400AsDiskAbsence(t *testing.T) {
+	base := &fakeAPI{}
+	api := &diskReadErrorAPI{
+		fakeAPI: base,
+		err: &sdk.APIError{
+			StatusCode: 400,
+			Method:     "GET",
+			Path:       "/v1/" + testLocation + "/storage/disks/" + testDiskID,
+			Message:    "No such virtual machine exists: " + testVM1,
+		},
+	}
+	adapter := newFencedAdapter(t, api, nil, time.Second)
+
+	if _, err := adapter.GetVolume(context.Background(), testLocation, testDiskID); err == nil || errors.Is(err, cloud.ErrNotFound) {
+		t.Fatalf("GetVolume() error = %v; want ordinary API error, not disk absence", err)
+	}
+	if err := adapter.DeleteVolume(context.Background(), testLocation, testDiskID); err == nil || errors.Is(err, cloud.ErrNotFound) {
+		t.Fatalf("DeleteVolume() error = %v; want ordinary API error, not disk absence", err)
+	}
+	if base.deleteCalls != 0 {
+		t.Fatalf("DeleteDisk() calls = %d; want zero after unrelated missing-VM HTTP 400", base.deleteCalls)
+	}
+}
+
 func TestDeleteVolumeDurableFenceRecoversDelayedCommittedAmbiguousDeleteAcrossRestart(t *testing.T) {
 	for name, mutationErr := range map[string]error{
 		"http 400": &sdk.APIError{StatusCode: 400, Method: "DELETE", Path: "/storage/disks/" + testDiskID, Message: "invalid"},
@@ -1175,6 +1570,32 @@ func TestDeleteVolumeDurableFenceRecoversDelayedCommittedAmbiguousDeleteAcrossRe
 				t.Fatalf("converged deletion fences=%#v err=%v", fences, err)
 			}
 		})
+	}
+}
+
+func TestDeleteVolumeStartsDestructiveReadbackWindowAfterMutationReturns(t *testing.T) {
+	base := &fakeAPI{
+		disks: []sdk.Disk{{
+			UUID: testDiskID, DisplayName: "pvc-slow-delete", SizeGiB: 1,
+			Status: "Active", BillingAccountID: 42,
+		}},
+	}
+	api := &delayedDeleteAPI{fakeAPI: base, delay: 30 * time.Millisecond}
+	store := newMemoryMutationFenceStore()
+	resolver := &fencedNodeResolver{
+		nodeResolver:             nodeResolver{},
+		memoryMutationFenceStore: store,
+	}
+	adapter := newFencedAdapter(t, api, resolver, 20*time.Millisecond)
+
+	if err := adapter.DeleteVolume(context.Background(), testLocation, testDiskID); err != nil {
+		t.Fatalf("delete with mutation longer than recovery window: %v", err)
+	}
+	if base.deleteCalls != 1 || len(base.disks) != 0 {
+		t.Fatalf("slow delete calls=%d disks=%#v", base.deleteCalls, base.disks)
+	}
+	if fence, err := store.Get(context.Background(), diskAttachmentFenceKey(testLocation, testDiskID)); err != nil || fence != nil {
+		t.Fatalf("slow delete fence=%#v err=%v", fence, err)
 	}
 }
 
@@ -1638,7 +2059,7 @@ func TestAttachAndDetachWaitForStorageStateConvergence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), minimumMutationDispatchReserve+time.Minute)
 	defer cancel()
 	if err := adapter.AttachVolume(ctx, testLocation, testDiskID, "worker-1"); err != nil {
 		t.Fatal(err)
@@ -1901,6 +2322,27 @@ func TestAdapterRequiresPositiveBillingAccount(t *testing.T) {
 	}
 }
 
+func TestAdapterDefaultDestructiveReadbackWindow(t *testing.T) {
+	adapter, err := New(&fakeAPI{}, nil, Config{
+		Location: testLocation, BillingAccountID: 42,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if adapter.absencePoll != 30*time.Second {
+		t.Fatalf("destructive absence interval = %s, want 30s", adapter.absencePoll)
+	}
+	if adapter.readback != 30*time.Second {
+		t.Fatalf("normal mutation readback timeout = %s, want 30s", adapter.readback)
+	}
+	if adapter.destructive != 2*time.Minute {
+		t.Fatalf("destructive readback timeout = %s, want 2m", adapter.destructive)
+	}
+	if margin := adapter.destructive - 3*adapter.absencePoll; margin != 30*time.Second {
+		t.Fatalf("three-observation completion margin = %s, want 30s", margin)
+	}
+}
+
 func TestDiskBillingOmissionOrMismatchNeverMutates(t *testing.T) {
 	for name, billing := range map[string]int64{"omitted": 0, "wrong": 43} {
 		t.Run(name, func(t *testing.T) {
@@ -2092,6 +2534,127 @@ func TestTargetVMRequiresExactUUIDBillingAndConfiguredNetwork(t *testing.T) {
 	}
 }
 
+func TestCanonicalNetworkVMMembersRejectsOmissionMalformedRowsAndDuplicates(t *testing.T) {
+	tests := []struct {
+		name        string
+		vmUUIDs     []string
+		wantErr     bool
+		wantMembers []string
+	}{
+		{name: "nil membership", vmUUIDs: nil, wantErr: true},
+		{name: "empty UUID element", vmUUIDs: []string{""}, wantErr: true},
+		{name: "malformed unrelated UUID", vmUUIDs: []string{testVM1, "not-a-uuid"}, wantErr: true},
+		{
+			name: "case-insensitive unrelated duplicate",
+			vmUUIDs: []string{
+				testVM1, testVM2, strings.ToUpper(testVM2),
+			},
+			wantErr: true,
+		},
+		{
+			name: "case-insensitive target duplicate",
+			vmUUIDs: []string{
+				testVM1, strings.ToUpper(testVM1),
+			},
+			wantErr: true,
+		},
+		{name: "valid empty membership", vmUUIDs: []string{}, wantMembers: []string{}},
+		{
+			name: "valid target canonicalized",
+			vmUUIDs: []string{
+				"  " + strings.ToUpper(testVM1) + "  ",
+			},
+			wantMembers: []string{testVM1},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			members, err := canonicalNetworkVMMembers(test.vmUUIDs)
+			if test.wantErr {
+				if err == nil {
+					t.Fatalf("membership %#v was accepted as %#v", test.vmUUIDs, members)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(members) != len(test.wantMembers) {
+				t.Fatalf("canonical membership = %#v, want %#v", members, test.wantMembers)
+			}
+			for _, vmUUID := range test.wantMembers {
+				if _, ok := members[vmUUID]; !ok {
+					t.Fatalf("canonical membership %#v lacks %s", members, vmUUID)
+				}
+			}
+		})
+	}
+}
+
+func TestGetVPCVMRequiresCompleteUniqueCanonicalMembership(t *testing.T) {
+	tests := []struct {
+		name       string
+		vmUUIDs    []string
+		omit       bool
+		wantErr    bool
+		wantVMUUID string
+	}{
+		{name: "nil membership", omit: true, wantErr: true},
+		{name: "valid empty membership lacks target", vmUUIDs: []string{}, wantErr: true},
+		{
+			name: "malformed unrelated UUID",
+			vmUUIDs: []string{
+				testVM1, "not-a-uuid",
+			},
+			wantErr: true,
+		},
+		{
+			name: "case-insensitive unrelated duplicate",
+			vmUUIDs: []string{
+				testVM1, testVM2, strings.ToUpper(testVM2),
+			},
+			wantErr: true,
+		},
+		{
+			name: "case-insensitive target duplicate",
+			vmUUIDs: []string{
+				testVM1, strings.ToUpper(testVM1),
+			},
+			wantErr: true,
+		},
+		{
+			name:       "valid target membership",
+			vmUUIDs:    []string{"  " + strings.ToUpper(testVM1) + "  "},
+			wantVMUUID: testVM1,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			api := &fakeAPI{
+				vms: []sdk.VM{{
+					UUID: testVM1, Status: "Active", BillingAccountID: 42,
+					NetworkUUID: testNetwork,
+				}},
+				networkVMUUIDs:        test.vmUUIDs,
+				omitNetworkMembership: test.omit,
+			}
+			vm, err := newAdapter(t, api, nil).getVPCVM(context.Background(), testLocation, testVM1)
+			if test.wantErr {
+				if !errors.Is(err, cloud.ErrInvalidNode) {
+					t.Fatalf("getVPCVM error = %v, want ErrInvalidNode", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if vm.UUID != test.wantVMUUID {
+				t.Fatalf("getVPCVM UUID = %q, want %q", vm.UUID, test.wantVMUUID)
+			}
+		})
+	}
+}
+
 func TestTargetVMAllowsSparseNetworkOnlyWithExactConfiguredVPCMembership(t *testing.T) {
 	ownedDisk := sdk.Disk{
 		UUID: testDiskID, DisplayName: "pvc", SizeGiB: 1, Status: "Active", BillingAccountID: 42,
@@ -2192,7 +2755,10 @@ func TestAttachStaleListCannotCompleteFenceWithoutExactVMStorage(t *testing.T) {
 	}
 	staleVMDetails := make(map[int]sdk.VM)
 	for read := 4; read < 64; read++ {
-		staleVMDetails[read] = sdk.VM{UUID: testVM1, BillingAccountID: 42, NetworkUUID: testNetwork}
+		staleVMDetails[read] = sdk.VM{
+			UUID: testVM1, BillingAccountID: 42, NetworkUUID: testNetwork,
+			Storage: []sdk.VMStorage{},
+		}
 	}
 	api := &detailSequenceAPI{
 		fakeAPI: base, stripListStorage: true,
@@ -2452,6 +3018,21 @@ func TestAttachCommittedHTTP500ConvergesThroughExactVMWhenListStorageIsStale(t *
 
 func apiNotFound(resource string) error {
 	return &sdk.APIError{StatusCode: 404, Method: "GET", Path: resource, Message: "not found"}
+}
+
+func exactAPINotFound(resource, uuid string) error {
+	path := "/v1/" + testLocation + "/user-resource/vm"
+	if resource == "disk" {
+		path = "/v1/" + testLocation + "/storage/disks/" + uuid
+	}
+	return &sdk.APIError{
+		StatusCode:    404,
+		Method:        "GET",
+		Path:          path,
+		Message:       "not found",
+		ExactLookup:   true,
+		RequestedUUID: uuid,
+	}
 }
 
 var _ API = (*fakeAPI)(nil)

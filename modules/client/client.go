@@ -18,9 +18,10 @@ import (
 )
 
 const (
-	defaultUserAgent   = "cloud-provider-inspace/dev"
-	defaultHTTPTimeout = 5 * time.Minute
-	defaultReadTimeout = 30 * time.Second
+	defaultUserAgent     = "cloud-provider-inspace/dev"
+	defaultHTTPTimeout   = 5 * time.Minute
+	defaultReadTimeout   = 30 * time.Second
+	maxResponseBodyBytes = 4 << 20
 )
 
 var (
@@ -33,8 +34,13 @@ var (
 	// ErrCrossOriginRedirect prevents an API key from following redirects to a
 	// different origin. This applies to read and write requests alike.
 	ErrCrossOriginRedirect = errors.New("inspace: cross-origin redirect blocked")
-	locationPattern        = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
-	uuidPattern            = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
+	// ErrReadRedirect prevents an exact or collection read from silently
+	// changing endpoint identity. Controllers use successful GETs as
+	// authoritative presence/absence evidence, so even a same-origin redirect
+	// must be handled as an error rather than rebound to the original request.
+	ErrReadRedirect = errors.New("inspace: read redirect blocked")
+	locationPattern = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
+	uuidPattern     = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
 )
 
 // Options configures a Client. Mutating requests are safe by default: they are
@@ -92,7 +98,6 @@ func NewClient(opts Options) (*Client, error) {
 	// Copy the caller's client so the safety policy cannot be bypassed by an
 	// HTTP 307/308 redirect and so caller-owned configuration is not mutated.
 	httpClientCopy := *httpClient
-	originalCheckRedirect := httpClientCopy.CheckRedirect
 	httpClientCopy.CheckRedirect = func(req *http.Request, via []*http.Request) error {
 		if len(via) != 0 && isMutation(via[len(via)-1].Method) {
 			return fmt.Errorf("%w: %s to %s", ErrMutationRedirect, via[len(via)-1].Method, req.URL.Redacted())
@@ -100,16 +105,10 @@ func NewClient(opts Options) (*Client, error) {
 		if !sameOrigin(baseURL, req.URL) {
 			return fmt.Errorf("%w: %s", ErrCrossOriginRedirect, req.URL.Redacted())
 		}
-		if isMutation(req.Method) && !isLiteralLoopback(req.URL.Hostname()) && !opts.DangerouslyAllowMutations {
-			return fmt.Errorf("%w: redirect to %s", ErrMutationBlocked, req.URL.Redacted())
+		if len(via) != 0 {
+			return fmt.Errorf("%w: %s to %s", ErrReadRedirect, via[len(via)-1].Method, req.URL.Redacted())
 		}
-		if originalCheckRedirect != nil {
-			return originalCheckRedirect(req, via)
-		}
-		if len(via) >= 10 {
-			return errors.New("stopped after 10 redirects")
-		}
-		return nil
+		return errors.New("inspace: redirect blocked")
 	}
 	userAgent := strings.TrimSpace(opts.UserAgent)
 	if userAgent == "" {
@@ -151,6 +150,23 @@ func (c *Client) locationPath(location, resource string) (string, error) {
 func validateUUID(kind, value string) error {
 	if !uuidPattern.MatchString(value) {
 		return fmt.Errorf("inspace: invalid %s UUID %q", kind, value)
+	}
+	return nil
+}
+
+func validateResponseUUID(kind, value string) error {
+	if err := validateUUID(kind, value); err != nil {
+		return fmt.Errorf("inspace: malformed %s response identity: %w", kind, err)
+	}
+	return nil
+}
+
+func validateExpectedResponseUUID(kind, value, expected string) error {
+	if err := validateResponseUUID(kind, value); err != nil {
+		return err
+	}
+	if !strings.EqualFold(value, expected) {
+		return fmt.Errorf("inspace: %s response UUID %q does not match expected UUID %q", kind, value, expected)
 	}
 	return nil
 }
@@ -223,20 +239,363 @@ func (c *Client) doBody(ctx context.Context, method, path string, query url.Valu
 		return fmt.Errorf("inspace: %s %s: %w", method, path, err)
 	}
 	defer resp.Body.Close()
-	data, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if resp.ContentLength > maxResponseBodyBytes {
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			return newIncompleteAPIError(
+				method,
+				path,
+				resp.StatusCode,
+				fmt.Sprintf("declared response body exceeds %d bytes and was not trusted", maxResponseBodyBytes),
+			)
+		}
+		return fmt.Errorf("inspace: read %s %s response: declared body exceeds %d bytes", method, path, maxResponseBodyBytes)
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBodyBytes+1))
 	if err != nil {
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			return newIncompleteAPIError(
+				method,
+				path,
+				resp.StatusCode,
+				fmt.Sprintf("response body could not be read completely: %v", err),
+			)
+		}
 		return fmt.Errorf("inspace: read %s %s response: %w", method, path, err)
+	}
+	if len(data) > maxResponseBodyBytes {
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			return newIncompleteAPIError(
+				method,
+				path,
+				resp.StatusCode,
+				fmt.Sprintf("response body exceeds %d bytes and was not trusted", maxResponseBodyBytes),
+			)
+		}
+		return fmt.Errorf("inspace: read %s %s response: body exceeds %d bytes", method, path, maxResponseBodyBytes)
+	}
+	if resp.ContentLength > 0 && int64(len(data)) != resp.ContentLength {
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			return newIncompleteAPIError(
+				method,
+				path,
+				resp.StatusCode,
+				fmt.Sprintf("response body length %d does not match declared length %d", len(data), resp.ContentLength),
+			)
+		}
+		return fmt.Errorf(
+			"inspace: read %s %s response: body length %d does not match declared length %d",
+			method,
+			path,
+			len(data),
+			resp.ContentLength,
+		)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return newAPIError(method, path, resp.StatusCode, data)
 	}
-	if out == nil || len(bytes.TrimSpace(data)) == 0 {
+	if err := validateSuccessResponse(method, path, resp.StatusCode, out != nil, data); err != nil {
+		return err
+	}
+	if out == nil {
 		return nil
 	}
-	if err := json.Unmarshal(data, out); err != nil {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 {
+		return fmt.Errorf("inspace: decode %s %s response: expected a non-empty JSON value", method, path)
+	}
+	if bytes.Equal(trimmed, []byte("null")) {
+		return fmt.Errorf("inspace: decode %s %s response: expected a non-null JSON value", method, path)
+	}
+	if err := validateJSONNoDuplicateObjectKeys(trimmed); err != nil {
+		return fmt.Errorf("inspace: decode %s %s response: %w", method, path, err)
+	}
+	if trimmed[0] == '{' {
+		var object map[string]json.RawMessage
+		if err := json.Unmarshal(trimmed, &object); err == nil && len(object) == 0 {
+			return fmt.Errorf("inspace: decode %s %s response: expected a non-empty JSON object", method, path)
+		}
+	}
+	if err := json.Unmarshal(trimmed, out); err != nil {
 		return fmt.Errorf("inspace: decode %s %s response: %w", method, path, err)
 	}
 	return nil
+}
+
+// validateJSONNoDuplicateObjectKeys rejects ambiguous JSON before it reaches
+// encoding/json, whose default last-key-wins behavior could otherwise replace
+// an identity or relationship field. It also proves that the input contains
+// exactly one complete JSON value.
+func validateJSONNoDuplicateObjectKeys(data []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	if err := validateJSONValue(decoder); err != nil {
+		return err
+	}
+	if token, err := decoder.Token(); err != io.EOF {
+		if err != nil {
+			return fmt.Errorf("invalid trailing JSON: %w", err)
+		}
+		return fmt.Errorf("unexpected trailing JSON token %v", token)
+	}
+	return nil
+}
+
+func validateJSONValue(decoder *json.Decoder) error {
+	token, err := decoder.Token()
+	if err != nil {
+		return fmt.Errorf("invalid JSON: %w", err)
+	}
+	delimiter, isDelimiter := token.(json.Delim)
+	if !isDelimiter {
+		return nil
+	}
+	switch delimiter {
+	case '{':
+		seen := make(map[string]struct{})
+		for decoder.More() {
+			keyToken, err := decoder.Token()
+			if err != nil {
+				return fmt.Errorf("invalid JSON object key: %w", err)
+			}
+			key, ok := keyToken.(string)
+			if !ok {
+				return errors.New("invalid JSON object key")
+			}
+			if _, duplicate := seen[key]; duplicate {
+				return fmt.Errorf("duplicate JSON object key %q", key)
+			}
+			seen[key] = struct{}{}
+			if err := validateJSONValue(decoder); err != nil {
+				return err
+			}
+		}
+		end, err := decoder.Token()
+		if err != nil {
+			return fmt.Errorf("invalid JSON object: %w", err)
+		}
+		if end != json.Delim('}') {
+			return errors.New("invalid JSON object terminator")
+		}
+		return nil
+	case '[':
+		for decoder.More() {
+			if err := validateJSONValue(decoder); err != nil {
+				return err
+			}
+		}
+		end, err := decoder.Token()
+		if err != nil {
+			return fmt.Errorf("invalid JSON array: %w", err)
+		}
+		if end != json.Delim(']') {
+			return errors.New("invalid JSON array terminator")
+		}
+		return nil
+	default:
+		return fmt.Errorf("unexpected JSON delimiter %q", delimiter)
+	}
+}
+
+type successBodyContract uint8
+
+const (
+	successJSON successBodyContract = iota
+	successEmpty
+)
+
+type endpointContract struct {
+	method       string
+	pathTemplate string
+	statuses     []int
+	body         successBodyContract
+}
+
+var (
+	statusOKOnly        = []int{http.StatusOK}
+	statusCreatedOnly   = []int{http.StatusCreated}
+	statusNoContentOnly = []int{http.StatusNoContent}
+	statusOKOrNoContent = []int{http.StatusOK, http.StatusNoContent}
+)
+
+// endpointContracts is deliberately an exhaustive whitelist of every route
+// used by this SDK. InSpace does not use one generic status convention:
+// notably, disk/firewall deletes return 204 while floating-IP and NLB deletes
+// return an empty 200 response. A method-wide default would therefore either
+// reject a documented success or accept an ambiguous response.
+var endpointContracts = []endpointContract{
+	{http.MethodGet, "/v1/config/locations", statusOKOnly, successJSON},
+	{http.MethodGet, "/v1/config/vm_images", statusOKOnly, successJSON},
+	{http.MethodGet, "/v1/{location}/user-resource/host_pool/list", statusOKOnly, successJSON},
+	{http.MethodGet, "/v1/{location}/user-resource/vm/list", statusOKOnly, successJSON},
+	{http.MethodGet, "/v1/{location}/user-resource/vm", statusOKOnly, successJSON},
+	{http.MethodGet, "/v1/{location}/storage/disks", statusOKOnly, successJSON},
+	{http.MethodGet, "/v1/{location}/storage/disks/{uuid}", statusOKOnly, successJSON},
+	{http.MethodGet, "/v1/{location}/network/ip_addresses", statusOKOnly, successJSON},
+	{http.MethodGet, "/v1/{location}/network/ip_addresses/{address}", statusOKOnly, successJSON},
+	{http.MethodGet, "/v1/{location}/network/firewalls", statusOKOnly, successJSON},
+	{http.MethodGet, "/v1/{location}/network/load_balancers", statusOKOnly, successJSON},
+	{http.MethodGet, "/v1/{location}/network/load_balancers/{uuid}", statusOKOnly, successJSON},
+	{http.MethodGet, "/v1/{location}/network/network/{uuid}", statusOKOnly, successJSON},
+	{http.MethodGet, "/v1/{location}/network/networks", statusOKOnly, successJSON},
+
+	{http.MethodPost, "/v1/{location}/user-resource/vm", statusCreatedOnly, successJSON},
+	{http.MethodPost, "/v1/{location}/storage/disks", statusCreatedOnly, successJSON},
+	{http.MethodPost, "/v1/{location}/network/ip_addresses", statusCreatedOnly, successJSON},
+	{http.MethodPost, "/v1/{location}/network/firewalls", statusCreatedOnly, successJSON},
+	{http.MethodPost, "/v1/{location}/network/load_balancers", statusCreatedOnly, successJSON},
+
+	{http.MethodPost, "/v1/{location}/user-resource/vm/storage/attach", statusOKOnly, successJSON},
+	{http.MethodPost, "/v1/{location}/user-resource/vm/storage/detach", statusOKOnly, successJSON},
+	{http.MethodPost, "/v1/{location}/network/ip_addresses/{address}/assign", statusOKOnly, successJSON},
+	{http.MethodPost, "/v1/{location}/network/ip_addresses/{address}/unassign", statusOKOnly, successJSON},
+	{http.MethodPost, "/v1/{location}/network/firewalls/{uuid}/vms", statusOKOnly, successJSON},
+	{http.MethodPost, "/v1/{location}/network/load_balancers/{uuid}/targets", statusOKOnly, successJSON},
+	{http.MethodPost, "/v1/{location}/network/load_balancers/{uuid}/forwarding_rules", statusOKOnly, successJSON},
+	{http.MethodPut, "/v1/{location}/network/firewalls/{uuid}", statusOKOnly, successJSON},
+	{http.MethodPatch, "/v1/{location}/network/ip_addresses/{address}", statusOKOnly, successJSON},
+
+	// The VM API reference does not state the success code. InSpace's live API
+	// and recorded contract return 204, but 200 is also a conventional empty
+	// delete response. Accept only those two and let authoritative readback
+	// establish whether the VM is gone.
+	{http.MethodDelete, "/v1/{location}/user-resource/vm", statusOKOrNoContent, successEmpty},
+	{http.MethodDelete, "/v1/{location}/storage/disks/{uuid}", statusNoContentOnly, successEmpty},
+	{http.MethodDelete, "/v1/{location}/network/ip_addresses/{address}", statusOKOnly, successEmpty},
+	{http.MethodDelete, "/v1/{location}/network/firewalls/{uuid}", statusNoContentOnly, successEmpty},
+	{http.MethodDelete, "/v1/{location}/network/firewalls/{uuid}/vms", statusNoContentOnly, successEmpty},
+	{http.MethodDelete, "/v1/{location}/network/load_balancers/{uuid}", statusOKOnly, successEmpty},
+	{http.MethodDelete, "/v1/{location}/network/load_balancers/{uuid}/targets/{uuid}", statusOKOnly, successEmpty},
+	{http.MethodDelete, "/v1/{location}/network/load_balancers/{uuid}/forwarding_rules/{uuid}", statusOKOnly, successEmpty},
+}
+
+func validateSuccessResponse(method, path string, status int, expectsJSON bool, data []byte) error {
+	contract, ok := endpointSuccessContract(method, path)
+	if !ok {
+		return &APIError{
+			StatusCode: status,
+			Method:     method,
+			Path:       path,
+			Message:    "successful response has no registered SDK endpoint contract",
+		}
+	}
+	if !containsHTTPStatus(contract.statuses, status) {
+		return &APIError{
+			StatusCode: status,
+			Method:     method,
+			Path:       path,
+			Message:    fmt.Sprintf("unexpected successful HTTP status %d for this endpoint; allowed statuses are %v", status, contract.statuses),
+		}
+	}
+	if expectsJSON != (contract.body == successJSON) {
+		return fmt.Errorf(
+			"inspace: internal response contract mismatch for %s %s: JSON output=%t",
+			method,
+			path,
+			expectsJSON,
+		)
+	}
+	if contract.body == successEmpty && len(bytes.TrimSpace(data)) != 0 {
+		return fmt.Errorf("inspace: decode %s %s response: expected an empty success body", method, path)
+	}
+	return nil
+}
+
+func containsHTTPStatus(statuses []int, candidate int) bool {
+	for _, status := range statuses {
+		if status == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func endpointSuccessContract(method, path string) (endpointContract, bool) {
+	for _, contract := range endpointContracts {
+		if contract.method == method && endpointPathMatches(path, contract.pathTemplate) {
+			return contract, true
+		}
+	}
+	return endpointContract{}, false
+}
+
+func endpointPathMatches(path, template string) bool {
+	pathParts := strings.Split(path, "/")
+	templateParts := strings.Split(template, "/")
+	if len(pathParts) != len(templateParts) {
+		return false
+	}
+	for index := range templateParts {
+		switch templateParts[index] {
+		case "{location}":
+			if !locationPattern.MatchString(pathParts[index]) {
+				return false
+			}
+		case "{uuid}":
+			if !uuidPattern.MatchString(pathParts[index]) {
+				return false
+			}
+		case "{address}":
+			if net.ParseIP(pathParts[index]) == nil {
+				return false
+			}
+		default:
+			if pathParts[index] != templateParts[index] {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// validatedListResponse distinguishes a valid empty JSON array from a
+// successful response whose body was empty or JSON null. It also requires
+// every row to expose one valid, unique canonical identity. A nil collection
+// or malformed row must never become authoritative absence evidence in a
+// controller.
+func validatedListResponse[T any](
+	result []T,
+	err error,
+	method, path string,
+	identity func(T) (string, error),
+) ([]T, error) {
+	if err != nil {
+		return result, err
+	}
+	if result == nil {
+		return nil, fmt.Errorf("inspace: decode %s %s response: expected a JSON array, got an empty or null body", method, path)
+	}
+	seen := make(map[string]int, len(result))
+	for index, item := range result {
+		key, identityErr := identity(item)
+		if identityErr != nil {
+			return nil, fmt.Errorf("inspace: decode %s %s response: invalid list element %d identity: %w", method, path, index, identityErr)
+		}
+		if key == "" {
+			return nil, fmt.Errorf("inspace: decode %s %s response: invalid list element %d identity: empty canonical key", method, path, index)
+		}
+		if previous, ok := seen[key]; ok {
+			return nil, fmt.Errorf("inspace: decode %s %s response: duplicate canonical identity %q at list elements %d and %d", method, path, key, previous, index)
+		}
+		seen[key] = index
+	}
+	return result, nil
+}
+
+func validatedUUIDListIdentity(kind, value string) (string, error) {
+	if err := validateUUID(kind, value); err != nil {
+		return "", err
+	}
+	return strings.ToLower(value), nil
+}
+
+func validatedRequiredListIdentity(kind, value string) (string, error) {
+	if value == "" {
+		return "", fmt.Errorf("inspace: empty %s", kind)
+	}
+	if value != strings.TrimSpace(value) {
+		return "", fmt.Errorf("inspace: invalid %s %q", kind, value)
+	}
+	return strings.ToLower(value), nil
 }
 
 // APIError is a normalized non-2xx API response. Retryable is only a scheduling
@@ -249,6 +608,26 @@ type APIError struct {
 	Path       string
 	Message    string
 	Retryable  bool
+	// ResponseBodyIncomplete is true when response headers were observed but
+	// the error body could not be read in full. Status still provides a retry
+	// scheduling hint, but an incomplete 400/404 body must never become
+	// authoritative resource absence.
+	ResponseBodyIncomplete bool
+	// ResponseBodyMalformed is true when a response claims a structured JSON
+	// error body but that body is malformed or contains duplicate object keys.
+	// Such a body can never supply semantic not-found authority.
+	ResponseBodyMalformed bool
+	// ExactLookup is set only by a resource-specific SDK lookup after binding
+	// the response to its requested canonical UUID. Generic route/list errors,
+	// including HTTP 404, are never authoritative resource absence.
+	ExactLookup bool
+	// RequestedUUID is populated only when a caller can bind the error to one
+	// exact resource lookup. Generic HTTP plumbing deliberately leaves it
+	// empty because many endpoints carry no singular resource identity.
+	RequestedUUID string
+	// RequestedAddress is populated only by an exact floating-IP lookup.
+	// Floating IP identity is its canonical public address, not a UUID.
+	RequestedAddress string
 }
 
 func (e *APIError) Error() string {
@@ -262,7 +641,12 @@ func newAPIError(method, path string, status int, data []byte) *APIError {
 		Message string         `json:"message"`
 		Errors  map[string]any `json:"errors"`
 	}
-	if json.Unmarshal(data, &payload) == nil {
+	malformed := false
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) != 0 && (trimmed[0] == '{' || trimmed[0] == '[') {
+		malformed = validateJSONNoDuplicateObjectKeys(trimmed) != nil
+	}
+	if !malformed && json.Unmarshal(data, &payload) == nil {
 		switch {
 		case payload.Message != "":
 			message = payload.Message
@@ -280,51 +664,159 @@ func newAPIError(method, path string, status int, data []byte) *APIError {
 		message = http.StatusText(status)
 	}
 	return &APIError{
-		StatusCode: status,
-		Method:     method,
-		Path:       path,
-		Message:    message,
-		Retryable: status == http.StatusRequestTimeout ||
-			status == http.StatusTooManyRequests || status >= 500,
+		StatusCode:            status,
+		Method:                method,
+		Path:                  path,
+		Message:               message,
+		Retryable:             retryableAPIStatus(status),
+		ResponseBodyMalformed: malformed,
 	}
 }
 
+func newIncompleteAPIError(method, path string, status int, message string) *APIError {
+	return &APIError{
+		StatusCode:             status,
+		Method:                 method,
+		Path:                   path,
+		Message:                message,
+		Retryable:              retryableAPIStatus(status),
+		ResponseBodyIncomplete: true,
+	}
+}
+
+func retryableAPIStatus(status int) bool {
+	return status == http.StatusRequestTimeout ||
+		status == http.StatusTooManyRequests ||
+		status >= 500
+}
+
+func bindExactLookupError(err error, requestedUUID string) error {
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		return err
+	}
+	bound := *apiErr
+	bound.ExactLookup = true
+	bound.RequestedUUID = requestedUUID
+	return &bound
+}
+
+func bindExactFloatingIPLookupError(err error, requestedAddress string) error {
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		return err
+	}
+	bound := *apiErr
+	bound.ExactLookup = true
+	bound.RequestedAddress = requestedAddress
+	return &bound
+}
+
 // IsNotFound reports whether err represents an absent resource. InSpace uses
-// HTTP 400 with a "No such virtual machine exists" message for some
-// already-deleted VM lookups, so that exact semantic response is normalized
-// alongside HTTP 404. Other "No such ... exists" errors can describe billing,
-// network, or authorization state and must remain ordinary failures.
+// HTTP 400 with a "No such virtual machine exists" message (sometimes followed
+// by the UUID) for some already-deleted exact VM lookups, so that narrowly
+// bound semantic response is normalized alongside HTTP 404. Other "No such
+// ... exists" errors can describe billing, network, or authorization state and
+// must remain ordinary failures.
 func IsNotFound(err error) bool {
 	var apiErr *APIError
 	if !errors.As(err, &apiErr) {
 		return false
 	}
+	if apiErr.ResponseBodyIncomplete || apiErr.ResponseBodyMalformed {
+		return false
+	}
 	if apiErr.StatusCode == http.StatusNotFound {
-		return true
+		if !apiErr.ExactLookup || apiErr.Method != http.MethodGet {
+			return false
+		}
+		if apiErr.RequestedAddress != "" {
+			return apiErr.RequestedUUID == "" &&
+				isPublicIPv4(apiErr.RequestedAddress) &&
+				isExactFloatingIPPath(apiErr.Path, apiErr.RequestedAddress)
+		}
+		return uuidPattern.MatchString(apiErr.RequestedUUID) &&
+			isBoundExactLookupPath(apiErr.Path, apiErr.RequestedUUID)
+	}
+	if apiErr.StatusCode != http.StatusBadRequest ||
+		!apiErr.ExactLookup ||
+		apiErr.Method != http.MethodGet ||
+		!isExactVMDetailPath(apiErr.Path) ||
+		!uuidPattern.MatchString(apiErr.RequestedUUID) {
+		return false
 	}
 	message := strings.ToLower(strings.TrimSpace(apiErr.Message))
 	message = strings.TrimSpace(strings.TrimPrefix(message, "error:"))
-	if apiErr.StatusCode != http.StatusBadRequest {
-		return false
+	messageUUID, ok := exactInSpaceMissingVMUUID(message, "no such virtual machine exists")
+	if !ok {
+		messageUUID, ok = exactInSpaceMissingVMUUID(message, "no such vm exists")
 	}
-	return exactInSpaceMissingVMPhrase(message, "no such virtual machine exists") ||
-		exactInSpaceMissingVMPhrase(message, "no such vm exists")
+	return ok && (messageUUID == "" || strings.EqualFold(messageUUID, apiErr.RequestedUUID))
 }
 
-func exactInSpaceMissingVMPhrase(message, phrase string) bool {
-	if message == phrase {
+func isPublicIPv4(value string) bool {
+	address := net.ParseIP(value)
+	return address != nil &&
+		address.To4() != nil &&
+		address.IsGlobalUnicast() &&
+		!address.IsPrivate() &&
+		!address.IsLoopback() &&
+		!address.IsUnspecified() &&
+		address.String() == value
+}
+
+func isExactFloatingIPPath(path, requestedAddress string) bool {
+	parts := strings.Split(path, "/")
+	return len(parts) == 6 &&
+		parts[0] == "" &&
+		parts[1] == "v1" &&
+		locationPattern.MatchString(parts[2]) &&
+		parts[3] == "network" &&
+		parts[4] == "ip_addresses" &&
+		parts[5] == requestedAddress
+}
+
+func isBoundExactLookupPath(path, requestedUUID string) bool {
+	if isExactVMDetailPath(path) {
 		return true
 	}
-	if !strings.HasPrefix(message, phrase) || len(message) == len(phrase) {
-		return false
+	parts := strings.Split(path, "/")
+	if len(parts) == 6 &&
+		parts[0] == "" &&
+		parts[1] == "v1" &&
+		locationPattern.MatchString(parts[2]) &&
+		strings.EqualFold(parts[5], requestedUUID) {
+		return (parts[3] == "storage" && parts[4] == "disks") ||
+			(parts[3] == "network" && parts[4] == "network") ||
+			(parts[3] == "network" && parts[4] == "load_balancers")
+	}
+	return false
+}
+
+func exactInSpaceMissingVMUUID(message, phrase string) (string, bool) {
+	if message == phrase {
+		return "", true
+	}
+	if !strings.HasPrefix(message, phrase) {
+		return "", false
 	}
 	// Live responses use ':' before the UUID; the published InSpace API spec
 	// uses '.'. Require the entire suffix to be one canonical UUID; accepting
 	// arbitrary prose after either separator could turn an authorization or
 	// billing error into destructive absence authority.
 	if message[len(phrase)] != ':' && message[len(phrase)] != '.' {
-		return false
+		return "", false
 	}
 	suffix := strings.TrimSpace(message[len(phrase)+1:])
-	return uuidPattern.MatchString(suffix)
+	return suffix, uuidPattern.MatchString(suffix)
+}
+
+func isExactVMDetailPath(path string) bool {
+	parts := strings.Split(path, "/")
+	return len(parts) == 5 &&
+		parts[0] == "" &&
+		parts[1] == "v1" &&
+		locationPattern.MatchString(parts[2]) &&
+		parts[3] == "user-resource" &&
+		parts[4] == "vm"
 }

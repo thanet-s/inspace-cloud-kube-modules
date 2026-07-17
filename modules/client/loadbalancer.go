@@ -3,8 +3,10 @@ package inspace
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 )
 
 func (c *Client) ListLoadBalancers(ctx context.Context, location string) ([]LoadBalancer, error) {
@@ -14,7 +16,15 @@ func (c *Client) ListLoadBalancers(ctx context.Context, location string) ([]Load
 	}
 	var result []LoadBalancer
 	err = c.do(ctx, http.MethodGet, path, nil, nil, &result)
-	return result, err
+	return validatedListResponse(result, err, http.MethodGet, path, func(loadBalancer LoadBalancer) (string, error) {
+		if strings.TrimSpace(loadBalancer.DisplayName) == "" {
+			return "", errors.New("inspace: load balancer list row has an empty display name")
+		}
+		if err := validateUUID("load balancer network", loadBalancer.NetworkUUID); err != nil {
+			return "", err
+		}
+		return validatedUUIDListIdentity("load balancer", loadBalancer.UUID)
+	})
 }
 
 func (c *Client) GetLoadBalancer(ctx context.Context, location, loadBalancerUUID string) (*LoadBalancer, error) {
@@ -27,6 +37,11 @@ func (c *Client) GetLoadBalancer(ctx context.Context, location, loadBalancerUUID
 	}
 	var result LoadBalancer
 	err = c.do(ctx, http.MethodGet, path, nil, nil, &result)
+	if err != nil {
+		err = bindExactLookupError(err, loadBalancerUUID)
+	} else if !strings.EqualFold(result.UUID, loadBalancerUUID) {
+		err = fmt.Errorf("inspace: exact load balancer response UUID %q does not match requested UUID %q", result.UUID, loadBalancerUUID)
+	}
 	return &result, err
 }
 
@@ -57,6 +72,9 @@ func (c *Client) CreateLoadBalancer(ctx context.Context, location string, input 
 	}
 	var result LoadBalancer
 	err = c.doJSON(ctx, http.MethodPost, path, nil, input, &result)
+	if err == nil {
+		err = validateResponseUUID("created load balancer", result.UUID)
+	}
 	return &result, err
 }
 
@@ -84,6 +102,12 @@ func (c *Client) AddLoadBalancerTarget(ctx context.Context, location, loadBalanc
 	}
 	var result LoadBalancerTarget
 	err = c.doJSON(ctx, http.MethodPost, path, nil, LoadBalancerTarget{TargetUUID: vmUUID, TargetType: "vm"}, &result)
+	if err == nil {
+		err = validateExpectedResponseUUID("load balancer target", result.TargetUUID, vmUUID)
+	}
+	if err == nil && result.TargetType != "vm" {
+		err = fmt.Errorf("inspace: load balancer target response type %q does not match expected type %q", result.TargetType, "vm")
+	}
 	return &result, err
 }
 
@@ -114,6 +138,26 @@ func (c *Client) AddLoadBalancerRule(ctx context.Context, location, loadBalancer
 	}
 	var result LoadBalancerRule
 	err = c.doJSON(ctx, http.MethodPost, path, nil, rule, &result)
+	if err == nil && result.UUID != "" {
+		err = validateResponseUUID("created load balancer rule", result.UUID)
+	}
+	expectedProtocol := rule.Protocol
+	if expectedProtocol == "" {
+		expectedProtocol = "TCP"
+	}
+	if err == nil && ((result.Protocol != "" && result.Protocol != expectedProtocol) ||
+		result.SourcePort != rule.SourcePort ||
+		result.TargetPort != rule.TargetPort) {
+		err = fmt.Errorf(
+			"inspace: load balancer rule response does not match requested protocol/ports: got %s/%d/%d, want %s/%d/%d",
+			result.Protocol,
+			result.SourcePort,
+			result.TargetPort,
+			expectedProtocol,
+			rule.SourcePort,
+			rule.TargetPort,
+		)
+	}
 	return &result, err
 }
 

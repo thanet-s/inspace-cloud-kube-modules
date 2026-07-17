@@ -95,6 +95,7 @@ spec:
           image: {{ include "inspace.systemImage" (dict "root" . "image" .Values.csi.sidecars.provisioner.image) }}
           args:
             - --csi-address=/csi/csi.sock
+            - --timeout={{ .Values.csi.sidecars.provisioner.timeoutSeconds }}s
             - --feature-gates=Topology=true
             - --strict-topology
             - --leader-election
@@ -109,6 +110,7 @@ spec:
           image: {{ include "inspace.systemImage" (dict "root" . "image" .Values.csi.sidecars.attacher.image) }}
           args:
             - --csi-address=/csi/csi.sock
+            - --timeout={{ .Values.csi.sidecars.attacher.timeoutSeconds }}s
             - --leader-election
           volumeMounts:
             - name: socket-dir

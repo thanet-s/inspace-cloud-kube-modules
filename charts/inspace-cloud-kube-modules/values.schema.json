@@ -153,8 +153,24 @@
           "additionalProperties": false,
           "required": ["provisioner", "attacher", "registrar", "livenessProbe"],
           "properties": {
-            "provisioner": {"type": "object", "additionalProperties": false, "required": ["image"], "properties": {"image": {"type": "string", "minLength": 1}}},
-            "attacher": {"type": "object", "additionalProperties": false, "required": ["image"], "properties": {"image": {"type": "string", "minLength": 1}}},
+            "provisioner": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["image", "timeoutSeconds"],
+              "properties": {
+                "image": {"type": "string", "minLength": 1},
+                "timeoutSeconds": {"type": "integer", "minimum": 600, "maximum": 3600}
+              }
+            },
+            "attacher": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["image", "timeoutSeconds"],
+              "properties": {
+                "image": {"type": "string", "minLength": 1},
+                "timeoutSeconds": {"type": "integer", "minimum": 600, "maximum": 3600}
+              }
+            },
             "registrar": {"type": "object", "additionalProperties": false, "required": ["image"], "properties": {"image": {"type": "string", "minLength": 1}}},
             "livenessProbe": {"type": "object", "additionalProperties": false, "required": ["image"], "properties": {"image": {"type": "string", "minLength": 1}}}
           }

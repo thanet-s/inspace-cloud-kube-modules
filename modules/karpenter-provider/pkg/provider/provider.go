@@ -492,7 +492,11 @@ func (p *CloudProvider) Delete(ctx context.Context, nodeClaim *karpv1.NodeClaim)
 		}
 		return fmt.Errorf("deleting VM %s: %w", id.VMUUID, err)
 	}
-	return nil
+	// The cloud boundary returns nil only after VM, floating-IP, and firewall
+	// absence have all converged. At that point the instance is already
+	// terminated, so satisfy Karpenter's Delete contract immediately instead
+	// of forcing a second complete deletion audit.
+	return cloudprovider.NewNodeClaimNotFoundError(fmt.Errorf("VM %s deletion converged", id.VMUUID))
 }
 
 func (p *CloudProvider) Get(ctx context.Context, value string) (*karpv1.NodeClaim, error) {

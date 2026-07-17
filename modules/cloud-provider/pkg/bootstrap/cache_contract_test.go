@@ -172,6 +172,70 @@ func TestCacheImageManifestExcludesDisabledRKE2Ingress(t *testing.T) {
 	}
 }
 
+func TestCacheImageManifestPinsReleasedModuleSourcesToPlatformDigests(t *testing.T) {
+	const moduleVersion = "0.6.0-rc.4"
+	digests := map[string]string{
+		"inspace-cloud-controller-manager": "sha256:" + strings.Repeat("a", 64),
+		"inspace-csi-driver":               "sha256:" + strings.Repeat("b", 64),
+		"karpenter-provider-inspace":       "sha256:" + strings.Repeat("c", 64),
+	}
+	manifest, err := renderCacheImageManifestWithDigests(
+		bootstrapCacheRKE2Version,
+		moduleVersion,
+		[]string{"rke2-ingress-nginx"},
+		digests,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for component, digest := range digests {
+		line := "docker://ghcr.io/thanet-s/" + component + "@" + digest +
+			"\tthanet-s/" + component + ":" + moduleVersion + "\n"
+		if strings.Count(manifest, line) != 1 {
+			t.Fatalf("cache manifest does not contain exactly one immutable source and tagged target %q", line)
+		}
+	}
+	if strings.Contains(manifest, "docker://ghcr.io/thanet-s/inspace-cloud-controller-manager:"+moduleVersion) {
+		t.Fatal("cache manifest retained a mutable product source after digest binding")
+	}
+}
+
+func TestCacheImageManifestRejectsIncompleteOrMalformedModuleDigests(t *testing.T) {
+	valid := map[string]string{
+		"inspace-cloud-controller-manager": "sha256:" + strings.Repeat("a", 64),
+		"inspace-csi-driver":               "sha256:" + strings.Repeat("b", 64),
+		"karpenter-provider-inspace":       "sha256:" + strings.Repeat("c", 64),
+	}
+	tests := map[string]map[string]string{
+		"missing": {
+			"inspace-cloud-controller-manager": valid["inspace-cloud-controller-manager"],
+			"inspace-csi-driver":               valid["inspace-csi-driver"],
+		},
+		"unknown": {
+			"inspace-cloud-controller-manager": valid["inspace-cloud-controller-manager"],
+			"inspace-csi-driver":               valid["inspace-csi-driver"],
+			"unknown":                          valid["karpenter-provider-inspace"],
+		},
+		"uppercase": {
+			"inspace-cloud-controller-manager": "sha256:" + strings.Repeat("A", 64),
+			"inspace-csi-driver":               valid["inspace-csi-driver"],
+			"karpenter-provider-inspace":       valid["karpenter-provider-inspace"],
+		},
+	}
+	for name, digests := range tests {
+		t.Run(name, func(t *testing.T) {
+			if _, err := renderCacheImageManifestWithDigests(
+				bootstrapCacheRKE2Version,
+				"0.6.0-rc.4",
+				nil,
+				digests,
+			); err == nil {
+				t.Fatal("malformed module digest set was accepted")
+			}
+		})
+	}
+}
+
 func TestCacheBastionCloudInitIsPrivateBoundedAndReadOnly(t *testing.T) {
 	key := []byte("0123456789abcdef0123456789abcdef")
 	hostname := "cache.unit.inspace.internal"

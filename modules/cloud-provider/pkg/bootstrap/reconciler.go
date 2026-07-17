@@ -58,6 +58,7 @@ type API interface {
 	AssignFirewallToVM(context.Context, string, string, string) error
 	DeleteFirewall(context.Context, string, string) error
 	ListFloatingIPs(context.Context, string, *inspace.FloatingIPFilters) ([]inspace.FloatingIP, error)
+	GetFloatingIP(context.Context, string, string) (*inspace.FloatingIP, error)
 	UpdateFloatingIP(context.Context, string, string, inspace.UpdateFloatingIPRequest) (*inspace.FloatingIP, error)
 	UnassignFloatingIP(context.Context, string, string) (*inspace.FloatingIP, error)
 	DeleteFloatingIP(context.Context, string, string) error
@@ -79,6 +80,9 @@ type Reconciler struct {
 	// ModuleVersion selects the exact released InSpace controller images that
 	// the bastion pre-seeds. Development builds must use directDownload.
 	ModuleVersion string
+	// ModuleImageDigests optionally binds bootstrap-cache source pulls to the
+	// verified linux/amd64 platform manifests for ModuleVersion.
+	ModuleImageDigests map[string]string
 
 	// SSHUsername and SSHPublicKey are optional and must be set together. The
 	// public key is sent to InSpace's VM-create API; private key material is
@@ -254,6 +258,9 @@ func (r *Reconciler) Reconcile(ctx context.Context, cluster *v1alpha1.InSpaceClu
 	}
 	firewalls, err := r.API.ListFirewalls(ctx, cluster.Spec.Location)
 	if err != nil {
+		return Result{}, err
+	}
+	if err := validateFirewallAssignmentCollections(firewalls); err != nil {
 		return Result{}, err
 	}
 	resourceNames := currentBootstrapResourceNames(cluster.Metadata.Name, owner)
@@ -574,6 +581,9 @@ func (r *Reconciler) Destroy(ctx context.Context, cluster *v1alpha1.InSpaceClust
 	}
 	firewalls, err := r.API.ListFirewalls(ctx, cluster.Spec.Location)
 	if err != nil {
+		return result, err
+	}
+	if err := validateFirewallAssignmentCollections(firewalls); err != nil {
 		return result, err
 	}
 	resourceNames, err := selectDestroyBootstrapResourceNames(
@@ -1458,6 +1468,9 @@ func (r *Reconciler) readVMCreateDispatchAuthority(
 	if err != nil {
 		return nil, false, fmt.Errorf("bootstrap: fresh firewall inventory before VM create: %w", err)
 	}
+	if err := validateFirewallAssignmentCollections(firewalls); err != nil {
+		return nil, false, fmt.Errorf("bootstrap: fresh firewall inventory before VM create: %w", err)
+	}
 	resourceNames := currentBootstrapResourceNames(clusterName, ownerKey(cluster))
 	nodeFirewall, err := uniqueFirewallByName(firewalls, resourceNames.NodeFirewall)
 	if err != nil {
@@ -1712,16 +1725,14 @@ func (r *Reconciler) recoverCreatedVMOwnership(
 			} else if !strings.EqualFold(network.UUID, desired.NetworkUUID) {
 				lastErr = errors.New("bootstrap: configured VPC identity changed during VM ownership recovery")
 			} else {
-				memberships := 0
-				for _, vmUUID := range network.VMUUIDs {
-					if strings.EqualFold(vmUUID, returnedUUID) {
-						memberships++
-					}
-				}
-				if memberships == 1 {
+				members, membershipErr := canonicalConfiguredVPCVMUUIDs(network)
+				if membershipErr != nil {
+					lastErr = fmt.Errorf("bootstrap: configured VPC membership during VM ownership recovery: %w", membershipErr)
+				} else if _, present := members[strings.ToLower(returnedUUID)]; present {
 					return detail, nil
+				} else {
+					lastErr = fmt.Errorf("bootstrap: exact VM %q is absent from configured-VPC membership", desired.Name)
 				}
-				lastErr = fmt.Errorf("bootstrap: exact VM %q has %d configured-VPC memberships, want one", desired.Name, memberships)
 			}
 		}
 
@@ -2299,9 +2310,12 @@ func (r *Reconciler) ensureOwnedAutoFloatingIP(ctx context.Context, cluster *v1a
 // reports false only when the exact original unnamed auto-assignment remains;
 // every missing, duplicate, foreign, or partially changed row is ambiguity.
 func (r *Reconciler) readFloatingIPUpdateState(ctx context.Context, cluster *v1alpha1.InSpaceCluster, name string, vm *inspace.VM, address string) (*inspace.FloatingIP, bool, error) {
-	items, err := r.API.ListFloatingIPs(ctx, cluster.Spec.Location, nil)
+	exact, absent, items, err := r.readExactFloatingIPInventory(ctx, cluster.Spec.Location, address)
 	if err != nil {
-		return nil, false, fmt.Errorf("bootstrap: list floating IPs after update of %q: %w", name, err)
+		return nil, false, fmt.Errorf("bootstrap: read exact floating IP after update of %q: %w", name, err)
+	}
+	if absent {
+		return nil, false, fmt.Errorf("bootstrap: floating IP %s disappeared after update of %q", address, name)
 	}
 	var found *inspace.FloatingIP
 	for i := range items {
@@ -2316,6 +2330,9 @@ func (r *Reconciler) readFloatingIPUpdateState(ctx context.Context, cluster *v1a
 	}
 	if found == nil {
 		return nil, false, fmt.Errorf("bootstrap: floating IP %s disappeared after update of %q", address, name)
+	}
+	if exact == nil || !bootstrapFloatingIPStateEqual(exact, found) {
+		return nil, false, fmt.Errorf("bootstrap: exact and list floating IP state disagree after update of %q", name)
 	}
 	if found.Address != address || found.AssignedTo != vm.UUID {
 		return nil, false, fmt.Errorf("bootstrap: floating IP %q update changed its exact address or VM assignment", name)
@@ -2561,6 +2578,9 @@ func exactFirewallAssignmentState(items []inspace.Firewall, expectedFirewall *in
 	if expectedFirewall == nil || !vmUUIDPattern.MatchString(expectedFirewall.UUID) || !vmUUIDPattern.MatchString(vmUUID) {
 		return false, errors.New("bootstrap: exact firewall assignment state requires valid firewall and VM UUIDs")
 	}
+	if err := validateFirewallAssignmentCollections(items); err != nil {
+		return false, fmt.Errorf("bootstrap: exact firewall assignment state: %w", err)
+	}
 	expectedRows := 0
 	assignmentRows := 0
 	for i := range items {
@@ -2636,7 +2656,7 @@ func (r *Reconciler) bootstrapCacheTLS(cluster *v1alpha1.InSpaceCluster, owner s
 	if len(r.BootstrapCacheKey) != 32 {
 		return cacheTLSMaterial{}, errors.New("bootstrap: cached mode requires a persisted 32-byte INSPACE_BOOTSTRAP_CACHE_KEY")
 	}
-	if _, err := renderCacheImageManifest(cluster.Spec.RKE2.Version, r.ModuleVersion, cluster.Spec.RKE2.Disable); err != nil {
+	if _, err := renderCacheImageManifestWithDigests(cluster.Spec.RKE2.Version, r.ModuleVersion, cluster.Spec.RKE2.Disable, r.ModuleImageDigests); err != nil {
 		return cacheTLSMaterial{}, err
 	}
 	return deriveCacheTLS(r.BootstrapCacheKey, owner, bootstrapCacheHostname(cluster.Metadata.Name), r.BootstrapCacheNotBefore)
@@ -2703,7 +2723,7 @@ func (r *Reconciler) desiredBastionVMRequest(cluster *v1alpha1.InSpaceCluster, n
 		cloudInit, err = RenderCacheBastionCloudInitJSON(CacheBastionCloudInitInput{
 			NodeName: name, PrivateSubnet: network.Subnet, CacheHostname: bootstrapCacheHostname(cluster.Metadata.Name),
 			RKE2Version: cluster.Spec.RKE2.Version, ModuleVersion: r.ModuleVersion,
-			Disable:       cluster.Spec.RKE2.Disable,
+			ModuleImageDigests: r.ModuleImageDigests, Disable: cluster.Spec.RKE2.Disable,
 			CACertificate: material.CACertificate, ServerCertificate: material.ServerCertificate, ServerPrivateKey: material.ServerPrivateKey,
 			SkipOSUpgrade: cluster.Spec.RKE2.SkipOSUpgrade,
 		})
@@ -2925,14 +2945,12 @@ func validateOwnedVM(vm *inspace.VM, desired inspace.CreateVMRequest, network *i
 	if network == nil || !strings.EqualFold(network.UUID, desired.NetworkUUID) {
 		return fmt.Errorf("bootstrap: refusing to adopt VM %q without the exact configured private network", vm.Name)
 	}
-	memberships := 0
-	for _, uuid := range network.VMUUIDs {
-		if strings.EqualFold(uuid, vm.UUID) {
-			memberships++
-		}
+	members, err := canonicalConfiguredVPCVMUUIDs(network)
+	if err != nil {
+		return fmt.Errorf("bootstrap: refusing to adopt VM %q with invalid configured-network membership: %w", vm.Name, err)
 	}
-	if memberships != 1 {
-		return fmt.Errorf("bootstrap: refusing to adopt VM %q with %d configured-network memberships, want one", vm.Name, memberships)
+	if _, present := members[strings.ToLower(vm.UUID)]; !present {
+		return fmt.Errorf("bootstrap: refusing to adopt VM %q without configured-network membership", vm.Name)
 	}
 	rootDiskMatches := false
 	for _, disk := range vm.Storage {
@@ -3031,14 +3049,12 @@ func (r *Reconciler) readExactOwnedVMMutationAuthority(
 	if network == nil || !strings.EqualFold(network.UUID, cluster.Spec.Network.UUID) {
 		return nil, fmt.Errorf("bootstrap: configured VPC identity changed for mutation target %s", vmUUID)
 	}
-	memberships := 0
-	for _, candidateUUID := range network.VMUUIDs {
-		if strings.EqualFold(candidateUUID, vmUUID) {
-			memberships++
-		}
+	members, err := canonicalConfiguredVPCVMUUIDs(network)
+	if err != nil {
+		return nil, fmt.Errorf("bootstrap: configured VPC membership for mutation target %s: %w", vmUUID, err)
 	}
-	if memberships != 1 {
-		return nil, fmt.Errorf("bootstrap: VM %q has %d configured-VPC memberships, want one", detail.Name, memberships)
+	if _, present := members[strings.ToLower(vmUUID)]; !present {
+		return nil, fmt.Errorf("bootstrap: VM %q lacks configured-VPC membership", detail.Name)
 	}
 
 	owned, controlPlaneNames, bastionName, err := uniqueDestroyVMs([]inspace.VM{*detail}, ownerKey(cluster), cluster.Metadata.Name)
@@ -3055,21 +3071,88 @@ func (r *Reconciler) readExactOwnedVMMutationAuthority(
 }
 
 func (r *Reconciler) findFloatingIPByAddress(ctx context.Context, location, address string) (*inspace.FloatingIP, error) {
-	items, err := r.API.ListFloatingIPs(ctx, location, nil)
+	exact, absent, _, err := r.readExactFloatingIPInventory(ctx, location, address)
 	if err != nil {
 		return nil, err
 	}
-	var found *inspace.FloatingIP
-	for i := range items {
-		if items[i].IsDeleted || items[i].Address != address {
+	if absent {
+		return nil, nil
+	}
+	return exact, nil
+}
+
+func (r *Reconciler) readExactFloatingIPInventory(
+	ctx context.Context,
+	location, address string,
+) (*inspace.FloatingIP, bool, []inspace.FloatingIP, error) {
+	parsed, err := netip.ParseAddr(address)
+	if err != nil || !parsed.Is4() || !parsed.IsGlobalUnicast() || parsed.IsPrivate() || parsed.String() != address {
+		return nil, false, nil, errors.New("bootstrap: exact floating-IP read requires a canonical public IPv4 address")
+	}
+	exact, exactErr := r.API.GetFloatingIP(ctx, location, address)
+	exactAbsent := false
+	if exactErr != nil {
+		if !inspace.IsNotFound(exactErr) {
+			return nil, false, nil, fmt.Errorf("bootstrap: read exact floating IP %s: %w", address, exactErr)
+		}
+		exactAbsent = true
+	} else {
+		if exact == nil || exact.Address != address {
+			return nil, false, nil, fmt.Errorf("bootstrap: exact floating-IP response does not match %s", address)
+		}
+		exactAbsent = exact.IsDeleted
+	}
+	items, listErr := r.API.ListFloatingIPs(ctx, location, nil)
+	if listErr != nil {
+		return nil, false, nil, fmt.Errorf("bootstrap: list floating IP %s for exact corroboration: %w", address, listErr)
+	}
+	var listed *inspace.FloatingIP
+	matches := 0
+	for index := range items {
+		if items[index].Address != address {
 			continue
 		}
-		if found != nil {
-			return nil, fmt.Errorf("bootstrap: duplicate active floating IP address %s", address)
+		matches++
+		if matches == 1 {
+			copy := items[index]
+			listed = &copy
 		}
-		found = &items[i]
 	}
-	return found, nil
+	if matches > 1 {
+		return nil, false, nil, fmt.Errorf("bootstrap: floating IP address %s appears %d times", address, matches)
+	}
+	listActive := listed != nil && !listed.IsDeleted
+	if exactAbsent {
+		if listActive {
+			return nil, false, nil, fmt.Errorf("bootstrap: exact floating IP %s is absent or deleted but active in list readback", address)
+		}
+		return nil, true, items, nil
+	}
+	if exact == nil {
+		return nil, false, nil, fmt.Errorf("bootstrap: exact floating IP %s returned no object", address)
+	}
+	if !listActive {
+		return nil, false, nil, fmt.Errorf("bootstrap: exact floating IP %s is active but absent or deleted in list readback", address)
+	}
+	if !bootstrapFloatingIPStateEqual(exact, listed) {
+		return nil, false, nil, fmt.Errorf("bootstrap: exact and list floating IP state disagree for %s", address)
+	}
+	return exact, false, items, nil
+}
+
+func bootstrapFloatingIPStateEqual(left, right *inspace.FloatingIP) bool {
+	return left != nil && right != nil &&
+		left.UUID == right.UUID &&
+		left.Address == right.Address &&
+		left.Name == right.Name &&
+		left.BillingAccountID == right.BillingAccountID &&
+		left.Type == right.Type &&
+		left.Enabled == right.Enabled &&
+		left.IsDeleted == right.IsDeleted &&
+		left.IsVirtual == right.IsVirtual &&
+		left.AssignedTo == right.AssignedTo &&
+		left.AssignedToResourceType == right.AssignedToResourceType &&
+		left.AssignedToPrivateIP == right.AssignedToPrivateIP
 }
 
 func validateFloatingIPCleanupReadback(item *inspace.FloatingIP, cluster *v1alpha1.InSpaceCluster, expectedName, expectedAddress string) error {
@@ -3234,6 +3317,9 @@ func validateOwnedFirewallAssignments(firewall *inspace.Firewall, allowed map[st
 	if firewall == nil {
 		return nil
 	}
+	if firewall.ResourcesAssigned == nil {
+		return fmt.Errorf("firewall %q omitted resources_assigned", firewall.EffectiveName())
+	}
 	for _, resource := range firewall.ResourcesAssigned {
 		if resource.ResourceType != "vm" || !allowed[resource.ResourceUUID] {
 			return errors.New("firewall contains a foreign or non-VM assignment")
@@ -3246,6 +3332,9 @@ func validateOwnedFirewallAssignments(firewall *inspace.Firewall, allowed map[st
 // deterministic managed objects. An owned VM must never be protected by a
 // second or foreign firewall because that policy could silently widen access.
 func validateReverseFirewallAssignments(firewalls []inspace.Firewall, nodeFirewall, bastionFirewall *inspace.Firewall, vms map[string]*inspace.VM, bastionVMName string, controlPlaneNames [ControlPlaneReplicas]string) error {
+	if err := validateFirewallAssignmentCollections(firewalls); err != nil {
+		return err
+	}
 	type expectedAttachment struct {
 		firewallUUID string
 		role         string
@@ -3487,45 +3576,39 @@ func bootstrapIPv4Value(address netip.Addr) uint32 {
 }
 
 // vmsOnConfiguredNetwork scopes RFC1918 collision checks to the actual VPC.
-// VM.NetworkUUID and Network.VMUUIDs are independent API evidence; when both
-// are present they must agree, while either one can identify membership when
-// the other field is omitted by a list response.
+// The complete Network.VMUUIDs collection is authoritative; a non-empty
+// VM.NetworkUUID is independent corroboration and must agree with it.
 func vmsOnConfiguredNetwork(vms []inspace.VM, network *inspace.Network) ([]inspace.VM, error) {
 	if network == nil || network.UUID == "" {
 		return nil, errors.New("bootstrap: configured network readback lacks a UUID")
 	}
-	hasMembershipReadback := network.VMUUIDs != nil
-	members := make(map[string]bool, len(network.VMUUIDs))
-	for _, uuid := range network.VMUUIDs {
-		if uuid == "" || members[uuid] {
-			return nil, errors.New("bootstrap: configured network contains an empty or duplicate VM UUID")
-		}
-		members[uuid] = true
+	members, err := canonicalConfiguredVPCVMUUIDs(network)
+	if err != nil {
+		return nil, fmt.Errorf("bootstrap: configured network membership is invalid: %w", err)
 	}
 	result := make([]inspace.VM, 0, len(vms))
 	seenVMs := make(map[string]bool, len(vms))
 	for i := range vms {
 		if vms[i].UUID != "" {
-			if seenVMs[vms[i].UUID] {
+			canonicalVMUUID := strings.ToLower(vms[i].UUID)
+			if seenVMs[canonicalVMUUID] {
 				return nil, fmt.Errorf("bootstrap: duplicate VM UUID %s in location readback", vms[i].UUID)
 			}
-			seenVMs[vms[i].UUID] = true
+			seenVMs[canonicalVMUUID] = true
 		}
-		listed := members[vms[i].UUID]
+		_, listed := members[strings.ToLower(vms[i].UUID)]
 		hasNetworkField := vms[i].NetworkUUID != ""
 		fieldMatches := vms[i].NetworkUUID == network.UUID
-		if hasNetworkField && hasMembershipReadback && listed != fieldMatches {
+		if hasNetworkField && listed != fieldMatches {
 			return nil, fmt.Errorf("bootstrap: VM %q network UUID and configured VPC membership disagree", vms[i].Name)
 		}
 		if fieldMatches || listed {
 			result = append(result, vms[i])
 		}
 	}
-	if hasMembershipReadback {
-		for uuid := range members {
-			if !seenVMs[uuid] {
-				return nil, fmt.Errorf("bootstrap: configured VPC lists VM %s missing from the location VM readback", uuid)
-			}
+	for uuid := range members {
+		if !seenVMs[uuid] {
+			return nil, fmt.Errorf("bootstrap: configured VPC lists VM %s missing from the location VM readback", uuid)
 		}
 	}
 	return result, nil
@@ -3533,8 +3616,14 @@ func vmsOnConfiguredNetwork(vms []inspace.VM, network *inspace.Network) ([]inspa
 
 func validateNoVMPoolCollision(vms []inspace.VM, pool privateIPv4Range) error {
 	for i := range vms {
-		address, err := netip.ParseAddr(vms[i].PrivateIPv4)
-		if err == nil && privatePoolContains(pool, address) {
+		address, err := validatedConfiguredResourcePrivateIPv4(
+			vms[i].PrivateIPv4,
+			fmt.Sprintf("VM %q", vms[i].Name),
+		)
+		if err != nil {
+			return err
+		}
+		if privatePoolContains(pool, address) {
 			return fmt.Errorf("bootstrap: VM %q already uses reserved private load-balancer address %s", vms[i].Name, address)
 		}
 	}
@@ -3547,8 +3636,14 @@ func validateNoLoadBalancerPoolCollision(loadBalancers []inspace.LoadBalancer, n
 		if loadBalancer.IsDeleted || loadBalancer.NetworkUUID != networkUUID {
 			continue
 		}
-		address, err := netip.ParseAddr(strings.TrimSpace(loadBalancer.PrivateAddress))
-		if err == nil && privatePoolContains(pool, address) {
+		address, err := validatedConfiguredResourcePrivateIPv4(
+			loadBalancer.PrivateAddress,
+			fmt.Sprintf("active load balancer %q", loadBalancer.DisplayName),
+		)
+		if err != nil {
+			return err
+		}
+		if privatePoolContains(pool, address) {
 			return fmt.Errorf("bootstrap: active load balancer %q already uses reserved private load-balancer address %s in the configured VPC", loadBalancer.DisplayName, address)
 		}
 	}
@@ -3562,15 +3657,33 @@ func validateNoLoadBalancerVirtualIPCollision(loadBalancers []inspace.LoadBalanc
 	}
 	for i := range loadBalancers {
 		loadBalancer := &loadBalancers[i]
-		if loadBalancer.IsDeleted || loadBalancer.NetworkUUID != networkUUID || strings.TrimSpace(loadBalancer.PrivateAddress) == "" {
+		if loadBalancer.IsDeleted || loadBalancer.NetworkUUID != networkUUID {
 			continue
 		}
-		privateAddress, parseErr := netip.ParseAddr(strings.TrimSpace(loadBalancer.PrivateAddress))
-		if parseErr == nil && privateAddress == virtualAddress {
+		privateAddress, parseErr := validatedConfiguredResourcePrivateIPv4(
+			loadBalancer.PrivateAddress,
+			fmt.Sprintf("active load balancer %q", loadBalancer.DisplayName),
+		)
+		if parseErr != nil {
+			return parseErr
+		}
+		if privateAddress == virtualAddress {
 			return fmt.Errorf("bootstrap: active load balancer %q already uses control-plane virtual IPv4 %s in the configured VPC", loadBalancer.DisplayName, virtualIPv4)
 		}
 	}
 	return nil
+}
+
+func validatedConfiguredResourcePrivateIPv4(value, resource string) (netip.Addr, error) {
+	address, err := netip.ParseAddr(value)
+	if err != nil || !address.Is4() || !address.IsPrivate() || address.String() != value {
+		return netip.Addr{}, fmt.Errorf(
+			"bootstrap: %s returned malformed private IPv4 %q in configured-VPC inventory",
+			resource,
+			value,
+		)
+	}
+	return address, nil
 }
 
 // validateControlPlaneBootstrapTopology allows slot 0 to initialize only when
@@ -3590,7 +3703,14 @@ func validateControlPlaneBootstrapTopology(vms map[string]*inspace.VM, clusterNa
 
 func validateNoVirtualIPCollision(vms []inspace.VM, virtualIPv4 string) error {
 	for i := range vms {
-		if vms[i].PrivateIPv4 == virtualIPv4 {
+		address, err := validatedConfiguredResourcePrivateIPv4(
+			vms[i].PrivateIPv4,
+			fmt.Sprintf("VM %q", vms[i].Name),
+		)
+		if err != nil {
+			return err
+		}
+		if address.String() == virtualIPv4 {
 			return fmt.Errorf("bootstrap: VM %q already uses control-plane virtual IPv4 %s", vms[i].Name, virtualIPv4)
 		}
 	}
@@ -3899,6 +4019,26 @@ func firewallHasVM(firewall *inspace.Firewall, uuid string) bool {
 		}
 	}
 	return false
+}
+
+// validateFirewallAssignmentCollections prevents a partial HTTP 200 firewall
+// row from being interpreted as an authoritative empty relationship. The
+// InSpace API represents no assignments as an explicit JSON array; an omitted
+// or null resources_assigned field must fail closed before any create, attach,
+// VM delete, or firewall delete decision.
+func validateFirewallAssignmentCollections(firewalls []inspace.Firewall) error {
+	for i := range firewalls {
+		firewall := &firewalls[i]
+		if firewall.ResourcesAssigned == nil {
+			return fmt.Errorf("bootstrap: firewall %q omitted resources_assigned", firewall.EffectiveName())
+		}
+		for _, resource := range firewall.ResourcesAssigned {
+			if resource.ResourceType != "vm" || !vmUUIDPattern.MatchString(resource.ResourceUUID) {
+				return fmt.Errorf("bootstrap: firewall %q returned an invalid assigned resource type or UUID", firewall.EffectiveName())
+			}
+		}
+	}
+	return nil
 }
 
 func controlPlaneUUIDSet(vms map[string]*inspace.VM, names [ControlPlaneReplicas]string) map[string]bool {

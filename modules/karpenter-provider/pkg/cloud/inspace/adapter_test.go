@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"net/netip"
 	"reflect"
 	"regexp"
@@ -215,7 +216,7 @@ func TestCreateRejectsActiveDeterministicFloatingIPNameBeforeVMPost(t *testing.T
 }
 
 func TestCreateRequiresVPCMembershipBeforeFirewallOrFIPMutation(t *testing.T) {
-	api := &fakeAPI{network: &sdk.Network{UUID: "network-1", Subnet: "10.0.0.0/24"}}
+	api := &fakeAPI{network: &sdk.Network{UUID: "network-1", Subnet: "10.0.0.0/24", VMUUIDs: []string{}}}
 	adapter, _ := New(api)
 	configureFastNetworkReadback(adapter, 60*time.Millisecond)
 	_, err := adapter.CreateVM(context.Background(), testRequest())
@@ -311,7 +312,7 @@ func TestAmbiguousReadDiscoveredFirewallFailureWithoutNetworkMembershipDoesNotMu
 		createErr:            errors.New("connection reset after request"),
 		commitOnCreateError:  true,
 		assignFirewallErrors: []error{errors.New("firewall assignment rejected")},
-		network:              &sdk.Network{UUID: "network-1", Subnet: "10.0.0.0/24"},
+		network:              &sdk.Network{UUID: "network-1", Subnet: "10.0.0.0/24", VMUUIDs: []string{}},
 	}
 	adapter, _ := New(api)
 	configureFastNetworkReadback(adapter, 60*time.Millisecond)
@@ -343,7 +344,7 @@ func TestControllerRestartDeletesCanonicallyOwnedVMWhenFirewallCannotBeRestored(
 	if len(api.vms) != 1 || api.vms[0].NetworkUUID != "" {
 		t.Fatalf("restart fixture must use canonical VM detail with omitted top-level network UUID: %#v", api.vms)
 	}
-	api.firewalls[0].ResourcesAssigned = nil
+	api.firewalls[0].ResourcesAssigned = []sdk.FirewallResource{}
 	api.floatingIPs[0].Name = ""
 	api.assignFirewallErrors = []error{errors.New("firewall assignment rejected")}
 	api.hideFloatingIPsThroughCall = 10_000
@@ -378,9 +379,9 @@ func TestControllerRestartFirewallFailureWithoutNetworkMembershipDoesNotMutateFI
 	if len(api.vms) != 1 || api.vms[0].NetworkUUID != "" {
 		t.Fatalf("restart fixture must omit the canonical top-level network UUID: %#v", api.vms)
 	}
-	api.firewalls[0].ResourcesAssigned = nil
+	api.firewalls[0].ResourcesAssigned = []sdk.FirewallResource{}
 	api.floatingIPs[0].Name = ""
-	api.network = &sdk.Network{UUID: request.NetworkUUID, Subnet: "10.0.0.0/24"}
+	api.network = &sdk.Network{UUID: request.NetworkUUID, Subnet: "10.0.0.0/24", VMUUIDs: []string{}}
 	api.assignFirewallErrors = []error{errors.New("firewall assignment rejected")}
 	api.operations = nil
 	api.firewallAssignCalls = 0
@@ -488,8 +489,8 @@ func TestEstablishedCreateRequiresNetworkBeforeFirewallRepair(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	api.firewalls[0].ResourcesAssigned = nil
-	api.network = &sdk.Network{UUID: request.NetworkUUID, Subnet: "10.0.0.0/24"}
+	api.firewalls[0].ResourcesAssigned = []sdk.FirewallResource{}
+	api.network = &sdk.Network{UUID: request.NetworkUUID, Subnet: "10.0.0.0/24", VMUUIDs: []string{}}
 	api.operations = nil
 	api.firewallAssignCalls = 0
 	configureFastNetworkReadback(adapter, 60*time.Millisecond)
@@ -1391,7 +1392,7 @@ func TestAmbiguousCreateWaitsForNetworkConvergenceWithoutMutation(t *testing.T) 
 	api := &fakeAPI{
 		createErr:           errors.New("connection reset after request"),
 		commitOnCreateError: true,
-		network:             &sdk.Network{UUID: "network-1", Subnet: "10.0.0.0/24"},
+		network:             &sdk.Network{UUID: "network-1", Subnet: "10.0.0.0/24", VMUUIDs: []string{}},
 	}
 	adapter, _ := New(api)
 	configureFastNetworkReadback(adapter, boundedReadbackTestTimeout)
@@ -1706,7 +1707,7 @@ func TestOwnedVIPCollisionRollsBackBeforeUnusableFIPOrFirewallAssignment(t *test
 	}
 	api.vms[0].PrivateIPv4 = request.ControlPlaneVIP
 	api.floatingIPs[0].Enabled = false
-	api.firewalls[0].ResourcesAssigned = nil
+	api.firewalls[0].ResourcesAssigned = []sdk.FirewallResource{}
 	api.operations = nil
 	api.firewallAssignCalls = 0
 	api.floatingIPAssignCalls = 0
@@ -2186,7 +2187,9 @@ func (f *firewallAssignmentGateTestAPI) ListFirewalls(ctx context.Context, _ str
 	result := make([]sdk.Firewall, len(f.inventory))
 	copy(result, f.inventory)
 	for i := range result {
-		result[i].ResourcesAssigned = append([]sdk.FirewallResource(nil), f.inventory[i].ResourcesAssigned...)
+		if f.inventory[i].ResourcesAssigned != nil {
+			result[i].ResourcesAssigned = append([]sdk.FirewallResource{}, f.inventory[i].ResourcesAssigned...)
+		}
 	}
 	return result, nil
 }
@@ -3165,7 +3168,7 @@ func TestCreateRejectsMalformedNetworkMembershipReadback(t *testing.T) {
 
 func TestCreateMissingNetworkMembershipPreservesProtectedLaunchForRestartAdoption(t *testing.T) {
 	api := &fakeAPI{
-		network:             &sdk.Network{UUID: "network-1", Subnet: "10.0.0.0/24"},
+		network:             &sdk.Network{UUID: "network-1", Subnet: "10.0.0.0/24", VMUUIDs: []string{}},
 		mutateGetVMResponse: func(vm *sdk.VM) { vm.NetworkUUID = "" },
 	}
 	adapter, _ := New(api)
@@ -3199,7 +3202,7 @@ func TestCreateMissingNetworkMembershipPreservesProtectedLaunchForRestartAdoptio
 func TestCreateCancellationKeepsBoundedVPCProofAndPreservesUnprovenLaunch(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	api := &fakeAPI{network: &sdk.Network{UUID: "network-1", Subnet: "10.0.0.0/24"}}
+	api := &fakeAPI{network: &sdk.Network{UUID: "network-1", Subnet: "10.0.0.0/24", VMUUIDs: []string{}}}
 	api.networkGetHook = func(call int) {
 		if call == 2 {
 			cancel()
@@ -3224,7 +3227,7 @@ func TestCreateCancellationKeepsBoundedVPCProofAndPreservesUnprovenLaunch(t *tes
 }
 
 func TestCreateCallerDeadlineFailsClosed(t *testing.T) {
-	api := &fakeAPI{network: &sdk.Network{UUID: "network-1", Subnet: "10.0.0.0/24"}}
+	api := &fakeAPI{network: &sdk.Network{UUID: "network-1", Subnet: "10.0.0.0/24", VMUUIDs: []string{}}}
 	adapter, _ := New(api)
 	configureFastNetworkReadback(adapter, boundedReadbackTestTimeout)
 	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
@@ -3356,7 +3359,7 @@ func TestCreateDoesNotDestroyAdoptedVMWhenVPCAttachmentIsTemporarilyAbsent(t *te
 	if _, err := adapter.CreateVM(context.Background(), request); err != nil {
 		t.Fatal(err)
 	}
-	api.network = &sdk.Network{UUID: request.NetworkUUID, Subnet: "10.0.0.0/24"}
+	api.network = &sdk.Network{UUID: request.NetworkUUID, Subnet: "10.0.0.0/24", VMUUIDs: []string{}}
 	api.operations = nil
 	configureFastNetworkReadback(adapter, 60*time.Millisecond)
 	if _, err := adapter.CreateVM(context.Background(), request); err == nil || !strings.Contains(err.Error(), "attachment to network") {
@@ -4259,7 +4262,7 @@ func TestEstablishedWorkerReadsAllowOmittedNetworkUUIDWithExactNetworkMembership
 	if delta := api.vmGetCalls - getCallsBefore; delta != 1 {
 		t.Fatalf("ListVMs network-omission GET delta=%d, want no convergence retry", delta)
 	}
-	api.network = &sdk.Network{UUID: "network-1", Subnet: "10.0.0.0/24"}
+	api.network = &sdk.Network{UUID: "network-1", Subnet: "10.0.0.0/24", VMUUIDs: []string{}}
 	api.operations = nil
 	if _, err := adapter.GetVM(context.Background(), "bkk01", created.UUID, "cluster-a"); err == nil || !strings.Contains(err.Error(), "network contains VM UUID 0 times") {
 		t.Fatalf("GetVM() error = %v, want exact GetNetwork membership rejection", err)
@@ -4757,7 +4760,7 @@ func TestDeleteRequiresExactConfiguredVPCMembershipBeforeMutation(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	api.network = &sdk.Network{UUID: testRequest().NetworkUUID, Subnet: "10.0.0.0/24"}
+	api.network = &sdk.Network{UUID: testRequest().NetworkUUID, Subnet: "10.0.0.0/24", VMUUIDs: []string{}}
 	api.operations = nil
 	api.deleteVMCalls = 0
 	if err := adapter.DeleteVM(context.Background(), created.Location, created.UUID, created.ClusterName, created.NodeClaimName, durableDeleteIdentity(created)); err == nil {
@@ -5157,6 +5160,78 @@ func TestDeleteFloatingIPUncertaintyRetainsFirewallAfterVMDeletion(t *testing.T)
 	}
 	if len(api.floatingIPs) != 1 {
 		t.Fatalf("persistent asynchronous floating IP unexpectedly disappeared: %#v", api.floatingIPs)
+	}
+}
+
+func TestExactFloatingIPInventoryRequiresExactAndListAgreement(t *testing.T) {
+	base := sdk.FloatingIP{
+		Address:          "203.0.113.10",
+		Name:             "cluster-a-karp-nodeclaim-a",
+		BillingAccountID: 1,
+		Type:             "public",
+		Enabled:          true,
+	}
+	assigned := base
+	assigned.AssignedTo = "11111111-1111-4111-8111-111111111111"
+	assigned.AssignedToResourceType = "virtual_machine"
+	assigned.AssignedToPrivateIP = "10.0.0.10"
+	tombstone := base
+	tombstone.IsDeleted = true
+
+	tests := []struct {
+		name       string
+		exact      *sdk.FloatingIP
+		listed     []sdk.FloatingIP
+		wantAbsent bool
+		wantError  bool
+	}{
+		{name: "active agreement", exact: &base, listed: []sdk.FloatingIP{base}},
+		{name: "assigned agreement", exact: &assigned, listed: []sdk.FloatingIP{assigned}},
+		{name: "404 and list absence", listed: []sdk.FloatingIP{}, wantAbsent: true},
+		{name: "tombstone and list tombstone", exact: &tombstone, listed: []sdk.FloatingIP{tombstone}, wantAbsent: true},
+		{name: "404 but list presence", listed: []sdk.FloatingIP{base}, wantError: true},
+		{name: "tombstone but list presence", exact: &tombstone, listed: []sdk.FloatingIP{base}, wantError: true},
+		{name: "exact presence but list absence", exact: &base, listed: []sdk.FloatingIP{}, wantError: true},
+		{name: "state disagreement", exact: &base, listed: []sdk.FloatingIP{assigned}, wantError: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			api := &fakeAPI{
+				floatingIPGetSnapshots:  map[int]*sdk.FloatingIP{1: test.exact},
+				floatingIPListSnapshots: map[int][]sdk.FloatingIP{1: test.listed},
+			}
+			adapter, err := New(api)
+			if err != nil {
+				t.Fatal(err)
+			}
+			item, absent, _, err := adapter.readExactFloatingIPInventory(
+				context.Background(),
+				"bkk01",
+				base.Address,
+			)
+			if test.wantError {
+				if err == nil || absent || item != nil {
+					t.Fatalf("authority = %#v, absent=%t, err=%v; want fail-closed error", item, absent, err)
+				}
+				if len(api.operations) != 0 {
+					t.Fatalf("split read dispatched mutations: %v", api.operations)
+				}
+				return
+			}
+			if err != nil || absent != test.wantAbsent {
+				t.Fatalf("authority = %#v, absent=%t, err=%v", item, absent, err)
+			}
+		})
+	}
+}
+
+func TestFirewallAssignmentsRejectOmittedRelationshipCollection(t *testing.T) {
+	_, err := firewallAssignmentsForVM([]sdk.Firewall{{
+		UUID:              "aaaaaaaa-1111-4222-8333-bbbbbbbbbbbb",
+		ResourcesAssigned: nil,
+	}}, "11111111-1111-4111-8111-111111111111")
+	if err == nil || !strings.Contains(err.Error(), "omitted resources_assigned") {
+		t.Fatalf("firewallAssignmentsForVM() error = %v", err)
 	}
 }
 
@@ -5966,6 +6041,9 @@ type fakeAPI struct {
 	hideFloatingIPsThroughCall         int
 	hideFloatingIPsUntilVMDelete       bool
 	floatingIPListSnapshots            map[int][]sdk.FloatingIP
+	floatingIPGetCalls                 int
+	floatingIPGetErrors                map[int]error
+	floatingIPGetSnapshots             map[int]*sdk.FloatingIP
 	unassignFloatingIPErrors           []error
 	unassignFloatingIPCommitOnError    bool
 	deleteFloatingIPErrors             []error
@@ -6010,10 +6088,12 @@ func (f *fakeAPI) GetNetwork(context.Context, string, string) (*sdk.Network, err
 	}
 	if f.network != nil {
 		copy := *f.network
-		copy.VMUUIDs = append([]string(nil), f.network.VMUUIDs...)
+		if f.network.VMUUIDs != nil {
+			copy.VMUUIDs = append([]string{}, f.network.VMUUIDs...)
+		}
 		return &copy, nil
 	}
-	network := &sdk.Network{UUID: "network-1", Subnet: "10.0.0.0/24"}
+	network := &sdk.Network{UUID: "network-1", Subnet: "10.0.0.0/24", VMUUIDs: []string{}}
 	if f.networkGetCalls > f.networkMembershipAfter {
 		for _, vm := range f.vms {
 			network.VMUUIDs = append(network.VMUUIDs, vm.UUID)
@@ -6041,9 +6121,12 @@ func cloneFirewalls(values []sdk.Firewall, hideAssignments bool) []sdk.Firewall 
 	for i := range result {
 		result[i].Rules = append([]sdk.FirewallRule(nil), result[i].Rules...)
 		if hideAssignments {
-			result[i].ResourcesAssigned = nil
-		} else {
-			result[i].ResourcesAssigned = append([]sdk.FirewallResource(nil), result[i].ResourcesAssigned...)
+			// Model an authoritative, eventually consistent empty relation.
+			// A nil slice is reserved for the distinct malformed/omitted-field
+			// tests and must fail closed in production.
+			result[i].ResourcesAssigned = []sdk.FirewallResource{}
+		} else if values[i].ResourcesAssigned != nil {
+			result[i].ResourcesAssigned = append([]sdk.FirewallResource{}, values[i].ResourcesAssigned...)
 		}
 	}
 	return result
@@ -6129,6 +6212,36 @@ func (f *fakeAPI) ListFloatingIPs(_ context.Context, _ string, filters *sdk.Floa
 		}
 	}
 	return result, nil
+}
+func (f *fakeAPI) GetFloatingIP(_ context.Context, location, address string) (*sdk.FloatingIP, error) {
+	f.floatingIPGetCalls++
+	if err := f.floatingIPGetErrors[f.floatingIPGetCalls]; err != nil {
+		return nil, err
+	}
+	if snapshot, ok := f.floatingIPGetSnapshots[f.floatingIPGetCalls]; ok {
+		if snapshot == nil {
+			return nil, exactFloatingIPNotFound(location, address)
+		}
+		copy := *snapshot
+		return &copy, nil
+	}
+	for index := range f.floatingIPs {
+		if f.floatingIPs[index].Address == address {
+			copy := f.floatingIPs[index]
+			return &copy, nil
+		}
+	}
+	return nil, exactFloatingIPNotFound(location, address)
+}
+func exactFloatingIPNotFound(location, address string) error {
+	return &sdk.APIError{
+		StatusCode:       http.StatusNotFound,
+		Method:           http.MethodGet,
+		Path:             "/v1/" + location + "/network/ip_addresses/" + address,
+		Message:          "not found",
+		ExactLookup:      true,
+		RequestedAddress: address,
+	}
 }
 func (f *fakeAPI) CreateFloatingIP(_ context.Context, _ string, request sdk.CreateFloatingIPRequest) (*sdk.FloatingIP, error) {
 	f.floatingIPCreateCalls++
@@ -6251,6 +6364,7 @@ func (f *fakeAPI) ListVMs(context.Context, string) ([]sdk.VM, error) {
 func secureFirewall() sdk.Firewall {
 	return sdk.Firewall{
 		UUID: "33333333-3333-4333-8333-333333333333", BillingAccountID: 1,
+		ResourcesAssigned: []sdk.FirewallResource{},
 		Rules: []sdk.FirewallRule{{
 			UUID: "in-vpc-pods-tcp", Protocol: "tcp", Direction: "inbound",
 			EndpointSpecType: "ip_prefixes", EndpointSpec: []string{"10.0.0.0/24", bootstrap.NativeRoutingPodCIDR},
@@ -6266,6 +6380,7 @@ func nodeLoadBalancerShardFirewall(cluster, shard string) sdk.Firewall {
 	port := int32(443)
 	firewall := sdk.Firewall{
 		UUID: "44444444-4444-4444-8444-444444444444", BillingAccountID: 1,
+		ResourcesAssigned: []sdk.FirewallResource{},
 		Rules: []sdk.FirewallRule{{
 			UUID: "public-tcp-443", Protocol: "tcp", Direction: "inbound",
 			PortStart: &port, PortEnd: &port, EndpointSpecType: "any",
@@ -6283,6 +6398,7 @@ func nodeLoadBalancerServiceFirewall(cluster, serviceUID string) sdk.Firewall {
 	port := int32(443)
 	firewall := sdk.Firewall{
 		UUID: "44444444-4444-4444-8444-444444444444", BillingAccountID: 1,
+		ResourcesAssigned: []sdk.FirewallResource{},
 		Rules: []sdk.FirewallRule{{
 			UUID: "public-tcp-443", Protocol: "tcp", Direction: "inbound",
 			PortStart: &port, PortEnd: &port, EndpointSpecType: "any",
@@ -6299,6 +6415,7 @@ func nodeLoadBalancerServiceFirewall(cluster, serviceUID string) sdk.Firewall {
 func nodeLoadBalancerClusterICMPFirewall(cluster string) sdk.Firewall {
 	firewall := sdk.Firewall{
 		UUID: "66666666-6666-4666-8666-666666666666", BillingAccountID: 1,
+		ResourcesAssigned: []sdk.FirewallResource{},
 		Rules: []sdk.FirewallRule{{
 			UUID: "public-icmp", Protocol: "icmp", Direction: "inbound", EndpointSpecType: "any",
 		}},
@@ -6347,19 +6464,33 @@ func (f *fakeAPI) GetVM(ctx context.Context, _, uuid string) (*sdk.VM, error) {
 		return nil, ctx.Err()
 	}
 	if injected != nil {
-		return nil, injected
+		return nil, bindTestExactVMError(injected, uuid)
 	}
 	if returnNil {
 		return nil, nil
 	}
 	if found == nil {
-		return nil, &sdk.APIError{StatusCode: 404}
+		return nil, bindTestExactVMError(&sdk.APIError{StatusCode: 404}, uuid)
 	}
 	if mutate != nil {
 		mutate(found)
 	}
 	return found, nil
 }
+
+func bindTestExactVMError(err error, uuid string) error {
+	var apiErr *sdk.APIError
+	if !errors.As(err, &apiErr) {
+		return err
+	}
+	bound := *apiErr
+	bound.Method = "GET"
+	bound.Path = "/v1/bkk01/user-resource/vm"
+	bound.ExactLookup = true
+	bound.RequestedUUID = uuid
+	return &bound
+}
+
 func (f *fakeAPI) CreateVM(_ context.Context, _ string, request sdk.CreateVMRequest) (*sdk.VM, error) {
 	f.createCalls++
 	f.firewallListCallsAtVMCreate = f.firewallListCalls

@@ -265,6 +265,25 @@ type FloatingIP struct {
 	CreatedAt              string `json:"created_at,omitempty"`
 	UpdatedAt              string `json:"updated_at,omitempty"`
 	UnassignedAt           string `json:"unassigned_at,omitempty"`
+	assignedToPresent      bool
+}
+
+// UnmarshalJSON preserves the distinction between the documented
+// "assigned_to": null value and an omitted assignment field. Controllers must
+// not interpret a partial HTTP 200 object as authoritative unassignment.
+func (f *FloatingIP) UnmarshalJSON(data []byte) error {
+	type floatingIPWithoutMethods FloatingIP
+	var decoded floatingIPWithoutMethods
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	*f = FloatingIP(decoded)
+	_, f.assignedToPresent = fields["assigned_to"]
+	return nil
 }
 
 type CreateFloatingIPRequest struct {

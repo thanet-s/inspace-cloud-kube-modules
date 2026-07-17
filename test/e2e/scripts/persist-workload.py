@@ -3,12 +3,17 @@
 
 import argparse
 import hashlib
+import ipaddress
 import json
 import os
 import pathlib
 import re
 import subprocess
-import tempfile
+import urllib.parse
+import uuid
+
+from cloud_identity_journal import record_known_cloud_identities
+from durable_io import atomic_write_json
 
 
 NODE_LOAD_BALANCER_SERVICE_NAMES = (
@@ -46,20 +51,86 @@ def node_load_balancer_datapath_name(service: dict) -> str:
     return "inlb-dp-" + identity
 
 
-def atomic_write(path: pathlib.Path, value) -> None:
-    fd, temporary = tempfile.mkstemp(prefix=path.name + ".", dir=path.parent)
-    try:
-        os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as stream:
-            json.dump(value, stream, indent=2, sort_keys=True)
-            stream.write("\n")
-        os.replace(temporary, path)
-    except BaseException:
+def recover_nodeclaim_cloud_identities(kubeconfig: str) -> tuple[list[str], list[str]]:
+    claims = kubectl(kubeconfig, "get", "nodeclaims")
+    if claims is None:
+        return [], []
+    items = claims.get("items")
+    if not isinstance(items, list) or any(not isinstance(item, dict) for item in items):
+        raise SystemExit("NodeClaim recovery inventory is malformed")
+    location = os.environ["INSPACE_LOCATION"]
+    vm_uuids = []
+    public_addresses = []
+    for claim in items:
+        status = claim.get("status", {})
+        if not isinstance(status, dict):
+            raise SystemExit("NodeClaim recovery status is malformed")
+        provider_id = status.get("providerID")
+        if provider_id in (None, ""):
+            continue
+        if not isinstance(provider_id, str):
+            raise SystemExit("NodeClaim recovery providerID is malformed")
+        parsed = urllib.parse.urlsplit(provider_id)
+        if (
+            parsed.scheme != "inspace"
+            or parsed.netloc != location
+            or parsed.query
+            or parsed.fragment
+            or not parsed.path.startswith("/")
+            or "/" in parsed.path[1:]
+        ):
+            raise SystemExit("NodeClaim recovery providerID is not canonical")
+        vm_uuid = parsed.path[1:]
         try:
-            os.unlink(temporary)
-        except FileNotFoundError:
-            pass
-        raise
+            canonical_uuid = str(uuid.UUID(vm_uuid))
+        except ValueError as error:
+            raise SystemExit("NodeClaim recovery providerID lacks a VM UUID") from error
+        if canonical_uuid != vm_uuid:
+            raise SystemExit("NodeClaim recovery VM UUID is not canonical")
+        vm_uuids.append(vm_uuid)
+
+        node_name = status.get("nodeName")
+        if node_name in (None, ""):
+            continue
+        if not isinstance(node_name, str):
+            raise SystemExit("NodeClaim recovery nodeName is malformed")
+        node = kubectl(kubeconfig, "get", "node", node_name)
+        if node is None:
+            continue
+        if not isinstance(node, dict) or node.get("spec", {}).get(
+            "providerID"
+        ) != provider_id:
+            raise SystemExit(
+                "NodeClaim recovery Node does not bind its exact providerID"
+            )
+        external = [
+            address.get("address")
+            for address in node.get("status", {}).get("addresses", [])
+            if isinstance(address, dict) and address.get("type") == "ExternalIP"
+        ]
+        if len(external) > 1:
+            raise SystemExit("NodeClaim recovery Node has multiple ExternalIPs")
+        if external:
+            try:
+                parsed_address = ipaddress.ip_address(external[0])
+            except ValueError as error:
+                raise SystemExit(
+                    "NodeClaim recovery ExternalIP is malformed"
+                ) from error
+            if (
+                parsed_address.version != 4
+                or not parsed_address.is_global
+                or str(parsed_address) != external[0]
+            ):
+                raise SystemExit(
+                    "NodeClaim recovery ExternalIP is not canonical public IPv4"
+                )
+            public_addresses.append(external[0])
+    if len(vm_uuids) != len(set(vm_uuids)):
+        raise SystemExit("NodeClaim recovery repeats a VM provider identity")
+    if len(public_addresses) != len(set(public_addresses)):
+        raise SystemExit("NodeClaim recovery repeats an ExternalIP")
+    return sorted(vm_uuids), sorted(public_addresses)
 
 
 def main() -> None:
@@ -135,7 +206,16 @@ def main() -> None:
                         "volumeHandle": handle,
                         "diskUUID": handle.rsplit("/", 1)[-1],
                     })
-    atomic_write(path, state)
+    vm_uuids, public_addresses = recover_nodeclaim_cloud_identities(
+        args.kubeconfig
+    )
+    atomic_write_json(path, state)
+    record_known_cloud_identities(
+        path,
+        state,
+        vm_uuids=vm_uuids,
+        floating_ip_addresses=public_addresses,
+    )
 
 
 if __name__ == "__main__":

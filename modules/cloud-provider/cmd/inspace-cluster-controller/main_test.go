@@ -162,6 +162,40 @@ func TestParseTCPPorts(t *testing.T) {
 	}
 }
 
+func TestParseBootstrapCacheImageDigests(t *testing.T) {
+	valid := map[string]string{
+		"inspace-cloud-controller-manager": "sha256:" + strings.Repeat("a", 64),
+		"inspace-csi-driver":               "sha256:" + strings.Repeat("b", 64),
+		"karpenter-provider-inspace":       "sha256:" + strings.Repeat("c", 64),
+	}
+	raw, err := json.Marshal(valid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := parseBootstrapCacheImageDigests(string(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, valid) {
+		t.Fatalf("parsed digests = %#v, want %#v", got, valid)
+	}
+	if got, err := parseBootstrapCacheImageDigests("  "); err != nil || got != nil {
+		t.Fatalf("empty optional digest input = %#v, %v; want nil, nil", got, err)
+	}
+	for name, raw := range map[string]string{
+		"malformed-json": "{",
+		"missing":        `{"inspace-cloud-controller-manager":"sha256:` + strings.Repeat("a", 64) + `"}`,
+		"uppercase":      strings.Replace(string(raw), strings.Repeat("a", 64), strings.Repeat("A", 64), 1),
+		"unknown":        strings.Replace(string(raw), "karpenter-provider-inspace", "unknown", 1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := parseBootstrapCacheImageDigests(raw); err == nil {
+				t.Fatal("invalid module image digest input was accepted")
+			}
+		})
+	}
+}
+
 func TestLoadBootstrapCacheSettingsRequiresPersistedKeyAndRealInitializationTime(t *testing.T) {
 	cluster := &v1alpha1.InSpaceCluster{}
 	notBefore := time.Now().UTC().Add(-time.Minute).Truncate(time.Second)
