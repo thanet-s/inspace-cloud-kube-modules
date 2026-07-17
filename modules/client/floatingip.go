@@ -265,17 +265,50 @@ func (c *Client) UnassignFloatingIP(ctx context.Context, location, address strin
 	}
 	var result FloatingIP
 	err = c.doJSON(ctx, http.MethodPost, path, nil, nil, &result)
-	if err == nil {
-		err = validateFloatingIPResponseIdentity(&result, address, false)
+	if err != nil {
+		return &result, err
 	}
-	if err == nil && (result.AssignedTo != "" || result.AssignedToResourceType != "") {
-		err = fmt.Errorf(
-			"inspace: floating IP unassignment response still reports resource %q/%q",
+	identityErr := validateFloatingIPResponseIdentity(&result, address, false)
+	if identityErr != nil {
+		if !errors.Is(identityErr, errSparseFloatingIPAssignment) {
+			return &result, identityErr
+		}
+		// The live unassign endpoint can omit the complete assignment tuple.
+		// Treat that body only as a stable mutation receipt and require the
+		// existing exact/list read path to prove the resulting relationship.
+		if authorityErr := validateSparseFloatingIPAuthority(&result, false); authorityErr != nil {
+			return &result, fmt.Errorf(
+				"inspace: sparse floating IP unassignment response is not authoritative: %w",
+				authorityErr,
+			)
+		}
+		readback, readbackErr := c.GetFloatingIP(ctx, location, address)
+		if readbackErr != nil {
+			return &result, fmt.Errorf(
+				"inspace: sparse floating IP unassignment response could not be corroborated by exact/list readback: %w",
+				readbackErr,
+			)
+		}
+		resolved, corroborationErr := corroborateSparseFloatingIP(result, *readback)
+		if corroborationErr != nil {
+			return &result, fmt.Errorf(
+				"inspace: sparse floating IP unassignment response disagrees with readback: %w",
+				corroborationErr,
+			)
+		}
+		result = resolved
+	}
+	if result.AssignedTo != "" ||
+		result.AssignedToResourceType != "" ||
+		result.AssignedToPrivateIP != "" {
+		return &result, fmt.Errorf(
+			"inspace: floating IP unassignment response/readback still reports resource %q/%q/%q",
 			result.AssignedTo,
 			result.AssignedToResourceType,
+			result.AssignedToPrivateIP,
 		)
 	}
-	return &result, err
+	return &result, nil
 }
 
 func (c *Client) DeleteFloatingIP(ctx context.Context, location, address string) error {

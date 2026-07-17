@@ -432,9 +432,10 @@ var (
 
 // endpointContracts is deliberately an exhaustive whitelist of every route
 // used by this SDK. InSpace does not use one generic status convention:
-// notably, disk/firewall deletes return 204 while floating-IP and NLB deletes
-// return an empty 200 response. A method-wide default would therefore either
-// reject a documented success or accept an ambiguous response.
+// notably, disk/firewall deletes return 204 while floating-IP and parent NLB
+// deletes return an empty 200 response, and NLB child deletes accept 200 or
+// 204. A method-wide default would therefore either reject a documented
+// success or accept an ambiguous response.
 var endpointContracts = []endpointContract{
 	{http.MethodGet, "/v1/config/locations", statusOKOnly, successJSON},
 	{http.MethodGet, "/v1/config/vm_images", statusOKOnly, successJSON},
@@ -458,7 +459,7 @@ var endpointContracts = []endpointContract{
 	// statuses carry the same required JSON object contract.
 	{http.MethodPost, "/v1/{location}/network/ip_addresses", statusOKOrCreated, successJSON},
 	{http.MethodPost, "/v1/{location}/network/firewalls", statusCreatedOnly, successJSON},
-	{http.MethodPost, "/v1/{location}/network/load_balancers", statusCreatedOnly, successJSON},
+	{http.MethodPost, "/v1/{location}/network/load_balancers", statusOKOrCreated, successJSON},
 
 	{http.MethodPost, "/v1/{location}/user-resource/vm/storage/attach", statusOKOnly, successJSON},
 	{http.MethodPost, "/v1/{location}/user-resource/vm/storage/detach", statusOKOnly, successJSON},
@@ -480,8 +481,8 @@ var endpointContracts = []endpointContract{
 	{http.MethodDelete, "/v1/{location}/network/firewalls/{uuid}", statusNoContentOnly, successEmpty},
 	{http.MethodDelete, "/v1/{location}/network/firewalls/{uuid}/vms", statusNoContentOnly, successEmpty},
 	{http.MethodDelete, "/v1/{location}/network/load_balancers/{uuid}", statusOKOnly, successEmpty},
-	{http.MethodDelete, "/v1/{location}/network/load_balancers/{uuid}/targets/{uuid}", statusOKOnly, successEmpty},
-	{http.MethodDelete, "/v1/{location}/network/load_balancers/{uuid}/forwarding_rules/{uuid}", statusOKOnly, successEmpty},
+	{http.MethodDelete, "/v1/{location}/network/load_balancers/{uuid}/targets/{uuid}", statusOKOrNoContent, successEmpty},
+	{http.MethodDelete, "/v1/{location}/network/load_balancers/{uuid}/forwarding_rules/{uuid}", statusOKOrNoContent, successEmpty},
 }
 
 func validateSuccessResponse(method, path string, status int, expectsJSON bool, data []byte, correlationID string) error {

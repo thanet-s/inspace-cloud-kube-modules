@@ -589,7 +589,281 @@ func TestSparseFloatingIPCreateReadbackFailureDoesNotReplayPOST(t *testing.T) {
 	}
 }
 
-func TestNonCreateFloatingIPMutationsKeepSparseResponsesFailClosed(t *testing.T) {
+func TestFloatingIPUnassignCorroboratesLiveSparseHTTP200Response(t *testing.T) {
+	const name = "cluster-edge-ip"
+	sparse := sparseFloatingIPLiteral(floatingIP, sparseFloatingIPUUID, name, 42, "")
+	var postCalls atomic.Int32
+	var exactReads atomic.Int32
+	var listReads atomic.Int32
+	client := newFloatingIPContractClient(t, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost &&
+			r.URL.Path == "/v1/bkk01/network/ip_addresses/"+floatingIP+"/unassign":
+			postCalls.Add(1)
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, sparse)
+		case r.Method == http.MethodGet &&
+			r.URL.Path == "/v1/bkk01/network/ip_addresses/"+floatingIP:
+			exactReads.Add(1)
+			_, _ = io.WriteString(w, sparse)
+		case r.Method == http.MethodGet &&
+			r.URL.Path == "/v1/bkk01/network/ip_addresses":
+			listReads.Add(1)
+			if r.URL.RawQuery != "billing_account_id=42" {
+				t.Errorf("corroborating list query = %q, want billing_account_id=42", r.URL.RawQuery)
+			}
+			_, _ = io.WriteString(w, "["+sparse+"]")
+		default:
+			http.NotFound(w, r)
+		}
+	})
+
+	unassigned, err := client.UnassignFloatingIP(context.Background(), "bkk01", floatingIP)
+	if err != nil {
+		t.Fatalf("UnassignFloatingIP() error = %v", err)
+	}
+	if unassigned.UUID != sparseFloatingIPUUID ||
+		unassigned.Address != floatingIP ||
+		unassigned.AssignedTo != "" ||
+		unassigned.AssignedToResourceType != "" ||
+		unassigned.AssignedToPrivateIP != "" {
+		t.Fatalf("UnassignFloatingIP() = %#v", unassigned)
+	}
+	if postCalls.Load() != 1 || exactReads.Load() != 1 || listReads.Load() != 1 {
+		t.Fatalf(
+			"POST/exact/list counts = %d/%d/%d, want 1/1/1",
+			postCalls.Load(),
+			exactReads.Load(),
+			listReads.Load(),
+		)
+	}
+}
+
+func TestFloatingIPUnassignExplicitNullKeepsOneRequestFastPath(t *testing.T) {
+	explicitUnassigned := sparseFloatingIPLiteral(
+		floatingIP,
+		sparseFloatingIPUUID,
+		"cluster-edge-ip",
+		42,
+		`,"assigned_to":null`,
+	)
+	var postCalls atomic.Int32
+	var readCalls atomic.Int32
+	client := newFloatingIPContractClient(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost:
+			postCalls.Add(1)
+			_, _ = io.WriteString(w, explicitUnassigned)
+		case http.MethodGet:
+			readCalls.Add(1)
+			http.Error(w, "unexpected readback", http.StatusInternalServerError)
+		default:
+			http.NotFound(w, r)
+		}
+	})
+
+	unassigned, err := client.UnassignFloatingIP(context.Background(), "bkk01", floatingIP)
+	if err != nil {
+		t.Fatalf("UnassignFloatingIP() error = %v", err)
+	}
+	if unassigned.AssignedTo != "" ||
+		unassigned.AssignedToResourceType != "" ||
+		unassigned.AssignedToPrivateIP != "" {
+		t.Fatalf("UnassignFloatingIP() = %#v", unassigned)
+	}
+	if postCalls.Load() != 1 || readCalls.Load() != 0 {
+		t.Fatalf("POST/read counts = %d/%d, want 1/0", postCalls.Load(), readCalls.Load())
+	}
+}
+
+func TestFloatingIPUnassignSparseResponseDoesNotHideAssignment(t *testing.T) {
+	const name = "cluster-edge-ip"
+	sparse := sparseFloatingIPLiteral(floatingIP, sparseFloatingIPUUID, name, 42, "")
+	historical := sparseFloatingIPLiteral(
+		floatingIP,
+		sparseFloatingIPUUID,
+		name,
+		42,
+		`,"unassigned_at":"2026-07-17T09:54:01Z"`,
+	)
+	assigned := sparseFloatingIPLiteral(
+		floatingIP,
+		sparseFloatingIPUUID,
+		name,
+		42,
+		`,"assigned_to":"`+vmUUID+`","assigned_to_resource_type":"virtual_machine","assigned_to_private_ip":"10.91.72.10"`,
+	)
+	tests := []struct {
+		name         string
+		postBody     string
+		exactBody    string
+		listBody     string
+		wantListRead bool
+	}{
+		{
+			name:      "exact read remains assigned",
+			postBody:  sparse,
+			exactBody: assigned,
+		},
+		{
+			name:         "list read remains assigned",
+			postBody:     sparse,
+			exactBody:    sparse,
+			listBody:     "[" + assigned + "]",
+			wantListRead: true,
+		},
+		{
+			name:      "historical unassigned timestamp cannot bypass assigned readback",
+			postBody:  historical,
+			exactBody: assigned,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var postCalls atomic.Int32
+			var exactReads atomic.Int32
+			var listReads atomic.Int32
+			client := newFloatingIPContractClient(t, func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case r.Method == http.MethodPost:
+					postCalls.Add(1)
+					_, _ = io.WriteString(w, test.postBody)
+				case r.Method == http.MethodGet &&
+					r.URL.Path == "/v1/bkk01/network/ip_addresses/"+floatingIP:
+					exactReads.Add(1)
+					_, _ = io.WriteString(w, test.exactBody)
+				case r.Method == http.MethodGet &&
+					r.URL.Path == "/v1/bkk01/network/ip_addresses":
+					listReads.Add(1)
+					_, _ = io.WriteString(w, test.listBody)
+				default:
+					http.NotFound(w, r)
+				}
+			})
+
+			if _, err := client.UnassignFloatingIP(context.Background(), "bkk01", floatingIP); err == nil ||
+				!strings.Contains(err.Error(), "still reports resource") {
+				t.Fatalf("UnassignFloatingIP() error = %v, want assigned-state rejection", err)
+			}
+			wantListReads := int32(0)
+			if test.wantListRead {
+				wantListReads = 1
+			}
+			if postCalls.Load() != 1 || exactReads.Load() != 1 || listReads.Load() != wantListReads {
+				t.Fatalf(
+					"POST/exact/list counts = %d/%d/%d, want 1/1/%d",
+					postCalls.Load(),
+					exactReads.Load(),
+					listReads.Load(),
+					wantListReads,
+				)
+			}
+		})
+	}
+}
+
+func TestFloatingIPUnassignSparseReadbackFailureDoesNotReplayPOST(t *testing.T) {
+	const name = "cluster-edge-ip"
+	sparse := sparseFloatingIPLiteral(floatingIP, sparseFloatingIPUUID, name, 42, "")
+	tests := []struct {
+		name      string
+		exactBody string
+		status    int
+		want      string
+	}{
+		{
+			name:      "stable identity mismatch",
+			exactBody: sparseFloatingIPLiteral(floatingIP, sparseFloatingIPUUID, "foreign", 42, `,"assigned_to":null`),
+			status:    http.StatusOK,
+			want:      "disagrees with readback",
+		},
+		{
+			name:   "transient exact read failure",
+			status: http.StatusServiceUnavailable,
+			want:   "could not be corroborated",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var postCalls atomic.Int32
+			var readCalls atomic.Int32
+			client := newFloatingIPContractClient(t, func(w http.ResponseWriter, r *http.Request) {
+				switch r.Method {
+				case http.MethodPost:
+					postCalls.Add(1)
+					_, _ = io.WriteString(w, sparse)
+				case http.MethodGet:
+					readCalls.Add(1)
+					w.WriteHeader(test.status)
+					_, _ = io.WriteString(w, test.exactBody)
+				default:
+					http.NotFound(w, r)
+				}
+			})
+
+			if _, err := client.UnassignFloatingIP(context.Background(), "bkk01", floatingIP); err == nil ||
+				!strings.Contains(err.Error(), test.want) {
+				t.Fatalf("UnassignFloatingIP() error = %v, want containing %q", err, test.want)
+			}
+			if postCalls.Load() != 1 || readCalls.Load() != 1 {
+				t.Fatalf(
+					"POST/read counts = %d/%d, want 1/1 and no mutation replay",
+					postCalls.Load(),
+					readCalls.Load(),
+				)
+			}
+		})
+	}
+}
+
+func TestFloatingIPUnassignRejectsUnauthoritativeSparseResponseBeforeReadback(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "incomplete stable identity",
+			body: `{"address":"` + floatingIP + `"}`,
+		},
+		{
+			name: "partial assignment tuple",
+			body: sparseFloatingIPLiteral(
+				floatingIP,
+				sparseFloatingIPUUID,
+				"cluster-edge-ip",
+				42,
+				`,"assigned_to_resource_type":null`,
+			),
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var postCalls atomic.Int32
+			var readCalls atomic.Int32
+			client := newFloatingIPContractClient(t, func(w http.ResponseWriter, r *http.Request) {
+				switch r.Method {
+				case http.MethodPost:
+					postCalls.Add(1)
+					_, _ = io.WriteString(w, test.body)
+				case http.MethodGet:
+					readCalls.Add(1)
+					http.Error(w, "unexpected readback", http.StatusInternalServerError)
+				default:
+					http.NotFound(w, r)
+				}
+			})
+
+			if _, err := client.UnassignFloatingIP(context.Background(), "bkk01", floatingIP); err == nil {
+				t.Fatal("UnassignFloatingIP() accepted unauthoritative sparse mutation response")
+			}
+			if postCalls.Load() != 1 || readCalls.Load() != 0 {
+				t.Fatalf("POST/read counts = %d/%d, want 1/0", postCalls.Load(), readCalls.Load())
+			}
+		})
+	}
+}
+
+func TestUpdateAndAssignFloatingIPKeepSparseResponsesFailClosed(t *testing.T) {
 	sparse := sparseFloatingIPLiteral(floatingIP, sparseFloatingIPUUID, "cluster-edge-ip", 42, "")
 	tests := []struct {
 		name   string
@@ -615,15 +889,6 @@ func TestNonCreateFloatingIPMutationsKeepSparseResponsesFailClosed(t *testing.T)
 			path:   "/v1/bkk01/network/ip_addresses/" + floatingIP + "/assign",
 			call: func(ctx context.Context, client *inspace.Client) error {
 				_, err := client.AssignFloatingIP(ctx, "bkk01", floatingIP, vmUUID, "virtual_machine")
-				return err
-			},
-		},
-		{
-			name:   "unassign",
-			method: http.MethodPost,
-			path:   "/v1/bkk01/network/ip_addresses/" + floatingIP + "/unassign",
-			call: func(ctx context.Context, client *inspace.Client) error {
-				_, err := client.UnassignFloatingIP(ctx, "bkk01", floatingIP)
 				return err
 			},
 		},

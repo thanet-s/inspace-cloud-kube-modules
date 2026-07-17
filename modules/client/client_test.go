@@ -969,7 +969,7 @@ func TestMutationSuccessResponseShapeAndStatusAreFailClosed(t *testing.T) {
 		{name: "AssignFirewallToVM", successStatus: http.StatusOK, call: func(ctx context.Context, client *inspace.Client) error {
 			return client.AssignFirewallToVM(ctx, "bkk01", firewallUUID, vmUUID)
 		}},
-		{name: "CreateLoadBalancer", successStatus: http.StatusCreated, call: func(ctx context.Context, client *inspace.Client) error {
+		{name: "CreateLoadBalancer", successStatus: http.StatusOK, call: func(ctx context.Context, client *inspace.Client) error {
 			_, err := client.CreateLoadBalancer(ctx, "bkk01", inspace.CreateLoadBalancerRequest{
 				DisplayName: "owned", NetworkUUID: networkUUID,
 				Rules: []inspace.LoadBalancerRule{{Protocol: "TCP", SourcePort: 443, TargetPort: 30443}},
@@ -1086,10 +1086,10 @@ func TestDeleteEndpointsRequireTheirDocumentedSuccessStatus(t *testing.T) {
 		{name: "DeleteLoadBalancer", allowed: []int{http.StatusOK}, call: func(ctx context.Context, client *inspace.Client) error {
 			return client.DeleteLoadBalancer(ctx, "bkk01", lbUUID)
 		}},
-		{name: "RemoveLoadBalancerTarget", allowed: []int{http.StatusOK}, call: func(ctx context.Context, client *inspace.Client) error {
+		{name: "RemoveLoadBalancerTarget", allowed: []int{http.StatusOK, http.StatusNoContent}, call: func(ctx context.Context, client *inspace.Client) error {
 			return client.RemoveLoadBalancerTarget(ctx, "bkk01", lbUUID, vmUUID)
 		}},
-		{name: "RemoveLoadBalancerRule", allowed: []int{http.StatusOK}, call: func(ctx context.Context, client *inspace.Client) error {
+		{name: "RemoveLoadBalancerRule", allowed: []int{http.StatusOK, http.StatusNoContent}, call: func(ctx context.Context, client *inspace.Client) error {
 			return client.RemoveLoadBalancerRule(ctx, "bkk01", lbUUID, ruleUUID)
 		}},
 	}
@@ -1123,6 +1123,66 @@ func TestDeleteEndpointsRequireTheirDocumentedSuccessStatus(t *testing.T) {
 			var apiErr *inspace.APIError
 			if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusAccepted {
 				t.Fatalf("%s wrong HTTP 202 error = %#v, want typed rejection", test.name, err)
+			}
+		})
+	}
+}
+
+func TestLoadBalancerChildDelete204DoesNotBroadenParentDelete(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(server.Close)
+	client, err := inspace.NewClient(inspace.Options{BaseURL: server.URL, APIKey: "test-key"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = client.DeleteLoadBalancer(context.Background(), "bkk01", lbUUID)
+	var apiErr *inspace.APIError
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusNoContent {
+		t.Fatalf("DeleteLoadBalancer() HTTP 204 error = %#v, want typed rejection", err)
+	}
+}
+
+func TestCreateLoadBalancerAcceptsOnlyObservedSuccessStatuses(t *testing.T) {
+	for _, test := range []struct {
+		status  int
+		wantErr bool
+	}{
+		{status: http.StatusOK},
+		{status: http.StatusCreated},
+		{status: http.StatusAccepted, wantErr: true},
+		{status: http.StatusPartialContent, wantErr: true},
+		{status: http.StatusNoContent, wantErr: true},
+	} {
+		t.Run(http.StatusText(test.status), func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodPost || r.URL.Path != "/v1/bkk01/network/load_balancers" {
+					t.Errorf("request = %s %s", r.Method, r.URL.Path)
+				}
+				w.WriteHeader(test.status)
+				_, _ = io.WriteString(w, `{"uuid":"`+lbUUID+`"}`)
+			}))
+			t.Cleanup(server.Close)
+			client, err := inspace.NewClient(inspace.Options{BaseURL: server.URL, APIKey: "test-key"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			created, err := client.CreateLoadBalancer(context.Background(), "bkk01", inspace.CreateLoadBalancerRequest{
+				DisplayName: "owned",
+				NetworkUUID: networkUUID,
+				Rules:       []inspace.LoadBalancerRule{{Protocol: "TCP", SourcePort: 443, TargetPort: 30443}},
+			})
+			if test.wantErr {
+				var apiErr *inspace.APIError
+				if !errors.As(err, &apiErr) || apiErr.StatusCode != test.status {
+					t.Fatalf("CreateLoadBalancer() HTTP %d error = %#v, want typed rejection", test.status, err)
+				}
+				return
+			}
+			if err != nil || created == nil || created.UUID != lbUUID {
+				t.Fatalf("CreateLoadBalancer() = %#v, %v", created, err)
 			}
 		})
 	}
@@ -1274,10 +1334,10 @@ func TestBodylessMutationEndpointsRejectNonEmptySuccessBodies(t *testing.T) {
 		{name: "DeleteLoadBalancer", status: http.StatusOK, call: func(ctx context.Context, client *inspace.Client) error {
 			return client.DeleteLoadBalancer(ctx, "bkk01", lbUUID)
 		}},
-		{name: "RemoveLoadBalancerTarget", status: http.StatusOK, call: func(ctx context.Context, client *inspace.Client) error {
+		{name: "RemoveLoadBalancerTarget", status: http.StatusNoContent, call: func(ctx context.Context, client *inspace.Client) error {
 			return client.RemoveLoadBalancerTarget(ctx, "bkk01", lbUUID, vmUUID)
 		}},
-		{name: "RemoveLoadBalancerRule", status: http.StatusOK, call: func(ctx context.Context, client *inspace.Client) error {
+		{name: "RemoveLoadBalancerRule", status: http.StatusNoContent, call: func(ctx context.Context, client *inspace.Client) error {
 			return client.RemoveLoadBalancerRule(ctx, "bkk01", lbUUID, ruleUUID)
 		}},
 	}

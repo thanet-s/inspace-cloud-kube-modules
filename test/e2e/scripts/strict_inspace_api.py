@@ -780,73 +780,16 @@ class StrictInSpaceAPI:
             raise StrictAPIError(
                 f"{endpoint_label} returned non-authoritative HTTP 400"
             )
-        try:
-            message = raw.decode("utf-8", errors="strict").strip()
-        except UnicodeDecodeError as error:
-            raise StrictAPIError(
-                f"{endpoint_label} returned malformed HTTP 400 text"
-            ) from error
-        try:
-            payload = json.loads(
-                message,
-                object_pairs_hook=_pairs_without_duplicates,
-            )
-        except json.JSONDecodeError:
-            payload = None
-        except StrictAPIError as error:
-            raise StrictAPIError(
-                f"{endpoint_label} returned malformed HTTP 400 JSON"
-            ) from error
-        if isinstance(payload, dict):
-            if "errors" in payload:
-                nested = payload["errors"]
-                expected = (
-                    "No such virtual machine exists: " + requested[0]
-                )
-                if (
-                    set(payload) == {"errors"}
-                    and isinstance(nested, dict)
-                    and set(nested) == {"Error"}
-                    and isinstance(nested["Error"], str)
-                    and nested["Error"] == expected
-                ):
-                    return True
-                raise StrictAPIError(
-                    f"{endpoint_label} returned non-authoritative HTTP 400"
-                )
-            structured_fields = [
-                field for field in ("message", "error") if field in payload
-            ]
-            if len(structured_fields) == 1:
-                field = structured_fields[0]
-                structured = payload[field]
-                if set(payload) != {field} or not isinstance(structured, str):
-                    raise StrictAPIError(
-                        f"{endpoint_label} returned non-authoritative HTTP 400"
-                    )
-                message = structured.strip()
-            elif structured_fields:
-                raise StrictAPIError(
-                    f"{endpoint_label} returned non-authoritative HTTP 400"
-                )
-        normalized = message.lower()
-        if normalized.startswith("error:"):
-            normalized = normalized.removeprefix("error:").strip()
-        phrases = ("no such virtual machine exists", "no such vm exists")
-        matched = False
-        for phrase in phrases:
-            if normalized.startswith(phrase + ":") or normalized.startswith(
-                phrase + "."
-            ):
-                suffix = normalized[len(phrase) + 1 :].strip()
-                try:
-                    matched = (
-                        str(uuid.UUID(suffix)).lower() == requested[0].lower()
-                    )
-                except (ValueError, AttributeError):
-                    matched = False
-                break
-        if not matched:
+        payload = _json_without_duplicates(raw)
+        expected = "No such virtual machine exists: " + requested[0]
+        if (
+            not isinstance(payload, dict)
+            or set(payload) != {"errors"}
+            or not isinstance(payload["errors"], dict)
+            or set(payload["errors"]) != {"Error"}
+            or not isinstance(payload["errors"]["Error"], str)
+            or payload["errors"]["Error"] != expected
+        ):
             raise StrictAPIError(
                 f"{endpoint_label} returned non-authoritative HTTP 400"
             )
