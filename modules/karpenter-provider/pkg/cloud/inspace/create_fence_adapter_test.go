@@ -505,6 +505,40 @@ func TestDurableBaseFirewallCommittedHTTPErrorNeverReplaysAcrossRestartAndLateVi
 	}
 }
 
+func TestDurableBaseFirewallNoCommitHTTPErrorPostsOnlyOnceAcrossRestart(t *testing.T) {
+	api := &fakeAPI{
+		assignFirewallErrors: []error{&sdk.APIError{StatusCode: 500, Message: "assignment response failed without commit"}},
+	}
+	request := fencedAdapterRequest(true)
+	harness := newDurableBaseFirewallHarness(request.FirewallUUID)
+	harness.attach(&request, true)
+	adapter, _ := New(api)
+	configureFastNetworkReadback(adapter, 60*time.Millisecond)
+
+	if _, err := adapter.CreateVM(context.Background(), request); !errors.Is(err, cloudapi.ErrCreateAttemptPending) {
+		t.Fatalf("first no-commit assignment error = %v, want pending", err)
+	}
+	if api.firewallAssignCalls != 1 || api.deleteVMCalls != 0 || len(api.vms) != 1 ||
+		harness.fence.Phase != cloudapi.FirewallAssignmentIssued || harness.rejectCalls != 0 {
+		t.Fatalf("first no-commit assignment state: assigns=%d deletes=%d VMs=%d rejects=%d fence=%#v",
+			api.firewallAssignCalls, api.deleteVMCalls, len(api.vms), harness.rejectCalls, harness.fence)
+	}
+
+	retry := request
+	harness.attach(&retry, false)
+	retry.CreatedVMUUID = harness.vmUUID
+	retry.CreateAttemptIntent = cloudapi.CreateAuthorizationPost
+	retry.CreateAttemptAllowPOST = false
+	restarted, _ := New(api)
+	configureFastNetworkReadback(restarted, 60*time.Millisecond)
+	if _, err := restarted.CreateVM(context.Background(), retry); !errors.Is(err, cloudapi.ErrCreateAttemptPending) {
+		t.Fatalf("restart no-commit assignment error = %v, want pending", err)
+	}
+	if api.firewallAssignCalls != 1 || harness.fence.Phase != cloudapi.FirewallAssignmentIssued {
+		t.Fatalf("restart replayed no-commit assignment: assigns=%d fence=%#v", api.firewallAssignCalls, harness.fence)
+	}
+}
+
 func TestDurableBaseFirewallLocalMutationBlockRejectsAndAllowsOneFreshRetry(t *testing.T) {
 	request := fencedAdapterRequest(true)
 	vmUUID := "11111111-1111-4111-8111-111111111111"
@@ -1511,6 +1545,231 @@ func TestProtectFencedCreateReattachesFirewallToExactOwnedSameVPCVM(t *testing.T
 	}
 	if api.firewallAssignCalls != 1 || api.firewallListCalls != 2 || len(api.operations) != 1 || api.operations[0] != "assign-firewall" || !firewallHasVM(api.firewalls[0], created.UUID) {
 		t.Fatalf("exact-owned recovery assigns=%d reads=%d operations=%v firewall=%#v, want one pre-read, one assignment, and one successful readback", api.firewallAssignCalls, api.firewallListCalls, api.operations, api.firewalls[0])
+	}
+}
+
+func TestProtectFencedCreateObservesIssuedFloatingIPCommitWithoutReplay(t *testing.T) {
+	api := &fakeAPI{}
+	adapter, _ := New(api)
+	configureFastNetworkReadback(adapter, boundedReadbackTestTimeout)
+	created, err := adapter.CreateVM(context.Background(), testRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	api.operations = nil
+	api.firewallAssignCalls = 0
+	api.floatingIPUpdateCalls = 0
+
+	cleanup := fencedCleanupRequest(true)
+	cleanup.CreatedVMUUID = created.UUID
+	cleanup.BaseFirewallAssignment = cloudapi.FirewallAssignmentFence{
+		VMUUID: created.UUID, FirewallUUID: cleanup.FirewallUUID,
+		Phase: cloudapi.FirewallAssignmentObserved, IssueID: "33333333333333333333333333333333",
+	}
+	harness := newDurableFloatingIPUpdateHarness()
+	harness.fence = cloudapi.FloatingIPUpdateFence{
+		VMUUID: created.UUID, Address: created.PublicIPv4, Name: created.FloatingIPName, BillingAccountID: created.BillingAccountID,
+		Phase: cloudapi.FloatingIPUpdateIssued, IssueID: "44444444444444444444444444444444",
+	}
+	harness.attachCleanup(&cleanup)
+	cleanup.FloatingIPUpdate = harness.fence
+
+	if err := adapter.ProtectFencedCreate(context.Background(), cleanup); err != nil {
+		t.Fatalf("ProtectFencedCreate() issued FIP readback = %v", err)
+	}
+	if api.firewallAssignCalls != 0 || api.floatingIPUpdateCalls != 0 || harness.observeCalls != 1 ||
+		harness.fence.Phase != cloudapi.FloatingIPUpdateObserved || len(api.operations) != 0 {
+		t.Fatalf("issued FIP recovery replayed mutation: firewall=%d PATCHes=%d observes=%d fence=%#v operations=%v",
+			api.firewallAssignCalls, api.floatingIPUpdateCalls, harness.observeCalls, harness.fence, api.operations)
+	}
+}
+
+func TestProtectFencedCreateDetectsObservedFloatingIPMetadataDriftWithoutReplay(t *testing.T) {
+	api := &fakeAPI{}
+	adapter, _ := New(api)
+	configureFastNetworkReadback(adapter, boundedReadbackTestTimeout)
+	created, err := adapter.CreateVM(context.Background(), testRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	api.floatingIPs[0].Name = ""
+	api.floatingIPs[0].BillingAccountID = 0
+	api.operations = nil
+	api.firewallAssignCalls = 0
+	api.floatingIPUpdateCalls = 0
+
+	cleanup := fencedCleanupRequest(true)
+	cleanup.CreatedVMUUID = created.UUID
+	cleanup.BaseFirewallAssignment = cloudapi.FirewallAssignmentFence{
+		VMUUID: created.UUID, FirewallUUID: cleanup.FirewallUUID,
+		Phase: cloudapi.FirewallAssignmentObserved, IssueID: "33333333333333333333333333333333",
+	}
+	harness := newDurableFloatingIPUpdateHarness()
+	harness.fence = cloudapi.FloatingIPUpdateFence{
+		VMUUID: created.UUID, Address: created.PublicIPv4, Name: created.FloatingIPName, BillingAccountID: created.BillingAccountID,
+		Phase: cloudapi.FloatingIPUpdateObserved, IssueID: "44444444444444444444444444444444",
+	}
+	harness.attachCleanup(&cleanup)
+	cleanup.FloatingIPUpdate = harness.fence
+
+	err = adapter.ProtectFencedCreate(context.Background(), cleanup)
+	if !errors.Is(err, cloudapi.ErrCreateAttemptPending) {
+		t.Fatalf("ProtectFencedCreate() observed FIP drift = %v, want bounded pending protection failure", err)
+	}
+	if api.firewallAssignCalls != 0 || api.floatingIPUpdateCalls != 0 || harness.observeCalls != 0 || len(api.operations) != 0 {
+		t.Fatalf("observed FIP drift replayed cloud mutation: firewall=%d PATCHes=%d observes=%d operations=%v",
+			api.firewallAssignCalls, api.floatingIPUpdateCalls, harness.observeCalls, api.operations)
+	}
+}
+
+func TestIssuedFloatingIPRollbackResumesAfterVMDeletionWithoutReplayingPatch(t *testing.T) {
+	for _, test := range []struct {
+		name             string
+		floatingIPName   func(*cloudapi.VM) string
+		billingAccountID func(*cloudapi.VM) int64
+		wantCleanup      bool
+	}{
+		{
+			name:             "pre-PATCH metadata",
+			floatingIPName:   func(*cloudapi.VM) string { return "" },
+			billingAccountID: func(*cloudapi.VM) int64 { return 0 },
+			wantCleanup:      true,
+		},
+		{
+			name:             "name-only PATCH commit",
+			floatingIPName:   func(vm *cloudapi.VM) string { return vm.FloatingIPName },
+			billingAccountID: func(*cloudapi.VM) int64 { return 0 },
+		},
+		{
+			name:             "billing-only PATCH commit",
+			floatingIPName:   func(*cloudapi.VM) string { return "" },
+			billingAccountID: func(vm *cloudapi.VM) int64 { return vm.BillingAccountID },
+		},
+		{
+			name:             "complete PATCH commit",
+			floatingIPName:   func(vm *cloudapi.VM) string { return vm.FloatingIPName },
+			billingAccountID: func(vm *cloudapi.VM) int64 { return vm.BillingAccountID },
+			wantCleanup:      true,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			api := &fakeAPI{}
+			adapter, _ := New(api)
+			configureFastNetworkReadback(adapter, boundedReadbackTestTimeout)
+			created, err := adapter.CreateVM(context.Background(), testRequest())
+			if err != nil {
+				t.Fatal(err)
+			}
+			api.floatingIPs[0].Name = test.floatingIPName(created)
+			api.floatingIPs[0].BillingAccountID = test.billingAccountID(created)
+			if !api.commitVMDelete(created.UUID) {
+				t.Fatal("failed to model a crash after the exact VM DELETE committed")
+			}
+			api.operations = nil
+			api.floatingIPUpdateCalls = 0
+
+			identity := durableDeleteIdentity(created)
+			identity.FloatingIPUpdate = cloudapi.FloatingIPUpdateFence{
+				VMUUID: created.UUID, Address: created.PublicIPv4, Name: created.FloatingIPName,
+				BillingAccountID: created.BillingAccountID, Phase: cloudapi.FloatingIPUpdateIssued,
+				IssueID: "44444444444444444444444444444444",
+			}
+			removals := &testRemovalMutationHarness{}
+			removals.attachDelete(&identity)
+
+			restarted, _ := New(api)
+			configureFastNetworkReadback(restarted, boundedReadbackTestTimeout)
+			err = restarted.DeleteVM(context.Background(), created.Location, created.UUID, created.ClusterName, created.NodeClaimName, identity)
+			if test.wantCleanup && !errors.Is(err, cloudapi.ErrNotFound) {
+				t.Fatalf("restarted rollback cleanup = %v, want absent VM completion", err)
+			}
+			if !test.wantCleanup && !errors.Is(err, cloudapi.ErrOwnershipMismatch) {
+				t.Fatalf("partial PATCH state cleanup = %v, want fail-closed ownership mismatch", err)
+			}
+			wantFloatingIPs := 0
+			if !test.wantCleanup {
+				wantFloatingIPs = 1
+			}
+			if api.floatingIPUpdateCalls != 0 || len(api.floatingIPs) != wantFloatingIPs {
+				t.Fatalf("restarted rollback replayed PATCH or leaked FIP: PATCHes=%d FIPs=%#v operations=%v",
+					api.floatingIPUpdateCalls, api.floatingIPs, api.operations)
+			}
+		})
+	}
+}
+
+func TestIssuedFloatingIPRollbackDeletesExactZeroBillingPrePatchStateWithoutPatchReplay(t *testing.T) {
+	api := &fakeAPI{}
+	adapter, _ := New(api)
+	configureFastNetworkReadback(adapter, boundedReadbackTestTimeout)
+	created, err := adapter.CreateVM(context.Background(), testRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	api.floatingIPs[0].Name = ""
+	api.floatingIPs[0].BillingAccountID = 0
+	api.operations = nil
+	api.floatingIPUpdateCalls = 0
+
+	identity := durableDeleteIdentity(created)
+	identity.FloatingIPUpdate = cloudapi.FloatingIPUpdateFence{
+		VMUUID: created.UUID, Address: created.PublicIPv4, Name: created.FloatingIPName,
+		BillingAccountID: created.BillingAccountID, Phase: cloudapi.FloatingIPUpdateIssued,
+		IssueID: "44444444444444444444444444444444",
+	}
+	removals := &testRemovalMutationHarness{}
+	removals.attachDelete(&identity)
+
+	restarted, _ := New(api)
+	configureFastNetworkReadback(restarted, boundedReadbackTestTimeout)
+	if err := restarted.DeleteVM(context.Background(), created.Location, created.UUID, created.ClusterName, created.NodeClaimName, identity); err != nil {
+		t.Fatalf("zero-billing pre-PATCH rollback = %v", err)
+	}
+	if api.floatingIPUpdateCalls != 0 || len(api.vms) != 0 || len(api.floatingIPs) != 0 {
+		t.Fatalf("zero-billing pre-PATCH rollback replayed PATCH or leaked resources: PATCHes=%d VMs=%#v FIPs=%#v operations=%v",
+			api.floatingIPUpdateCalls, api.vms, api.floatingIPs, api.operations)
+	}
+}
+
+func TestObservedFloatingIPDriftRollbackConvergesFromCoherentPrePatchMetadata(t *testing.T) {
+	api := &fakeAPI{}
+	adapter, _ := New(api)
+	configureFastNetworkReadback(adapter, boundedReadbackTestTimeout)
+	created, err := adapter.CreateVM(context.Background(), testRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	api.floatingIPs[0].Name = ""
+	api.floatingIPs[0].BillingAccountID = 0
+	api.operations = nil
+	api.floatingIPUpdateCalls = 0
+
+	cleanup := fencedCleanupRequest(true)
+	cleanup.CreatedVMUUID = created.UUID
+	cleanup.RollbackChosen = true
+	cleanup.AttemptResolved = true
+	cleanup.Resolutions = []cloudapi.FencedCreateCleanupResolution{{
+		VMUUID: created.UUID, FloatingIPName: created.FloatingIPName, PublicIPv4: created.PublicIPv4,
+	}}
+	cleanup.BaseFirewallAssignment = cloudapi.FirewallAssignmentFence{
+		VMUUID: created.UUID, FirewallUUID: cleanup.FirewallUUID,
+		Phase: cloudapi.FirewallAssignmentObserved, IssueID: "33333333333333333333333333333333",
+	}
+	cleanup.FloatingIPUpdate = cloudapi.FloatingIPUpdateFence{
+		VMUUID: created.UUID, Address: created.PublicIPv4, Name: created.FloatingIPName,
+		BillingAccountID: created.BillingAccountID, Phase: cloudapi.FloatingIPUpdateObserved,
+		IssueID: "44444444444444444444444444444444",
+	}
+
+	restarted, _ := New(api)
+	configureFastNetworkReadback(restarted, boundedReadbackTestTimeout)
+	result, err := restarted.CleanupFencedCreate(context.Background(), cleanup)
+	if err != nil && !errors.Is(err, cloudapi.ErrNotFound) {
+		t.Fatalf("observed FIP drift rollback = %#v, %v", result, err)
+	}
+	if result.Resolution != nil || api.floatingIPUpdateCalls != 0 || len(api.vms) != 0 || len(api.floatingIPs) != 0 {
+		t.Fatalf("observed FIP drift rollback replayed PATCH or leaked resources: result=%#v PATCHes=%d VMs=%#v FIPs=%#v operations=%v",
+			result, api.floatingIPUpdateCalls, api.vms, api.floatingIPs, api.operations)
 	}
 }
 

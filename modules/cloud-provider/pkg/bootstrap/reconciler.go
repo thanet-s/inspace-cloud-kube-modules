@@ -41,6 +41,7 @@ var (
 	// ErrRetryableAmbiguousVMDelete marks a VM DELETE whose commit status is
 	// uncertain and whose exact in-memory deletion intent must survive a retry.
 	ErrRetryableAmbiguousVMDelete  = errors.New("bootstrap: retryable ambiguous VM deletion outcome")
+	errCreatedVMNotVisible         = errors.New("bootstrap: created VM is not visible in authoritative inventory")
 	errManagedFirewallNotVisible   = errors.New("bootstrap: managed firewall row is not yet visible during assignment readback")
 	errOwnedVMMutationTargetAbsent = errors.New("bootstrap: owned VM mutation target is absent")
 )
@@ -102,14 +103,15 @@ type Reconciler struct {
 	firewallAssignmentGates sync.Map
 	statusMu                sync.Mutex
 
-	protectionAuditTimeout            time.Duration
-	protectionRequestTimeout          time.Duration
-	protectionReadbackMinInterval     time.Duration
-	protectionReadbackMaxInterval     time.Duration
-	createdVMRecoveryTimeout          time.Duration
-	createdVMFloatingIPCleanupTimeout time.Duration
-	createdVMDeleteTimeout            time.Duration
-	vmAbsenceObservationMinInterval   time.Duration
+	protectionAuditTimeout               time.Duration
+	protectionRequestTimeout             time.Duration
+	protectionReadbackMinInterval        time.Duration
+	protectionReadbackMaxInterval        time.Duration
+	createdVMRecoveryTimeout             time.Duration
+	createdVMFloatingIPCleanupTimeout    time.Duration
+	createdVMDeleteTimeout               time.Duration
+	vmAbsenceObservationMinInterval      time.Duration
+	firewallAssignmentProtectionDeadline time.Duration
 }
 
 type privateIPv4Range struct {
@@ -1227,6 +1229,12 @@ func (r *Reconciler) ensureManagedVMCreate(
 			if identityUUID == "" {
 				identity, discoveryErr := r.discoverCreatedVMIdentity(ctx, cluster, desired)
 				if discoveryErr != nil {
+					if errors.Is(discoveryErr, errCreatedVMNotVisible) {
+						return nil, false, errors.Join(
+							issuedVMCreateAbsentError(attemptKey, attempt),
+							discoveryErr,
+						)
+					}
 					return nil, false, fmt.Errorf("%w: VM %q has no authoritative identity yet: %v", ErrCreateAttemptPending, desired.Name, discoveryErr)
 				}
 				ownedIdentity, discoveryErr = r.recoverCreatedVMOwnership(ctx, cluster, desired, identity.UUID)
@@ -1339,8 +1347,14 @@ func (r *Reconciler) ensureManagedVMCreate(
 		anchorErr = r.recordMaterializedCreate(ctx, cluster, attemptKey, createAttemptKindVM, desired.Name, intentHash, secured.UUID)
 	}
 	if secured == nil || anchorErr != nil {
+		pendingErr := fmt.Errorf("%w: VM %q POST outcome requires authoritative recovery", ErrCreateAttemptPending, desired.Name)
+		if errors.Is(secureErr, errCreatedVMNotVisible) {
+			if attempt, exists := r.createAttempt(cluster, attemptKey); exists {
+				pendingErr = issuedVMCreateAbsentError(attemptKey, attempt)
+			}
+		}
 		return nil, true, errors.Join(createErr, secureErr, anchorErr,
-			fmt.Errorf("%w: VM %q POST outcome requires authoritative recovery", ErrCreateAttemptPending, desired.Name))
+			pendingErr)
 	}
 	protectionErr := r.protectReturnedVMUUID(ctx, cluster, assignmentAttemptKey, firewall, secured.UUID)
 	if protectionErr != nil || secureErr != nil {
@@ -1644,7 +1658,7 @@ func (r *Reconciler) discoverCreatedVMIdentity(ctx context.Context, cluster *v1a
 				candidate = &copy
 			}
 			if candidate == nil {
-				lastErr = fmt.Errorf("VM %q is not yet visible during create recovery", desired.Name)
+				lastErr = fmt.Errorf("%w: VM %q is not yet visible during create recovery", errCreatedVMNotVisible, desired.Name)
 			} else if !vmUUIDPattern.MatchString(candidate.UUID) {
 				return nil, fmt.Errorf("VM %q has an invalid UUID during create recovery", desired.Name)
 			} else {
@@ -2357,10 +2371,76 @@ func (r *Reconciler) ensureVMProtection(ctx context.Context, cluster *v1alpha1.I
 	if vm == nil || !vmUUIDPattern.MatchString(vm.UUID) {
 		return false, errors.New("bootstrap: cannot ensure firewall protection without an exact VM UUID")
 	}
-	if err := r.ensureExactFirewallAssignment(ctx, cluster, attemptKey, firewall, vm.UUID); err != nil {
-		return false, err
+	protectionErr := r.ensureExactFirewallAssignment(ctx, cluster, attemptKey, firewall, vm.UUID)
+	if protectionErr == nil {
+		return true, nil
 	}
-	return true, nil
+	candidate, candidateErr := r.expiredFixedFirewallAssignmentRollback(cluster, time.Now().UTC())
+	if candidateErr != nil {
+		return false, errors.Join(protectionErr, candidateErr)
+	}
+	if candidate == nil || candidate.slot.assignmentKey != attemptKey ||
+		!strings.EqualFold(candidate.vmUUID, vm.UUID) ||
+		firewall == nil || !strings.EqualFold(candidate.firewallID, firewall.UUID) {
+		return false, protectionErr
+	}
+
+	// The durable deadline alone is not destructive authority. Perform one
+	// final uncached relationship read after the ordinary bounded readback
+	// failed. A relation that committed at any point before this read is
+	// materialized, even when its issue receipt is already older than the
+	// deadline. Read errors preserve the issued receipt and perform no cleanup.
+	readCtx, readCancel := context.WithTimeout(
+		context.WithoutCancel(ctx),
+		configuredDuration(r.protectionRequestTimeout, defaultProtectionRequestTimeout),
+	)
+	present, finalReadErr := r.readExactFirewallAssignment(
+		readCtx,
+		cluster.Spec.Location,
+		firewall,
+		vm.UUID,
+	)
+	readCancel()
+	if finalReadErr != nil {
+		return false, errors.Join(protectionErr,
+			fmt.Errorf("bootstrap: final firewall protection authority read: %w", finalReadErr))
+	}
+	if present {
+		resourceName := firewall.UUID + "/" + vm.UUID
+		intentHash, hashErr := createIntentHash(
+			createAttemptKindFirewallAssignment,
+			resourceName,
+			firewallAssignmentIntent{
+				Location:     cluster.Spec.Location,
+				FirewallUUID: firewall.UUID,
+				VMUUID:       vm.UUID,
+			},
+		)
+		if hashErr != nil {
+			return false, errors.Join(protectionErr, hashErr)
+		}
+		persistCtx, persistCancel := r.detachedStatusMutationContext(ctx)
+		materializeErr := r.recordMaterializedCreate(
+			persistCtx,
+			cluster,
+			attemptKey,
+			createAttemptKindFirewallAssignment,
+			resourceName,
+			intentHash,
+			vm.UUID,
+		)
+		persistCancel()
+		if materializeErr != nil {
+			return false, errors.Join(protectionErr, materializeErr,
+				fmt.Errorf("%w: final firewall protection readback was not anchored", ErrCreateAttemptPending))
+		}
+		return true, nil
+	}
+	started, rollbackErr := r.containExpiredFirewallAssignment(ctx, cluster)
+	if started || rollbackErr != nil {
+		return false, errors.Join(protectionErr, rollbackErr)
+	}
+	return false, protectionErr
 }
 
 type firewallAssignmentIntent struct {

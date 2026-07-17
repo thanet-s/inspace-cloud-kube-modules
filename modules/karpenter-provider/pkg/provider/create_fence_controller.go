@@ -23,7 +23,10 @@ import (
 	cloudapi "github.com/thanet-s/inspace-cloud-kube-modules/modules/karpenter-provider/pkg/cloud"
 )
 
-const createFenceCleanupRequeue = 10 * time.Second
+const (
+	createFenceCleanupRequeue     = 10 * time.Second
+	createProtectionIssueDeadline = 2 * time.Minute
+)
 
 // CreateFenceController owns the narrow crash window between an issued
 // InSpace VM POST and durable NodeClaim ProviderID persistence. Karpenter's
@@ -35,6 +38,7 @@ type CreateFenceController struct {
 	apiReader  client.Reader
 	cloud      cloudapi.Cloud
 	namespace  string
+	now        func() time.Time
 }
 
 func NewCreateFenceController(kubeClient client.Client, apiReader client.Reader, cloud cloudapi.Cloud, namespaces ...string) (*CreateFenceController, error) {
@@ -51,7 +55,7 @@ func NewCreateFenceController(kubeClient client.Client, apiReader client.Reader,
 	if namespace == "" {
 		return nil, fmt.Errorf("controller namespace is required for durable firewall coordination")
 	}
-	return &CreateFenceController{kubeClient: kubeClient, apiReader: apiReader, cloud: cloud, namespace: namespace}, nil
+	return &CreateFenceController{kubeClient: kubeClient, apiReader: apiReader, cloud: cloud, namespace: namespace, now: time.Now}, nil
 }
 
 func (c *CreateFenceController) Name() string { return "inspace.nodeclaim.create-protection" }
@@ -81,7 +85,7 @@ func (c *CreateFenceController) Reconcile(ctx context.Context, nodeClaim *karpv1
 
 	deleting := !nodeClaim.DeletionTimestamp.IsZero()
 	rollbackChosen := record.Phase == createFenceIssued && record.RollbackAt != nil
-	assignmentStore := &kubernetesCreateFenceStore{writer: c.kubeClient, reader: c.apiReader, namespace: c.namespace, now: time.Now, nonce: createFenceNonce}
+	assignmentStore := &kubernetesCreateFenceStore{writer: c.kubeClient, reader: c.apiReader, namespace: c.namespace, now: c.now, nonce: createFenceNonce}
 	if encoded := nodeClaim.Annotations[AnnotationRemovalMutationFence]; encoded == "" {
 		if deleting || rollbackChosen {
 			return reconcile.Result{}, fmt.Errorf("NodeClaim %q lacks a removal mutation fence established before deletion/rollback", nodeClaim.Name)
@@ -115,7 +119,7 @@ func (c *CreateFenceController) Reconcile(ctx context.Context, nodeClaim *karpv1
 				break
 			}
 		}
-		store := &kubernetesCreateFenceStore{writer: c.kubeClient, reader: c.apiReader, namespace: c.namespace, now: time.Now, nonce: createFenceNonce}
+		store := &kubernetesCreateFenceStore{writer: c.kubeClient, reader: c.apiReader, namespace: c.namespace, now: c.now, nonce: createFenceNonce}
 		rollbackCtx, cancel := detachedCreateFenceContext(ctx)
 		_, rollbackErr := store.ChooseRollback(rollbackCtx, nodeClaim, record.Binding, record.Token, record.IssueID, record.CreatedVMUUID, anchorReceipt)
 		cancel()
@@ -171,6 +175,13 @@ func (c *CreateFenceController) Reconcile(ctx context.Context, nodeClaim *karpv1
 		FloatingIPName:      record.FloatingIPName, PublicIPv4: record.PublicIPv4,
 		Resolutions: resolutions, Baseline: cloneCreateInventory(record.Baseline),
 		BaseFirewallAssignment: firewallAssignmentFenceFromRecord(record),
+	}
+	floatingIPUpdate, hasFloatingIPUpdate, err := floatingIPUpdateForProtection(nodeClaim, record)
+	if err != nil {
+		return reconcile.Result{}, err
+	}
+	if hasFloatingIPUpdate && (floatingIPUpdate.Phase == cloudapi.FloatingIPUpdateIssued || floatingIPUpdate.Phase == cloudapi.FloatingIPUpdateObserved) {
+		cleanup.FloatingIPUpdate = floatingIPUpdateFenceFromRecord(floatingIPUpdate)
 	}
 	cleanup.AuthorizeBaseFirewall = func(authorizeCtx context.Context, vmUUID string) (cloudapi.FirewallAssignmentAuthorization, error) {
 		updated, authorization, authorizeErr := assignmentStore.AuthorizeBaseFirewall(authorizeCtx, nodeClaim, record.Binding, record.Token, vmUUID)
@@ -281,16 +292,72 @@ func (c *CreateFenceController) Reconcile(ctx context.Context, nodeClaim *karpv1
 		// protection failure irreversibly chooses rollback so the next pass
 		// deletes the exact UUID instead of exposing it indefinitely.
 		if record.Phase == createFenceIssued && record.CreatedVMUUID != "" {
-			if protectErr := c.cloud.ProtectFencedCreate(ctx, cleanup); protectErr != nil {
-				if errors.Is(protectErr, cloudapi.ErrCreateAttemptPending) {
+			protectErr := c.cloud.ProtectFencedCreate(ctx, cleanup)
+			if protectErr != nil {
+				// Protection callbacks may have advanced either dependent receipt
+				// while the cloud audit was running. Re-read uncached state before
+				// using its durable issue age to select rollback.
+				freshClaim, freshRecord, freshUpdate, freshHasUpdate, refreshErr := c.readProtectionState(ctx, nodeClaim)
+				if refreshErr != nil {
+					return reconcile.Result{}, fmt.Errorf("refreshing NodeClaim %q protection state after cloud audit failed: %w", nodeClaim.Name, refreshErr)
+				}
+				nodeClaim, record = freshClaim, freshRecord
+				if record.RollbackAt != nil {
+					return reconcile.Result{Requeue: true}, nil
+				}
+				issuedAt, unresolved := unresolvedProtectionIssuedAt(record, freshUpdate, freshHasUpdate)
+				if unresolved && c.now().UTC().Before(issuedAt.Add(createProtectionIssueDeadline)) {
 					return reconcile.Result{RequeueAfter: createFenceCleanupRequeue}, nil
 				}
-				store := &kubernetesCreateFenceStore{writer: c.kubeClient, reader: c.apiReader, namespace: c.namespace, now: time.Now, nonce: createFenceNonce}
+				if !unresolved && errors.Is(protectErr, cloudapi.ErrCreateAttemptPending) {
+					store := &kubernetesCreateFenceStore{writer: c.kubeClient, reader: c.apiReader, namespace: c.namespace, now: c.now, nonce: createFenceNonce}
+					failureCtx, cancel := detachedCreateFenceContext(ctx)
+					failedClaim, failureAt, failureErr := store.RecordProtectionFailure(
+						failureCtx,
+						nodeClaim,
+						record.Binding,
+						record.Token,
+						record.IssueID,
+						record.CreatedVMUUID,
+					)
+					cancel()
+					if failureErr != nil {
+						return reconcile.Result{}, fmt.Errorf("persisting anchored VM %s protection failure: %w", record.CreatedVMUUID, failureErr)
+					}
+					nodeClaim = failedClaim
+					if c.now().UTC().Before(failureAt.Add(createProtectionIssueDeadline)) {
+						return reconcile.Result{RequeueAfter: createFenceCleanupRequeue}, nil
+					}
+				}
+				var rollbackResolution *cloudapi.FencedCreateCleanupResolution
+				if freshHasUpdate && (freshUpdate.Phase == cloudapi.FloatingIPUpdateIssued || freshUpdate.Phase == cloudapi.FloatingIPUpdateObserved) {
+					rollbackResolution = &cloudapi.FencedCreateCleanupResolution{
+						VMUUID: freshUpdate.VMUUID, FloatingIPName: freshUpdate.Name, PublicIPv4: freshUpdate.Address,
+					}
+				}
+				store := &kubernetesCreateFenceStore{writer: c.kubeClient, reader: c.apiReader, namespace: c.namespace, now: c.now, nonce: createFenceNonce}
 				rollbackCtx, cancel := detachedCreateFenceContext(ctx)
-				_, rollbackErr := store.ChooseRollback(rollbackCtx, nodeClaim, record.Binding, record.Token, record.IssueID, record.CreatedVMUUID, nil)
+				_, rollbackErr := store.ChooseRollback(rollbackCtx, nodeClaim, record.Binding, record.Token, record.IssueID, record.CreatedVMUUID, rollbackResolution)
 				cancel()
 				if rollbackErr != nil {
 					return reconcile.Result{}, fmt.Errorf("protecting anchored VM %s failed and persisting rollback also failed: %w", record.CreatedVMUUID, errors.Join(protectErr, rollbackErr))
+				}
+				return reconcile.Result{Requeue: true}, nil
+			}
+			if record.ProtectionFailureAt != nil {
+				store := &kubernetesCreateFenceStore{writer: c.kubeClient, reader: c.apiReader, namespace: c.namespace, now: c.now, nonce: createFenceNonce}
+				recoveryCtx, cancel := detachedCreateFenceContext(ctx)
+				_, recoveryErr := store.ClearProtectionFailure(
+					recoveryCtx,
+					nodeClaim,
+					record.Binding,
+					record.Token,
+					record.IssueID,
+					record.CreatedVMUUID,
+				)
+				cancel()
+				if recoveryErr != nil {
+					return reconcile.Result{}, fmt.Errorf("clearing anchored VM %s protection failure after successful readback: %w", record.CreatedVMUUID, recoveryErr)
 				}
 				return reconcile.Result{Requeue: true}, nil
 			}
@@ -345,6 +412,66 @@ func (c *CreateFenceController) Reconcile(ctx context.Context, nodeClaim *karpv1
 		return reconcile.Result{}, err
 	}
 	return reconcile.Result{RequeueAfter: createFenceCleanupRequeue}, nil
+}
+
+func floatingIPUpdateForProtection(nodeClaim *karpv1.NodeClaim, record createFenceRecord) (floatingIPUpdateRecord, bool, error) {
+	encoded := nodeClaim.Annotations[AnnotationFloatingIPUpdateFence]
+	if encoded == "" {
+		return floatingIPUpdateRecord{}, false, nil
+	}
+	update, err := decodeFloatingIPUpdateRecord(encoded, record.Binding, record.Token)
+	if err != nil {
+		return floatingIPUpdateRecord{}, false, fmt.Errorf("NodeClaim %q floating-IP protection receipt: %w", nodeClaim.Name, err)
+	}
+	if update.VMUUID != record.CreatedVMUUID || update.BillingAccountID != record.Cleanup.BillingAccountID {
+		return floatingIPUpdateRecord{}, false, fmt.Errorf("NodeClaim %q floating-IP protection receipt does not match its exact created VM", nodeClaim.Name)
+	}
+	return update, true, nil
+}
+
+func (c *CreateFenceController) readProtectionState(
+	ctx context.Context,
+	nodeClaim *karpv1.NodeClaim,
+) (*karpv1.NodeClaim, createFenceRecord, floatingIPUpdateRecord, bool, error) {
+	var current karpv1.NodeClaim
+	if err := c.apiReader.Get(ctx, types.NamespacedName{Name: nodeClaim.Name}, &current); err != nil {
+		return nil, createFenceRecord{}, floatingIPUpdateRecord{}, false, err
+	}
+	if current.UID != nodeClaim.UID || !controllerutil.ContainsFinalizer(&current, CreateFenceFinalizer) {
+		return nil, createFenceRecord{}, floatingIPUpdateRecord{}, false, fmt.Errorf("NodeClaim changed identity or lost create protection")
+	}
+	record, err := decodeCreateFence(current.Annotations[AnnotationCreateFence])
+	if err != nil {
+		return nil, createFenceRecord{}, floatingIPUpdateRecord{}, false, err
+	}
+	if record.Binding.NodeClaimUID != string(current.UID) || record.Cleanup.NodeClaimName != current.Name {
+		return nil, createFenceRecord{}, floatingIPUpdateRecord{}, false, fmt.Errorf("durable create protection changed exact NodeClaim identity")
+	}
+	update, exists, err := floatingIPUpdateForProtection(&current, record)
+	if err != nil {
+		return nil, createFenceRecord{}, floatingIPUpdateRecord{}, false, err
+	}
+	return &current, record, update, exists, nil
+}
+
+func unresolvedProtectionIssuedAt(record createFenceRecord, update floatingIPUpdateRecord, hasUpdate bool) (time.Time, bool) {
+	if assignment := record.BaseFirewallAssignment; assignment != nil && assignment.Phase == cloudapi.FirewallAssignmentIssued {
+		if assignment.IssuedAt != nil && !assignment.IssuedAt.IsZero() {
+			return assignment.IssuedAt.UTC(), true
+		}
+		if record.IssuedAt != nil {
+			return record.IssuedAt.UTC(), true
+		}
+	}
+	if hasUpdate && update.Phase == cloudapi.FloatingIPUpdateIssued {
+		if !update.IssuedAt.IsZero() {
+			return update.IssuedAt.UTC(), true
+		}
+		if record.IssuedAt != nil {
+			return record.IssuedAt.UTC(), true
+		}
+	}
+	return time.Time{}, false
 }
 
 func (c *CreateFenceController) resolveOperatorCreateFence(

@@ -1830,8 +1830,28 @@ func TestUUIDLessUncommittedCreateDoesNotRetryPOST(t *testing.T) {
 	if !errors.Is(err, io.ErrUnexpectedEOF) || !strings.Contains(err.Error(), "ownership is uncertain") {
 		t.Fatalf("uncommitted UUID-less create did not report explicit uncertainty: %v", err)
 	}
+	var absentCreate *IssuedVMCreateAbsentError
+	if !errors.As(err, &absentCreate) ||
+		absentCreate.AttemptKey != createAttemptBastionVM ||
+		absentCreate.ResourceName != bastionName {
+		t.Fatalf("uncommitted UUID-less create absence identity = %#v, error=%v", absentCreate, err)
+	}
+	attempt := cluster.Status.CreateAttempts[createAttemptBastionVM]
+	issuedAt, parseErr := time.Parse(time.RFC3339Nano, attempt.IssuedAt)
+	if parseErr != nil || !absentCreate.IssuedAt.Equal(issuedAt) {
+		t.Fatalf("typed absence issue time = %s, durable attempt=%#v", absentCreate.IssuedAt, attempt)
+	}
 	if len(api.vmCreates) != 1 || len(api.vms) != 0 || len(api.vmDeletes) != 0 {
 		t.Fatalf("uncommitted UUID-less create was retried or destructively guessed: creates=%d VMs=%#v deletes=%#v", len(api.vmCreates), api.vms, api.vmDeletes)
+	}
+
+	cluster = restartClusterFromJSON(t, cluster)
+	_, err = testReconciler(api).Reconcile(context.Background(), cluster, "unit-test-secret-token")
+	if !errors.As(err, &absentCreate) || !errors.Is(err, ErrCreateAttemptPending) {
+		t.Fatalf("restart did not retain typed issued-create absence: %v", err)
+	}
+	if len(api.vmCreates) != 1 || len(api.vms) != 0 || len(api.vmDeletes) != 0 {
+		t.Fatalf("restart replayed or guessed an absent issued create: creates=%d VMs=%#v deletes=%#v", len(api.vmCreates), api.vms, api.vmDeletes)
 	}
 }
 
@@ -2539,7 +2559,9 @@ func TestAmbiguousFirewallAssignmentLateVisibilityNeverReplaysAcrossRestart(t *t
 	api.firewallAssignmentReadbackDelay = 1000
 	assignmentPrefix := "assign-firewall/" + bastionFirewall.UUID + "/" + bastion.UUID
 	before := countEventsWithPrefix(api.events, assignmentPrefix)
-	if _, err := testReconciler(api).Reconcile(context.Background(), cluster, "unit-test-secret-token"); !errors.Is(err, ErrCreateAttemptPending) {
+	first := testReconciler(api)
+	first.firewallAssignmentProtectionDeadline = time.Hour
+	if _, err := first.Reconcile(context.Background(), cluster, "unit-test-secret-token"); !errors.Is(err, ErrCreateAttemptPending) {
 		t.Fatalf("first Reconcile() error = %v, want durable pending assignment", err)
 	}
 	attempt := cluster.Status.CreateAttempts[createAttemptBastionFirewallAssignment]
@@ -2553,7 +2575,9 @@ func TestAmbiguousFirewallAssignmentLateVisibilityNeverReplaysAcrossRestart(t *t
 	// A fresh reconciler receives only the durably persisted cluster status.
 	// Although the committed row is still hidden, it must perform reads only.
 	cluster = restartClusterFromJSON(t, cluster)
-	if _, err := testReconciler(api).Reconcile(context.Background(), cluster, "unit-test-secret-token"); !errors.Is(err, ErrCreateAttemptPending) {
+	restarted := testReconciler(api)
+	restarted.firewallAssignmentProtectionDeadline = time.Hour
+	if _, err := restarted.Reconcile(context.Background(), cluster, "unit-test-secret-token"); !errors.Is(err, ErrCreateAttemptPending) {
 		t.Fatalf("restart Reconcile() error = %v, want read-only pending recovery", err)
 	}
 	if got := countEventsWithPrefix(api.events, assignmentPrefix); got != before+1 {
@@ -2562,7 +2586,9 @@ func TestAmbiguousFirewallAssignmentLateVisibilityNeverReplaysAcrossRestart(t *t
 
 	api.firewallAssignmentError = nil
 	api.firewallAssignmentReadbackRemaining = 0
-	if _, err := testReconciler(api).Reconcile(context.Background(), cluster, "unit-test-secret-token"); err != nil {
+	restarted = testReconciler(api)
+	restarted.firewallAssignmentProtectionDeadline = time.Hour
+	if _, err := restarted.Reconcile(context.Background(), cluster, "unit-test-secret-token"); err != nil {
 		t.Fatalf("visible committed assignment did not recover: %v", err)
 	}
 	attempt = cluster.Status.CreateAttempts[createAttemptBastionFirewallAssignment]
@@ -4516,6 +4542,7 @@ func testReconciler(api *fakeAPI) *Reconciler {
 		protectionReadbackMinInterval: time.Millisecond, protectionReadbackMaxInterval: 5 * time.Millisecond,
 		createdVMRecoveryTimeout: 100 * time.Millisecond, createdVMFloatingIPCleanupTimeout: 25 * time.Millisecond,
 		createdVMDeleteTimeout: 25 * time.Millisecond, vmAbsenceObservationMinInterval: time.Nanosecond,
+		firewallAssignmentProtectionDeadline: time.Nanosecond,
 	}
 }
 

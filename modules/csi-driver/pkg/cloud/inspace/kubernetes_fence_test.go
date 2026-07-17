@@ -51,7 +51,7 @@ func (s *mutationLeaseAPIServer) ServeHTTP(w http.ResponseWriter, r *http.Reques
 		}
 		writeLeaseJSON(w, http.StatusCreated, lease)
 	case r.Method == http.MethodGet && r.URL.Path == collection:
-		list := kubernetesLeaseList{}
+		list := kubernetesLeaseList{Items: []kubernetesLease{}}
 		if s.lease != nil {
 			list.Items = []kubernetesLease{*s.lease}
 		}

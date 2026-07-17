@@ -356,6 +356,397 @@ func TestLiveAnchoredProtectionFailureChoosesRollback(t *testing.T) {
 	}
 }
 
+func TestLiveAnchoredPendingProtectionWaitsForDurableIssueDeadlineThenChoosesRollback(t *testing.T) {
+	claim := createFenceControllerClaim(t, createFenceIssued)
+	record, err := decodeCreateFence(claim.Annotations[AnnotationCreateFence])
+	if err != nil {
+		t.Fatal(err)
+	}
+	anchorCreatedFence(&record)
+	now := time.Date(2026, 7, 17, 12, 0, 0, 0, time.UTC)
+	issuedAt := now.Add(-createProtectionIssueDeadline + time.Second)
+	record.IssuedAt = timePointer(issuedAt)
+	record.BaseFirewallAssignment.IssuedAt = timePointer(issuedAt)
+	claim.Annotations[AnnotationCreateFence] = mustEncodeCreateFence(record)
+	kubeClient := createFenceControllerClient(t, claim)
+	cloud := &recordingFenceCleanupCloud{Cloud: cloudfake.New(), protectErr: cloudapi.ErrCreateAttemptPending}
+	controller, _ := NewCreateFenceController(kubeClient, kubeClient, cloud)
+	controller.now = func() time.Time { return now }
+
+	result, err := controller.Reconcile(context.Background(), claim.DeepCopy())
+	if err != nil || result.RequeueAfter != createFenceCleanupRequeue {
+		t.Fatalf("pre-deadline reconcile = %#v, %v", result, err)
+	}
+	var stored karpv1.NodeClaim
+	if err := kubeClient.Get(context.Background(), types.NamespacedName{Name: claim.Name}, &stored); err != nil {
+		t.Fatal(err)
+	}
+	storedRecord, err := decodeCreateFence(stored.Annotations[AnnotationCreateFence])
+	if err != nil || storedRecord.RollbackAt != nil || cloud.protectCalls != 1 || cloud.calls != 0 {
+		t.Fatalf("pre-deadline state = %#v err=%v protect=%d cleanup=%d", storedRecord, err, cloud.protectCalls, cloud.calls)
+	}
+
+	now = now.Add(2 * time.Second)
+	result, err = controller.Reconcile(context.Background(), &stored)
+	if err != nil || !result.Requeue {
+		t.Fatalf("post-deadline reconcile = %#v, %v", result, err)
+	}
+	if err := kubeClient.Get(context.Background(), types.NamespacedName{Name: claim.Name}, &stored); err != nil {
+		t.Fatal(err)
+	}
+	storedRecord, err = decodeCreateFence(stored.Annotations[AnnotationCreateFence])
+	if err != nil || storedRecord.RollbackAt == nil || !storedRecord.RollbackAt.Equal(now) || !storedRecord.DependentUnresolved ||
+		cloud.protectCalls != 2 || cloud.calls != 0 {
+		t.Fatalf("post-deadline rollback = %#v err=%v protect=%d cleanup=%d", storedRecord, err, cloud.protectCalls, cloud.calls)
+	}
+}
+
+func TestObservedFirewallProtectionDriftUsesDurableFailureDeadline(t *testing.T) {
+	claim := createFenceControllerClaim(t, createFenceIssued)
+	record, err := decodeCreateFence(claim.Annotations[AnnotationCreateFence])
+	if err != nil {
+		t.Fatal(err)
+	}
+	anchorCreatedFence(&record)
+	now := time.Date(2026, 7, 17, 13, 0, 0, 0, time.UTC)
+	observedAt := now.Add(-time.Minute)
+	record.BaseFirewallAssignment.Phase = cloudapi.FirewallAssignmentObserved
+	record.BaseFirewallAssignment.ObservedAt = &observedAt
+	record.BaseFirewallAssignment.RejectedAt = nil
+	claim.Annotations[AnnotationCreateFence] = mustEncodeCreateFence(record)
+	kubeClient := createFenceControllerClient(t, claim)
+	cloud := &recordingFenceCleanupCloud{Cloud: cloudfake.New(), protectErr: cloudapi.ErrCreateAttemptPending}
+
+	first, _ := NewCreateFenceController(kubeClient, kubeClient, cloud)
+	first.now = func() time.Time { return now }
+	result, err := first.Reconcile(context.Background(), claim.DeepCopy())
+	if err != nil || result.RequeueAfter != createFenceCleanupRequeue {
+		t.Fatalf("first observed-firewall drift reconcile = %#v, %v", result, err)
+	}
+	var stored karpv1.NodeClaim
+	if err := kubeClient.Get(context.Background(), types.NamespacedName{Name: claim.Name}, &stored); err != nil {
+		t.Fatal(err)
+	}
+	storedRecord, err := decodeCreateFence(stored.Annotations[AnnotationCreateFence])
+	if err != nil || storedRecord.ProtectionFailureAt == nil || !storedRecord.ProtectionFailureAt.Equal(now) || storedRecord.RollbackAt != nil {
+		t.Fatalf("durable observed-firewall failure marker = %#v err=%v", storedRecord, err)
+	}
+
+	beforeDeadline := now.Add(createProtectionIssueDeadline - time.Second)
+	restarted, _ := NewCreateFenceController(kubeClient, kubeClient, cloud)
+	restarted.now = func() time.Time { return beforeDeadline }
+	result, err = restarted.Reconcile(context.Background(), &stored)
+	if err != nil || result.RequeueAfter != createFenceCleanupRequeue {
+		t.Fatalf("restart before observed-firewall deadline = %#v, %v", result, err)
+	}
+	if err := kubeClient.Get(context.Background(), types.NamespacedName{Name: claim.Name}, &stored); err != nil {
+		t.Fatal(err)
+	}
+	storedRecord, err = decodeCreateFence(stored.Annotations[AnnotationCreateFence])
+	if err != nil || storedRecord.ProtectionFailureAt == nil || !storedRecord.ProtectionFailureAt.Equal(now) || storedRecord.RollbackAt != nil {
+		t.Fatalf("restart replaced observed-firewall failure marker = %#v err=%v", storedRecord, err)
+	}
+
+	afterDeadline := now.Add(createProtectionIssueDeadline + time.Second)
+	restarted.now = func() time.Time { return afterDeadline }
+	result, err = restarted.Reconcile(context.Background(), &stored)
+	if err != nil || !result.Requeue {
+		t.Fatalf("restart after observed-firewall deadline = %#v, %v", result, err)
+	}
+	if err := kubeClient.Get(context.Background(), types.NamespacedName{Name: claim.Name}, &stored); err != nil {
+		t.Fatal(err)
+	}
+	storedRecord, err = decodeCreateFence(stored.Annotations[AnnotationCreateFence])
+	if err != nil || storedRecord.ProtectionFailureAt != nil || storedRecord.RollbackAt == nil ||
+		!storedRecord.RollbackAt.Equal(afterDeadline) || !storedRecord.DependentUnresolved {
+		t.Fatalf("observed-firewall bounded rollback = %#v err=%v", storedRecord, err)
+	}
+}
+
+func TestObservedFloatingIPProtectionDriftUsesDurableFailureDeadlineAndExactCleanup(t *testing.T) {
+	claim := createFenceControllerClaim(t, createFenceIssued)
+	record, err := decodeCreateFence(claim.Annotations[AnnotationCreateFence])
+	if err != nil {
+		t.Fatal(err)
+	}
+	anchorCreatedFence(&record)
+	now := time.Date(2026, 7, 17, 14, 0, 0, 0, time.UTC)
+	observedAt := now.Add(-time.Minute)
+	record.BaseFirewallAssignment.Phase = cloudapi.FirewallAssignmentObserved
+	record.BaseFirewallAssignment.ObservedAt = &observedAt
+	record.BaseFirewallAssignment.RejectedAt = nil
+	claim.Annotations[AnnotationCreateFence] = mustEncodeCreateFence(record)
+	update := floatingIPUpdateRecord{
+		Schema: floatingIPUpdateFenceSchema, Binding: record.Binding, AttemptToken: record.Token,
+		VMUUID: record.CreatedVMUUID, Address: "203.0.113.10", Name: "karpenter-general-a-1234567890",
+		BillingAccountID: record.Cleanup.BillingAccountID, Phase: cloudapi.FloatingIPUpdateObserved,
+		IssueID: "44444444444444444444444444444444", IssuedAt: now.Add(-2 * time.Minute), ObservedAt: &observedAt,
+	}
+	encodedUpdate, err := json.Marshal(update)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim.Annotations[AnnotationFloatingIPUpdateFence] = string(encodedUpdate)
+	kubeClient := createFenceControllerClient(t, claim)
+	cloud := &recordingFenceCleanupCloud{Cloud: cloudfake.New(), protectErr: cloudapi.ErrCreateAttemptPending}
+
+	first, _ := NewCreateFenceController(kubeClient, kubeClient, cloud)
+	first.now = func() time.Time { return now }
+	result, err := first.Reconcile(context.Background(), claim.DeepCopy())
+	if err != nil || result.RequeueAfter != createFenceCleanupRequeue {
+		t.Fatalf("first observed-FIP drift reconcile = %#v, %v", result, err)
+	}
+	if cloud.request.FloatingIPUpdate != floatingIPUpdateFenceFromRecord(update) {
+		t.Fatalf("observed FIP receipt omitted from protection request: got %#v want %#v", cloud.request.FloatingIPUpdate, floatingIPUpdateFenceFromRecord(update))
+	}
+	var stored karpv1.NodeClaim
+	if err := kubeClient.Get(context.Background(), types.NamespacedName{Name: claim.Name}, &stored); err != nil {
+		t.Fatal(err)
+	}
+	storedRecord, err := decodeCreateFence(stored.Annotations[AnnotationCreateFence])
+	if err != nil || storedRecord.ProtectionFailureAt == nil || !storedRecord.ProtectionFailureAt.Equal(now) || storedRecord.RollbackAt != nil {
+		t.Fatalf("durable observed-FIP failure marker = %#v err=%v", storedRecord, err)
+	}
+
+	afterDeadline := now.Add(createProtectionIssueDeadline + time.Second)
+	restarted, _ := NewCreateFenceController(kubeClient, kubeClient, cloud)
+	restarted.now = func() time.Time { return afterDeadline }
+	result, err = restarted.Reconcile(context.Background(), &stored)
+	if err != nil || !result.Requeue {
+		t.Fatalf("restart after observed-FIP deadline = %#v, %v", result, err)
+	}
+	if err := kubeClient.Get(context.Background(), types.NamespacedName{Name: claim.Name}, &stored); err != nil {
+		t.Fatal(err)
+	}
+	storedRecord, err = decodeCreateFence(stored.Annotations[AnnotationCreateFence])
+	wantResolution := cloudapi.FencedCreateCleanupResolution{
+		VMUUID: update.VMUUID, FloatingIPName: update.Name, PublicIPv4: update.Address,
+	}
+	if err != nil || storedRecord.ProtectionFailureAt != nil || storedRecord.RollbackAt == nil ||
+		storedRecord.DependentUnresolved || len(storedRecord.CleanupResolutions) != 1 ||
+		storedRecord.CleanupResolutions[0] != wantResolution {
+		t.Fatalf("observed-FIP bounded exact rollback = %#v err=%v want=%#v", storedRecord, err, wantResolution)
+	}
+}
+
+func TestSuccessfulProtectionClearsDurableFailureDeadline(t *testing.T) {
+	claim := createFenceControllerClaim(t, createFenceIssued)
+	record, err := decodeCreateFence(claim.Annotations[AnnotationCreateFence])
+	if err != nil {
+		t.Fatal(err)
+	}
+	anchorCreatedFence(&record)
+	now := time.Date(2026, 7, 17, 15, 0, 0, 0, time.UTC)
+	failureAt := now.Add(-time.Minute)
+	record.ProtectionFailureAt = &failureAt
+	observedAt := now.Add(-2 * time.Minute)
+	record.BaseFirewallAssignment.Phase = cloudapi.FirewallAssignmentObserved
+	record.BaseFirewallAssignment.ObservedAt = &observedAt
+	record.BaseFirewallAssignment.RejectedAt = nil
+	claim.Annotations[AnnotationCreateFence] = mustEncodeCreateFence(record)
+	kubeClient := createFenceControllerClient(t, claim)
+	cloud := &recordingFenceCleanupCloud{Cloud: cloudfake.New()}
+	controller, _ := NewCreateFenceController(kubeClient, kubeClient, cloud)
+	controller.now = func() time.Time { return now }
+
+	result, err := controller.Reconcile(context.Background(), claim.DeepCopy())
+	if err != nil || !result.Requeue {
+		t.Fatalf("successful protection recovery = %#v, %v", result, err)
+	}
+	var stored karpv1.NodeClaim
+	if err := kubeClient.Get(context.Background(), types.NamespacedName{Name: claim.Name}, &stored); err != nil {
+		t.Fatal(err)
+	}
+	storedRecord, err := decodeCreateFence(stored.Annotations[AnnotationCreateFence])
+	if err != nil || storedRecord.ProtectionFailureAt != nil || storedRecord.RollbackAt != nil || cloud.protectCalls != 1 {
+		t.Fatalf("successful protection retained stale failure deadline: record=%#v err=%v protects=%d", storedRecord, err, cloud.protectCalls)
+	}
+}
+
+func TestLiveAnchoredPreDeadlineFirewallCommitIsObservedBeforeRollback(t *testing.T) {
+	claim := createFenceControllerClaim(t, createFenceIssued)
+	record, err := decodeCreateFence(claim.Annotations[AnnotationCreateFence])
+	if err != nil {
+		t.Fatal(err)
+	}
+	anchorCreatedFence(&record)
+	now := time.Date(2026, 7, 17, 12, 0, 0, 0, time.UTC)
+	issuedAt := now.Add(-createProtectionIssueDeadline + time.Second)
+	record.IssuedAt = timePointer(issuedAt)
+	record.BaseFirewallAssignment.IssuedAt = timePointer(issuedAt)
+	claim.Annotations[AnnotationCreateFence] = mustEncodeCreateFence(record)
+	kubeClient := createFenceControllerClient(t, claim)
+	cloud := &recordingFenceCleanupCloud{Cloud: cloudfake.New()}
+	cloud.protect = func(request cloudapi.FencedCreateCleanupRequest) error {
+		return request.ObserveBaseFirewall(context.Background(), record.CreatedVMUUID, record.BaseFirewallAssignment.IssueID)
+	}
+	controller, _ := NewCreateFenceController(kubeClient, kubeClient, cloud)
+	controller.now = func() time.Time { return now }
+
+	result, err := controller.Reconcile(context.Background(), claim.DeepCopy())
+	if err != nil || result.RequeueAfter != createFenceCleanupRequeue {
+		t.Fatalf("commit readback reconcile = %#v, %v", result, err)
+	}
+	var stored karpv1.NodeClaim
+	if err := kubeClient.Get(context.Background(), types.NamespacedName{Name: claim.Name}, &stored); err != nil {
+		t.Fatal(err)
+	}
+	storedRecord, err := decodeCreateFence(stored.Annotations[AnnotationCreateFence])
+	if err != nil || storedRecord.RollbackAt != nil || storedRecord.BaseFirewallAssignment.Phase != cloudapi.FirewallAssignmentObserved ||
+		cloud.protectCalls != 1 || cloud.calls != 0 {
+		t.Fatalf("committed protection state = %#v err=%v protect=%d cleanup=%d", storedRecord, err, cloud.protectCalls, cloud.calls)
+	}
+}
+
+func TestLiveAnchoredProtectionRead5xxDoesNotRollbackBeforeIssueDeadline(t *testing.T) {
+	claim := createFenceControllerClaim(t, createFenceIssued)
+	record, err := decodeCreateFence(claim.Annotations[AnnotationCreateFence])
+	if err != nil {
+		t.Fatal(err)
+	}
+	anchorCreatedFence(&record)
+	now := time.Date(2026, 7, 17, 12, 0, 0, 0, time.UTC)
+	issuedAt := now.Add(-time.Minute)
+	record.IssuedAt = timePointer(issuedAt)
+	record.BaseFirewallAssignment.IssuedAt = timePointer(issuedAt)
+	claim.Annotations[AnnotationCreateFence] = mustEncodeCreateFence(record)
+	kubeClient := createFenceControllerClient(t, claim)
+	cloud := &recordingFenceCleanupCloud{Cloud: cloudfake.New(), protectErr: errors.New("GET firewall readback: HTTP 503")}
+	controller, _ := NewCreateFenceController(kubeClient, kubeClient, cloud)
+	controller.now = func() time.Time { return now }
+
+	result, err := controller.Reconcile(context.Background(), claim.DeepCopy())
+	if err != nil || result.RequeueAfter != createFenceCleanupRequeue {
+		t.Fatalf("read 5xx reconcile = %#v, %v", result, err)
+	}
+	var stored karpv1.NodeClaim
+	if err := kubeClient.Get(context.Background(), types.NamespacedName{Name: claim.Name}, &stored); err != nil {
+		t.Fatal(err)
+	}
+	storedRecord, err := decodeCreateFence(stored.Annotations[AnnotationCreateFence])
+	if err != nil || storedRecord.RollbackAt != nil || cloud.protectCalls != 1 || cloud.calls != 0 {
+		t.Fatalf("read 5xx changed durable state = %#v err=%v protect=%d cleanup=%d", storedRecord, err, cloud.protectCalls, cloud.calls)
+	}
+}
+
+func TestLiveAnchoredIssuedFloatingIPUsesItsOwnDeadline(t *testing.T) {
+	claim := createFenceControllerClaim(t, createFenceIssued)
+	record, err := decodeCreateFence(claim.Annotations[AnnotationCreateFence])
+	if err != nil {
+		t.Fatal(err)
+	}
+	anchorCreatedFence(&record)
+	now := time.Date(2026, 7, 17, 12, 0, 0, 0, time.UTC)
+	createIssuedAt := now.Add(-time.Hour)
+	record.IssuedAt = timePointer(createIssuedAt)
+	record.BaseFirewallAssignment.Phase = cloudapi.FirewallAssignmentObserved
+	record.BaseFirewallAssignment.ObservedAt = timePointer(now.Add(-time.Minute))
+	record.BaseFirewallAssignment.RejectedAt = nil
+	claim.Annotations[AnnotationCreateFence] = mustEncodeCreateFence(record)
+	update := floatingIPUpdateRecord{
+		Schema: floatingIPUpdateFenceSchema, Binding: record.Binding, AttemptToken: record.Token,
+		VMUUID: record.CreatedVMUUID, Address: "203.0.113.10", Name: "karpenter-general-a-1234567890",
+		BillingAccountID: record.Cleanup.BillingAccountID, Phase: cloudapi.FloatingIPUpdateIssued,
+		IssueID: "44444444444444444444444444444444", IssuedAt: now.Add(-createProtectionIssueDeadline + time.Second),
+	}
+	encodedUpdate, err := json.Marshal(update)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim.Annotations[AnnotationFloatingIPUpdateFence] = string(encodedUpdate)
+	kubeClient := createFenceControllerClient(t, claim)
+	cloud := &recordingFenceCleanupCloud{Cloud: cloudfake.New(), protectErr: cloudapi.ErrCreateAttemptPending}
+	controller, _ := NewCreateFenceController(kubeClient, kubeClient, cloud)
+	controller.now = func() time.Time { return now }
+
+	result, err := controller.Reconcile(context.Background(), claim.DeepCopy())
+	if err != nil || result.RequeueAfter != createFenceCleanupRequeue {
+		t.Fatalf("fresh FIP issue reconcile = %#v, %v", result, err)
+	}
+	if cloud.request.FloatingIPUpdate != floatingIPUpdateFenceFromRecord(update) {
+		t.Fatalf("cloud protection request FIP fence = %#v, want %#v", cloud.request.FloatingIPUpdate, floatingIPUpdateFenceFromRecord(update))
+	}
+	var stored karpv1.NodeClaim
+	if err := kubeClient.Get(context.Background(), types.NamespacedName{Name: claim.Name}, &stored); err != nil {
+		t.Fatal(err)
+	}
+	storedRecord, err := decodeCreateFence(stored.Annotations[AnnotationCreateFence])
+	if err != nil || storedRecord.RollbackAt != nil {
+		t.Fatalf("old create issue overrode fresh FIP issue: record=%#v err=%v", storedRecord, err)
+	}
+
+	now = now.Add(2 * time.Second)
+	result, err = controller.Reconcile(context.Background(), &stored)
+	if err != nil || !result.Requeue {
+		t.Fatalf("expired FIP issue reconcile = %#v, %v", result, err)
+	}
+	if err := kubeClient.Get(context.Background(), types.NamespacedName{Name: claim.Name}, &stored); err != nil {
+		t.Fatal(err)
+	}
+	storedRecord, err = decodeCreateFence(stored.Annotations[AnnotationCreateFence])
+	if err != nil || storedRecord.RollbackAt == nil || storedRecord.DependentUnresolved ||
+		len(storedRecord.CleanupResolutions) != 1 ||
+		storedRecord.CleanupResolutions[0] != (cloudapi.FencedCreateCleanupResolution{
+			VMUUID: update.VMUUID, FloatingIPName: update.Name, PublicIPv4: update.Address,
+		}) {
+		t.Fatalf("expired FIP issue rollback = %#v err=%v", storedRecord, err)
+	}
+}
+
+func TestRollbackResumesAcrossRestartAndLateFirewallAssignment(t *testing.T) {
+	claim := createFenceControllerClaim(t, createFenceIssued)
+	record, err := decodeCreateFence(claim.Annotations[AnnotationCreateFence])
+	if err != nil {
+		t.Fatal(err)
+	}
+	anchorCreatedFence(&record)
+	now := time.Date(2026, 7, 17, 12, 0, 0, 0, time.UTC)
+	issuedAt := now.Add(-createProtectionIssueDeadline - time.Second)
+	record.IssuedAt = timePointer(issuedAt)
+	record.BaseFirewallAssignment.IssuedAt = timePointer(issuedAt)
+	claim.Annotations[AnnotationCreateFence] = mustEncodeCreateFence(record)
+	kubeClient := createFenceControllerClient(t, claim)
+	cloud := &recordingFenceCleanupCloud{Cloud: cloudfake.New(), protectErr: cloudapi.ErrCreateAttemptPending}
+	first, _ := NewCreateFenceController(kubeClient, kubeClient, cloud)
+	first.now = func() time.Time { return now }
+
+	if result, err := first.Reconcile(context.Background(), claim.DeepCopy()); err != nil || !result.Requeue {
+		t.Fatalf("rollback selection = %#v, %v", result, err)
+	}
+	var stored karpv1.NodeClaim
+	if err := kubeClient.Get(context.Background(), types.NamespacedName{Name: claim.Name}, &stored); err != nil {
+		t.Fatal(err)
+	}
+	cloud.protectErr = nil
+	cloud.result = cloudapi.ErrCreateAttemptPending
+	cloud.cleanup = func(request cloudapi.FencedCreateCleanupRequest) (cloudapi.FencedCreateCleanupResult, error) {
+		if !request.RollbackChosen {
+			t.Fatal("restart cleanup ran before durable rollback readback")
+		}
+		if err := request.ObserveBaseFirewall(context.Background(), record.CreatedVMUUID, record.BaseFirewallAssignment.IssueID); err != nil {
+			t.Fatalf("persisting late firewall assignment: %v", err)
+		}
+		return cloudapi.FencedCreateCleanupResult{}, cloudapi.ErrCreateAttemptPending
+	}
+	restarted, _ := NewCreateFenceController(kubeClient, kubeClient, cloud)
+	restarted.now = func() time.Time { return now.Add(time.Second) }
+
+	result, err := restarted.Reconcile(context.Background(), &stored)
+	if err != nil || result.RequeueAfter != createFenceCleanupRequeue {
+		t.Fatalf("restart cleanup = %#v, %v", result, err)
+	}
+	if cloud.protectCalls != 1 || cloud.calls != 1 {
+		t.Fatalf("restart replayed protection instead of cleanup: protect=%d cleanup=%d", cloud.protectCalls, cloud.calls)
+	}
+	if err := kubeClient.Get(context.Background(), types.NamespacedName{Name: claim.Name}, &stored); err != nil {
+		t.Fatal(err)
+	}
+	storedRecord, err := decodeCreateFence(stored.Annotations[AnnotationCreateFence])
+	if err != nil || storedRecord.RollbackAt == nil || storedRecord.BaseFirewallAssignment.Phase != cloudapi.FirewallAssignmentObserved {
+		t.Fatalf("restart/late-assignment state = %#v err=%v", storedRecord, err)
+	}
+}
+
 func TestOperatorVMResolutionValidatesProtectsAndAnchorsExactAttempt(t *testing.T) {
 	claim := createFenceControllerClaim(t, createFenceIssued)
 	record, err := decodeCreateFence(claim.Annotations[AnnotationCreateFence])
@@ -476,7 +867,9 @@ type recordingFenceCleanupCloud struct {
 	response     cloudapi.FencedCreateCleanupResult
 	calls        int
 	request      cloudapi.FencedCreateCleanupRequest
+	cleanup      func(cloudapi.FencedCreateCleanupRequest) (cloudapi.FencedCreateCleanupResult, error)
 	protectErr   error
+	protect      func(cloudapi.FencedCreateCleanupRequest) error
 	protectCalls int
 }
 
@@ -501,14 +894,21 @@ func (c *conflictOnceCreateFenceClient) Patch(ctx context.Context, object client
 	return c.Client.Patch(ctx, object, patch, options...)
 }
 
-func (c *recordingFenceCleanupCloud) ProtectFencedCreate(_ context.Context, _ cloudapi.FencedCreateCleanupRequest) error {
+func (c *recordingFenceCleanupCloud) ProtectFencedCreate(_ context.Context, request cloudapi.FencedCreateCleanupRequest) error {
 	c.protectCalls++
+	c.request = request
+	if c.protect != nil {
+		return c.protect(request)
+	}
 	return c.protectErr
 }
 
 func (c *recordingFenceCleanupCloud) CleanupFencedCreate(_ context.Context, request cloudapi.FencedCreateCleanupRequest) (cloudapi.FencedCreateCleanupResult, error) {
 	c.calls++
 	c.request = request
+	if c.cleanup != nil {
+		return c.cleanup(request)
+	}
 	return c.response, c.result
 }
 
