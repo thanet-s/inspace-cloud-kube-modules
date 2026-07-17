@@ -239,7 +239,7 @@ def test_proxy_bypass_and_exact_absence() -> None:
                 "present exact object was mistaken for absence",
             )
 
-            vm_uuid = "11111111-1111-4111-8111-111111111111"
+            vm_uuid = "11111111-1111-4111-8111-11111111111a"
             vm_route = f"/v1/bkk01/user-resource/vm?uuid={vm_uuid}"
             Handler.routes[vm_route] = (
                 400,
@@ -260,6 +260,24 @@ def test_proxy_bypass_and_exact_absence() -> None:
             Handler.routes[vm_route] = (
                 400,
                 {},
+                json.dumps(
+                    {
+                        "errors": {
+                            "Error": "No such virtual machine exists: "
+                            + vm_uuid
+                        }
+                    }
+                ).encode(),
+            )
+            require(
+                api.client().exact_absent(
+                    f"user-resource/vm?uuid={vm_uuid}", location="bkk01"
+                ),
+                "nested UUID-bound exact VM HTTP 400 was not recognized as absence",
+            )
+            Handler.routes[vm_route] = (
+                400,
+                {},
                 b'{"error":"No such virtual machine exists: '
                 b'22222222-2222-4222-8222-222222222222"}',
             )
@@ -269,6 +287,493 @@ def test_proxy_bypass_and_exact_absence() -> None:
                 ),
                 "HTTP 400 for a different VM identity",
             )
+            for label, body in (
+                (
+                    "nested HTTP 400 for a different VM identity",
+                    {
+                        "errors": {
+                            "Error": "No such virtual machine exists: "
+                            "22222222-2222-4222-8222-222222222222"
+                        }
+                    },
+                ),
+                (
+                    "nested HTTP 400 without an exact VM identity",
+                    {"errors": {"Error": "No such virtual machine exists"}},
+                ),
+                (
+                    "nested HTTP 400 with an extra top-level field",
+                    {
+                        "errors": {
+                            "Error": "No such virtual machine exists: "
+                            + vm_uuid
+                        },
+                        "status": 400,
+                    },
+                ),
+                (
+                    "nested HTTP 400 with an extra error field",
+                    {
+                        "errors": {
+                            "Error": "No such virtual machine exists: "
+                            + vm_uuid,
+                            "Code": "missing",
+                        }
+                    },
+                ),
+                (
+                    "nested HTTP 400 with the wrong error-key case",
+                    {
+                        "errors": {
+                            "error": "No such virtual machine exists: "
+                            + vm_uuid
+                        }
+                    },
+                ),
+                (
+                    "nested HTTP 400 with a non-object errors field",
+                    {
+                        "errors": "No such virtual machine exists: "
+                        + vm_uuid
+                    },
+                ),
+                (
+                    "nested HTTP 400 with a non-string Error field",
+                    {"errors": {"Error": {"message": vm_uuid}}},
+                ),
+                (
+                    "nested HTTP 400 with alternate phrase casing",
+                    {
+                        "errors": {
+                            "Error": "no such virtual machine exists: "
+                            + vm_uuid
+                        }
+                    },
+                ),
+                (
+                    "nested HTTP 400 with the abbreviated phrase",
+                    {
+                        "errors": {
+                            "Error": "No such VM exists: " + vm_uuid
+                        }
+                    },
+                ),
+                (
+                    "nested HTTP 400 with a period separator",
+                    {
+                        "errors": {
+                            "Error": "No such virtual machine exists. "
+                            + vm_uuid
+                        }
+                    },
+                ),
+                (
+                    "nested HTTP 400 with a non-canonical UUID",
+                    {
+                        "errors": {
+                            "Error": "No such virtual machine exists: "
+                            + vm_uuid.upper()
+                        }
+                    },
+                ),
+                (
+                    "nested HTTP 400 with trailing prose",
+                    {
+                        "errors": {
+                            "Error": "No such virtual machine exists: "
+                            + vm_uuid
+                            + " in this account"
+                        }
+                    },
+                ),
+                (
+                    "nested HTTP 400 with a matching legacy sibling",
+                    {
+                        "errors": {"Error": "validation failed"},
+                        "error": "No such virtual machine exists: "
+                        + vm_uuid,
+                    },
+                ),
+                (
+                    "case-confusable nested HTTP 400 with a legacy sibling",
+                    {
+                        "Errors": {"Error": "validation failed"},
+                        "error": "No such virtual machine exists: "
+                        + vm_uuid,
+                    },
+                ),
+                (
+                    "legacy HTTP 400 with an extra field",
+                    {
+                        "status": 400,
+                        "error": "No such virtual machine exists: "
+                        + vm_uuid,
+                    },
+                ),
+                (
+                    "legacy HTTP 400 with two message fields",
+                    {
+                        "message": "No such virtual machine exists: "
+                        + vm_uuid,
+                        "error": "No such virtual machine exists: "
+                        + vm_uuid,
+                    },
+                ),
+            ):
+                Handler.routes[vm_route] = (
+                    400,
+                    {},
+                    json.dumps(body).encode(),
+                )
+                reject(
+                    lambda: api.client().exact_absent(
+                        f"user-resource/vm?uuid={vm_uuid}",
+                        location="bkk01",
+                    ),
+                    label,
+                )
+            for label, body in (
+                (
+                    "nested HTTP 400 with a duplicate top-level key",
+                    b'{"errors":{"Error":"No such virtual machine exists: '
+                    + vm_uuid.encode()
+                    + b'"},"errors":{"Error":"No such virtual machine exists: '
+                    + vm_uuid.encode()
+                    + b'"}}',
+                ),
+                (
+                    "nested HTTP 400 with a duplicate error key",
+                    b'{"errors":{"Error":"No such virtual machine exists: '
+                    + vm_uuid.encode()
+                    + b'","Error":"No such virtual machine exists: '
+                    + vm_uuid.encode()
+                    + b'"}}',
+                ),
+            ):
+                Handler.routes[vm_route] = (400, {}, body)
+                reject(
+                    lambda: api.client().exact_absent(
+                        f"user-resource/vm?uuid={vm_uuid}",
+                        location="bkk01",
+                    ),
+                    label,
+                )
+
+            disk_uuid = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+            disk_route = f"/v1/bkk01/storage/disks/{disk_uuid}"
+            deleted_disk = {
+                "uuid": disk_uuid,
+                "user_id": 7,
+                "billing_account_id": 8,
+                "status": "Deleted",
+                "size_gb": 1,
+                "source_image_type": "EMPTY",
+                "created_at": "2026-07-17T10:00:00Z",
+                "updated_at": "2026-07-17T10:02:00Z",
+                "deleted_at": "2026-07-17T10:01:00Z",
+                "display_name": "pvc-unit-test",
+                "read_only_bootable": False,
+                "snapshots": [],
+                "storage_pool_uuid": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            }
+            disk_tombstone_identity = {
+                "expected_billing_account_id": 8,
+                "expected_name": "pvc-unit-test",
+            }
+            Handler.routes[disk_route] = (
+                200,
+                {},
+                json.dumps(deleted_disk).encode(),
+            )
+            require(
+                api.client().exact_absent(
+                    f"storage/disks/{disk_uuid}",
+                    location="bkk01",
+                    **disk_tombstone_identity,
+                ),
+                "canonical exact deleted-disk tombstone was not absence",
+            )
+            for label, expected_identity in (
+                (
+                    "wrong expected billing account",
+                    {
+                        **disk_tombstone_identity,
+                        "expected_billing_account_id": 9,
+                    },
+                ),
+                (
+                    "wrong expected deterministic name",
+                    {
+                        **disk_tombstone_identity,
+                        "expected_name": "pvc-other",
+                    },
+                ),
+            ):
+                reject(
+                    lambda: api.client().exact_absent(
+                        f"storage/disks/{disk_uuid}",
+                        location="bkk01",
+                        **expected_identity,
+                    ),
+                    f"deleted disk tombstone with {label}",
+                )
+            Handler.routes[disk_route] = (
+                200,
+                {},
+                json.dumps({**deleted_disk, "status": "Active"}).encode(),
+            )
+            require(
+                not api.client().exact_absent(
+                    f"storage/disks/{disk_uuid}", location="bkk01"
+                ),
+                "active exact disk was mistaken for absence",
+            )
+            malformed_deleted_disks = {
+                "wrong UUID": {
+                    **deleted_disk,
+                    "uuid": "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+                },
+                "missing billing": {
+                    key: value
+                    for key, value in deleted_disk.items()
+                    if key != "billing_account_id"
+                },
+                "zero billing": {
+                    **deleted_disk,
+                    "billing_account_id": 0,
+                },
+                "missing deletion time": {
+                    key: value
+                    for key, value in deleted_disk.items()
+                    if key != "deleted_at"
+                },
+                "wrong source type": {
+                    **deleted_disk,
+                    "source_image_type": "OS_BASE",
+                },
+                "residual source image": {
+                    **deleted_disk,
+                    "source_image": "ubuntu-24.04",
+                },
+                "missing deterministic name": {
+                    key: value
+                    for key, value in deleted_disk.items()
+                    if key != "display_name"
+                },
+                "bootable": {
+                    **deleted_disk,
+                    "read_only_bootable": True,
+                },
+                "malformed snapshots": {
+                    **deleted_disk,
+                    "snapshots": [1],
+                },
+                "malformed storage pool": {
+                    **deleted_disk,
+                    "storage_pool_uuid": "not-a-uuid",
+                },
+                "case-confusable status": {
+                    **deleted_disk,
+                    "Status": "Active",
+                },
+                "case-confusable billing": {
+                    **deleted_disk,
+                    "Billing_Account_ID": 9,
+                },
+                "case-confusable name": {
+                    **deleted_disk,
+                    "Display_Name": "pvc-other",
+                },
+            }
+            for label, value in malformed_deleted_disks.items():
+                Handler.routes[disk_route] = (
+                    200,
+                    {},
+                    json.dumps(value).encode(),
+                )
+                reject(
+                    lambda: api.client().exact_absent(
+                        f"storage/disks/{disk_uuid}",
+                        location="bkk01",
+                        **disk_tombstone_identity,
+                    ),
+                    f"deleted disk tombstone with {label}",
+                )
+            Handler.routes[disk_route] = (
+                200,
+                {},
+                json.dumps({**deleted_disk, "status": "deleted"}).encode(),
+            )
+            require(
+                not api.client().exact_absent(
+                    f"storage/disks/{disk_uuid}", location="bkk01"
+                ),
+                "noncanonical deleted-disk status was mistaken for absence",
+            )
+
+            load_balancer_uuid = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+            load_balancer_route = (
+                f"/v1/bkk01/network/load_balancers/{load_balancer_uuid}"
+            )
+            deleted_load_balancer = {
+                "uuid": load_balancer_uuid,
+                "display_name": "k8s-unit-test",
+                "user_id": 7,
+                "billing_account_id": 8,
+                "created_at": "2026-07-17T10:00:00Z",
+                "updated_at": "2026-07-17T10:02:00Z",
+                "is_deleted": True,
+                "deleted_at": "2026-07-17T10:01:00Z",
+                "private_address": "10.0.0.10",
+                "network_uuid": "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+                "forwarding_rules": [{"protocol": "TCP"}],
+                "targets": [],
+            }
+            load_balancer_tombstone_identity = {
+                "expected_billing_account_id": 8,
+                "expected_name": "k8s-unit-test",
+                "expected_network_uuid": (
+                    "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
+                ),
+            }
+            Handler.routes[load_balancer_route] = (
+                200,
+                {},
+                json.dumps(deleted_load_balancer).encode(),
+            )
+            require(
+                api.client().exact_absent(
+                    f"network/load_balancers/{load_balancer_uuid}",
+                    location="bkk01",
+                    **load_balancer_tombstone_identity,
+                ),
+                "canonical exact deleted-NLB tombstone was not absence",
+            )
+            for label, expected_identity in (
+                (
+                    "wrong expected billing account",
+                    {
+                        **load_balancer_tombstone_identity,
+                        "expected_billing_account_id": 9,
+                    },
+                ),
+                (
+                    "wrong expected deterministic name",
+                    {
+                        **load_balancer_tombstone_identity,
+                        "expected_name": "k8s-other",
+                    },
+                ),
+                (
+                    "wrong expected network",
+                    {
+                        **load_balancer_tombstone_identity,
+                        "expected_network_uuid": (
+                            "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"
+                        ),
+                    },
+                ),
+            ):
+                reject(
+                    lambda: api.client().exact_absent(
+                        f"network/load_balancers/{load_balancer_uuid}",
+                        location="bkk01",
+                        **expected_identity,
+                    ),
+                    f"deleted NLB tombstone with {label}",
+                )
+            Handler.routes[load_balancer_route] = (
+                200,
+                {},
+                json.dumps(
+                    {**deleted_load_balancer, "is_deleted": False}
+                ).encode(),
+            )
+            require(
+                not api.client().exact_absent(
+                    f"network/load_balancers/{load_balancer_uuid}",
+                    location="bkk01",
+                ),
+                "active exact NLB was mistaken for absence",
+            )
+            malformed_deleted_load_balancers = {
+                "wrong UUID": {
+                    **deleted_load_balancer,
+                    "uuid": "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+                },
+                "missing billing": {
+                    key: value
+                    for key, value in deleted_load_balancer.items()
+                    if key != "billing_account_id"
+                },
+                "zero billing": {
+                    **deleted_load_balancer,
+                    "billing_account_id": 0,
+                },
+                "missing deletion time": {
+                    key: value
+                    for key, value in deleted_load_balancer.items()
+                    if key != "deleted_at"
+                },
+                "malformed deletion state": {
+                    **deleted_load_balancer,
+                    "is_deleted": "true",
+                },
+                "missing ownership name": {
+                    key: value
+                    for key, value in deleted_load_balancer.items()
+                    if key != "display_name"
+                },
+                "malformed network": {
+                    **deleted_load_balancer,
+                    "network_uuid": "not-a-uuid",
+                },
+                "malformed private address": {
+                    **deleted_load_balancer,
+                    "private_address": "not-an-ip",
+                },
+                "missing targets": {
+                    key: value
+                    for key, value in deleted_load_balancer.items()
+                    if key != "targets"
+                },
+                "malformed forwarding rules": {
+                    **deleted_load_balancer,
+                    "forwarding_rules": [1],
+                },
+                "retained target": {
+                    **deleted_load_balancer,
+                    "targets": [{"uuid": disk_uuid}],
+                },
+                "case-confusable deletion state": {
+                    **deleted_load_balancer,
+                    "IS_DELETED": False,
+                },
+                "case-confusable billing": {
+                    **deleted_load_balancer,
+                    "Billing_Account_ID": 9,
+                },
+                "case-confusable network": {
+                    **deleted_load_balancer,
+                    "Network_UUID": (
+                        "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"
+                    ),
+                },
+            }
+            for label, value in malformed_deleted_load_balancers.items():
+                Handler.routes[load_balancer_route] = (
+                    200,
+                    {},
+                    json.dumps(value).encode(),
+                )
+                reject(
+                    lambda: api.client().exact_absent(
+                        f"network/load_balancers/{load_balancer_uuid}",
+                        location="bkk01",
+                        **load_balancer_tombstone_identity,
+                    ),
+                    f"deleted NLB tombstone with {label}",
+                )
     finally:
         for name, value in old_proxy.items():
             if value is None:
@@ -773,6 +1278,137 @@ def test_stable_zero_proofs() -> None:
         and calls == ["exact", "exact", "exact"],
         "stable final zero did not require three exact corroboration passes",
     )
+
+    disk_uuid = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    load_balancer_uuid = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+    exact_state = {
+        "knownDiskUUIDs": [disk_uuid],
+        "knownLoadBalancerUUIDs": [load_balancer_uuid],
+        "pvcDiskName": "pvc-unit-test",
+        "serviceLoadBalancerName": "k8s-unit-test",
+    }
+
+    class ExactAuditAPI:
+        def __init__(self, lists):
+            self.lists = lists
+            self.exact_calls = []
+
+        def get(self, path, *, location):
+            require(location == "bkk01", "exact audit used another location")
+            return self.lists.get(path, [])
+
+        def exact_absent(self, path, *, location, **expected):
+            require(location == "bkk01", "exact audit used another location")
+            self.exact_calls.append((path, expected))
+            return True
+
+    exact_environment = {
+        "INSPACE_LOCATION": "bkk01",
+        "INSPACE_BILLING_ACCOUNT_ID": "8",
+        "INSPACE_NETWORK_UUID": "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+    }
+    old_exact_environment = {
+        key: os.environ.get(key) for key in exact_environment
+    }
+    os.environ.update(exact_environment)
+    try:
+        exact_api = ExactAuditAPI({})
+        cloud_audit.corroborate_exact_absence(
+            exact_state,
+            api=exact_api,
+        )
+        require(
+            exact_api.exact_calls
+            == [
+                (
+                    f"storage/disks/{disk_uuid}",
+                    {
+                        "expected_billing_account_id": 8,
+                        "expected_name": "pvc-unit-test",
+                    },
+                ),
+                (
+                    f"network/load_balancers/{load_balancer_uuid}",
+                    {
+                        "expected_billing_account_id": 8,
+                        "expected_name": "k8s-unit-test",
+                        "expected_network_uuid": (
+                            "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+                        ),
+                    },
+                ),
+            ],
+            "exact tombstone audit omitted its durable ownership identity",
+        )
+
+        listed_api = ExactAuditAPI(
+            {"storage/disks": [{"uuid": disk_uuid}]}
+        )
+        try:
+            cloud_audit.corroborate_exact_absence(
+                {
+                    "knownDiskUUIDs": [disk_uuid],
+                    "pvcDiskName": "pvc-unit-test",
+                },
+                api=listed_api,
+            )
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError(
+                "exact disk tombstone passed while its raw list row remained"
+            )
+        require(
+            listed_api.exact_calls == [],
+            "raw disk presence did not block exact tombstone processing",
+        )
+
+        class SequencedDiskAPI(ExactAuditAPI):
+            def __init__(self):
+                super().__init__({})
+                self.disk_reads = 0
+
+            def get(self, path, *, location):
+                if path != "storage/disks":
+                    return super().get(path, location=location)
+                self.disk_reads += 1
+                if self.disk_reads == 2:
+                    return [{"uuid": disk_uuid}]
+                return []
+
+        sequenced_api = SequencedDiskAPI()
+        try:
+            cloud_audit.stable_audit(
+                {
+                    "knownDiskUUIDs": [disk_uuid],
+                    "pvcDiskName": "pvc-unit-test",
+                },
+                "owner",
+                "cluster",
+                "pool",
+                audit_reader=lambda *_args: zero,
+                read_count=3,
+                delay_seconds=0,
+                sleeper=lambda _seconds: None,
+                exact_absence_reader=lambda state: (
+                    cloud_audit.corroborate_exact_absence(
+                        state,
+                        api=sequenced_api,
+                    )
+                ),
+            )
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError(
+                "transient raw disk-list omission produced false final zero"
+            )
+    finally:
+        for key, value in old_exact_environment.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
     with tempfile.TemporaryDirectory() as temporary:
         missing_state = pathlib.Path(temporary) / "state.json"

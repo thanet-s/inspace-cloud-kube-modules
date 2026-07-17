@@ -448,11 +448,19 @@ def known_exact_identities(state: dict) -> dict[str, list[str]]:
     return identities
 
 
-def corroborate_exact_absence(state: dict) -> None:
-    api = StrictInSpaceAPI.from_environment(
-        user_agent="inspace-rke2-e2e-final-exact-audit/1"
-    )
+def corroborate_exact_absence(state: dict, *, api=None) -> None:
+    if api is None:
+        api = StrictInSpaceAPI.from_environment(
+            user_agent="inspace-rke2-e2e-final-exact-audit/2"
+        )
     location = os.environ["INSPACE_LOCATION"]
+    billing_account = int(os.environ["INSPACE_BILLING_ACCOUNT_ID"])
+    if billing_account < 1:
+        raise SystemExit("configured billing account must be positive")
+    network_uuid = _canonical_uuid(
+        os.environ["INSPACE_NETWORK_UUID"],
+        "configured network UUID",
+    )
     identities = known_exact_identities(state)
     paths = {
         "vms": lambda identity: "user-resource/vm?"
@@ -462,9 +470,53 @@ def corroborate_exact_absence(state: dict) -> None:
         "floatingIPs": lambda identity: "network/ip_addresses/"
         + urllib.parse.quote(identity, safe=".:"),
     }
+    list_paths = {
+        "vms": ("user-resource/vm/list", "uuid"),
+        "disks": ("storage/disks", "uuid"),
+        "loadBalancers": ("network/load_balancers", "uuid"),
+        "floatingIPs": ("network/ip_addresses", "address"),
+    }
+    disk_name = state.get("pvcDiskName", "")
+    load_balancer_name = state.get("serviceLoadBalancerName", "")
     for kind, values in identities.items():
+        if not values:
+            continue
+        list_path, identity_field = list_paths[kind]
+        listed = api.get(list_path, location=location)
+        for row in listed:
+            if row[identity_field] in values:
+                raise SystemExit(
+                    f"journaled {kind} identity remains present in raw list readback"
+                )
         for identity in values:
-            if not api.exact_absent(paths[kind](identity), location=location):
+            expected = {}
+            if kind == "disks":
+                if not isinstance(disk_name, str) or not disk_name:
+                    raise SystemExit(
+                        "journaled disk lacks its deterministic PVC name"
+                    )
+                expected = {
+                    "expected_billing_account_id": billing_account,
+                    "expected_name": disk_name,
+                }
+            elif kind == "loadBalancers":
+                if (
+                    not isinstance(load_balancer_name, str)
+                    or not load_balancer_name
+                ):
+                    raise SystemExit(
+                        "journaled load balancer lacks its deterministic name"
+                    )
+                expected = {
+                    "expected_billing_account_id": billing_account,
+                    "expected_name": load_balancer_name,
+                    "expected_network_uuid": network_uuid,
+                }
+            if not api.exact_absent(
+                paths[kind](identity),
+                location=location,
+                **expected,
+            ):
                 raise SystemExit(
                     f"journaled {kind} identity remains present after list audit"
                 )

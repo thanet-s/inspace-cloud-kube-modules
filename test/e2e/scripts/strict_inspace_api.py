@@ -103,6 +103,120 @@ def _required_list(item: dict[str, Any], field: str, label: str) -> list[Any]:
     return item[field]
 
 
+def _required_positive_int(item: dict[str, Any], field: str, label: str) -> int:
+    value = item.get(field)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise StrictAPIError(f"{label} lacks positive integer field {field}")
+    return value
+
+
+def _reject_case_confusable_fields(
+    item: dict[str, Any],
+    canonical_fields: tuple[str, ...],
+    label: str,
+) -> None:
+    for key in item:
+        for canonical in canonical_fields:
+            if key != canonical and key.casefold() == canonical.casefold():
+                raise StrictAPIError(
+                    f"{label} has non-canonical field {key}; want {canonical}"
+                )
+
+
+def _validate_deleted_disk_tombstone(
+    value: dict[str, Any],
+    *,
+    expected_billing_account_id: int,
+    expected_name: str,
+) -> None:
+    label = "exact deleted disk"
+    _reject_case_confusable_fields(
+        value,
+        (
+            "uuid",
+            "user_id",
+            "billing_account_id",
+            "status",
+            "size_gb",
+            "source_image_type",
+            "source_image",
+            "created_at",
+            "updated_at",
+            "deleted_at",
+            "display_name",
+            "read_only_bootable",
+            "snapshots",
+            "storage_pool_uuid",
+        ),
+        label,
+    )
+    for field in ("user_id", "billing_account_id", "size_gb"):
+        _required_positive_int(value, field, label)
+    if value["billing_account_id"] != expected_billing_account_id:
+        raise StrictAPIError(f"{label} belongs to another billing account")
+    if value.get("status") != "Deleted":
+        raise StrictAPIError(f"{label} is not explicitly Deleted")
+    if value.get("source_image_type") != "EMPTY":
+        raise StrictAPIError(f"{label} is not explicitly sourced from EMPTY")
+    if value.get("source_image", "") != "":
+        raise StrictAPIError(f"{label} unexpectedly retains a source image")
+    if _required_string(value, "display_name", label) != expected_name:
+        raise StrictAPIError(f"{label} has another deterministic name")
+    _required_string(value, "created_at", label)
+    _required_string(value, "updated_at", label)
+    _required_string(value, "deleted_at", label)
+    if value.get("read_only_bootable") is not False:
+        raise StrictAPIError(f"{label} is not explicitly non-bootable")
+    snapshots = _required_list(value, "snapshots", label)
+    if snapshots:
+        raise StrictAPIError(f"{label} retains snapshots")
+    _canonical_uuid(value.get("storage_pool_uuid"), f"{label} storage pool")
+
+
+def _validate_deleted_load_balancer_tombstone(
+    value: dict[str, Any],
+    *,
+    expected_billing_account_id: int,
+    expected_name: str,
+    expected_network_uuid: str,
+) -> None:
+    label = "exact deleted load balancer"
+    _reject_case_confusable_fields(
+        value,
+        (
+            "uuid",
+            "display_name",
+            "user_id",
+            "billing_account_id",
+            "created_at",
+            "updated_at",
+            "is_deleted",
+            "deleted_at",
+            "private_address",
+            "network_uuid",
+            "forwarding_rules",
+            "targets",
+        ),
+        label,
+    )
+    _validate_load_balancer_rows([value])
+    for field in ("user_id", "billing_account_id"):
+        _required_positive_int(value, field, label)
+    if value["billing_account_id"] != expected_billing_account_id:
+        raise StrictAPIError(f"{label} belongs to another billing account")
+    if value["display_name"] != expected_name:
+        raise StrictAPIError(f"{label} has another deterministic name")
+    if value["network_uuid"] != expected_network_uuid:
+        raise StrictAPIError(f"{label} belongs to another network")
+    if value.get("is_deleted") is not True:
+        raise StrictAPIError(f"{label} is not explicitly deleted")
+    if value["targets"]:
+        raise StrictAPIError(f"{label} retains targets")
+    _required_string(value, "created_at", label)
+    _required_string(value, "updated_at", label)
+    _required_string(value, "deleted_at", label)
+
+
 def _validate_rich_sparse_floating_ip_identity(
     row: dict[str, Any], label: str
 ) -> None:
@@ -569,7 +683,15 @@ class StrictInSpaceAPI:
         self._validate_endpoint_value(path, value)
         return value
 
-    def exact_absent(self, path: str, *, location: str) -> bool:
+    def exact_absent(
+        self,
+        path: str,
+        *,
+        location: str,
+        expected_billing_account_id: int | None = None,
+        expected_name: str | None = None,
+        expected_network_uuid: str | None = None,
+    ) -> bool:
         """Corroborate absence on one exact identity endpoint.
 
         Exact object APIs use HTTP 404 for missing disk/NLB/FIP objects.
@@ -589,6 +711,61 @@ class StrictInSpaceAPI:
         if status == 200:
             value = _json_without_duplicates(raw)
             self._validate_endpoint_value(path, value)
+            parsed = urllib.parse.urlsplit(path)
+            route = parsed.path
+            if route.startswith("storage/disks/"):
+                disk_status = value.get("status")
+                if not isinstance(disk_status, str):
+                    raise StrictAPIError(
+                        f"{endpoint_label} lacks string disk status"
+                    )
+                if disk_status == "Deleted":
+                    if (
+                        isinstance(expected_billing_account_id, bool)
+                        or not isinstance(expected_billing_account_id, int)
+                        or expected_billing_account_id < 1
+                        or not isinstance(expected_name, str)
+                        or not expected_name
+                    ):
+                        raise StrictAPIError(
+                            f"{endpoint_label} lacks expected tombstone identity"
+                        )
+                    _validate_deleted_disk_tombstone(
+                        value,
+                        expected_billing_account_id=expected_billing_account_id,
+                        expected_name=expected_name,
+                    )
+                    return True
+            if route.startswith("network/load_balancers/"):
+                is_deleted = value.get("is_deleted")
+                if not isinstance(is_deleted, bool):
+                    raise StrictAPIError(
+                        f"{endpoint_label} lacks boolean deletion state"
+                    )
+                if is_deleted:
+                    if (
+                        isinstance(expected_billing_account_id, bool)
+                        or not isinstance(expected_billing_account_id, int)
+                        or expected_billing_account_id < 1
+                        or not isinstance(expected_name, str)
+                        or not expected_name
+                        or not isinstance(expected_network_uuid, str)
+                        or not expected_network_uuid
+                    ):
+                        raise StrictAPIError(
+                            f"{endpoint_label} lacks expected tombstone identity"
+                        )
+                    expected_network_uuid = _canonical_uuid(
+                        expected_network_uuid,
+                        "expected tombstone network",
+                    )
+                    _validate_deleted_load_balancer_tombstone(
+                        value,
+                        expected_billing_account_id=expected_billing_account_id,
+                        expected_name=expected_name,
+                        expected_network_uuid=expected_network_uuid,
+                    )
+                    return True
             return False
         if status == 404:
             return True
@@ -614,23 +791,50 @@ class StrictInSpaceAPI:
                 message,
                 object_pairs_hook=_pairs_without_duplicates,
             )
-        except (json.JSONDecodeError, StrictAPIError):
+        except json.JSONDecodeError:
             payload = None
+        except StrictAPIError as error:
+            raise StrictAPIError(
+                f"{endpoint_label} returned malformed HTTP 400 JSON"
+            ) from error
         if isinstance(payload, dict):
-            structured = payload.get("message")
-            if not isinstance(structured, str):
-                structured = payload.get("error")
-            if isinstance(structured, str):
+            if "errors" in payload:
+                nested = payload["errors"]
+                expected = (
+                    "No such virtual machine exists: " + requested[0]
+                )
+                if (
+                    set(payload) == {"errors"}
+                    and isinstance(nested, dict)
+                    and set(nested) == {"Error"}
+                    and isinstance(nested["Error"], str)
+                    and nested["Error"] == expected
+                ):
+                    return True
+                raise StrictAPIError(
+                    f"{endpoint_label} returned non-authoritative HTTP 400"
+                )
+            structured_fields = [
+                field for field in ("message", "error") if field in payload
+            ]
+            if len(structured_fields) == 1:
+                field = structured_fields[0]
+                structured = payload[field]
+                if set(payload) != {field} or not isinstance(structured, str):
+                    raise StrictAPIError(
+                        f"{endpoint_label} returned non-authoritative HTTP 400"
+                    )
                 message = structured.strip()
+            elif structured_fields:
+                raise StrictAPIError(
+                    f"{endpoint_label} returned non-authoritative HTTP 400"
+                )
         normalized = message.lower()
         if normalized.startswith("error:"):
             normalized = normalized.removeprefix("error:").strip()
         phrases = ("no such virtual machine exists", "no such vm exists")
         matched = False
         for phrase in phrases:
-            if normalized == phrase:
-                matched = True
-                break
             if normalized.startswith(phrase + ":") or normalized.startswith(
                 phrase + "."
             ):
