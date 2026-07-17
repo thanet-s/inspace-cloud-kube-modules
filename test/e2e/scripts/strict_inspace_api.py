@@ -26,6 +26,25 @@ from typing import Any
 CANONICAL_API_ROOT = "https://api.inspace.cloud"
 MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 LOCATION_PATTERN = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$")
+FLOATING_IP_RESPONSE_FIELDS = (
+    "uuid",
+    "id",
+    "address",
+    "user_id",
+    "billing_account_id",
+    "type",
+    "name",
+    "enabled",
+    "is_deleted",
+    "is_ipv6",
+    "is_virtual",
+    "assigned_to",
+    "assigned_to_resource_type",
+    "assigned_to_private_ip",
+    "created_at",
+    "updated_at",
+    "unassigned_at",
+)
 
 
 class StrictAPIError(RuntimeError):
@@ -82,6 +101,26 @@ def _required_list(item: dict[str, Any], field: str, label: str) -> list[Any]:
     if field not in item or not isinstance(item[field], list):
         raise StrictAPIError(f"{label} lacks complete array field {field}")
     return item[field]
+
+
+def _validate_rich_sparse_floating_ip_identity(
+    row: dict[str, Any], label: str
+) -> None:
+    """Require stable ownership fields when no unassignment marker exists."""
+    _canonical_uuid(row.get("uuid"), label)
+    for field in ("id", "user_id", "billing_account_id"):
+        value = row.get(field)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise StrictAPIError(f"{label} lacks positive integer field {field}")
+    if row.get("type") != "public":
+        raise StrictAPIError(f"{label} is not a public floating IP")
+    for field in ("enabled", "is_deleted"):
+        if not isinstance(row.get(field), bool):
+            raise StrictAPIError(f"{label} lacks boolean field {field}")
+    if row.get("is_ipv6") is not False:
+        raise StrictAPIError(f"{label} is not explicitly IPv4")
+    _required_string(row, "created_at", label)
+    _required_string(row, "updated_at", label)
 
 
 def _validate_locations(rows: list[Any]) -> None:
@@ -167,16 +206,32 @@ def _validate_floating_ip_rows(rows: list[Any]) -> None:
         label = f"floating-IP list row {index}"
         if not isinstance(row, dict):
             raise StrictAPIError(f"{label} is not an object")
+        for key in row:
+            for canonical in FLOATING_IP_RESPONSE_FIELDS:
+                if key != canonical and key.casefold() == canonical.casefold():
+                    raise StrictAPIError(
+                        f"{label} has non-canonical field {key}; want {canonical}"
+                    )
         identities.append(_canonical_ip(row.get("address"), label))
         _required_string(row, "name", label, allow_empty=True)
         if "assigned_to" not in row:
-            _required_string(row, "unassigned_at", label)
-            if row.get("assigned_to_resource_type") not in (None, ""):
-                raise StrictAPIError(f"{label} has contradictory assignment type")
-            if row.get("assigned_to_private_ip") not in (None, ""):
+            # InSpace's live list and exact-address read models omit the
+            # complete assignment tuple, including unassigned_at, for a newly
+            # created but never-assigned address. Without the older
+            # unassigned_at marker, require the complete stable ownership
+            # identity before accepting the row for inventory/journaling.
+            if "assigned_to_resource_type" in row:
                 raise StrictAPIError(
-                    f"{label} has contradictory assigned private address"
+                    f"{label} has assignment type without assigned_to"
                 )
+            if "assigned_to_private_ip" in row:
+                raise StrictAPIError(
+                    f"{label} has assigned private address without assigned_to"
+                )
+            if "unassigned_at" in row:
+                _required_string(row, "unassigned_at", label)
+            else:
+                _validate_rich_sparse_floating_ip_identity(row, label)
             continue
         if row["assigned_to"] is not None and not isinstance(row["assigned_to"], str):
             raise StrictAPIError(f"{label} has malformed assignment state")

@@ -425,6 +425,7 @@ type endpointContract struct {
 var (
 	statusOKOnly        = []int{http.StatusOK}
 	statusCreatedOnly   = []int{http.StatusCreated}
+	statusOKOrCreated   = []int{http.StatusOK, http.StatusCreated}
 	statusNoContentOnly = []int{http.StatusNoContent}
 	statusOKOrNoContent = []int{http.StatusOK, http.StatusNoContent}
 )
@@ -452,7 +453,10 @@ var endpointContracts = []endpointContract{
 
 	{http.MethodPost, "/v1/{location}/user-resource/vm", statusCreatedOnly, successJSON},
 	{http.MethodPost, "/v1/{location}/storage/disks", statusCreatedOnly, successJSON},
-	{http.MethodPost, "/v1/{location}/network/ip_addresses", statusCreatedOnly, successJSON},
+	// The live floating-IP API has returned 200 with the created object, while
+	// the existing SDK contract accepts conventional 201 responses. Both
+	// statuses carry the same required JSON object contract.
+	{http.MethodPost, "/v1/{location}/network/ip_addresses", statusOKOrCreated, successJSON},
 	{http.MethodPost, "/v1/{location}/network/firewalls", statusCreatedOnly, successJSON},
 	{http.MethodPost, "/v1/{location}/network/load_balancers", statusCreatedOnly, successJSON},
 
