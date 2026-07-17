@@ -99,11 +99,15 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	terminationRecoveryController, err := provider.NewTerminationRecoveryController(op.GetClient(), op.GetAPIReader(), undecorated)
+	if err != nil {
+		return err
+	}
 	allControllers := controllers.NewControllers(
 		ctx, op.Manager, op.Clock, op.GetClient(), op.EventRecorder, cloudProvider,
 		undecorated, clusterState, op.InstanceTypeStore,
 	)
-	allControllers = append(allControllers, nodeClassController, createFenceController)
+	allControllers = append(allControllers, nodeClassController, createFenceController, terminationRecoveryController)
 	op.WithControllers(ctx, allControllers...).Start(ctx)
 	return nil
 }

@@ -413,6 +413,8 @@ const (
 	successJSON successBodyContract = iota
 	successEmpty
 	successEmptyOrJSON
+	successExactEmpty
+	successJSONTrue
 )
 
 type endpointContract struct {
@@ -432,10 +434,11 @@ var (
 
 // endpointContracts is deliberately an exhaustive whitelist of every route
 // used by this SDK. InSpace does not use one generic status convention:
-// notably, disk/firewall deletes return 204 while floating-IP and parent NLB
-// deletes return an empty 200 response, and NLB child deletes accept 200 or
-// 204. A method-wide default would therefore either reject a documented
-// success or accept an ambiguous response.
+// notably, disk/parent-firewall deletes return 204, firewall relationship
+// deletes return an empty 200 or 204, floating-IP deletes return JSON boolean
+// true with 200, parent NLB deletes return an empty 200, and NLB child deletes
+// accept 200 or 204. A method-wide default would therefore either reject a
+// documented/live success or accept an ambiguous response.
 var endpointContracts = []endpointContract{
 	{http.MethodGet, "/v1/config/locations", statusOKOnly, successJSON},
 	{http.MethodGet, "/v1/config/vm_images", statusOKOnly, successJSON},
@@ -452,13 +455,15 @@ var endpointContracts = []endpointContract{
 	{http.MethodGet, "/v1/{location}/network/network/{uuid}", statusOKOnly, successJSON},
 	{http.MethodGet, "/v1/{location}/network/networks", statusOKOnly, successJSON},
 
-	{http.MethodPost, "/v1/{location}/user-resource/vm", statusCreatedOnly, successJSON},
+	// Live VM and firewall creates return 200 with the created object; retain
+	// 201 for the documented/conventional create response.
+	{http.MethodPost, "/v1/{location}/user-resource/vm", statusOKOrCreated, successJSON},
 	{http.MethodPost, "/v1/{location}/storage/disks", statusCreatedOnly, successJSON},
 	// The live floating-IP API has returned 200 with the created object, while
 	// the existing SDK contract accepts conventional 201 responses. Both
 	// statuses carry the same required JSON object contract.
 	{http.MethodPost, "/v1/{location}/network/ip_addresses", statusOKOrCreated, successJSON},
-	{http.MethodPost, "/v1/{location}/network/firewalls", statusCreatedOnly, successJSON},
+	{http.MethodPost, "/v1/{location}/network/firewalls", statusOKOrCreated, successJSON},
 	{http.MethodPost, "/v1/{location}/network/load_balancers", statusOKOrCreated, successJSON},
 
 	{http.MethodPost, "/v1/{location}/user-resource/vm/storage/attach", statusOKOnly, successJSON},
@@ -477,9 +482,9 @@ var endpointContracts = []endpointContract{
 	// absence readback after dispatch.
 	{http.MethodDelete, "/v1/{location}/user-resource/vm", statusOKOrNoContent, successEmptyOrJSON},
 	{http.MethodDelete, "/v1/{location}/storage/disks/{uuid}", statusNoContentOnly, successEmpty},
-	{http.MethodDelete, "/v1/{location}/network/ip_addresses/{address}", statusOKOnly, successEmpty},
+	{http.MethodDelete, "/v1/{location}/network/ip_addresses/{address}", statusOKOnly, successJSONTrue},
 	{http.MethodDelete, "/v1/{location}/network/firewalls/{uuid}", statusNoContentOnly, successEmpty},
-	{http.MethodDelete, "/v1/{location}/network/firewalls/{uuid}/vms", statusNoContentOnly, successEmpty},
+	{http.MethodDelete, "/v1/{location}/network/firewalls/{uuid}/vms", statusOKOrNoContent, successExactEmpty},
 	{http.MethodDelete, "/v1/{location}/network/load_balancers/{uuid}", statusOKOnly, successEmpty},
 	{http.MethodDelete, "/v1/{location}/network/load_balancers/{uuid}/targets/{uuid}", statusOKOrNoContent, successEmpty},
 	{http.MethodDelete, "/v1/{location}/network/load_balancers/{uuid}/forwarding_rules/{uuid}", statusOKOrNoContent, successEmpty},
@@ -539,6 +544,31 @@ func validateSuccessResponse(method, path string, status int, expectsJSON bool, 
 					err,
 				)
 			}
+		}
+	case successExactEmpty:
+		if len(data) != 0 {
+			return newMalformedResponseAPIError(
+				method,
+				path,
+				status,
+				"expected exactly zero success body bytes",
+				correlationID,
+				nil,
+			)
+		}
+	case successJSONTrue:
+		// The live floating-IP DELETE response is the four-byte JSON literal
+		// true. Keep this receipt exact: false, null, structured/arbitrary JSON,
+		// trailing values, and surrounding whitespace are not deletion proof.
+		if !bytes.Equal(data, []byte("true")) {
+			return newMalformedResponseAPIError(
+				method,
+				path,
+				status,
+				"expected the exact JSON boolean true success body",
+				correlationID,
+				nil,
+			)
 		}
 	}
 	return nil
