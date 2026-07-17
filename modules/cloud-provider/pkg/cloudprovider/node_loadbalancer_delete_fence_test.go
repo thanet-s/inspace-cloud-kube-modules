@@ -8,6 +8,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	kubefake "k8s.io/client-go/kubernetes/fake"
 
 	inspace "github.com/thanet-s/inspace-cloud-kube-modules/modules/client"
@@ -102,8 +103,10 @@ func TestNodeLoadBalancerFirewallDeleteRechecksAuthorityAfterIssue(t *testing.T)
 			t.Fatalf("Service delete final authority: fired=%t deletes=%d", fired, api.deleteCalls)
 		}
 		stored, err = provider.kubeClient.CoreV1().Services(service.Namespace).Get(ctx, service.Name, metav1.GetOptions{})
-		if err != nil || stored.Annotations[annotationNodeLoadBalancerFWDeleteIssued] == "" {
-			t.Fatalf("Service delete issue receipt was not retained: %#v err=%v", stored, err)
+		if err != nil ||
+			stored.Annotations[annotationNodeLoadBalancerFWDeleteTarget] != uuid ||
+			stored.Annotations[annotationNodeLoadBalancerFWDeleteIssued] != "" {
+			t.Fatalf("Service delete issue receipt was not reset to intent: %#v err=%v", stored, err)
 		}
 	})
 
@@ -160,8 +163,10 @@ func TestNodeLoadBalancerFirewallDeleteRechecksAuthorityAfterIssue(t *testing.T)
 			t.Fatalf("shard delete final authority: fired=%t deletes=%d", fired, api.deleteCalls)
 		}
 		stored, err := provider.dynamicClient.Resource(nodePoolGVR).Get(ctx, aggregateTestShard, metav1.GetOptions{})
-		if err != nil || stored.GetAnnotations()[annotationNodeLoadBalancerShardFWDeleteIssued] == "" {
-			t.Fatalf("shard delete issue receipt was not retained: %#v err=%v", stored, err)
+		if err != nil ||
+			stored.GetAnnotations()[annotationNodeLoadBalancerShardFWDeleteTarget] != aggregateTestFirewallUUID ||
+			stored.GetAnnotations()[annotationNodeLoadBalancerShardFWDeleteIssued] != "" {
+			t.Fatalf("shard delete issue receipt was not reset to intent: %#v err=%v", stored, err)
 		}
 	})
 
@@ -192,8 +197,114 @@ func TestNodeLoadBalancerFirewallDeleteRechecksAuthorityAfterIssue(t *testing.T)
 			t.Fatalf("cluster ICMP delete final authority: fired=%t deletes=%d", fired, api.deleteCalls)
 		}
 		stored, err := provider.dynamicClient.Resource(nodeClassGVR).Get(ctx, nodeClassName, metav1.GetOptions{})
-		if err != nil || stored.GetAnnotations()[annotationNodeLoadBalancerICMPDeleteIssued] == "" {
-			t.Fatalf("cluster ICMP delete issue receipt was not retained: %#v err=%v", stored, err)
+		if err != nil ||
+			stored.GetAnnotations()[annotationNodeLoadBalancerICMPDeleteTarget] != uuid ||
+			stored.GetAnnotations()[annotationNodeLoadBalancerICMPDeleteIssued] != "" {
+			t.Fatalf("cluster ICMP delete issue receipt was not reset to intent: %#v err=%v", stored, err)
+		}
+	})
+}
+
+func TestNodeLoadBalancerFirewallDeleteRejectsSameNameStateOwnerReplacement(t *testing.T) {
+	t.Run("shard NodePool", func(t *testing.T) {
+		ctx := context.Background()
+		service := aggregateTestService("delete-replacement", "19999999-2222-4333-8444-555555555555", corev1.ProtocolTCP, 443)
+		plan := nodeLoadBalancerShardPlan{
+			Name: aggregateTestShard, Claims: []string{string(service.UID)},
+			Ports: nodeLoadBalancerPortClaimsOrFatal(t, service),
+		}
+		policy, err := desiredNodeLoadBalancerShardFirewall("unit-test-cluster", 42, plan, []*corev1.Service{service})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ledger, err := nodeLoadBalancerShardFirewallPolicyLedger(policy)
+		if err != nil {
+			t.Fatal(err)
+		}
+		base := &fakeAPI{firewalls: []inspace.Firewall{aggregateTestFirewall(policy, aggregateTestFirewallUUID)}}
+		provider := newTestProvider(t, base)
+		pool := deletingNodeLoadBalancerStateAnchorPool(nodeLoadBalancerSafetyNodePool(
+			aggregateTestShard,
+			provider.config.ClusterID,
+			"delete-replacement",
+			1,
+		))
+		annotations := pool.GetAnnotations()
+		if annotations == nil {
+			annotations = map[string]string{}
+		}
+		annotations[annotationNodeLoadBalancerShardFirewallUUID] = aggregateTestFirewallUUID
+		annotations[annotationNodeLoadBalancerShardFirewallHash] = policy.Hash
+		annotations[annotationNodeLoadBalancerShardFirewallLedger] = ledger
+		pool.SetAnnotations(annotations)
+		provider.dynamicClient = newNodeLoadBalancerTestDynamicClient(pool)
+		resource := provider.dynamicClient.Resource(nodePoolGVR)
+		api := &postIssueFirewallDeleteDriftAPI{fakeAPI: base}
+		replaced := false
+		api.hook = func() {
+			if replaced {
+				return
+			}
+			replaced = true
+			current, getErr := resource.Get(ctx, aggregateTestShard, metav1.GetOptions{})
+			if getErr != nil {
+				t.Fatal(getErr)
+			}
+			replacement := current.DeepCopy()
+			replacement.SetResourceVersion("")
+			replacement.SetUID(types.UID("replacement-" + string(current.GetUID())))
+			if deleteErr := resource.Delete(ctx, aggregateTestShard, metav1.DeleteOptions{}); deleteErr != nil {
+				t.Fatal(deleteErr)
+			}
+			if _, createErr := resource.Create(ctx, replacement, metav1.CreateOptions{}); createErr != nil {
+				t.Fatal(createErr)
+			}
+		}
+		provider.api = api
+		controller := &nodeLoadBalancerController{provider: provider}
+		if done, err := controller.deleteAggregateShardFirewall(ctx, aggregateTestShard); err == nil || done {
+			t.Fatalf("same-name NodePool replacement result: done=%t err=%v", done, err)
+		}
+		if !replaced || api.deleteCalls != 0 {
+			t.Fatalf("same-name NodePool replacement crossed DeleteFirewall: replaced=%t deletes=%d", replaced, api.deleteCalls)
+		}
+	})
+
+	t.Run("cluster ICMP NodeClass", func(t *testing.T) {
+		ctx, base, provider, controller, nodeClassName, desired := newClusterICMPSafetyFixture(t)
+		const uuid = "97777777-2222-4333-8444-555555555556"
+		setClusterICMPSafetyAnnotations(t, ctx, provider, nodeClassName, map[string]string{
+			annotationNodeLoadBalancerICMPFirewallUUID: uuid,
+		})
+		base.firewalls = []inspace.Firewall{clusterICMPSafetyFirewall(desired, uuid)}
+		resource := provider.dynamicClient.Resource(nodeClassGVR)
+		api := &postIssueFirewallDeleteDriftAPI{fakeAPI: base}
+		replaced := false
+		api.hook = func() {
+			if replaced {
+				return
+			}
+			replaced = true
+			current, getErr := resource.Get(ctx, nodeClassName, metav1.GetOptions{})
+			if getErr != nil {
+				t.Fatal(getErr)
+			}
+			replacement := current.DeepCopy()
+			replacement.SetResourceVersion("")
+			replacement.SetUID(types.UID("replacement-" + string(current.GetUID())))
+			if deleteErr := resource.Delete(ctx, nodeClassName, metav1.DeleteOptions{}); deleteErr != nil {
+				t.Fatal(deleteErr)
+			}
+			if _, createErr := resource.Create(ctx, replacement, metav1.CreateOptions{}); createErr != nil {
+				t.Fatal(createErr)
+			}
+		}
+		provider.api = api
+		if done, err := controller.cleanupClusterICMPFirewall(ctx, nodeClassName); err == nil || done {
+			t.Fatalf("same-name NodeClass replacement result: done=%t err=%v", done, err)
+		}
+		if !replaced || api.deleteCalls != 0 {
+			t.Fatalf("same-name NodeClass replacement crossed DeleteFirewall: replaced=%t deletes=%d", replaced, api.deleteCalls)
 		}
 	})
 }

@@ -184,6 +184,18 @@ func (r *Reconciler) compareAndSwapStatus(
 	})
 }
 
+// detachedStatusMutationContext lets the controller finish one receipt
+// transition after its reconcile context is canceled, while retaining the
+// same finite request budget used for other bootstrap protection writes.
+// Without this bound a stalled Kubernetes API write could pin a reconcile
+// goroutine forever during error recovery.
+func (r *Reconciler) detachedStatusMutationContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(
+		context.WithoutCancel(ctx),
+		configuredDuration(r.protectionRequestTimeout, defaultProtectionRequestTimeout),
+	)
+}
+
 func validateCreateAttempt(attempt v1alpha1.ResourceCreateAttemptStatus, kind, name, intentHash string) error {
 	if attempt.ResourceKind != kind || attempt.ResourceName != name || attempt.IntentHash != intentHash {
 		return fmt.Errorf("bootstrap: durable create attempt for %s %q does not match the current immutable intent", kind, name)
@@ -360,7 +372,9 @@ func (r *Reconciler) recordPreDispatchCreateRejection(
 	cluster *v1alpha1.InSpaceCluster,
 	key, kind, name, intentHash string,
 ) error {
-	return r.compareAndSwapStatus(ctx, cluster, func(attempts map[string]v1alpha1.ResourceCreateAttemptStatus) error {
+	persistCtx, cancel := r.detachedStatusMutationContext(ctx)
+	defer cancel()
+	return r.compareAndSwapStatus(persistCtx, cluster, func(attempts map[string]v1alpha1.ResourceCreateAttemptStatus) error {
 		current, ok := attempts[key]
 		if !ok {
 			return fmt.Errorf("bootstrap: create attempt %q disappeared before rejection persistence", key)
@@ -375,6 +389,42 @@ func (r *Reconciler) recordPreDispatchCreateRejection(
 			return fmt.Errorf("bootstrap: create attempt %q cannot record rejection from phase %q", key, current.Phase)
 		}
 		current.Phase = createAttemptPhaseRejected
+		attempts[key] = current
+		return nil
+	})
+}
+
+// resetPreDispatchCreateIssue releases an issued one-shot mutation receipt
+// only when the caller has not invoked the cloud mutation API. Post-CAS
+// authority reads can fail or reject stale identity, but neither outcome is a
+// dispatched POST/PATCH. Keeping the receipt issued in that case would turn a
+// transient read-model failure into a permanent controller deadlock.
+//
+// The exact kind/name/intent tuple is revalidated inside the status CAS. Any
+// concurrent transition therefore fails closed instead of clearing another
+// controller's issue.
+func (r *Reconciler) resetPreDispatchCreateIssue(
+	ctx context.Context,
+	cluster *v1alpha1.InSpaceCluster,
+	key, kind, name, intentHash string,
+) error {
+	persistCtx, cancel := r.detachedStatusMutationContext(ctx)
+	defer cancel()
+	return r.compareAndSwapStatus(persistCtx, cluster, func(attempts map[string]v1alpha1.ResourceCreateAttemptStatus) error {
+		current, ok := attempts[key]
+		if !ok {
+			return fmt.Errorf("bootstrap: create attempt %q disappeared before pre-dispatch reset", key)
+		}
+		if err := validateCreateAttempt(current, kind, name, intentHash); err != nil {
+			return err
+		}
+		if current.Phase != createAttemptPhaseIssued {
+			return fmt.Errorf("bootstrap: create attempt %q changed before pre-dispatch reset", key)
+		}
+		current.Phase = createAttemptPhaseIntent
+		current.IssueID = ""
+		current.IssuedAt = ""
+		current.ResourceUUID = ""
 		attempts[key] = current
 		return nil
 	})

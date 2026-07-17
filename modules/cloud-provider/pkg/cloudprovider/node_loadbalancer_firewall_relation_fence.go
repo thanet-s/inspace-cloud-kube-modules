@@ -12,12 +12,14 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/types"
 
 	inspace "github.com/thanet-s/inspace-cloud-kube-modules/modules/client"
 )
 
 const (
 	annotationNodeLoadBalancerFirewallRelationIssued   = "service.inspace.cloud/node-lb-firewall-relation-issued"
+	annotationNodeLoadBalancerFirewallRelationOwnerUID = "service.inspace.cloud/node-lb-firewall-relation-owner-uid"
 	annotationNodeLoadBalancerFirewallRelationVMAbsent = "service.inspace.cloud/node-lb-firewall-relation-vm-absence"
 )
 
@@ -174,6 +176,7 @@ func advanceNodeLoadBalancerFirewallRelationObservation(
 			return false, false, nil
 		}
 		delete(values, annotationNodeLoadBalancerFirewallRelationIssued)
+		delete(values, annotationNodeLoadBalancerFirewallRelationOwnerUID)
 		return true, true, nil
 	}
 	if fence.operation != nodeLoadBalancerFirewallRelationUnassign {
@@ -200,6 +203,7 @@ func advanceNodeLoadBalancerFirewallRelationObservation(
 		return false, false, nil
 	}
 	delete(values, annotationNodeLoadBalancerFirewallRelationIssued)
+	delete(values, annotationNodeLoadBalancerFirewallRelationOwnerUID)
 	return true, true, nil
 }
 
@@ -270,6 +274,15 @@ func (c *nodeLoadBalancerController) nodeLoadBalancerFirewallRelationVMCloudAuth
 		exactAbsent = true
 	} else if exact == nil {
 		return false, false, fmt.Errorf("node load balancer: exact relation VM %s returned an empty response", vmUUID)
+	} else if strings.EqualFold(strings.TrimSpace(exact.Status), "deleted") {
+		if exact.UUID != vmUUID || exact.BillingAccountID != c.provider.config.BillingAccountID ||
+			(exact.NetworkUUID != "" && exact.NetworkUUID != c.provider.config.NetworkUUID) {
+			return false, false, fmt.Errorf("node load balancer: deleted relation VM %s has conflicting exact identity", vmUUID)
+		}
+		// A canonical tombstone is one source of absence evidence. List and
+		// configured-VPC membership below must independently omit it, and callers
+		// still persist two spaced observations before an unassign may dispatch.
+		exactAbsent = true
 	}
 	items, err := c.provider.api.ListVMs(ctx, c.provider.config.Location)
 	if err != nil {
@@ -360,6 +373,7 @@ type nodeLoadBalancerFirewallRelationOwner struct {
 
 type nodeLoadBalancerFirewallRelationOwnerSnapshot struct {
 	annotations map[string]string
+	uid         types.UID
 	commit      func(context.Context, map[string]string) error
 }
 
@@ -384,6 +398,7 @@ func (c *nodeLoadBalancerController) serviceFirewallRelationOwner(service *corev
 			}
 			return nodeLoadBalancerFirewallRelationOwnerSnapshot{
 				annotations: copyNodeLoadBalancerAnnotations(current.Annotations),
+				uid:         current.UID,
 				commit: func(ctx context.Context, values map[string]string) error {
 					copy := current.DeepCopy()
 					copy.Annotations = copyNodeLoadBalancerAnnotations(values)
@@ -413,6 +428,13 @@ func (c *nodeLoadBalancerController) serviceFirewallRelationOwner(service *corev
 }
 
 func (c *nodeLoadBalancerController) shardFirewallRelationOwner(shard string) nodeLoadBalancerFirewallRelationOwner {
+	return c.shardFirewallRelationOwnerForUID(shard, "")
+}
+
+func (c *nodeLoadBalancerController) shardFirewallRelationOwnerForUID(
+	shard string,
+	expectedUID types.UID,
+) nodeLoadBalancerFirewallRelationOwner {
 	return nodeLoadBalancerFirewallRelationOwner{
 		description: "NodePool " + shard,
 		authorize: func(ctx context.Context, fence nodeLoadBalancerFirewallRelationFence, before inspace.Firewall) error {
@@ -424,6 +446,12 @@ func (c *nodeLoadBalancerController) shardFirewallRelationOwner(shard string) no
 			if err != nil {
 				return nodeLoadBalancerFirewallRelationOwnerSnapshot{}, err
 			}
+			if expectedUID != "" && pool.GetUID() != expectedUID {
+				return nodeLoadBalancerFirewallRelationOwnerSnapshot{}, fmt.Errorf(
+					"node load balancer: NodePool %s identity changed before firewall relation transition",
+					shard,
+				)
+			}
 			labels := pool.GetLabels()
 			if labels[nodeLoadBalancerManagedLabel] != "true" ||
 				labels[nodeLoadBalancerClusterLabel] != c.provider.config.ClusterID ||
@@ -433,6 +461,7 @@ func (c *nodeLoadBalancerController) shardFirewallRelationOwner(shard string) no
 			}
 			return nodeLoadBalancerFirewallRelationOwnerSnapshot{
 				annotations: copyNodeLoadBalancerAnnotations(pool.GetAnnotations()),
+				uid:         pool.GetUID(),
 				commit: func(ctx context.Context, values map[string]string) error {
 					copy := pool.DeepCopy()
 					copy.SetAnnotations(copyNodeLoadBalancerAnnotations(values))
@@ -464,6 +493,13 @@ func (c *nodeLoadBalancerController) shardFirewallRelationOwner(shard string) no
 }
 
 func (c *nodeLoadBalancerController) clusterICMPFirewallRelationOwner(nodeClassName string) nodeLoadBalancerFirewallRelationOwner {
+	return c.clusterICMPFirewallRelationOwnerForUID(nodeClassName, "")
+}
+
+func (c *nodeLoadBalancerController) clusterICMPFirewallRelationOwnerForUID(
+	nodeClassName string,
+	expectedUID types.UID,
+) nodeLoadBalancerFirewallRelationOwner {
 	return nodeLoadBalancerFirewallRelationOwner{
 		description: "InSpaceNodeClass " + nodeClassName,
 		authorize: func(ctx context.Context, fence nodeLoadBalancerFirewallRelationFence, before inspace.Firewall) error {
@@ -474,9 +510,16 @@ func (c *nodeLoadBalancerController) clusterICMPFirewallRelationOwner(nodeClassN
 			if err != nil {
 				return nodeLoadBalancerFirewallRelationOwnerSnapshot{}, err
 			}
+			if expectedUID != "" && object.GetUID() != expectedUID {
+				return nodeLoadBalancerFirewallRelationOwnerSnapshot{}, fmt.Errorf(
+					"node load balancer: InSpaceNodeClass %s identity changed before firewall relation transition",
+					nodeClassName,
+				)
+			}
 			resource := c.provider.dynamicClient.Resource(nodeClassGVR)
 			return nodeLoadBalancerFirewallRelationOwnerSnapshot{
 				annotations: copyNodeLoadBalancerAnnotations(object.GetAnnotations()),
+				uid:         object.GetUID(),
 				commit: func(ctx context.Context, values map[string]string) error {
 					copy := object.DeepCopy()
 					copy.SetAnnotations(copyNodeLoadBalancerAnnotations(values))
@@ -930,6 +973,31 @@ func (c *nodeLoadBalancerController) reconcileNodeLoadBalancerFirewallRelation(
 	if err != nil {
 		return false, fmt.Errorf("node load balancer: read %s firewall relation owner: %w", owner.description, err)
 	}
+	if snapshot.uid == "" {
+		return false, fmt.Errorf("node load balancer: %s firewall relation owner has an empty UID", owner.description)
+	}
+	legacyIssued := snapshot.annotations[annotationNodeLoadBalancerFirewallRelationIssued]
+	legacyOwnerUID := snapshot.annotations[annotationNodeLoadBalancerFirewallRelationOwnerUID]
+	if legacyIssued != "" && legacyOwnerUID == "" {
+		if _, parseErr := parseNodeLoadBalancerFirewallRelationFence(legacyIssued); parseErr != nil {
+			return false, parseErr
+		}
+		// v0.6.0-rc.2 persisted relation receipts before they carried an owner
+		// UID. Bind a valid legacy receipt to the exact live object through the
+		// owner's optimistic CAS, then stop this pass. This migration performs no
+		// cloud read or mutation; the next reconciliation resolves the unchanged
+		// receipt through the normal authoritative readback path.
+		values := copyNodeLoadBalancerAnnotations(snapshot.annotations)
+		values[annotationNodeLoadBalancerFirewallRelationOwnerUID] = string(snapshot.uid)
+		if commitErr := snapshot.commit(ctx, values); commitErr != nil {
+			return false, fmt.Errorf(
+				"node load balancer: bind legacy %s firewall relation receipt to owner UID: %w",
+				owner.description,
+				commitErr,
+			)
+		}
+		return false, nil
+	}
 	items, err := c.provider.api.ListFirewalls(ctx, c.provider.config.Location)
 	if err != nil {
 		return false, fmt.Errorf("node load balancer: list firewalls for %s relation fence: %w", owner.description, err)
@@ -950,7 +1018,16 @@ func (c *nodeLoadBalancerController) reconcileNodeLoadBalancerFirewallRelation(
 	values := copyNodeLoadBalancerAnnotations(snapshot.annotations)
 	changed := false
 	existingValue := values[annotationNodeLoadBalancerFirewallRelationIssued]
+	existingOwnerUID := values[annotationNodeLoadBalancerFirewallRelationOwnerUID]
 	if existingValue != "" {
+		if existingOwnerUID != string(snapshot.uid) {
+			return false, fmt.Errorf(
+				"node load balancer: %s firewall relation receipt owner UID %q does not match live UID %q",
+				owner.description,
+				existingOwnerUID,
+				snapshot.uid,
+			)
+		}
 		existing, parseErr := parseNodeLoadBalancerFirewallRelationFence(existingValue)
 		if parseErr != nil {
 			return false, parseErr
@@ -978,6 +1055,12 @@ func (c *nodeLoadBalancerController) reconcileNodeLoadBalancerFirewallRelation(
 				converged && existing.absenceObservedAt == "" &&
 				c.nodeLoadBalancerFirewallRelationAbsenceDelay() == 0
 		}
+	} else if existingOwnerUID != "" {
+		return false, fmt.Errorf(
+			"node load balancer: %s has an orphan firewall relation owner UID receipt %q",
+			owner.description,
+			existingOwnerUID,
+		)
 	} else if desired != nil {
 		converged, readbackErr := nodeLoadBalancerFirewallRelationConverged(*desired, items)
 		if readbackErr != nil {
@@ -1041,6 +1124,7 @@ func (c *nodeLoadBalancerController) reconcileNodeLoadBalancerFirewallRelation(
 				issued.issueID = issueID
 				issued.issuedAt = c.nodeLoadBalancerFirewallRelationTime().Format(time.RFC3339Nano)
 				values[annotationNodeLoadBalancerFirewallRelationIssued] = issued.String()
+				values[annotationNodeLoadBalancerFirewallRelationOwnerUID] = string(snapshot.uid)
 				issuedFence = &issued
 				result = outcomeIssued
 				changed = true
@@ -1066,6 +1150,22 @@ func (c *nodeLoadBalancerController) reconcileNodeLoadBalancerFirewallRelation(
 
 	switch result {
 	case outcomeConverged:
+		finalOwner, readErr := owner.read(ctx)
+		if readErr != nil {
+			return false, fmt.Errorf("node load balancer: re-read converged %s firewall relation owner: %w", owner.description, readErr)
+		}
+		if finalOwner.uid != snapshot.uid {
+			return false, errors.New("node load balancer: firewall relation owner UID changed during converged readback")
+		}
+		for _, key := range []string{
+			annotationNodeLoadBalancerFirewallRelationIssued,
+			annotationNodeLoadBalancerFirewallRelationOwnerUID,
+			annotationNodeLoadBalancerFirewallRelationVMAbsent,
+		} {
+			if finalOwner.annotations[key] != snapshot.annotations[key] {
+				return false, errors.New("node load balancer: firewall relation receipt changed during converged readback")
+			}
+		}
 		return true, nil
 	case outcomePending:
 		return false, fmt.Errorf(
@@ -1094,21 +1194,50 @@ func (c *nodeLoadBalancerController) reconcileNodeLoadBalancerFirewallRelation(
 	if owner.authorize == nil {
 		return false, fmt.Errorf("node load balancer: %s firewall relation has no pre-dispatch authority", owner.description)
 	}
-	authorityBefore, err := exactNodeLoadBalancerFirewallFromItems(items, issuedFence.firewallUUID)
-	if err != nil {
-		return false, fmt.Errorf("node load balancer: capture %s firewall relation issue authority: %w", owner.description, err)
-	}
-	if err := owner.authorize(ctx, *issuedFence, *authorityBefore); err != nil {
-		// No cloud request was dispatched. Keep the exact issued fence as a
-		// durable rejected-at-boundary receipt. A later reconciliation must
-		// authoritatively observe state and retire it before another attempt can
-		// be issued.
-		return false, fmt.Errorf(
+	issuedOwnerUID := snapshot.uid
+	rejectUndispatched := func(authorityErr error) (bool, error) {
+		rejection := fmt.Errorf(
 			"node load balancer: reject %s firewall relation mutation %s at final pre-dispatch authority: %w",
 			owner.description,
 			issuedFence,
-			err,
+			authorityErr,
 		)
+		clearErr := clearNodeLoadBalancerFirewallRelationFence(ctx, owner, issuedOwnerUID, *issuedFence)
+		if clearErr != nil {
+			clearErr = fmt.Errorf("node load balancer: clear proven-undispatched %s firewall relation fence: %w", owner.description, clearErr)
+		}
+		return false, errors.Join(rejection, clearErr)
+	}
+	authorityBefore, err := exactNodeLoadBalancerFirewallFromItems(items, issuedFence.firewallUUID)
+	if err != nil {
+		return rejectUndispatched(fmt.Errorf("capture %s firewall relation issue authority: %w", owner.description, err))
+	}
+	if err := owner.authorize(ctx, *issuedFence, *authorityBefore); err != nil {
+		// No cloud request was dispatched. The requested relation therefore
+		// cannot converge and an issued receipt would suppress every future
+		// attempt forever. Clear only this exact CAS-owned issue; concurrent
+		// replacement is preserved by clearNodeLoadBalancerFirewallRelationFence.
+		return rejectUndispatched(err)
+	}
+	// The policy/VM authority above may perform several reads. Re-read the
+	// durable owner last so a stale controller cannot dispatch after another
+	// reconciler cleared or replaced its one-shot receipt.
+	finalOwner, err := owner.read(ctx)
+	if err != nil {
+		return rejectUndispatched(fmt.Errorf("re-read exact issued receipt: %w", err))
+	}
+	if finalOwner.uid != issuedOwnerUID ||
+		finalOwner.annotations[annotationNodeLoadBalancerFirewallRelationOwnerUID] != string(issuedOwnerUID) {
+		return rejectUndispatched(errors.New("firewall relation owner UID changed during final authority"))
+	}
+	finalFence, err := parseNodeLoadBalancerFirewallRelationFence(
+		finalOwner.annotations[annotationNodeLoadBalancerFirewallRelationIssued],
+	)
+	if err != nil || !sameNodeLoadBalancerFirewallRelationIssue(finalFence, *issuedFence) {
+		return rejectUndispatched(errors.Join(
+			errors.New("exact issued receipt changed during final authority"),
+			err,
+		))
 	}
 
 	var mutationErr error
@@ -1116,6 +1245,16 @@ func (c *nodeLoadBalancerController) reconcileNodeLoadBalancerFirewallRelation(
 		mutationErr = c.provider.api.AssignFirewallToVM(ctx, c.provider.config.Location, issuedFence.firewallUUID, issuedFence.vmUUID)
 	} else {
 		mutationErr = c.provider.api.UnassignFirewallFromVM(ctx, c.provider.config.Location, issuedFence.firewallUUID, issuedFence.vmUUID)
+	}
+	if errors.Is(mutationErr, inspace.ErrMutationBlocked) {
+		// The SDK produced this typed error before dispatch. Clear only the exact
+		// UID-pinned receipt using a detached bounded context; a canceled caller
+		// must not strand authority that provably never crossed the HTTP boundary.
+		clearErr := clearNodeLoadBalancerFirewallRelationFence(ctx, owner, issuedOwnerUID, *issuedFence)
+		return false, errors.Join(
+			fmt.Errorf("node load balancer: %s firewall relation mutation %s was blocked before dispatch: %w", owner.description, issuedFence, mutationErr),
+			clearErr,
+		)
 	}
 	if mutationErr == nil {
 		// A successful response is still not authoritative state. Perform one
@@ -1141,21 +1280,10 @@ func (c *nodeLoadBalancerController) reconcileNodeLoadBalancerFirewallRelation(
 			fmt.Errorf("node load balancer: authoritative firewall relation readback: %w", readbackErr),
 		)
 	}
-	// Only the typed local block proves no dispatch. Every cloud/transport error
-	// remains fenced below, even for exact removals, until desired state becomes
-	// visible or an operator obtains terminal provider-side proof. A local block
-	// can retire its exact issue immediately after the mandatory fresh read.
-	if errors.Is(mutationErr, inspace.ErrMutationBlocked) {
-		clearErr := clearNodeLoadBalancerFirewallRelationFence(ctx, owner, *issuedFence)
-		return false, errors.Join(
-			fmt.Errorf("node load balancer: %s firewall relation mutation %s did not converge: %w", owner.description, issuedFence, mutationErr),
-			clearErr,
-		)
-	}
-
 	cleared, observationErr := c.observeNodeLoadBalancerFirewallRelationIssue(
 		ctx,
 		owner,
+		issuedOwnerUID,
 		*issuedFence,
 		items,
 		c.nodeLoadBalancerFirewallRelationTime(),
@@ -1175,6 +1303,7 @@ func (c *nodeLoadBalancerController) reconcileNodeLoadBalancerFirewallRelation(
 func (c *nodeLoadBalancerController) observeNodeLoadBalancerFirewallRelationIssue(
 	ctx context.Context,
 	owner nodeLoadBalancerFirewallRelationOwner,
+	expectedOwnerUID types.UID,
 	expected nodeLoadBalancerFirewallRelationFence,
 	items []inspace.Firewall,
 	now time.Time,
@@ -1182,6 +1311,10 @@ func (c *nodeLoadBalancerController) observeNodeLoadBalancerFirewallRelationIssu
 	snapshot, err := owner.read(ctx)
 	if err != nil {
 		return false, fmt.Errorf("node load balancer: read %s firewall relation owner after mutation: %w", owner.description, err)
+	}
+	if expectedOwnerUID == "" || snapshot.uid != expectedOwnerUID ||
+		snapshot.annotations[annotationNodeLoadBalancerFirewallRelationOwnerUID] != string(expectedOwnerUID) {
+		return false, errors.New("node load balancer: firewall relation owner UID changed before authoritative-outcome observation")
 	}
 	storedValue := snapshot.annotations[annotationNodeLoadBalancerFirewallRelationIssued]
 	stored, err := parseNodeLoadBalancerFirewallRelationFence(storedValue)
@@ -1215,11 +1348,18 @@ func (c *nodeLoadBalancerController) observeNodeLoadBalancerFirewallRelationIssu
 func clearNodeLoadBalancerFirewallRelationFence(
 	ctx context.Context,
 	owner nodeLoadBalancerFirewallRelationOwner,
+	expectedOwnerUID types.UID,
 	issued nodeLoadBalancerFirewallRelationFence,
 ) error {
-	clearSnapshot, err := owner.read(ctx)
+	clearCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), durableReceiptWriteTimeout)
+	defer cancel()
+	clearSnapshot, err := owner.read(clearCtx)
 	if err != nil {
 		return err
+	}
+	if expectedOwnerUID == "" || clearSnapshot.uid != expectedOwnerUID ||
+		clearSnapshot.annotations[annotationNodeLoadBalancerFirewallRelationOwnerUID] != string(expectedOwnerUID) {
+		return errors.New("firewall relation owner UID changed before authoritative-outcome clearance")
 	}
 	stored, parseErr := parseNodeLoadBalancerFirewallRelationFence(
 		clearSnapshot.annotations[annotationNodeLoadBalancerFirewallRelationIssued],
@@ -1229,7 +1369,8 @@ func clearNodeLoadBalancerFirewallRelationFence(
 	}
 	clearValues := copyNodeLoadBalancerAnnotations(clearSnapshot.annotations)
 	delete(clearValues, annotationNodeLoadBalancerFirewallRelationIssued)
-	return clearSnapshot.commit(ctx, clearValues)
+	delete(clearValues, annotationNodeLoadBalancerFirewallRelationOwnerUID)
+	return clearSnapshot.commit(clearCtx, clearValues)
 }
 
 func mustNodeLoadBalancerFirewallRelationFenceValue(

@@ -1118,6 +1118,28 @@ func TestFencedRollbackCommittedHTTP500ThenRestartAbsenceDoesNotReplayDelete(t *
 	}
 }
 
+func TestFencedAnchorAbsenceUsesDestructiveBudgetBeyondLaunchCleanupTimeout(t *testing.T) {
+	api := &fakeAPI{}
+	adapter, _ := New(api)
+	adapter.launchCleanupTimeout = 10 * time.Millisecond
+	adapter.destructiveAbsenceTimeout = 250 * time.Millisecond
+	adapter.destructiveAbsenceReadInterval = 20 * time.Millisecond
+	adapter.networkAttachmentRequestTimeout = 50 * time.Millisecond
+
+	cleanup := fencedCleanupRequest(true)
+	cleanup.CreatedVMUUID = "11111111-1111-4111-8111-111111111111"
+	cleanup.RollbackChosen = true
+	cleanup.AttemptResolved = true
+
+	if _, err := adapter.reconcileFencedCreatedVMAnchor(context.Background(), cleanup, true); err != nil {
+		t.Fatalf("fenced absent-anchor cleanup inherited the shorter launch deadline: %v", err)
+	}
+	if api.vmGetCalls < destructiveAbsenceConfirmations || api.networkGetCalls < destructiveAbsenceConfirmations {
+		t.Fatalf("fenced absent-anchor proof used VM GETs=%d VPC GETs=%d, want at least %d complete observations",
+			api.vmGetCalls, api.networkGetCalls, destructiveAbsenceConfirmations)
+	}
+}
+
 func TestCleanupIgnoresCanonicalPostBaselineManualVMAndFIP(t *testing.T) {
 	manualUUID := "99999999-9999-4999-8999-999999999999"
 	api := &fakeAPI{
@@ -1344,6 +1366,44 @@ func TestProtectFencedCreateRejectsForeignSameVPCVMBeforeFirewallMutation(t *tes
 	}
 	if api.firewallAssignCalls != 0 || len(api.operations) != 0 || firewallHasVM(api.firewalls[0], created.UUID) {
 		t.Fatalf("foreign same-VPC VM reached firewall mutation: assigns=%d operations=%v firewall=%#v", api.firewallAssignCalls, api.operations, api.firewalls[0])
+	}
+}
+
+func TestProtectFencedCreateRejectsInactiveOrDriftedAnchorBeforeFirewallMutation(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*sdk.VM)
+	}{
+		{name: "HTTP 200 deleted tombstone", mutate: func(vm *sdk.VM) { vm.Status = "Deleted" }},
+		{name: "top-level launch shape drift", mutate: func(vm *sdk.VM) { vm.VCPU++ }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			api := &fakeAPI{}
+			adapter, _ := New(api)
+			configureFastNetworkReadback(adapter, boundedReadbackTestTimeout)
+			created, err := adapter.CreateVM(context.Background(), testRequest())
+			if err != nil {
+				t.Fatal(err)
+			}
+			test.mutate(&api.vms[0])
+			api.firewalls[0].ResourcesAssigned = nil
+			api.operations = nil
+			api.firewallAssignCalls = 0
+			api.floatingIPUpdateCalls = 0
+			api.deleteVMCalls = 0
+
+			cleanup := fencedCleanupRequest(true)
+			cleanup.CreatedVMUUID = created.UUID
+			err = adapter.ProtectFencedCreate(context.Background(), cleanup)
+			if !errors.Is(err, cloudapi.ErrOwnershipMismatch) {
+				t.Fatalf("ProtectFencedCreate() error = %v, want active ownership rejection", err)
+			}
+			if api.firewallAssignCalls != 0 || api.floatingIPUpdateCalls != 0 || api.deleteVMCalls != 0 ||
+				len(api.operations) != 0 || firewallHasVM(api.firewalls[0], created.UUID) {
+				t.Fatalf("inactive/drifted anchor reached cloud mutation: firewall=%d FIP PATCHes=%d VM deletes=%d operations=%v firewallState=%#v",
+					api.firewallAssignCalls, api.floatingIPUpdateCalls, api.deleteVMCalls, api.operations, api.firewalls[0])
+			}
+		})
 	}
 }
 
@@ -1772,6 +1832,43 @@ func TestDurableVMDeleteCommittedHTTP500NeverReplaysAfterAdapterRestart(t *testi
 	}
 	if api.deleteVMCalls != 1 {
 		t.Fatalf("reconstructed adapter replayed VM DELETE: calls=%d", api.deleteVMCalls)
+	}
+}
+
+func TestDurableVMDeleteCommittedHTTP500ConvergesThroughExactDeletedTombstone(t *testing.T) {
+	api := &fakeAPI{deleteVMLeavesTombstone: true}
+	adapter, _ := New(api)
+	configureFastNetworkReadback(adapter, 500*time.Millisecond)
+	created, err := adapter.CreateVM(context.Background(), testRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	harness := &testRemovalMutationHarness{}
+	identity := durableDeleteIdentity(created)
+	identity.NetworkUUID = testRequest().NetworkUUID
+	harness.attachDelete(&identity)
+	api.deleteVMErrors = []error{errors.New("HTTP 500 after committed VM DELETE")}
+	api.deleteVMCommitOnError = true
+	api.operations = nil
+
+	if err := adapter.DeleteVM(context.Background(), created.Location, created.UUID, created.ClusterName, created.NodeClaimName, identity); err != nil {
+		t.Fatalf("committed VM DELETE tombstone recovery = %v", err)
+	}
+	tombstone, ok := api.exactVMTombstones[created.UUID]
+	if !ok || !vmDeletedTombstone(tombstone) || api.deleteVMCalls != 1 || len(api.vms) != 0 ||
+		len(api.floatingIPs) != 0 || firewallHasVM(api.firewalls[0], created.UUID) {
+		t.Fatalf("tombstone convergence state: tombstone=%#v present=%t calls=%d VMs=%#v FIPs=%#v firewall=%#v operations=%v",
+			tombstone, ok, api.deleteVMCalls, api.vms, api.floatingIPs, api.firewalls[0], api.operations)
+	}
+
+	restarted, _ := New(api)
+	configureFastNetworkReadback(restarted, 500*time.Millisecond)
+	err = restarted.DeleteVM(context.Background(), created.Location, created.UUID, created.ClusterName, created.NodeClaimName, identity)
+	if !errors.Is(err, cloudapi.ErrNotFound) {
+		t.Fatalf("restarted tombstone delete = %v, want ErrNotFound", err)
+	}
+	if api.deleteVMCalls != 1 {
+		t.Fatalf("reconstructed adapter replayed VM DELETE against exact tombstone: calls=%d", api.deleteVMCalls)
 	}
 }
 

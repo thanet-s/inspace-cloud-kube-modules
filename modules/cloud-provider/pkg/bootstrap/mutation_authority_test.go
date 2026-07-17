@@ -109,7 +109,7 @@ func TestVMCreatePostCASAdoptsExactConcurrentObjectWithoutPOST(t *testing.T) {
 	}
 }
 
-func TestVMCreatePostCASForeignCollisionRetainsIssueAcrossRestart(t *testing.T) {
+func TestVMCreatePostCASForeignCollisionResetsUndispatchedIssue(t *testing.T) {
 	api := newFakeAPI()
 	cluster := testCluster()
 	reconciler := testReconciler(api)
@@ -138,8 +138,8 @@ func TestVMCreatePostCASForeignCollisionRetainsIssueAcrossRestart(t *testing.T) 
 	if err == nil || !errors.Is(err, ErrCreateAttemptPending) || !*fired || len(api.vmCreates) != 0 {
 		t.Fatalf("foreign post-CAS VM collision = fired=%t error=%v POSTs=%#v", *fired, err, api.vmCreates)
 	}
-	if attempt := cluster.Status.CreateAttempts[createAttemptBastionVM]; attempt.Phase != createAttemptPhaseIssued {
-		t.Fatalf("foreign post-CAS VM collision lost issue: %#v", attempt)
+	if attempt := cluster.Status.CreateAttempts[createAttemptBastionVM]; attempt.Phase != createAttemptPhaseIntent {
+		t.Fatalf("foreign post-CAS VM collision did not reset undispatched issue: %#v", attempt)
 	}
 
 	cluster = restartClusterFromJSON(t, cluster)
@@ -150,8 +150,41 @@ func TestVMCreatePostCASForeignCollisionRetainsIssueAcrossRestart(t *testing.T) 
 		currentBootstrapResourceNames(cluster.Metadata.Name, ownerKey(cluster)).BastionFloatingIP,
 		api.network.Subnet, cluster.Spec.Endpoint.VirtualIPv4, privateIPv4Range{},
 	)
-	if len(api.vmCreates) != 0 || cluster.Status.CreateAttempts[createAttemptBastionVM].Phase != createAttemptPhaseIssued {
+	if len(api.vmCreates) != 0 || cluster.Status.CreateAttempts[createAttemptBastionVM].Phase != createAttemptPhaseIntent {
 		t.Fatalf("restart replayed foreign VM collision: POSTs=%#v receipt=%#v", api.vmCreates, cluster.Status.CreateAttempts[createAttemptBastionVM])
+	}
+}
+
+func TestVMCreatePostCASDeletedTombstoneResetsUndispatchedIssue(t *testing.T) {
+	api := newFakeAPI()
+	cluster := testCluster()
+	reconciler := testReconciler(api)
+	desired, err := reconciler.desiredBastionVMRequest(cluster, &api.network, ownerKey(cluster), cacheTLSMaterial{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	firewall := testManagedBastionFirewall(reconciler, api, cluster)
+	api.firewalls = []inspace.Firewall{firewall}
+	const vmUUID = "bbbbbbbb-1111-4222-8333-bbbbbbbbbbbb"
+	fired := installCreateIssueCASHook(t, reconciler, createAttemptBastionVM, func() {
+		tombstone := testVMFromCreateRequest(vmUUID, desired)
+		tombstone.Status = "Deleted"
+		api.mu.Lock()
+		defer api.mu.Unlock()
+		api.vms = append(api.vms, tombstone)
+		api.network.VMUUIDs = append(api.network.VMUUIDs, vmUUID)
+	})
+
+	_, _, err = reconciler.ensureManagedVMCreate(
+		context.Background(), cluster, createAttemptBastionVM, &firewall, nil, desired,
+		currentBootstrapResourceNames(cluster.Metadata.Name, ownerKey(cluster)).BastionFloatingIP,
+		api.network.Subnet, cluster.Spec.Endpoint.VirtualIPv4, privateIPv4Range{},
+	)
+	if err == nil || !errors.Is(err, ErrCreateAttemptPending) || !*fired || len(api.vmCreates) != 0 {
+		t.Fatalf("deleted post-CAS VM collision = fired=%t error=%v POSTs=%#v", *fired, err, api.vmCreates)
+	}
+	if attempt := cluster.Status.CreateAttempts[createAttemptBastionVM]; attempt.Phase != createAttemptPhaseIntent {
+		t.Fatalf("deleted post-CAS VM collision did not reset undispatched issue: %#v", attempt)
 	}
 }
 
@@ -246,8 +279,8 @@ func TestVMCreatePostCASRevalidatesEveryCloudAuthorityBeforePOST(t *testing.T) {
 			if len(api.vmCreates) != 0 {
 				t.Fatalf("post-CAS authority drift dispatched VM POST: %#v", api.vmCreates)
 			}
-			if attempt := cluster.Status.CreateAttempts[createAttemptBastionVM]; attempt.Phase != createAttemptPhaseIssued {
-				t.Fatalf("post-CAS authority drift lost issue receipt: %#v", attempt)
+			if attempt := cluster.Status.CreateAttempts[createAttemptBastionVM]; attempt.Phase != createAttemptPhaseIntent {
+				t.Fatalf("post-CAS authority drift did not reset undispatched issue: %#v", attempt)
 			}
 		})
 	}
@@ -325,14 +358,14 @@ func TestFirewallCreatePostCASAdoptsExactObjectAndRejectsDrift(t *testing.T) {
 				}
 				return
 			}
-			if err == nil || !errors.Is(err, ErrCreateAttemptPending) || attempt.Phase != createAttemptPhaseIssued {
-				t.Fatalf("drifted firewall did not retain issue: error=%v receipt=%#v", err, attempt)
+			if err == nil || !errors.Is(err, ErrCreateAttemptPending) || attempt.Phase != createAttemptPhaseIntent {
+				t.Fatalf("drifted firewall did not reset undispatched issue: error=%v receipt=%#v", err, attempt)
 			}
 			cluster = restartClusterFromJSON(t, cluster)
 			_, _ = testReconciler(api).ensureManagedFirewallCreate(
 				context.Background(), cluster, createAttemptBastionFirewall, "bastion", request, nil, api.network.Subnet, validate,
 			)
-			if len(api.firewallCreates) != 0 || cluster.Status.CreateAttempts[createAttemptBastionFirewall].Phase != createAttemptPhaseIssued {
+			if len(api.firewallCreates) != 0 || cluster.Status.CreateAttempts[createAttemptBastionFirewall].Phase != createAttemptPhaseIntent {
 				t.Fatalf("restart replayed drifted firewall create: creates=%#v receipt=%#v", api.firewallCreates, cluster.Status.CreateAttempts[createAttemptBastionFirewall])
 			}
 		})
@@ -409,14 +442,14 @@ func TestFirewallCreatePostCASRecomputesFreshVPCPolicyBeforePOST(t *testing.T) {
 			if len(api.firewallCreates) != 0 {
 				t.Fatalf("post-CAS firewall authority dispatched POST: %#v", api.firewallCreates)
 			}
-			if attempt := cluster.Status.CreateAttempts[createAttemptNodeFirewall]; attempt.Phase != createAttemptPhaseIssued {
-				t.Fatalf("post-CAS firewall authority lost issue receipt: %#v", attempt)
+			if attempt := cluster.Status.CreateAttempts[createAttemptNodeFirewall]; attempt.Phase != createAttemptPhaseIntent {
+				t.Fatalf("post-CAS firewall authority did not reset undispatched issue: %#v", attempt)
 			}
 		})
 	}
 }
 
-func TestFloatingIPRenamePostCASDriftRetainsIssueWithoutPATCH(t *testing.T) {
+func TestFloatingIPRenamePostCASDriftResetsUndispatchedIssue(t *testing.T) {
 	api := newFakeAPI()
 	cluster := testCluster()
 	const vmUUID = "bbbbbbbb-1111-4222-8333-bbbbbbbbbbbb"
@@ -439,18 +472,18 @@ func TestFloatingIPRenamePostCASDriftRetainsIssueWithoutPATCH(t *testing.T) {
 	if err == nil || !errors.Is(err, ErrCreateAttemptPending) || !*fired || api.floatingIPUpdateCalls != 0 {
 		t.Fatalf("post-CAS FIP drift = fired=%t error=%v PATCHes=%d", *fired, err, api.floatingIPUpdateCalls)
 	}
-	if attempt := cluster.Status.CreateAttempts[createAttemptBastionFloatingIPUpdate]; attempt.Phase != createAttemptPhaseIssued {
-		t.Fatalf("post-CAS FIP drift lost issue: %#v", attempt)
+	if attempt := cluster.Status.CreateAttempts[createAttemptBastionFloatingIPUpdate]; attempt.Phase != createAttemptPhaseIntent {
+		t.Fatalf("post-CAS FIP drift did not reset undispatched issue: %#v", attempt)
 	}
 
 	cluster = restartClusterFromJSON(t, cluster)
 	_, _, _ = testReconciler(api).ensureOwnedAutoFloatingIP(context.Background(), cluster, name, &vm, &item)
-	if api.floatingIPUpdateCalls != 0 || cluster.Status.CreateAttempts[createAttemptBastionFloatingIPUpdate].Phase != createAttemptPhaseIssued {
+	if api.floatingIPUpdateCalls != 0 || cluster.Status.CreateAttempts[createAttemptBastionFloatingIPUpdate].Phase != createAttemptPhaseIntent {
 		t.Fatalf("restart replayed drifted FIP PATCH: calls=%d receipt=%#v", api.floatingIPUpdateCalls, cluster.Status.CreateAttempts[createAttemptBastionFloatingIPUpdate])
 	}
 }
 
-func TestFirewallAssignmentPostCASDriftRetainsIssueWithoutPOST(t *testing.T) {
+func TestFirewallAssignmentPostCASDriftResetsUndispatchedIssue(t *testing.T) {
 	api := newFakeAPI()
 	cluster := testCluster()
 	const vmUUID = "bbbbbbbb-1111-4222-8333-bbbbbbbbbbbb"
@@ -472,18 +505,75 @@ func TestFirewallAssignmentPostCASDriftRetainsIssueWithoutPOST(t *testing.T) {
 	if err == nil || !errors.Is(err, ErrCreateAttemptPending) || !*fired || api.firewallAssignmentCalls != 0 {
 		t.Fatalf("post-CAS assignment drift = fired=%t error=%v POSTs=%d", *fired, err, api.firewallAssignmentCalls)
 	}
-	if attempt := cluster.Status.CreateAttempts[key]; attempt.Phase != createAttemptPhaseIssued {
-		t.Fatalf("post-CAS assignment drift lost issue: %#v", attempt)
+	if attempt := cluster.Status.CreateAttempts[key]; attempt.Phase != createAttemptPhaseIntent {
+		t.Fatalf("post-CAS assignment drift did not reset undispatched issue: %#v", attempt)
 	}
 
 	cluster = restartClusterFromJSON(t, cluster)
 	_ = testReconciler(api).ensureExactFirewallAssignment(context.Background(), cluster, key, &firewall, vmUUID)
-	if api.firewallAssignmentCalls != 0 || cluster.Status.CreateAttempts[key].Phase != createAttemptPhaseIssued {
+	if api.firewallAssignmentCalls != 0 || cluster.Status.CreateAttempts[key].Phase != createAttemptPhaseIntent {
 		t.Fatalf("restart replayed drifted firewall assignment: calls=%d receipt=%#v", api.firewallAssignmentCalls, cluster.Status.CreateAttempts[key])
 	}
 }
 
-func TestRollbackFloatingIPPostCASDriftRetainsIssuedRemoval(t *testing.T) {
+func TestDeletedVMTombstoneNeverAuthorizesRelatedMutation(t *testing.T) {
+	t.Run("firewall assignment", func(t *testing.T) {
+		api := newFakeAPI()
+		cluster := testCluster()
+		const vmUUID = "bbbbbbbb-1111-4222-8333-bbbbbbbbbbbb"
+		seedOwnedMutationVMs(t, api, cluster, vmUUID)
+		firewall := inspace.Firewall{
+			UUID: "aaaaaaaa-1111-4222-8333-444444444444", DisplayName: "unit-assignment-firewall",
+			BillingAccountID: cluster.Spec.BillingAccountID,
+		}
+		api.firewalls = []inspace.Firewall{firewall}
+		const key = "firewall-assignment/deleted-vm"
+		reconciler := testReconciler(api)
+		fired := installCreateIssueCASHook(t, reconciler, key, func() {
+			api.mu.Lock()
+			defer api.mu.Unlock()
+			api.vms[0].Status = "Deleted"
+		})
+
+		err := reconciler.ensureExactFirewallAssignment(context.Background(), cluster, key, &firewall, vmUUID)
+		if err == nil || !errors.Is(err, ErrCreateAttemptPending) || !*fired || api.firewallAssignmentCalls != 0 {
+			t.Fatalf("deleted VM assignment authority = fired=%t error=%v POSTs=%d", *fired, err, api.firewallAssignmentCalls)
+		}
+		if attempt := cluster.Status.CreateAttempts[key]; attempt.Phase != createAttemptPhaseIntent {
+			t.Fatalf("deleted VM assignment did not reset undispatched issue: %#v", attempt)
+		}
+	})
+
+	t.Run("floating IP update", func(t *testing.T) {
+		api := newFakeAPI()
+		cluster := testCluster()
+		const vmUUID = "bbbbbbbb-1111-4222-8333-bbbbbbbbbbbb"
+		seedOwnedMutationVMs(t, api, cluster, vmUUID)
+		vm := api.vms[0]
+		name := currentBootstrapResourceNames(cluster.Metadata.Name, ownerKey(cluster)).BastionFloatingIP
+		item := inspace.FloatingIP{
+			Address: "203.0.113.40", BillingAccountID: cluster.Spec.BillingAccountID, Type: "public", Enabled: true,
+			AssignedTo: vmUUID, AssignedToResourceType: "virtual_machine", AssignedToPrivateIP: vm.PrivateIPv4,
+		}
+		api.floatingIPs = []inspace.FloatingIP{item}
+		reconciler := testReconciler(api)
+		fired := installCreateIssueCASHook(t, reconciler, createAttemptBastionFloatingIPUpdate, func() {
+			api.mu.Lock()
+			defer api.mu.Unlock()
+			api.vms[0].Status = "Deleted"
+		})
+
+		_, _, err := reconciler.ensureOwnedAutoFloatingIP(context.Background(), cluster, name, &vm, &item)
+		if err == nil || !errors.Is(err, ErrCreateAttemptPending) || !*fired || api.floatingIPUpdateCalls != 0 {
+			t.Fatalf("deleted VM floating-IP authority = fired=%t error=%v PATCHes=%d", *fired, err, api.floatingIPUpdateCalls)
+		}
+		if attempt := cluster.Status.CreateAttempts[createAttemptBastionFloatingIPUpdate]; attempt.Phase != createAttemptPhaseIntent {
+			t.Fatalf("deleted VM floating-IP update did not reset undispatched issue: %#v", attempt)
+		}
+	})
+}
+
+func TestRollbackFloatingIPPostCASDriftResetsUndispatchedRemoval(t *testing.T) {
 	for _, test := range []struct {
 		name        string
 		intentPhase string
@@ -527,20 +617,20 @@ func TestRollbackFloatingIPPostCASDriftRetainsIssuedRemoval(t *testing.T) {
 			if err == nil || !errors.Is(err, ErrCreateAttemptPending) || !*fired || api.floatingIPUnassignCalls != 0 || len(api.floatingIPDeletes) != 0 {
 				t.Fatalf("post-CAS rollback %s drift = fired=%t error=%v unassign=%d deletes=%#v", test.name, *fired, err, api.floatingIPUnassignCalls, api.floatingIPDeletes)
 			}
-			if attempt := cluster.Status.DeleteAttempts[deleteAttemptBastion]; attempt.Phase != test.issuedPhase {
-				t.Fatalf("post-CAS rollback %s lost issue: %#v", test.name, attempt)
+			if attempt := cluster.Status.DeleteAttempts[deleteAttemptBastion]; attempt.Phase != test.intentPhase {
+				t.Fatalf("post-CAS rollback %s did not reset undispatched issue: %#v", test.name, attempt)
 			}
 
 			cluster = restartClusterFromJSON(t, cluster)
 			_, _ = testReconciler(api).rollbackFloatingIP(context.Background(), cluster, deleteAttemptBastion)
-			if api.floatingIPUnassignCalls != 0 || len(api.floatingIPDeletes) != 0 || cluster.Status.DeleteAttempts[deleteAttemptBastion].Phase != test.issuedPhase {
+			if api.floatingIPUnassignCalls != 0 || len(api.floatingIPDeletes) != 0 || cluster.Status.DeleteAttempts[deleteAttemptBastion].Phase != test.intentPhase {
 				t.Fatalf("restart replayed rollback %s: unassign=%d deletes=%#v receipt=%#v", test.name, api.floatingIPUnassignCalls, api.floatingIPDeletes, cluster.Status.DeleteAttempts[deleteAttemptBastion])
 			}
 		})
 	}
 }
 
-func TestDestroyFloatingIPPostCASVMDriftRetainsIssuedUnassign(t *testing.T) {
+func TestDestroyFloatingIPPostCASVMDriftResetsUndispatchedUnassign(t *testing.T) {
 	api := newFakeAPI()
 	cluster := testCluster()
 	const vmUUID = "bbbbbbbb-1111-4222-8333-bbbbbbbbbbbb"
@@ -566,13 +656,13 @@ func TestDestroyFloatingIPPostCASVMDriftRetainsIssuedUnassign(t *testing.T) {
 	if err == nil || !errors.Is(err, ErrCreateAttemptPending) || !*fired || api.floatingIPUnassignCalls != 0 {
 		t.Fatalf("post-CAS destroy target drift = fired=%t error=%v unassign=%d", *fired, err, api.floatingIPUnassignCalls)
 	}
-	if attempt := cluster.Status.DeleteAttempts[destroyFIPBastionKey]; attempt.Phase != deletePhaseFIPUnassignIssued {
-		t.Fatalf("post-CAS destroy target drift lost issue: %#v", attempt)
+	if attempt := cluster.Status.DeleteAttempts[destroyFIPBastionKey]; attempt.Phase != deletePhaseFIPUnassignIntent {
+		t.Fatalf("post-CAS destroy target drift did not reset undispatched issue: %#v", attempt)
 	}
 
 	cluster = restartClusterFromJSON(t, cluster)
 	_, _ = testReconciler(api).reconcileDestroyFloatingIPRemoval(context.Background(), cluster, destroyFIPBastionKey)
-	if api.floatingIPUnassignCalls != 0 || cluster.Status.DeleteAttempts[destroyFIPBastionKey].Phase != deletePhaseFIPUnassignIssued {
+	if api.floatingIPUnassignCalls != 0 || cluster.Status.DeleteAttempts[destroyFIPBastionKey].Phase != deletePhaseFIPUnassignIntent {
 		t.Fatalf("restart replayed drifted destroy unassign: calls=%d receipt=%#v", api.floatingIPUnassignCalls, cluster.Status.DeleteAttempts[destroyFIPBastionKey])
 	}
 }

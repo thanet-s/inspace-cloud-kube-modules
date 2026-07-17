@@ -16,6 +16,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	kubefake "k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 
@@ -35,6 +36,57 @@ type ambiguousFirewallRelationAPI struct {
 	hiddenReads   int
 	committed     bool
 	mutationCalls int
+}
+
+type blockedFirewallRelationAPI struct {
+	*fakeAPI
+	cancel      context.CancelFunc
+	listCalls   int
+	assignCalls int
+}
+
+type legacyFirewallRelationMigrationAPI struct {
+	*fakeAPI
+	listCalls     int
+	assignCalls   int
+	unassignCalls int
+}
+
+func (a *blockedFirewallRelationAPI) ListFirewalls(ctx context.Context, location string) ([]inspace.Firewall, error) {
+	a.listCalls++
+	return a.fakeAPI.ListFirewalls(ctx, location)
+}
+
+func (a *blockedFirewallRelationAPI) AssignFirewallToVM(context.Context, string, string, string) error {
+	a.assignCalls++
+	if a.cancel != nil {
+		a.cancel()
+	}
+	return inspace.ErrMutationBlocked
+}
+
+func (a *legacyFirewallRelationMigrationAPI) ListFirewalls(
+	ctx context.Context,
+	location string,
+) ([]inspace.Firewall, error) {
+	a.listCalls++
+	return a.fakeAPI.ListFirewalls(ctx, location)
+}
+
+func (a *legacyFirewallRelationMigrationAPI) AssignFirewallToVM(
+	ctx context.Context,
+	location, firewallUUID, vmUUID string,
+) error {
+	a.assignCalls++
+	return a.fakeAPI.AssignFirewallToVM(ctx, location, firewallUUID, vmUUID)
+}
+
+func (a *legacyFirewallRelationMigrationAPI) UnassignFirewallFromVM(
+	ctx context.Context,
+	location, firewallUUID, vmUUID string,
+) error {
+	a.unassignCalls++
+	return a.fakeAPI.UnassignFirewallFromVM(ctx, location, firewallUUID, vmUUID)
 }
 
 func (a *ambiguousFirewallRelationAPI) ListFirewalls(ctx context.Context, location string) ([]inspace.Firewall, error) {
@@ -105,6 +157,58 @@ type firewallRelationOwnerHarness struct {
 	provider        *Provider
 	owner           func(*nodeLoadBalancerController) nodeLoadBalancerFirewallRelationOwner
 	readAnnotations func(context.Context) (map[string]string, error)
+	replaceOwner    func(context.Context) error
+}
+
+type deletedRelationVMReadbackAPI struct {
+	*fakeAPI
+	exact  inspace.VM
+	listed []inspace.VM
+}
+
+func (a *deletedRelationVMReadbackAPI) GetVM(context.Context, string, string) (*inspace.VM, error) {
+	copy := a.exact
+	return &copy, nil
+}
+
+func (a *deletedRelationVMReadbackAPI) ListVMs(context.Context, string) ([]inspace.VM, error) {
+	return append([]inspace.VM(nil), a.listed...), nil
+}
+
+func TestNodeLoadBalancerRelationDeletedVMTombstoneNeedsCanonicalMultiSourceAbsence(t *testing.T) {
+	base := inspace.VM{
+		UUID: testFirewallRelationVMUUID, Status: "Deleted", BillingAccountID: 42, NetworkUUID: testNetworkUUID,
+	}
+	for _, test := range []struct {
+		name       string
+		exact      inspace.VM
+		listed     []inspace.VM
+		members    []string
+		wantAbsent bool
+	}{
+		{name: "canonical absence", exact: base, wantAbsent: true},
+		{name: "still listed", exact: base, listed: []inspace.VM{base}},
+		{name: "still in VPC", exact: base, members: []string{testFirewallRelationVMUUID}},
+		{name: "wrong billing", exact: func() inspace.VM { vm := base; vm.BillingAccountID++; return vm }()},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			api := &deletedRelationVMReadbackAPI{
+				fakeAPI: &fakeAPI{network: &inspace.Network{UUID: testNetworkUUID, VMUUIDs: test.members}},
+				exact:   test.exact, listed: test.listed,
+			}
+			controller := &nodeLoadBalancerController{provider: newTestProvider(t, api)}
+			owned, absent, err := controller.nodeLoadBalancerFirewallRelationVMCloudAuthority(context.Background(), testFirewallRelationVMUUID)
+			if test.wantAbsent {
+				if err != nil || owned || !absent {
+					t.Fatalf("canonical tombstone authority: owned=%t absent=%t err=%v", owned, absent, err)
+				}
+				return
+			}
+			if err == nil || owned || absent {
+				t.Fatalf("non-canonical tombstone authority: owned=%t absent=%t err=%v", owned, absent, err)
+			}
+		})
+	}
 }
 
 // withoutFirewallRelationCloudAuthorityForFenceTest keeps the serialization
@@ -137,6 +241,20 @@ func newFirewallRelationOwnerHarness(t *testing.T, path string, api API) firewal
 				}
 				return stored.Annotations, nil
 			},
+			replaceOwner: func(ctx context.Context) error {
+				stored, err := provider.kubeClient.CoreV1().Services(service.Namespace).Get(ctx, service.Name, metav1.GetOptions{})
+				if err != nil {
+					return err
+				}
+				replacement := stored.DeepCopy()
+				replacement.ResourceVersion = ""
+				replacement.UID = types.UID("replacement-" + string(stored.UID))
+				if err := provider.kubeClient.CoreV1().Services(service.Namespace).Delete(ctx, service.Name, metav1.DeleteOptions{}); err != nil {
+					return err
+				}
+				_, err = provider.kubeClient.CoreV1().Services(service.Namespace).Create(ctx, replacement, metav1.CreateOptions{})
+				return err
+			},
 		}
 	case "public-node-local":
 		service := publicNodeLocalTestService("relation-local", "relation-local-uid", "edge", corev1.ProtocolTCP, 443)
@@ -152,6 +270,20 @@ func newFirewallRelationOwnerHarness(t *testing.T, path string, api API) firewal
 					return nil, err
 				}
 				return stored.Annotations, nil
+			},
+			replaceOwner: func(ctx context.Context) error {
+				stored, err := provider.kubeClient.CoreV1().Services(service.Namespace).Get(ctx, service.Name, metav1.GetOptions{})
+				if err != nil {
+					return err
+				}
+				replacement := stored.DeepCopy()
+				replacement.ResourceVersion = ""
+				replacement.UID = types.UID("replacement-" + string(stored.UID))
+				if err := provider.kubeClient.CoreV1().Services(service.Namespace).Delete(ctx, service.Name, metav1.DeleteOptions{}); err != nil {
+					return err
+				}
+				_, err = provider.kubeClient.CoreV1().Services(service.Namespace).Create(ctx, replacement, metav1.CreateOptions{})
+				return err
 			},
 		}
 	case "shared-shard":
@@ -169,6 +301,21 @@ func newFirewallRelationOwnerHarness(t *testing.T, path string, api API) firewal
 					return nil, err
 				}
 				return stored.GetAnnotations(), nil
+			},
+			replaceOwner: func(ctx context.Context) error {
+				resource := provider.dynamicClient.Resource(nodePoolGVR)
+				stored, err := resource.Get(ctx, shard, metav1.GetOptions{})
+				if err != nil {
+					return err
+				}
+				replacement := stored.DeepCopy()
+				replacement.SetResourceVersion("")
+				replacement.SetUID(types.UID("replacement-" + string(stored.GetUID())))
+				if err := resource.Delete(ctx, shard, metav1.DeleteOptions{}); err != nil {
+					return err
+				}
+				_, err = resource.Create(ctx, replacement, metav1.CreateOptions{})
+				return err
 			},
 		}
 	case "cluster-icmp":
@@ -192,6 +339,21 @@ func newFirewallRelationOwnerHarness(t *testing.T, path string, api API) firewal
 					return nil, err
 				}
 				return stored.GetAnnotations(), nil
+			},
+			replaceOwner: func(ctx context.Context) error {
+				resource := provider.dynamicClient.Resource(nodeClassGVR)
+				stored, err := resource.Get(ctx, name, metav1.GetOptions{})
+				if err != nil {
+					return err
+				}
+				replacement := stored.DeepCopy()
+				replacement.SetResourceVersion("")
+				replacement.SetUID(types.UID("replacement-" + string(stored.GetUID())))
+				if err := resource.Delete(ctx, name, metav1.DeleteOptions{}); err != nil {
+					return err
+				}
+				_, err = resource.Create(ctx, replacement, metav1.CreateOptions{})
+				return err
 			},
 		}
 	default:
@@ -958,7 +1120,7 @@ func (a *postCASFirewallAuthorityRaceAPI) UnassignFirewallFromVM(
 	return a.fakeAPI.UnassignFirewallFromVM(ctx, location, firewallUUID, vmUUID)
 }
 
-func TestNodeLoadBalancerFirewallRelationPostCASAuthorityDriftBlocksDispatch(t *testing.T) {
+func TestNodeLoadBalancerFirewallRelationPostCASAuthorityDriftBlocksDispatchAndClearsReceipt(t *testing.T) {
 	for _, operation := range []nodeLoadBalancerFirewallRelationOperation{
 		nodeLoadBalancerFirewallRelationAssign,
 		nodeLoadBalancerFirewallRelationUnassign,
@@ -1006,11 +1168,38 @@ func TestNodeLoadBalancerFirewallRelationPostCASAuthorityDriftBlocksDispatch(t *
 				stored := getNodeLoadBalancerTestService(
 					t, fixture.ctx, fixture.provider, fixture.service.Namespace, fixture.service.Name,
 				)
-				if stored.Annotations[annotationNodeLoadBalancerFirewallRelationIssued] == "" {
-					t.Fatalf("rejected post-CAS authority cleared its durable issue fence: %#v", stored.Annotations)
+				if stored.Annotations[annotationNodeLoadBalancerFirewallRelationIssued] != "" {
+					t.Fatalf("rejected post-CAS authority retained a proven-undispatched issue fence: %#v", stored.Annotations)
 				}
 			})
 		}
+	}
+}
+
+func TestNodeLoadBalancerFirewallRelationMissingIssueAuthorityClearsUndispatchedReceipt(t *testing.T) {
+	ctx := context.Background()
+	service := nodeLoadBalancerTestService("relation-missing-firewall", "relation-missing-firewall-uid", corev1.ProtocolTCP, 443)
+	api := &fakeAPI{}
+	provider := newTestProvider(t, api)
+	provider.kubeClient = kubefake.NewSimpleClientset(service.DeepCopy())
+	controller := &nodeLoadBalancerController{provider: provider}
+	converged, err := controller.reconcileNodeLoadBalancerFirewallRelation(
+		ctx,
+		withoutFirewallRelationCloudAuthorityForFenceTest(controller.serviceFirewallRelationOwner(service)),
+		&nodeLoadBalancerFirewallRelationFence{
+			operation: nodeLoadBalancerFirewallRelationAssign, firewallUUID: testFirewallRelationFirewallUUID,
+			vmUUID: testFirewallRelationVMUUID,
+		},
+	)
+	if err == nil || converged {
+		t.Fatalf("missing firewall issue authority: converged=%t err=%v", converged, err)
+	}
+	if len(api.assignedFirewalls) != 0 {
+		t.Fatalf("missing firewall crossed AssignFirewallToVM: %v", api.assignedFirewalls)
+	}
+	stored := getNodeLoadBalancerTestService(t, ctx, provider, service.Namespace, service.Name)
+	if stored.Annotations[annotationNodeLoadBalancerFirewallRelationIssued] != "" {
+		t.Fatalf("missing firewall retained proven-undispatched receipt: %#v", stored.Annotations)
 	}
 }
 
@@ -1104,8 +1293,8 @@ func TestShardFirewallRelationAssignRejectsPostCASLedgerAndOwnerDrift(t *testing
 			if err != nil {
 				t.Fatal(err)
 			}
-			if current.GetAnnotations()[annotationNodeLoadBalancerFirewallRelationIssued] == "" {
-				t.Fatal("rejected relation assignment cleared its issued receipt")
+			if current.GetAnnotations()[annotationNodeLoadBalancerFirewallRelationIssued] != "" {
+				t.Fatal("rejected relation assignment retained its proven-undispatched receipt")
 			}
 		})
 	}
@@ -1152,8 +1341,8 @@ func TestClusterICMPRelationAssignRejectsDeletingNodeClass(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if stored.GetAnnotations()[annotationNodeLoadBalancerFirewallRelationIssued] == "" {
-		t.Fatal("rejected ICMP assignment cleared its issued receipt")
+	if stored.GetAnnotations()[annotationNodeLoadBalancerFirewallRelationIssued] != "" {
+		t.Fatal("rejected ICMP assignment retained its proven-undispatched receipt")
 	}
 }
 
@@ -1241,6 +1430,181 @@ func TestNodeLoadBalancerFirewallRelationHTTPErrorAndReadFailureRetainFence(t *t
 	}
 }
 
+func TestNodeLoadBalancerFirewallRelationMutationBlockedClearsWithoutReadback(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	service := nodeLoadBalancerTestService("relation-blocked", "relation-blocked-uid", corev1.ProtocolTCP, 443)
+	api := &blockedFirewallRelationAPI{
+		fakeAPI: &fakeAPI{firewalls: []inspace.Firewall{{UUID: testFirewallRelationFirewallUUID}}},
+		cancel:  cancel,
+	}
+	provider := newTestProvider(t, api)
+	provider.kubeClient = kubefake.NewSimpleClientset(service.DeepCopy())
+	controller := &nodeLoadBalancerController{provider: provider}
+	converged, err := controller.reconcileNodeLoadBalancerFirewallRelation(
+		ctx,
+		withoutFirewallRelationCloudAuthorityForFenceTest(controller.serviceFirewallRelationOwner(service)),
+		&nodeLoadBalancerFirewallRelationFence{
+			operation:    nodeLoadBalancerFirewallRelationAssign,
+			firewallUUID: testFirewallRelationFirewallUUID,
+			vmUUID:       testFirewallRelationVMUUID,
+		},
+	)
+	if converged || !errors.Is(err, inspace.ErrMutationBlocked) {
+		t.Fatalf("blocked relation mutation result: converged=%t err=%v", converged, err)
+	}
+	if api.assignCalls != 1 || api.listCalls != 1 {
+		t.Fatalf("blocked relation mutation calls: assign=%d list=%d, want 1/1", api.assignCalls, api.listCalls)
+	}
+	stored := getNodeLoadBalancerTestService(t, context.Background(), provider, service.Namespace, service.Name)
+	if stored.Annotations[annotationNodeLoadBalancerFirewallRelationIssued] != "" ||
+		stored.Annotations[annotationNodeLoadBalancerFirewallRelationOwnerUID] != "" {
+		t.Fatalf("blocked relation mutation retained UID-pinned receipt: %#v", stored.Annotations)
+	}
+}
+
+func TestNodeLoadBalancerFirewallRelationLegacyReceiptBindsExactOwnerWithoutCloudIO(t *testing.T) {
+	legacy := nodeLoadBalancerFirewallRelationFence{
+		operation:    nodeLoadBalancerFirewallRelationAssign,
+		firewallUUID: testFirewallRelationFirewallUUID,
+		vmUUID:       testFirewallRelationVMUUID,
+		issueID:      "0123456789abcdef0123456789abcdef",
+		issuedAt:     "2026-07-17T00:00:00Z",
+	}
+	for _, path := range []string{"per-service", "shared-shard", "cluster-icmp"} {
+		for _, replaceOwner := range []bool{false, true} {
+			name := path + "/live-owner"
+			if replaceOwner {
+				name = path + "/same-name-replacement"
+			}
+			t.Run(name, func(t *testing.T) {
+				ctx := context.Background()
+				api := &legacyFirewallRelationMigrationAPI{
+					fakeAPI: &fakeAPI{firewalls: []inspace.Firewall{{UUID: testFirewallRelationFirewallUUID}}},
+				}
+				harness := newFirewallRelationOwnerHarness(t, path, api)
+				controller := &nodeLoadBalancerController{provider: harness.provider}
+				originalOwner := harness.owner(controller)
+				original, err := originalOwner.read(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				values := copyNodeLoadBalancerAnnotations(original.annotations)
+				values[annotationNodeLoadBalancerFirewallRelationIssued] = legacy.String()
+				delete(values, annotationNodeLoadBalancerFirewallRelationOwnerUID)
+				if err := original.commit(ctx, values); err != nil {
+					t.Fatal(err)
+				}
+
+				owner := originalOwner
+				if replaceOwner {
+					if err := harness.replaceOwner(ctx); err != nil {
+						t.Fatal(err)
+					}
+					if path == "per-service" {
+						current, err := harness.provider.kubeClient.CoreV1().Services("default").Get(
+							ctx,
+							"relation-service",
+							metav1.GetOptions{},
+						)
+						if err != nil {
+							t.Fatal(err)
+						}
+						owner = withoutFirewallRelationCloudAuthorityForFenceTest(
+							controller.serviceFirewallRelationOwner(current),
+						)
+					} else {
+						owner = harness.owner(controller)
+					}
+				}
+				beforeMigration, err := owner.read(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if replaceOwner && beforeMigration.uid == original.uid {
+					t.Fatalf("same-name owner replacement retained UID %q", original.uid)
+				}
+
+				converged, err := controller.reconcileNodeLoadBalancerFirewallRelation(ctx, owner, nil)
+				if err != nil || converged {
+					t.Fatalf("legacy receipt migration: converged=%t err=%v", converged, err)
+				}
+				if api.listCalls != 0 || api.assignCalls != 0 || api.unassignCalls != 0 {
+					t.Fatalf(
+						"legacy receipt migration crossed cloud API: list=%d assign=%d unassign=%d",
+						api.listCalls,
+						api.assignCalls,
+						api.unassignCalls,
+					)
+				}
+				afterMigration, err := owner.read(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if afterMigration.uid != beforeMigration.uid ||
+					afterMigration.annotations[annotationNodeLoadBalancerFirewallRelationIssued] != legacy.String() ||
+					afterMigration.annotations[annotationNodeLoadBalancerFirewallRelationOwnerUID] != string(beforeMigration.uid) {
+					t.Fatalf(
+						"legacy receipt was not bound to exact live owner: before=%q after=%q annotations=%#v",
+						beforeMigration.uid,
+						afterMigration.uid,
+						afterMigration.annotations,
+					)
+				}
+			})
+		}
+	}
+}
+
+func TestNodeLoadBalancerFirewallRelationSameNameOwnerReplacementBlocksDispatch(t *testing.T) {
+	for _, path := range []string{"per-service", "public-node-local", "shared-shard", "cluster-icmp"} {
+		t.Run(path, func(t *testing.T) {
+			ctx := context.Background()
+			api := &fakeAPI{firewalls: []inspace.Firewall{{UUID: testFirewallRelationFirewallUUID}}}
+			harness := newFirewallRelationOwnerHarness(t, path, api)
+			controller := &nodeLoadBalancerController{provider: harness.provider}
+			owner := harness.owner(controller)
+			owner.authorize = func(context.Context, nodeLoadBalancerFirewallRelationFence, inspace.Firewall) error {
+				return harness.replaceOwner(ctx)
+			}
+			converged, err := controller.reconcileNodeLoadBalancerFirewallRelation(
+				ctx,
+				owner,
+				&nodeLoadBalancerFirewallRelationFence{
+					operation:    nodeLoadBalancerFirewallRelationAssign,
+					firewallUUID: testFirewallRelationFirewallUUID,
+					vmUUID:       testFirewallRelationVMUUID,
+				},
+			)
+			if err == nil || converged {
+				t.Fatalf("same-name owner replacement result: converged=%t err=%v", converged, err)
+			}
+			if len(api.assignedFirewalls) != 0 {
+				t.Fatalf("same-name owner replacement crossed AssignFirewallToVM: %v", api.assignedFirewalls)
+			}
+			annotations, readErr := harness.readAnnotations(ctx)
+			if readErr != nil {
+				t.Fatal(readErr)
+			}
+			if annotations[annotationNodeLoadBalancerFirewallRelationIssued] == "" ||
+				annotations[annotationNodeLoadBalancerFirewallRelationOwnerUID] == "" {
+				t.Fatalf("replacement did not preserve the stale UID-pinned receipt: %#v", annotations)
+			}
+
+			restarted := &nodeLoadBalancerController{provider: harness.provider}
+			if converged, err = restarted.reconcileNodeLoadBalancerFirewallRelation(
+				ctx,
+				harness.owner(restarted),
+				nil,
+			); err == nil || converged {
+				t.Fatalf("replacement accepted the predecessor receipt after restart: converged=%t err=%v", converged, err)
+			}
+			if len(api.assignedFirewalls) != 0 {
+				t.Fatalf("restart crossed AssignFirewallToVM after owner replacement: %v", api.assignedFirewalls)
+			}
+		})
+	}
+}
+
 func TestNodeLoadBalancerFirewallRelationDefinitiveFailureCannotClearReplacementAttempt(t *testing.T) {
 	ctx := context.Background()
 	service := nodeLoadBalancerTestService("relation-aba", "relation-aba-uid", corev1.ProtocolTCP, 443)
@@ -1279,6 +1643,108 @@ func TestNodeLoadBalancerFirewallRelationDefinitiveFailureCannotClearReplacement
 	stored := getNodeLoadBalancerTestService(t, ctx, provider, service.Namespace, service.Name)
 	if stored.Annotations[annotationNodeLoadBalancerFirewallRelationIssued] != replacement.String() {
 		t.Fatalf("replacement relation attempt was cleared: %#v", stored.Annotations)
+	}
+}
+
+func TestNodeLoadBalancerFirewallRelationFinalReceiptDriftBlocksDispatchAndPreservesReplacement(t *testing.T) {
+	ctx := context.Background()
+	service := nodeLoadBalancerTestService("relation-final-receipt", "relation-final-receipt-uid", corev1.ProtocolTCP, 443)
+	api := &fakeAPI{firewalls: []inspace.Firewall{{UUID: testFirewallRelationFirewallUUID}}}
+	provider := newTestProvider(t, api)
+	provider.kubeClient = kubefake.NewSimpleClientset(service.DeepCopy())
+	controller := &nodeLoadBalancerController{provider: provider}
+	replacement := nodeLoadBalancerFirewallRelationFence{
+		operation: nodeLoadBalancerFirewallRelationAssign, firewallUUID: testFirewallRelationFirewallUUID,
+		vmUUID: "73333333-2222-4333-8444-555555555555", issueID: "0123456789abcdef0123456789abcdef",
+		issuedAt: "2026-07-17T00:00:00Z",
+	}
+	owner := withoutFirewallRelationCloudAuthorityForFenceTest(controller.serviceFirewallRelationOwner(service))
+	owner.authorize = func(context.Context, nodeLoadBalancerFirewallRelationFence, inspace.Firewall) error {
+		current, err := provider.kubeClient.CoreV1().Services(service.Namespace).Get(ctx, service.Name, metav1.GetOptions{})
+		if err != nil {
+			return err
+		}
+		current.Annotations[annotationNodeLoadBalancerFirewallRelationIssued] = replacement.String()
+		_, err = provider.kubeClient.CoreV1().Services(service.Namespace).Update(ctx, current, metav1.UpdateOptions{})
+		return err
+	}
+	converged, err := controller.reconcileNodeLoadBalancerFirewallRelation(
+		ctx,
+		owner,
+		&nodeLoadBalancerFirewallRelationFence{
+			operation: nodeLoadBalancerFirewallRelationAssign, firewallUUID: testFirewallRelationFirewallUUID,
+			vmUUID: testFirewallRelationVMUUID,
+		},
+	)
+	if err == nil || converged || !strings.Contains(err.Error(), "exact issued receipt changed") {
+		t.Fatalf("final receipt drift result: converged=%t err=%v", converged, err)
+	}
+	if len(api.assignedFirewalls) != 0 {
+		t.Fatalf("final receipt drift crossed AssignFirewallToVM: %v", api.assignedFirewalls)
+	}
+	stored := getNodeLoadBalancerTestService(t, ctx, provider, service.Namespace, service.Name)
+	if got := stored.Annotations[annotationNodeLoadBalancerFirewallRelationIssued]; got != replacement.String() {
+		t.Fatalf("replacement receipt = %q, want %q", got, replacement.String())
+	}
+}
+
+func TestNodeLoadBalancerFirewallRelationClearUsesBoundedDetachedContext(t *testing.T) {
+	ownerUID := types.UID("canceled-context-owner")
+	issued := nodeLoadBalancerFirewallRelationFence{
+		operation:    nodeLoadBalancerFirewallRelationAssign,
+		firewallUUID: testFirewallRelationFirewallUUID,
+		vmUUID:       testFirewallRelationVMUUID,
+		issueID:      "0123456789abcdef0123456789abcdef",
+		issuedAt:     "2026-07-17T00:00:00Z",
+	}
+	annotations := map[string]string{
+		annotationNodeLoadBalancerFirewallRelationIssued:   issued.String(),
+		annotationNodeLoadBalancerFirewallRelationOwnerUID: string(ownerUID),
+	}
+	sawDeadline := false
+	checkContext := func(ctx context.Context) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		deadline, ok := ctx.Deadline()
+		if !ok || time.Until(deadline) <= 0 || time.Until(deadline) > durableReceiptWriteTimeout {
+			return errors.New("firewall relation receipt cleanup lacks a live bounded context")
+		}
+		sawDeadline = true
+		return nil
+	}
+	owner := nodeLoadBalancerFirewallRelationOwner{
+		description: "canceled-context fixture",
+		read: func(ctx context.Context) (nodeLoadBalancerFirewallRelationOwnerSnapshot, error) {
+			if err := checkContext(ctx); err != nil {
+				return nodeLoadBalancerFirewallRelationOwnerSnapshot{}, err
+			}
+			return nodeLoadBalancerFirewallRelationOwnerSnapshot{
+				annotations: copyNodeLoadBalancerAnnotations(annotations),
+				uid:         ownerUID,
+				commit: func(ctx context.Context, values map[string]string) error {
+					if err := checkContext(ctx); err != nil {
+						return err
+					}
+					annotations = copyNodeLoadBalancerAnnotations(values)
+					return nil
+				},
+			}, nil
+		},
+	}
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := clearNodeLoadBalancerFirewallRelationFence(canceled, owner, ownerUID, issued); err != nil {
+		t.Fatalf("clear receipt with canceled reconcile context: %v", err)
+	}
+	if !sawDeadline {
+		t.Fatal("firewall relation receipt cleanup did not expose a finite deadline")
+	}
+	if annotations[annotationNodeLoadBalancerFirewallRelationIssued] != "" {
+		t.Fatalf("canceled-context receipt cleanup retained annotation: %#v", annotations)
+	}
+	if annotations[annotationNodeLoadBalancerFirewallRelationOwnerUID] != "" {
+		t.Fatalf("canceled-context receipt cleanup retained owner UID: %#v", annotations)
 	}
 }
 

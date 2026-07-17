@@ -730,7 +730,7 @@ func TestStandardNLBCreateRechecksDeterministicAbsenceAfterIssue(t *testing.T) {
 				if err == nil || observed != nil || changed {
 					t.Fatalf("foreign post-issue appearance: observed=%#v changed=%t err=%v", observed, changed, err)
 				}
-				assertIssuedStandardNLBFence(t, inner, service, standardNLBCreateLoadBalancer)
+				assertNoStandardNLBFence(t, inner, service)
 			}
 		})
 
@@ -763,7 +763,7 @@ func TestStandardNLBCreateRechecksDeterministicAbsenceAfterIssue(t *testing.T) {
 				if err == nil || observed != nil {
 					t.Fatalf("foreign post-issue floating IP: observed=%#v err=%v", observed, err)
 				}
-				assertIssuedStandardNLBFence(t, inner, service, standardNLBCreateFloatingIP)
+				assertNoStandardNLBFence(t, inner, service)
 			}
 		})
 	}
@@ -868,7 +868,7 @@ func TestStandardNLBPostIssueAuthorityDriftBlocksEveryMutationClass(t *testing.T
 				(len(base.floatingIPs) != 0 && base.floatingIPs[0].AssignedTo != floatingIP.AssignedTo) {
 				t.Fatalf("post-issue drift crossed cloud boundary: %#v", base)
 			}
-			assertIssuedStandardNLBFence(t, inner, service, operation)
+			assertNoStandardNLBFence(t, inner, service)
 		})
 	}
 }
@@ -954,7 +954,7 @@ func TestStandardNLBAdditiveMutationsRejectServiceWithdrawalAfterIssue(t *testin
 				len(base.addedTargets) != 0 || len(base.addedRules) != 0 {
 				t.Fatalf("withdrawn Service crossed cloud boundary: %#v", base)
 			}
-			assertIssuedStandardNLBFence(t, inner, service, operation)
+			assertNoStandardNLBFence(t, inner, service)
 		})
 	}
 }
@@ -1044,7 +1044,7 @@ func TestStandardNLBDestructiveMutationsRejectReaddedLiveIntentAfterIssue(t *tes
 				len(base.deletedIPs) != 0 || len(base.deletedLBs) != 0 {
 				t.Fatalf("re-added live intent crossed cloud boundary: %#v", base)
 			}
-			assertIssuedStandardNLBFence(t, inner, service, operation)
+			assertNoStandardNLBFence(t, inner, service)
 		})
 	}
 }
@@ -1116,7 +1116,7 @@ func TestStandardNLBAddTargetRechecksKubernetesEligibilityAfterIssue(t *testing.
 			if len(base.addedTargets) != 0 || len(base.lbs[0].Targets) != 0 {
 				t.Fatalf("post-issue target ineligibility mutated cloud state: calls=%v targets=%#v", base.addedTargets, base.lbs[0].Targets)
 			}
-			assertIssuedStandardNLBFence(t, inner, service, standardNLBAddTarget)
+			assertNoStandardNLBFence(t, inner, service)
 		})
 	}
 }

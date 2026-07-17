@@ -42,6 +42,12 @@ func TestManagedNodeLoadBalancerCanonicalVMAndVPCProofBlocksAdvertisement(t *tes
 		wantError bool
 	}{
 		{
+			name: "HTTP 200 deleted VM tombstone",
+			mutate: func(t *testing.T, fixture *nodeLoadBalancerFailClosedFixture) {
+				managedNodeLoadBalancerFixtureVM(t, fixture).Status = "Deleted"
+			},
+		},
+		{
 			name: "zero VM billing",
 			mutate: func(t *testing.T, fixture *nodeLoadBalancerFailClosedFixture) {
 				managedNodeLoadBalancerFixtureVM(t, fixture).BillingAccountID = 0

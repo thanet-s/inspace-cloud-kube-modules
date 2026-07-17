@@ -206,7 +206,7 @@ remain separate. An unconditional cleanup block removes the Services,
 datapath children, NodePools, NodeClaims, nodes, aggregate and ICMP firewalls,
 VMs, FIPs, workload, and generated NodeClass through that finalizer-safe
 cleanup path. The global
-ICMP firewall must be absent and the complete billable-resource inventory must
+ICMP firewall must be absent and the complete cloud-resource inventory must
 equal its pre-Node-LB snapshot. The deployments, PVC, private Services,
 cluster, and general worker remain available to later checks or a preserved
 phased run.
@@ -245,13 +245,18 @@ FIP remain, and only then deletes the static capacity and NodeClass.
 
 ## Safety and cleanup
 
-Use only a new, empty, isolated billing account. Before its first mutation the
-suite captures every API-visible VM, firewall, floating IP, load balancer, and
-disk in every location returned by the authoritative location inventory and
-requires all five inventories to be empty. Cleanup must make the full
-cross-location account inventory exactly equal that persisted baseline, in addition to its
-deterministic ownership audit. A malformed or unidentifiable active API item
-is fatal rather than silently ignored.
+Use only a new, isolated billing account with the prepared VPC and no billable
+workload resources. Before its first mutation the suite captures every
+API-visible VM, private network, firewall, floating IP, load balancer, and disk
+in every location returned by the authoritative location inventory, plus the
+global object-storage bucket and managed-service-package inventories. VMs,
+firewalls, FIPs, NLBs, disks, buckets, and service packages must all be empty;
+the configured user-owned VPC must be the account's only active private network
+and is retained as immutable baseline state. Cleanup
+must make the full account inventory exactly equal that persisted baseline, in
+addition to its deterministic ownership audit. Rows explicitly marked
+`is_deleted: true` or `status: deleted` are tombstones; every other malformed
+or unidentifiable item is fatal rather than silently ignored.
 
 Before a repeat `test` captures its temporary Node-LB baseline, it requires the
 active NLB UUID set to equal the immutable pre-mutation account baseline

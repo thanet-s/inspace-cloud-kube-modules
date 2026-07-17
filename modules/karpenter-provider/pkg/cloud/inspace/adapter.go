@@ -53,7 +53,13 @@ const (
 	defaultDestructiveAbsenceTimeout      = 5 * time.Minute
 	defaultDestructiveAbsenceReadInterval = 30 * time.Second
 	destructiveAbsenceConfirmations       = 3
-	canonicalVMReadConcurrency            = 8
+	// A complete launch rollback has five independently bounded destructive
+	// phases: exact delete preflight, core VM absence, FIP removal, final VM/FIP
+	// absence, and firewall-relation removal. Keep one additional window for
+	// ownership/CAS/API work between those phases so an earlier near-timeout
+	// phase cannot consume the deadline required by a later safety audit.
+	destructiveCleanupWindowCount = 6
+	canonicalVMReadConcurrency    = 8
 )
 
 var (
@@ -460,7 +466,10 @@ func (a *Adapter) CreateVM(ctx context.Context, request cloudapi.CreateVMRequest
 		}
 		postCASVM, postCASOwnership, postCASErr := a.postAuthorizeLaunchPreflight(ctx, request, record, networkPrefix)
 		if postCASErr != nil {
-			return nil, errors.Join(cloudapi.ErrCreateAttemptPending,
+			// AuthorizeLaunch completed its issue CAS, but this invocation has not
+			// called CreateVM. ErrCreateAttemptRejected tells the provider to CAS
+			// that exact attempt into its terminal no-dispatch state.
+			return nil, errors.Join(cloudapi.ErrCreateAttemptRejected,
 				fmt.Errorf("fresh post-authorization launch preflight blocked VM POST: %w", postCASErr))
 		}
 		if postCASVM != nil {
@@ -615,6 +624,9 @@ func (a *Adapter) ensureFencedCreateAnchorOwnership(ctx context.Context, request
 				record.FloatingIPName != floatingIPName(request.ClusterName, request.NodeClaimName) {
 				return fmt.Errorf("%w: fenced VM %s does not match its exact durable launch binding", cloudapi.ErrOwnershipMismatch, request.CreatedVMUUID)
 			} else {
+				if validationErr := validateActiveEstablishedLaunchIdentity(*vm, record); validationErr != nil {
+					return fmt.Errorf("fenced VM %s active launch identity: %w", request.CreatedVMUUID, validationErr)
+				}
 				return nil
 			}
 		}
@@ -967,10 +979,36 @@ func (a *Adapter) reconcileFencedCleanupReceipts(ctx context.Context, request cl
 	return nil
 }
 
+// newDestructiveCleanupContext preserves bounded, detached launch cleanup while
+// reserving a complete timeout window for every sequential destructive phase.
+// Production absence requires three observations spaced 30 seconds apart, so
+// the shorter best-effort launch discovery budget must never become a parent
+// deadline for a later VM, FIP, or firewall safety audit.
+func (a *Adapter) newDestructiveCleanupContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	minimum := destructiveCleanupWindowCount * a.destructiveAbsenceTimeout
+	timeout := a.launchCleanupTimeout
+	if timeout < minimum {
+		timeout = minimum
+	}
+	return context.WithTimeout(context.WithoutCancel(ctx), timeout)
+}
+
+// newFloatingIPRemovalContext gives destructive FIP convergence its complete
+// safety window but still returns control to cleanupLaunch when an address is
+// persistently visible, leaving the outer window for final VM/firewall audit.
+func (a *Adapter) newFloatingIPRemovalContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	timeout := a.launchFloatingIPCleanupTimeout
+	if timeout < a.destructiveAbsenceTimeout {
+		timeout = a.destructiveAbsenceTimeout
+	}
+	return context.WithTimeout(ctx, timeout)
+}
+
 func (a *Adapter) reconcileFencedCreatedVMAnchor(ctx context.Context, request cloudapi.FencedCreateCleanupRequest, hasReceipt bool) (*cloudapi.FencedCreateCleanupResolution, error) {
-	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), a.launchCleanupTimeout)
+	cleanupCtx, cancel := a.newDestructiveCleanupContext(ctx)
 	defer cancel()
-	_, anchorMissing, anchorReadErr := a.readVMForDelete(cleanupCtx, request.Location, request.NetworkUUID, request.CreatedVMUUID)
+	tombstoneVerifier := newFencedCleanupDeletedVMTombstoneVerifier(request, request.CreatedVMUUID)
+	_, anchorMissing, anchorReadErr := a.readVMForDeleteWithTombstone(cleanupCtx, request.Location, request.NetworkUUID, request.CreatedVMUUID, tombstoneVerifier)
 	if anchorReadErr != nil {
 		return nil, fmt.Errorf("reading anchored VM %s before cleanup: %w", request.CreatedVMUUID, anchorReadErr)
 	}
@@ -1021,20 +1059,20 @@ func (a *Adapter) reconcileFencedCreatedVMAnchor(ctx context.Context, request cl
 	// snapshot is not authority to dispatch another mutation. A restarted
 	// reconciler may be observing a DELETE that committed despite an error.
 	removalAuthority := cleanupRemovalMutationAuthority(request)
-	_, deleteAuthorization, deleteErr := a.deleteAnchoredVMIfPresent(cleanupCtx, request.Location, request.NetworkUUID, request.CreatedVMUUID, removalAuthority,
+	_, deleteAuthorization, deleteErr := a.deleteAnchoredVMIfPresent(cleanupCtx, request.Location, request.NetworkUUID, request.CreatedVMUUID, removalAuthority, tombstoneVerifier,
 		func(proofCtx context.Context) error {
 			return a.proveFreshCleanupMutationTarget(proofCtx, request, request.CreatedVMUUID, networkPrefix)
 		})
 	if errors.Is(deleteErr, errRemovalFenceInvalid) {
 		return nil, fmt.Errorf("anchored VM %s has invalid removal authority: %w", request.CreatedVMUUID, deleteErr)
 	}
-	if err := a.waitForVMAbsence(cleanupCtx, request.Location, request.NetworkUUID, request.CreatedVMUUID, "after anchored create rollback"); err != nil {
+	if err := a.waitForAuthorizedVMAbsence(cleanupCtx, request.Location, request.NetworkUUID, request.CreatedVMUUID, "after anchored create rollback", tombstoneVerifier); err != nil {
 		return nil, fmt.Errorf("anchored VM %s deletion has not converged: %w", request.CreatedVMUUID, errors.Join(deleteErr, err))
 	}
 	if err := a.observeRemovalMutation(cleanupCtx, removalAuthority, deleteAuthorization); err != nil {
 		return nil, fmt.Errorf("persisting anchored VM %s deletion: %w", request.CreatedVMUUID, err)
 	}
-	if err := a.detachFirewallAfterVMDeletion(cleanupCtx, request.Location, request.NetworkUUID, request.FirewallUUID, request.CreatedVMUUID, request.BillingAccountID, cleanupBaseFirewallDetachmentAuthority(request)); err != nil {
+	if err := a.detachFirewallAfterVMDeletion(cleanupCtx, request.Location, request.NetworkUUID, request.FirewallUUID, request.CreatedVMUUID, request.BillingAccountID, cleanupBaseFirewallDetachmentAuthority(request), tombstoneVerifier); err != nil {
 		return nil, err
 	}
 	return nil, nil
@@ -1254,6 +1292,12 @@ func (a *Adapter) ensureBaselineTargetFloatingIPName(
 		requestCancel()
 		if readbackErr := readbackCtx.Err(); readbackErr != nil {
 			if floatingIPUpdateIssued(authorization) {
+				if authorization.AllowPOST && !updateAttempted {
+					return sdk.FloatingIP{}, a.rejectUndispatchedFloatingIPUpdate(
+						readbackCtx, authority, authorization, false,
+						fmt.Errorf("baseline target floating IP %s rename stopped before PATCH: %w", assignment.Address, errors.Join(lastObservation, updateErr, readbackErr)),
+					)
+				}
 				return sdk.FloatingIP{}, fmt.Errorf("%w: baseline target floating IP %s rename stopped: %v", cloudapi.ErrCreateAttemptPending, assignment.Address, errors.Join(lastObservation, updateErr, readbackErr))
 			}
 			return sdk.FloatingIP{}, fmt.Errorf("baseline target floating IP %s rename stopped: %w", assignment.Address, errors.Join(lastObservation, updateErr, readbackErr))
@@ -1262,6 +1306,9 @@ func (a *Adapter) ensureBaselineTargetFloatingIPName(
 			lastObservation = fmt.Errorf("listing baseline target floating IP %s: %w", assignment.Address, listErr)
 			if !isRetryableReadback(readbackCtx, listErr) {
 				if floatingIPUpdateIssued(authorization) {
+					if authorization.AllowPOST && !updateAttempted {
+						return sdk.FloatingIP{}, a.rejectUndispatchedFloatingIPUpdate(readbackCtx, authority, authorization, false, lastObservation)
+					}
 					return sdk.FloatingIP{}, fmt.Errorf("%w: %v", cloudapi.ErrCreateAttemptPending, lastObservation)
 				}
 				return sdk.FloatingIP{}, lastObservation
@@ -1270,6 +1317,9 @@ func (a *Adapter) ensureBaselineTargetFloatingIPName(
 			current, present, validationErr := baselineTargetFloatingIP(addresses, assignment, vmUUID, expectedName)
 			if validationErr != nil {
 				if floatingIPUpdateIssued(authorization) {
+					if authorization.AllowPOST && !updateAttempted {
+						return sdk.FloatingIP{}, a.rejectUndispatchedFloatingIPUpdate(readbackCtx, authority, authorization, false, validationErr)
+					}
 					return sdk.FloatingIP{}, fmt.Errorf("%w: validating issued baseline floating-IP update state: %v", cloudapi.ErrCreateAttemptPending, validationErr)
 				}
 				return sdk.FloatingIP{}, validationErr
@@ -1302,8 +1352,10 @@ func (a *Adapter) ensureBaselineTargetFloatingIPName(
 				if authorization.Fence.Phase == cloudapi.FloatingIPUpdateIssued && authorization.AllowPOST && !updateAttempted {
 					fresh, freshErr := a.proveFreshBaselineFloatingIPUpdateTarget(readbackCtx, location, assignment, vmUUID, expectedName, proveMutationTarget)
 					if freshErr != nil {
-						return sdk.FloatingIP{}, errors.Join(cloudapi.ErrCreateAttemptPending,
-							fmt.Errorf("fresh mutation-target proof blocked baseline floating-IP update for %s: %w", assignment.Address, freshErr))
+						return sdk.FloatingIP{}, a.rejectUndispatchedFloatingIPUpdate(
+							readbackCtx, authority, authorization, false,
+							fmt.Errorf("fresh mutation-target proof blocked baseline floating-IP update for %s: %w", assignment.Address, freshErr),
+						)
 					}
 					current = fresh
 					if current.Name == expectedName {
@@ -1340,6 +1392,12 @@ func (a *Adapter) ensureBaselineTargetFloatingIPName(
 		}
 		if err := waitForReadback(readbackCtx, readbackDelay); err != nil {
 			if authority.fenced && authorization != nil && authorization.Fence.Phase == cloudapi.FloatingIPUpdateIssued {
+				if authorization.AllowPOST && !updateAttempted {
+					return sdk.FloatingIP{}, a.rejectUndispatchedFloatingIPUpdate(
+						readbackCtx, authority, authorization, false,
+						fmt.Errorf("baseline target floating IP %s rename did not reach PATCH: %w", assignment.Address, errors.Join(lastObservation, updateErr, err)),
+					)
+				}
 				return sdk.FloatingIP{}, fmt.Errorf("%w: baseline target floating IP %s rename did not converge: %v", cloudapi.ErrCreateAttemptPending, assignment.Address, errors.Join(lastObservation, updateErr, err))
 			}
 			return sdk.FloatingIP{}, fmt.Errorf("baseline target floating IP %s rename did not converge: %w", assignment.Address, errors.Join(lastObservation, updateErr, err))
@@ -1904,7 +1962,7 @@ func (a *Adapter) proveFreshLiveDeleteMutationTarget(
 			(identity.BillingAccountID > 0 && actual.BillingAccountID != identity.BillingAccountID) {
 			return fmt.Errorf("%w: canonical delete ownership/billing binding changed", cloudapi.ErrOwnershipMismatch)
 		}
-		if err := validateEstablishedLaunchIdentity(*vm, actual); err != nil {
+		if err := validateActiveEstablishedLaunchIdentity(*vm, actual); err != nil {
 			return err
 		}
 		return nil
@@ -2032,7 +2090,7 @@ func (a *Adapter) cleanupProvenAutoLaunch(ctx context.Context, request cloudapi.
 		discoveryErr = fmt.Errorf("auto-reserved floating IP for VM %s has no exact durable name/address/account cleanup anchor", vmUUID)
 	}
 	return a.cleanupLaunchWithoutFloatingIP(ctx, request.Location, request.NetworkUUID, request.FirewallUUID, vmUUID, request.BillingAccountID, cause, discoveryErr,
-		createBaseFirewallDetachmentAuthority(request), createRemovalMutationAuthority(request), func(proofCtx context.Context) error {
+		createBaseFirewallDetachmentAuthority(request), createRemovalMutationAuthority(request), newCreateDeletedVMTombstoneVerifier(request, vmUUID), func(proofCtx context.Context) error {
 			return a.proveFreshCreateRemovalMutationTarget(proofCtx, request, vmUUID)
 		})
 }
@@ -2053,26 +2111,35 @@ func (a *Adapter) cleanupFencedLaunch(ctx context.Context, request cloudapi.Crea
 		}
 	}
 	return a.cleanupLaunch(ctx, request.Location, request.NetworkUUID, request.FirewallUUID, vmUUID, request.BillingAccountID, floatingIP, cause,
-		createBaseFirewallDetachmentAuthority(request), createRemovalMutationAuthority(request), func(proofCtx context.Context) error {
+		createBaseFirewallDetachmentAuthority(request), createRemovalMutationAuthority(request), newCreateDeletedVMTombstoneVerifier(request, vmUUID), func(proofCtx context.Context) error {
 			return a.proveFreshCreateRemovalMutationTarget(proofCtx, request, vmUUID)
 		})
 }
 
-func (a *Adapter) cleanupLaunchWithoutFloatingIP(ctx context.Context, location, networkUUID, firewallUUID, vmUUID string, billingAccountID int64, cause, floatingUncertainty error, authority baseFirewallDetachmentAuthority, removalAuthority removalMutationAuthority, proveMutationTarget func(context.Context) error) error {
-	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), a.launchCleanupTimeout)
+func (a *Adapter) cleanupLaunchWithoutFloatingIP(
+	ctx context.Context,
+	location, networkUUID, firewallUUID, vmUUID string,
+	billingAccountID int64,
+	cause, floatingUncertainty error,
+	authority baseFirewallDetachmentAuthority,
+	removalAuthority removalMutationAuthority,
+	tombstoneVerifier *deletedVMTombstoneVerifier,
+	proveMutationTarget func(context.Context) error,
+) error {
+	cleanupCtx, cancel := a.newDestructiveCleanupContext(ctx)
 	defer cancel()
 	if err := a.validateBaseFirewallOwnership(cleanupCtx, location, firewallUUID, billingAccountID); err != nil {
 		return errors.Join(cause, fmt.Errorf("authorizing VM %s rollback from base firewall ownership: %w", vmUUID, err))
 	}
 	var errs []error
-	_, deleteAuthorization, vmDeleteErr := a.deleteAnchoredVMIfPresent(cleanupCtx, location, networkUUID, vmUUID, removalAuthority, proveMutationTarget)
+	_, deleteAuthorization, vmDeleteErr := a.deleteAnchoredVMIfPresent(cleanupCtx, location, networkUUID, vmUUID, removalAuthority, tombstoneVerifier, proveMutationTarget)
 	if errors.Is(vmDeleteErr, errRemovalFenceInvalid) {
 		return errors.Join(cause, fmt.Errorf("public VM %s rollback removal authority: %w", vmUUID, vmDeleteErr))
 	}
 	if vmDeleteErr != nil {
 		errs = append(errs, fmt.Errorf("deleting public VM %s without a safe floating IP anchor: %w", vmUUID, vmDeleteErr))
 	}
-	if absenceErr := a.waitForVMAbsence(cleanupCtx, location, networkUUID, vmUUID, "after security-priority launch rollback"); absenceErr != nil {
+	if absenceErr := a.waitForAuthorizedVMAbsence(cleanupCtx, location, networkUUID, vmUUID, "after security-priority launch rollback", tombstoneVerifier); absenceErr != nil {
 		errs = append(errs, fmt.Errorf("cleanup of public VM %s did not prove absence; cloud firewall remains attached: %w", vmUUID, absenceErr))
 		return errors.Join(append([]error{cause, fmt.Errorf("floating IP cleanup remains uncertain: %w", floatingUncertainty)}, errs...)...)
 	}
@@ -2080,7 +2147,7 @@ func (a *Adapter) cleanupLaunchWithoutFloatingIP(ctx context.Context, location, 
 		errs = append(errs, fmt.Errorf("persisting public VM %s rollback deletion: %w", vmUUID, observeErr))
 		return errors.Join(append([]error{cause, fmt.Errorf("floating IP cleanup remains uncertain: %w", floatingUncertainty)}, errs...)...)
 	}
-	if err := a.detachFirewallAfterVMDeletion(cleanupCtx, location, networkUUID, firewallUUID, vmUUID, billingAccountID, authority); err != nil {
+	if err := a.detachFirewallAfterVMDeletion(cleanupCtx, location, networkUUID, firewallUUID, vmUUID, billingAccountID, authority, tombstoneVerifier); err != nil {
 		errs = append(errs, err)
 	}
 	return errors.Join(append([]error{cause, fmt.Errorf("floating IP cleanup remains uncertain after VM deletion: %w", floatingUncertainty)}, errs...)...)
@@ -2247,7 +2314,7 @@ func (a *Adapter) readEstablishedVM(ctx context.Context, location, uuid, cluster
 			case !complete:
 				lastObservation = fmt.Errorf("%w: established worker VM %s lacks complete persisted ownership: %w", cloudapi.ErrOwnershipMismatch, uuid, errPersistedOwnershipIncomplete)
 			default:
-				validationErr := validateEstablishedLaunchIdentity(*vm, record)
+				validationErr := validateActiveEstablishedLaunchIdentity(*vm, record)
 				if validationErr == nil {
 					return vm, record, nil
 				}
@@ -2283,7 +2350,7 @@ func (a *Adapter) ListVMs(ctx context.Context, location, clusterName string) ([]
 			if !complete {
 				return nil, fmt.Errorf("%w: established worker VM %s lacks complete persisted ownership: %w", cloudapi.ErrOwnershipMismatch, vms[i].UUID, errPersistedOwnershipIncomplete)
 			}
-			if err := validateEstablishedLaunchIdentity(vms[i], record); err != nil {
+			if err := validateActiveEstablishedLaunchIdentity(vms[i], record); err != nil {
 				return nil, fmt.Errorf("established worker VM %s launch identity drift: %w", vms[i].UUID, err)
 			}
 			owned = append(owned, ownedVM{vm: vms[i], record: record})
@@ -2430,7 +2497,7 @@ func (a *Adapter) readCanonicalListedVM(ctx context.Context, location, clusterNa
 			return nil, fmt.Errorf("%w: canonical Karpenter ownership for listed VM %s differs from its complete list record", cloudapi.ErrOwnershipMismatch, summary.UUID)
 		}
 		if canonicalRecordComplete && record.Cluster == clusterName {
-			validationErr := validateEstablishedLaunchIdentity(*vm, record)
+			validationErr := validateActiveEstablishedLaunchIdentity(*vm, record)
 			if validationErr == nil {
 				return vm, nil
 			}
@@ -2575,7 +2642,8 @@ func auditEstablishedVMProtection(vm sdk.VM, record ownership, network *sdk.Netw
 
 func (a *Adapter) DeleteVM(ctx context.Context, location, uuid, clusterName, nodeClaimName string, identity cloudapi.DeleteVMIdentity) error {
 	removalAuthority := deleteRemovalMutationAuthority(identity)
-	vm, vmMissing, getErr := a.readVMForDelete(ctx, location, identity.NetworkUUID, uuid)
+	tombstoneVerifier := a.newLiveDeleteDeletedVMTombstoneVerifier(uuid, clusterName, nodeClaimName, identity)
+	vm, vmMissing, getErr := a.readVMForDeleteWithTombstone(ctx, location, identity.NetworkUUID, uuid, tombstoneVerifier)
 	if getErr != nil {
 		return getErr
 	}
@@ -2594,6 +2662,10 @@ func (a *Adapter) DeleteVM(ctx context.Context, location, uuid, clusterName, nod
 		if ownershipErr != nil {
 			return fmt.Errorf("authorizing deletion of VM %s from durable identity: %w", uuid, ownershipErr)
 		}
+		// The active canonical read supplies the strongest possible post-DELETE
+		// tombstone identity: every normalized ownership field must remain
+		// byte-for-byte equal to the exact pre-mutation record.
+		tombstoneVerifier = newOwnedDeletedVMTombstoneVerifier(uuid, record)
 		if record.Schema == ownershipSchema {
 			vip, vipErr := validateControlPlaneVIP(record.ControlPlaneVIP)
 			if vipErr != nil {
@@ -2672,7 +2744,7 @@ func (a *Adapter) DeleteVM(ctx context.Context, location, uuid, clusterName, nod
 	}
 	// First prove only the core VM indexes absent. A stale expected FIP may still
 	// point at the deleted UUID and is intentionally cleaned in the next stage.
-	if absenceErr := a.waitForVMCoreAbsence(ctx, location, effectiveNetworkUUID, uuid, "after delete"); absenceErr != nil {
+	if absenceErr := a.waitForAuthorizedVMCoreAbsence(ctx, location, effectiveNetworkUUID, uuid, "after delete", tombstoneVerifier); absenceErr != nil {
 		if deleteErr != nil {
 			errs = append(errs, fmt.Errorf("deleting VM %s: %w", uuid, deleteErr))
 		}
@@ -2683,7 +2755,7 @@ func (a *Adapter) DeleteVM(ctx context.Context, location, uuid, clusterName, nod
 		return fmt.Errorf("persisting authoritative VM %s deletion: %w", uuid, observeErr)
 	}
 	if floatingIP != nil {
-		if floatingCleanupErr := a.deleteOwnedFloatingIP(ctx, location, effectiveNetworkUUID, *floatingIP, uuid, removalAuthority); floatingCleanupErr != nil {
+		if floatingCleanupErr := a.deleteOwnedFloatingIP(ctx, location, effectiveNetworkUUID, *floatingIP, uuid, removalAuthority, tombstoneVerifier); floatingCleanupErr != nil {
 			// Dependents and firewalls remain intact until every VM index has
 			// converged absent after the canonical VM lifecycle audit.
 			return floatingCleanupErr
@@ -2691,10 +2763,10 @@ func (a *Adapter) DeleteVM(ctx context.Context, location, uuid, clusterName, nod
 	}
 	// Before detaching any firewall, require the core indexes and every active
 	// FIP assignment to agree that the exact VM UUID is gone.
-	if absenceErr := a.waitForVMAbsence(ctx, location, effectiveNetworkUUID, uuid, "after dependent cleanup"); absenceErr != nil {
+	if absenceErr := a.waitForAuthorizedVMAbsence(ctx, location, effectiveNetworkUUID, uuid, "after dependent cleanup", tombstoneVerifier); absenceErr != nil {
 		return absenceErr
 	}
-	if err := a.detachFirewallAfterVMDeletion(ctx, location, effectiveNetworkUUID, baseFirewallUUID, uuid, expectedBillingAccountID, deleteBaseFirewallDetachmentAuthority(identity)); err != nil {
+	if err := a.detachFirewallAfterVMDeletion(ctx, location, effectiveNetworkUUID, baseFirewallUUID, uuid, expectedBillingAccountID, deleteBaseFirewallDetachmentAuthority(identity), tombstoneVerifier); err != nil {
 		errs = append(errs, err)
 	}
 	if len(errs) != 0 {
@@ -2868,6 +2940,135 @@ func validateOrphanDeleteAuthority(identity cloudapi.DeleteVMIdentity, expectedF
 	return nil
 }
 
+// deletedVMTombstoneVerifier is deletion-only authority for treating an exact
+// HTTP-200 VM detail with status Deleted as one negative GetVM observation.
+// The verifier never participates in active/adoption paths. It binds the
+// tombstone to a complete, stable Karpenter ownership record and to external
+// durable identity supplied by the caller; ListVMs and configured-VPC omission
+// are still required separately by the absence helpers.
+type deletedVMTombstoneVerifier struct {
+	uuid           string
+	clusterName    string
+	expectedRecord *ownership
+	validateAnchor func(sdk.VM, ownership) error
+}
+
+func (v *deletedVMTombstoneVerifier) validate(vm sdk.VM) error {
+	if v == nil {
+		return fmt.Errorf("%w: deleted VM tombstone has no exact deletion authority", cloudapi.ErrOwnershipMismatch)
+	}
+	if !vmDeletedTombstone(vm) {
+		return fmt.Errorf("%w: VM %s is not a deleted tombstone", cloudapi.ErrOwnershipMismatch, vm.UUID)
+	}
+	if !strings.EqualFold(vm.UUID, v.uuid) {
+		return fmt.Errorf("%w: deleted VM tombstone UUID %q does not match %q", cloudapi.ErrOwnershipMismatch, vm.UUID, v.uuid)
+	}
+	record, managed, complete, err := inspectOwnershipDescription(vm.Description, v.clusterName)
+	if err != nil {
+		return err
+	}
+	if !managed || !complete {
+		return fmt.Errorf("%w: deleted VM tombstone %s lacks complete Karpenter ownership", cloudapi.ErrOwnershipMismatch, vm.UUID)
+	}
+	if record.BillingAccountID <= 0 || vm.BillingAccountID <= 0 || vm.BillingAccountID != record.BillingAccountID {
+		return fmt.Errorf("%w: deleted VM tombstone %s lacks an exact positive billing binding", cloudapi.ErrOwnershipMismatch, vm.UUID)
+	}
+	if err := validateV2WorkerName(record.Cluster, record.NodeClaim, record.VMName); err != nil {
+		return fmt.Errorf("%w: deleted VM tombstone %s has no deterministic worker name: %v", cloudapi.ErrOwnershipMismatch, vm.UUID, err)
+	}
+	if vm.Name != record.VMName {
+		return fmt.Errorf("%w: deleted VM tombstone name %q does not match owned name %q", cloudapi.ErrOwnershipMismatch, vm.Name, record.VMName)
+	}
+	if err := validateEstablishedLaunchIdentity(vm, record); err != nil {
+		return fmt.Errorf("deleted VM tombstone %s launch identity: %w", vm.UUID, err)
+	}
+	if v.validateAnchor == nil {
+		return fmt.Errorf("%w: deleted VM tombstone %s has no external durable binding", cloudapi.ErrOwnershipMismatch, vm.UUID)
+	}
+	if err := v.validateAnchor(vm, record); err != nil {
+		return err
+	}
+	if v.expectedRecord != nil {
+		if *v.expectedRecord != record {
+			return fmt.Errorf("%w: deleted VM tombstone %s ownership changed between authoritative observations", cloudapi.ErrOwnershipMismatch, vm.UUID)
+		}
+	} else {
+		exact := record
+		v.expectedRecord = &exact
+	}
+	return nil
+}
+
+func newOwnedDeletedVMTombstoneVerifier(uuid string, record ownership) *deletedVMTombstoneVerifier {
+	exact := record
+	return &deletedVMTombstoneVerifier{
+		uuid: uuid, clusterName: record.Cluster, expectedRecord: &exact,
+		validateAnchor: func(_ sdk.VM, actual ownership) error {
+			if actual != exact {
+				return fmt.Errorf("%w: deleted VM tombstone %s differs from the exact pre-DELETE ownership", cloudapi.ErrOwnershipMismatch, uuid)
+			}
+			return nil
+		},
+	}
+}
+
+func newCreateDeletedVMTombstoneVerifier(request cloudapi.CreateVMRequest, uuid string) *deletedVMTombstoneVerifier {
+	return newOwnedDeletedVMTombstoneVerifier(uuid, newOwnership(request))
+}
+
+func newFencedCleanupDeletedVMTombstoneVerifier(request cloudapi.FencedCreateCleanupRequest, uuid string) *deletedVMTombstoneVerifier {
+	return &deletedVMTombstoneVerifier{
+		uuid: uuid, clusterName: request.ClusterName,
+		validateAnchor: func(vm sdk.VM, record ownership) error {
+			if record.Schema != ownershipSchema || record.Cluster != request.ClusterName || record.NodePool != request.NodePoolName ||
+				record.NodeClaim != request.NodeClaimName || record.VMName != request.VMName || record.KeyHash != request.OwnershipKeyHash ||
+				record.SpecHash != request.SpecHash || record.BootstrapHash != request.BootstrapHash || record.FirewallUUID != request.FirewallUUID ||
+				inspacev1.EffectiveFirewallProfile(record.FirewallProfile) != request.FirewallProfile || record.NetworkUUID != request.NetworkUUID ||
+				record.ControlPlaneVIP != request.ControlPlaneVIP || record.PrivateLoadBalancerPoolStart != request.PrivateLoadBalancerPoolStart ||
+				record.PrivateLoadBalancerPoolStop != request.PrivateLoadBalancerPoolStop || record.BillingAccountID != request.BillingAccountID ||
+				record.FloatingIPName != floatingIPName(request.ClusterName, request.NodeClaimName) ||
+				vm.Name != request.VMName || vm.BillingAccountID != request.BillingAccountID {
+				return fmt.Errorf("%w: deleted VM tombstone %s does not match its exact durable fenced-create binding", cloudapi.ErrOwnershipMismatch, uuid)
+			}
+			return nil
+		},
+	}
+}
+
+func (a *Adapter) newLiveDeleteDeletedVMTombstoneVerifier(
+	uuid, clusterName, nodeClaimName string,
+	identity cloudapi.DeleteVMIdentity,
+) *deletedVMTombstoneVerifier {
+	expectedFloatingIPName := floatingIPName(clusterName, nodeClaimName)
+	return &deletedVMTombstoneVerifier{
+		uuid: uuid, clusterName: clusterName,
+		validateAnchor: func(vm sdk.VM, record ownership) error {
+			if record.Cluster != clusterName || record.NodeClaim != nodeClaimName {
+				return fmt.Errorf("%w: deleted VM tombstone %s is not owned by cluster %q and NodeClaim %q", cloudapi.ErrOwnershipMismatch, uuid, clusterName, nodeClaimName)
+			}
+			// A pre-existing tombstone has no active canonical VM read from
+			// which to capture an exact pre-DELETE record. Bind every durable
+			// cleanup coordinate explicitly, including for legacy ownership
+			// schemas whose normal active-delete compatibility path predates
+			// the Kubernetes-side identity receipt.
+			if err := validateDurableDeleteIdentity(identity, expectedFloatingIPName); err != nil {
+				return fmt.Errorf("%w: deleted VM tombstone %s has invalid external durable identity: %v", cloudapi.ErrOwnershipMismatch, uuid, err)
+			}
+			if record.BillingAccountID != identity.BillingAccountID ||
+				record.NetworkUUID == "" || record.NetworkUUID != identity.NetworkUUID ||
+				record.FirewallUUID == "" || record.FirewallUUID != identity.FirewallUUID ||
+				record.FloatingIPName != identity.FloatingIPName ||
+				(record.PublicIPv4 != "" && record.PublicIPv4 != identity.PublicIPv4) {
+				return fmt.Errorf("%w: deleted VM tombstone %s does not match its external durable deletion identity", cloudapi.ErrOwnershipMismatch, uuid)
+			}
+			if _, err := a.validateLiveDeleteAuthority(vm, record, identity, clusterName, nodeClaimName); err != nil {
+				return fmt.Errorf("authorizing deleted VM tombstone %s from durable identity: %w", uuid, err)
+			}
+			return nil
+		},
+	}
+}
+
 func deleteIdentityCoreEmpty(identity cloudapi.DeleteVMIdentity) bool {
 	return identity.FloatingIPName == "" && identity.PublicIPv4 == "" && identity.BillingAccountID == 0 &&
 		identity.NetworkUUID == "" && identity.FirewallUUID == ""
@@ -2909,19 +3110,45 @@ func validateDurableDeleteLookupIdentity(identity cloudapi.DeleteVMIdentity, exp
 	return nil
 }
 
-// waitForVMAbsence is the post-mutation counterpart to readVMForDelete. It
-// never turns a DELETE response into state: three spaced canonical 404s,
-// each corroborated by a valid location-wide list without the UUID, are
-// required before dependent firewall cleanup can begin.
+// waitForVMAbsence is the generic post-mutation counterpart to readVMForDelete.
+// Without exact deletion authority, an HTTP-200 Deleted tombstone remains
+// visible and fail closed.
 func (a *Adapter) waitForVMAbsence(ctx context.Context, location, networkUUID, uuid, phase string) error {
-	return a.waitForVMAbsenceWithDependents(ctx, location, networkUUID, uuid, phase, true)
+	return a.waitForVMAbsenceWithDependents(ctx, location, networkUUID, uuid, phase, true, nil)
 }
 
 func (a *Adapter) waitForVMCoreAbsence(ctx context.Context, location, networkUUID, uuid, phase string) error {
-	return a.waitForVMAbsenceWithDependents(ctx, location, networkUUID, uuid, phase, false)
+	return a.waitForVMAbsenceWithDependents(ctx, location, networkUUID, uuid, phase, false, nil)
 }
 
-func (a *Adapter) waitForVMAbsenceWithDependents(ctx context.Context, location, networkUUID, uuid, phase string, includeFloatingIP bool) error {
+func (a *Adapter) waitForAuthorizedVMAbsence(
+	ctx context.Context,
+	location, networkUUID, uuid, phase string,
+	verifier *deletedVMTombstoneVerifier,
+) error {
+	return a.waitForVMAbsenceWithDependents(ctx, location, networkUUID, uuid, phase, true, verifier)
+}
+
+func (a *Adapter) waitForAuthorizedVMCoreAbsence(
+	ctx context.Context,
+	location, networkUUID, uuid, phase string,
+	verifier *deletedVMTombstoneVerifier,
+) error {
+	return a.waitForVMAbsenceWithDependents(ctx, location, networkUUID, uuid, phase, false, verifier)
+}
+
+// waitForVMAbsenceWithDependents never turns a DELETE response alone into
+// state. It requires three spaced exact-GET negatives, each corroborated by a
+// valid location-wide VM list and configured VPC without the UUID. A canonical
+// HTTP-200 Deleted tombstone is one exact-GET negative only when the caller
+// supplies full immutable deletion authority; generic callers retain the old
+// fail-closed behavior.
+func (a *Adapter) waitForVMAbsenceWithDependents(
+	ctx context.Context,
+	location, networkUUID, uuid, phase string,
+	includeFloatingIP bool,
+	verifier *deletedVMTombstoneVerifier,
+) error {
 	readbackCtx, cancel := context.WithTimeout(ctx, a.destructiveAbsenceTimeout)
 	defer cancel()
 	absenceConfirmations := 0
@@ -2937,6 +3164,7 @@ func (a *Adapter) waitForVMAbsenceWithDependents(ctx context.Context, location, 
 		if readbackErr := readbackCtx.Err(); readbackErr != nil {
 			return fmt.Errorf("VM %s absence %s stopped: %w", uuid, phase, errors.Join(errVMAbsenceUncertain, lastObservation, getErr, readbackErr))
 		}
+		exactAbsent := false
 		switch {
 		case getErr == nil && vm == nil:
 			absenceConfirmations = 0
@@ -2944,8 +3172,15 @@ func (a *Adapter) waitForVMAbsenceWithDependents(ctx context.Context, location, 
 		case getErr == nil && !strings.EqualFold(vm.UUID, uuid):
 			return fmt.Errorf("%w: canonical VM detail UUID %q does not match delete target %q", cloudapi.ErrOwnershipMismatch, vm.UUID, uuid)
 		case getErr == nil:
-			absenceConfirmations = 0
-			lastObservation = fmt.Errorf("VM %s remains visible %s", uuid, phase)
+			if verifier != nil && vmDeletedTombstone(*vm) {
+				if err := verifier.validate(*vm); err != nil {
+					return fmt.Errorf("validating deleted VM tombstone %s %s: %w", uuid, phase, err)
+				}
+				exactAbsent = true
+			} else {
+				absenceConfirmations = 0
+				lastObservation = fmt.Errorf("VM %s remains visible %s", uuid, phase)
+			}
 		case !sdk.IsNotFound(getErr):
 			absenceConfirmations = 0
 			lastObservation = fmt.Errorf("getting VM %s %s: %w", uuid, phase, getErr)
@@ -2953,6 +3188,9 @@ func (a *Adapter) waitForVMAbsenceWithDependents(ctx context.Context, location, 
 				return lastObservation
 			}
 		default:
+			exactAbsent = true
+		}
+		if exactAbsent {
 			requestCtx, requestCancel := context.WithTimeout(readbackCtx, a.networkAttachmentRequestTimeout)
 			listed, listErr := a.api.ListVMs(requestCtx, location)
 			requestCancel()
@@ -3026,11 +3264,21 @@ func (a *Adapter) waitForVMAbsenceWithDependents(ctx context.Context, location, 
 	}
 }
 
-// readVMForDelete never treats one eventually consistent 404 as permission to
-// clean dependent resources. Absence requires three spaced confirmations
-// from both GetVM and the location-wide VM list. If either source still sees
-// the UUID, reads continue within a fixed bound and no mutation is attempted.
+// readVMForDelete is the generic pre-delete reader. Without exact deletion
+// authority, an HTTP-200 Deleted tombstone remains visible and fail closed.
 func (a *Adapter) readVMForDelete(ctx context.Context, location, networkUUID, uuid string) (*sdk.VM, bool, error) {
+	return a.readVMForDeleteWithTombstone(ctx, location, networkUUID, uuid, nil)
+}
+
+// readVMForDeleteWithTombstone requires three spaced exact-GET negatives plus
+// ListVMs/configured-VPC omission before returning missing. A fully verified
+// Deleted tombstone may supply the exact-GET negative; it never bypasses either
+// corroborating index.
+func (a *Adapter) readVMForDeleteWithTombstone(
+	ctx context.Context,
+	location, networkUUID, uuid string,
+	verifier *deletedVMTombstoneVerifier,
+) (*sdk.VM, bool, error) {
 	readbackCtx, cancel := context.WithTimeout(ctx, a.destructiveAbsenceTimeout)
 	defer cancel()
 	absenceConfirmations := 0
@@ -3050,6 +3298,7 @@ func (a *Adapter) readVMForDelete(ctx context.Context, location, networkUUID, uu
 		if readbackErr := readbackCtx.Err(); readbackErr != nil {
 			return nil, false, fmt.Errorf("VM %s delete preflight stopped: %w", uuid, errors.Join(errVMAbsenceUncertain, lastObservation, currentObservation, readbackErr))
 		}
+		exactAbsent := false
 		switch {
 		case getErr == nil && vm == nil:
 			absenceConfirmations = 0
@@ -3057,7 +3306,14 @@ func (a *Adapter) readVMForDelete(ctx context.Context, location, networkUUID, uu
 		case getErr == nil && !strings.EqualFold(vm.UUID, uuid):
 			return nil, false, fmt.Errorf("%w: canonical VM detail UUID %q does not match delete target %q", cloudapi.ErrOwnershipMismatch, vm.UUID, uuid)
 		case getErr == nil:
-			return vm, false, nil
+			if verifier != nil && vmDeletedTombstone(*vm) {
+				if err := verifier.validate(*vm); err != nil {
+					return nil, false, fmt.Errorf("validating deleted VM tombstone %s before delete: %w", uuid, err)
+				}
+				exactAbsent = true
+			} else {
+				return vm, false, nil
+			}
 		case !sdk.IsNotFound(getErr):
 			absenceConfirmations = 0
 			if !isRetryableReadback(readbackCtx, getErr) {
@@ -3065,6 +3321,9 @@ func (a *Adapter) readVMForDelete(ctx context.Context, location, networkUUID, uu
 			}
 			lastObservation = currentObservation
 		default:
+			exactAbsent = true
+		}
+		if exactAbsent {
 			requestCtx, requestCancel := context.WithTimeout(readbackCtx, a.networkAttachmentRequestTimeout)
 			listed, listErr := a.api.ListVMs(requestCtx, location)
 			requestCancel()
@@ -3098,12 +3357,12 @@ func (a *Adapter) readVMForDelete(ctx context.Context, location, networkUUID, uu
 					if networkPresent {
 						absenceConfirmations = 0
 						lastObservation = fmt.Errorf("%w: GetVM/ListVMs omit %s while configured VPC still contains it", cloudapi.ErrOwnershipMismatch, uuid)
-						break
-					}
-					absenceConfirmations++
-					lastObservation = fmt.Errorf("VM %s absence confirmation %d of %d", uuid, absenceConfirmations, destructiveAbsenceConfirmations)
-					if absenceConfirmations == destructiveAbsenceConfirmations {
-						return nil, true, nil
+					} else {
+						absenceConfirmations++
+						lastObservation = fmt.Errorf("VM %s absence confirmation %d of %d", uuid, absenceConfirmations, destructiveAbsenceConfirmations)
+						if absenceConfirmations == destructiveAbsenceConfirmations {
+							return nil, true, nil
+						}
 					}
 				}
 			}
@@ -3124,8 +3383,14 @@ func (a *Adapter) readVMForDelete(ctx context.Context, location, networkUUID, uu
 // authority; readVMForDelete supplies a fresh canonical presence observation.
 // A proved-absent observation is deliberately read-only because it may be the
 // first observation after an ambiguous but committed DELETE.
-func (a *Adapter) deleteAnchoredVMIfPresent(ctx context.Context, location, networkUUID, uuid string, authority removalMutationAuthority, proofs ...func(context.Context) error) (bool, cloudapi.RemovalMutationAuthorization, error) {
-	vm, missing, err := a.readVMForDelete(ctx, location, networkUUID, uuid)
+func (a *Adapter) deleteAnchoredVMIfPresent(
+	ctx context.Context,
+	location, networkUUID, uuid string,
+	authority removalMutationAuthority,
+	tombstoneVerifier *deletedVMTombstoneVerifier,
+	proofs ...func(context.Context) error,
+) (bool, cloudapi.RemovalMutationAuthorization, error) {
+	vm, missing, err := a.readVMForDeleteWithTombstone(ctx, location, networkUUID, uuid, tombstoneVerifier)
 	if err != nil {
 		return false, cloudapi.RemovalMutationAuthorization{}, err
 	}
@@ -3168,11 +3433,12 @@ func (a *Adapter) deleteCanonicalVM(ctx context.Context, location, uuid string, 
 		}
 	} else if authority.complete() || !a.allowUnfencedTestMutations {
 		if proofErr := proveMutationTarget(ctx); proofErr != nil {
-			// The durable issue remains issued but undispatched. Ownership/VPC drift
-			// after the Kubernetes CAS can be transient or UUID reuse; neither permits
-			// rejection or a cloud DELETE against the stale pre-CAS object.
+			// This invocation owns the exact issued slot and has not called the
+			// cloud DELETE. Rejecting that slot permits a fresh CAS after transient
+			// authority drift without replaying any ambiguous cloud request.
+			rejectErr := a.rejectRemovalMutation(ctx, authority, authorization)
 			return authorization, errors.Join(cloudapi.ErrCreateAttemptPending,
-				fmt.Errorf("fresh mutation-target proof blocked VM %s DELETE: %w", uuid, proofErr))
+				fmt.Errorf("fresh mutation-target proof blocked VM %s DELETE: %w", uuid, proofErr), rejectErr)
 		}
 	}
 	requestCtx, cancel := context.WithTimeout(ctx, a.networkAttachmentRequestTimeout)
@@ -3653,6 +3919,9 @@ func validateGeneratedPassword(password string) error {
 }
 
 func validateExisting(vm sdk.VM, request cloudapi.CreateVMRequest, actual, expected ownership) error {
+	if err := rejectDeletedVMForActiveUse(vm); err != nil {
+		return err
+	}
 	normalizedActual, actualPartial, actualErr := normalizeOwnershipLaunchIdentity(actual)
 	normalizedExpected, expectedPartial, expectedErr := normalizeOwnershipLaunchIdentity(expected)
 	if actualErr != nil || expectedErr != nil || actualPartial || expectedPartial || normalizedActual != normalizedExpected ||
@@ -3670,6 +3939,9 @@ func validateExisting(vm sdk.VM, request cloudapi.CreateVMRequest, actual, expec
 func validatePersistedVM(vm sdk.VM, vmUUID string, request cloudapi.CreateVMRequest, expected ownership) error {
 	if !strings.EqualFold(vm.UUID, vmUUID) {
 		return fmt.Errorf("%w: VM detail read-back UUID %q does not match launched VM %q", cloudapi.ErrOwnershipMismatch, vm.UUID, vmUUID)
+	}
+	if err := rejectDeletedVMForActiveUse(vm); err != nil {
+		return err
 	}
 	incomplete := false
 	var actual ownership
@@ -3922,6 +4194,24 @@ func validateEstablishedLaunchIdentity(vm sdk.VM, record ownership) error {
 		return fmt.Errorf("%w: established VM lacks complete launch identity: %w", cloudapi.ErrOwnershipMismatch, errPersistedOwnershipIncomplete)
 	}
 	return nil
+}
+
+func validateActiveEstablishedLaunchIdentity(vm sdk.VM, record ownership) error {
+	if err := rejectDeletedVMForActiveUse(vm); err != nil {
+		return err
+	}
+	return validateEstablishedLaunchIdentity(vm, record)
+}
+
+func rejectDeletedVMForActiveUse(vm sdk.VM) error {
+	if vmDeletedTombstone(vm) {
+		return fmt.Errorf("%w: VM %s is a deleted tombstone", cloudapi.ErrOwnershipMismatch, vm.UUID)
+	}
+	return nil
+}
+
+func vmDeletedTombstone(vm sdk.VM) bool {
+	return strings.EqualFold(strings.TrimSpace(vm.Status), "deleted")
 }
 
 // ownershipMatchesExpectedWherePresent distinguishes an eventually
@@ -4438,16 +4728,17 @@ func (a *Adapter) ensureDurableBaseFirewall(
 			// per-firewall gate is still held. The CAS may also have taken long
 			// enough for the VM UUID to be reused or its ownership/VPC binding to
 			// drift, so re-prove the complete mutation target after the CAS and the
-			// in-gate firewall read. A failed proof leaves the issue durable and
-			// undispatched for read-only recovery; it is not safe to reject it.
+			// in-gate firewall read. A failed proof is proven pre-dispatch and rejects
+			// only this invocation's exact issue.
 			resetProtectionContext()
 			if proveMutationTarget == nil && !a.allowUnfencedTestMutations {
-				return errors.Join(cloudapi.ErrCreateAttemptPending, fmt.Errorf("fresh mutation-target proof is unavailable for base-firewall assignment to VM %s", vmUUID))
+				return rejectUndispatched(errors.New("fresh mutation-target proof is unavailable for base-firewall assignment to VM " + vmUUID))
 			}
 			if proveMutationTarget != nil {
 				if proofErr := proveMutationTarget(protectionCtx); proofErr != nil {
-					return errors.Join(cloudapi.ErrCreateAttemptPending,
-						fmt.Errorf("fresh mutation-target proof blocked base-firewall assignment to VM %s: %w", vmUUID, proofErr))
+					return rejectUndispatched(
+						fmt.Errorf("fresh mutation-target proof blocked base-firewall assignment to VM %s: %w", vmUUID, proofErr),
+					)
 				}
 			}
 			postIssued = false
@@ -4565,6 +4856,12 @@ func (a *Adapter) ensureAutoFloatingIPReadback(ctx context.Context, location, vm
 		requestCancel()
 		if readbackErr := readbackCtx.Err(); readbackErr != nil {
 			if floatingIPUpdateIssued(authorization) {
+				if authorization.AllowPOST && !updateAttempted {
+					return lastCandidate, a.rejectUndispatchedFloatingIPUpdate(
+						readbackCtx, authority, authorization, false,
+						fmt.Errorf("auto-reserved floating IP for VM %s read-back stopped before PATCH: %w", vmUUID, errors.Join(lastObservation, updateErr, readbackErr)),
+					)
+				}
 				return lastCandidate, fmt.Errorf("%w: auto-reserved floating IP for VM %s read-back stopped: %v", cloudapi.ErrCreateAttemptPending, vmUUID, errors.Join(lastObservation, updateErr, readbackErr))
 			}
 			return lastCandidate, fmt.Errorf("auto-reserved floating IP for VM %s read-back stopped: %w", vmUUID, errors.Join(lastObservation, updateErr, readbackErr))
@@ -4573,6 +4870,9 @@ func (a *Adapter) ensureAutoFloatingIPReadback(ctx context.Context, location, vm
 			lastObservation = fmt.Errorf("listing auto-reserved floating IP for VM %s: %w", vmUUID, err)
 			if !isRetryableReadback(readbackCtx, err) {
 				if floatingIPUpdateIssued(authorization) {
+					if authorization.AllowPOST && !updateAttempted {
+						return lastCandidate, a.rejectUndispatchedFloatingIPUpdate(readbackCtx, authority, authorization, false, lastObservation)
+					}
 					return lastCandidate, fmt.Errorf("%w: %v", cloudapi.ErrCreateAttemptPending, lastObservation)
 				}
 				return nil, lastObservation
@@ -4582,6 +4882,9 @@ func (a *Adapter) ensureAutoFloatingIPReadback(ctx context.Context, location, vm
 			lastCandidate = candidate
 			if validationErr != nil {
 				if floatingIPUpdateIssued(authorization) {
+					if authorization.AllowPOST && !updateAttempted {
+						return candidate, a.rejectUndispatchedFloatingIPUpdate(readbackCtx, authority, authorization, false, validationErr)
+					}
 					return candidate, fmt.Errorf("%w: validating issued floating-IP update state: %v", cloudapi.ErrCreateAttemptPending, validationErr)
 				}
 				return candidate, validationErr
@@ -4616,8 +4919,10 @@ func (a *Adapter) ensureAutoFloatingIPReadback(ctx context.Context, location, vm
 						readbackCtx, location, vmUUID, candidate.Address, expectedName, billingAccountID, requireUsable, allowSharedName, proveMutationTarget,
 					)
 					if freshErr != nil {
-						return candidate, errors.Join(cloudapi.ErrCreateAttemptPending,
-							fmt.Errorf("fresh mutation-target proof blocked floating-IP update for %s: %w", candidate.Address, freshErr))
+						return candidate, a.rejectUndispatchedFloatingIPUpdate(
+							readbackCtx, authority, authorization, false,
+							fmt.Errorf("fresh mutation-target proof blocked floating-IP update for %s: %w", candidate.Address, freshErr),
+						)
 					}
 					candidate = freshCandidate
 					lastCandidate = candidate
@@ -4657,6 +4962,12 @@ func (a *Adapter) ensureAutoFloatingIPReadback(ctx context.Context, location, vm
 		}
 		if err := waitForReadback(readbackCtx, readbackDelay); err != nil {
 			if authority.fenced && authorization != nil && authorization.Fence.Phase == cloudapi.FloatingIPUpdateIssued {
+				if authorization.AllowPOST && !updateAttempted {
+					return lastCandidate, a.rejectUndispatchedFloatingIPUpdate(
+						readbackCtx, authority, authorization, false,
+						fmt.Errorf("auto-reserved floating IP for VM %s did not reach PATCH: %w", vmUUID, errors.Join(lastObservation, updateErr, err)),
+					)
+				}
 				return lastCandidate, fmt.Errorf("%w: auto-reserved floating IP for VM %s did not converge: %v", cloudapi.ErrCreateAttemptPending, vmUUID, errors.Join(lastObservation, updateErr, err))
 			}
 			return lastCandidate, fmt.Errorf("auto-reserved floating IP for VM %s did not converge: %w", vmUUID, errors.Join(lastObservation, updateErr, err))
@@ -4667,6 +4978,22 @@ func (a *Adapter) ensureAutoFloatingIPReadback(ctx context.Context, location, vm
 
 func floatingIPUpdateIssued(authorization *cloudapi.FloatingIPUpdateAuthorization) bool {
 	return authorization != nil && authorization.Fence.Phase == cloudapi.FloatingIPUpdateIssued
+}
+
+func (a *Adapter) rejectUndispatchedFloatingIPUpdate(
+	ctx context.Context,
+	authority floatingIPUpdateAuthority,
+	authorization *cloudapi.FloatingIPUpdateAuthorization,
+	mutationAttempted bool,
+	cause error,
+) error {
+	if authorization == nil || !authorization.AllowPOST || mutationAttempted {
+		return errors.Join(cloudapi.ErrCreateAttemptPending, cause)
+	}
+	rejectCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), a.networkAttachmentRequestTimeout)
+	defer cancel()
+	rejectErr := authority.reject(rejectCtx, authorization.Fence)
+	return errors.Join(cloudapi.ErrCreateAttemptPending, cause, rejectErr)
 }
 
 func validateFloatingIPUpdateAuthorization(
@@ -5338,8 +5665,18 @@ func validateWorkerFloatingIPAssignmentsInList(addresses []sdk.FloatingIP, expec
 	return nil
 }
 
-func (a *Adapter) cleanupLaunch(ctx context.Context, location, networkUUID, firewallUUID, vmUUID string, billingAccountID int64, floatingIP sdk.FloatingIP, cause error, authority baseFirewallDetachmentAuthority, removalAuthority removalMutationAuthority, proofs ...func(context.Context) error) error {
-	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), a.launchCleanupTimeout)
+func (a *Adapter) cleanupLaunch(
+	ctx context.Context,
+	location, networkUUID, firewallUUID, vmUUID string,
+	billingAccountID int64,
+	floatingIP sdk.FloatingIP,
+	cause error,
+	authority baseFirewallDetachmentAuthority,
+	removalAuthority removalMutationAuthority,
+	tombstoneVerifier *deletedVMTombstoneVerifier,
+	proofs ...func(context.Context) error,
+) error {
+	cleanupCtx, cancel := a.newDestructiveCleanupContext(ctx)
 	defer cancel()
 	if err := a.validateBaseFirewallOwnership(cleanupCtx, location, firewallUUID, billingAccountID); err != nil {
 		return errors.Join(cause, fmt.Errorf("authorizing VM %s rollback from base firewall ownership: %w", vmUUID, err))
@@ -5349,11 +5686,11 @@ func (a *Adapter) cleanupLaunch(ctx context.Context, location, networkUUID, fire
 	if len(proofs) != 0 {
 		proveMutationTarget = proofs[0]
 	}
-	_, deleteAuthorization, vmDeleteErr := a.deleteAnchoredVMIfPresent(cleanupCtx, location, networkUUID, vmUUID, removalAuthority, proveMutationTarget)
+	_, deleteAuthorization, vmDeleteErr := a.deleteAnchoredVMIfPresent(cleanupCtx, location, networkUUID, vmUUID, removalAuthority, tombstoneVerifier, proveMutationTarget)
 	if errors.Is(vmDeleteErr, errRemovalFenceInvalid) {
 		return errors.Join(cause, fmt.Errorf("VM %s rollback removal authority: %w", vmUUID, vmDeleteErr))
 	}
-	if absenceErr := a.waitForVMCoreAbsence(cleanupCtx, location, networkUUID, vmUUID, "after launch rollback"); absenceErr != nil {
+	if absenceErr := a.waitForAuthorizedVMCoreAbsence(cleanupCtx, location, networkUUID, vmUUID, "after launch rollback", tombstoneVerifier); absenceErr != nil {
 		if vmDeleteErr != nil {
 			errs = append(errs, fmt.Errorf("deleting unprotected VM %s during launch rollback: %w", vmUUID, vmDeleteErr))
 		}
@@ -5366,18 +5703,18 @@ func (a *Adapter) cleanupLaunch(ctx context.Context, location, networkUUID, fire
 	}
 	// Once Get/List/VPC prove the VM absent, explicitly retire the exact FIP;
 	// its assignment may legitimately lag the VM deletion.
-	floatingCtx, floatingCancel := context.WithTimeout(cleanupCtx, a.launchFloatingIPCleanupTimeout)
-	floatingErr := a.deleteOwnedFloatingIP(floatingCtx, location, networkUUID, floatingIP, vmUUID, removalAuthority)
+	floatingCtx, floatingCancel := a.newFloatingIPRemovalContext(cleanupCtx)
+	floatingErr := a.deleteOwnedFloatingIP(floatingCtx, location, networkUUID, floatingIP, vmUUID, removalAuthority, tombstoneVerifier)
 	floatingCancel()
 	if floatingErr != nil {
 		errs = append(errs, floatingErr)
 	}
-	if absenceErr := a.waitForVMAbsence(cleanupCtx, location, networkUUID, vmUUID, "after launch dependent cleanup"); absenceErr != nil {
+	if absenceErr := a.waitForAuthorizedVMAbsence(cleanupCtx, location, networkUUID, vmUUID, "after launch dependent cleanup", tombstoneVerifier); absenceErr != nil {
 		errs = append(errs, absenceErr)
 		return errors.Join(append([]error{cause}, errs...)...)
 	}
 	// Only after the final VM/FIP absence proof may firewall assignments go.
-	if err := a.detachFirewallAfterVMDeletion(cleanupCtx, location, networkUUID, firewallUUID, vmUUID, billingAccountID, authority); err != nil {
+	if err := a.detachFirewallAfterVMDeletion(cleanupCtx, location, networkUUID, firewallUUID, vmUUID, billingAccountID, authority, tombstoneVerifier); err != nil {
 		errs = append(errs, err)
 	}
 	if len(errs) == 0 {
@@ -5386,7 +5723,13 @@ func (a *Adapter) cleanupLaunch(ctx context.Context, location, networkUUID, fire
 	return errors.Join(append([]error{cause}, errs...)...)
 }
 
-func (a *Adapter) detachFirewallAfterVMDeletion(ctx context.Context, location, networkUUID, firewallUUID, vmUUID string, billingAccountID int64, authority baseFirewallDetachmentAuthority) error {
+func (a *Adapter) detachFirewallAfterVMDeletion(
+	ctx context.Context,
+	location, networkUUID, firewallUUID, vmUUID string,
+	billingAccountID int64,
+	authority baseFirewallDetachmentAuthority,
+	tombstoneVerifiers ...*deletedVMTombstoneVerifier,
+) error {
 	// Karpenter owns only the exact base firewall persisted in its VM ownership
 	// record. CCM owns NodeLB ICMP, shard, and per-Service firewalls, even when
 	// those firewalls still contain this deleted VM UUID.
@@ -5399,10 +5742,20 @@ func (a *Adapter) detachFirewallAfterVMDeletion(ctx context.Context, location, n
 	if !vmUUIDPattern.MatchString(strings.ToLower(firewallUUID)) {
 		return fmt.Errorf("%w: deleted VM %s has no canonical provider-owned base firewall", cloudapi.ErrOwnershipMismatch, vmUUID)
 	}
-	return a.detachExactFirewallRelationAfterVMDeletion(ctx, location, networkUUID, strings.ToLower(firewallUUID), strings.ToLower(vmUUID), billingAccountID, authority)
+	var tombstoneVerifier *deletedVMTombstoneVerifier
+	if len(tombstoneVerifiers) != 0 {
+		tombstoneVerifier = tombstoneVerifiers[0]
+	}
+	return a.detachExactFirewallRelationAfterVMDeletion(ctx, location, networkUUID, strings.ToLower(firewallUUID), strings.ToLower(vmUUID), billingAccountID, authority, tombstoneVerifier)
 }
 
-func (a *Adapter) detachExactFirewallRelationAfterVMDeletion(ctx context.Context, location, networkUUID, firewallUUID, vmUUID string, billingAccountID int64, authority baseFirewallDetachmentAuthority) error {
+func (a *Adapter) detachExactFirewallRelationAfterVMDeletion(
+	ctx context.Context,
+	location, networkUUID, firewallUUID, vmUUID string,
+	billingAccountID int64,
+	authority baseFirewallDetachmentAuthority,
+	tombstoneVerifier *deletedVMTombstoneVerifier,
+) error {
 	// POST and DELETE mutate the same firewall relationship collection. Hold the
 	// same per-firewall gate from the fresh pre-delete read until three exact
 	// absence reads, so scale-up and scale-down cannot overlap on that endpoint.
@@ -5515,9 +5868,10 @@ func (a *Adapter) detachExactFirewallRelationAfterVMDeletion(ctx context.Context
 					// Re-prove the VM absent from every canonical core index after that
 					// CAS, then re-read the exact firewall relationship immediately
 					// before DELETE so UUID reuse or relation drift cannot redirect it.
-					if proofErr := a.proveFreshFirewallDetachmentTarget(readbackCtx, location, networkUUID, firewallUUID, vmUUID, billingAccountID); proofErr != nil {
-						return fmt.Errorf("%w: fresh mutation-target proof blocked base-firewall detachment for VM %s: %v",
-							cloudapi.ErrCreateAttemptPending, vmUUID, proofErr)
+					if proofErr := a.proveFreshFirewallDetachmentTarget(readbackCtx, location, networkUUID, firewallUUID, vmUUID, billingAccountID, tombstoneVerifier); proofErr != nil {
+						return rejectUndispatched(
+							fmt.Errorf("fresh mutation-target proof blocked base-firewall detachment for VM %s: %w", vmUUID, proofErr),
+						)
 					}
 					requestCtx, requestCancel := context.WithTimeout(readbackCtx, a.networkAttachmentRequestTimeout)
 					deleteAttempted = true
@@ -5548,11 +5902,16 @@ func (a *Adapter) detachExactFirewallRelationAfterVMDeletion(ctx context.Context
 	}
 }
 
-func (a *Adapter) proveFreshFirewallDetachmentTarget(ctx context.Context, location, networkUUID, firewallUUID, vmUUID string, billingAccountID int64) error {
+func (a *Adapter) proveFreshFirewallDetachmentTarget(
+	ctx context.Context,
+	location, networkUUID, firewallUUID, vmUUID string,
+	billingAccountID int64,
+	tombstoneVerifier *deletedVMTombstoneVerifier,
+) error {
 	if strings.TrimSpace(networkUUID) == "" {
 		return fmt.Errorf("%w: configured VPC UUID is required for firewall detachment", cloudapi.ErrOwnershipMismatch)
 	}
-	if err := a.waitForVMCoreAbsence(ctx, location, networkUUID, vmUUID, "during base-firewall detachment authorization"); err != nil {
+	if err := a.waitForAuthorizedVMCoreAbsence(ctx, location, networkUUID, vmUUID, "during base-firewall detachment authorization", tombstoneVerifier); err != nil {
 		return err
 	}
 	requestCtx, cancel := context.WithTimeout(ctx, a.networkAttachmentRequestTimeout)
@@ -5584,11 +5943,22 @@ func (a *Adapter) proveFreshFirewallDetachmentTarget(ctx context.Context, locati
 	return nil
 }
 
-func (a *Adapter) deleteOwnedFloatingIP(ctx context.Context, location, networkUUID string, floatingIP sdk.FloatingIP, expectedVMUUID string, authority removalMutationAuthority) error {
+func (a *Adapter) deleteOwnedFloatingIP(
+	ctx context.Context,
+	location, networkUUID string,
+	floatingIP sdk.FloatingIP,
+	expectedVMUUID string,
+	authority removalMutationAuthority,
+	tombstoneVerifiers ...*deletedVMTombstoneVerifier,
+) error {
 	if floatingIP.Name == "" || floatingIP.Address == "" || floatingIP.BillingAccountID <= 0 {
 		return fmt.Errorf("%w: incomplete floating IP ownership anchor", cloudapi.ErrOwnershipMismatch)
 	}
 	expectedVMUUID = strings.ToLower(expectedVMUUID)
+	var tombstoneVerifier *deletedVMTombstoneVerifier
+	if len(tombstoneVerifiers) != 0 {
+		tombstoneVerifier = tombstoneVerifiers[0]
+	}
 	unassignMutation := cloudapi.RemovalMutation{
 		Operation: cloudapi.RemovalMutationFloatingIPUnassign, Location: location, VMUUID: expectedVMUUID,
 		Address: floatingIP.Address, Name: floatingIP.Name, BillingAccountID: floatingIP.BillingAccountID,
@@ -5656,9 +6026,10 @@ func (a *Adapter) deleteOwnedFloatingIP(ctx context.Context, location, networkUU
 					}
 					if authorization.AllowMutation {
 						if authority.complete() {
-							if proofErr := a.proveFreshFloatingIPRemovalTarget(readbackCtx, location, networkUUID, floatingIP, expectedVMUUID, true); proofErr != nil {
+							if proofErr := a.proveFreshFloatingIPRemovalTarget(readbackCtx, location, networkUUID, floatingIP, expectedVMUUID, true, tombstoneVerifier); proofErr != nil {
+								rejectErr := a.rejectRemovalMutation(readbackCtx, authority, authorization)
 								return errors.Join(cloudapi.ErrCreateAttemptPending,
-									fmt.Errorf("fresh mutation-target proof blocked floating IP %s unassignment: %w", current.Address, proofErr))
+									fmt.Errorf("fresh mutation-target proof blocked floating IP %s unassignment: %w", current.Address, proofErr), rejectErr)
 							}
 						}
 						requestCtx, requestCancel := context.WithTimeout(readbackCtx, a.networkAttachmentRequestTimeout)
@@ -5695,9 +6066,10 @@ func (a *Adapter) deleteOwnedFloatingIP(ctx context.Context, location, networkUU
 					}
 					if deleteAuthorization.AllowMutation {
 						if authority.complete() {
-							if proofErr := a.proveFreshFloatingIPRemovalTarget(readbackCtx, location, networkUUID, floatingIP, expectedVMUUID, false); proofErr != nil {
+							if proofErr := a.proveFreshFloatingIPRemovalTarget(readbackCtx, location, networkUUID, floatingIP, expectedVMUUID, false, tombstoneVerifier); proofErr != nil {
+								rejectErr := a.rejectRemovalMutation(readbackCtx, authority, deleteAuthorization)
 								return errors.Join(cloudapi.ErrCreateAttemptPending,
-									fmt.Errorf("fresh mutation-target proof blocked floating IP %s deletion: %w", current.Address, proofErr))
+									fmt.Errorf("fresh mutation-target proof blocked floating IP %s deletion: %w", current.Address, proofErr), rejectErr)
 							}
 						}
 						requestCtx, requestCancel := context.WithTimeout(readbackCtx, a.networkAttachmentRequestTimeout)
@@ -5762,6 +6134,7 @@ func (a *Adapter) proveFreshFloatingIPRemovalTarget(
 	expected sdk.FloatingIP,
 	expectedVMUUID string,
 	requireAssigned bool,
+	tombstoneVerifier *deletedVMTombstoneVerifier,
 ) error {
 	readExact := func() error {
 		requestCtx, cancel := context.WithTimeout(ctx, a.networkAttachmentRequestTimeout)
@@ -5792,7 +6165,7 @@ func (a *Adapter) proveFreshFloatingIPRemovalTarget(
 	// A floating IP may legitimately retain its deleted VM UUID while cloud
 	// relation convergence lags. Re-prove the VM absent from Get/List/VPC after
 	// the CAS so UUID reuse cannot redirect the dependent mutation.
-	if err := a.waitForVMCoreAbsence(ctx, location, networkUUID, expectedVMUUID, "during floating-IP removal authorization"); err != nil {
+	if err := a.waitForAuthorizedVMCoreAbsence(ctx, location, networkUUID, expectedVMUUID, "during floating-IP removal authorization", tombstoneVerifier); err != nil {
 		return err
 	}
 	return readExact()

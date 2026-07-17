@@ -3785,8 +3785,8 @@ func TestDestroyRemovalIntentsRevalidateCloudOwnershipAfterIssueCAS(t *testing.T
 					t.Fatal("drifted floating-IP receipt authorized a cloud mutation")
 				}
 				attempt := cluster.Status.DeleteAttempts[destroyFIPBastionKey]
-				if countEventsWithPrefix(api.events, "unassign-fip/") != 0 || len(api.floatingIPDeletes) != 0 || attempt.Phase != deletePhaseFIPUnassignIssued {
-					t.Fatalf("floating-IP drift mutated cloud state or lost its durable issue lock: events=%#v deletes=%#v attempt=%#v", api.events, api.floatingIPDeletes, attempt)
+				if countEventsWithPrefix(api.events, "unassign-fip/") != 0 || len(api.floatingIPDeletes) != 0 || attempt.Phase != deletePhaseFIPUnassignIntent {
+					t.Fatalf("floating-IP drift mutated cloud state or retained an undispatched issue: events=%#v deletes=%#v attempt=%#v", api.events, api.floatingIPDeletes, attempt)
 				}
 			})
 		}
@@ -3821,8 +3821,8 @@ func TestDestroyRemovalIntentsRevalidateCloudOwnershipAfterIssueCAS(t *testing.T
 					t.Fatal("drifted firewall receipt authorized a cloud mutation")
 				}
 				attempt := cluster.Status.DeleteAttempts[destroyFirewallBastionKey]
-				if len(api.firewallDeletes) != 0 || attempt.Phase != deletePhaseFirewallDeleteIssued {
-					t.Fatalf("firewall drift mutated cloud state or lost its durable issue lock: deletes=%#v attempt=%#v", api.firewallDeletes, attempt)
+				if len(api.firewallDeletes) != 0 || attempt.Phase != deletePhaseFirewallDeleteIntent {
+					t.Fatalf("firewall drift mutated cloud state or retained an undispatched issue: deletes=%#v attempt=%#v", api.firewallDeletes, attempt)
 				}
 			})
 		}
@@ -3936,8 +3936,8 @@ func TestDestroyVMIntentRevalidatesCanonicalOwnershipBeforeDispatch(t *testing.T
 			if _, err := reconciler.reconcileVMDelete(context.Background(), cluster, deleteAttemptBastion); err == nil {
 				t.Fatal("drifted durable VM intent became deletion authority")
 			}
-			if len(api.vmDeletes) != 0 || cluster.Status.DeleteAttempts[deleteAttemptBastion].Phase != deletePhaseVMIssued {
-				t.Fatalf("drifted durable VM intent mutated cloud state or lost its durable issue lock: deletes=%#v receipt=%#v", api.vmDeletes, cluster.Status.DeleteAttempts[deleteAttemptBastion])
+			if len(api.vmDeletes) != 0 || cluster.Status.DeleteAttempts[deleteAttemptBastion].Phase != deletePhaseVMIntent {
+				t.Fatalf("drifted durable VM intent mutated cloud state or retained an undispatched issue: deletes=%#v receipt=%#v", api.vmDeletes, cluster.Status.DeleteAttempts[deleteAttemptBastion])
 			}
 		})
 	}

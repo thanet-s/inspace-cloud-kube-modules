@@ -366,6 +366,8 @@ func TestPublicNodeLocalManualAuthorizationRequiresExactAccountVPCMembership(t *
 		wantErr  bool
 	}{
 		{name: "exact membership", wantAuth: true},
+		{name: "sparse VM network with exact VPC membership", mutate: func(api *fakeAPI) { api.vms[0].NetworkUUID = "" }, wantAuth: true},
+		{name: "HTTP 200 deleted VM tombstone", mutate: func(api *fakeAPI) { api.vms[0].Status = "Deleted" }},
 		{name: "zero billing account", mutate: func(api *fakeAPI) { api.vms[0].BillingAccountID = 0 }},
 		{name: "foreign billing account", mutate: func(api *fakeAPI) { api.vms[0].BillingAccountID = 99 }},
 		{name: "foreign VM network", mutate: func(api *fakeAPI) { api.vms[0].NetworkUUID = "99999999-9999-4999-8999-999999999999" }},

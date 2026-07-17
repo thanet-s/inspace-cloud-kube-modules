@@ -172,6 +172,13 @@ func (c *loadBalancerTargetController) sync(ctx context.Context, key string) err
 	if err != nil {
 		return err
 	}
+	// The stock Service controller owns finalizer-driven teardown.  A deleting
+	// Service must never enter this target-only reconciler: staging an additive
+	// target, rule, or floating-IP mutation here can race the destructive
+	// cleanup receipt and manufacture a permanently ambiguous operation.
+	if service.DeletionTimestamp != nil {
+		return nil
+	}
 	patched, malformed, err := c.reconcilePublicIntentAnnotation(ctx, service)
 	if err != nil || malformed || patched {
 		return err

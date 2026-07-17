@@ -49,7 +49,7 @@ func TestPostLaunchCASAppearanceIsAdoptedWithoutDuplicateVMPost(t *testing.T) {
 	}
 }
 
-func TestPostLaunchCASNetworkAuthorityDriftLeavesIssuedReceiptUndispatched(t *testing.T) {
+func TestPostLaunchCASNetworkAuthorityDriftRejectsUndispatchedAttempt(t *testing.T) {
 	readErr := errors.New("network read failed after launch CAS")
 	tests := []struct {
 		name   string
@@ -123,14 +123,14 @@ func TestPostLaunchCASNetworkAuthorityDriftLeavesIssuedReceiptUndispatched(t *te
 			}
 
 			_, err := adapter.CreateVM(context.Background(), request)
-			if !errors.Is(err, cloudapi.ErrCreateAttemptPending) || !strings.Contains(err.Error(), test.want) {
-				t.Fatalf("CreateVM() error = %v, want pending post-CAS network failure containing %q", err, test.want)
+			if !errors.Is(err, cloudapi.ErrCreateAttemptRejected) || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("CreateVM() error = %v, want rejected post-CAS network failure containing %q", err, test.want)
 			}
 			if api.createCalls != 0 {
 				t.Fatalf("post-CAS network failure dispatched %d VM POSTs, want zero", api.createCalls)
 			}
 			if authorizeCalls != 1 || receiptPhase != "issued" {
-				t.Fatalf("launch receipt = phase %q after %d authorizations, want one retained issued receipt", receiptPhase, authorizeCalls)
+				t.Fatalf("launch authorization = phase %q after %d calls; provider must consume ErrCreateAttemptRejected for this exact issue", receiptPhase, authorizeCalls)
 			}
 			if api.networkGetCalls != 2 || api.firewallListCalls != 2 {
 				t.Fatalf("post-CAS authority ordering = network reads %d, firewall reads %d; want fresh network read before a third firewall read", api.networkGetCalls, api.firewallListCalls)
@@ -139,7 +139,7 @@ func TestPostLaunchCASNetworkAuthorityDriftLeavesIssuedReceiptUndispatched(t *te
 	}
 }
 
-func TestBaseFirewallAssignmentDriftAfterCASLeavesIssuedReceiptUndispatched(t *testing.T) {
+func TestBaseFirewallAssignmentDriftAfterCASRejectsUndispatchedReceipt(t *testing.T) {
 	const vmUUID = "11111111-1111-4111-8111-111111111111"
 	request := fencedAdapterRequest(true)
 	api := &fakeAPI{vms: []sdk.VM{canonicalVMForRequest(t, request, vmUUID)}}
@@ -160,12 +160,12 @@ func TestBaseFirewallAssignmentDriftAfterCASLeavesIssuedReceiptUndispatched(t *t
 	if !errors.Is(err, cloudapi.ErrCreateAttemptPending) || !strings.Contains(err.Error(), "fresh mutation-target proof") {
 		t.Fatalf("assignment error = %v, want post-CAS proof failure", err)
 	}
-	if api.firewallAssignCalls != 0 || harness.fence.Phase != cloudapi.FirewallAssignmentIssued || harness.rejectCalls != 0 {
-		t.Fatalf("post-CAS drift dispatched or rejected receipt: assigns=%d fence=%#v rejects=%d", api.firewallAssignCalls, harness.fence, harness.rejectCalls)
+	if api.firewallAssignCalls != 0 || harness.fence.Phase != cloudapi.FirewallAssignmentRejected || harness.rejectCalls != 1 {
+		t.Fatalf("post-CAS drift failed to reject undispatched receipt: assigns=%d fence=%#v rejects=%d", api.firewallAssignCalls, harness.fence, harness.rejectCalls)
 	}
 }
 
-func TestAutoFloatingIPDriftAfterCASLeavesIssuedReceiptUndispatched(t *testing.T) {
+func TestAutoFloatingIPDriftAfterCASRejectsUndispatchedReceipt(t *testing.T) {
 	const vmUUID = "11111111-1111-4111-8111-111111111111"
 	request := fencedAdapterRequest(true)
 	address := sdk.FloatingIP{
@@ -194,12 +194,45 @@ func TestAutoFloatingIPDriftAfterCASLeavesIssuedReceiptUndispatched(t *testing.T
 	if !errors.Is(err, cloudapi.ErrCreateAttemptPending) || !strings.Contains(err.Error(), "fresh mutation-target proof") {
 		t.Fatalf("floating-IP error = %v, want post-CAS proof failure", err)
 	}
-	if api.floatingIPUpdateCalls != 0 || harness.fence.Phase != cloudapi.FloatingIPUpdateIssued || harness.rejectCalls != 0 {
-		t.Fatalf("post-CAS drift dispatched or rejected FIP receipt: PATCHes=%d fence=%#v rejects=%d", api.floatingIPUpdateCalls, harness.fence, harness.rejectCalls)
+	if api.floatingIPUpdateCalls != 0 || harness.fence.Phase != cloudapi.FloatingIPUpdateRejected || harness.rejectCalls != 1 {
+		t.Fatalf("post-CAS drift failed to reject undispatched FIP receipt: PATCHes=%d fence=%#v rejects=%d", api.floatingIPUpdateCalls, harness.fence, harness.rejectCalls)
 	}
 }
 
-func TestBaselineFloatingIPDriftAfterCASLeavesIssuedReceiptUndispatched(t *testing.T) {
+func TestCleanupFloatingIPDeletedVMTombstoneRejectsUndispatchedReceipt(t *testing.T) {
+	const vmUUID = "11111111-1111-4111-8111-111111111111"
+	request := fencedCleanupRequest(true)
+	request.CreatedVMUUID = vmUUID
+	vm := canonicalVMForRequest(t, testRequest(), vmUUID)
+	vm.Status = "Deleted"
+	address := sdk.FloatingIP{
+		Address: "203.0.113.10", BillingAccountID: request.BillingAccountID, Enabled: true, Type: "public",
+		AssignedTo: vmUUID, AssignedToResourceType: "virtual_machine",
+	}
+	api := &fakeAPI{vms: []sdk.VM{vm}, floatingIPs: []sdk.FloatingIP{address}}
+	adapter, _ := New(api)
+	configureFastNetworkReadback(adapter, boundedReadbackTestTimeout)
+	harness := newDurableFloatingIPUpdateHarness()
+	harness.attachCleanup(&request)
+
+	_, err := adapter.ensureAutoFloatingIP(
+		context.Background(), request.Location, vmUUID, floatingIPName(request.ClusterName, request.NodeClaimName), request.BillingAccountID,
+		cleanupFloatingIPUpdateAuthority(request),
+		func(ctx context.Context) error {
+			return adapter.ensureFencedCreateAnchorOwnership(ctx, request)
+		},
+	)
+	if !errors.Is(err, cloudapi.ErrCreateAttemptPending) || !strings.Contains(err.Error(), "fresh mutation-target proof") {
+		t.Fatalf("deleted cleanup VM authority error = %v, want pre-dispatch proof rejection", err)
+	}
+	if api.floatingIPUpdateCalls != 0 || api.firewallAssignCalls != 0 || api.deleteVMCalls != 0 ||
+		harness.fence.Phase != cloudapi.FloatingIPUpdateRejected || harness.rejectCalls != 1 || len(api.operations) != 0 {
+		t.Fatalf("deleted cleanup VM crossed mutation boundary: FIP PATCHes=%d firewall=%d VM deletes=%d fence=%#v rejects=%d operations=%v",
+			api.floatingIPUpdateCalls, api.firewallAssignCalls, api.deleteVMCalls, harness.fence, harness.rejectCalls, api.operations)
+	}
+}
+
+func TestBaselineFloatingIPDriftAfterCASRejectsUndispatchedReceipt(t *testing.T) {
 	const vmUUID = "11111111-1111-4111-8111-111111111111"
 	request := fencedCleanupRequest(true)
 	current := sdk.FloatingIP{
@@ -233,12 +266,12 @@ func TestBaselineFloatingIPDriftAfterCASLeavesIssuedReceiptUndispatched(t *testi
 	if !errors.Is(err, cloudapi.ErrCreateAttemptPending) || !strings.Contains(err.Error(), "fresh mutation-target proof") {
 		t.Fatalf("baseline floating-IP error = %v, want post-CAS proof failure", err)
 	}
-	if api.floatingIPUpdateCalls != 0 || harness.fence.Phase != cloudapi.FloatingIPUpdateIssued || harness.rejectCalls != 0 {
-		t.Fatalf("post-CAS baseline drift dispatched or rejected receipt: PATCHes=%d fence=%#v rejects=%d", api.floatingIPUpdateCalls, harness.fence, harness.rejectCalls)
+	if api.floatingIPUpdateCalls != 0 || harness.fence.Phase != cloudapi.FloatingIPUpdateRejected || harness.rejectCalls != 1 {
+		t.Fatalf("post-CAS baseline drift failed to reject undispatched receipt: PATCHes=%d fence=%#v rejects=%d", api.floatingIPUpdateCalls, harness.fence, harness.rejectCalls)
 	}
 }
 
-func TestVMDeleteDriftAfterCASLeavesIssuedReceiptUndispatched(t *testing.T) {
+func TestVMDeleteDriftAfterCASRejectsUndispatchedReceipt(t *testing.T) {
 	api := &fakeAPI{}
 	adapter, _ := New(api)
 	configureFastNetworkReadback(adapter, boundedReadbackTestTimeout)
@@ -248,6 +281,7 @@ func TestVMDeleteDriftAfterCASLeavesIssuedReceiptUndispatched(t *testing.T) {
 	}
 	identity := durableDeleteIdentity(created)
 	var fence cloudapi.RemovalMutationFence
+	rejects := 0
 	identity.AuthorizeRemovalMutation = func(_ context.Context, mutation cloudapi.RemovalMutation, present bool) (cloudapi.RemovalMutationAuthorization, error) {
 		if mutation.Operation != cloudapi.RemovalMutationVMDelete || !present {
 			t.Fatalf("removal authorization = %#v present=%t", mutation, present)
@@ -257,19 +291,26 @@ func TestVMDeleteDriftAfterCASLeavesIssuedReceiptUndispatched(t *testing.T) {
 		return cloudapi.RemovalMutationAuthorization{Fence: fence, Active: true, AllowMutation: true}, nil
 	}
 	identity.ObserveRemovalMutation = func(context.Context, cloudapi.RemovalMutationFence) error { return nil }
-	identity.RejectRemovalMutation = func(context.Context, cloudapi.RemovalMutationFence) error { return nil }
+	identity.RejectRemovalMutation = func(_ context.Context, rejected cloudapi.RemovalMutationFence) error {
+		if rejected != fence {
+			return errors.New("removal rejection identity changed")
+		}
+		rejects++
+		fence.Phase = cloudapi.RemovalMutationRejected
+		return nil
+	}
 	api.operations = nil
 
 	err = adapter.DeleteVM(context.Background(), created.Location, created.UUID, created.ClusterName, created.NodeClaimName, identity)
 	if !errors.Is(err, cloudapi.ErrCreateAttemptPending) || !strings.Contains(err.Error(), "fresh mutation-target proof") {
 		t.Fatalf("DeleteVM() error = %v, want post-CAS proof failure", err)
 	}
-	if api.deleteVMCalls != 0 || len(api.operations) != 0 || fence.Phase != cloudapi.RemovalMutationIssued {
-		t.Fatalf("post-CAS VM drift reached DELETE: calls=%d operations=%v fence=%#v", api.deleteVMCalls, api.operations, fence)
+	if api.deleteVMCalls != 0 || len(api.operations) != 0 || fence.Phase != cloudapi.RemovalMutationRejected || rejects != 1 {
+		t.Fatalf("post-CAS VM drift failed to reject undispatched DELETE: calls=%d operations=%v fence=%#v rejects=%d", api.deleteVMCalls, api.operations, fence, rejects)
 	}
 }
 
-func TestFloatingIPRemovalDriftAfterCASLeavesIssuedReceiptUndispatched(t *testing.T) {
+func TestFloatingIPRemovalDriftAfterCASRejectsUndispatchedReceipt(t *testing.T) {
 	const vmUUID = "11111111-1111-4111-8111-111111111111"
 	for _, test := range []struct {
 		name      string
@@ -311,21 +352,28 @@ func TestFloatingIPRemovalDriftAfterCASLeavesIssuedReceiptUndispatched(t *testin
 					return cloudapi.RemovalMutationAuthorization{Fence: issued, Active: true, AllowMutation: true}, nil
 				},
 				observe: func(context.Context, cloudapi.RemovalMutationFence) error { return nil },
-				reject:  func(context.Context, cloudapi.RemovalMutationFence) error { rejects++; return nil },
+				reject: func(_ context.Context, rejected cloudapi.RemovalMutationFence) error {
+					if rejected != issued {
+						return errors.New("floating-IP removal rejection identity changed")
+					}
+					rejects++
+					issued.Phase = cloudapi.RemovalMutationRejected
+					return nil
+				},
 			}
 
 			err := adapter.deleteOwnedFloatingIP(context.Background(), "bkk01", "network-1", address, vmUUID, authority)
 			if !errors.Is(err, cloudapi.ErrCreateAttemptPending) || !strings.Contains(err.Error(), "fresh mutation-target proof") {
 				t.Fatalf("removal error = %v, want post-CAS proof failure", err)
 			}
-			if countOperation(api.operations, test.wantOp) != 0 || issued.Phase != cloudapi.RemovalMutationIssued || rejects != 0 {
-				t.Fatalf("post-CAS FIP drift dispatched or rejected: operations=%v fence=%#v rejects=%d", api.operations, issued, rejects)
+			if countOperation(api.operations, test.wantOp) != 0 || issued.Phase != cloudapi.RemovalMutationRejected || rejects != 1 {
+				t.Fatalf("post-CAS FIP drift failed to reject undispatched receipt: operations=%v fence=%#v rejects=%d", api.operations, issued, rejects)
 			}
 		})
 	}
 }
 
-func TestFirewallDetachmentVMReappearanceAfterCASLeavesIssuedReceiptUndispatched(t *testing.T) {
+func TestFirewallDetachmentVMReappearanceAfterCASRejectsUndispatchedReceipt(t *testing.T) {
 	const (
 		vmUUID       = "11111111-1111-4111-8111-111111111111"
 		firewallUUID = "33333333-3333-4333-8333-333333333333"
@@ -347,14 +395,21 @@ func TestFirewallDetachmentVMReappearanceAfterCASLeavesIssuedReceiptUndispatched
 			return cloudapi.FirewallDetachmentAuthorization{Fence: fence, AllowDELETE: true}, nil
 		},
 		observe: func(context.Context, cloudapi.FirewallDetachmentFence) error { return nil },
-		reject:  func(context.Context, cloudapi.FirewallDetachmentFence) error { rejects++; return nil },
+		reject: func(_ context.Context, rejected cloudapi.FirewallDetachmentFence) error {
+			if rejected != fence {
+				return errors.New("firewall detachment rejection identity changed")
+			}
+			rejects++
+			fence.Phase = cloudapi.FirewallAssignmentRejected
+			return nil
+		},
 	}
 
 	err := adapter.detachFirewallAfterVMDeletion(context.Background(), "bkk01", "network-1", firewallUUID, vmUUID, firewall.BillingAccountID, authority)
 	if !errors.Is(err, cloudapi.ErrCreateAttemptPending) || !strings.Contains(err.Error(), "fresh mutation-target proof") {
 		t.Fatalf("detachment error = %v, want post-CAS VM absence failure", err)
 	}
-	if countOperation(api.operations, "unassign-firewall") != 0 || fence.Phase != cloudapi.FirewallAssignmentIssued || rejects != 0 {
-		t.Fatalf("post-CAS VM reappearance dispatched or rejected detachment: operations=%v fence=%#v rejects=%d", api.operations, fence, rejects)
+	if countOperation(api.operations, "unassign-firewall") != 0 || fence.Phase != cloudapi.FirewallAssignmentRejected || rejects != 1 {
+		t.Fatalf("post-CAS VM reappearance failed to reject undispatched detachment: operations=%v fence=%#v rejects=%d", api.operations, fence, rejects)
 	}
 }

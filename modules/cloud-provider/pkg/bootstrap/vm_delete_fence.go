@@ -294,9 +294,17 @@ func (r *Reconciler) observeExactVMDeletion(ctx context.Context, cluster *v1alph
 		return false, err
 	}
 	detail, err := r.API.GetVM(ctx, attempt.Location, attempt.ResourceUUID)
-	if err != nil {
+	deletedTombstone := err == nil && detail != nil && strings.EqualFold(strings.TrimSpace(detail.Status), "deleted")
+	if err != nil || deletedTombstone {
 		if !inspace.IsNotFound(err) {
-			return false, fmt.Errorf("bootstrap: read back VM %s after delete: %w", attempt.ResourceUUID, err)
+			if !deletedTombstone {
+				return false, fmt.Errorf("bootstrap: read back VM %s after delete: %w", attempt.ResourceUUID, err)
+			}
+			if !strings.EqualFold(detail.UUID, attempt.ResourceUUID) || detail.Name != attempt.ResourceName ||
+				detail.BillingAccountID != cluster.Spec.BillingAccountID ||
+				(detail.NetworkUUID != "" && !strings.EqualFold(detail.NetworkUUID, cluster.Spec.Network.UUID)) {
+				return false, fmt.Errorf("bootstrap: deleted VM tombstone for %q changed exact UUID/name/billing/VPC identity", attempt.ResourceName)
+			}
 		}
 		corroborated, corroborateErr := r.corroborateVMDeletionAbsence(ctx, cluster, key, attempt)
 		if corroborateErr != nil || !corroborated {
@@ -451,7 +459,8 @@ func (r *Reconciler) reconcileVMDelete(ctx context.Context, cluster *v1alpha1.In
 	}
 	present, ownershipErr := r.authorizeVMDeleteDispatch(ctx, cluster, key, issuedAttempt)
 	if ownershipErr != nil {
-		return false, errors.Join(ownershipErr,
+		resetErr := r.resetPreDispatchDeleteIssue(ctx, cluster, key, deletePhaseVMIssued, deletePhaseVMIntent)
+		return false, errors.Join(ownershipErr, resetErr,
 			fmt.Errorf("%w: VM delete %q lacks post-CAS ownership authority", ErrCreateAttemptPending, key))
 	}
 	if !present {
@@ -464,15 +473,11 @@ func (r *Reconciler) reconcileVMDelete(ctx context.Context, cluster *v1alpha1.In
 		}
 		return absent, observeErr
 	}
-	deleteErr := r.API.DeleteVM(ctx, attempt.Location, attempt.ResourceUUID)
+	deleteCtx, deleteCancel := context.WithTimeout(context.WithoutCancel(ctx), configuredDuration(r.createdVMDeleteTimeout, defaultCreatedVMDeleteTimeout))
+	deleteErr := r.API.DeleteVM(deleteCtx, attempt.Location, attempt.ResourceUUID)
+	deleteCancel()
 	if deleteVMFailureProvesNoDispatch(deleteErr) {
-		resetErr := r.mutateDeleteAttempt(ctx, cluster, key, func(current *v1alpha1.ResourceDeleteAttemptStatus) error {
-			if current.Phase != deletePhaseVMIssued {
-				return fmt.Errorf("bootstrap: VM delete attempt %q changed after local rejection", key)
-			}
-			setDeleteAttemptPhase(current, deletePhaseVMIntent)
-			return nil
-		})
+		resetErr := r.resetPreDispatchDeleteIssue(ctx, cluster, key, deletePhaseVMIssued, deletePhaseVMIntent)
 		return false, errors.Join(deleteErr, resetErr)
 	}
 	absent, readErr := r.observeExactVMDeletion(ctx, cluster, key)
@@ -518,6 +523,14 @@ func (r *Reconciler) authorizeVMDeleteDispatch(
 	}
 	if detail.NetworkUUID != "" && !strings.EqualFold(detail.NetworkUUID, cluster.Spec.Network.UUID) {
 		return false, fmt.Errorf("bootstrap: refusing to delete VM %q from another private network", attempt.ResourceName)
+	}
+	if strings.EqualFold(strings.TrimSpace(detail.Status), "deleted") {
+		corroborated, corroborateErr := r.corroborateVMDeletionAbsence(ctx, cluster, key, attempt)
+		if corroborateErr != nil || !corroborated {
+			return false, errors.Join(corroborateErr,
+				fmt.Errorf("bootstrap: deleted VM tombstone %s lacks List/VPC absence", attempt.ResourceUUID))
+		}
+		return false, nil
 	}
 
 	listed, err := r.API.ListVMs(ctx, attempt.Location)
@@ -720,7 +733,8 @@ func (r *Reconciler) rollbackFloatingIP(ctx context.Context, cluster *v1alpha1.I
 		}
 		fresh, authorityErr := r.authorizeRollbackFloatingIPDispatch(ctx, cluster, key, deletePhaseRollbackFIPUnassignIssued)
 		if authorityErr != nil {
-			return false, errors.Join(authorityErr,
+			resetErr := r.resetPreDispatchDeleteIssue(ctx, cluster, key, deletePhaseRollbackFIPUnassignIssued, deletePhaseRollbackFIPUnassignIntent)
+			return false, errors.Join(authorityErr, resetErr,
 				fmt.Errorf("%w: rollback floating-IP unassign %q lacks post-CAS authority", ErrCreateAttemptPending, key))
 		}
 		if fresh == nil || fresh.AssignedTo == "" {
@@ -730,10 +744,7 @@ func (r *Reconciler) rollbackFloatingIP(ctx context.Context, cluster *v1alpha1.I
 		_, mutationErr := r.API.UnassignFloatingIP(mutationCtx, cluster.Spec.Location, fresh.Address)
 		cancel()
 		if deleteVMFailureProvesNoDispatch(mutationErr) {
-			resetErr := r.mutateDeleteAttempt(ctx, cluster, key, func(current *v1alpha1.ResourceDeleteAttemptStatus) error {
-				setDeleteAttemptPhase(current, deletePhaseRollbackFIPUnassignIntent)
-				return nil
-			})
+			resetErr := r.resetPreDispatchDeleteIssue(ctx, cluster, key, deletePhaseRollbackFIPUnassignIssued, deletePhaseRollbackFIPUnassignIntent)
 			return false, errors.Join(mutationErr, resetErr)
 		}
 		return false, errors.Join(mutationErr, r.observeRollbackFloatingIP(ctx, cluster, key))
@@ -746,7 +757,8 @@ func (r *Reconciler) rollbackFloatingIP(ctx context.Context, cluster *v1alpha1.I
 		}
 		fresh, authorityErr := r.authorizeRollbackFloatingIPDispatch(ctx, cluster, key, deletePhaseRollbackFIPDeleteIssued)
 		if authorityErr != nil {
-			return false, errors.Join(authorityErr,
+			resetErr := r.resetPreDispatchDeleteIssue(ctx, cluster, key, deletePhaseRollbackFIPDeleteIssued, deletePhaseRollbackFIPDeleteIntent)
+			return false, errors.Join(authorityErr, resetErr,
 				fmt.Errorf("%w: rollback floating-IP delete %q lacks post-CAS authority", ErrCreateAttemptPending, key))
 		}
 		if fresh == nil {
@@ -756,10 +768,7 @@ func (r *Reconciler) rollbackFloatingIP(ctx context.Context, cluster *v1alpha1.I
 		mutationErr := r.API.DeleteFloatingIP(mutationCtx, cluster.Spec.Location, fresh.Address)
 		cancel()
 		if deleteVMFailureProvesNoDispatch(mutationErr) {
-			resetErr := r.mutateDeleteAttempt(ctx, cluster, key, func(current *v1alpha1.ResourceDeleteAttemptStatus) error {
-				setDeleteAttemptPhase(current, deletePhaseRollbackFIPDeleteIntent)
-				return nil
-			})
+			resetErr := r.resetPreDispatchDeleteIssue(ctx, cluster, key, deletePhaseRollbackFIPDeleteIssued, deletePhaseRollbackFIPDeleteIntent)
 			return false, errors.Join(mutationErr, resetErr)
 		}
 		return false, errors.Join(mutationErr, r.observeRollbackFloatingIP(ctx, cluster, key))

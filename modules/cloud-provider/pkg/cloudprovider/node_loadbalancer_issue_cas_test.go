@@ -8,6 +8,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	kubefake "k8s.io/client-go/kubernetes/fake"
 
 	inspace "github.com/thanet-s/inspace-cloud-kube-modules/modules/client"
@@ -84,8 +85,10 @@ func TestNodeLoadBalancerFirewallCreateRechecksNameAbsenceAfterIssue(t *testing.
 				t.Fatal(err)
 			}
 			if foreign {
-				if stored.Annotations[annotationNodeLoadBalancerPendingFWIssued] == "" {
-					t.Fatalf("foreign Service firewall released issue receipt: %#v", stored.Annotations)
+				if stored.Annotations[annotationNodeLoadBalancerPendingFWIssued] != "" ||
+					stored.Annotations[annotationNodeLoadBalancerPendingFWIssuedAt] != "" ||
+					stored.Annotations[annotationNodeLoadBalancerPendingFWName] != desired.Request.DisplayName {
+					t.Fatalf("foreign Service firewall did not reset to staged intent: %#v", stored.Annotations)
 				}
 			} else if stored.Annotations[annotationNodeLoadBalancerPendingFirewall] != base.firewalls[0].UUID ||
 				stored.Annotations[annotationNodeLoadBalancerPendingFWIssued] != "" {
@@ -144,8 +147,9 @@ func TestNodeLoadBalancerFirewallCreateRechecksNameAbsenceAfterIssue(t *testing.
 			}
 			pool := fixture.pool(t)
 			if foreign {
-				if pool.GetAnnotations()[annotationNodeLoadBalancerShardFWIssuedAt] == "" {
-					t.Fatalf("foreign shard firewall released issue receipt: %#v", pool.GetAnnotations())
+				if pool.GetAnnotations()[annotationNodeLoadBalancerShardFWIssuedAt] != "" ||
+					pool.GetAnnotations()[annotationNodeLoadBalancerShardFWPendingHash] != desired.Hash {
+					t.Fatalf("foreign shard firewall did not reset to staged intent: %#v", pool.GetAnnotations())
 				}
 			} else if pool.GetAnnotations()[annotationNodeLoadBalancerShardFirewallUUID] != fixture.api.firewalls[0].UUID ||
 				pool.GetAnnotations()[annotationNodeLoadBalancerShardFWIssuedAt] != "" {
@@ -193,8 +197,9 @@ func TestNodeLoadBalancerFirewallCreateRechecksNameAbsenceAfterIssue(t *testing.
 				t.Fatal(err)
 			}
 			if foreign {
-				if nodeClass.GetAnnotations()[annotationNodeLoadBalancerICMPCreateIssued] == "" {
-					t.Fatalf("foreign ICMP firewall released issue receipt: %#v", nodeClass.GetAnnotations())
+				if nodeClass.GetAnnotations()[annotationNodeLoadBalancerICMPCreateIssued] != "" ||
+					nodeClass.GetAnnotations()[annotationNodeLoadBalancerICMPPendingName] != desired.Request.DisplayName {
+					t.Fatalf("foreign ICMP firewall did not reset to staged intent: %#v", nodeClass.GetAnnotations())
 				}
 			} else if nodeClass.GetAnnotations()[annotationNodeLoadBalancerICMPFirewallUUID] != base.firewalls[0].UUID ||
 				nodeClass.GetAnnotations()[annotationNodeLoadBalancerICMPCreateIssued] != "" {
@@ -259,8 +264,9 @@ func TestShardFirewallUpdateRechecksAuthorityAfterIssue(t *testing.T) {
 		t.Fatalf("shard update final authority: fired=%t updates=%d", fired, len(fixture.api.updatedFirewalls))
 	}
 	pool := fixture.pool(t)
-	if pool.GetAnnotations()[annotationNodeLoadBalancerShardFWIssuedAt] == "" {
-		t.Fatalf("shard update drift released issued receipt: %#v", pool.GetAnnotations())
+	if pool.GetAnnotations()[annotationNodeLoadBalancerShardFWIssuedAt] != "" ||
+		pool.GetAnnotations()[annotationNodeLoadBalancerShardFWPendingHash] == "" {
+		t.Fatalf("shard update drift did not reset to staged intent: %#v", pool.GetAnnotations())
 	}
 }
 
@@ -329,14 +335,14 @@ func TestShardFirewallCreateRejectsLivePolicyOrOwnerDeletionAfterIssue(t *testin
 			}
 			fixture.provider.api = api
 			state, err := fixture.controller.reconcileShardFirewallPolicy(fixture.ctx, fixture.shard)
-			if err == nil || !state.MutationIssued {
+			if err == nil || state.MutationIssued {
 				t.Fatalf("post-issue create authority = state %#v, err=%v", state, err)
 			}
 			if !fired || len(fixture.api.createdFirewalls) != 0 {
 				t.Fatalf("post-issue drift crossed CreateFirewall: fired=%t creates=%d", fired, len(fixture.api.createdFirewalls))
 			}
-			if fixture.pool(t).GetAnnotations()[annotationNodeLoadBalancerShardFWIssuedAt] == "" {
-				t.Fatal("rejected create cleared its issued receipt")
+			if fixture.pool(t).GetAnnotations()[annotationNodeLoadBalancerShardFWIssuedAt] != "" {
+				t.Fatal("rejected create did not reset its issued receipt")
 			}
 		})
 	}
@@ -393,14 +399,14 @@ func TestShardFirewallUpdateRejectsLiveServicePolicyChangeAfterIssue(t *testing.
 	}
 	fixture.provider.api = api
 	state, err := fixture.controller.reconcileShardFirewallPolicy(fixture.ctx, fixture.shard)
-	if err == nil || !state.MutationIssued {
+	if err == nil || state.MutationIssued {
 		t.Fatalf("post-issue update authority = state %#v, err=%v", state, err)
 	}
 	if !fired || len(fixture.api.updatedFirewalls) != 0 {
 		t.Fatalf("post-issue Service drift crossed UpdateFirewall: fired=%t updates=%d", fired, len(fixture.api.updatedFirewalls))
 	}
-	if fixture.pool(t).GetAnnotations()[annotationNodeLoadBalancerShardFWIssuedAt] == "" {
-		t.Fatal("rejected update cleared its issued receipt")
+	if fixture.pool(t).GetAnnotations()[annotationNodeLoadBalancerShardFWIssuedAt] != "" {
+		t.Fatal("rejected update did not reset its issued receipt")
 	}
 }
 
@@ -434,8 +440,8 @@ func TestClusterICMPCreateRejectsNodeClassDeletionAfterIssue(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if nodeClass.GetAnnotations()[annotationNodeLoadBalancerICMPCreateIssued] == "" {
-		t.Fatal("rejected ICMP create cleared its issued receipt")
+	if nodeClass.GetAnnotations()[annotationNodeLoadBalancerICMPCreateIssued] != "" {
+		t.Fatal("rejected ICMP create did not reset its issued receipt")
 	}
 }
 
@@ -457,9 +463,13 @@ func TestClusterICMPCreateAuthorityRejectsStaleSecondController(t *testing.T) {
 		annotationNodeLoadBalancerICMPPendingStarted: startedAt,
 		annotationNodeLoadBalancerICMPCreateIssued:   "",
 	}
+	nodeClass, err := provider.dynamicClient.Resource(nodeClassGVR).Get(ctx, nodeClassName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
 	second := &nodeLoadBalancerController{provider: provider}
 	attempt := func(controller *nodeLoadBalancerController, issuedAt string) error {
-		if _, err := controller.issueManagedNodeClassICMPCreate(ctx, nodeClassName, expectedStaged, issuedAt); err != nil {
+		if _, err := controller.issueManagedNodeClassICMPCreate(ctx, nodeClassName, nodeClass.GetUID(), expectedStaged, issuedAt); err != nil {
 			return err
 		}
 		_, err := controller.provider.api.CreateFirewall(ctx, controller.provider.config.Location, desired.Request)
@@ -482,6 +492,120 @@ func TestClusterICMPCreateAuthorityRejectsStaleSecondController(t *testing.T) {
 	if stored.GetAnnotations()[annotationNodeLoadBalancerICMPCreateIssued] == "" {
 		t.Fatal("winning ICMP create authority was not retained")
 	}
+}
+
+func TestFirewallCreateIssueRejectsSameNameOwnerReplacement(t *testing.T) {
+	t.Run("cluster ICMP NodeClass", func(t *testing.T) {
+		ctx, api, provider, controller, nodeClassName, desired := newClusterICMPSafetyFixture(t)
+		startedAt := time.Now().Add(-time.Second).UTC().Format(time.RFC3339Nano)
+		setClusterICMPSafetyAnnotations(t, ctx, provider, nodeClassName, map[string]string{
+			annotationNodeLoadBalancerICMPPendingName:    desired.Request.DisplayName,
+			annotationNodeLoadBalancerICMPPendingStarted: startedAt,
+		})
+		resource := provider.dynamicClient.Resource(nodeClassGVR)
+		original, err := resource.Get(ctx, nodeClassName, metav1.GetOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		originalUID := original.GetUID()
+		replacement := original.DeepCopy()
+		replacement.SetResourceVersion("")
+		replacement.SetUID(types.UID("replacement-" + string(originalUID)))
+		if err := resource.Delete(ctx, nodeClassName, metav1.DeleteOptions{}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := resource.Create(ctx, replacement, metav1.CreateOptions{}); err != nil {
+			t.Fatal(err)
+		}
+		expectedStaged := map[string]string{
+			annotationNodeLoadBalancerICMPFirewallUUID:   "",
+			annotationNodeLoadBalancerICMPPendingUUID:    "",
+			annotationNodeLoadBalancerICMPPendingName:    desired.Request.DisplayName,
+			annotationNodeLoadBalancerICMPPendingStarted: startedAt,
+			annotationNodeLoadBalancerICMPCreateIssued:   "",
+		}
+		if _, issueErr := controller.issueManagedNodeClassICMPCreate(
+			ctx,
+			nodeClassName,
+			originalUID,
+			expectedStaged,
+			time.Now().UTC().Format(time.RFC3339Nano),
+		); issueErr == nil {
+			_, _ = controller.provider.api.CreateFirewall(ctx, controller.provider.config.Location, desired.Request)
+			t.Fatal("replacement NodeClass acquired the predecessor's create authority")
+		}
+		if len(api.createdFirewalls) != 0 {
+			t.Fatalf("replacement NodeClass crossed CreateFirewall: %v", api.createdFirewalls)
+		}
+		stored, err := resource.Get(ctx, nodeClassName, metav1.GetOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if stored.GetUID() == originalUID ||
+			stored.GetAnnotations()[annotationNodeLoadBalancerICMPCreateIssued] != "" {
+			t.Fatalf("replacement NodeClass receipt changed: uid=%q annotations=%#v", stored.GetUID(), stored.GetAnnotations())
+		}
+	})
+
+	t.Run("shard NodePool", func(t *testing.T) {
+		fixture := newAggregateShardFirewallTestFixture(t, aggregateTestService(
+			"replacement-owner",
+			"18888888-2222-4333-8444-555555555555",
+			corev1.ProtocolTCP,
+			443,
+		))
+		fixture.reconcile(t)
+		resource := fixture.provider.dynamicClient.Resource(nodePoolGVR)
+		original, err := resource.Get(fixture.ctx, fixture.shard, metav1.GetOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		annotations, err := nodeLoadBalancerShardFirewallAnnotations(original)
+		if err != nil {
+			t.Fatal(err)
+		}
+		expectedStaged := nodeLoadBalancerShardFirewallMutationExpected(annotations, "")
+		desired, _, _, err := fixture.controller.desiredStagedShardFirewallPolicy(fixture.ctx, fixture.shard)
+		if err != nil || desired == nil {
+			t.Fatalf("desired shard policy = %#v, err=%v", desired, err)
+		}
+		originalUID := original.GetUID()
+		replacement := original.DeepCopy()
+		replacement.SetResourceVersion("")
+		replacement.SetUID(types.UID("replacement-" + string(originalUID)))
+		if err := resource.Delete(fixture.ctx, fixture.shard, metav1.DeleteOptions{}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := resource.Create(fixture.ctx, replacement, metav1.CreateOptions{}); err != nil {
+			t.Fatal(err)
+		}
+		if _, issueErr := fixture.controller.issueShardFirewallMutation(
+			fixture.ctx,
+			fixture.shard,
+			originalUID,
+			expectedStaged,
+			time.Now().UTC().Format(time.RFC3339Nano),
+			true,
+		); issueErr == nil {
+			_, _ = fixture.controller.provider.api.CreateFirewall(
+				fixture.ctx,
+				fixture.controller.provider.config.Location,
+				desired.Request,
+			)
+			t.Fatal("replacement NodePool acquired the predecessor's create authority")
+		}
+		if len(fixture.api.createdFirewalls) != 0 {
+			t.Fatalf("replacement NodePool crossed CreateFirewall: %v", fixture.api.createdFirewalls)
+		}
+		stored, err := resource.Get(fixture.ctx, fixture.shard, metav1.GetOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if stored.GetUID() == originalUID ||
+			stored.GetAnnotations()[annotationNodeLoadBalancerShardFWIssuedAt] != "" {
+			t.Fatalf("replacement NodePool receipt changed: uid=%q annotations=%#v", stored.GetUID(), stored.GetAnnotations())
+		}
+	})
 }
 
 func TestShardFirewallCreateAuthorityRejectsStaleSecondController(t *testing.T) {
@@ -519,6 +643,7 @@ func TestShardFirewallCreateAuthorityRejectsStaleSecondController(t *testing.T) 
 		if _, err := controller.issueShardFirewallMutation(
 			fixture.ctx,
 			fixture.shard,
+			pool.GetUID(),
 			expectedStaged,
 			issuedAt,
 			true,

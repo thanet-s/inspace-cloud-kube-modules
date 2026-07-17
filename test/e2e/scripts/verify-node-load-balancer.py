@@ -57,7 +57,10 @@ DATAPATH_NAME_PATTERN = re.compile(r"^inlb-dp-[0-9a-f]{52}$")
 UUID_PATTERN = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
 )
-IMMUTABLE_INVENTORY_KEYS = {"vms", "firewalls", "floatingIPs", "loadBalancers", "disks"}
+IMMUTABLE_INVENTORY_KEYS = {
+    "vms", "networks", "firewalls", "floatingIPs", "loadBalancers", "disks",
+    "buckets", "servicePackages",
+}
 
 
 def fail(message: str) -> None:

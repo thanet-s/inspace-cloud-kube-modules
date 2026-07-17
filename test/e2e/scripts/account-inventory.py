@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Capture/compare every API-visible billable resource in the isolated E2E account."""
+"""Capture/compare every API-visible cloud resource in the isolated E2E account."""
 
 import argparse
 import json
@@ -11,13 +11,21 @@ import tempfile
 import urllib.request
 
 
-RESOURCE_PATHS = {
+LOCATION_RESOURCE_PATHS = {
     "vms": ("user-resource/vm/list", "uuid"),
+    "networks": ("network/networks", "uuid"),
     "firewalls": ("network/firewalls", "uuid"),
     "floatingIPs": ("network/ip_addresses", "address"),
     "loadBalancers": ("network/load_balancers", "uuid"),
     "disks": ("storage/disks", "uuid"),
 }
+
+GLOBAL_RESOURCE_PATHS = {
+    "buckets": ("storage/bucket/list", "name"),
+    "servicePackages": ("user-resource/service/packages", "uuid"),
+}
+
+RESOURCE_PATHS = {**LOCATION_RESOURCE_PATHS, **GLOBAL_RESOURCE_PATHS}
 
 
 def api_get(path: str, location: str | None = None):
@@ -55,7 +63,7 @@ def active(item: dict) -> bool:
 def inventory() -> dict[str, list[str]]:
     result = {name: [] for name in RESOURCE_PATHS}
     for location in locations():
-        for name, (path, identity_field) in RESOURCE_PATHS.items():
+        for name, (path, identity_field) in LOCATION_RESOURCE_PATHS.items():
             identities = result[name]
             for item in api_get(path, location):
                 if not isinstance(item, dict):
@@ -66,6 +74,17 @@ def inventory() -> dict[str, list[str]]:
                 if not isinstance(identity, str) or not identity.strip():
                     raise SystemExit(f"active {location}/{name} item has no stable {identity_field}")
                 identities.append(f"{location}:{identity}")
+    for name, (path, identity_field) in GLOBAL_RESOURCE_PATHS.items():
+        identities = result[name]
+        for item in api_get(path):
+            if not isinstance(item, dict):
+                raise SystemExit(f"global/{path} returned a non-object resource item")
+            if not active(item):
+                continue
+            identity = item.get(identity_field)
+            if not isinstance(identity, str) or not identity.strip():
+                raise SystemExit(f"active global/{name} item has no stable {identity_field}")
+            identities.append(f"global:{identity}")
     for name, identities in result.items():
         if len(identities) != len(set(identities)):
             raise SystemExit(f"active {name} inventory contains duplicate identities")
@@ -129,7 +148,11 @@ def main() -> None:
         if output.exists():
             raise SystemExit("refusing to replace an existing baseline inventory")
         atomic_write(output, current)
-        print(json.dumps({"captured": True, "counts": {key: len(value) for key, value in current.items()}}, sort_keys=True))
+        print(json.dumps({
+            "captured": True,
+            "counts": {key: len(value) for key, value in current.items()},
+            "networks": current["networks"],
+        }, sort_keys=True))
         return
 
     baseline = read_baseline(pathlib.Path(args.baseline))

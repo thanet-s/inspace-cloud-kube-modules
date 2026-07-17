@@ -11,7 +11,10 @@ import stat
 import urllib.request
 
 
-IMMUTABLE_INVENTORY_KEYS = {"vms", "firewalls", "floatingIPs", "loadBalancers", "disks"}
+IMMUTABLE_INVENTORY_KEYS = {
+    "vms", "networks", "firewalls", "floatingIPs", "loadBalancers", "disks",
+    "buckets", "servicePackages",
+}
 
 
 def api_get(path: str):

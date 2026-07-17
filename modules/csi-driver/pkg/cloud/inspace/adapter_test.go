@@ -88,6 +88,39 @@ type transientDiskOmissionAPI struct {
 	round        int
 }
 
+// deletedDiskTombstoneAPI models the live InSpace delete contract: after the
+// DELETE commits, ListDisks omits the disk while exact GetDisk keeps returning
+// its canonical identity and billing account with status Deleted.
+type deletedDiskTombstoneAPI struct {
+	*fakeAPI
+	tombstone *sdk.Disk
+}
+
+func (a *deletedDiskTombstoneAPI) GetDisk(ctx context.Context, location, id string) (*sdk.Disk, error) {
+	if a.tombstone != nil {
+		copy := *a.tombstone
+		return &copy, nil
+	}
+	return a.fakeAPI.GetDisk(ctx, location, id)
+}
+
+func (a *deletedDiskTombstoneAPI) DeleteDisk(ctx context.Context, location, id string) error {
+	var deleted sdk.Disk
+	for _, disk := range a.disks {
+		if strings.EqualFold(disk.UUID, id) {
+			deleted = disk
+			break
+		}
+	}
+	before := a.deleteCalls
+	err := a.fakeAPI.DeleteDisk(ctx, location, id)
+	if a.deleteCalls == before+1 && !a.suppressDeleteCommit && a.pendingDeleteDisk == "" {
+		deleted.Status = "Deleted"
+		a.tombstone = &deleted
+	}
+	return err
+}
+
 func (a *transientDiskOmissionAPI) GetDisk(ctx context.Context, location, id string) (*sdk.Disk, error) {
 	if a.round < a.hiddenRounds {
 		return nil, apiNotFound("disk")
@@ -477,7 +510,7 @@ func TestEnsureVolumeRechecksDeterministicNameAfterFenceCAS(t *testing.T) {
 			t.Fatalf("post-CAS exact appearance caused %d CreateDisk call(s)", api.createCalls)
 		}
 	})
-	t.Run("foreign disk blocks POST and retains fence", func(t *testing.T) {
+	t.Run("foreign disk blocks POST and clears undispatched fence", func(t *testing.T) {
 		foreign := owned
 		foreign.BillingAccountID = 99
 		api := &fakeAPI{
@@ -491,11 +524,11 @@ func TestEnsureVolumeRechecksDeterministicNameAfterFenceCAS(t *testing.T) {
 		if api.createCalls != 0 {
 			t.Fatalf("post-CAS foreign appearance caused %d CreateDisk call(s)", api.createCalls)
 		}
-		if fence, err := store.Get(context.Background(), diskCreateFenceKey(spec.Location, spec.Name)); err != nil || fence == nil {
-			t.Fatalf("post-CAS foreign appearance lost fence=%#v err=%v", fence, err)
+		if fence, err := store.Get(context.Background(), diskCreateFenceKey(spec.Location, spec.Name)); err != nil || fence != nil {
+			t.Fatalf("post-CAS foreign appearance left fence=%#v err=%v", fence, err)
 		}
 	})
-	t.Run("duplicate disks block POST and retain fence", func(t *testing.T) {
+	t.Run("duplicate disks block POST and clear undispatched fence", func(t *testing.T) {
 		duplicate := owned
 		duplicate.UUID = testVM2
 		api := &fakeAPI{diskAppearsOnListCall: 2, appearingDisks: []sdk.Disk{owned, duplicate}}
@@ -507,10 +540,377 @@ func TestEnsureVolumeRechecksDeterministicNameAfterFenceCAS(t *testing.T) {
 		if api.createCalls != 0 {
 			t.Fatalf("post-CAS duplicates caused %d CreateDisk call(s)", api.createCalls)
 		}
-		if fence, err := store.Get(context.Background(), diskCreateFenceKey(spec.Location, spec.Name)); err != nil || fence == nil {
-			t.Fatalf("post-CAS duplicates lost fence=%#v err=%v", fence, err)
+		if fence, err := store.Get(context.Background(), diskCreateFenceKey(spec.Location, spec.Name)); err != nil || fence != nil {
+			t.Fatalf("post-CAS duplicates left fence=%#v err=%v", fence, err)
 		}
 	})
+	t.Run("terminal disk blocks POST and clears undispatched fence", func(t *testing.T) {
+		failed := owned
+		failed.Status = "Failed"
+		api := &fakeAPI{diskAppearsOnListCall: 2, appearingDisks: []sdk.Disk{failed}}
+		store := newMemoryMutationFenceStore()
+		resolver := &fencedNodeResolver{nodeResolver: nodeResolver{}, memoryMutationFenceStore: store}
+		if _, err := newFencedAdapter(t, api, resolver, time.Second).EnsureVolume(context.Background(), spec); err == nil {
+			t.Fatal("post-CAS terminal disk was accepted")
+		}
+		if api.createCalls != 0 {
+			t.Fatalf("post-CAS terminal disk caused %d CreateDisk call(s)", api.createCalls)
+		}
+		if fence, err := store.Get(context.Background(), diskCreateFenceKey(spec.Location, spec.Name)); err != nil || fence != nil {
+			t.Fatalf("post-CAS terminal disk left fence=%#v err=%v", fence, err)
+		}
+	})
+}
+
+type secondDiskListErrorAPI struct {
+	*fakeAPI
+	calls int
+	err   error
+}
+
+func (a *secondDiskListErrorAPI) ListDisks(ctx context.Context, location string) ([]sdk.Disk, error) {
+	a.calls++
+	if a.calls == 2 {
+		return nil, a.err
+	}
+	return a.fakeAPI.ListDisks(ctx, location)
+}
+
+type deadlineCheckingMutationFenceStore struct {
+	mutationFenceStore
+	sawDeadline bool
+}
+
+func (s *deadlineCheckingMutationFenceStore) Delete(ctx context.Context, fence mutationFence) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	deadline, ok := ctx.Deadline()
+	if !ok || time.Until(deadline) <= 0 {
+		return errors.New("CSI fence delete lacks a live bounded context")
+	}
+	s.sawDeadline = true
+	return s.mutationFenceStore.Delete(ctx, fence)
+}
+
+type advanceReceiptBeforeFenceDeleteStore struct {
+	mutationFenceStore
+	receipt     string
+	advanced    bool
+	sawDeadline bool
+}
+
+func (s *advanceReceiptBeforeFenceDeleteStore) Delete(ctx context.Context, fence mutationFence) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	deadline, ok := ctx.Deadline()
+	if !ok || time.Until(deadline) <= 0 {
+		return errors.New("CSI fence delete lacks a live bounded context")
+	}
+	s.sawDeadline = true
+	if !s.advanced {
+		current, err := s.mutationFenceStore.Get(ctx, fence.Key)
+		if err != nil {
+			return err
+		}
+		if current == nil {
+			return errors.New("CSI mutation fence disappeared before replacement receipt")
+		}
+		if _, err := s.mutationFenceStore.SetReceipt(ctx, *current, s.receipt); err != nil {
+			return err
+		}
+		s.advanced = true
+	}
+	return s.mutationFenceStore.Delete(ctx, fence)
+}
+
+func TestDetachedFenceDeleteSurvivesCancellationWithReadbackBound(t *testing.T) {
+	base := newMemoryMutationFenceStore()
+	candidate, err := newMutationFence("disk-create/bkk01/canceled-delete", diskCreateIntent{
+		Operation: "create-disk", Location: testLocation, Name: "canceled-delete", SizeGiB: 1, BillingAccountID: 42,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored, acquired, err := base.Create(context.Background(), candidate)
+	if err != nil || !acquired || stored == nil {
+		t.Fatalf("seed fence: stored=%#v acquired=%t err=%v", stored, acquired, err)
+	}
+	checking := &deadlineCheckingMutationFenceStore{mutationFenceStore: base}
+	adapter := newAdapter(t, &fakeAPI{}, nil)
+	adapter.readback = 50 * time.Millisecond
+	adapter.fences = checking
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := adapter.deleteMutationFenceDetached(canceled, *stored); err != nil {
+		t.Fatalf("detached fence delete: %v", err)
+	}
+	if !checking.sawDeadline {
+		t.Fatal("detached fence delete did not expose a finite deadline")
+	}
+	if current, err := base.Get(context.Background(), candidate.Key); err != nil || current != nil {
+		t.Fatalf("detached fence delete result=%#v err=%v", current, err)
+	}
+}
+
+func TestAttachmentPredispatchCleanupSurvivesCancellationAndPreservesAdvancedReceipt(t *testing.T) {
+	vm := func(uuid string, attached bool) sdk.VM {
+		result := sdk.VM{
+			UUID: uuid, Status: "Active", BillingAccountID: 42, NetworkUUID: testNetwork,
+		}
+		if attached {
+			result.Storage = []sdk.VMStorage{{UUID: testDiskID}}
+		}
+		return result
+	}
+	type cleanupCase struct {
+		name          string
+		attach        bool
+		vms           []sdk.VM
+		vmReads       map[int]sdk.VM
+		wantElsewhere bool
+	}
+	tests := []cleanupCase{
+		{
+			name: "attach first discovery already desired", attach: true,
+			vms: []sdk.VM{{UUID: testVM1}},
+			vmReads: map[int]sdk.VM{
+				1: vm(testVM1, false),
+				2: vm(testVM1, true),
+			},
+		},
+		{
+			name: "attach first discovery on another VM", attach: true,
+			vms: []sdk.VM{{UUID: testVM1}, {UUID: testVM2}},
+			vmReads: map[int]sdk.VM{
+				1: vm(testVM1, false),
+				2: vm(testVM1, false),
+				3: vm(testVM2, true),
+			},
+			wantElsewhere: true,
+		},
+		{
+			name: "attach canonical detail already desired", attach: true,
+			vms: []sdk.VM{{UUID: testVM1}},
+			vmReads: map[int]sdk.VM{
+				1: vm(testVM1, false),
+				2: vm(testVM1, false),
+				3: vm(testVM1, true),
+			},
+		},
+		{
+			name: "attach final discovery already desired", attach: true,
+			vms: []sdk.VM{{UUID: testVM1}},
+			vmReads: map[int]sdk.VM{
+				1: vm(testVM1, false),
+				2: vm(testVM1, false),
+				3: vm(testVM1, false),
+				4: vm(testVM1, true),
+			},
+		},
+		{
+			name: "detach first recheck already empty",
+			vms:  []sdk.VM{{UUID: testVM1}},
+			vmReads: map[int]sdk.VM{
+				1: vm(testVM1, true),
+				2: vm(testVM1, false),
+			},
+		},
+		{
+			name: "detach first recheck moved to another VM",
+			vms:  []sdk.VM{{UUID: testVM1}, {UUID: testVM2}},
+			vmReads: map[int]sdk.VM{
+				1: vm(testVM1, true),
+				2: vm(testVM2, false),
+				3: vm(testVM1, false),
+				4: vm(testVM2, true),
+			},
+			wantElsewhere: true,
+		},
+		{
+			name: "detach canonical detail already empty",
+			vms:  []sdk.VM{{UUID: testVM1}},
+			vmReads: map[int]sdk.VM{
+				1: vm(testVM1, true),
+				2: vm(testVM1, true),
+				3: vm(testVM1, false),
+			},
+		},
+		{
+			name: "detach final discovery already empty",
+			vms:  []sdk.VM{{UUID: testVM1}},
+			vmReads: map[int]sdk.VM{
+				1: vm(testVM1, true),
+				2: vm(testVM1, true),
+				3: vm(testVM1, true),
+				4: vm(testVM1, false),
+			},
+		},
+	}
+
+	for _, test := range tests {
+		for _, advanceReceipt := range []bool{false, true} {
+			mode := "clear"
+			if advanceReceipt {
+				mode = "receipt advanced before delete"
+			}
+			t.Run(test.name+"/"+mode, func(t *testing.T) {
+				baseAPI := &fakeAPI{
+					disks: []sdk.Disk{{
+						UUID: testDiskID, DisplayName: "pvc", SizeGiB: 1,
+						Status: "Active", BillingAccountID: 42,
+					}},
+					vms: test.vms,
+				}
+				api := &detailSequenceAPI{fakeAPI: baseAPI, vmOverride: test.vmReads}
+				baseStore := newMemoryMutationFenceStore()
+				resolver := &fencedNodeResolver{
+					nodeResolver: nodeResolver{
+						"worker-1": fmt.Sprintf("inspace://%s/%s", testLocation, testVM1),
+					},
+					memoryMutationFenceStore: baseStore,
+				}
+				adapter := newFencedAdapter(t, api, resolver, 50*time.Millisecond)
+
+				var sawDeadline func() bool
+				if advanceReceipt {
+					store := &advanceReceiptBeforeFenceDeleteStore{
+						mutationFenceStore: baseStore,
+						receipt:            testVM2,
+					}
+					adapter.fences = store
+					sawDeadline = func() bool { return store.sawDeadline && store.advanced }
+				} else {
+					store := &deadlineCheckingMutationFenceStore{mutationFenceStore: baseStore}
+					adapter.fences = store
+					sawDeadline = func() bool { return store.sawDeadline }
+				}
+
+				canceled, cancel := context.WithCancel(context.Background())
+				cancel()
+				var err error
+				if test.attach {
+					err = adapter.AttachVolume(canceled, testLocation, testDiskID, "worker-1")
+				} else {
+					err = adapter.DetachVolume(canceled, testLocation, testDiskID, "")
+				}
+				if test.wantElsewhere && !errors.Is(err, cloud.ErrVolumeAttachedElsewhere) {
+					t.Fatalf("operation error = %v, want ErrVolumeAttachedElsewhere", err)
+				}
+				if !test.wantElsewhere && !advanceReceipt && err != nil {
+					t.Fatalf("operation error = %v", err)
+				}
+				if advanceReceipt && err == nil {
+					t.Fatal("advanced receipt was cleared")
+				}
+				if !sawDeadline() {
+					t.Fatal("cleanup did not use a live bounded context")
+				}
+				if baseAPI.mutationCalls() != 0 {
+					t.Fatalf("pre-dispatch cleanup issued %d cloud mutation(s)", baseAPI.mutationCalls())
+				}
+				fence, getErr := baseStore.Get(context.Background(), diskAttachmentFenceKey(testLocation, testDiskID))
+				if getErr != nil {
+					t.Fatal(getErr)
+				}
+				if advanceReceipt {
+					if fence == nil || fence.Receipt != testVM2 {
+						t.Fatalf("advanced receipt fence = %#v, want retained receipt %s", fence, testVM2)
+					}
+				} else if fence != nil {
+					t.Fatalf("proven-undispatched fence = %#v, want cleared", fence)
+				}
+			})
+		}
+	}
+}
+
+func TestEnsureVolumePredispatchCleanupPreservesAdvancedReceipt(t *testing.T) {
+	spec := cloud.VolumeSpec{Name: "pvc-post-cas-receipt-race", Location: testLocation, CapacityBytes: gib}
+	owned := sdk.Disk{
+		UUID: testDiskID, DisplayName: spec.Name, SizeGiB: 1,
+		Status: "Active", BillingAccountID: 42, SourceImageType: "EMPTY",
+	}
+	tests := map[string][]sdk.Disk{
+		"duplicate": {
+			owned,
+			{
+				UUID: testVM2, DisplayName: spec.Name, SizeGiB: 1,
+				Status: "Active", BillingAccountID: 42, SourceImageType: "EMPTY",
+			},
+		},
+		"validation": {
+			{
+				UUID: testDiskID, DisplayName: spec.Name, SizeGiB: 1,
+				Status: "Active", BillingAccountID: 99, SourceImageType: "EMPTY",
+			},
+		},
+		"readiness": {
+			{
+				UUID: testDiskID, DisplayName: spec.Name, SizeGiB: 1,
+				Status: "Failed", BillingAccountID: 42, SourceImageType: "EMPTY",
+			},
+		},
+	}
+	for name, appearing := range tests {
+		t.Run(name, func(t *testing.T) {
+			api := &fakeAPI{diskAppearsOnListCall: 2, appearingDisks: appearing, preserveDiskBilling: true}
+			base := newMemoryMutationFenceStore()
+			store := &advanceReceiptBeforeFenceDeleteStore{
+				mutationFenceStore: base,
+				receipt:            testVM1,
+			}
+			adapter := newFencedAdapter(t, api, nil, time.Second)
+			adapter.fences = store
+
+			if _, err := adapter.EnsureVolume(context.Background(), spec); err == nil {
+				t.Fatal("post-CAS authority failure was accepted")
+			}
+			if api.createCalls != 0 {
+				t.Fatalf("post-CAS authority failure caused %d CreateDisk call(s)", api.createCalls)
+			}
+			if !store.advanced || !store.sawDeadline {
+				t.Fatalf("cleanup advanced=%t saw bounded context=%t", store.advanced, store.sawDeadline)
+			}
+			fence, err := base.Get(context.Background(), diskCreateFenceKey(spec.Location, spec.Name))
+			if err != nil || fence == nil || fence.Receipt != testVM1 {
+				t.Fatalf("advanced receipt fence=%#v err=%v", fence, err)
+			}
+		})
+	}
+}
+
+func TestEnsureVolumeClearsUndispatchedFenceAfterPostCASHTTPReadError(t *testing.T) {
+	spec := cloud.VolumeSpec{Name: "pvc-post-cas-http-error", Location: testLocation, CapacityBytes: gib}
+	base := &fakeAPI{}
+	api := &secondDiskListErrorAPI{
+		fakeAPI: base,
+		err: &sdk.APIError{
+			StatusCode: 500, Method: "GET", Path: "/storage/disks", Message: "temporary read failure", Retryable: true,
+		},
+	}
+	store := newMemoryMutationFenceStore()
+	resolver := &fencedNodeResolver{nodeResolver: nodeResolver{}, memoryMutationFenceStore: store}
+	adapter := newFencedAdapter(t, api, resolver, time.Second)
+
+	if _, err := adapter.EnsureVolume(context.Background(), spec); err == nil {
+		t.Fatal("post-CAS HTTP read failure was accepted")
+	}
+	if base.createCalls != 0 {
+		t.Fatalf("post-CAS HTTP read failure dispatched %d CreateDisk call(s)", base.createCalls)
+	}
+	if fence, err := store.Get(context.Background(), diskCreateFenceKey(spec.Location, spec.Name)); err != nil || fence != nil {
+		t.Fatalf("proven-undispatched fence = %#v, err = %v; want cleared", fence, err)
+	}
+
+	volume, err := adapter.EnsureVolume(context.Background(), spec)
+	if err != nil {
+		t.Fatalf("retry after proven-undispatched read failure: %v", err)
+	}
+	if volume.ID == "" || base.createCalls != 1 {
+		t.Fatalf("retry volume = %#v, CreateDisk calls = %d", volume, base.createCalls)
+	}
 }
 
 func TestEnsureVolumeReconcilesAmbiguousCreate(t *testing.T) {
@@ -778,6 +1178,99 @@ func TestDeleteVolumeDurableFenceRecoversDelayedCommittedAmbiguousDeleteAcrossRe
 	}
 }
 
+func TestDeleteVolumeConvergesCanonicalDeletedTombstoneAcrossRestart(t *testing.T) {
+	base := &fakeAPI{disks: []sdk.Disk{{
+		UUID: testDiskID, DisplayName: "pvc-delete", SizeGiB: 1,
+		Status: "Active", BillingAccountID: 42,
+	}}}
+	api := &deletedDiskTombstoneAPI{fakeAPI: base}
+	store := newMemoryMutationFenceStore()
+	resolver := &fencedNodeResolver{nodeResolver: nodeResolver{}, memoryMutationFenceStore: store}
+
+	// The live API returns HTTP 204, omits the disk from ListDisks, and retains
+	// an exact status=Deleted tombstone. Stop after the first durable observation
+	// to prove a restarted controller resumes the same fence without replaying
+	// DELETE.
+	first := newFencedAdapter(t, api, resolver, 20*time.Millisecond)
+	first.absencePoll = 100 * time.Millisecond
+	if err := first.DeleteVolume(context.Background(), testLocation, testDiskID); !errors.Is(err, cloud.ErrUnavailable) {
+		t.Fatalf("first tombstone delete error=%v, want ErrUnavailable", err)
+	}
+	if base.deleteCalls != 1 || len(base.disks) != 0 || api.tombstone == nil || !strings.EqualFold(api.tombstone.Status, "deleted") {
+		t.Fatalf("committed tombstone delete calls=%d disks=%#v tombstone=%#v", base.deleteCalls, base.disks, api.tombstone)
+	}
+	fence, err := store.Get(context.Background(), diskAttachmentFenceKey(testLocation, testDiskID))
+	if err != nil || fence == nil {
+		t.Fatalf("retained tombstone delete fence=%#v err=%v", fence, err)
+	}
+	observation, err := decodeMutationObservation(fence.Observation)
+	if err != nil || observation.Kind != diskDeleteAbsenceObservationKind || observation.Count != 1 {
+		t.Fatalf("retained tombstone observation=%#v err=%v", observation, err)
+	}
+
+	restarted := newFencedAdapter(t, api, resolver, time.Second)
+	if err := restarted.DeleteVolume(context.Background(), testLocation, testDiskID); err != nil {
+		t.Fatal(err)
+	}
+	if base.deleteCalls != 1 {
+		t.Fatalf("restart replayed tombstone DELETE %d times", base.deleteCalls)
+	}
+	if fence, err := store.Get(context.Background(), diskAttachmentFenceKey(testLocation, testDiskID)); err != nil || fence != nil {
+		t.Fatalf("completed tombstone delete fence=%#v err=%v", fence, err)
+	}
+}
+
+func TestCanonicalDeletedDiskTombstoneIsAbsentForReadAndNeverAttached(t *testing.T) {
+	api := &fakeAPI{
+		disks: []sdk.Disk{{
+			UUID: testDiskID, DisplayName: "pvc-deleted", SizeGiB: 1,
+			Status: "Deleted", BillingAccountID: 42,
+		}},
+		vms: []sdk.VM{{
+			UUID: testVM1, Status: "Active", BillingAccountID: 42,
+			NetworkUUID: testNetwork,
+		}},
+		networkVMUUIDs: []string{testVM1},
+	}
+	adapter := newAdapter(t, api, nodeResolver{
+		"worker-1": fmt.Sprintf("inspace://%s/%s", testLocation, testVM1),
+	})
+
+	if _, err := adapter.GetVolume(context.Background(), testLocation, testDiskID); !errors.Is(err, cloud.ErrNotFound) {
+		t.Fatalf("GetVolume deleted tombstone error = %v, want ErrNotFound", err)
+	}
+	if err := adapter.AttachVolume(context.Background(), testLocation, testDiskID, "worker-1"); !errors.Is(err, cloud.ErrNotFound) {
+		t.Fatalf("AttachVolume deleted tombstone error = %v, want ErrNotFound", err)
+	}
+	if api.attachCalls != 0 {
+		t.Fatalf("deleted tombstone issued %d AttachDisk call(s)", api.attachCalls)
+	}
+}
+
+func TestDeleteVolumeAdoptsCanonicalDeletedTombstoneWithoutReplayingDelete(t *testing.T) {
+	base := &fakeAPI{}
+	api := &deletedDiskTombstoneAPI{
+		fakeAPI: base,
+		tombstone: &sdk.Disk{
+			UUID: testDiskID, DisplayName: "pvc-deleted", SizeGiB: 1,
+			Status: "Deleted", BillingAccountID: 42,
+		},
+	}
+	store := newMemoryMutationFenceStore()
+	resolver := &fencedNodeResolver{nodeResolver: nodeResolver{}, memoryMutationFenceStore: store}
+	adapter := newFencedAdapter(t, api, resolver, time.Second)
+
+	if err := adapter.DeleteVolume(context.Background(), testLocation, testDiskID); err != nil {
+		t.Fatal(err)
+	}
+	if base.deleteCalls != 0 {
+		t.Fatalf("pre-existing deleted tombstone replayed DELETE %d time(s)", base.deleteCalls)
+	}
+	if fence, err := store.Get(context.Background(), diskAttachmentFenceKey(testLocation, testDiskID)); err != nil || fence != nil {
+		t.Fatalf("completed pre-existing tombstone fence=%#v err=%v", fence, err)
+	}
+}
+
 func TestLocallyBlockedDiskDeleteClearsOnlyItsUndispatchedFence(t *testing.T) {
 	api := &fakeAPI{
 		disks:               []sdk.Disk{{UUID: testDiskID, DisplayName: "pvc", SizeGiB: 1, Status: "Active", BillingAccountID: 42}},
@@ -840,6 +1333,111 @@ func TestDiskDeleteAbsenceProofPersistsAcrossRestart(t *testing.T) {
 	}
 	if api.mutationCalls() != 0 {
 		t.Fatalf("absence recovery issued %d cloud mutation(s)", api.mutationCalls())
+	}
+}
+
+func TestDiskDeleteTombstoneAbsenceRemainsFailClosed(t *testing.T) {
+	tests := []struct {
+		name       string
+		tombstone  sdk.Disk
+		listedDisk *sdk.Disk
+	}{
+		{name: "active", tombstone: sdk.Disk{UUID: testDiskID, Status: "Active", BillingAccountID: 42}},
+		{name: "error", tombstone: sdk.Disk{UUID: testDiskID, Status: "Error", BillingAccountID: 42}},
+		{name: "failed", tombstone: sdk.Disk{UUID: testDiskID, Status: "Failed", BillingAccountID: 42}},
+		{name: "deleting", tombstone: sdk.Disk{UUID: testDiskID, Status: "Deleting", BillingAccountID: 42}},
+		{name: "empty status", tombstone: sdk.Disk{UUID: testDiskID, BillingAccountID: 42}},
+		{name: "unknown status", tombstone: sdk.Disk{UUID: testDiskID, Status: "Archived", BillingAccountID: 42}},
+		{
+			name: "deleted but still listed",
+			tombstone: sdk.Disk{
+				UUID: testDiskID, Status: "Deleted", BillingAccountID: 42,
+			},
+			listedDisk: &sdk.Disk{UUID: testDiskID, Status: "Deleted", BillingAccountID: 42},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			base := &fakeAPI{}
+			if test.listedDisk != nil {
+				base.disks = []sdk.Disk{*test.listedDisk}
+			}
+			tombstone := test.tombstone
+			api := &deletedDiskTombstoneAPI{fakeAPI: base, tombstone: &tombstone}
+			store := newMemoryMutationFenceStore()
+			resolver := &fencedNodeResolver{nodeResolver: nodeResolver{}, memoryMutationFenceStore: store}
+			intent := diskAttachmentIntent{
+				Operation: "disk-delete", Location: testLocation,
+				DiskUUID: testDiskID, BillingAccountID: 42,
+			}
+			candidate, err := newMutationFence(diskAttachmentFenceKey(testLocation, testDiskID), intent)
+			if err != nil {
+				t.Fatal(err)
+			}
+			stored, acquired, err := store.Create(context.Background(), candidate)
+			if err != nil || !acquired || stored == nil {
+				t.Fatalf("seed disk-delete fence: stored=%#v acquired=%t err=%v", stored, acquired, err)
+			}
+			encoded, err := encodeMutationObservation(mutationObservation{
+				Kind: diskDeleteAbsenceObservationKind, Count: 1,
+				FirstObservedAt: time.Now().UTC().Format(time.RFC3339Nano),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			stored, err = store.SetObservation(context.Background(), *stored, encoded)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			adapter := newFencedAdapter(t, api, resolver, time.Second)
+			readCtx, cancel := context.WithTimeout(context.Background(), 5*time.Millisecond)
+			_, readErr := adapter.waitForDiskAbsent(readCtx, testLocation, testDiskID, *stored)
+			cancel()
+			if readErr == nil {
+				t.Fatal("visible tombstone state completed destructive absence proof")
+			}
+			retained, err := store.Get(context.Background(), candidate.Key)
+			if err != nil || retained == nil || retained.Observation != "" {
+				t.Fatalf("visible tombstone state did not reset absence proof: fence=%#v err=%v", retained, err)
+			}
+			if base.mutationCalls() != 0 {
+				t.Fatalf("visible tombstone state caused %d mutation(s)", base.mutationCalls())
+			}
+		})
+	}
+}
+
+func TestDiskDeleteTombstoneRequiresExactIdentityAndBilling(t *testing.T) {
+	for name, tombstone := range map[string]sdk.Disk{
+		"wrong UUID":      {UUID: testVM1, Status: "Deleted", BillingAccountID: 42},
+		"omitted billing": {UUID: testDiskID, Status: "Deleted"},
+		"wrong billing":   {UUID: testDiskID, Status: "Deleted", BillingAccountID: 43},
+	} {
+		t.Run(name, func(t *testing.T) {
+			api := &deletedDiskTombstoneAPI{fakeAPI: &fakeAPI{}, tombstone: &tombstone}
+			store := newMemoryMutationFenceStore()
+			resolver := &fencedNodeResolver{nodeResolver: nodeResolver{}, memoryMutationFenceStore: store}
+			intent := diskAttachmentIntent{
+				Operation: "disk-delete", Location: testLocation,
+				DiskUUID: testDiskID, BillingAccountID: 42,
+			}
+			candidate, err := newMutationFence(diskAttachmentFenceKey(testLocation, testDiskID), intent)
+			if err != nil {
+				t.Fatal(err)
+			}
+			stored, acquired, err := store.Create(context.Background(), candidate)
+			if err != nil || !acquired || stored == nil {
+				t.Fatalf("seed disk-delete fence: stored=%#v acquired=%t err=%v", stored, acquired, err)
+			}
+			adapter := newFencedAdapter(t, api, resolver, time.Second)
+			if _, err := adapter.waitForDiskAbsent(context.Background(), testLocation, testDiskID, *stored); err == nil {
+				t.Fatal("non-canonical Deleted tombstone completed absence proof")
+			}
+			if api.mutationCalls() != 0 {
+				t.Fatalf("non-canonical tombstone caused %d mutation(s)", api.mutationCalls())
+			}
+		})
 	}
 }
 
@@ -1472,8 +2070,8 @@ func TestTargetVMRequiresExactUUIDBillingAndConfiguredNetwork(t *testing.T) {
 		"wrong UUID":    {UUID: testVM2, BillingAccountID: 42, NetworkUUID: networkUUID},
 		"zero billing":  {UUID: testVM1, BillingAccountID: 0, NetworkUUID: networkUUID},
 		"wrong billing": {UUID: testVM1, BillingAccountID: 43, NetworkUUID: networkUUID},
-		"empty network": {UUID: testVM1, BillingAccountID: 42},
 		"wrong network": {UUID: testVM1, BillingAccountID: 42, NetworkUUID: testVM2},
+		"deleted":       {UUID: testVM1, Status: "Deleted", BillingAccountID: 42, NetworkUUID: networkUUID},
 	} {
 		t.Run(name, func(t *testing.T) {
 			base := &fakeAPI{disks: []sdk.Disk{ownedDisk}, vms: []sdk.VM{{UUID: testVM1, BillingAccountID: 42, NetworkUUID: networkUUID}}}
@@ -1492,6 +2090,47 @@ func TestTargetVMRequiresExactUUIDBillingAndConfiguredNetwork(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestTargetVMAllowsSparseNetworkOnlyWithExactConfiguredVPCMembership(t *testing.T) {
+	ownedDisk := sdk.Disk{
+		UUID: testDiskID, DisplayName: "pvc", SizeGiB: 1, Status: "Active", BillingAccountID: 42,
+	}
+	// This matches the live InSpace VM detail/list contract: identity and
+	// billing_account are present, while network_uuid is omitted.
+	sparseVM := sdk.VM{UUID: testVM1, BillingAccountID: 42}
+
+	t.Run("exact membership authorizes attach", func(t *testing.T) {
+		api := &fakeAPI{
+			disks: []sdk.Disk{ownedDisk}, vms: []sdk.VM{sparseVM},
+			networkVMUUIDs: []string{testVM1}, preserveVMNetwork: true,
+		}
+		adapter := newFencedNetworkAdapter(t, api, nodeResolver{
+			"worker-1": fmt.Sprintf("inspace://%s/%s", testLocation, testVM1),
+		}, time.Second)
+		if err := adapter.AttachVolume(context.Background(), testLocation, testDiskID, "worker-1"); err != nil {
+			t.Fatal(err)
+		}
+		if api.attachCalls != 1 || vmDiskRows(api.vms[0], testDiskID) != 1 {
+			t.Fatalf("sparse-detail attach calls=%d storage=%#v", api.attachCalls, api.vms[0].Storage)
+		}
+	})
+
+	t.Run("missing membership remains fail closed", func(t *testing.T) {
+		api := &fakeAPI{
+			disks: []sdk.Disk{ownedDisk}, vms: []sdk.VM{sparseVM},
+			networkVMUUIDs: []string{testVM2}, preserveVMNetwork: true,
+		}
+		adapter := newFencedNetworkAdapter(t, api, nodeResolver{
+			"worker-1": fmt.Sprintf("inspace://%s/%s", testLocation, testVM1),
+		}, time.Second)
+		if err := adapter.AttachVolume(context.Background(), testLocation, testDiskID, "worker-1"); !errors.Is(err, cloud.ErrInvalidNode) {
+			t.Fatalf("missing-membership attach error=%v, want ErrInvalidNode", err)
+		}
+		if api.mutationCalls() != 0 {
+			t.Fatalf("missing membership caused %d cloud mutation(s)", api.mutationCalls())
+		}
+	})
 }
 
 func TestFinalExactVMReadRejectsOwnershipDriftBeforeMutation(t *testing.T) {

@@ -457,7 +457,12 @@ create receipts are `service.inspace.cloud/node-lb-pending-firewall-name`,
 `service.inspace.cloud/node-lb-pending-firewall-started-at`,
 `service.inspace.cloud/node-lb-pending-firewall-issued-token`, and
 `service.inspace.cloud/node-lb-pending-firewall-issued-at`; the exact relation
-receipt is `service.inspace.cloud/node-lb-firewall-relation-issued`. For an
+receipt is the pair
+`service.inspace.cloud/node-lb-firewall-relation-issued` and
+`service.inspace.cloud/node-lb-firewall-relation-owner-uid`. After the required
+provider-side terminal no-commit proof, remove both relation keys atomically
+from the same exact Service, NodePool, or NodeClass owner; removing only one
+leaves an intentionally fail-closed orphan receipt. For an
 emergency withdrawal, retain the `node-lb-withdraw-firewall-*` ledger unless
 provider-side proof covers every persisted firewall/VM pair. For a shard
 NodePool the transaction annotations are the `node-lb-shard-firewall-pending-*`,

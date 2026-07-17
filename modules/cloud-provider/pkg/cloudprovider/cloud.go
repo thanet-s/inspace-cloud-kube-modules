@@ -73,6 +73,7 @@ const (
 	standardNLBDeleteLoadBalancer = "delete-load-balancer"
 
 	standardNLBRemovalAbsenceDelay = 30 * time.Second
+	durableReceiptWriteTimeout     = 10 * time.Second
 )
 
 var errStandardNLBRemovalPending = errors.New("cloudprovider: public NLB removal remains durably pending")
@@ -492,7 +493,14 @@ func (p *Provider) resolveVM(ctx context.Context, node *corev1.Node) (*inspace.V
 		if err != nil {
 			return nil, fmt.Errorf("cloudprovider: parse provider ID: %w", err)
 		}
-		return p.api.GetVM(ctx, id.Location, id.UUID)
+		vm, err := p.api.GetVM(ctx, id.Location, id.UUID)
+		if err != nil {
+			return nil, err
+		}
+		if vm == nil || strings.EqualFold(strings.TrimSpace(vm.Status), "deleted") {
+			return nil, cloud.InstanceNotFound
+		}
+		return vm, nil
 	}
 	vms, err := p.api.ListVMs(ctx, p.config.Location)
 	if err != nil {
@@ -500,6 +508,9 @@ func (p *Provider) resolveVM(ctx context.Context, node *corev1.Node) (*inspace.V
 	}
 	var matches []*inspace.VM
 	for i := range vms {
+		if strings.EqualFold(strings.TrimSpace(vms[i].Status), "deleted") {
+			continue
+		}
 		if vms[i].Name == node.Name || vms[i].Hostname == node.Name {
 			matches = append(matches, &vms[i])
 		}
@@ -854,6 +865,30 @@ func standardNLBMutationError(action string, err error) error {
 	return fmt.Errorf("cloudprovider: %s: %w", action, err)
 }
 
+// clearStandardNLBFenceAfterProvenNonDispatch is used only after an issued
+// receipt has been persisted and a later authority check rejects the operation
+// before the InSpace mutation method is called.  At that boundary the provider
+// knows the cloud request was not dispatched, so retaining the receipt would
+// manufacture permanent ambiguity.  The exact raw value makes the clear a CAS:
+// a concurrently changed receipt is never overwritten.
+func (p *Provider) clearStandardNLBFenceAfterProvenNonDispatch(
+	ctx context.Context,
+	service *corev1.Service,
+	expectedRaw string,
+	rejection error,
+) error {
+	if rejection == nil {
+		rejection = errors.New("cloudprovider: public NLB mutation was rejected before dispatch")
+	}
+	clearCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), durableReceiptWriteTimeout)
+	defer cancel()
+	_, clearErr := p.replaceStandardNLBFence(clearCtx, service, expectedRaw, nil)
+	if clearErr != nil {
+		clearErr = fmt.Errorf("cloudprovider: clear proven non-dispatched public NLB receipt: %w", clearErr)
+	}
+	return errors.Join(rejection, clearErr)
+}
+
 func standardNLBRemovalOperation(operation string) bool {
 	switch operation {
 	case standardNLBUnassignFloatingIP, standardNLBDeleteFloatingIP, standardNLBRemoveTarget,
@@ -970,23 +1005,72 @@ func (p *Provider) GetLoadBalancer(ctx context.Context, _ string, service *corev
 		return nil, lb != nil, err
 	}
 	if lb == nil && floatingIP == nil {
+		// The stock Kubernetes Service controller calls GetLoadBalancer before
+		// EnsureLoadBalancerDeleted and removes its cleanup finalizer when this
+		// method reports that no load balancer exists.  Keep a deleting Service
+		// in the cleanup path while any durable mutation receipt remains: an
+		// issued removal still needs its second spaced absence observation, and
+		// an issued additive mutation must be resolved before cleanup can safely
+		// prove that no late cloud resource exists.
+		pending, pendingErr := p.standardNLBDeletionReceiptPending(ctx, service)
+		if pendingErr != nil {
+			return nil, false, pendingErr
+		}
+		if pending {
+			return nil, true, nil
+		}
 		return nil, false, nil
 	}
+	unassignedForDeletion := false
+	if floatingIP != nil {
+		loadBalancerUUID := ""
+		loadBalancerPrivateAddress := ""
+		if lb != nil {
+			loadBalancerUUID = lb.UUID
+			loadBalancerPrivateAddress = lb.PrivateAddress
+		}
+		if assignmentErr := validateServiceFloatingIPAssignment(floatingIP, loadBalancerUUID, loadBalancerPrivateAddress); assignmentErr != nil {
+			// Unassignment is the first destructive cleanup step.  Accept only a
+			// completely clean unassigned relation, and only while Kubernetes has
+			// explicitly marked this exact Service for deletion.  A live Service,
+			// a wrong owner, or any residual relation metadata remains an error.
+			if service == nil || service.DeletionTimestamp == nil {
+				return nil, lb != nil, errors.New("cloudprovider: owned load balancer floating IP has an unexpected assignment")
+			}
+			if unassignedErr := validateServiceFloatingIPUnassigned(floatingIP); unassignedErr != nil {
+				return nil, lb != nil, errors.New("cloudprovider: owned load balancer floating IP has an unexpected assignment")
+			}
+			unassignedForDeletion = true
+		}
+	}
 	if lb == nil {
+		if unassignedForDeletion {
+			// There is no status address to publish, but exists=true is required
+			// for the stock Service controller to enter provider cleanup.
+			return nil, true, nil
+		}
 		return nil, true, errors.New("cloudprovider: deterministically owned floating IP exists without its load balancer")
 	}
 	if lb.NetworkUUID != p.config.NetworkUUID {
 		return nil, true, fmt.Errorf("cloudprovider: refusing to report owned load balancer %q on network %q", lb.DisplayName, lb.NetworkUUID)
 	}
 	publicAddress := ""
-	if floatingIP != nil {
-		if err := validateServiceFloatingIPAssignment(floatingIP, lb.UUID, lb.PrivateAddress); err != nil {
-			return nil, true, errors.New("cloudprovider: owned load balancer floating IP has an unexpected assignment")
-		}
+	if floatingIP != nil && !unassignedForDeletion {
 		publicAddress = floatingIP.Address
 	}
 	status, err := statusForLoadBalancer(lb, publicAddress)
 	return status, true, err
+}
+
+func (p *Provider) standardNLBDeletionReceiptPending(ctx context.Context, service *corev1.Service) (bool, error) {
+	if service == nil || service.DeletionTimestamp == nil {
+		return false, nil
+	}
+	fence, _, err := p.readStandardNLBFence(ctx, service)
+	if err != nil {
+		return false, err
+	}
+	return fence != nil, nil
 }
 
 func (p *Provider) GetLoadBalancerNameForService(service *corev1.Service) string {
@@ -1053,11 +1137,13 @@ func (p *Provider) ensureStandardNLBLoadBalancer(
 	}
 	appeared, authorityErr := p.findOwnedLoadBalancer(ctx, service)
 	if authorityErr != nil {
-		return nil, false, fmt.Errorf("cloudprovider: public NLB post-issue absence authority: %w", authorityErr)
+		rejection := fmt.Errorf("cloudprovider: public NLB post-issue absence authority: %w", authorityErr)
+		return nil, false, p.clearStandardNLBFenceAfterProvenNonDispatch(ctx, service, raw, rejection)
 	}
 	if appeared != nil {
 		if err := validateStandardNLBInitialPolicy(appeared, request); err != nil {
-			return nil, false, fmt.Errorf("cloudprovider: public NLB appeared after issue with a different initial payload: %w", err)
+			rejection := fmt.Errorf("cloudprovider: public NLB appeared after issue with a different initial payload: %w", err)
+			return nil, false, p.clearStandardNLBFenceAfterProvenNonDispatch(ctx, service, raw, rejection)
 		}
 		if _, clearErr := p.replaceStandardNLBFence(ctx, service, raw, nil); clearErr != nil {
 			return nil, false, fmt.Errorf("cloudprovider: promote public NLB that appeared after issue: %w", clearErr)
@@ -1065,7 +1151,8 @@ func (p *Provider) ensureStandardNLBLoadBalancer(
 		return appeared, true, nil
 	}
 	if err := p.authorizeStandardNLBMutationPreDispatch(ctx, service, fenceValue); err != nil {
-		return nil, false, fmt.Errorf("cloudprovider: reject public NLB create at final Service authority: %w", err)
+		rejection := fmt.Errorf("cloudprovider: reject public NLB create at final Service authority: %w", err)
+		return nil, false, p.clearStandardNLBFenceAfterProvenNonDispatch(ctx, service, raw, rejection)
 	}
 	created, createErr := p.api.CreateLoadBalancer(ctx, p.config.Location, request)
 	observed, listErr := p.findOwnedLoadBalancer(ctx, service)
@@ -1085,8 +1172,8 @@ func (p *Provider) ensureStandardNLBLoadBalancer(
 		return observed, true, nil
 	}
 	if standardNLBMutationKnownPreDispatch(createErr) {
-		_, clearErr := p.replaceStandardNLBFence(ctx, service, raw, nil)
-		return nil, false, errors.Join(fmt.Errorf("cloudprovider: create public NLB: %w", createErr), clearErr)
+		rejection := fmt.Errorf("cloudprovider: create public NLB: %w", createErr)
+		return nil, false, p.clearStandardNLBFenceAfterProvenNonDispatch(ctx, service, raw, rejection)
 	}
 	if createErr != nil {
 		return nil, false, fmt.Errorf(
@@ -1163,11 +1250,13 @@ func (p *Provider) ensureStandardNLBPublicFloatingIP(
 	}
 	appeared, authorityErr := p.findOwnedFloatingIP(ctx, service)
 	if authorityErr != nil {
-		return nil, fmt.Errorf("cloudprovider: public floating-IP post-issue absence authority: %w", authorityErr)
+		rejection := fmt.Errorf("cloudprovider: public floating-IP post-issue absence authority: %w", authorityErr)
+		return nil, p.clearStandardNLBFenceAfterProvenNonDispatch(ctx, service, raw, rejection)
 	}
 	if appeared != nil {
 		if validateErr := validateServiceFloatingIPUnassigned(appeared); validateErr != nil {
-			return nil, fmt.Errorf("cloudprovider: public floating IP appeared after issue in an unexpected state: %w", validateErr)
+			rejection := fmt.Errorf("cloudprovider: public floating IP appeared after issue in an unexpected state: %w", validateErr)
+			return nil, p.clearStandardNLBFenceAfterProvenNonDispatch(ctx, service, raw, rejection)
 		}
 		if _, clearErr := p.replaceStandardNLBFence(ctx, service, raw, nil); clearErr != nil {
 			return nil, fmt.Errorf("cloudprovider: promote public floating IP that appeared after issue: %w", clearErr)
@@ -1175,7 +1264,8 @@ func (p *Provider) ensureStandardNLBPublicFloatingIP(
 		return appeared, nil
 	}
 	if err := p.authorizeStandardNLBMutationPreDispatch(ctx, service, fenceValue); err != nil {
-		return nil, fmt.Errorf("cloudprovider: reject public floating-IP create at final Service authority: %w", err)
+		rejection := fmt.Errorf("cloudprovider: reject public floating-IP create at final Service authority: %w", err)
+		return nil, p.clearStandardNLBFenceAfterProvenNonDispatch(ctx, service, raw, rejection)
 	}
 	created, createErr := p.api.CreateFloatingIP(ctx, p.config.Location, request)
 	observed, listErr := p.findOwnedFloatingIP(ctx, service)
@@ -1192,8 +1282,8 @@ func (p *Provider) ensureStandardNLBPublicFloatingIP(
 		return observed, nil
 	}
 	if standardNLBMutationKnownPreDispatch(createErr) {
-		_, clearErr := p.replaceStandardNLBFence(ctx, service, raw, nil)
-		return nil, errors.Join(fmt.Errorf("cloudprovider: create public floating IP: %w", createErr), clearErr)
+		rejection := fmt.Errorf("cloudprovider: create public floating IP: %w", createErr)
+		return nil, p.clearStandardNLBFenceAfterProvenNonDispatch(ctx, service, raw, rejection)
 	}
 	if createErr != nil {
 		return nil, fmt.Errorf(
@@ -1270,20 +1360,25 @@ func (p *Provider) ensureStandardNLBFloatingIPAssignment(
 	}
 	freshLoadBalancer, err := p.authorizeStandardNLBLoadBalancerIdentityPreDispatch(ctx, service, loadBalancer)
 	if err != nil {
-		return nil, fmt.Errorf("cloudprovider: reject floating-IP assignment at final pre-dispatch authority: %w", err)
+		rejection := fmt.Errorf("cloudprovider: reject floating-IP assignment at final pre-dispatch authority: %w", err)
+		return nil, p.clearStandardNLBFenceAfterProvenNonDispatch(ctx, service, raw, rejection)
 	}
 	freshFloatingIP, err := p.authorizeStandardNLBFloatingIPPreDispatch(ctx, service, floatingIP)
 	if err != nil {
-		return nil, fmt.Errorf("cloudprovider: reject floating-IP assignment at final pre-dispatch authority: %w", err)
+		rejection := fmt.Errorf("cloudprovider: reject floating-IP assignment at final pre-dispatch authority: %w", err)
+		return nil, p.clearStandardNLBFenceAfterProvenNonDispatch(ctx, service, raw, rejection)
 	}
 	if err := validateServiceFloatingIPUnassigned(freshFloatingIP); err != nil {
-		return nil, fmt.Errorf("cloudprovider: reject floating-IP assignment after issue: %w", err)
+		rejection := fmt.Errorf("cloudprovider: reject floating-IP assignment after issue: %w", err)
+		return nil, p.clearStandardNLBFenceAfterProvenNonDispatch(ctx, service, raw, rejection)
 	}
 	if freshLoadBalancer.UUID != fenceValue.LoadBalancerUUID || freshFloatingIP.Address != fenceValue.ResourceName {
-		return nil, errors.New("cloudprovider: floating-IP assignment payload changed after issue")
+		rejection := errors.New("cloudprovider: floating-IP assignment payload changed after issue")
+		return nil, p.clearStandardNLBFenceAfterProvenNonDispatch(ctx, service, raw, rejection)
 	}
 	if err := p.authorizeStandardNLBMutationPreDispatch(ctx, service, fenceValue); err != nil {
-		return nil, fmt.Errorf("cloudprovider: reject floating-IP assignment at final Service authority: %w", err)
+		rejection := fmt.Errorf("cloudprovider: reject floating-IP assignment at final Service authority: %w", err)
+		return nil, p.clearStandardNLBFenceAfterProvenNonDispatch(ctx, service, raw, rejection)
 	}
 	_, mutationErr := p.api.AssignFloatingIP(ctx, p.config.Location, floatingIP.Address, loadBalancer.UUID, "load_balancer")
 	observed, listErr := p.findOwnedFloatingIP(ctx, service)
@@ -1305,8 +1400,7 @@ func (p *Provider) ensureStandardNLBFloatingIPAssignment(
 		}
 	}
 	if standardNLBMutationKnownPreDispatch(mutationErr) {
-		_, clearErr := p.replaceStandardNLBFence(ctx, service, raw, nil)
-		return nil, errors.Join(mutationErr, clearErr)
+		return nil, p.clearStandardNLBFenceAfterProvenNonDispatch(ctx, service, raw, mutationErr)
 	}
 	if mutationErr != nil {
 		return nil, fmt.Errorf(
@@ -1522,19 +1616,24 @@ func (p *Provider) cleanupOwnedLoadBalancer(ctx context.Context, service *corev1
 		return standardNLBRemovalPending(fence)
 	}
 	freshLoadBalancer, authorityErr := p.authorizeStandardNLBLoadBalancerIdentityPreDispatch(ctx, service, lb)
-	if authorityErr != nil || freshLoadBalancer.UUID != fence.LoadBalancerUUID {
-		return errors.Join(
+	if authorityErr != nil {
+		rejection := errors.Join(
 			errors.New("cloudprovider: reject public NLB delete at final pre-dispatch authority"),
 			authorityErr,
 		)
+		return p.clearStandardNLBFenceAfterProvenNonDispatch(ctx, service, raw, rejection)
+	}
+	if freshLoadBalancer.UUID != fence.LoadBalancerUUID {
+		rejection := errors.New("cloudprovider: reject public NLB delete because its exact UUID changed after issue")
+		return p.clearStandardNLBFenceAfterProvenNonDispatch(ctx, service, raw, rejection)
 	}
 	if authorityErr := p.authorizeStandardNLBMutationPreDispatch(ctx, service, fence); authorityErr != nil {
-		return fmt.Errorf("cloudprovider: reject public NLB delete at final Service authority: %w", authorityErr)
+		rejection := fmt.Errorf("cloudprovider: reject public NLB delete at final Service authority: %w", authorityErr)
+		return p.clearStandardNLBFenceAfterProvenNonDispatch(ctx, service, raw, rejection)
 	}
 	deleteErr := p.api.DeleteLoadBalancer(ctx, p.config.Location, lb.UUID)
 	if standardNLBMutationKnownPreDispatch(deleteErr) {
-		_, clearErr := p.replaceStandardNLBFence(ctx, service, raw, nil)
-		return errors.Join(deleteErr, clearErr)
+		return p.clearStandardNLBFenceAfterProvenNonDispatch(ctx, service, raw, deleteErr)
 	}
 	_, absent, readErr := p.readExactOwnedStandardNLB(ctx, service, lb.UUID)
 	if readErr != nil {
@@ -1782,26 +1881,29 @@ func (p *Provider) cleanupOwnedFloatingIP(
 		}
 		freshLoadBalancer, authorityErr := p.authorizeStandardNLBLoadBalancerIdentityPreDispatch(ctx, service, preIssueLoadBalancer)
 		if authorityErr != nil {
-			return fmt.Errorf("cloudprovider: reject floating-IP unassign at final NLB authority: %w", authorityErr)
+			rejection := fmt.Errorf("cloudprovider: reject floating-IP unassign at final NLB authority: %w", authorityErr)
+			return p.clearStandardNLBFenceAfterProvenNonDispatch(ctx, service, raw, rejection)
 		}
 		freshFloatingIP, authorityErr := p.authorizeStandardNLBFloatingIPPreDispatch(ctx, service, floatingIP)
 		if authorityErr != nil {
-			return fmt.Errorf("cloudprovider: reject floating-IP unassign at final address authority: %w", authorityErr)
+			rejection := fmt.Errorf("cloudprovider: reject floating-IP unassign at final address authority: %w", authorityErr)
+			return p.clearStandardNLBFenceAfterProvenNonDispatch(ctx, service, raw, rejection)
 		}
 		if err := validateServiceFloatingIPAssignment(
 			freshFloatingIP,
 			freshLoadBalancer.UUID,
 			freshLoadBalancer.PrivateAddress,
 		); err != nil {
-			return fmt.Errorf("cloudprovider: reject floating-IP unassign after issue: %w", err)
+			rejection := fmt.Errorf("cloudprovider: reject floating-IP unassign after issue: %w", err)
+			return p.clearStandardNLBFenceAfterProvenNonDispatch(ctx, service, raw, rejection)
 		}
 		if err := p.authorizeStandardNLBMutationPreDispatch(ctx, service, fence); err != nil {
-			return fmt.Errorf("cloudprovider: reject floating-IP unassign at final Service authority: %w", err)
+			rejection := fmt.Errorf("cloudprovider: reject floating-IP unassign at final Service authority: %w", err)
+			return p.clearStandardNLBFenceAfterProvenNonDispatch(ctx, service, raw, rejection)
 		}
 		_, unassignErr := p.api.UnassignFloatingIP(ctx, p.config.Location, address)
 		if standardNLBMutationKnownPreDispatch(unassignErr) {
-			_, clearErr := p.replaceStandardNLBFence(ctx, service, raw, nil)
-			return errors.Join(unassignErr, clearErr)
+			return p.clearStandardNLBFenceAfterProvenNonDispatch(ctx, service, raw, unassignErr)
 		}
 		observed, exactAbsent, readErr := p.readExactOwnedStandardNLBFloatingIP(ctx, service, address)
 		if readErr != nil {
@@ -1854,21 +1956,24 @@ func (p *Provider) cleanupOwnedFloatingIP(
 	}
 	freshFloatingIP, authorityErr := p.authorizeStandardNLBFloatingIPPreDispatch(ctx, service, floatingIP)
 	if authorityErr != nil {
-		return fmt.Errorf("cloudprovider: reject floating-IP delete at final pre-dispatch authority: %w", authorityErr)
+		rejection := fmt.Errorf("cloudprovider: reject floating-IP delete at final pre-dispatch authority: %w", authorityErr)
+		return p.clearStandardNLBFenceAfterProvenNonDispatch(ctx, service, raw, rejection)
 	}
 	if freshFloatingIP.Address != fence.ResourceName {
-		return errors.New("cloudprovider: floating-IP delete payload changed after issue")
+		rejection := errors.New("cloudprovider: floating-IP delete payload changed after issue")
+		return p.clearStandardNLBFenceAfterProvenNonDispatch(ctx, service, raw, rejection)
 	}
 	if err := validateServiceFloatingIPUnassigned(freshFloatingIP); err != nil {
-		return fmt.Errorf("cloudprovider: reject assigned floating-IP delete after issue: %w", err)
+		rejection := fmt.Errorf("cloudprovider: reject assigned floating-IP delete after issue: %w", err)
+		return p.clearStandardNLBFenceAfterProvenNonDispatch(ctx, service, raw, rejection)
 	}
 	if err := p.authorizeStandardNLBMutationPreDispatch(ctx, service, fence); err != nil {
-		return fmt.Errorf("cloudprovider: reject floating-IP delete at final Service authority: %w", err)
+		rejection := fmt.Errorf("cloudprovider: reject floating-IP delete at final Service authority: %w", err)
+		return p.clearStandardNLBFenceAfterProvenNonDispatch(ctx, service, raw, rejection)
 	}
 	deleteErr := p.api.DeleteFloatingIP(ctx, p.config.Location, address)
 	if standardNLBMutationKnownPreDispatch(deleteErr) {
-		_, clearErr := p.replaceStandardNLBFence(ctx, service, raw, nil)
-		return errors.Join(deleteErr, clearErr)
+		return p.clearStandardNLBFenceAfterProvenNonDispatch(ctx, service, raw, deleteErr)
 	}
 	_, exactAbsent, readErr := p.readExactOwnedStandardNLBFloatingIP(ctx, service, address)
 	if readErr != nil {
@@ -2081,6 +2186,7 @@ func (p *Provider) readExactOwnedStandardNLB(
 	}
 	exact, getErr := p.api.GetLoadBalancer(ctx, p.config.Location, loadBalancerUUID)
 	exactAbsent := false
+	exactSoftDeleted := false
 	if getErr != nil {
 		if !inspace.IsNotFound(getErr) {
 			return nil, false, fmt.Errorf("cloudprovider: read exact public NLB %s: %w", loadBalancerUUID, getErr)
@@ -2089,6 +2195,21 @@ func (p *Provider) readExactOwnedStandardNLB(
 		exact = nil
 	} else if exact == nil {
 		return nil, false, fmt.Errorf("cloudprovider: exact public NLB %s returned an empty response", loadBalancerUUID)
+	} else if exact.UUID != loadBalancerUUID {
+		return nil, false, fmt.Errorf("cloudprovider: exact public NLB read returned UUID %s, expected %s", exact.UUID, loadBalancerUUID)
+	} else if exact.IsDeleted {
+		// InSpace may retain a soft-deleted object on the exact endpoint instead
+		// of returning 404. A tombstone is still positive identity evidence, so
+		// name, VPC, and billing drift must remain fail closed. Treat the validated
+		// tombstone as negative liveness evidence only after the independent active
+		// list below corroborates that neither this UUID nor its deterministic
+		// ownership name remains mutable.
+		if err := p.validateOwnedLoadBalancerTombstoneIdentity(service, exact); err != nil {
+			return nil, false, err
+		}
+		exactAbsent = true
+		exactSoftDeleted = true
+		exact = nil
 	}
 
 	items, listErr := p.api.ListLoadBalancers(ctx, p.config.Location)
@@ -2123,6 +2244,9 @@ func (p *Provider) readExactOwnedStandardNLB(
 
 	if exactAbsent {
 		if exactInList != nil {
+			if exactSoftDeleted {
+				return nil, false, fmt.Errorf("cloudprovider: exact public NLB %s returned a soft-deleted object but remains active in list readback", loadBalancerUUID)
+			}
 			return nil, false, fmt.Errorf("cloudprovider: exact public NLB %s returned 404 but remains visible in list readback", loadBalancerUUID)
 		}
 		if named != nil {
@@ -2173,6 +2297,35 @@ func (p *Provider) validateOwnedLoadBalancerIdentity(service *corev1.Service, lb
 	}
 	if strings.TrimSpace(lb.UUID) == "" {
 		return fmt.Errorf("cloudprovider: load balancer ownership name %q has no stable UUID", expectedName)
+	}
+	return nil
+}
+
+func (p *Provider) validateOwnedLoadBalancerTombstoneIdentity(service *corev1.Service, lb *inspace.LoadBalancer) error {
+	if service == nil {
+		return errors.New("cloudprovider: service is required")
+	}
+	if lb == nil {
+		return errors.New("cloudprovider: owned load balancer tombstone response is empty")
+	}
+	expectedName := p.loadBalancerName(service)
+	if lb.DisplayName != expectedName {
+		return fmt.Errorf("cloudprovider: deleted load balancer %q lacks deterministic ownership name %q", lb.DisplayName, expectedName)
+	}
+	if lb.NetworkUUID != p.config.NetworkUUID {
+		return fmt.Errorf("cloudprovider: deleted load balancer ownership name %q exists on network %q, not configured network %q", expectedName, lb.NetworkUUID, p.config.NetworkUUID)
+	}
+	if lb.BillingAccountID != p.config.BillingAccountID {
+		return fmt.Errorf(
+			"cloudprovider: deleted load balancer ownership name %q belongs to billing account %d, not configured billing account %d",
+			expectedName, lb.BillingAccountID, p.config.BillingAccountID,
+		)
+	}
+	if !lb.IsDeleted {
+		return fmt.Errorf("cloudprovider: load balancer ownership name %q is not a deleted tombstone", expectedName)
+	}
+	if strings.TrimSpace(lb.UUID) == "" {
+		return fmt.Errorf("cloudprovider: deleted load balancer ownership name %q has no stable UUID", expectedName)
 	}
 	return nil
 }
@@ -2606,17 +2759,44 @@ func (p *Provider) authorizeStandardNLBTargetVMPreDispatch(ctx context.Context, 
 	if !validNodeLoadBalancerCloudUUID(vmUUID) {
 		return errors.New("cloudprovider: public NLB target pre-dispatch authority requires a canonical VM UUID")
 	}
+	return p.validateStandardNLBTargetVMCloudAuthority(ctx, vmUUID)
+}
+
+// validateStandardNLBTargetVMCloudAuthority proves the exact account and VPC
+// identity of a target without trusting network_uuid to be present in either
+// VM response. The live InSpace VM detail and list endpoints can omit that
+// redundant field, so the configured Network object and its unique VM
+// membership are the final VPC authority. A non-empty contradictory VM field
+// still fails closed.
+func (p *Provider) validateStandardNLBTargetVMCloudAuthority(ctx context.Context, vmUUID string) error {
+	if !validNodeLoadBalancerCloudUUID(vmUUID) {
+		return errors.New("cloudprovider: public NLB target authority requires a canonical VM UUID")
+	}
 	vm, err := p.api.GetVM(ctx, p.config.Location, vmUUID)
 	if err != nil {
-		return fmt.Errorf("cloudprovider: read exact public NLB target VM %s at pre-dispatch: %w", vmUUID, err)
+		return fmt.Errorf("cloudprovider: read exact public NLB target VM %s: %w", vmUUID, err)
 	}
-	if vm == nil || vm.UUID != vmUUID || vm.BillingAccountID != p.config.BillingAccountID ||
-		vm.NetworkUUID != p.config.NetworkUUID {
-		return fmt.Errorf("cloudprovider: public NLB target VM %s lost exact account/VPC authority", vmUUID)
+	if vm == nil || vm.UUID != vmUUID {
+		return fmt.Errorf("cloudprovider: exact NLB target VM identity does not match providerID for VM %s", vmUUID)
+	}
+	if strings.EqualFold(strings.TrimSpace(vm.Status), "deleted") {
+		return fmt.Errorf("cloudprovider: exact NLB target VM %s is a deleted tombstone", vmUUID)
+	}
+	if vm.BillingAccountID != p.config.BillingAccountID {
+		return fmt.Errorf(
+			"cloudprovider: NLB target VM %s belongs to billing account %d, expected %d",
+			vmUUID, vm.BillingAccountID, p.config.BillingAccountID,
+		)
+	}
+	if vm.NetworkUUID != "" && vm.NetworkUUID != p.config.NetworkUUID {
+		return fmt.Errorf(
+			"cloudprovider: NLB target VM %s belongs to network %q, expected %q",
+			vmUUID, vm.NetworkUUID, p.config.NetworkUUID,
+		)
 	}
 	vms, err := p.api.ListVMs(ctx, p.config.Location)
 	if err != nil {
-		return fmt.Errorf("cloudprovider: list public NLB target VMs at pre-dispatch: %w", err)
+		return fmt.Errorf("cloudprovider: list public NLB target VMs: %w", err)
 	}
 	listMatches := 0
 	var listed *inspace.VM
@@ -2631,7 +2811,8 @@ func (p *Provider) authorizeStandardNLBTargetVMPreDispatch(ctx context.Context, 
 		}
 	}
 	if listMatches != 1 || listed == nil || listed.BillingAccountID != p.config.BillingAccountID ||
-		listed.NetworkUUID != p.config.NetworkUUID {
+		strings.EqualFold(strings.TrimSpace(listed.Status), "deleted") ||
+		(listed.NetworkUUID != "" && listed.NetworkUUID != p.config.NetworkUUID) {
 		return fmt.Errorf(
 			"cloudprovider: public NLB target VM %s lacks unique exact list/account/VPC authority (rows=%d)",
 			vmUUID,
@@ -2643,7 +2824,7 @@ func (p *Provider) authorizeStandardNLBTargetVMPreDispatch(ctx context.Context, 
 		return fmt.Errorf("cloudprovider: read public NLB target VPC at pre-dispatch: %w", err)
 	}
 	if network == nil || network.UUID != p.config.NetworkUUID {
-		return errors.New("cloudprovider: public NLB target VPC identity changed at pre-dispatch")
+		return errors.New("cloudprovider: public NLB target VPC identity changed")
 	}
 	memberships := 0
 	exactMembership := false
@@ -3023,20 +3204,23 @@ func (p *Provider) addStandardNLBTarget(
 	}
 	fresh, err := p.authorizeStandardNLBLoadBalancerPreDispatch(ctx, service, lb)
 	if err != nil {
-		return nil, fmt.Errorf("cloudprovider: reject add-target at final NLB authority: %w", err)
+		rejection := fmt.Errorf("cloudprovider: reject add-target at final NLB authority: %w", err)
+		return nil, p.clearStandardNLBFenceAfterProvenNonDispatch(ctx, service, raw, rejection)
 	}
 	visible, err := standardNLBTargetVisible(fresh, targetUUID)
 	if err != nil || visible {
-		return nil, errors.Join(err, errors.New("cloudprovider: add-target relation changed after issue"))
+		rejection := errors.Join(err, errors.New("cloudprovider: add-target relation changed after issue"))
+		return nil, p.clearStandardNLBFenceAfterProvenNonDispatch(ctx, service, raw, rejection)
 	}
 	if err := p.authorizeStandardNLBTargetVMPreDispatch(ctx, targetUUID); err != nil {
-		return nil, err
+		return nil, p.clearStandardNLBFenceAfterProvenNonDispatch(ctx, service, raw, err)
 	}
 	if err := p.authorizeStandardNLBTargetKubernetesPreDispatch(ctx, service, targetUUID); err != nil {
-		return nil, err
+		return nil, p.clearStandardNLBFenceAfterProvenNonDispatch(ctx, service, raw, err)
 	}
 	if err := p.authorizeStandardNLBMutationPreDispatch(ctx, service, fence); err != nil {
-		return nil, fmt.Errorf("cloudprovider: reject add-target at final Service authority: %w", err)
+		rejection := fmt.Errorf("cloudprovider: reject add-target at final Service authority: %w", err)
+		return nil, p.clearStandardNLBFenceAfterProvenNonDispatch(ctx, service, raw, rejection)
 	}
 	response, mutationErr := p.api.AddLoadBalancerTarget(ctx, p.config.Location, lb.UUID, targetUUID)
 	observed, exactAbsent, readErr := p.readExactOwnedStandardNLB(ctx, service, lb.UUID)
@@ -3059,8 +3243,7 @@ func (p *Provider) addStandardNLBTarget(
 		}
 	}
 	if standardNLBMutationKnownPreDispatch(mutationErr) {
-		_, clearErr := p.replaceStandardNLBFence(ctx, service, raw, nil)
-		return nil, errors.Join(mutationErr, clearErr)
+		return nil, p.clearStandardNLBFenceAfterProvenNonDispatch(ctx, service, raw, mutationErr)
 	}
 	if mutationErr != nil {
 		return nil, fmt.Errorf("cloudprovider: add target %s to NLB %s remains ambiguous after error: %w", targetUUID, lb.UUID, mutationErr)
@@ -3098,14 +3281,17 @@ func (p *Provider) addStandardNLBRule(
 	}
 	fresh, err := p.authorizeStandardNLBLoadBalancerPreDispatch(ctx, service, lb)
 	if err != nil {
-		return nil, fmt.Errorf("cloudprovider: reject add-rule at final NLB authority: %w", err)
+		rejection := fmt.Errorf("cloudprovider: reject add-rule at final NLB authority: %w", err)
+		return nil, p.clearStandardNLBFenceAfterProvenNonDispatch(ctx, service, raw, rejection)
 	}
 	visible, err := standardNLBRuleVisible(fresh, rule)
 	if err != nil || visible {
-		return nil, errors.Join(err, errors.New("cloudprovider: add-rule relation changed after issue"))
+		rejection := errors.Join(err, errors.New("cloudprovider: add-rule relation changed after issue"))
+		return nil, p.clearStandardNLBFenceAfterProvenNonDispatch(ctx, service, raw, rejection)
 	}
 	if err := p.authorizeStandardNLBMutationPreDispatch(ctx, service, fence); err != nil {
-		return nil, fmt.Errorf("cloudprovider: reject add-rule at final Service authority: %w", err)
+		rejection := fmt.Errorf("cloudprovider: reject add-rule at final Service authority: %w", err)
+		return nil, p.clearStandardNLBFenceAfterProvenNonDispatch(ctx, service, raw, rejection)
 	}
 	response, mutationErr := p.api.AddLoadBalancerRule(ctx, p.config.Location, lb.UUID, rule)
 	observed, exactAbsent, readErr := p.readExactOwnedStandardNLB(ctx, service, lb.UUID)
@@ -3129,8 +3315,7 @@ func (p *Provider) addStandardNLBRule(
 		}
 	}
 	if standardNLBMutationKnownPreDispatch(mutationErr) {
-		_, clearErr := p.replaceStandardNLBFence(ctx, service, raw, nil)
-		return nil, errors.Join(mutationErr, clearErr)
+		return nil, p.clearStandardNLBFenceAfterProvenNonDispatch(ctx, service, raw, mutationErr)
 	}
 	if mutationErr != nil {
 		return nil, fmt.Errorf("cloudprovider: add rule %d->%d to NLB %s remains ambiguous after error: %w", rule.SourcePort, rule.TargetPort, lb.UUID, mutationErr)
@@ -3165,19 +3350,21 @@ func (p *Provider) removeStandardNLBTarget(
 	}
 	fresh, authorityErr := p.authorizeStandardNLBLoadBalancerPreDispatch(ctx, service, lb)
 	if authorityErr != nil {
-		return nil, fmt.Errorf("cloudprovider: reject remove-target at final NLB authority: %w", authorityErr)
+		rejection := fmt.Errorf("cloudprovider: reject remove-target at final NLB authority: %w", authorityErr)
+		return nil, p.clearStandardNLBFenceAfterProvenNonDispatch(ctx, service, raw, rejection)
 	}
 	preDispatchVisible, visibilityErr := standardNLBTargetVisible(fresh, targetUUID)
 	if visibilityErr != nil || !preDispatchVisible {
-		return nil, errors.Join(visibilityErr, errors.New("cloudprovider: remove-target relation changed after issue"))
+		rejection := errors.Join(visibilityErr, errors.New("cloudprovider: remove-target relation changed after issue"))
+		return nil, p.clearStandardNLBFenceAfterProvenNonDispatch(ctx, service, raw, rejection)
 	}
 	if authorityErr := p.authorizeStandardNLBMutationPreDispatch(ctx, service, fence); authorityErr != nil {
-		return nil, fmt.Errorf("cloudprovider: reject remove-target at final Service authority: %w", authorityErr)
+		rejection := fmt.Errorf("cloudprovider: reject remove-target at final Service authority: %w", authorityErr)
+		return nil, p.clearStandardNLBFenceAfterProvenNonDispatch(ctx, service, raw, rejection)
 	}
 	mutationErr := p.api.RemoveLoadBalancerTarget(ctx, p.config.Location, lb.UUID, targetUUID)
 	if standardNLBMutationKnownPreDispatch(mutationErr) {
-		_, clearErr := p.replaceStandardNLBFence(ctx, service, raw, nil)
-		return nil, errors.Join(mutationErr, clearErr)
+		return nil, p.clearStandardNLBFenceAfterProvenNonDispatch(ctx, service, raw, mutationErr)
 	}
 	observed, exactAbsent, readErr := p.readExactOwnedStandardNLB(ctx, service, lb.UUID)
 	if readErr != nil {
@@ -3225,7 +3412,8 @@ func (p *Provider) removeStandardNLBRule(
 	}
 	fresh, authorityErr := p.authorizeStandardNLBLoadBalancerPreDispatch(ctx, service, lb)
 	if authorityErr != nil {
-		return nil, fmt.Errorf("cloudprovider: reject remove-rule at final NLB authority: %w", authorityErr)
+		rejection := fmt.Errorf("cloudprovider: reject remove-rule at final NLB authority: %w", authorityErr)
+		return nil, p.clearStandardNLBFenceAfterProvenNonDispatch(ctx, service, raw, rejection)
 	}
 	ruleVisible := false
 	for _, current := range fresh.ForwardingRules {
@@ -3235,15 +3423,16 @@ func (p *Provider) removeStandardNLBRule(
 		}
 	}
 	if !ruleVisible {
-		return nil, errors.New("cloudprovider: remove-rule relation changed after issue")
+		rejection := errors.New("cloudprovider: remove-rule relation changed after issue")
+		return nil, p.clearStandardNLBFenceAfterProvenNonDispatch(ctx, service, raw, rejection)
 	}
 	if authorityErr := p.authorizeStandardNLBMutationPreDispatch(ctx, service, fence); authorityErr != nil {
-		return nil, fmt.Errorf("cloudprovider: reject remove-rule at final Service authority: %w", authorityErr)
+		rejection := fmt.Errorf("cloudprovider: reject remove-rule at final Service authority: %w", authorityErr)
+		return nil, p.clearStandardNLBFenceAfterProvenNonDispatch(ctx, service, raw, rejection)
 	}
 	mutationErr := p.api.RemoveLoadBalancerRule(ctx, p.config.Location, lb.UUID, ruleUUID)
 	if standardNLBMutationKnownPreDispatch(mutationErr) {
-		_, clearErr := p.replaceStandardNLBFence(ctx, service, raw, nil)
-		return nil, errors.Join(mutationErr, clearErr)
+		return nil, p.clearStandardNLBFenceAfterProvenNonDispatch(ctx, service, raw, mutationErr)
 	}
 	observed, exactAbsent, readErr := p.readExactOwnedStandardNLB(ctx, service, lb.UUID)
 	if readErr != nil {
@@ -3455,24 +3644,8 @@ func (p *Provider) targetUUIDsFromNodes(
 		if _, duplicate := set[id.UUID]; duplicate {
 			return nil, fmt.Errorf("cloudprovider: multiple eligible Nodes claim exact InSpace VM %s", id.UUID)
 		}
-		vm, err := p.api.GetVM(ctx, id.Location, id.UUID)
-		if err != nil {
-			return nil, fmt.Errorf("cloudprovider: read exact NLB target VM %s for Node %s: %w", id.UUID, node.Name, err)
-		}
-		if vm == nil || vm.UUID != id.UUID {
-			return nil, fmt.Errorf("cloudprovider: exact NLB target VM identity does not match providerID for Node %s", node.Name)
-		}
-		if vm.BillingAccountID != p.config.BillingAccountID {
-			return nil, fmt.Errorf(
-				"cloudprovider: NLB target VM %s for Node %s belongs to billing account %d, expected %d",
-				id.UUID, node.Name, vm.BillingAccountID, p.config.BillingAccountID,
-			)
-		}
-		if vm.NetworkUUID != p.config.NetworkUUID {
-			return nil, fmt.Errorf(
-				"cloudprovider: NLB target VM %s for Node %s belongs to network %q, expected %q",
-				id.UUID, node.Name, vm.NetworkUUID, p.config.NetworkUUID,
-			)
+		if err := p.validateStandardNLBTargetVMCloudAuthority(ctx, id.UUID); err != nil {
+			return nil, fmt.Errorf("cloudprovider: authorize NLB target VM %s for Node %s: %w", id.UUID, node.Name, err)
 		}
 		set[id.UUID] = struct{}{}
 	}
