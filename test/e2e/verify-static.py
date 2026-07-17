@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from unittest import mock
 
 
 ROOT = pathlib.Path(__file__).resolve().parent
@@ -964,6 +965,36 @@ def verify_durable_release_state_contract() -> None:
             pass
         else:
             raise AssertionError("offline destroy followed a symlinked run directory")
+
+        live_binding = {
+            "INSPACE_E2E_VERSION": version,
+            "INSPACE_E2E_RELEASE_REVISION": revision,
+        }
+        for image in release_module.IMAGE_NAMES:
+            prefix = release_module.ENV_PREFIXES[image]
+            live_binding[prefix + "_RELEASE_DIGEST"] = images[image][
+                "releaseDigest"
+            ]
+            live_binding[prefix + "_PLATFORM_DIGEST"] = images[image][
+                "platformDigest"
+            ]
+        for chart in release_module.CHART_NAMES:
+            prefix = release_module.CHART_ENV_PREFIXES[chart]
+            live_binding[prefix + "_DIGEST"] = charts[chart]["sha256"]
+        with mock.patch.dict(os.environ, live_binding, clear=True):
+            release_module.require_environment_binding(document, "INSPACE_E2E_")
+        wrong_live_binding = live_binding.copy()
+        wrong_live_binding.pop("INSPACE_E2E_RELEASE_REVISION")
+        wrong_live_binding["INSPACE_E2E_REVISION"] = revision
+        with mock.patch.dict(os.environ, wrong_live_binding, clear=True):
+            try:
+                release_module.require_environment_binding(document, "INSPACE_E2E_")
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(
+                    "live artifact binding accepted the obsolete revision variable"
+                )
 
         environment = os.environ.copy()
         environment["INSPACE_E2E_BUILT_VERSION"] = version

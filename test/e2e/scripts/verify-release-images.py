@@ -872,10 +872,14 @@ def copy_artifacts_to_state(source_root: pathlib.Path, state_root: pathlib.Path,
 
 
 def require_environment_binding(result: dict, prefix: str) -> None:
-    if os.environ.get(prefix + "VERSION") != result["version"]:
-        raise ValueError(f"{prefix}VERSION does not match the verified release manifest")
-    if os.environ.get(prefix + "REVISION") != result["revision"]:
-        raise ValueError(f"{prefix}REVISION does not match the verified release manifest")
+    version_name = prefix + "VERSION"
+    revision_name = prefix + "REVISION"
+    if prefix == "INSPACE_E2E_":
+        revision_name = "INSPACE_E2E_RELEASE_REVISION"
+    if os.environ.get(version_name) != result["version"]:
+        raise ValueError(f"{version_name} does not match the verified release manifest")
+    if os.environ.get(revision_name) != result["revision"]:
+        raise ValueError(f"{revision_name} does not match the verified release manifest")
     for image in IMAGE_NAMES:
         image_prefix = ENV_PREFIXES[image]
         for field, suffix in (
