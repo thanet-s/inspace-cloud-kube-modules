@@ -93,6 +93,13 @@ func TestCSIRWOLifecycleSmoke(t *testing.T) {
 	if info.GetVendorVersion() != "0.2.0-test" {
 		t.Fatalf("plugin version = %q", info.GetVendorVersion())
 	}
+	nodeInfo, err := h.node.NodeGetInfo(ctx, &csi.NodeGetInfoRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := nodeInfo.GetAccessibleTopology().GetSegments(); len(got) != 1 || got[TopologyLocationKey] != "bkk01" {
+		t.Fatalf("node topology = %v, want only %s=bkk01", got, TopologyLocationKey)
+	}
 
 	created, err := h.controller.CreateVolume(ctx, &csi.CreateVolumeRequest{
 		Name:               "pvc-smoke",

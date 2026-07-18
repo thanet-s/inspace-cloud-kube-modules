@@ -279,6 +279,16 @@ func TestSelectInstanceTypeSupportsNumericBoundsAndHostClassOffering(t *testing.
 			wantType: "is-general-2c-4g",
 		},
 		{
+			name: "bound CSI volume topology selects matching location",
+			requirements: []karpv1.NodeSelectorRequirementWithMinValues{
+				{Key: catalog.LabelFamily, Operator: corev1.NodeSelectorOpIn, Values: []string{"general"}},
+				{Key: catalog.LabelInstanceCPU, Operator: corev1.NodeSelectorOpGt, Values: []string{"1"}},
+				{Key: catalog.LabelHostClass, Operator: corev1.NodeSelectorOpIn, Values: []string{inspacev1.HostClassAMDEPYC}},
+				{Key: catalog.CSITopologyLocationKey, Operator: corev1.NodeSelectorOpIn, Values: []string{inspacev1.LocationBangkok}},
+			},
+			wantType: "is-general-2c-4g",
+		},
+		{
 			name: "smallest AMD extra-memory shape",
 			requirements: []karpv1.NodeSelectorRequirementWithMinValues{
 				{Key: catalog.LabelFamily, Operator: corev1.NodeSelectorOpIn, Values: []string{"extra-memory"}},

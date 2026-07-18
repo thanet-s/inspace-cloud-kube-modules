@@ -2127,9 +2127,10 @@ func (h *testRemovalMutationHarness) authorize(_ context.Context, mutation cloud
 		return cloudapi.RemovalMutationAuthorization{}, nil
 	}
 	h.issued++
+	issuedAt := time.Now().UTC()
 	h.current = cloudapi.RemovalMutationFence{
 		RemovalMutation: mutation, Phase: cloudapi.RemovalMutationIssued,
-		IssueID: fmt.Sprintf("%032x", h.issued),
+		IssueID: fmt.Sprintf("%032x", h.issued), IssuedAt: issuedAt,
 	}
 	return cloudapi.RemovalMutationAuthorization{Fence: h.current, Active: true, AllowMutation: true}, nil
 }
@@ -2139,6 +2140,7 @@ func (h *testRemovalMutationHarness) observe(_ context.Context, fence cloudapi.R
 		return errors.New("test removal observation identity changed")
 	}
 	h.current.Phase = cloudapi.RemovalMutationObserved
+	h.current.ObservedAt = time.Now().UTC()
 	return nil
 }
 

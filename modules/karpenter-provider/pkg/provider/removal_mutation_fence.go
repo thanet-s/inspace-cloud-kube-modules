@@ -16,25 +16,42 @@ import (
 	cloudapi "github.com/thanet-s/inspace-cloud-kube-modules/modules/karpenter-provider/pkg/cloud"
 )
 
+const maxRemovalMutationEncodedBytes = 64 * 1024
+
+type observedFloatingIPDeleteRecord struct {
+	Location   string    `json:"location"`
+	VMUUID     string    `json:"vmUUID"`
+	Address    string    `json:"address"`
+	Name       string    `json:"name"`
+	BillingID  int64     `json:"billingAccountID"`
+	IssueID    string    `json:"issueID"`
+	IssuedAt   time.Time `json:"issuedAt"`
+	ObservedAt time.Time `json:"observedAt"`
+}
+
 // removalMutationRecord is a single serialized journal for all destructive
 // mutations owned by one NodeClaim. Keeping one active receipt prevents the VM
 // and either floating-IP operation from overlapping across controller replicas.
+// Observed Floating-IP DELETE receipts are retained as a bounded history so
+// final audits can distinguish later address reuse for every cleanup
+// resolution, not just the most recently deleted duplicate VM.
 type removalMutationRecord struct {
-	Schema       string                            `json:"schema"`
-	Binding      createFenceBinding                `json:"binding"`
-	AttemptToken string                            `json:"attemptToken"`
-	ReadyAt      time.Time                         `json:"readyAt"`
-	Operation    cloudapi.RemovalMutationOperation `json:"operation,omitempty"`
-	Location     string                            `json:"location,omitempty"`
-	VMUUID       string                            `json:"vmUUID,omitempty"`
-	Address      string                            `json:"address,omitempty"`
-	Name         string                            `json:"name,omitempty"`
-	BillingID    int64                             `json:"billingAccountID,omitempty"`
-	Phase        cloudapi.RemovalMutationPhase     `json:"phase"`
-	IssueID      string                            `json:"issueID,omitempty"`
-	IssuedAt     *time.Time                        `json:"issuedAt,omitempty"`
-	RejectedAt   *time.Time                        `json:"rejectedAt,omitempty"`
-	ObservedAt   *time.Time                        `json:"observedAt,omitempty"`
+	Schema                    string                            `json:"schema"`
+	Binding                   createFenceBinding                `json:"binding"`
+	AttemptToken              string                            `json:"attemptToken"`
+	ReadyAt                   time.Time                         `json:"readyAt"`
+	Operation                 cloudapi.RemovalMutationOperation `json:"operation,omitempty"`
+	Location                  string                            `json:"location,omitempty"`
+	VMUUID                    string                            `json:"vmUUID,omitempty"`
+	Address                   string                            `json:"address,omitempty"`
+	Name                      string                            `json:"name,omitempty"`
+	BillingID                 int64                             `json:"billingAccountID,omitempty"`
+	Phase                     cloudapi.RemovalMutationPhase     `json:"phase"`
+	IssueID                   string                            `json:"issueID,omitempty"`
+	IssuedAt                  *time.Time                        `json:"issuedAt,omitempty"`
+	RejectedAt                *time.Time                        `json:"rejectedAt,omitempty"`
+	ObservedAt                *time.Time                        `json:"observedAt,omitempty"`
+	ObservedFloatingIPDeletes []observedFloatingIPDeleteRecord  `json:"observedFloatingIPDeletes,omitempty"`
 }
 
 func newRemovalMutationReadyRecord(binding createFenceBinding, token string, now time.Time) removalMutationRecord {
@@ -52,9 +69,96 @@ func removalMutationFromRecord(record removalMutationRecord) cloudapi.RemovalMut
 }
 
 func removalMutationFenceFromRecord(record removalMutationRecord) cloudapi.RemovalMutationFence {
+	var issuedAt time.Time
+	if record.IssuedAt != nil {
+		issuedAt = record.IssuedAt.UTC()
+	}
+	var observedAt time.Time
+	if record.ObservedAt != nil {
+		observedAt = record.ObservedAt.UTC()
+	}
 	return cloudapi.RemovalMutationFence{
 		RemovalMutation: removalMutationFromRecord(record), Phase: record.Phase, IssueID: record.IssueID,
+		IssuedAt: issuedAt, ObservedAt: observedAt,
 	}
+}
+
+func observedFloatingIPDeleteFence(record observedFloatingIPDeleteRecord) cloudapi.RemovalMutationFence {
+	return cloudapi.RemovalMutationFence{
+		RemovalMutation: cloudapi.RemovalMutation{
+			Operation:        cloudapi.RemovalMutationFloatingIPDelete,
+			Location:         record.Location,
+			VMUUID:           record.VMUUID,
+			Address:          record.Address,
+			Name:             record.Name,
+			BillingAccountID: record.BillingID,
+		},
+		Phase:      cloudapi.RemovalMutationObserved,
+		IssueID:    record.IssueID,
+		IssuedAt:   record.IssuedAt.UTC(),
+		ObservedAt: record.ObservedAt.UTC(),
+	}
+}
+
+func historicalObservedFloatingIPDelete(
+	record removalMutationRecord,
+	desired cloudapi.RemovalMutation,
+) (cloudapi.RemovalMutationFence, bool) {
+	if desired.Operation != cloudapi.RemovalMutationFloatingIPDelete {
+		return cloudapi.RemovalMutationFence{}, false
+	}
+	for i := range record.ObservedFloatingIPDeletes {
+		fence := observedFloatingIPDeleteFence(record.ObservedFloatingIPDeletes[i])
+		if fence.RemovalMutation == desired {
+			return fence, true
+		}
+	}
+	return cloudapi.RemovalMutationFence{}, false
+}
+
+func appendObservedFloatingIPDelete(
+	record *removalMutationRecord,
+	fence cloudapi.RemovalMutationFence,
+	observedAt time.Time,
+) error {
+	if fence.Operation != cloudapi.RemovalMutationFloatingIPDelete {
+		return nil
+	}
+	for i := range record.ObservedFloatingIPDeletes {
+		current := observedFloatingIPDeleteFence(record.ObservedFloatingIPDeletes[i])
+		if current.RemovalMutation != fence.RemovalMutation {
+			continue
+		}
+		if current.IssueID != fence.IssueID ||
+			!current.IssuedAt.Equal(fence.IssuedAt) ||
+			!current.ObservedAt.Equal(observedAt) {
+			return fmt.Errorf("observed floating-IP DELETE history changed for %s", fence.Address)
+		}
+		return nil
+	}
+	if len(record.ObservedFloatingIPDeletes) >= cloudapi.MaxCreateCleanupResolutions {
+		return fmt.Errorf("observed floating-IP DELETE history exceeds %d entries", cloudapi.MaxCreateCleanupResolutions)
+	}
+	record.ObservedFloatingIPDeletes = append(record.ObservedFloatingIPDeletes, observedFloatingIPDeleteRecord{
+		Location:   fence.Location,
+		VMUUID:     fence.VMUUID,
+		Address:    fence.Address,
+		Name:       fence.Name,
+		BillingID:  fence.BillingAccountID,
+		IssueID:    fence.IssueID,
+		IssuedAt:   fence.IssuedAt.UTC(),
+		ObservedAt: observedAt.UTC(),
+	})
+	return nil
+}
+
+func archiveCurrentObservedFloatingIPDelete(record *removalMutationRecord) error {
+	if record.Phase != cloudapi.RemovalMutationObserved ||
+		record.Operation != cloudapi.RemovalMutationFloatingIPDelete {
+		return nil
+	}
+	fence := removalMutationFenceFromRecord(*record)
+	return appendObservedFloatingIPDelete(record, fence, fence.ObservedAt)
 }
 
 func normalizeRemovalMutation(value cloudapi.RemovalMutation) (cloudapi.RemovalMutation, error) {
@@ -90,8 +194,19 @@ func validateRemovalMutationFence(fence cloudapi.RemovalMutationFence) error {
 	if desired != fence.RemovalMutation || !createFenceKeyHashPattern.MatchString(fence.IssueID) {
 		return fmt.Errorf("removal receipt identity or issue ID is not canonical")
 	}
+	if fence.IssuedAt.IsZero() {
+		return fmt.Errorf("removal receipt has no issue time")
+	}
 	switch fence.Phase {
-	case cloudapi.RemovalMutationIssued, cloudapi.RemovalMutationRejected, cloudapi.RemovalMutationObserved:
+	case cloudapi.RemovalMutationIssued, cloudapi.RemovalMutationRejected:
+		if !fence.ObservedAt.IsZero() {
+			return fmt.Errorf("non-observed removal receipt contains an observation time")
+		}
+		return nil
+	case cloudapi.RemovalMutationObserved:
+		if fence.ObservedAt.IsZero() || fence.ObservedAt.Before(fence.IssuedAt) {
+			return fmt.Errorf("observed removal receipt has an invalid observation time")
+		}
 		return nil
 	default:
 		return fmt.Errorf("removal receipt has invalid phase %q", fence.Phase)
@@ -104,15 +219,35 @@ func removalMutationIdentityMatches(record removalMutationRecord, desired clouda
 
 func decodeRemovalMutationRecord(value string, binding createFenceBinding, token string) (removalMutationRecord, error) {
 	var record removalMutationRecord
-	if value == "" || len(value) > 16*1024 || json.Unmarshal([]byte(value), &record) != nil {
+	if value == "" || len(value) > maxRemovalMutationEncodedBytes || json.Unmarshal([]byte(value), &record) != nil {
 		return removalMutationRecord{}, fmt.Errorf("durable removal mutation fence is missing or malformed")
 	}
 	if record.Schema != removalMutationFenceSchema || record.Binding != binding || token == "" || record.AttemptToken != token || record.ReadyAt.IsZero() {
 		return removalMutationRecord{}, fmt.Errorf("durable removal mutation fence has incomplete or changed NodeClaim identity")
 	}
+	if len(record.ObservedFloatingIPDeletes) > cloudapi.MaxCreateCleanupResolutions {
+		return removalMutationRecord{}, fmt.Errorf("durable removal mutation fence has too many observed floating-IP DELETE receipts")
+	}
+	seenHistoricalMutations := make(map[cloudapi.RemovalMutation]struct{}, len(record.ObservedFloatingIPDeletes))
+	seenHistoricalIssues := make(map[string]struct{}, len(record.ObservedFloatingIPDeletes))
+	for i := range record.ObservedFloatingIPDeletes {
+		fence := observedFloatingIPDeleteFence(record.ObservedFloatingIPDeletes[i])
+		if err := validateRemovalMutationFence(fence); err != nil {
+			return removalMutationRecord{}, fmt.Errorf("durable removal mutation fence has invalid observed floating-IP DELETE receipt %d: %w", i, err)
+		}
+		if _, duplicate := seenHistoricalMutations[fence.RemovalMutation]; duplicate {
+			return removalMutationRecord{}, fmt.Errorf("durable removal mutation fence repeats an observed floating-IP DELETE identity")
+		}
+		if _, duplicate := seenHistoricalIssues[fence.IssueID]; duplicate {
+			return removalMutationRecord{}, fmt.Errorf("durable removal mutation fence repeats an observed floating-IP DELETE issue")
+		}
+		seenHistoricalMutations[fence.RemovalMutation] = struct{}{}
+		seenHistoricalIssues[fence.IssueID] = struct{}{}
+	}
 	if record.Phase == cloudapi.RemovalMutationReady {
 		if record.Operation != "" || record.Location != "" || record.VMUUID != "" || record.Address != "" || record.Name != "" || record.BillingID != 0 ||
-			record.IssueID != "" || record.IssuedAt != nil || record.RejectedAt != nil || record.ObservedAt != nil {
+			record.IssueID != "" || record.IssuedAt != nil || record.RejectedAt != nil || record.ObservedAt != nil ||
+			len(record.ObservedFloatingIPDeletes) != 0 {
 			return removalMutationRecord{}, fmt.Errorf("durable removal mutation ready fence contains mutation state")
 		}
 		return record, nil
@@ -193,6 +328,12 @@ func (s *kubernetesCreateFenceStore) AuthorizeRemovalMutation(
 		if decodeErr != nil {
 			return nil, cloudapi.RemovalMutationAuthorization{}, decodeErr
 		}
+		if historical, found := historicalObservedFloatingIPDelete(record, desired); found {
+			if present {
+				return nil, cloudapi.RemovalMutationAuthorization{}, fmt.Errorf("NodeClaim %q observed removal resource reappeared", claim.Name)
+			}
+			return current, cloudapi.RemovalMutationAuthorization{Fence: historical, Active: true}, nil
+		}
 		exact := removalMutationIdentityMatches(record, desired)
 		switch record.Phase {
 		case cloudapi.RemovalMutationReady:
@@ -235,12 +376,16 @@ func (s *kubernetesCreateFenceStore) AuthorizeRemovalMutation(
 		if nonceErr != nil {
 			return nil, cloudapi.RemovalMutationAuthorization{}, fmt.Errorf("generating removal mutation issue identity: %w", nonceErr)
 		}
+		if err := archiveCurrentObservedFloatingIPDelete(&record); err != nil {
+			return nil, cloudapi.RemovalMutationAuthorization{}, err
+		}
 		now := s.now().UTC()
 		issued := removalMutationRecord{
 			Schema: removalMutationFenceSchema, Binding: binding, AttemptToken: token, ReadyAt: record.ReadyAt,
 			Operation: desired.Operation, Location: desired.Location, VMUUID: desired.VMUUID,
 			Address: desired.Address, Name: desired.Name, BillingID: desired.BillingAccountID,
 			Phase: cloudapi.RemovalMutationIssued, IssueID: issueID, IssuedAt: &now,
+			ObservedFloatingIPDeletes: append([]observedFloatingIPDeleteRecord(nil), record.ObservedFloatingIPDeletes...),
 		}
 		written, writeErr := s.persistRemovalMutation(ctx, current, issued, func(stored removalMutationRecord) bool {
 			return stored.Phase == cloudapi.RemovalMutationIssued && stored.IssueID == issueID && removalMutationIdentityMatches(stored, desired)
@@ -294,8 +439,34 @@ func (s *kubernetesCreateFenceStore) finishRemovalMutation(
 		if !removalMutationIdentityMatches(record, fence.RemovalMutation) || record.IssueID != fence.IssueID {
 			return nil, fmt.Errorf("NodeClaim %q removal mutation identity changed", claim.Name)
 		}
+		durableFence := removalMutationFenceFromRecord(record)
+		if !durableFence.IssuedAt.Equal(fence.IssuedAt) {
+			return nil, fmt.Errorf("NodeClaim %q removal mutation issue time changed", claim.Name)
+		}
 		if record.Phase == terminal {
-			return current, nil
+			if terminal != cloudapi.RemovalMutationObserved || fence.Operation != cloudapi.RemovalMutationFloatingIPDelete {
+				return current, nil
+			}
+			if _, found := historicalObservedFloatingIPDelete(record, fence.RemovalMutation); found {
+				return current, nil
+			}
+			if record.ObservedAt == nil || record.ObservedAt.IsZero() {
+				return nil, fmt.Errorf("NodeClaim %q observed floating-IP DELETE has no observation time", claim.Name)
+			}
+			if err := appendObservedFloatingIPDelete(&record, durableFence, record.ObservedAt.UTC()); err != nil {
+				return nil, err
+			}
+			written, writeErr := s.persistRemovalMutation(ctx, current, record, func(stored removalMutationRecord) bool {
+				_, found := historicalObservedFloatingIPDelete(stored, fence.RemovalMutation)
+				return stored.Phase == terminal && stored.IssueID == fence.IssueID &&
+					removalMutationIdentityMatches(stored, fence.RemovalMutation) && found
+			})
+			if writeErr == nil {
+				return written, nil
+			}
+			lastErr = writeErr
+			claim = current
+			continue
 		}
 		if terminal == cloudapi.RemovalMutationRejected && record.Phase != cloudapi.RemovalMutationIssued {
 			return nil, fmt.Errorf("NodeClaim %q removal mutation is not issued", claim.Name)
@@ -303,17 +474,31 @@ func (s *kubernetesCreateFenceStore) finishRemovalMutation(
 		if terminal == cloudapi.RemovalMutationObserved && record.Phase != cloudapi.RemovalMutationIssued && record.Phase != cloudapi.RemovalMutationRejected {
 			return nil, fmt.Errorf("NodeClaim %q removal mutation has no observable receipt", claim.Name)
 		}
+		if fence.Phase != record.Phase {
+			return nil, fmt.Errorf("NodeClaim %q removal mutation phase changed", claim.Name)
+		}
 		now := s.now().UTC()
 		record.Phase = terminal
 		if terminal == cloudapi.RemovalMutationObserved {
 			record.ObservedAt = &now
 			record.RejectedAt = nil
+			if err := appendObservedFloatingIPDelete(&record, durableFence, now); err != nil {
+				return nil, err
+			}
 		} else {
 			record.RejectedAt = &now
 			record.ObservedAt = nil
 		}
 		written, writeErr := s.persistRemovalMutation(ctx, current, record, func(stored removalMutationRecord) bool {
-			return stored.Phase == terminal && stored.IssueID == fence.IssueID && removalMutationIdentityMatches(stored, fence.RemovalMutation)
+			if stored.Phase != terminal || stored.IssueID != fence.IssueID ||
+				!removalMutationIdentityMatches(stored, fence.RemovalMutation) {
+				return false
+			}
+			if terminal == cloudapi.RemovalMutationObserved && fence.Operation == cloudapi.RemovalMutationFloatingIPDelete {
+				_, found := historicalObservedFloatingIPDelete(stored, fence.RemovalMutation)
+				return found
+			}
+			return true
 		})
 		if writeErr == nil {
 			return written, nil
@@ -333,6 +518,13 @@ func (s *kubernetesCreateFenceStore) persistRemovalMutation(
 	encoded, err := json.Marshal(record)
 	if err != nil {
 		return nil, fmt.Errorf("encoding NodeClaim %q removal mutation fence: %w", current.Name, err)
+	}
+	if len(encoded) > maxRemovalMutationEncodedBytes {
+		return nil, fmt.Errorf(
+			"encoding NodeClaim %q removal mutation fence exceeds %d bytes",
+			current.Name,
+			maxRemovalMutationEncodedBytes,
+		)
 	}
 	copy := current.DeepCopy()
 	if copy.Annotations == nil {
@@ -433,6 +625,12 @@ func (s *memoryCreateFenceStore) AuthorizeRemovalMutation(
 	if _, err := decodeRemovalMutationRecord(mustEncodeRemovalMutation(record), binding, token); err != nil {
 		return nil, cloudapi.RemovalMutationAuthorization{}, err
 	}
+	if historical, found := historicalObservedFloatingIPDelete(record, desired); found {
+		if present {
+			return nil, cloudapi.RemovalMutationAuthorization{}, fmt.Errorf("observed removal resource reappeared")
+		}
+		return claimWithRemovalMutation(claim, record), cloudapi.RemovalMutationAuthorization{Fence: historical, Active: true}, nil
+	}
 	exact := removalMutationIdentityMatches(record, desired)
 	switch record.Phase {
 	case cloudapi.RemovalMutationReady:
@@ -472,12 +670,16 @@ func (s *memoryCreateFenceStore) AuthorizeRemovalMutation(
 	if err != nil {
 		return nil, cloudapi.RemovalMutationAuthorization{}, err
 	}
+	if err := archiveCurrentObservedFloatingIPDelete(&record); err != nil {
+		return nil, cloudapi.RemovalMutationAuthorization{}, err
+	}
 	now := s.now().UTC()
 	record = removalMutationRecord{
 		Schema: removalMutationFenceSchema, Binding: binding, AttemptToken: token, ReadyAt: record.ReadyAt,
 		Operation: desired.Operation, Location: desired.Location, VMUUID: desired.VMUUID,
 		Address: desired.Address, Name: desired.Name, BillingID: desired.BillingAccountID,
 		Phase: cloudapi.RemovalMutationIssued, IssueID: issueID, IssuedAt: &now,
+		ObservedFloatingIPDeletes: append([]observedFloatingIPDeleteRecord(nil), record.ObservedFloatingIPDeletes...),
 	}
 	s.removalMutations[claim.UID] = record
 	return claimWithRemovalMutation(claim, record), cloudapi.RemovalMutationAuthorization{Fence: removalMutationFenceFromRecord(record), Active: true, AllowMutation: true}, nil
@@ -511,7 +713,22 @@ func (s *memoryCreateFenceStore) finishMemoryRemovalMutation(claim *karpv1.NodeC
 	if !ok || !removalMutationIdentityMatches(record, fence.RemovalMutation) || record.IssueID != fence.IssueID {
 		return nil, fmt.Errorf("removal mutation identity changed")
 	}
+	durableFence := removalMutationFenceFromRecord(record)
+	if !durableFence.IssuedAt.Equal(fence.IssuedAt) {
+		return nil, fmt.Errorf("removal mutation issue time changed")
+	}
 	if record.Phase == terminal {
+		if terminal == cloudapi.RemovalMutationObserved && fence.Operation == cloudapi.RemovalMutationFloatingIPDelete {
+			if _, found := historicalObservedFloatingIPDelete(record, fence.RemovalMutation); !found {
+				if record.ObservedAt == nil || record.ObservedAt.IsZero() {
+					return nil, fmt.Errorf("observed floating-IP DELETE has no observation time")
+				}
+				if err := appendObservedFloatingIPDelete(&record, durableFence, record.ObservedAt.UTC()); err != nil {
+					return nil, err
+				}
+				s.removalMutations[claim.UID] = record
+			}
+		}
 		return claimWithRemovalMutation(claim, record), nil
 	}
 	if terminal == cloudapi.RemovalMutationRejected && record.Phase != cloudapi.RemovalMutationIssued {
@@ -520,11 +737,17 @@ func (s *memoryCreateFenceStore) finishMemoryRemovalMutation(claim *karpv1.NodeC
 	if terminal == cloudapi.RemovalMutationObserved && record.Phase != cloudapi.RemovalMutationIssued && record.Phase != cloudapi.RemovalMutationRejected {
 		return nil, fmt.Errorf("removal mutation has no observable receipt")
 	}
+	if fence.Phase != record.Phase {
+		return nil, fmt.Errorf("removal mutation phase changed")
+	}
 	now := s.now().UTC()
 	record.Phase = terminal
 	if terminal == cloudapi.RemovalMutationObserved {
 		record.ObservedAt = &now
 		record.RejectedAt = nil
+		if err := appendObservedFloatingIPDelete(&record, durableFence, now); err != nil {
+			return nil, err
+		}
 	} else {
 		record.RejectedAt = &now
 		record.ObservedAt = nil

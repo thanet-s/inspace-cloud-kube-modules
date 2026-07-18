@@ -148,6 +148,329 @@ func TestRemovalMutationFenceSurvivesStoreRestartAndOnlyBlockedIssueCanReset(t *
 	}
 }
 
+func TestObservedRemovalMutationAbsentLookupIsReadOnlyAfterStoreRestart(t *testing.T) {
+	ctx := context.Background()
+	claim := createFenceTestNodeClaim()
+	kubeClient := fake.NewClientBuilder().WithScheme(kubescheme.Scheme).WithObjects(claim).Build()
+	store, err := NewKubernetesCreateFenceStore(kubeClient, kubeClient)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding, cleanup := createFenceTestIdentity(claim)
+	fenced, fence, _, err := store.Ensure(ctx, claim, binding, cleanup, cloudapi.CreateInventory{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mutation := cloudapi.RemovalMutation{
+		Operation:        cloudapi.RemovalMutationFloatingIPDelete,
+		Location:         cleanup.Location,
+		VMUUID:           "22222222-2222-4222-8222-222222222222",
+		Address:          "203.0.113.10",
+		Name:             "owned-fip",
+		BillingAccountID: cleanup.BillingAccountID,
+	}
+	issuedClaim, issued, err := store.AuthorizeRemovalMutation(ctx, fenced, binding, fence.Token, mutation, true)
+	if err != nil || !issued.Active || !issued.AllowMutation || issued.Fence.Phase != cloudapi.RemovalMutationIssued {
+		t.Fatalf("issued removal authorization = %#v, %v", issued, err)
+	}
+	forged := issued.Fence
+	forged.IssuedAt = forged.IssuedAt.Add(-time.Hour)
+	if _, err := store.ObserveRemovalMutation(ctx, issuedClaim, binding, fence.Token, forged); err == nil ||
+		!strings.Contains(err.Error(), "issue time changed") {
+		t.Fatalf("forged removal issue-time observation error = %v", err)
+	}
+	observedClaim, err := store.ObserveRemovalMutation(ctx, issuedClaim, binding, fence.Token, issued.Fence)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var persisted karpv1.NodeClaim
+	if err := kubeClient.Get(ctx, types.NamespacedName{Name: claim.Name}, &persisted); err != nil {
+		t.Fatal(err)
+	}
+	before := persisted.Annotations[AnnotationRemovalMutationFence]
+	if before == "" {
+		t.Fatal("observed removal mutation was not persisted")
+	}
+	assertUnchanged := func(phase string) {
+		t.Helper()
+		var current karpv1.NodeClaim
+		if err := kubeClient.Get(ctx, types.NamespacedName{Name: claim.Name}, &current); err != nil {
+			t.Fatal(err)
+		}
+		if got := current.Annotations[AnnotationRemovalMutationFence]; got != before {
+			t.Fatalf("%s changed observed removal annotation:\nbefore=%s\nafter=%s", phase, before, got)
+		}
+	}
+
+	restarted, err := NewKubernetesCreateFenceStore(kubeClient, kubeClient)
+	if err != nil {
+		t.Fatal(err)
+	}
+	readClaim, exactAbsent, err := restarted.AuthorizeRemovalMutation(
+		ctx,
+		observedClaim,
+		binding,
+		fence.Token,
+		mutation,
+		false,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if readClaim == nil || !exactAbsent.Active || exactAbsent.AllowMutation ||
+		exactAbsent.Fence.RemovalMutation != issued.Fence.RemovalMutation ||
+		exactAbsent.Fence.IssueID != issued.Fence.IssueID ||
+		exactAbsent.Fence.Phase != cloudapi.RemovalMutationObserved {
+		t.Fatalf("exact observed absent lookup = %#v claim=%#v", exactAbsent, readClaim)
+	}
+	assertUnchanged("exact absent lookup")
+
+	different := mutation
+	different.Address = "203.0.113.11"
+	readClaim, differentAbsent, err := restarted.AuthorizeRemovalMutation(
+		ctx,
+		readClaim,
+		binding,
+		fence.Token,
+		different,
+		false,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if readClaim == nil || differentAbsent.Active || differentAbsent.AllowMutation ||
+		differentAbsent.Fence != (cloudapi.RemovalMutationFence{}) {
+		t.Fatalf("different observed absent lookup = %#v claim=%#v", differentAbsent, readClaim)
+	}
+	assertUnchanged("different absent lookup")
+
+	if _, _, err := restarted.AuthorizeRemovalMutation(
+		ctx,
+		readClaim,
+		binding,
+		fence.Token,
+		mutation,
+		true,
+	); err == nil || !strings.Contains(err.Error(), "observed removal resource reappeared") {
+		t.Fatalf("exact observed present lookup error = %v", err)
+	}
+	assertUnchanged("exact present rejection")
+}
+
+func TestRemovalMutationAbsentLookupRequiresExactObservedPhase(t *testing.T) {
+	ctx := context.Background()
+	claim := createFenceTestNodeClaim()
+	kubeClient := fake.NewClientBuilder().WithScheme(kubescheme.Scheme).WithObjects(claim).Build()
+	store, err := NewKubernetesCreateFenceStore(kubeClient, kubeClient)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding, cleanup := createFenceTestIdentity(claim)
+	current, fence, _, err := store.Ensure(ctx, claim, binding, cleanup, cloudapi.CreateInventory{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mutation := cloudapi.RemovalMutation{
+		Operation: cloudapi.RemovalMutationFloatingIPDelete, Location: cleanup.Location,
+		VMUUID: "22222222-2222-4222-8222-222222222222", Address: "203.0.113.10",
+		Name: "owned-fip", BillingAccountID: cleanup.BillingAccountID,
+	}
+	assertLookup := func(label string, expectedPhase cloudapi.RemovalMutationPhase, wantActive bool) {
+		t.Helper()
+		var beforeClaim karpv1.NodeClaim
+		if err := kubeClient.Get(ctx, types.NamespacedName{Name: claim.Name}, &beforeClaim); err != nil {
+			t.Fatal(err)
+		}
+		before := beforeClaim.Annotations[AnnotationRemovalMutationFence]
+		var authorization cloudapi.RemovalMutationAuthorization
+		current, authorization, err = store.AuthorizeRemovalMutation(ctx, current, binding, fence.Token, mutation, false)
+		if err != nil {
+			t.Fatalf("%s absent lookup = %v", label, err)
+		}
+		if authorization.Active != wantActive || authorization.AllowMutation {
+			t.Fatalf("%s absent lookup = %#v, want active=%t and read-only", label, authorization, wantActive)
+		}
+		if wantActive && (authorization.Fence.Phase != expectedPhase ||
+			authorization.Fence.IssuedAt.IsZero() ||
+			(expectedPhase == cloudapi.RemovalMutationObserved &&
+				authorization.Fence.ObservedAt.Before(authorization.Fence.IssuedAt))) {
+			t.Fatalf("%s absent lookup fence = %#v", label, authorization.Fence)
+		}
+		var afterClaim karpv1.NodeClaim
+		if err := kubeClient.Get(ctx, types.NamespacedName{Name: claim.Name}, &afterClaim); err != nil {
+			t.Fatal(err)
+		}
+		if after := afterClaim.Annotations[AnnotationRemovalMutationFence]; after != before {
+			t.Fatalf("%s absent lookup changed annotation:\nbefore=%s\nafter=%s", label, before, after)
+		}
+	}
+
+	assertLookup("ready", "", false)
+	var issued cloudapi.RemovalMutationAuthorization
+	current, issued, err = store.AuthorizeRemovalMutation(ctx, current, binding, fence.Token, mutation, true)
+	if err != nil || !issued.AllowMutation {
+		t.Fatalf("issue = %#v, %v", issued, err)
+	}
+	assertLookup("issued", cloudapi.RemovalMutationIssued, true)
+	current, err = store.RejectRemovalMutation(ctx, current, binding, fence.Token, issued.Fence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertLookup("rejected", cloudapi.RemovalMutationRejected, true)
+	current, issued, err = store.AuthorizeRemovalMutation(ctx, current, binding, fence.Token, mutation, true)
+	if err != nil || !issued.AllowMutation {
+		t.Fatalf("reissue = %#v, %v", issued, err)
+	}
+	current, err = store.ObserveRemovalMutation(ctx, current, binding, fence.Token, issued.Fence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertLookup("observed", cloudapi.RemovalMutationObserved, true)
+}
+
+func TestObservedFloatingIPDeleteHistorySurvivesLaterRemovalSlots(t *testing.T) {
+	ctx := context.Background()
+	claim := createFenceTestNodeClaim()
+	kubeClient := fake.NewClientBuilder().WithScheme(kubescheme.Scheme).WithObjects(claim).Build()
+	store, err := NewKubernetesCreateFenceStore(kubeClient, kubeClient)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding, cleanup := createFenceTestIdentity(claim)
+	current, fence, _, err := store.Ensure(ctx, claim, binding, cleanup, cloudapi.CreateInventory{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mutations := []cloudapi.RemovalMutation{
+		{
+			Operation: cloudapi.RemovalMutationFloatingIPDelete, Location: cleanup.Location,
+			VMUUID: "22222222-2222-4222-8222-222222222222", Address: "203.0.113.10",
+			Name: "owned-fip-a", BillingAccountID: cleanup.BillingAccountID,
+		},
+		{
+			Operation: cloudapi.RemovalMutationFloatingIPDelete, Location: cleanup.Location,
+			VMUUID: "33333333-3333-4333-8333-333333333333", Address: "203.0.113.11",
+			Name: "owned-fip-b", BillingAccountID: cleanup.BillingAccountID,
+		},
+	}
+	for index, mutation := range mutations {
+		var authorization cloudapi.RemovalMutationAuthorization
+		current, authorization, err = store.AuthorizeRemovalMutation(ctx, current, binding, fence.Token, mutation, true)
+		if err != nil || !authorization.Active || !authorization.AllowMutation {
+			t.Fatalf("authorizing %s = %#v, %v", mutation.Address, authorization, err)
+		}
+		current, err = store.ObserveRemovalMutation(ctx, current, binding, fence.Token, authorization.Fence)
+		if err != nil {
+			t.Fatalf("observing %s = %v", mutation.Address, err)
+		}
+		if index == 0 {
+			// Model an rc.1 record created before observed-delete history
+			// existed. Advancing the slot must archive this current receipt.
+			legacy, decodeErr := decodeRemovalMutationRecord(
+				current.Annotations[AnnotationRemovalMutationFence],
+				binding,
+				fence.Token,
+			)
+			if decodeErr != nil {
+				t.Fatal(decodeErr)
+			}
+			legacy.ObservedFloatingIPDeletes = nil
+			current = claimWithRemovalMutation(current, legacy)
+			if err := kubeClient.Update(ctx, current); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	var persisted karpv1.NodeClaim
+	if err := kubeClient.Get(ctx, types.NamespacedName{Name: claim.Name}, &persisted); err != nil {
+		t.Fatal(err)
+	}
+	before := persisted.Annotations[AnnotationRemovalMutationFence]
+	record, err := decodeRemovalMutationRecord(before, binding, fence.Token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(record.ObservedFloatingIPDeletes) != len(mutations) {
+		t.Fatalf("observed delete history has %d entries, want %d", len(record.ObservedFloatingIPDeletes), len(mutations))
+	}
+
+	restarted, err := NewKubernetesCreateFenceStore(kubeClient, kubeClient)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, mutation := range mutations {
+		var authorization cloudapi.RemovalMutationAuthorization
+		current, authorization, err = restarted.AuthorizeRemovalMutation(ctx, current, binding, fence.Token, mutation, false)
+		if err != nil {
+			t.Fatalf("reading historical %s = %v", mutation.Address, err)
+		}
+		if current == nil || !authorization.Active || authorization.AllowMutation ||
+			authorization.Fence.Phase != cloudapi.RemovalMutationObserved ||
+			authorization.Fence.RemovalMutation != mutation ||
+			authorization.Fence.IssuedAt.IsZero() ||
+			authorization.Fence.ObservedAt.Before(authorization.Fence.IssuedAt) {
+			t.Fatalf("historical authorization for %s = %#v", mutation.Address, authorization)
+		}
+		if _, _, err := restarted.AuthorizeRemovalMutation(ctx, current, binding, fence.Token, mutation, true); err == nil ||
+			!strings.Contains(err.Error(), "observed removal resource reappeared") {
+			t.Fatalf("historical present lookup for %s = %v", mutation.Address, err)
+		}
+	}
+	if err := kubeClient.Get(ctx, types.NamespacedName{Name: claim.Name}, &persisted); err != nil {
+		t.Fatal(err)
+	}
+	if after := persisted.Annotations[AnnotationRemovalMutationFence]; after != before {
+		t.Fatalf("historical lookups changed removal annotation:\nbefore=%s\nafter=%s", before, after)
+	}
+}
+
+func TestRemovalMutationHistoryMaximumRoundTripsWithinAnnotationBound(t *testing.T) {
+	claim := createFenceTestNodeClaim()
+	binding, _ := createFenceTestIdentity(claim)
+	token := strings.Repeat("1", 32)
+	now := time.Date(2026, time.July, 18, 3, 0, 0, 0, time.UTC)
+	record := newRemovalMutationReadyRecord(binding, token, now.Add(-time.Hour))
+	record.Operation = cloudapi.RemovalMutationVMDelete
+	record.Location = "bkk01"
+	record.VMUUID = "99999999-9999-4999-8999-999999999999"
+	record.Phase = cloudapi.RemovalMutationObserved
+	record.IssueID = strings.Repeat("f", 32)
+	issuedAt := now.Add(-time.Minute)
+	observedAt := now
+	record.IssuedAt = &issuedAt
+	record.ObservedAt = &observedAt
+	for i := 0; i < cloudapi.MaxCreateCleanupResolutions; i++ {
+		record.ObservedFloatingIPDeletes = append(record.ObservedFloatingIPDeletes, observedFloatingIPDeleteRecord{
+			Location:   "bkk01",
+			VMUUID:     fmt.Sprintf("11111111-1111-4111-8111-%012x", i+1),
+			Address:    fmt.Sprintf("203.0.113.%d", i+1),
+			Name:       fmt.Sprintf("%03d-%s", i, strings.Repeat("n", 251)),
+			BillingID:  1,
+			IssueID:    fmt.Sprintf("%032x", i+1),
+			IssuedAt:   issuedAt.Add(time.Duration(i) * time.Second),
+			ObservedAt: observedAt.Add(time.Duration(i) * time.Second),
+		})
+	}
+	encoded := mustEncodeRemovalMutation(record)
+	if len(encoded) > maxRemovalMutationEncodedBytes {
+		t.Fatalf("maximum removal history encodes to %d bytes, limit %d", len(encoded), maxRemovalMutationEncodedBytes)
+	}
+	decoded, err := decodeRemovalMutationRecord(encoded, binding, token)
+	if err != nil {
+		t.Fatalf("decoding maximum removal history = %v", err)
+	}
+	if len(decoded.ObservedFloatingIPDeletes) != cloudapi.MaxCreateCleanupResolutions {
+		t.Fatalf("decoded %d historical deletes, want %d", len(decoded.ObservedFloatingIPDeletes), cloudapi.MaxCreateCleanupResolutions)
+	}
+	record.ObservedFloatingIPDeletes = append(record.ObservedFloatingIPDeletes, record.ObservedFloatingIPDeletes[0])
+	if _, err := decodeRemovalMutationRecord(mustEncodeRemovalMutation(record), binding, token); err == nil ||
+		!strings.Contains(err.Error(), "too many") {
+		t.Fatalf("oversized history decode error = %v", err)
+	}
+}
+
 func TestRemovalMutationFenceConcurrentControllersGrantOneCloudCall(t *testing.T) {
 	ctx := context.Background()
 	claim := createFenceTestNodeClaim()

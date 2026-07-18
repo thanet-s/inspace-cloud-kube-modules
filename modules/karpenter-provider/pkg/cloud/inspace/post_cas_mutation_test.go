@@ -286,7 +286,10 @@ func TestVMDeleteDriftAfterCASRejectsUndispatchedReceipt(t *testing.T) {
 		if mutation.Operation != cloudapi.RemovalMutationVMDelete || !present {
 			t.Fatalf("removal authorization = %#v present=%t", mutation, present)
 		}
-		fence = cloudapi.RemovalMutationFence{RemovalMutation: mutation, Phase: cloudapi.RemovalMutationIssued, IssueID: strings.Repeat("a", 32)}
+		fence = cloudapi.RemovalMutationFence{
+			RemovalMutation: mutation, Phase: cloudapi.RemovalMutationIssued,
+			IssueID: strings.Repeat("a", 32), IssuedAt: time.Now().UTC(),
+		}
 		api.vms[0].Name = "foreign-after-cas"
 		return cloudapi.RemovalMutationAuthorization{Fence: fence, Active: true, AllowMutation: true}, nil
 	}
@@ -329,6 +332,7 @@ func TestVMVolumeAttachmentAfterCASRejectsUndispatchedDeleteReceipt(t *testing.T
 			RemovalMutation: mutation,
 			Phase:           cloudapi.RemovalMutationIssued,
 			IssueID:         strings.Repeat("c", 32),
+			IssuedAt:        time.Now().UTC(),
 		}
 		api.vms[0].Storage = append(api.vms[0].Storage, sdk.VMStorage{
 			UUID:    "33333333-3333-4333-8333-333333333333",
@@ -393,6 +397,7 @@ func TestVMStorageInventoryDriftAfterCASRejectsUndispatchedDeleteReceipt(t *test
 					RemovalMutation: mutation,
 					Phase:           cloudapi.RemovalMutationIssued,
 					IssueID:         strings.Repeat("d", 32),
+					IssuedAt:        time.Now().UTC(),
 				}
 				mutate(&api.vms[0])
 				return cloudapi.RemovalMutationAuthorization{Fence: fence, Active: true, AllowMutation: true}, nil
@@ -455,7 +460,10 @@ func TestFloatingIPRemovalDriftAfterCASRejectsUndispatchedReceipt(t *testing.T) 
 					if mutation.Operation != test.operation || !present {
 						t.Fatalf("authorization = %#v present=%t, want %s/present", mutation, present, test.operation)
 					}
-					issued = cloudapi.RemovalMutationFence{RemovalMutation: mutation, Phase: cloudapi.RemovalMutationIssued, IssueID: strings.Repeat("b", 32)}
+					issued = cloudapi.RemovalMutationFence{
+						RemovalMutation: mutation, Phase: cloudapi.RemovalMutationIssued,
+						IssueID: strings.Repeat("b", 32), IssuedAt: time.Now().UTC(),
+					}
 					if test.assigned {
 						api.floatingIPs[0].AssignedTo = "99999999-9999-4999-8999-999999999999"
 					} else {

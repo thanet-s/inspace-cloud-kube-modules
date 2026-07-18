@@ -110,6 +110,37 @@ func TestCatalogHasAll31BoundedVariants(t *testing.T) {
 	}
 }
 
+func TestCSITopologyLocationNormalizesToCatalogLocation(t *testing.T) {
+	if got := karpv1.NormalizedLabels[CSITopologyLocationKey]; got != LabelLocation {
+		t.Fatalf("CSI topology alias normalizes to %q, want %q", got, LabelLocation)
+	}
+
+	types, err := New(Options{Location: inspacev1.LocationBangkok})
+	if err != nil {
+		t.Fatal(err)
+	}
+	matching := scheduling.NewRequirements(
+		scheduling.NewRequirement(CSITopologyLocationKey, corev1.NodeSelectorOpIn, inspacev1.LocationBangkok),
+	)
+	if matching.Has(CSITopologyLocationKey) || !matching.Has(LabelLocation) {
+		t.Fatalf("CSI topology requirement was not canonicalized: %v", matching)
+	}
+	for _, instanceType := range types {
+		if !matching.IsCompatible(instanceType.Requirements, scheduling.AllowUndefinedWellKnownLabels) {
+			t.Fatalf("%s rejects matching CSI topology location", instanceType.Name)
+		}
+	}
+
+	mismatching := scheduling.NewRequirements(
+		scheduling.NewRequirement(CSITopologyLocationKey, corev1.NodeSelectorOpIn, "sin01"),
+	)
+	for _, instanceType := range types {
+		if mismatching.IsCompatible(instanceType.Requirements, scheduling.AllowUndefinedWellKnownLabels) {
+			t.Fatalf("%s accepts mismatched CSI topology location", instanceType.Name)
+		}
+	}
+}
+
 func TestCatalogHasOnlySupportedOneCoreAndExtraMemoryShapes(t *testing.T) {
 	types, err := New(Options{})
 	if err != nil {
