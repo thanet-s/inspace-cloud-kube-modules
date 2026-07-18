@@ -1,0 +1,27 @@
+Host inspace-bastion
+  HostName {{ deployment_state.bastionPublicIPv4 }}
+  User {{ ssh_username }}
+  IdentityFile {{ ssh_private_key_file_expanded }}
+  IdentitiesOnly yes
+  BatchMode yes
+  StrictHostKeyChecking yes
+  UserKnownHostsFile {{ deploy_state_dir }}/known-hosts-bastion
+  ConnectTimeout 10
+  ServerAliveInterval 5
+  ServerAliveCountMax 3
+
+{% for control_plane in deployment_state.controlPlanes %}
+Host inspace-cp{{ loop.index0 }}
+  HostName {{ control_plane.privateIPv4 }}
+  User {{ ssh_username }}
+  IdentityFile {{ ssh_private_key_file_expanded }}
+  IdentitiesOnly yes
+  BatchMode yes
+  StrictHostKeyChecking yes
+  UserKnownHostsFile {{ deploy_state_dir }}/known-hosts-cp{{ loop.index0 }}
+  ProxyJump inspace-bastion
+  ConnectTimeout 10
+  ServerAliveInterval 5
+  ServerAliveCountMax 3
+
+{% endfor %}

@@ -1,0 +1,19 @@
+---
+- name: Establish the private Kubernetes API tunnel
+  hosts: localhost
+  gather_facts: false
+  vars:
+    deploy_create_state_dir: false
+  tasks:
+    - name: Validate inventory, topology, tools, and SSH identity
+      ansible.builtin.include_tasks: tasks/preflight.yml
+
+    - name: Load and validate the deployment journal
+      ansible.builtin.include_tasks: tasks/load-state.yml
+
+    - name: Start the private API tunnel and wait for readiness
+      ansible.builtin.include_tasks: tasks/start-tunnel.yml
+
+    - name: Report tunnel access
+      ansible.builtin.debug:
+        msg: "Tunnel is active; export KUBECONFIG={{ deploy_state_dir }}/kubeconfig.yaml"

@@ -1,0 +1,481 @@
+---
+- name: Create an InSpace RKE2 cluster and install its cloud modules
+  hosts: localhost
+  gather_facts: false
+  vars:
+    deploy_create_state_dir: true
+  tasks:
+    - name: Validate inventory, topology, tools, and SSH identity
+      ansible.builtin.include_tasks: tasks/preflight.yml
+
+    - name: Require the API token only in the process environment
+      ansible.builtin.assert:
+        that: lookup('env', 'INSPACE_API_TOKEN') | length > 0
+        fail_msg: "Export INSPACE_API_TOKEN; do not store it in inventory."
+      no_log: true
+
+    - name: Inspect durable bootstrap files
+      ansible.builtin.stat:
+        path: "{{ deploy_state_dir }}/{{ item }}"
+      loop:
+        - cluster.yaml
+        - rke2-token
+        - bootstrap-cache-key
+        - bootstrap-cache-not-before
+        - state.json
+      register: deploy_bootstrap_files
+
+    - name: Render the desired bootstrap spec without touching durable status
+      ansible.builtin.template:
+        src: "{{ deploy_root }}/templates/cluster.yaml.j2"
+        dest: "{{ deploy_state_dir }}/cluster.desired.yaml"
+        mode: "0600"
+
+    - name: Require resumed bootstrap spec to remain byte-semantically identical
+      ansible.builtin.assert:
+        that:
+          - >-
+            (lookup('file', deploy_state_dir + '/cluster.yaml') | from_yaml).apiVersion ==
+            (lookup('file', deploy_state_dir + '/cluster.desired.yaml') | from_yaml).apiVersion
+          - >-
+            (lookup('file', deploy_state_dir + '/cluster.yaml') | from_yaml).kind ==
+            (lookup('file', deploy_state_dir + '/cluster.desired.yaml') | from_yaml).kind
+          - >-
+            (lookup('file', deploy_state_dir + '/cluster.yaml') | from_yaml).metadata.name ==
+            (lookup('file', deploy_state_dir + '/cluster.desired.yaml') | from_yaml).metadata.name
+          - >-
+            (lookup('file', deploy_state_dir + '/cluster.yaml') | from_yaml).metadata.namespace ==
+            (lookup('file', deploy_state_dir + '/cluster.desired.yaml') | from_yaml).metadata.namespace
+          - >-
+            (lookup('file', deploy_state_dir + '/cluster.yaml') | from_yaml).spec ==
+            (lookup('file', deploy_state_dir + '/cluster.desired.yaml') | from_yaml).spec
+        fail_msg: >-
+          The persisted bootstrap spec differs from inventory. The controller
+          ledger is preserved and no cloud mutation was attempted.
+      when: deploy_bootstrap_files.results[0].stat.exists
+
+    - name: Install the initial bootstrap spec
+      ansible.builtin.copy:
+        src: "{{ deploy_state_dir }}/cluster.desired.yaml"
+        dest: "{{ deploy_state_dir }}/cluster.yaml"
+        remote_src: true
+        mode: "0600"
+      when: not deploy_bootstrap_files.results[0].stat.exists
+
+    - name: Remove the non-authoritative desired-spec scratch file
+      ansible.builtin.file:
+        path: "{{ deploy_state_dir }}/cluster.desired.yaml"
+        state: absent
+
+    - name: Generate the RKE2 registration token
+      ansible.builtin.command:
+        argv: [openssl, rand, -hex, "32"]
+      register: deploy_generated_rke2_token
+      changed_when: true
+      no_log: true
+      when: not deploy_bootstrap_files.results[1].stat.exists
+
+    - name: Persist the RKE2 registration token
+      ansible.builtin.copy:
+        content: "{{ deploy_generated_rke2_token.stdout }}\n"
+        dest: "{{ deploy_state_dir }}/rke2-token"
+        mode: "0600"
+      no_log: true
+      when: not deploy_bootstrap_files.results[1].stat.exists
+
+    - name: Generate the 256-bit bootstrap cache key
+      ansible.builtin.command:
+        argv: [openssl, rand, -hex, "32"]
+      register: deploy_generated_cache_key
+      changed_when: true
+      no_log: true
+      when:
+        - not bootstrap_direct_download | bool
+        - not deploy_bootstrap_files.results[2].stat.exists
+
+    - name: Persist the bootstrap cache key
+      ansible.builtin.copy:
+        content: "{{ deploy_generated_cache_key.stdout }}\n"
+        dest: "{{ deploy_state_dir }}/bootstrap-cache-key"
+        mode: "0600"
+      no_log: true
+      when:
+        - not bootstrap_direct_download | bool
+        - not deploy_bootstrap_files.results[2].stat.exists
+
+    - name: Capture the real cache certificate start time
+      ansible.builtin.command:
+        argv: [date, -u, "+%Y-%m-%dT%H:%M:%SZ"]
+      register: deploy_generated_cache_epoch
+      changed_when: true
+      when:
+        - not bootstrap_direct_download | bool
+        - not deploy_bootstrap_files.results[3].stat.exists
+
+    - name: Persist the cache certificate start time
+      ansible.builtin.copy:
+        content: "{{ deploy_generated_cache_epoch.stdout }}\n"
+        dest: "{{ deploy_state_dir }}/bootstrap-cache-not-before"
+        mode: "0600"
+      when:
+        - not bootstrap_direct_download | bool
+        - not deploy_bootstrap_files.results[3].stat.exists
+
+    - name: Pull the exact bootstrap controller release
+      ansible.builtin.command:
+        argv:
+          - docker
+          - pull
+          - "ghcr.io/thanet-s/inspace-cloud-controller-manager:{{ modules_version }}"
+      changed_when: true
+
+    - name: Reconcile bootstrap infrastructure synchronously to readiness
+      ansible.builtin.command:
+        argv:
+          - docker
+          - run
+          - --rm
+          - "--user={{ lookup('pipe', 'id -u') }}:{{ lookup('pipe', 'id -g') }}"
+          - --entrypoint
+          - /usr/local/bin/inspace-cluster-controller
+          - --env
+          - INSPACE_ALLOW_REMOTE_MUTATIONS
+          - --env
+          - INSPACE_API_URL
+          - --env
+          - INSPACE_API_TOKEN
+          - --env
+          - INSPACE_RKE2_TOKEN
+          - --env
+          - INSPACE_BOOTSTRAP_CACHE_KEY
+          - --env
+          - INSPACE_BOOTSTRAP_CACHE_NOT_BEFORE
+          - --mount
+          - "type=bind,src={{ deploy_state_dir }},dst=/state"
+          - --mount
+          - "type=bind,src={{ ssh_public_key_file_expanded }},dst=/ssh/public-key,readonly"
+          - "ghcr.io/thanet-s/inspace-cloud-controller-manager:{{ modules_version }}"
+          - --cluster-config
+          - /state/cluster.yaml
+          - --ssh-public-key-file
+          - /ssh/public-key
+          - --ssh-username
+          - "{{ ssh_username }}"
+          - --management-cidr
+          - "{{ management_cidr }}"
+          - --management-tcp-ports
+          - "22"
+          - --until-ready
+          - --interval
+          - 15s
+          - --operation-timeout
+          - 2h
+          - --output=json
+      environment:
+        INSPACE_ALLOW_REMOTE_MUTATIONS: "true"
+        INSPACE_API_URL: "{{ inspace_api_url }}"
+        INSPACE_API_TOKEN: "{{ lookup('env', 'INSPACE_API_TOKEN') }}"
+        INSPACE_RKE2_TOKEN: "{{ lookup('file', deploy_state_dir + '/rke2-token') | trim }}"
+        INSPACE_BOOTSTRAP_CACHE_KEY: >-
+          {{ '' if bootstrap_direct_download | bool else (lookup('file', deploy_state_dir + '/bootstrap-cache-key') | trim) }}
+        INSPACE_BOOTSTRAP_CACHE_NOT_BEFORE: >-
+          {{ '' if bootstrap_direct_download | bool else (lookup('file', deploy_state_dir + '/bootstrap-cache-not-before') | trim) }}
+      register: deploy_bootstrap_controller
+      changed_when: true
+      no_log: true
+
+    - name: Decode the authoritative bootstrap result
+      ansible.builtin.set_fact:
+        bootstrap_result: >-
+          {{ (deploy_bootstrap_controller.stdout_lines | select('match', '^\{') | list | last) | from_json }}
+      no_log: true
+
+    - name: Require the requested control-plane cardinality
+      ansible.builtin.assert:
+        that:
+          - bootstrap_result.ready | bool
+          - bootstrap_result.controlPlaneVMs | length == control_plane_replicas | int
+          - bootstrap_result.controlPlaneVMs | unique | length == control_plane_replicas | int
+          - bootstrap_result.privateControlPlaneEndpoint == 'https://' + control_plane_vip + ':6443'
+          - bootstrap_result.privateRegistrationEndpoint == 'https://' + control_plane_vip + ':9345'
+          - bootstrap_result.bastionPublicIPv4 | length > 0
+          - bootstrap_result.bastionPrivateIPv4 | length > 0
+        fail_msg: "Bootstrap did not return the exact requested one-or-three control-plane topology."
+
+    - name: Persist the authoritative bootstrap result
+      ansible.builtin.copy:
+        content: "{{ bootstrap_result | to_nice_json }}\n"
+        dest: "{{ deploy_state_dir }}/bootstrap-result.json"
+        mode: "0600"
+
+    - name: Bind bootstrap output to exact deterministic FIPs
+      ansible.builtin.command:
+        argv:
+          - "{{ deploy_root }}/scripts/discover_bootstrap.py"
+          - --result
+          - "{{ deploy_state_dir }}/bootstrap-result.json"
+          - --output
+          - "{{ deploy_state_dir }}/state.json"
+          - --cluster-config
+          - "{{ deploy_state_dir }}/cluster.yaml"
+          - --cluster
+          - "{{ cluster_name }}"
+          - --replicas
+          - "{{ control_plane_replicas | string }}"
+          - --billing-account-id
+          - "{{ inspace_billing_account_id | string }}"
+          - --location
+          - "{{ inspace_location }}"
+          - --api-url
+          - "{{ inspace_api_url }}"
+          - --ssh-username
+          - "{{ ssh_username }}"
+          - --modules-version
+          - "{{ modules_version }}"
+      environment:
+        INSPACE_API_TOKEN: "{{ lookup('env', 'INSPACE_API_TOKEN') }}"
+      changed_when: true
+      no_log: true
+
+    - name: Load and validate the deployment journal
+      ansible.builtin.include_tasks: tasks/load-state.yml
+
+    - name: Wait for bastion SSH
+      ansible.builtin.wait_for:
+        host: "{{ deployment_state.bastionPublicIPv4 }}"
+        port: 22
+        connect_timeout: 10
+        sleep: 5
+        timeout: 1200
+
+    - name: Inspect the pinned bastion host key
+      ansible.builtin.stat:
+        path: "{{ deploy_state_dir }}/known-hosts-bastion"
+      register: deploy_bastion_known_host
+
+    - name: Scan the bastion host key before first authentication
+      ansible.builtin.command:
+        argv: [ssh-keyscan, -T, "15", "{{ deployment_state.bastionPublicIPv4 }}"]
+      register: deploy_bastion_keyscan
+      changed_when: false
+      retries: 20
+      delay: 5
+      until: deploy_bastion_keyscan.rc == 0 and deploy_bastion_keyscan.stdout | length > 0
+      when: not deploy_bastion_known_host.stat.exists
+
+    - name: Pin the bastion host key
+      ansible.builtin.copy:
+        content: "{{ deploy_bastion_keyscan.stdout }}\n"
+        dest: "{{ deploy_state_dir }}/known-hosts-bastion"
+        mode: "0600"
+      when: not deploy_bastion_known_host.stat.exists
+
+    - name: Render the bastion and control-plane SSH topology
+      ansible.builtin.template:
+        src: "{{ deploy_root }}/templates/ssh-config.j2"
+        dest: "{{ deploy_state_dir }}/ssh-config"
+        mode: "0600"
+
+    - name: Wait for authenticated bastion access
+      ansible.builtin.command:
+        argv: [ssh, -F, "{{ deploy_state_dir }}/ssh-config", inspace-bastion, "true"]
+      register: deploy_bastion_ssh
+      changed_when: false
+      retries: 120
+      delay: 5
+      until: deploy_bastion_ssh.rc == 0
+
+    - name: Inspect pinned control-plane host keys
+      ansible.builtin.stat:
+        path: "{{ deploy_state_dir }}/known-hosts-cp{{ deploy_cp_index }}"
+      loop: "{{ deployment_state.controlPlanes }}"
+      loop_control:
+        index_var: deploy_cp_index
+        label: "{{ item.name }}"
+      register: deploy_control_plane_known_hosts
+
+    - name: Scan private control-plane host keys through the bastion
+      ansible.builtin.command:
+        argv:
+          - ssh
+          - -F
+          - "{{ deploy_state_dir }}/ssh-config"
+          - inspace-bastion
+          - ssh-keyscan
+          - -T
+          - "15"
+          - "{{ item.item.privateIPv4 }}"
+      loop: "{{ deploy_control_plane_known_hosts.results }}"
+      loop_control:
+        label: "{{ item.item.name }}"
+      register: deploy_control_plane_keyscans
+      changed_when: false
+      retries: 20
+      delay: 5
+      until: deploy_control_plane_keyscans.rc == 0
+      when: not item.stat.exists
+
+    - name: Pin private control-plane host keys
+      ansible.builtin.copy:
+        content: "{{ item.stdout }}\n"
+        dest: "{{ deploy_state_dir }}/known-hosts-cp{{ item.item.deploy_cp_index }}"
+        mode: "0600"
+      loop: "{{ deploy_control_plane_keyscans.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.item.name | default('existing') }}"
+      when: not item.skipped | default(false)
+
+    - name: Wait for control-plane cloud-init completion
+      ansible.builtin.command:
+        argv:
+          - ssh
+          - -F
+          - "{{ deploy_state_dir }}/ssh-config"
+          - "inspace-cp{{ deploy_cp_index }}"
+          - >-
+            sudo timeout --kill-after=5s 4800s sh -c
+            'cloud-init status --wait >/dev/null 2>&1 || test $? -eq 2'
+      loop: "{{ deployment_state.controlPlanes }}"
+      loop_control:
+        index_var: deploy_cp_index
+        label: "{{ item.name }}"
+      changed_when: false
+
+    - name: Read the administrator kubeconfig from cp0
+      ansible.builtin.command:
+        argv:
+          - ssh
+          - -F
+          - "{{ deploy_state_dir }}/ssh-config"
+          - inspace-cp0
+          - sudo
+          - cat
+          - /etc/rancher/rke2/rke2.yaml
+      register: deploy_remote_kubeconfig
+      changed_when: false
+      no_log: true
+
+    - name: Persist the administrator kubeconfig locally
+      ansible.builtin.copy:
+        content: "{{ deploy_remote_kubeconfig.stdout }}"
+        dest: "{{ deploy_state_dir }}/kubeconfig.yaml"
+        mode: "0600"
+      no_log: true
+
+    - name: Point kubeconfig at the local private-VIP tunnel
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - --kubeconfig
+          - "{{ deploy_state_dir }}/kubeconfig.yaml"
+          - config
+          - set-cluster
+          - default
+          - --server=https://127.0.0.1:16443
+          - "--tls-server-name={{ control_plane_vip }}"
+      changed_when: true
+
+    - name: Start the private API tunnel and wait for readiness
+      ansible.builtin.include_tasks: tasks/start-tunnel.yml
+
+    - name: Wait for exactly the requested fixed control-plane nodes
+      ansible.builtin.shell: |
+        set -euo pipefail
+        export KUBECONFIG={{ (deploy_state_dir + '/kubeconfig.yaml') | quote }}
+        kubectl wait --for=condition=Ready node --all --timeout=15m
+        test "$(kubectl get nodes -o json | jq '[.items[] | select(.metadata.labels | has("node-role.kubernetes.io/control-plane"))] | length')" \
+          -eq {{ control_plane_replicas | int }}
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Apply optional operator RKE2 configuration with rolling readiness gates
+      ansible.builtin.include_tasks: tasks/apply-control-plane-config.yml
+
+    - name: Create or update cloud and RKE2 agent-token Secrets
+      ansible.builtin.shell: |
+        set -euo pipefail
+        export KUBECONFIG={{ (deploy_state_dir + '/kubeconfig.yaml') | quote }}
+        kubectl -n kube-system create secret generic inspace-cloud-credentials \
+          --from-literal="api-token=$INSPACE_API_TOKEN" \
+          --from-literal="billing-account-id={{ inspace_billing_account_id }}" \
+          --dry-run=client -o yaml | kubectl apply -f -
+        kubectl -n kube-system create secret generic inspace-rke2-agent-token \
+          --from-file="token={{ deploy_state_dir }}/rke2-token" \
+          --dry-run=client -o yaml | kubectl apply -f -
+      args:
+        executable: /bin/bash
+      environment:
+        INSPACE_API_TOKEN: "{{ lookup('env', 'INSPACE_API_TOKEN') }}"
+      changed_when: true
+      no_log: true
+
+    - name: Render released chart values
+      ansible.builtin.template:
+        src: "{{ deploy_root }}/templates/chart-values.yaml.j2"
+        dest: "{{ deploy_state_dir }}/chart-values.yaml"
+        mode: "0600"
+
+    - name: Install the exact released CRDs chart
+      ansible.builtin.command:
+        argv:
+          - helm
+          - --kubeconfig
+          - "{{ deploy_state_dir }}/kubeconfig.yaml"
+          - upgrade
+          - --install
+          - inspace-crds
+          - oci://ghcr.io/thanet-s/charts/inspace-cloud-kube-modules-crds
+          - --version
+          - "{{ modules_version }}"
+          - --namespace
+          - kube-system
+          - --wait
+          - --timeout
+          - 5m
+      changed_when: true
+
+    - name: Install exact released CCM CSI and Karpenter controllers
+      ansible.builtin.command:
+        argv:
+          - helm
+          - --kubeconfig
+          - "{{ deploy_state_dir }}/kubeconfig.yaml"
+          - upgrade
+          - --install
+          - inspace
+          - oci://ghcr.io/thanet-s/charts/inspace-cloud-kube-modules
+          - --version
+          - "{{ modules_version }}"
+          - --namespace
+          - kube-system
+          - --values
+          - "{{ deploy_state_dir }}/chart-values.yaml"
+          - --wait
+          - --timeout
+          - 15m
+      changed_when: true
+
+    - name: Render the default Karpenter worker topology
+      ansible.builtin.template:
+        src: "{{ deploy_root }}/templates/karpenter.yaml.j2"
+        dest: "{{ deploy_state_dir }}/karpenter.yaml"
+        mode: "0600"
+
+    - name: Apply the default Karpenter NodeClass and zero-at-rest NodePool
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - --kubeconfig
+          - "{{ deploy_state_dir }}/kubeconfig.yaml"
+          - apply
+          - -f
+          - "{{ deploy_state_dir }}/karpenter.yaml"
+      changed_when: true
+
+    - name: Report cluster access
+      ansible.builtin.debug:
+        msg:
+          - "Cluster {{ cluster_name }} is ready with {{ control_plane_replicas }} control-plane node(s)."
+          - "Kubeconfig: {{ deploy_state_dir }}/kubeconfig.yaml"
+          - "Tunnel: {{ deploy_root }}/run.sh tunnel {{ inventory_file }}"

@@ -1,0 +1,29 @@
+---
+- name: Render the pinned SSH topology
+  ansible.builtin.template:
+    src: "{{ deploy_root }}/templates/ssh-config.j2"
+    dest: "{{ deploy_state_dir }}/ssh-config"
+    mode: "0600"
+
+- name: Start or reuse the private Kubernetes API tunnel
+  ansible.builtin.command:
+    argv:
+      - "{{ deploy_root }}/scripts/api-tunnel.sh"
+      - start
+      - "{{ deploy_state_dir }}"
+  changed_when: false
+
+- name: Wait for the tunneled Kubernetes API
+  ansible.builtin.command:
+    argv:
+      - kubectl
+      - --kubeconfig
+      - "{{ deploy_state_dir }}/kubeconfig.yaml"
+      - --request-timeout=10s
+      - get
+      - --raw=/readyz
+  register: deploy_api_ready
+  changed_when: false
+  retries: 60
+  delay: 5
+  until: deploy_api_ready.rc == 0

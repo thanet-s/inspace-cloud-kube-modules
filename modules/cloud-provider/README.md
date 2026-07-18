@@ -2,7 +2,7 @@
 
 InSpace Cloud integration for Kubernetes/RKE2. This repository contains the
 shared location-aware API client, an external cloud-controller-manager (CCM),
-and the fixed three-server RKE2 bootstrap reconciler.
+and the fixed one-or-three-server RKE2 bootstrap reconciler.
 
 ## Implemented
 
@@ -15,8 +15,8 @@ and the fixed three-server RKE2 bootstrap reconciler.
   Cilium LB-IPAM plus L2 announcements, while explicitly public TCP Services
   use deterministic InSpace NLB/FIP ownership.
 - A reconciler that first creates one fixed Ubuntu 24.04 bastion
-  (1 vCPU/2048 MiB/30 GiB), then creates exactly three Ubuntu 24.04 RKE2
-  servers in deterministic slot order. Each server's restrictive firewall
+  (1 vCPU/2048 MiB/30 GiB), then creates either one low-cost or exactly three
+  HA Ubuntu 24.04 RKE2 servers in deterministic slot order. Each server's restrictive firewall
   assignment is authoritatively proven before the next VM POST; already
   protected servers may continue booting in parallel. The API and RKE2
   registration use a caller-selected private VPC VIP; bootstrap creates no
@@ -26,7 +26,8 @@ and the fixed three-server RKE2 bootstrap reconciler.
   `cache.<metadata.name>.inspace.internal:8443`; it does not allocate another
   VIP. `spec.bootstrapCache.directDownload: true` explicitly disables it.
 - Fixed control-plane VM, guest-hostname, and Kubernetes Node identities are
-  `<metadata.name>-cp0`, `<metadata.name>-cp1`, and `<metadata.name>-cp2`.
+  `<metadata.name>-cp0` for a single-server cluster, with
+  `<metadata.name>-cp1` and `<metadata.name>-cp2` added for HA.
   The bastion VM and guest hostname are `<metadata.name>-bastion`.
   `metadata.name` must be a lowercase DNS label of at most 55 characters.
 - A per-node RKE2 static Pod running kube-vip v1.2.1 by immutable multiarch
@@ -54,7 +55,7 @@ and the fixed three-server RKE2 bootstrap reconciler.
 
 `spec.rke2.skipOSUpgrade: true` is an explicit optimization for short-lived
 test clusters. It removes only the one-time `apt-get upgrade -y` step from all
-three control planes and the bastion, including the default cache bastion. The
+selected control planes and the bastion, including the default cache bastion. The
 mirror rewrite, `apt-get update`, required package installation, and
 automatic-update shutdown still run. Omit it or set it to `false` for the
 production default.
@@ -113,6 +114,8 @@ and reconciles safe, retryable passes. The fixed bastion is fully protected
 before any control-plane creation. Missing control-plane VMs are created in
 deterministic slot order with a hard creation bound of one. Each VM's
 restrictive firewall assignment must be authoritatively visible before the
+next VM POST. `spec.controlPlane.replicas` is required, immutable, and accepts
+only `1` or `3`; two-server embedded-etcd topology is deliberately unsupported.
 next VM POST; protected servers may continue booting in parallel, and
 slot-ordered errors retain every successful VM for the next pass. Each server
 must use exactly Ubuntu 24.04 with 2-16 vCPUs and 4096-65536 MiB memory.
@@ -262,7 +265,7 @@ older fixed-node schemas, including schema v7 control planes paired with the
 unchanged v6 bastion.
 
 New bootstrap FIPs are `<metadata.name>-bastion-ip` and
-`<metadata.name>-cp0-ip` through `-cp2-ip`. The two firewall display names are
+`<metadata.name>-cp0-ip`, plus `-cp1-ip` and `-cp2-ip` for HA. The two firewall display names are
 `<metadata.name>-bastion-<owner>` and `<metadata.name>-nodes-<owner>`; keeping
 the namespace/name owner hash in firewall names preserves ownership even
 though InSpace omits firewall descriptions from readback.
@@ -284,8 +287,8 @@ Sparse VM list entries are canonicalized through the per-VM detail endpoint
 before adoption or deletion.
 InSpace accepts firewall descriptions on create but omits them from readback,
 so an absent description is tolerated while any returned mismatch is rejected.
-It unassigns and deletes all four owned FIPs before deleting the bastion and
-three control-plane VMs, because InSpace VM deletion only leaves an automatic
+It unassigns and deletes every selected control-plane FIP plus the bastion FIP
+before deleting the bastion and selected control-plane VMs, because InSpace VM deletion only leaves an automatic
 FIP active and unassigned. Both managed firewalls are deleted only after their
 assignments are absent:
 
@@ -318,8 +321,9 @@ an issued destructive request inside that window, the command exits nonzero
 and retains its exact no-replay receipt. Re-running teardown resumes
 authoritative readback; it does not send the destructive request again.
 
-`infrastructureReady=true` means the bastion, three control-plane VMs, four
-floating addresses, and both firewall assignments exist in the API. It does
+`infrastructureReady=true` means the bastion, the selected one or three
+control-plane VMs, their floating addresses, and both firewall assignments
+exist in the API. It does
 **not** yet probe the cluster VIP from the controller host. The JSON result
 reports `controlPlaneEndpoint`/`privateControlPlaneEndpoint` as
 `https://<virtualIPv4>:6443`, `privateRegistrationEndpoint` as
@@ -334,7 +338,7 @@ firewall protection before the next VM POST; their subsequent boots may still
 overlap.
 
 Control-plane slot 0 is the one-time RKE2 initializer. The controller creates
-it only when no control-plane VM exists. If slot 0 is absent while slot 1 or 2
+it only when no control-plane VM exists. In HA topology, if slot 0 is absent while slot 1 or 2
 still exists, reconciliation fails closed instead of initializing a second
 cluster. Recovering or replacing slot 0 requires an explicit manual lifecycle
 that verifies the surviving etcd membership and chooses a state-aware RKE2
@@ -621,6 +625,11 @@ and requires an exact zero-owned-resource cloud audit after teardown.
   resolve Secret references through a Kubernetes management cluster, or use a
   Kubernetes finalizer. Lifecycle is explicit CLI reconciliation and owned
   `--delete` teardown.
+- The repository's [Ansible lifecycle](../../deploy/README.md) wraps that CLI
+  with a gitignored inventory, durable local journal, private-API tunnel,
+  released Helm installation, rolling operator config, and owner-scoped
+  teardown. It is still operator-run automation, not a hosted management
+  service.
 - In-place control-plane machine image or shape updates are not implemented;
   changes require an explicitly managed replacement lifecycle.
 - Automatic replacement of missing control-plane slot 0 is not implemented;

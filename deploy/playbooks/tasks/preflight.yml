@@ -1,0 +1,141 @@
+---
+- name: Resolve deployment paths
+  ansible.builtin.set_fact:
+    deploy_root: "{{ (playbook_dir + '/..') | realpath }}"
+    deploy_state_dir: "{{ ((playbook_dir + '/../.state/' + cluster_name) | realpath) }}"
+    ssh_private_key_file_expanded: "{{ ssh_private_key_file | expanduser }}"
+    ssh_public_key_file_expanded: "{{ ssh_public_key_file | expanduser }}"
+
+- name: Require the complete deployment inventory
+  ansible.builtin.assert:
+    that:
+      - inspace_api_url is match('^https://[^/]+(?:/.*)?$')
+      - inspace_location is match('^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$')
+      - inspace_billing_account_id | int > 0
+      - inspace_network_uuid is match('^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$')
+      - inspace_amd_host_pool_uuid is match('^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$')
+      - cluster_name is match('^[a-z0-9](?:[a-z0-9-]{0,53}[a-z0-9])?$')
+      - control_plane_replicas | int in [1, 3]
+      - modules_version is match('^[0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z.-]+)?$')
+      - rke2_version is match('^v[0-9]+\\.[0-9]+\\.[0-9]+\\+rke2r[0-9]+$')
+      - ssh_username is match('^[a-z_][a-z0-9_-]{0,29}$')
+      - ssh_private_key_file_expanded.startswith('/')
+      - ssh_public_key_file_expanded.startswith('/')
+      - "',' not in ssh_private_key_file_expanded"
+      - "',' not in ssh_public_key_file_expanded"
+      - "'\n' not in ssh_private_key_file_expanded"
+      - "'\n' not in ssh_public_key_file_expanded"
+      - management_cidr is defined
+      - control_plane_extra_config is mapping
+      - karpenter_instance_families | length > 0
+    fail_msg: "Deployment inventory is incomplete or violates the supported v0.7 topology."
+
+- name: Reject bootstrap-owned RKE2 keys from operator extra configuration
+  ansible.builtin.assert:
+    that:
+      - >-
+        control_plane_extra_config.keys() | list |
+        intersect([
+          'token', 'token-file', 'agent-token', 'agent-token-file', 'server',
+          'cluster-cidr', 'service-cidr', 'cluster-dns', 'cluster-domain',
+          'node-ip', 'node-external-ip', 'advertise-address', 'node-name',
+          'node-taint', 'node-label', 'tls-san', 'cni', 'disable',
+          'disable-cloud-controller', 'disable-kube-proxy', 'kube-proxy-arg',
+          'kubelet-arg', 'egress-selector-mode', 'write-kubeconfig-mode',
+          'system-default-registry', 'data-dir', 'cluster-reset',
+          'cluster-reset-restore-path'
+        ]) | length == 0
+    fail_msg: "control_plane_extra_config attempts to override bootstrap-owned topology, identity, CNI, CIDR, token, or registry state."
+
+- name: Validate private VIP and Service range relationships
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -c
+      - >-
+        import ipaddress,sys;
+        vip,start,stop=map(ipaddress.ip_address,sys.argv[1:4]);
+        pod,service=map(ipaddress.ip_network,sys.argv[4:6]);
+        assert all(a.version == 4 and a.is_private and str(a) == raw for a,raw in zip((vip,start,stop),sys.argv[1:4]));
+        assert int(start) <= int(stop) and 16 <= int(stop)-int(start)+1 <= 256;
+        assert not int(start) <= int(vip) <= int(stop);
+        assert all(a not in pod and a not in service for a in (vip,start,stop))
+      - "{{ control_plane_vip }}"
+      - "{{ private_load_balancer_pool_start }}"
+      - "{{ private_load_balancer_pool_stop }}"
+      - "{{ pod_cidr }}"
+      - "{{ service_cidr }}"
+  changed_when: false
+
+- name: Validate the bastion management CIDR
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -c
+      - >-
+        import ipaddress,sys;
+        raw=sys.argv[1]; value=ipaddress.ip_network(raw,strict=True);
+        assert value.version == 4 and (raw == '0.0.0.0/0' or (value.prefixlen == 32 and value.network_address.is_global and not value.network_address.is_private))
+      - "{{ management_cidr }}"
+  changed_when: false
+
+- name: Require deployment host tools
+  ansible.builtin.command:
+    argv: [sh, -c, "command -v \"$1\" >/dev/null", sh, "{{ item }}"]
+  loop:
+    - docker
+    - helm
+    - kubectl
+    - openssl
+    - python3
+    - jq
+    - scp
+    - ssh
+    - ssh-keygen
+    - ssh-keyscan
+  changed_when: false
+
+- name: Inspect SSH key files
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: false
+  loop:
+    - "{{ ssh_private_key_file_expanded }}"
+    - "{{ ssh_public_key_file_expanded }}"
+  register: deploy_ssh_key_files
+
+- name: Require regular non-symlink SSH key files and a private key mode
+  ansible.builtin.assert:
+    that:
+      - deploy_ssh_key_files.results | selectattr('stat.exists') | list | length == 2
+      - deploy_ssh_key_files.results | selectattr('stat.isreg') | list | length == 2
+      - deploy_ssh_key_files.results | selectattr('stat.islnk') | list | length == 0
+      - deploy_ssh_key_files.results[0].stat.mode in ['0400', '0600']
+    fail_msg: "SSH keys must be regular non-symlink files; the private key must be mode 0400 or 0600."
+
+- name: Derive the public key from the supplied private key
+  ansible.builtin.command:
+    argv: [ssh-keygen, -y, -f, "{{ ssh_private_key_file_expanded }}"]
+  register: deploy_derived_public_key
+  changed_when: false
+  no_log: true
+
+- name: Load the supplied public key
+  ansible.builtin.set_fact:
+    ssh_public_key_text: "{{ lookup('file', ssh_public_key_file_expanded) | trim }}"
+  no_log: true
+
+- name: Require the supplied SSH key pair to match
+  ansible.builtin.assert:
+    that:
+      - ssh_public_key_text.split()[0:2] == deploy_derived_public_key.stdout.split()[0:2]
+      - ssh_public_key_text.split()[0] in ['ssh-ed25519', 'ecdsa-sha2-nistp256']
+    fail_msg: "SSH private/public files do not form one supported key pair."
+  no_log: true
+
+- name: Create the cluster-scoped local state directory
+  ansible.builtin.file:
+    path: "{{ deploy_state_dir }}"
+    state: directory
+    mode: "0700"
+  when: deploy_create_state_dir | default(true) | bool

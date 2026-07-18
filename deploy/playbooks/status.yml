@@ -1,0 +1,50 @@
+---
+- name: Inspect an existing InSpace RKE2 cluster without cloud mutations
+  hosts: localhost
+  gather_facts: false
+  vars:
+    deploy_create_state_dir: false
+  tasks:
+    - name: Validate inventory, topology, tools, and SSH identity
+      ansible.builtin.include_tasks: tasks/preflight.yml
+
+    - name: Load and validate the deployment journal
+      ansible.builtin.include_tasks: tasks/load-state.yml
+
+    - name: Start the private API tunnel and wait for readiness
+      ansible.builtin.include_tasks: tasks/start-tunnel.yml
+
+    - name: Read cluster node health
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - --kubeconfig
+          - "{{ deploy_state_dir }}/kubeconfig.yaml"
+          - get
+          - nodes
+          - -o
+          - wide
+      register: deploy_node_status
+      changed_when: false
+
+    - name: Read cloud-module rollout health
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - --kubeconfig
+          - "{{ deploy_state_dir }}/kubeconfig.yaml"
+          - -n
+          - kube-system
+          - get
+          - deployment,daemonset
+          - -l
+          - app.kubernetes.io/part-of=inspace-cloud-kube-modules
+      register: deploy_module_status
+      changed_when: false
+
+    - name: Show cluster status
+      ansible.builtin.debug:
+        msg:
+          - "{{ deploy_node_status.stdout }}"
+          - "{{ deploy_module_status.stdout }}"
+          - "Kubeconfig: {{ deploy_state_dir }}/kubeconfig.yaml"

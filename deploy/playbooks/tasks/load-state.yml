@@ -1,0 +1,44 @@
+---
+- name: Inspect the deployment state journal
+  ansible.builtin.stat:
+    path: "{{ deploy_state_dir }}/state.json"
+  register: deploy_state_file
+
+- name: Require the deployment state journal
+  ansible.builtin.assert:
+    that: deploy_state_file.stat.exists and deploy_state_file.stat.isreg
+    fail_msg: "No deployment journal exists for this cluster; run deploy/run.sh init first."
+
+- name: Load the deployment state journal
+  ansible.builtin.set_fact:
+    deployment_state: "{{ lookup('file', deploy_state_dir + '/state.json') | from_json }}"
+    persisted_inspace_cluster: "{{ lookup('file', deploy_state_dir + '/cluster.yaml') | from_yaml }}"
+
+- name: Bind local state to the selected inventory
+  ansible.builtin.assert:
+    that:
+      - deployment_state.schema == 'inspace-deploy-state-v1'
+      - deployment_state.clusterName == cluster_name
+      - deployment_state.controlPlaneReplicas | int == control_plane_replicas | int
+      - deployment_state.controlPlanes | length == control_plane_replicas | int
+      - deployment_state.sshUsername == ssh_username
+      - deployment_state.owner is match('^[0-9a-f]{16}$')
+      - deployment_state.bootstrapControllerVersion is match('^[0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z.-]+)?$')
+      - persisted_inspace_cluster.metadata.name == cluster_name
+      - persisted_inspace_cluster.spec.location == inspace_location
+      - persisted_inspace_cluster.spec.billingAccountID | int == inspace_billing_account_id | int
+      - persisted_inspace_cluster.spec.network.uuid == inspace_network_uuid
+      - persisted_inspace_cluster.spec.endpoint.virtualIPv4 == control_plane_vip
+      - persisted_inspace_cluster.spec.network.podCIDR == pod_cidr
+      - persisted_inspace_cluster.spec.network.serviceCIDR == service_cidr
+      - persisted_inspace_cluster.spec.network.privateLoadBalancerPool.start == private_load_balancer_pool_start
+      - persisted_inspace_cluster.spec.network.privateLoadBalancerPool.stop == private_load_balancer_pool_stop
+      - persisted_inspace_cluster.spec.controlPlane.replicas | int == control_plane_replicas | int
+      - persisted_inspace_cluster.spec.controlPlane.machine.vcpu | int == control_plane_vcpu | int
+      - persisted_inspace_cluster.spec.controlPlane.machine.memoryMiB | int == control_plane_memory_mib | int
+      - persisted_inspace_cluster.spec.controlPlane.machine.rootDiskGiB | int == control_plane_root_disk_gib | int
+      - persisted_inspace_cluster.spec.controlPlane.machine.hostPoolUUID == inspace_amd_host_pool_uuid
+      - persisted_inspace_cluster.spec.rke2.version == rke2_version
+      - persisted_inspace_cluster.spec.rke2.skipOSUpgrade | bool == skip_os_upgrade | bool
+      - persisted_inspace_cluster.spec.bootstrapCache.directDownload | bool == bootstrap_direct_download | bool
+    fail_msg: "The deployment journal belongs to another cluster or topology."

@@ -1,0 +1,53 @@
+---
+all:
+  hosts:
+    localhost:
+      ansible_connection: local
+
+  vars:
+    # The API token is deliberately not stored here. Export
+    # INSPACE_API_TOKEN before running deploy/run.sh.
+    inspace_api_url: https://api.inspace.cloud
+    inspace_location: bkk01
+    inspace_billing_account_id: 12345
+    inspace_network_uuid: 11111111-1111-4111-8111-111111111111
+    inspace_amd_host_pool_uuid: 22222222-2222-4222-8222-222222222222
+
+    cluster_name: example-rke2
+    # Exactly 1 (low cost) or 3 (embedded-etcd HA). Two is rejected.
+    control_plane_replicas: 1
+    control_plane_vip: 10.20.30.10
+    private_load_balancer_pool_start: 10.20.30.200
+    private_load_balancer_pool_stop: 10.20.30.239
+    pod_cidr: 10.42.0.0/16
+    service_cidr: 10.43.0.0/16
+
+    # Use an exact published version. Release candidates are supported for
+    # acceptance testing, for example 0.7.0-rc.1.
+    modules_version: 0.7.0
+    rke2_version: v1.35.6+rke2r1
+    control_plane_vcpu: 2
+    control_plane_memory_mib: 4096
+    control_plane_root_disk_gib: 60
+    skip_os_upgrade: false
+    bootstrap_direct_download: false
+
+    ssh_username: inspace
+    ssh_private_key_file: /home/example/.ssh/id_ed25519
+    ssh_public_key_file: /home/example/.ssh/id_ed25519.pub
+    # Any is the default. Prefer one public /32 when the operator has a stable
+    # management address.
+    management_cidr: 0.0.0.0/0
+
+    # This file is merged by RKE2 after the bootstrap-owned base config.
+    # Topology, identity, CNI, CIDR, token, and registry keys are rejected.
+    control_plane_extra_config: {}
+
+    karpenter_node_class_name: ubuntu-workers
+    karpenter_node_pool_name: general
+    karpenter_root_disk_gib: 100
+    karpenter_cpu_limit: "32"
+    karpenter_memory_limit: 64Gi
+    karpenter_instance_families: [general, compute, memory, extra-memory]
+    karpenter_min_cpu_exclusive: "1"
+    karpenter_consolidate_after: 1m

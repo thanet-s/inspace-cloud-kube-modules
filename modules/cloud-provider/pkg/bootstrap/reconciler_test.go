@@ -217,6 +217,61 @@ func TestSingleControlPlaneRejectsOutOfRangeMutationReceipts(t *testing.T) {
 	}
 }
 
+func TestSingleControlPlaneRejectsOutOfRangeCloudResources(t *testing.T) {
+	t.Run("VM", func(t *testing.T) {
+		api := newFakeAPI()
+		cluster := testCluster()
+		cluster.Spec.ControlPlane.Replicas = 1
+		reconciler := testReconciler(api)
+		reconcileUntilReady(t, reconciler, cluster)
+		eventCount := len(api.events)
+		unexpected := inspace.VM{
+			UUID:             "99999999-1111-4222-8333-bbbbbbbbbbbb",
+			Name:             "unit-cp1",
+			Hostname:         "unit-cp1",
+			Status:           "running",
+			PrivateIPv4:      "10.20.30.99",
+			NetworkUUID:      api.network.UUID,
+			BillingAccountID: cluster.Spec.BillingAccountID,
+		}
+		api.vms = append(api.vms, unexpected)
+		api.network.VMUUIDs = append(api.network.VMUUIDs, unexpected.UUID)
+
+		if _, err := reconciler.Reconcile(context.Background(), cluster, "unit-test-secret-token"); err == nil || !strings.Contains(err.Error(), "unexpected VM") {
+			t.Fatalf("out-of-range VM error=%v", err)
+		}
+		if len(api.events) != eventCount {
+			t.Fatalf("out-of-range VM allowed cloud mutation: %v", api.events[eventCount:])
+		}
+	})
+
+	t.Run("floating IP", func(t *testing.T) {
+		api := newFakeAPI()
+		cluster := testCluster()
+		cluster.Spec.ControlPlane.Replicas = 1
+		reconciler := testReconciler(api)
+		reconcileUntilReady(t, reconciler, cluster)
+		eventCount := len(api.events)
+		api.floatingIPs = append(api.floatingIPs, inspace.FloatingIP{
+			UUID:                   "99999999-9999-4222-8333-bbbbbbbbbbbb",
+			Address:                "203.0.113.99",
+			Name:                   "unit-cp1-ip",
+			BillingAccountID:       cluster.Spec.BillingAccountID,
+			Type:                   "public",
+			Enabled:                true,
+			AssignedToResourceType: "virtual_machine",
+			AssignedToPrivateIP:    "10.20.30.99",
+		})
+
+		if _, err := reconciler.Reconcile(context.Background(), cluster, "unit-test-secret-token"); err == nil || !strings.Contains(err.Error(), "outside the configured 1-control-plane topology") {
+			t.Fatalf("out-of-range floating IP error=%v", err)
+		}
+		if len(api.events) != eventCount {
+			t.Fatalf("out-of-range floating IP allowed cloud mutation: %v", api.events[eventCount:])
+		}
+	})
+}
+
 func TestManagedBastionFirewallAllowsOnlyManagementICMP(t *testing.T) {
 	const managementCIDR = "203.0.113.10/32"
 	const privateSubnet = "10.20.30.0/24"

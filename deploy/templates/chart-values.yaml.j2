@@ -1,0 +1,27 @@
+global:
+  inspace:
+    systemImageRegistry: "{{ bootstrap_result.bootstrapCacheRegistry | default('') }}"
+    networkUUID: {{ inspace_network_uuid }}
+    clusterID: {{ cluster_name }}
+    controlPlaneVIP: {{ control_plane_vip }}
+    privateLoadBalancerPool:
+      start: {{ private_load_balancer_pool_start }}
+      stop: {{ private_load_balancer_pool_stop }}
+    apiSecret:
+      name: inspace-cloud-credentials
+      tokenKey: api-token
+      billingAccountIDKey: billing-account-id
+
+ccm:
+  replicaCount: {{ 1 if control_plane_replicas | int == 1 else 2 }}
+
+karpenter:
+  replicaCount: {{ 1 if control_plane_replicas | int == 1 else 2 }}
+  clusterName: {{ cluster_name }}
+  defaultNodeClass: {{ karpenter_node_class_name }}
+  agentTokenSecret:
+    create: false
+
+csi:
+  storageClass:
+    name: inspace-rwo
