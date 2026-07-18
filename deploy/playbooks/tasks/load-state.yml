@@ -39,6 +39,6 @@
       - persisted_inspace_cluster.spec.controlPlane.machine.rootDiskGiB | int == control_plane_root_disk_gib | int
       - persisted_inspace_cluster.spec.controlPlane.machine.hostPoolUUID == inspace_amd_host_pool_uuid
       - persisted_inspace_cluster.spec.rke2.version == rke2_version
-      - persisted_inspace_cluster.spec.rke2.skipOSUpgrade | bool == skip_os_upgrade | bool
-      - persisted_inspace_cluster.spec.bootstrapCache.directDownload | bool == bootstrap_direct_download | bool
+      - persisted_inspace_cluster.spec.rke2.get('skipOSUpgrade', false) | bool == skip_os_upgrade | bool
+      - persisted_inspace_cluster.spec.bootstrapCache.get('directDownload', false) | bool == bootstrap_direct_download | bool
     fail_msg: "The deployment journal belongs to another cluster or topology."

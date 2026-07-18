@@ -72,6 +72,38 @@
         dest: "{{ deploy_state_dir }}/cluster.desired.yaml"
         mode: "0600"
 
+    - name: Load persisted and desired bootstrap specs for resumed drift validation
+      ansible.builtin.set_fact:
+        deploy_persisted_bootstrap_spec: >-
+          {{ (lookup('file', deploy_state_dir + '/cluster.yaml') | from_yaml).spec }}
+        deploy_desired_bootstrap_spec: >-
+          {{ (lookup('file', deploy_state_dir + '/cluster.desired.yaml') | from_yaml).spec }}
+      when: deploy_bootstrap_files.results[0].stat.exists
+
+    - name: Normalize only canonical omitted-false bootstrap fields
+      ansible.builtin.set_fact:
+        deploy_persisted_bootstrap_spec_normalized: >-
+          {{
+            deploy_persisted_bootstrap_spec |
+            combine({
+              'bootstrapCache': deploy_persisted_bootstrap_spec.get('bootstrapCache', {}) |
+                combine({'directDownload': deploy_persisted_bootstrap_spec.get('bootstrapCache', {}).get('directDownload', false)}),
+              'rke2': deploy_persisted_bootstrap_spec.rke2 |
+                combine({'skipOSUpgrade': deploy_persisted_bootstrap_spec.rke2.get('skipOSUpgrade', false)})
+            })
+          }}
+        deploy_desired_bootstrap_spec_normalized: >-
+          {{
+            deploy_desired_bootstrap_spec |
+            combine({
+              'bootstrapCache': deploy_desired_bootstrap_spec.get('bootstrapCache', {}) |
+                combine({'directDownload': deploy_desired_bootstrap_spec.get('bootstrapCache', {}).get('directDownload', false)}),
+              'rke2': deploy_desired_bootstrap_spec.rke2 |
+                combine({'skipOSUpgrade': deploy_desired_bootstrap_spec.rke2.get('skipOSUpgrade', false)})
+            })
+          }}
+      when: deploy_bootstrap_files.results[0].stat.exists
+
     - name: Require resumed bootstrap spec to remain byte-semantically identical
       ansible.builtin.assert:
         that:
@@ -88,8 +120,8 @@
             (lookup('file', deploy_state_dir + '/cluster.yaml') | from_yaml).metadata.namespace ==
             (lookup('file', deploy_state_dir + '/cluster.desired.yaml') | from_yaml).metadata.namespace
           - >-
-            (lookup('file', deploy_state_dir + '/cluster.yaml') | from_yaml).spec ==
-            (lookup('file', deploy_state_dir + '/cluster.desired.yaml') | from_yaml).spec
+            deploy_persisted_bootstrap_spec_normalized ==
+            deploy_desired_bootstrap_spec_normalized
         fail_msg: >-
           The persisted bootstrap spec differs from inventory. The controller
           ledger is preserved and no cloud mutation was attempted.
@@ -435,6 +467,9 @@
       args:
         executable: /bin/bash
       changed_when: false
+
+    - name: Settle packaged components without provisioning an elastic worker
+      ansible.builtin.include_tasks: tasks/settle-single-control-plane.yml
 
     - name: Apply optional operator RKE2 configuration with rolling readiness gates
       ansible.builtin.include_tasks: tasks/apply-control-plane-config.yml

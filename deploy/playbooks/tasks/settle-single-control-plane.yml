@@ -1,0 +1,131 @@
+---
+- name: Settle RKE2 packaged components on the single control plane
+  when: control_plane_replicas | int == 1
+  block:
+    - name: Require every expected RKE2 packaged HelmChart
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - --kubeconfig
+          - "{{ deploy_state_dir }}/kubeconfig.yaml"
+          - -n
+          - kube-system
+          - get
+          - helmchart.helm.cattle.io
+          - "{{ item }}"
+      loop:
+        - rke2-cilium
+        - rke2-coredns
+        - rke2-metrics-server
+        - rke2-runtimeclasses
+        - rke2-snapshot-controller
+        - rke2-snapshot-controller-crd
+      register: deploy_single_cp_helmcharts
+      changed_when: false
+      retries: 120
+      delay: 5
+      until: deploy_single_cp_helmcharts.rc == 0
+
+    - name: Detect incomplete RKE2 packaged install Jobs
+      ansible.builtin.shell: |
+        set -euo pipefail
+        export KUBECONFIG={{ (deploy_state_dir + '/kubeconfig.yaml') | quote }}
+        needs_settle=false
+        for chart in \
+          rke2-cilium \
+          rke2-coredns \
+          rke2-metrics-server \
+          rke2-runtimeclasses \
+          rke2-snapshot-controller \
+          rke2-snapshot-controller-crd
+        do
+          job="$(kubectl -n kube-system get helmchart.helm.cattle.io "$chart" -o jsonpath='{.status.jobName}')"
+          if test -z "$job" || \
+             test "$(kubectl -n kube-system get "job/$job" -o jsonpath='{.status.conditions[?(@.type=="Complete")].status}' 2>/dev/null || true)" != True
+          then
+            needs_settle=true
+          fi
+        done
+        printf '%s\n' "$needs_settle"
+      args:
+        executable: /bin/bash
+      register: deploy_single_cp_needs_settle
+      changed_when: false
+
+    - name: Temporarily make cp0 schedulable for packaged install Jobs
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - --kubeconfig
+          - "{{ deploy_state_dir }}/kubeconfig.yaml"
+          - taint
+          - node
+          - "{{ cluster_name }}-cp0"
+          - node-role.kubernetes.io/control-plane-
+      register: deploy_single_cp_untaint
+      changed_when: "'untainted' in deploy_single_cp_untaint.stdout"
+      failed_when:
+        - deploy_single_cp_untaint.rc != 0
+        - "'not found' not in deploy_single_cp_untaint.stderr"
+      when: deploy_single_cp_needs_settle.stdout | trim == 'true'
+
+    - name: Wait for every expected RKE2 packaged install Job
+      ansible.builtin.shell: |
+        set -euo pipefail
+        export KUBECONFIG={{ (deploy_state_dir + '/kubeconfig.yaml') | quote }}
+        for chart in \
+          rke2-cilium \
+          rke2-coredns \
+          rke2-metrics-server \
+          rke2-runtimeclasses \
+          rke2-snapshot-controller \
+          rke2-snapshot-controller-crd
+        do
+          job="$(kubectl -n kube-system get helmchart.helm.cattle.io "$chart" -o jsonpath='{.status.jobName}')"
+          test -n "$job"
+          kubectl -n kube-system wait --for=condition=complete "job/$job" --timeout=15m
+        done
+      args:
+        executable: /bin/bash
+      changed_when: false
+      when: deploy_single_cp_needs_settle.stdout | trim == 'true'
+
+    - name: Wait for the single Cilium operator replica
+      ansible.builtin.shell: |
+        set -euo pipefail
+        export KUBECONFIG={{ (deploy_state_dir + '/kubeconfig.yaml') | quote }}
+        test "$(kubectl -n kube-system get deployment cilium-operator -o jsonpath='{.spec.replicas}')" -eq 1
+        kubectl -n kube-system rollout status deployment/cilium-operator --timeout=15m
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+  always:
+    - name: Restore the durable control-plane NoSchedule taint
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - --kubeconfig
+          - "{{ deploy_state_dir }}/kubeconfig.yaml"
+          - taint
+          - node
+          - "{{ cluster_name }}-cp0"
+          - node-role.kubernetes.io/control-plane=true:NoSchedule
+          - --overwrite
+      register: deploy_single_cp_retaint
+      changed_when: "'tainted' in deploy_single_cp_retaint.stdout"
+
+    - name: Prove the single control plane returned to zero-worker state
+      ansible.builtin.shell: |
+        set -euo pipefail
+        export KUBECONFIG={{ (deploy_state_dir + '/kubeconfig.yaml') | quote }}
+        test "$(kubectl get nodes -o json | jq '[.items[] | select(.metadata.labels | has("node-role.kubernetes.io/control-plane") | not)] | length')" -eq 0
+        taint="$(kubectl get node {{ (cluster_name + '-cp0') | quote }} -o json | jq -r \
+          '[.spec.taints[]? | select(.key == "node-role.kubernetes.io/control-plane" and .value == "true" and .effect == "NoSchedule")] | length')"
+        test "$taint" -eq 1
+        if kubectl api-resources --api-group=karpenter.sh -o name | grep -Eq '^nodeclaims(\.karpenter\.sh)?$'; then
+          test "$(kubectl get nodeclaims -o json | jq '.items | length')" -eq 0
+        fi
+      args:
+        executable: /bin/bash
+      changed_when: false

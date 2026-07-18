@@ -63,11 +63,13 @@ def main() -> None:
     for fragment in (
         "cluster.desired.yaml",
         "persisted bootstrap spec differs",
+        "deploy_persisted_bootstrap_spec_normalized",
         "INSPACE_ALLOW_REMOTE_MUTATIONS",
         "bootstrap_controller_version",
         "--until-ready",
         "discover_bootstrap.py",
         "tasks/start-tunnel.yml",
+        "tasks/settle-single-control-plane.yml",
         "inspace-cloud-kube-modules-crds",
         "inspace-cloud-kube-modules",
         "tasks/apply-control-plane-config.yml",
@@ -86,6 +88,21 @@ def main() -> None:
         init.count("linux/amd64") == 2 and destroy.count("linux/amd64") == 2,
         "bootstrap controller pull/run does not pin the published x86 platform",
     )
+    load_state = read("deploy/playbooks/tasks/load-state.yml")
+    single_cp_settle = read("deploy/playbooks/tasks/settle-single-control-plane.yml")
+    for fragment in (
+        "control_plane_replicas | int == 1",
+        "Temporarily make cp0 schedulable",
+        "Wait for every expected RKE2 packaged install Job",
+        "Restore the durable control-plane NoSchedule taint",
+        "zero-worker state",
+    ):
+        require(fragment in single_cp_settle, f"single-control-plane settling lacks {fragment}")
+    for optional_false in ("skipOSUpgrade", "directDownload"):
+        require(
+            f".get('{optional_false}', false)" in load_state,
+            f"persisted bootstrap state does not default omitted {optional_false}",
+        )
 
     for forbidden in (
         "'token'",
