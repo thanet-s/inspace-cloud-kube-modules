@@ -540,7 +540,11 @@ def ready_endpoint_nodes(kubeconfig: str) -> list[str]:
     )
     result = []
     for endpoint_slice in ([] if slices is None else slices.get("items", [])):
-        for endpoint in endpoint_slice.get("endpoints", []):
+        endpoints = endpoint_slice.get("endpoints")
+        if endpoints is None:
+            continue
+        require(isinstance(endpoints, list), "EndpointSlice endpoints must be an array or null")
+        for endpoint in endpoints:
             conditions = endpoint.get("conditions", {})
             if conditions.get("ready") is True and conditions.get("terminating") is not True:
                 node_name = endpoint.get("nodeName")
@@ -740,6 +744,19 @@ def require_datapath_absent(kubeconfig: str, namespace: str, name: str, uid: str
     require(child is None, f"private datapath Service/{child_name} remains")
 
 
+def parse_remote_address(value: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address:
+    text = value.strip()
+    if text.startswith("[") and text.endswith("]"):
+        text = text[1:-1]
+    try:
+        address = ipaddress.ip_address(text)
+    except ValueError as error:
+        fail(f"public-local backend returned malformed client source {value!r}: {error}")
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+        return address.ipv4_mapped
+    return address
+
+
 def http_probe(proof: dict, marker: str) -> str:
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     sources = []
@@ -750,10 +767,7 @@ def http_probe(proof: dict, marker: str) -> str:
         require(body == marker, f"public-local FIP {address} returned the wrong backend marker")
         with opener.open(f"http://{address}/cgi-bin/source", timeout=10) as response:
             source_text = response.read().decode().strip()
-        try:
-            source = ipaddress.ip_address(source_text)
-        except ValueError as error:
-            fail(f"public-local backend returned malformed client source {source_text!r}: {error}")
+        source = parse_remote_address(source_text)
         require(
             source.version == 4 and source.is_global and str(source) not in public_ips,
             "public-local backend did not retain a global client source distinct from the edge FIP",

@@ -60,6 +60,7 @@ helm-package: helm-verify
 
 e2e-static:
 	python3 test/e2e/verify-static.py
+	python3 test/e2e/test-public-node-local-verifier.py
 	@set -eu; for script in test/e2e/run.sh test/e2e/scripts/*.sh; do \
 		bash -n "$$script"; \
 	done
