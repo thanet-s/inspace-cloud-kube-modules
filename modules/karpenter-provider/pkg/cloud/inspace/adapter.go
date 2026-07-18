@@ -909,6 +909,7 @@ func (a *Adapter) auditFencedCleanupReceiptSnapshot(
 	if err := validateFirewallBillingAccount(*baseFirewall, request.BillingAccountID); err != nil {
 		return err
 	}
+	removalAuthority := cleanupRemovalMutationAuthority(request)
 
 	for _, resolution := range request.Resolutions {
 		vmUUID := strings.ToLower(resolution.VMUUID)
@@ -944,11 +945,34 @@ func (a *Adapter) auditFencedCleanupReceiptSnapshot(
 			if address.IsDeleted {
 				continue
 			}
-			if address.Address == resolution.PublicIPv4 ||
-				address.Name == resolution.FloatingIPName ||
+			if address.Name == resolution.FloatingIPName ||
 				strings.EqualFold(address.AssignedTo, vmUUID) {
 				return fmt.Errorf("%w: floating IP %s for durably resolved VM %s reappeared during cleanup audit",
 					cloudapi.ErrCreateAttemptPending, address.Address, vmUUID)
+			}
+			if address.Address == resolution.PublicIPv4 {
+				reallocated, reuseErr := a.proveObservedFloatingIPAddressReallocation(
+					ctx,
+					request.Location,
+					vmUUID,
+					resolution.FloatingIPName,
+					resolution.PublicIPv4,
+					request.BillingAccountID,
+					removalAuthority,
+				)
+				if reuseErr != nil {
+					return fmt.Errorf(
+						"%w: floating IP address %s for durably resolved VM %s cannot be proven as a later allocation: %w",
+						cloudapi.ErrCreateAttemptPending,
+						resolution.PublicIPv4,
+						vmUUID,
+						reuseErr,
+					)
+				}
+				if !reallocated {
+					return fmt.Errorf("%w: floating IP %s for durably resolved VM %s reappeared during cleanup audit",
+						cloudapi.ErrCreateAttemptPending, address.Address, vmUUID)
+				}
 			}
 		}
 
@@ -2857,7 +2881,14 @@ func (a *Adapter) DeleteVM(ctx context.Context, location, uuid, clusterName, nod
 	var floatingIP *sdk.FloatingIP
 	if vmMissing {
 		var floatingErr error
-		floatingIP, floatingErr = a.readOrphanFloatingIPForDelete(ctx, location, uuid, floatingIPName(clusterName, nodeClaimName), identity)
+		floatingIP, floatingErr = a.readOrphanFloatingIPForDelete(
+			ctx,
+			location,
+			uuid,
+			floatingIPName(clusterName, nodeClaimName),
+			identity,
+			removalAuthority,
+		)
 		if floatingErr != nil {
 			return floatingErr
 		}
@@ -3667,7 +3698,11 @@ func (a *Adapter) authorizeRemovalMutation(
 	fence := authorization.Fence
 	if fence.RemovalMutation != mutation || !createAttemptTokenPattern.MatchString(fence.IssueID) ||
 		(fence.Phase != cloudapi.RemovalMutationIssued && fence.Phase != cloudapi.RemovalMutationRejected && fence.Phase != cloudapi.RemovalMutationObserved) ||
-		(authorization.AllowMutation && fence.Phase != cloudapi.RemovalMutationIssued) {
+		(authorization.AllowMutation && fence.Phase != cloudapi.RemovalMutationIssued) ||
+		fence.IssuedAt.IsZero() ||
+		(fence.Phase == cloudapi.RemovalMutationObserved &&
+			(fence.ObservedAt.IsZero() || fence.ObservedAt.Before(fence.IssuedAt))) ||
+		(fence.Phase != cloudapi.RemovalMutationObserved && !fence.ObservedAt.IsZero()) {
 		return cloudapi.RemovalMutationAuthorization{}, fmt.Errorf("%w: durable removal authorization identity changed for VM %s", cloudapi.ErrOwnershipMismatch, mutation.VMUUID)
 	}
 	return authorization, nil
@@ -6558,7 +6593,12 @@ func firewallAssignmentsForVM(firewalls []sdk.Firewall, vmUUID string) ([]string
 	return assignments, nil
 }
 
-func (a *Adapter) readOrphanFloatingIPForDelete(ctx context.Context, location, vmUUID, expectedName string, identity cloudapi.DeleteVMIdentity) (*sdk.FloatingIP, error) {
+func (a *Adapter) readOrphanFloatingIPForDelete(
+	ctx context.Context,
+	location, vmUUID, expectedName string,
+	identity cloudapi.DeleteVMIdentity,
+	authority removalMutationAuthority,
+) (*sdk.FloatingIP, error) {
 	if err := validateDurableDeleteLookupIdentity(identity, expectedName); err != nil {
 		return nil, fmt.Errorf("%w: missing VM %s orphan cleanup requires durable floating IP name/address lookup identity: %v", cloudapi.ErrOwnershipMismatch, vmUUID, err)
 	}
@@ -6614,6 +6654,34 @@ func (a *Adapter) readOrphanFloatingIPForDelete(ctx context.Context, location, v
 				}
 			}
 			if len(contradictory) != 0 {
+				if len(matches) == 0 && len(contradictory) == 1 &&
+					contradictory[0].Address == identity.PublicIPv4 &&
+					contradictory[0].Name != identity.FloatingIPName &&
+					!strings.EqualFold(contradictory[0].AssignedTo, vmUUID) {
+					reallocated, reuseErr := a.proveObservedFloatingIPAddressReallocation(
+						readbackCtx,
+						location,
+						vmUUID,
+						identity.FloatingIPName,
+						identity.PublicIPv4,
+						identity.BillingAccountID,
+						authority,
+					)
+					if reuseErr == nil && reallocated {
+						return nil, nil
+					}
+					if reuseErr != nil {
+						return nil, fmt.Errorf(
+							"%w: floating IP inventory contradicts durable orphan identity %q/%s/account-%d for missing VM %s and address reallocation proof failed: %w",
+							cloudapi.ErrOwnershipMismatch,
+							identity.FloatingIPName,
+							identity.PublicIPv4,
+							identity.BillingAccountID,
+							vmUUID,
+							reuseErr,
+						)
+					}
+				}
 				return nil, fmt.Errorf("%w: floating IP inventory contradicts durable orphan identity %q/%s/account-%d for missing VM %s", cloudapi.ErrOwnershipMismatch, identity.FloatingIPName, identity.PublicIPv4, identity.BillingAccountID, vmUUID)
 			}
 			switch len(matches) {
@@ -6656,6 +6724,137 @@ func (a *Adapter) readOrphanFloatingIPForDelete(ctx context.Context, location, v
 			return nil, fmt.Errorf("orphan floating IP discovery for missing VM %s did not converge: %w", vmUUID, errors.Join(lastObservation, err))
 		}
 	}
+}
+
+// proveObservedFloatingIPAddressReallocation distinguishes a later InSpace
+// allocation from resurrection of an owned floating IP after its DELETE. The
+// old address is not sufficient identity because InSpace may immediately
+// allocate the same numeric IPv4 address to another VM. This proof is
+// deliberately read-only and succeeds only when:
+//
+//   - exact GET and the unfiltered list agree on one complete, active row;
+//   - that row has a new name and is assigned to a different canonical VM; and
+//   - Kubernetes already stores an Observed receipt for DELETE of the exact old
+//     VM/address/name/billing tuple.
+//
+// No current allocation field is ever used as mutation authority.
+func (a *Adapter) proveObservedFloatingIPAddressReallocation(
+	ctx context.Context,
+	location, oldVMUUID, oldName, address string,
+	billingAccountID int64,
+	authority removalMutationAuthority,
+) (bool, error) {
+	requestCtx, cancel := context.WithTimeout(ctx, a.networkAttachmentRequestTimeout)
+	current, absent, addresses, err := a.readExactFloatingIPInventory(requestCtx, location, address)
+	cancel()
+	if err != nil {
+		return false, fmt.Errorf("corroborating current floating IP %s: %w", address, err)
+	}
+	if absent || current == nil {
+		return false, nil
+	}
+	var listed *sdk.FloatingIP
+	for i := range addresses {
+		candidate := addresses[i]
+		if candidate.IsDeleted {
+			continue
+		}
+		if strings.EqualFold(candidate.Name, oldName) ||
+			strings.EqualFold(candidate.AssignedTo, oldVMUUID) {
+			return false, fmt.Errorf(
+				"%w: current floating-IP inventory still overlaps old ownership %q/VM-%s",
+				cloudapi.ErrOwnershipMismatch,
+				oldName,
+				oldVMUUID,
+			)
+		}
+		if candidate.Address == address {
+			copy := candidate
+			listed = &copy
+		}
+	}
+	if listed == nil {
+		return false, fmt.Errorf(
+			"%w: current floating IP %s has no active list identity",
+			cloudapi.ErrOwnershipMismatch,
+			address,
+		)
+	}
+	if err := sdk.ValidateFloatingIPStableReadbackMatch(*current, *listed); err != nil {
+		return false, fmt.Errorf(
+			"%w: current floating IP %s lacks exact/list stable allocation proof: %w",
+			cloudapi.ErrOwnershipMismatch,
+			address,
+			err,
+		)
+	}
+	if err := validateUsableFloatingIP(*current); err != nil {
+		return false, fmt.Errorf("current floating IP %s is not a usable later allocation: %w", address, err)
+	}
+	if current.UUID != strings.ToLower(current.UUID) || !vmUUIDPattern.MatchString(current.UUID) {
+		return false, fmt.Errorf(
+			"%w: current floating IP %s has a non-canonical allocation UUID",
+			cloudapi.ErrOwnershipMismatch,
+			address,
+		)
+	}
+	if strings.TrimSpace(current.Name) == "" || strings.EqualFold(current.Name, oldName) {
+		return false, fmt.Errorf(
+			"%w: current floating IP %s does not have a distinct nonempty name",
+			cloudapi.ErrOwnershipMismatch,
+			address,
+		)
+	}
+	assignedVMUUID := strings.ToLower(strings.TrimSpace(current.AssignedTo))
+	if current.AssignedToResourceType != "virtual_machine" ||
+		assignedVMUUID == "" ||
+		assignedVMUUID != current.AssignedTo ||
+		!vmUUIDPattern.MatchString(assignedVMUUID) ||
+		assignedVMUUID == strings.ToLower(oldVMUUID) {
+		return false, fmt.Errorf(
+			"%w: current floating IP %s is not assigned to a distinct canonical VM",
+			cloudapi.ErrOwnershipMismatch,
+			address,
+		)
+	}
+
+	mutation := cloudapi.RemovalMutation{
+		Operation:        cloudapi.RemovalMutationFloatingIPDelete,
+		Location:         location,
+		VMUUID:           strings.ToLower(oldVMUUID),
+		Address:          address,
+		Name:             oldName,
+		BillingAccountID: billingAccountID,
+	}
+	authorization, err := a.authorizeRemovalMutation(ctx, authority, mutation, false)
+	if err != nil {
+		return false, fmt.Errorf("reading durable floating-IP deletion receipt: %w", err)
+	}
+	if !authorization.Active ||
+		authorization.AllowMutation ||
+		authorization.Fence.Phase != cloudapi.RemovalMutationObserved {
+		return false, nil
+	}
+	createdAt, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(current.CreatedAt))
+	if err != nil {
+		return false, fmt.Errorf(
+			"%w: current floating IP %s has invalid creation time %q",
+			cloudapi.ErrOwnershipMismatch,
+			address,
+			current.CreatedAt,
+		)
+	}
+	// InSpace currently serializes allocation timestamps to seconds while the
+	// Kubernetes receipt includes sub-second precision. Accept the issue
+	// second itself, but never an allocation from an earlier second.
+	if createdAt.Before(authorization.Fence.IssuedAt.Truncate(time.Second)) {
+		return false, fmt.Errorf(
+			"%w: current floating IP %s was not created after the old deletion was issued",
+			cloudapi.ErrOwnershipMismatch,
+			address,
+		)
+	}
+	return true, nil
 }
 
 func (a *Adapter) findFloatingIPByName(ctx context.Context, location, name string, billingAccountID int64) (*sdk.FloatingIP, error) {

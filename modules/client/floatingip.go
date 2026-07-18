@@ -486,6 +486,73 @@ func validateFloatingIPStableAuthority(result *FloatingIP, allowDeleted bool) er
 	return nil
 }
 
+// ValidateFloatingIPStableReadback verifies that one active read result carries
+// the complete stable allocation identity and an authoritative assignment
+// tuple. It is intentionally stricter than ordinary discovery, where sparse
+// relationship fields can be corroborated by a second endpoint.
+func ValidateFloatingIPStableReadback(result FloatingIP) error {
+	if err := validateFloatingIPStableAuthority(&result, false); err != nil {
+		return err
+	}
+	if !result.isVirtualPresent {
+		return errors.New("inspace: floating IP response omits is_virtual")
+	}
+	if err := validateFloatingIPResponseIdentity(&result, result.Address, false); err != nil {
+		return err
+	}
+	return nil
+}
+
+// ValidateFloatingIPStableReadbackMatch requires exact and list endpoints to
+// agree on the full stable allocation identity and relationship state.
+func ValidateFloatingIPStableReadbackMatch(exact, listed FloatingIP) error {
+	if err := ValidateFloatingIPStableReadback(exact); err != nil {
+		return fmt.Errorf("exact floating IP identity is incomplete: %w", err)
+	}
+	if err := ValidateFloatingIPStableReadback(listed); err != nil {
+		return fmt.Errorf("listed floating IP identity is incomplete: %w", err)
+	}
+	equal := exact.UUID == listed.UUID &&
+		exact.ID == listed.ID &&
+		exact.Address == listed.Address &&
+		exact.UserID == listed.UserID &&
+		exact.BillingAccountID == listed.BillingAccountID &&
+		exact.Type == listed.Type &&
+		exact.Name == listed.Name &&
+		exact.Enabled == listed.Enabled &&
+		exact.IsDeleted == listed.IsDeleted &&
+		exact.IsIPv6 == listed.IsIPv6 &&
+		exact.IsVirtual == listed.IsVirtual &&
+		exact.AssignedTo == listed.AssignedTo &&
+		exact.AssignedToResourceType == listed.AssignedToResourceType &&
+		exact.AssignedToPrivateIP == listed.AssignedToPrivateIP &&
+		exact.CreatedAt == listed.CreatedAt &&
+		exact.UpdatedAt == listed.UpdatedAt &&
+		exact.UnassignedAt == listed.UnassignedAt &&
+		exact.assignedToPresent == listed.assignedToPresent &&
+		exact.assignedTypePresent == listed.assignedTypePresent &&
+		exact.assignedPrivatePresent == listed.assignedPrivatePresent &&
+		exact.assignmentCorroborated == listed.assignmentCorroborated &&
+		exact.stableIdentityPresent == listed.stableIdentityPresent &&
+		exact.isIPv6Present == listed.isIPv6Present &&
+		exact.isVirtualPresent == listed.isVirtualPresent
+	if !equal {
+		return fmt.Errorf(
+			"inspace: exact and list floating IP identities disagree for %s (UUID/ID/name/VM %q/%d/%q/%q versus %q/%d/%q/%q)",
+			exact.Address,
+			exact.UUID,
+			exact.ID,
+			exact.Name,
+			exact.AssignedTo,
+			listed.UUID,
+			listed.ID,
+			listed.Name,
+			listed.AssignedTo,
+		)
+	}
+	return nil
+}
+
 func validateFloatingIPStableIdentityMatch(left, right FloatingIP) error {
 	if err := validateSparseFloatingIPAuthority(&left, false); err != nil {
 		return fmt.Errorf("primary sparse representation is not authoritative: %w", err)

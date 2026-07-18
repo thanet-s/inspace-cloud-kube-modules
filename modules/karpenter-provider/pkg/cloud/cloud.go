@@ -357,8 +357,10 @@ type RemovalMutation struct {
 // locally blocked request may transition to Rejected and obtain a later issue.
 type RemovalMutationFence struct {
 	RemovalMutation
-	Phase   RemovalMutationPhase
-	IssueID string
+	Phase      RemovalMutationPhase
+	IssueID    string
+	IssuedAt   time.Time
+	ObservedAt time.Time
 }
 
 type RemovalMutationAuthorization struct {

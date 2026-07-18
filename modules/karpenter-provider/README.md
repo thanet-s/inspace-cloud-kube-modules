@@ -248,6 +248,19 @@ an older v3 claim with only name/address may finish when two reads prove that
 no overlapping FIP exists, but it cannot mutate an active address. Legacy
 v1/v2 VM records retain their own address/account retry anchor.
 
+InSpace may later allocate the same numeric public address to a different
+worker. Address equality alone therefore does not prove that the old Floating
+IP reappeared. After the exact old Floating-IP DELETE receipt reaches
+`Observed`, cleanup may treat one exact/list-corroborated active row as a later
+allocation only when it has a complete allocation UUID, a different nonempty
+name, a canonical assignment to a different VM, and a `created_at` timestamp
+no earlier than the old DELETE issue second. Kubernetes retains a bounded
+observed-delete history for every cleanup resolution, so later serialized
+removal slots do not erase this proof for an older duplicate launch. That check
+is read-only and never grants mutation authority over the later allocation.
+Any missing receipt, old name or VM, pre-issue timestamp, sparse identity,
+duplicate address, or inconsistent readback retains the finalizer.
+
 Before authorizing any provider-initiated VM DELETE, Karpenter requires the
 canonical VM detail to report exactly one primary root disk and no attached
 non-primary block volumes. It repeats an exact VM read immediately before

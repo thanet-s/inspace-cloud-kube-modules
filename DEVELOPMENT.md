@@ -538,6 +538,18 @@ FIP-assignment absence again, and finally removes every stale firewall
 assignment for the UUID. The shared firewall itself is not deleted with an
 individual worker.
 
+InSpace can immediately reuse a deleted Floating IP's numeric address for a
+new allocation. Cleanup recognizes that state only when Kubernetes already
+stores an `Observed` receipt for deletion of the exact old
+VM/address/name/billing tuple and a fresh exact/list read agrees on one complete
+new allocation UUID, different name, different assigned VM, and `created_at`
+no earlier than the old DELETE issue second. The removal journal retains up to
+`MaxCreateCleanupResolutions` observed Floating-IP DELETE receipts, preserving
+that lower bound after a later serialized removal occupies the active slot.
+The check is read-only and never mutates the new allocation. Missing or
+non-observed receipts, old ownership fields, pre-issue timestamps, sparse
+identities, duplicates, and exact/list disagreement remain fail-closed.
+
 VM DELETE has an additional fail-closed storage invariant. The first canonical
 read must contain exactly one primary root disk and no non-primary entries
 before deletion authorization. After the removal-mutation CAS and all ownership
