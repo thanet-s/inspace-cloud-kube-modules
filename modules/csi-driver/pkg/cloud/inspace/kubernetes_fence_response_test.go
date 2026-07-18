@@ -24,10 +24,10 @@ func (f roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) 
 
 func TestKubernetesMutationLeaseResponseRejectsExactLimitPlusJunk(t *testing.T) {
 	fence, body := testMutationLeaseResponse(t)
-	if len(body) >= maxKubernetesLeaseResponseBytes {
+	if len(body) >= maxKubernetesAPIResponseBytes {
 		t.Fatalf("test Lease body is unexpectedly large: %d", len(body))
 	}
-	body = append(body, bytes.Repeat([]byte(" "), maxKubernetesLeaseResponseBytes-len(body))...)
+	body = append(body, bytes.Repeat([]byte(" "), maxKubernetesAPIResponseBytes-len(body))...)
 	body = append(body, 'x')
 
 	resolver := newRawMutationLeaseResolver(t, body, -1)
@@ -323,7 +323,7 @@ func TestKubernetesMutationLeaseResponseRejectsDeclaredLengthMismatch(t *testing
 }
 
 func TestKubernetesMutationLeaseListRejectsOversizedResponse(t *testing.T) {
-	body := append([]byte(`{"items":[]}`), bytes.Repeat([]byte(" "), maxKubernetesLeaseResponseBytes)...)
+	body := append([]byte(`{"items":[]}`), bytes.Repeat([]byte(" "), maxKubernetesAPIResponseBytes)...)
 	resolver := newRawMutationLeaseResolver(t, body, -1)
 	if _, err := resolver.List(context.Background(), ""); err == nil ||
 		!errors.Is(err, cloud.ErrUnavailable) || !strings.Contains(err.Error(), "exceeds") {
@@ -342,7 +342,7 @@ func TestKubernetesMutationLeaseListRejectsItemCountAmplification(t *testing.T) 
 		body.Write(item)
 	}
 	body.WriteString(`]}`)
-	if body.Len() >= maxKubernetesLeaseResponseBytes {
+	if body.Len() >= maxKubernetesAPIResponseBytes {
 		t.Fatalf("item-amplification test body is unexpectedly oversized: %d", body.Len())
 	}
 	resolver := newRawMutationLeaseResolver(t, body.Bytes(), int64(body.Len()))

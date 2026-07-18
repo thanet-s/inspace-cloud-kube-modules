@@ -564,6 +564,16 @@ conditional DELETE, so this is the narrowest provider-side race window rather
 than an atomic cloud guarantee. Direct dashboard/API VM deletion bypasses the
 guard and can delete all attached non-primary block volumes.
 
+CSI detach must not treat a missing Kubernetes Node as proof that its cloud
+attachment is gone. A stale Karpenter VolumeAttachment may recover only from a
+typed Node `404`, with an exact deleting NodeClaim whose canonical ProviderID,
+node name, lifecycle finalizers, materialized create fence, account/VPC
+identity, and v3 VM ownership all identify the one attached VM while no current
+Node owns that ProviderID. The controller repeats this authority after its
+detach-fence CAS immediately before dispatch. Static, legacy, incomplete, or
+contradictory identity is retryable and retains the VolumeAttachment finalizer;
+AttachVolume never uses this recovery path.
+
 Karpenter VM creation also uses a durable one-POST fence. After its issue CAS,
 fresh deterministic-name and ownership inventory either adopts one exact VM or
 proves the absence needed to authorize POST. The SDK response UUID remains

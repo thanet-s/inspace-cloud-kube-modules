@@ -91,11 +91,17 @@ exact-reads the union of every location-wide VM row and every configured-VPC
 member. A disk visible on a VM outside the configured VPC therefore blocks
 delete and a second attach instead of being misclassified as unattached.
 Missing or duplicate VM/VPC identity fails closed, and attachment mutations
-are rejected when `INSPACE_NETWORK_UUID` is absent. A stale
-unpublish for a deleted Kubernetes Node is treated as an idempotent no-op; it
-never detaches a different VM's disk. The driver never
-identifies a node by a public or private IP address; public IPv4 egress does not
-change CSI identity or topology.
+are rejected when `INSPACE_NETWORK_UUID` is absent. If a Karpenter
+`VolumeAttachment` outlives its Kubernetes Node, detach recovery requires a
+typed Node `404`, the exact still-finalized deleting NodeClaim, its canonical
+ProviderID and materialized create fence, zero current Nodes with that
+ProviderID, and a complete v3 cloud VM identity that agrees on node name, guest
+hostname, VM UUID, cluster, account, and VPC. The proof is repeated after the
+detach Lease CAS immediately before dispatch. A clearly different current VM
+is an idempotent no-op; static, legacy, partial, contradictory, or unavailable
+identity fails retryably so external-attacher retains its finalizer. The driver
+never identifies a node by a public or private IP address; public IPv4 egress
+does not change CSI identity or topology.
 
 Static and imported PV handles are unsupported. Disk shape and VM relationships
 prevent a handle from targeting OS, image-backed, bootable, or primary storage,
@@ -130,6 +136,8 @@ Controller mode requires:
   inventory) to bind every target VM to the cluster VPC
 - in-cluster ServiceAccount access to read Nodes and manage the driver's
   mutation-fence Leases in its namespace
+- read-only `get`/`list` access to Karpenter NodeClaims for deleted-Node detach
+  recovery
 
 Node mode requires only `INSPACE_LOCATION` and `NODE_ID`. It does not read or
 receive the InSpace API token. Its image must include `blkid`, `mkfs.ext4`,

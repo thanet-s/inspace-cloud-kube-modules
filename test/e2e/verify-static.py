@@ -52,6 +52,35 @@ def single_kind_document(text: str, kind: str) -> str:
     return matches[0]
 
 
+def verify_read_only_nodeclaim_rbac(document: str, label: str) -> None:
+    """Require one exact read-only NodeClaim rule and no wildcard authority."""
+    rule_blocks = re.split(r"(?m)(?=^  - apiGroups:)", document)
+    nodeclaim_rules = [
+        block
+        for block in rule_blocks
+        if re.search(r'(?m)^    resources: \[[^\n]*"nodeclaims"[^\n]*\]$', block)
+    ]
+    require(
+        len(nodeclaim_rules) == 1,
+        f"{label} must contain exactly one NodeClaim RBAC rule",
+    )
+    require(
+        nodeclaim_rules[0].startswith('  - apiGroups: ["karpenter.sh"]\n')
+        and '    resources: ["nodeclaims"]\n' in nodeclaim_rules[0]
+        and '    verbs: ["get", "list"]\n' in nodeclaim_rules[0],
+        f"{label} NodeClaim RBAC must be exact read-only get/list",
+    )
+    require(
+        'apiGroups: ["*"]' not in document and 'resources: ["*"]' not in document,
+        f"{label} must not contain wildcard ClusterRole authority",
+    )
+    require(
+        'resources: ["nodeclaims/status"]' not in document
+        and 'resources: ["nodeclaims/finalizers"]' not in document,
+        f"{label} must not grant NodeClaim subresource authority",
+    )
+
+
 def load_script_module(name: str, path: pathlib.Path):
     spec = importlib.util.spec_from_file_location(name, path)
     require(spec is not None and spec.loader is not None, f"cannot load {path.name}")
@@ -1092,6 +1121,25 @@ def verify_node_load_balancer_helm_contract() -> None:
     require(
         csi_deployment.count("            - --timeout=600s") == 2,
         "rendered CSI provisioner and attacher must each have a 600-second RPC timeout",
+    )
+    csi_role = manifest_document(
+        rendered, "ClusterRole", "verify-inspace-cloud-kube-modules-csi-controller"
+    )
+    verify_read_only_nodeclaim_rbac(
+        csi_role,
+        "rendered CSI controller ClusterRole",
+    )
+    standalone_csi_rbac = (
+        repository / "modules/csi-driver/deploy/kubernetes/rbac.yaml"
+    ).read_text(encoding="utf-8")
+    standalone_csi_role = manifest_document(
+        standalone_csi_rbac,
+        "ClusterRole",
+        "inspace-csi-controller",
+    )
+    verify_read_only_nodeclaim_rbac(
+        standalone_csi_role,
+        "standalone CSI controller ClusterRole",
     )
     ccm_deployment = manifest_document(
         rendered, "Deployment", "verify-inspace-cloud-kube-modules-ccm"
