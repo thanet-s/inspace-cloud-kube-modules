@@ -13,6 +13,9 @@ isolated-account assertions and is not the production inventory.
 
 - macOS or Linux management host with `ansible-core 2.21`, Docker, Helm,
   kubectl, OpenSSH, OpenSSL, Python 3, and jq
+- Docker support for running `linux/amd64` images; Apple Silicon Docker Desktop
+  uses its built-in x86 emulation because InSpace and current release images
+  are x86-64 only
 - one existing InSpace VPC, an unused private control-plane VIP, and a private
   Service VIP range of 16–256 addresses excluded from normal cloud allocation
 - an exact released module version
