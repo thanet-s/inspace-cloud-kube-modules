@@ -106,6 +106,34 @@ func TestDeleteMalformedProviderIDDoesNotReleaseFinalizer(t *testing.T) {
 	}
 }
 
+func TestDeleteVolumeGuardsRemainRetryable(t *testing.T) {
+	tests := map[string]error{
+		"attached non-primary volumes": cloudapi.ErrAttachedNonPrimaryVolumes,
+		"uncertain storage inventory":  cloudapi.ErrVMStorageInventoryUncertain,
+	}
+	for name, guardErr := range tests {
+		t.Run(name, func(t *testing.T) {
+			nodeClass := providerNodeClass()
+			cloud := &recordingDeleteCloud{Cloud: cloudfake.New(), deleteErr: guardErr}
+			provider, err := New(cloud, NewStaticResolver(nodeClass), providerOptions(nodeClass))
+			if err != nil {
+				t.Fatal(err)
+			}
+			claim := &karpv1.NodeClaim{
+				ObjectMeta: metav1.ObjectMeta{Name: "general-abc"},
+				Status: karpv1.NodeClaimStatus{
+					ProviderID: "inspace://bkk01/11111111-1111-4111-8111-111111111111",
+				},
+			}
+
+			err = provider.Delete(context.Background(), claim)
+			if !errors.Is(err, guardErr) || cloudprovider.IsNodeClaimNotFoundError(err) {
+				t.Fatalf("Delete() error = %v, want retryable guard %v", err, guardErr)
+			}
+		})
+	}
+}
+
 func TestDeleteThreadsDurableFloatingIPIdentityFromNodeClaimAnnotations(t *testing.T) {
 	nodeClass := providerNodeClass()
 	cloud := &recordingDeleteCloud{Cloud: cloudfake.New()}
@@ -176,10 +204,14 @@ func TestDeleteUsesRetainedLaunchNetworkAfterControllerConfigChanges(t *testing.
 type recordingDeleteCloud struct {
 	*cloudfake.Cloud
 	lastDeleteIdentity cloudapi.DeleteVMIdentity
+	deleteErr          error
 }
 
 func (c *recordingDeleteCloud) DeleteVM(ctx context.Context, location, uuid, clusterName, nodeClaimName string, identity cloudapi.DeleteVMIdentity) error {
 	c.lastDeleteIdentity = identity
+	if c.deleteErr != nil {
+		return c.deleteErr
+	}
 	return c.Cloud.DeleteVM(ctx, location, uuid, clusterName, nodeClaimName, identity)
 }
 

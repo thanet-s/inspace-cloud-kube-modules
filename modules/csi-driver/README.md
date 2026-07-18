@@ -24,6 +24,20 @@ finishes. A delete is refused while the disk is attached. It is also refused if
 the InSpace disk has snapshots: the native delete API would delete those
 snapshots too, so the driver fails safely instead.
 
+## VM deletion safety
+
+InSpace VM deletion can also delete every attached non-primary block volume.
+Deleting a worker directly through the InSpace dashboard or API bypasses
+Kubernetes, CSI detachment, and the Karpenter provider. That can permanently
+delete the volumes and their data.
+
+Terminate workers through Kubernetes/Karpenter and wait for each
+`VolumeAttachment` to disappear. The Karpenter provider refuses its own VM
+DELETE while any non-primary block volume remains in the VM's authoritative
+storage inventory, then retries after CSI detaches every additional volume.
+That guard cannot intercept an out-of-band dashboard or API deletion. Keep
+independent backups for important data.
+
 Create is idempotent by `(location, CSI name)`. The native API does not expose
 idempotency keys, so the controller writes an immutable
 `coordination.k8s.io/v1` Lease before each disk create, attach, detach, or

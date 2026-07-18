@@ -165,6 +165,42 @@ func TestDocumentedResourceContracts(t *testing.T) {
 	}
 }
 
+func TestExactVMContractPreservesEveryStoragePrimaryFlag(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/v1/bkk01/user-resource/vm" || r.URL.Query().Get("uuid") != vmUUID {
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.String())
+		}
+		writeLiteral(w, http.StatusOK, `{
+			"uuid":"aaaaaaaa-1111-4222-8333-bbbbbbbbbbbb",
+			"name":"worker",
+			"status":"running",
+			"storage":[
+				{"uuid":"10000000-0000-4000-8000-000000000001","name":"root","size":100,"primary":true},
+				{"uuid":"10000000-0000-4000-8000-000000000002","name":"data-a","size":20,"primary":false},
+				{"uuid":"10000000-0000-4000-8000-000000000003","name":"data-b","size":40,"primary":false}
+			]
+		}`)
+	}))
+	t.Cleanup(server.Close)
+	client, err := inspace.NewClient(inspace.Options{BaseURL: server.URL, APIKey: "literal-fixture-key"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	vm, err := client.GetVM(context.Background(), "bkk01", vmUUID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(vm.Storage) != 3 || !vm.Storage[0].Primary || vm.Storage[1].Primary || vm.Storage[2].Primary {
+		t.Fatalf("GetVM() storage = %#v, want one primary root and two non-primary volumes", vm.Storage)
+	}
+	if vm.Storage[0].UUID != "10000000-0000-4000-8000-000000000001" ||
+		vm.Storage[1].UUID != "10000000-0000-4000-8000-000000000002" ||
+		vm.Storage[2].UUID != "10000000-0000-4000-8000-000000000003" {
+		t.Fatalf("GetVM() changed storage ordering or identities: %#v", vm.Storage)
+	}
+}
+
 func TestCreateLoadBalancerRequestPreservesExplicitEmptyTargets(t *testing.T) {
 	data, err := json.Marshal(inspace.CreateLoadBalancerRequest{Targets: []inspace.LoadBalancerTarget{}})
 	if err != nil {

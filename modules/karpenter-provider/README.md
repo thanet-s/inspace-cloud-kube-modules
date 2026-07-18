@@ -242,6 +242,22 @@ an older v3 claim with only name/address may finish when two reads prove that
 no overlapping FIP exists, but it cannot mutate an active address. Legacy
 v1/v2 VM records retain their own address/account retry anchor.
 
+Before authorizing any provider-initiated VM DELETE, Karpenter requires the
+canonical VM detail to report exactly one primary root disk and no attached
+non-primary block volumes. It repeats an exact VM read immediately before
+dispatch. An attached volume, omitted storage inventory, or ambiguous primary
+layout blocks the request before dispatch; the error remains retryable, the
+NodeClaim stays terminating, and the VM, Floating IP, and firewall assignments
+remain intact. Reconciliation proceeds after CSI has detached every additional
+volume.
+
+This guard applies to normal Karpenter termination and provider-owned rollback.
+It cannot intercept a VM deleted directly through the InSpace dashboard or API.
+InSpace can delete every attached non-primary block volume with such an
+out-of-band VM deletion. The API exposes no conditional VM DELETE, so the final
+exact read narrows but cannot make the attachment check atomic against a
+simultaneous external attachment.
+
 The fixed coordinator Lease contains independent non-expiring CAS receipts per
 base firewall. Same-firewall assignments and detachments serialize across
 NodeClaims, processes, and restarts; different firewalls can progress

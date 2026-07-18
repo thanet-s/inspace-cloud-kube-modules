@@ -310,6 +310,118 @@ func TestVMDeleteDriftAfterCASRejectsUndispatchedReceipt(t *testing.T) {
 	}
 }
 
+func TestVMVolumeAttachmentAfterCASRejectsUndispatchedDeleteReceipt(t *testing.T) {
+	api := &fakeAPI{}
+	adapter, _ := New(api)
+	configureFastNetworkReadback(adapter, boundedReadbackTestTimeout)
+	created, err := adapter.CreateVM(context.Background(), testRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity := durableDeleteIdentity(created)
+	var fence cloudapi.RemovalMutationFence
+	rejects := 0
+	identity.AuthorizeRemovalMutation = func(_ context.Context, mutation cloudapi.RemovalMutation, present bool) (cloudapi.RemovalMutationAuthorization, error) {
+		if mutation.Operation != cloudapi.RemovalMutationVMDelete || !present {
+			t.Fatalf("removal authorization = %#v present=%t", mutation, present)
+		}
+		fence = cloudapi.RemovalMutationFence{
+			RemovalMutation: mutation,
+			Phase:           cloudapi.RemovalMutationIssued,
+			IssueID:         strings.Repeat("c", 32),
+		}
+		api.vms[0].Storage = append(api.vms[0].Storage, sdk.VMStorage{
+			UUID:    "33333333-3333-4333-8333-333333333333",
+			Name:    "data-after-cas",
+			SizeGiB: 20,
+		})
+		return cloudapi.RemovalMutationAuthorization{Fence: fence, Active: true, AllowMutation: true}, nil
+	}
+	identity.ObserveRemovalMutation = func(context.Context, cloudapi.RemovalMutationFence) error { return nil }
+	identity.RejectRemovalMutation = func(_ context.Context, rejected cloudapi.RemovalMutationFence) error {
+		if rejected != fence {
+			return errors.New("removal rejection identity changed")
+		}
+		rejects++
+		fence.Phase = cloudapi.RemovalMutationRejected
+		return nil
+	}
+	api.operations = nil
+
+	err = adapter.DeleteVM(context.Background(), created.Location, created.UUID, created.ClusterName, created.NodeClaimName, identity)
+	if !errors.Is(err, cloudapi.ErrCreateAttemptPending) || !errors.Is(err, cloudapi.ErrAttachedNonPrimaryVolumes) ||
+		!strings.Contains(err.Error(), "fresh attached-volume guard") {
+		t.Fatalf("DeleteVM() error = %v, want post-CAS attached-volume guard", err)
+	}
+	if api.deleteVMCalls != 0 || len(api.operations) != 0 || fence.Phase != cloudapi.RemovalMutationRejected || rejects != 1 ||
+		len(api.vms) != 1 || len(api.floatingIPs) != 1 || !firewallHasVM(api.firewalls[0], created.UUID) {
+		t.Fatalf("post-CAS attachment failed to reject undispatched DELETE: calls=%d operations=%v fence=%#v rejects=%d VMs=%#v FIPs=%#v firewall=%#v",
+			api.deleteVMCalls, api.operations, fence, rejects, api.vms, api.floatingIPs, api.firewalls[0])
+	}
+}
+
+func TestVMStorageInventoryDriftAfterCASRejectsUndispatchedDeleteReceipt(t *testing.T) {
+	for name, mutate := range map[string]func(*sdk.VM){
+		"omitted inventory": func(vm *sdk.VM) {
+			vm.Storage = nil
+		},
+		"multiple primary disks": func(vm *sdk.VM) {
+			vm.Storage = append(vm.Storage, sdk.VMStorage{
+				UUID:    "33333333-3333-4333-8333-333333333333",
+				Name:    "ambiguous-primary",
+				SizeGiB: 20,
+				Primary: true,
+			})
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			api := &fakeAPI{}
+			adapter, _ := New(api)
+			configureFastNetworkReadback(adapter, boundedReadbackTestTimeout)
+			created, err := adapter.CreateVM(context.Background(), testRequest())
+			if err != nil {
+				t.Fatal(err)
+			}
+			identity := durableDeleteIdentity(created)
+			var fence cloudapi.RemovalMutationFence
+			rejects := 0
+			identity.AuthorizeRemovalMutation = func(_ context.Context, mutation cloudapi.RemovalMutation, present bool) (cloudapi.RemovalMutationAuthorization, error) {
+				if mutation.Operation != cloudapi.RemovalMutationVMDelete || !present {
+					t.Fatalf("removal authorization = %#v present=%t", mutation, present)
+				}
+				fence = cloudapi.RemovalMutationFence{
+					RemovalMutation: mutation,
+					Phase:           cloudapi.RemovalMutationIssued,
+					IssueID:         strings.Repeat("d", 32),
+				}
+				mutate(&api.vms[0])
+				return cloudapi.RemovalMutationAuthorization{Fence: fence, Active: true, AllowMutation: true}, nil
+			}
+			identity.ObserveRemovalMutation = func(context.Context, cloudapi.RemovalMutationFence) error { return nil }
+			identity.RejectRemovalMutation = func(_ context.Context, rejected cloudapi.RemovalMutationFence) error {
+				if rejected != fence {
+					return errors.New("removal rejection identity changed")
+				}
+				rejects++
+				fence.Phase = cloudapi.RemovalMutationRejected
+				return nil
+			}
+			api.operations = nil
+
+			err = adapter.DeleteVM(context.Background(), created.Location, created.UUID, created.ClusterName, created.NodeClaimName, identity)
+			if !errors.Is(err, cloudapi.ErrCreateAttemptPending) || !errors.Is(err, cloudapi.ErrOwnershipMismatch) ||
+				!strings.Contains(err.Error(), "fresh mutation-target proof") {
+				t.Fatalf("DeleteVM() error = %v, want post-CAS fail-closed storage proof", err)
+			}
+			if api.deleteVMCalls != 0 || len(api.operations) != 0 || fence.Phase != cloudapi.RemovalMutationRejected || rejects != 1 ||
+				len(api.vms) != 1 || len(api.floatingIPs) != 1 || !firewallHasVM(api.firewalls[0], created.UUID) {
+				t.Fatalf("post-CAS storage drift failed to reject undispatched DELETE: calls=%d operations=%v fence=%#v rejects=%d VMs=%#v FIPs=%#v firewall=%#v",
+					api.deleteVMCalls, api.operations, fence, rejects, api.vms, api.floatingIPs, api.firewalls[0])
+			}
+		})
+	}
+}
+
 func TestFloatingIPRemovalDriftAfterCASRejectsUndispatchedReceipt(t *testing.T) {
 	const vmUUID = "11111111-1111-4111-8111-111111111111"
 	for _, test := range []struct {

@@ -74,6 +74,7 @@ var (
 	errFloatingIPCleanupUncertain          = errors.New("floating IP cleanup did not converge")
 	errFirewallCleanupUncertain            = errors.New("firewall cleanup did not converge")
 	errRemovalFenceInvalid                 = errors.New("durable removal mutation authority is invalid")
+	errVMDeleteUndispatched                = errors.New("VM DELETE was not dispatched")
 	vmUUIDPattern                          = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
 	ownedInstanceTypePattern               = regexp.MustCompile(`^is-(compute|general|memory|extra-memory)-([0-9]+)c-([0-9]+)g$`)
 	nodeLoadBalancerShardPattern           = regexp.MustCompile(`^inlb-[0-9a-f]{8}$`)
@@ -1190,6 +1191,9 @@ func (a *Adapter) reconcileFencedCreatedVMAnchor(ctx context.Context, request cl
 	if errors.Is(deleteErr, errRemovalFenceInvalid) {
 		return nil, fmt.Errorf("anchored VM %s has invalid removal authority: %w", request.CreatedVMUUID, deleteErr)
 	}
+	if vmDeleteWasNotDispatched(deleteErr) {
+		return nil, fmt.Errorf("anchored VM %s deletion blocked before dispatch: %w", request.CreatedVMUUID, deleteErr)
+	}
 	if err := a.waitForAuthorizedVMAbsence(cleanupCtx, request.Location, request.NetworkUUID, request.CreatedVMUUID, "after anchored create rollback", tombstoneVerifier); err != nil {
 		return nil, fmt.Errorf("anchored VM %s deletion has not converged: %w", request.CreatedVMUUID, errors.Join(deleteErr, err))
 	}
@@ -2272,6 +2276,13 @@ func (a *Adapter) cleanupLaunchWithoutFloatingIP(
 	if errors.Is(vmDeleteErr, errRemovalFenceInvalid) {
 		return errors.Join(cause, fmt.Errorf("public VM %s rollback removal authority: %w", vmUUID, vmDeleteErr))
 	}
+	if vmDeleteWasNotDispatched(vmDeleteErr) {
+		return errors.Join(
+			cause,
+			fmt.Errorf("floating IP cleanup remains uncertain: %w", floatingUncertainty),
+			fmt.Errorf("public VM %s rollback blocked before dispatch: %w", vmUUID, vmDeleteErr),
+		)
+	}
 	if vmDeleteErr != nil {
 		errs = append(errs, fmt.Errorf("deleting public VM %s without a safe floating IP anchor: %w", vmUUID, vmDeleteErr))
 	}
@@ -2871,6 +2882,9 @@ func (a *Adapter) DeleteVM(ctx context.Context, location, uuid, clusterName, nod
 			})
 		if errors.Is(deleteErr, errRemovalFenceInvalid) {
 			return fmt.Errorf("authorizing durable VM %s deletion: %w", uuid, deleteErr)
+		}
+		if vmDeleteWasNotDispatched(deleteErr) {
+			return fmt.Errorf("deleting VM %s blocked before dispatch: %w", uuid, deleteErr)
 		}
 	} else {
 		vmDeleteAuthorization, deleteErr = a.authorizeRemovalMutation(ctx, removalAuthority, cloudapi.RemovalMutation{
@@ -3578,6 +3592,9 @@ func (a *Adapter) deleteCanonicalVM(ctx context.Context, location, uuid string, 
 		return cloudapi.RemovalMutationAuthorization{}, fmt.Errorf("%w: %w", errRemovalFenceInvalid,
 			fmt.Errorf("%w: canonical VM detail UUID %q does not match delete target %q", cloudapi.ErrOwnershipMismatch, observedUUID, uuid))
 	}
+	if err := validateVMDeleteVolumeSafety(*vm); err != nil {
+		return cloudapi.RemovalMutationAuthorization{}, fmt.Errorf("%w: %w", errVMDeleteUndispatched, err)
+	}
 	mutation := cloudapi.RemovalMutation{Operation: cloudapi.RemovalMutationVMDelete, Location: location, VMUUID: strings.ToLower(uuid)}
 	authorization, err := a.authorizeRemovalMutation(ctx, authority, mutation, true)
 	if err != nil {
@@ -3596,16 +3613,28 @@ func (a *Adapter) deleteCanonicalVM(ctx context.Context, location, uuid string, 
 			// cloud DELETE. Rejecting that slot permits a fresh CAS after transient
 			// authority drift without replaying any ambiguous cloud request.
 			rejectErr := a.rejectRemovalMutation(ctx, authority, authorization)
-			return authorization, errors.Join(cloudapi.ErrCreateAttemptPending,
+			return authorization, errors.Join(errVMDeleteUndispatched, cloudapi.ErrCreateAttemptPending,
 				fmt.Errorf("fresh mutation-target proof blocked VM %s DELETE: %w", uuid, proofErr), rejectErr)
 		}
+	}
+	if volumeErr := a.proveVMDeleteVolumeSafety(ctx, location, uuid); volumeErr != nil {
+		var rejectErr error
+		if authorization.Active && authorization.AllowMutation {
+			rejectErr = a.rejectRemovalMutation(ctx, authority, authorization)
+		}
+		return authorization, errors.Join(
+			errVMDeleteUndispatched,
+			cloudapi.ErrCreateAttemptPending,
+			fmt.Errorf("fresh attached-volume guard blocked VM %s DELETE: %w", uuid, volumeErr),
+			rejectErr,
+		)
 	}
 	requestCtx, cancel := context.WithTimeout(ctx, a.networkAttachmentRequestTimeout)
 	defer cancel()
 	deleteErr := a.api.DeleteVM(requestCtx, location, uuid)
 	if errors.Is(deleteErr, sdk.ErrMutationBlocked) {
 		rejectErr := a.rejectRemovalMutation(ctx, authority, authorization)
-		return authorization, fmt.Errorf("VM %s DELETE was locally blocked before dispatch: %w", uuid, errors.Join(deleteErr, rejectErr))
+		return authorization, fmt.Errorf("%w: VM %s DELETE was locally blocked before dispatch: %w", errVMDeleteUndispatched, uuid, errors.Join(deleteErr, rejectErr))
 	}
 	return authorization, deleteErr
 }
@@ -5903,6 +5932,9 @@ func (a *Adapter) cleanupLaunch(
 	_, deleteAuthorization, vmDeleteErr := a.deleteAnchoredVMIfPresent(cleanupCtx, location, networkUUID, vmUUID, removalAuthority, tombstoneVerifier, proveMutationTarget)
 	if errors.Is(vmDeleteErr, errRemovalFenceInvalid) {
 		return errors.Join(cause, fmt.Errorf("VM %s rollback removal authority: %w", vmUUID, vmDeleteErr))
+	}
+	if vmDeleteWasNotDispatched(vmDeleteErr) {
+		return errors.Join(cause, fmt.Errorf("VM %s rollback blocked before dispatch: %w", vmUUID, vmDeleteErr))
 	}
 	if absenceErr := a.waitForAuthorizedVMCoreAbsence(cleanupCtx, location, networkUUID, vmUUID, "after launch rollback", tombstoneVerifier); absenceErr != nil {
 		if vmDeleteErr != nil {
