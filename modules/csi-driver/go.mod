@@ -7,7 +7,7 @@ replace github.com/thanet-s/inspace-cloud-kube-modules/modules/client => ../clie
 require (
 	github.com/container-storage-interface/spec v1.12.0
 	github.com/thanet-s/inspace-cloud-kube-modules/modules/client v0.0.0
-	google.golang.org/grpc v1.82.0
+	google.golang.org/grpc v1.82.1
 	google.golang.org/protobuf v1.36.11
 )
 
