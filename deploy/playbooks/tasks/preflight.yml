@@ -9,13 +9,21 @@
 - name: Require the complete deployment inventory
   ansible.builtin.assert:
     that:
-      - inspace_api_url is match('^https://[^/]+(?:/.*)?$')
+      - inspace_api_url is match('^https://[A-Za-z0-9.-]+(?::[0-9]{1,5})?/?$')
       - inspace_location is match('^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$')
       - inspace_billing_account_id | int > 0
       - inspace_network_uuid is match('^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$')
       - inspace_amd_host_pool_uuid is match('^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$')
       - cluster_name is match('^[a-z0-9](?:[a-z0-9-]{0,53}[a-z0-9])?$')
       - control_plane_replicas | int in [1, 3]
+      - control_plane_vcpu | int >= 2
+      - control_plane_vcpu | int <= 16
+      - control_plane_memory_mib | int >= 4096
+      - control_plane_memory_mib | int <= 65536
+      - control_plane_root_disk_gib | int >= 30
+      - control_plane_root_disk_gib | int <= 2000
+      - pod_cidr == '10.42.0.0/16'
+      - service_cidr == '10.43.0.0/16'
       - modules_version is match('^[0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z.-]+)?$')
       - rke2_version is match('^v[0-9]+\\.[0-9]+\\.[0-9]+\\+rke2r[0-9]+$')
       - ssh_username is match('^[a-z_][a-z0-9_-]{0,29}$')
@@ -56,7 +64,8 @@
         import ipaddress,sys;
         vip,start,stop=map(ipaddress.ip_address,sys.argv[1:4]);
         pod,service=map(ipaddress.ip_network,sys.argv[4:6]);
-        assert all(a.version == 4 and a.is_private and str(a) == raw for a,raw in zip((vip,start,stop),sys.argv[1:4]));
+        rfc1918=tuple(map(ipaddress.ip_network,('10.0.0.0/8','172.16.0.0/12','192.168.0.0/16')));
+        assert all(a.version == 4 and any(a in network for network in rfc1918) and str(a) == raw for a,raw in zip((vip,start,stop),sys.argv[1:4]));
         assert int(start) <= int(stop) and 16 <= int(stop)-int(start)+1 <= 256;
         assert not int(start) <= int(vip) <= int(stop);
         assert all(a not in pod and a not in service for a in (vip,start,stop))
