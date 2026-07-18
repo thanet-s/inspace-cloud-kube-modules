@@ -64,6 +64,7 @@ def main() -> None:
         "cluster.desired.yaml",
         "persisted bootstrap spec differs",
         "INSPACE_ALLOW_REMOTE_MUTATIONS",
+        "bootstrap_controller_version",
         "--until-ready",
         "discover_bootstrap.py",
         "tasks/start-tunnel.yml",
@@ -75,6 +76,11 @@ def main() -> None:
     require(
         init.index("cluster.desired.yaml") < init.index("--until-ready"),
         "desired-spec fence does not precede bootstrap mutation",
+    )
+    require(
+        init.index("bootstrap-controller-version")
+        < init.index("INSPACE_ALLOW_REMOTE_MUTATIONS"),
+        "bootstrap destroy authority is not pinned before bootstrap mutation",
     )
 
     for forbidden in (

@@ -130,6 +130,7 @@ def main() -> None:
     parser.add_argument("--location", required=True)
     parser.add_argument("--api-url", required=True)
     parser.add_argument("--ssh-username", required=True)
+    parser.add_argument("--bootstrap-controller-version", required=True)
     parser.add_argument("--modules-version", required=True)
     args = parser.parse_args()
 
@@ -227,7 +228,7 @@ def main() -> None:
         "schema": "inspace-deploy-state-v1",
         "clusterName": args.cluster,
         "controlPlaneReplicas": args.replicas,
-        "bootstrapControllerVersion": args.modules_version,
+        "bootstrapControllerVersion": args.bootstrap_controller_version,
         "modulesVersion": args.modules_version,
         "owner": result.get("owner"),
         "clusterConfigSHA256": hashlib.sha256(config_data).hexdigest(),

@@ -22,8 +22,49 @@
         - rke2-token
         - bootstrap-cache-key
         - bootstrap-cache-not-before
+        - bootstrap-controller-version
         - state.json
       register: deploy_bootstrap_files
+
+    - name: Refuse an unversioned pre-existing bootstrap ledger
+      ansible.builtin.assert:
+        that:
+          - not deploy_bootstrap_files.results[0].stat.exists or deploy_bootstrap_files.results[4].stat.exists
+        fail_msg: >-
+          cluster.yaml exists without its original bootstrap-controller version;
+          preserving the ledger is the fail-closed outcome.
+
+    - name: Persist bootstrap destroy authority before the first remote mutation
+      ansible.builtin.copy:
+        content: "{{ modules_version }}\n"
+        dest: "{{ deploy_state_dir }}/bootstrap-controller-version"
+        mode: "0600"
+      when: not deploy_bootstrap_files.results[4].stat.exists
+
+    - name: Load the pinned bootstrap controller version
+      ansible.builtin.set_fact:
+        bootstrap_controller_version: "{{ lookup('file', deploy_state_dir + '/bootstrap-controller-version') | trim }}"
+
+    - name: Validate the pinned bootstrap controller version
+      ansible.builtin.assert:
+        that:
+          - bootstrap_controller_version is match('^[0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z.-]+)?$')
+        fail_msg: "Pinned bootstrap-controller version is malformed."
+
+    - name: Load existing lifecycle identity for a resumed run
+      ansible.builtin.set_fact:
+        deploy_existing_state: "{{ lookup('file', deploy_state_dir + '/state.json') | from_json }}"
+      when: deploy_bootstrap_files.results[5].stat.exists
+
+    - name: Require resumed lifecycle state to match inventory
+      ansible.builtin.assert:
+        that:
+          - deploy_existing_state.schema == 'inspace-deploy-state-v1'
+          - deploy_existing_state.clusterName == cluster_name
+          - deploy_existing_state.controlPlaneReplicas | int == control_plane_replicas | int
+          - deploy_existing_state.bootstrapControllerVersion == bootstrap_controller_version
+        fail_msg: "Existing deployment state belongs to another cluster or topology."
+      when: deploy_bootstrap_files.results[5].stat.exists
 
     - name: Render the desired bootstrap spec without touching durable status
       ansible.builtin.template:
@@ -126,7 +167,7 @@
         argv:
           - docker
           - pull
-          - "ghcr.io/thanet-s/inspace-cloud-controller-manager:{{ modules_version }}"
+          - "ghcr.io/thanet-s/inspace-cloud-controller-manager:{{ bootstrap_controller_version }}"
       changed_when: true
 
     - name: Reconcile bootstrap infrastructure synchronously to readiness
@@ -154,7 +195,7 @@
           - "type=bind,src={{ deploy_state_dir }},dst=/state"
           - --mount
           - "type=bind,src={{ ssh_public_key_file_expanded }},dst=/ssh/public-key,readonly"
-          - "ghcr.io/thanet-s/inspace-cloud-controller-manager:{{ modules_version }}"
+          - "ghcr.io/thanet-s/inspace-cloud-controller-manager:{{ bootstrap_controller_version }}"
           - --cluster-config
           - /state/cluster.yaml
           - --ssh-public-key-file
@@ -230,6 +271,8 @@
           - "{{ inspace_api_url }}"
           - --ssh-username
           - "{{ ssh_username }}"
+          - --bootstrap-controller-version
+          - "{{ bootstrap_controller_version }}"
           - --modules-version
           - "{{ modules_version }}"
       environment:

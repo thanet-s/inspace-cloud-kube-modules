@@ -59,7 +59,9 @@ deploy/run.sh tunnel "$PWD/deploy/inventory.yml"
 
 `init` is resumable. It renders a desired spec separately and refuses any
 bootstrap-spec drift before touching the persisted `cluster.yaml`; this avoids
-erasing uncertain cloud-mutation receipts. It then:
+erasing uncertain cloud-mutation receipts. Before its first cloud mutation it
+also persists the bootstrap-controller version that must later resume or
+destroy that ledger. It then:
 
 1. generates and persists the RKE2 token and optional cache PKI seed;
 2. runs the exact released bootstrap controller to API-level readiness;
