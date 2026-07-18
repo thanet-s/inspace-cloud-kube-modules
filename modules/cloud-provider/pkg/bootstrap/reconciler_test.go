@@ -4409,6 +4409,51 @@ func TestRenderControlPlaneCloudInitUsesVIPStaticPodAndBoundedBoot(t *testing.T)
 	assertControlPlaneCloudInit(t, raw, "cp-1", false)
 }
 
+func TestRenderSingleControlPlanePinsCoreDNSWithoutChangingThreeControlPlanes(t *testing.T) {
+	input := CloudInitInput{
+		NodeName: "cp-0", NodeExternalIPv4: "203.0.113.10", PrivateSubnet: "10.20.30.0/24", VirtualIPv4: "10.20.30.10",
+		RKE2Version: "v1.35.6+rke2r1", RKE2Token: "token", Initialize: true,
+		PodCIDR: "10.42.0.0/16", ServiceCIDR: "10.43.0.0/16",
+		PrivateLoadBalancerPoolStart: "10.20.30.200", PrivateLoadBalancerPoolStop: "10.20.30.239",
+		TLSSubjectAltNames: []string{"10.20.30.10"},
+	}
+
+	threeControlPlanes, err := RenderCloudInitJSON(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	threeFiles := decodeWriteFiles(t, threeControlPlanes)
+	if _, exists := threeFiles["/var/lib/inspace/rke2-coredns-config"]; exists {
+		t.Fatal("three-control-plane cloud-init unexpectedly overrides packaged CoreDNS")
+	}
+	if strings.Contains(threeFiles["/usr/local/sbin/inspace-bootstrap-rke2"], "rke2-coredns-config.yaml") {
+		t.Fatal("three-control-plane install script unexpectedly installs a CoreDNS override")
+	}
+
+	input.SingleControlPlane = true
+	singleControlPlane, err := RenderCloudInitJSON(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	singleFiles := decodeWriteFiles(t, singleControlPlane)
+	coreDNSConfig := singleFiles["/var/lib/inspace/rke2-coredns-config"]
+	for _, required := range []string{
+		"name: rke2-coredns",
+		"replicaCount: 1",
+		"autoscaler:\n      enabled: false",
+	} {
+		if !strings.Contains(coreDNSConfig, required) {
+			t.Fatalf("single-control-plane CoreDNS config lacks %q:\n%s", required, coreDNSConfig)
+		}
+	}
+	if !strings.Contains(
+		singleFiles["/usr/local/sbin/inspace-bootstrap-rke2"],
+		"install -m 0600 /var/lib/inspace/rke2-coredns-config /var/lib/rancher/rke2/server/manifests/rke2-coredns-config.yaml",
+	) {
+		t.Fatal("single-control-plane install script does not install the CoreDNS override")
+	}
+}
+
 func TestRenderControlPlaneCloudInitRejectsInvalidGuestHostname(t *testing.T) {
 	for _, nodeName := range []string{"UPPER", "contains.dot", strings.Repeat("a", 64)} {
 		_, err := RenderCloudInitJSON(CloudInitInput{

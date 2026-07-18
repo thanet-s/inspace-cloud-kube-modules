@@ -486,6 +486,31 @@ func TestControlPlaneCloudInitUsesPrivateCacheOrDirectUpstreamExclusively(t *tes
 	cacheContractAssertShell(t, directScript)
 }
 
+func TestSingleControlPlaneCachedInstallIncludesCoreDNSOverride(t *testing.T) {
+	key := []byte("0123456789abcdef0123456789abcdef")
+	hostname := "cache.unit.inspace.internal"
+	material, err := deriveCacheTLS(key, "default/unit:4d7ca80d", hostname, time.Now().UTC().Truncate(time.Second).Add(-time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := cacheContractControlPlaneInput()
+	input.SingleControlPlane = true
+	input.BootstrapCache = &NodeCacheConfig{Address: "10.20.30.21", Hostname: hostname, CABundle: material.CACertificate}
+	raw, err := RenderCloudInitJSON(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	files := cacheContractDecodeCloudInit(t, raw)
+	if !strings.Contains(files["/var/lib/inspace/rke2-coredns-config"].Content, "autoscaler:\n      enabled: false") {
+		t.Fatal("cached single-control-plane cloud-init lacks the CoreDNS autoscaler override")
+	}
+	script := files["/usr/local/sbin/inspace-bootstrap-rke2"].Content
+	if !strings.Contains(script, "install -m 0600 /var/lib/inspace/rke2-coredns-config /var/lib/rancher/rke2/server/manifests/rke2-coredns-config.yaml") {
+		t.Fatal("cached single-control-plane install script does not install its CoreDNS override")
+	}
+	cacheContractAssertShell(t, script)
+}
+
 func TestDirectControlPlaneCloudInitV8OwnershipBytes(t *testing.T) {
 	raw, err := RenderCloudInitJSON(cacheContractControlPlaneInput())
 	if err != nil {
