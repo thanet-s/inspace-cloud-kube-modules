@@ -52,6 +52,18 @@
       register: deploy_single_cp_needs_settle
       changed_when: false
 
+    - name: Record the original cloud-provider startup taint
+      ansible.builtin.shell: |
+        set -euo pipefail
+        export KUBECONFIG={{ (deploy_state_dir + '/kubeconfig.yaml') | quote }}
+        kubectl get node {{ (cluster_name + '-cp0') | quote }} -o json |
+          jq -r 'any(.spec.taints[]?; .key == "node.cloudprovider.kubernetes.io/uninitialized" and .value == "true" and .effect == "NoSchedule")'
+      args:
+        executable: /bin/bash
+      register: deploy_single_cp_had_cloud_provider_taint
+      changed_when: false
+      failed_when: deploy_single_cp_had_cloud_provider_taint.stdout | trim not in ['true', 'false']
+
     - name: Temporarily make cp0 schedulable for packaged install Jobs
       ansible.builtin.command:
         argv:
@@ -68,6 +80,25 @@
         - deploy_single_cp_untaint.rc != 0
         - "'not found' not in deploy_single_cp_untaint.stderr"
       when: deploy_single_cp_needs_settle.stdout | trim == 'true'
+
+    - name: Temporarily remove the cloud-provider startup taint
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - --kubeconfig
+          - "{{ deploy_state_dir }}/kubeconfig.yaml"
+          - taint
+          - node
+          - "{{ cluster_name }}-cp0"
+          - node.cloudprovider.kubernetes.io/uninitialized-
+      register: deploy_single_cp_cloud_provider_untaint
+      changed_when: "'untainted' in deploy_single_cp_cloud_provider_untaint.stdout"
+      failed_when:
+        - deploy_single_cp_cloud_provider_untaint.rc != 0
+        - "'not found' not in deploy_single_cp_cloud_provider_untaint.stderr"
+      when:
+        - deploy_single_cp_needs_settle.stdout | trim == 'true'
+        - deploy_single_cp_had_cloud_provider_taint.stdout | trim == 'true'
 
     - name: Wait for every expected RKE2 packaged install Job
       ansible.builtin.shell: |
@@ -101,6 +132,22 @@
       changed_when: false
 
   always:
+    - name: Restore the original cloud-provider startup taint
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - --kubeconfig
+          - "{{ deploy_state_dir }}/kubeconfig.yaml"
+          - taint
+          - node
+          - "{{ cluster_name }}-cp0"
+          - node.cloudprovider.kubernetes.io/uninitialized=true:NoSchedule
+          - --overwrite
+      register: deploy_single_cp_cloud_provider_retaint
+      changed_when: "'tainted' in deploy_single_cp_cloud_provider_retaint.stdout"
+      when:
+        - "(deploy_single_cp_had_cloud_provider_taint | default({'stdout': 'false'})).stdout | trim == 'true'"
+
     - name: Restore the durable control-plane NoSchedule taint
       ansible.builtin.command:
         argv:
@@ -123,6 +170,9 @@
         taint="$(kubectl get node {{ (cluster_name + '-cp0') | quote }} -o json | jq -r \
           '[.spec.taints[]? | select(.key == "node-role.kubernetes.io/control-plane" and .value == "true" and .effect == "NoSchedule")] | length')"
         test "$taint" -eq 1
+        cloud_provider_taint="$(kubectl get node {{ (cluster_name + '-cp0') | quote }} -o json | jq -r \
+          '[.spec.taints[]? | select(.key == "node.cloudprovider.kubernetes.io/uninitialized" and .value == "true" and .effect == "NoSchedule")] | length')"
+        test "$cloud_provider_taint" -eq {{ 1 if ((deploy_single_cp_had_cloud_provider_taint | default({'stdout': 'false'})).stdout | trim == 'true') else 0 }}
         if kubectl api-resources --api-group=karpenter.sh -o name | grep -Eq '^nodeclaims(\.karpenter\.sh)?$'; then
           test "$(kubectl get nodeclaims -o json | jq '.items | length')" -eq 0
         fi

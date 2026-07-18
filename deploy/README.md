@@ -74,8 +74,9 @@ serialization are compared using their API default of `false`. It then:
 5. retrieves a kubeconfig whose endpoint is only the local bastion tunnel;
 6. waits for the requested one or three Ready servers;
 7. on a one-server topology, temporarily schedules only RKE2's packaged
-   installation Jobs on cp0, restores its `NoSchedule` taint, and verifies
-   zero workers before Karpenter exists;
+   installation Jobs on cp0, restores both the control-plane and cloud-provider
+   startup taints to their original state, and verifies zero workers before
+   Karpenter exists;
 8. installs exact-version OCI charts and the default Karpenter resources.
 
 `update` does not replace fixed VMs or rewrite bootstrap cloud-init. It puts

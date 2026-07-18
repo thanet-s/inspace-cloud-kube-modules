@@ -469,7 +469,7 @@
       changed_when: false
 
     - name: Settle packaged components without provisioning an elastic worker
-      ansible.builtin.include_tasks: tasks/settle-single-control-plane.yml
+      ansible.builtin.import_tasks: tasks/settle-single-control-plane.yml
 
     - name: Apply optional operator RKE2 configuration with rolling readiness gates
       ansible.builtin.include_tasks: tasks/apply-control-plane-config.yml

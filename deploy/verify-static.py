@@ -85,6 +85,10 @@ def main() -> None:
         "bootstrap destroy authority is not pinned before bootstrap mutation",
     )
     require(
+        "ansible.builtin.import_tasks: tasks/settle-single-control-plane.yml" in init,
+        "single-control-plane tasks are not statically parsed by syntax checks",
+    )
+    require(
         init.count("linux/amd64") == 2 and destroy.count("linux/amd64") == 2,
         "bootstrap controller pull/run does not pin the published x86 platform",
     )
@@ -94,6 +98,8 @@ def main() -> None:
         "control_plane_replicas | int == 1",
         "Temporarily make cp0 schedulable",
         "Wait for every expected RKE2 packaged install Job",
+        "Temporarily remove the cloud-provider startup taint",
+        "Restore the original cloud-provider startup taint",
         "Restore the durable control-plane NoSchedule taint",
         "zero-worker state",
     ):
