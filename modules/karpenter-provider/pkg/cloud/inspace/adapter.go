@@ -6835,7 +6835,7 @@ func (a *Adapter) proveObservedFloatingIPAddressReallocation(
 		authorization.Fence.Phase != cloudapi.RemovalMutationObserved {
 		return false, nil
 	}
-	createdAt, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(current.CreatedAt))
+	createdAt, err := parseFloatingIPAllocationTimestamp(current.CreatedAt)
 	if err != nil {
 		return false, fmt.Errorf(
 			"%w: current floating IP %s has invalid creation time %q",
@@ -6855,6 +6855,29 @@ func (a *Adapter) proveObservedFloatingIPAddressReallocation(
 		)
 	}
 	return true, nil
+}
+
+func parseFloatingIPAllocationTimestamp(value string) (time.Time, error) {
+	value = strings.TrimSpace(value)
+	if parsed, err := time.Parse(time.RFC3339Nano, value); err == nil {
+		return parsed.UTC(), nil
+	}
+	// Live InSpace exact and collection responses currently serialize these
+	// timestamps as UTC seconds without an offset. Accept only that exact
+	// additional layout; every other ambiguous or partial representation
+	// remains invalid.
+	const liveUTCLayout = "2006-01-02 15:04:05"
+	if len(value) != len(liveUTCLayout) {
+		return time.Time{}, fmt.Errorf("timestamp does not match RFC 3339 or the live UTC seconds layout")
+	}
+	parsed, err := time.ParseInLocation(liveUTCLayout, value, time.UTC)
+	if err != nil {
+		return time.Time{}, err
+	}
+	if parsed.Format(liveUTCLayout) != value {
+		return time.Time{}, fmt.Errorf("timestamp is not canonical UTC seconds")
+	}
+	return parsed.UTC(), nil
 }
 
 func (a *Adapter) findFloatingIPByName(ctx context.Context, location, name string, billingAccountID int64) (*sdk.FloatingIP, error) {

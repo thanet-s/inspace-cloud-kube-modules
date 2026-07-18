@@ -549,6 +549,9 @@ that lower bound after a later serialized removal occupies the active slot.
 The check is read-only and never mutates the new allocation. Missing or
 non-observed receipts, old ownership fields, pre-issue timestamps, sparse
 identities, duplicates, and exact/list disagreement remain fail-closed.
+The live exact and collection endpoints may both omit optional `is_virtual`
+and may serialize UTC timestamps as `YYYY-MM-DD HH:MM:SS`; omission must agree
+across both reads, and only that exact UTC layout or RFC 3339 is accepted.
 
 VM DELETE has an additional fail-closed storage invariant. The first canonical
 read must contain exactly one primary root disk and no non-primary entries

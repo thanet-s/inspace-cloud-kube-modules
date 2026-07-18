@@ -21,7 +21,7 @@ const (
 )
 
 var (
-	reallocatedFIPCreatedAt = time.Date(2026, time.July, 18, 3, 0, 0, 0, time.UTC)
+	reallocatedFIPCreatedAt = time.Date(2026, time.July, 18, 10, 50, 45, 0, time.UTC)
 	oldFIPDeleteIssuedAt    = reallocatedFIPCreatedAt.Add(-time.Minute)
 	oldFIPDeleteObservedAt  = reallocatedFIPCreatedAt.Add(time.Minute)
 )
@@ -39,17 +39,29 @@ func reallocatedFloatingIP() sdk.FloatingIP {
 		"enabled":true,
 		"is_deleted":false,
 		"is_ipv6":false,
-		"is_virtual":false,
 		"assigned_to":"22222222-2222-4222-8222-222222222222",
 		"assigned_to_resource_type":"virtual_machine",
 		"assigned_to_private_ip":"10.0.0.22",
-		"created_at":"2026-07-18T03:00:00Z",
-		"updated_at":"2026-07-18T03:00:00Z",
-		"unassigned_at":null
+		"created_at":"2026-07-18 10:50:45",
+		"updated_at":"2026-07-18 10:50:47"
 	}`), &address); err != nil {
 		panic(err)
 	}
 	return address
+}
+
+func reallocatedFloatingIPWithIsVirtual(value bool) sdk.FloatingIP {
+	address := reallocatedFloatingIP()
+	address.IsVirtual = value
+	encoded, err := json.Marshal(address)
+	if err != nil {
+		panic(err)
+	}
+	var result sdk.FloatingIP
+	if err := json.Unmarshal(encoded, &result); err != nil {
+		panic(err)
+	}
+	return result
 }
 
 func observedFloatingIPDeleteHarness() *testRemovalMutationHarness {
@@ -88,6 +100,27 @@ func TestObservedFloatingIPAddressReallocationProofIsReadOnly(t *testing.T) {
 	}{
 		"observed exact deletion accepts a complete later allocation": {
 			wantAccepted: true,
+		},
+		"RFC3339 allocation timestamp remains accepted": {
+			mutateAddress: func(address *sdk.FloatingIP) {
+				address.CreatedAt = reallocatedFIPCreatedAt.Format(time.RFC3339Nano)
+				address.UpdatedAt = reallocatedFIPCreatedAt.Format(time.RFC3339Nano)
+			},
+			wantAccepted: true,
+		},
+		"optional is_virtual present and equal remains accepted": {
+			mutateAPI: func(api *fakeAPI) {
+				address := reallocatedFloatingIPWithIsVirtual(false)
+				api.floatingIPGetSnapshots = map[int]*sdk.FloatingIP{1: &address}
+				api.floatingIPListSnapshots = map[int][]sdk.FloatingIP{1: {address}}
+			},
+			wantAccepted: true,
+		},
+		"explicit virtual allocation fails closed": {
+			mutateAddress: func(address *sdk.FloatingIP) {
+				virtual := reallocatedFloatingIPWithIsVirtual(true)
+				*address = virtual
+			},
 		},
 		"ready fence is insufficient": {
 			mutateFence: func(h *testRemovalMutationHarness) {
@@ -151,9 +184,24 @@ func TestObservedFloatingIPAddressReallocationProofIsReadOnly(t *testing.T) {
 				address.CreatedAt = oldFIPDeleteIssuedAt.Add(-time.Second).Format(time.RFC3339Nano)
 			},
 		},
+		"timezone-less allocation created before deletion issue fails closed": {
+			mutateAddress: func(address *sdk.FloatingIP) {
+				address.CreatedAt = oldFIPDeleteIssuedAt.Add(-time.Second).UTC().Format("2006-01-02 15:04:05")
+			},
+		},
 		"allocation with invalid creation time fails closed": {
 			mutateAddress: func(address *sdk.FloatingIP) {
 				address.CreatedAt = "not-a-time"
+			},
+		},
+		"allocation with unsupported timezone-less suffix fails closed": {
+			mutateAddress: func(address *sdk.FloatingIP) {
+				address.CreatedAt = "2026-07-18 10:50:45Z"
+			},
+		},
+		"allocation with unsupported timezone-less fraction fails closed": {
+			mutateAddress: func(address *sdk.FloatingIP) {
+				address.CreatedAt = "2026-07-18 10:50:45.1"
 			},
 		},
 		"duplicate active address fails closed": {
@@ -215,6 +263,22 @@ func TestObservedFloatingIPAddressReallocationProofIsReadOnly(t *testing.T) {
 				exact := api.floatingIPs[0]
 				listed := exact
 				listed.UpdatedAt = reallocatedFIPCreatedAt.Add(time.Minute).Format(time.RFC3339Nano)
+				api.floatingIPGetSnapshots = map[int]*sdk.FloatingIP{1: &exact}
+				api.floatingIPListSnapshots = map[int][]sdk.FloatingIP{1: {listed}}
+			},
+		},
+		"exact and list optional is_virtual presence disagrees": {
+			mutateAPI: func(api *fakeAPI) {
+				exact := api.floatingIPs[0]
+				listed := reallocatedFloatingIPWithIsVirtual(false)
+				api.floatingIPGetSnapshots = map[int]*sdk.FloatingIP{1: &exact}
+				api.floatingIPListSnapshots = map[int][]sdk.FloatingIP{1: {listed}}
+			},
+		},
+		"exact and list optional is_virtual values disagree": {
+			mutateAPI: func(api *fakeAPI) {
+				exact := reallocatedFloatingIPWithIsVirtual(false)
+				listed := reallocatedFloatingIPWithIsVirtual(true)
 				api.floatingIPGetSnapshots = map[int]*sdk.FloatingIP{1: &exact}
 				api.floatingIPListSnapshots = map[int][]sdk.FloatingIP{1: {listed}}
 			},

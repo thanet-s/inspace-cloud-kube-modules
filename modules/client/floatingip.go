@@ -491,10 +491,14 @@ func validateFloatingIPStableAuthority(result *FloatingIP, allowDeleted bool) er
 // tuple. It is intentionally stricter than ordinary discovery, where sparse
 // relationship fields can be corroborated by a second endpoint.
 func ValidateFloatingIPStableReadback(result FloatingIP) error {
+	return validateFloatingIPStableReadback(result, false)
+}
+
+func validateFloatingIPStableReadback(result FloatingIP, allowMissingIsVirtual bool) error {
 	if err := validateFloatingIPStableAuthority(&result, false); err != nil {
 		return err
 	}
-	if !result.isVirtualPresent {
+	if !result.isVirtualPresent && !allowMissingIsVirtual {
 		return errors.New("inspace: floating IP response omits is_virtual")
 	}
 	if err := validateFloatingIPResponseIdentity(&result, result.Address, false); err != nil {
@@ -504,12 +508,22 @@ func ValidateFloatingIPStableReadback(result FloatingIP) error {
 }
 
 // ValidateFloatingIPStableReadbackMatch requires exact and list endpoints to
-// agree on the full stable allocation identity and relationship state.
+// agree on the full stable allocation identity and relationship state. Live
+// reads can omit optional is_virtual from both endpoints; omission is accepted
+// only with that two-source agreement, while standalone validation remains
+// strict.
 func ValidateFloatingIPStableReadbackMatch(exact, listed FloatingIP) error {
-	if err := ValidateFloatingIPStableReadback(exact); err != nil {
+	if exact.isVirtualPresent != listed.isVirtualPresent {
+		return fmt.Errorf(
+			"inspace: exact and list floating IP identities disagree on is_virtual presence for %s",
+			exact.Address,
+		)
+	}
+	allowMissingIsVirtual := !exact.isVirtualPresent
+	if err := validateFloatingIPStableReadback(exact, allowMissingIsVirtual); err != nil {
 		return fmt.Errorf("exact floating IP identity is incomplete: %w", err)
 	}
-	if err := ValidateFloatingIPStableReadback(listed); err != nil {
+	if err := validateFloatingIPStableReadback(listed, allowMissingIsVirtual); err != nil {
 		return fmt.Errorf("listed floating IP identity is incomplete: %w", err)
 	}
 	equal := exact.UUID == listed.UUID &&

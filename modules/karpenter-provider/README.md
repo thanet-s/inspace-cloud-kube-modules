@@ -258,6 +258,9 @@ no earlier than the old DELETE issue second. Kubernetes retains a bounded
 observed-delete history for every cleanup resolution, so later serialized
 removal slots do not erase this proof for an older duplicate launch. That check
 is read-only and never grants mutation authority over the later allocation.
+Live exact and collection reads may both omit optional `is_virtual`; the proof
+accepts that omission only when both agree, and accepts only RFC 3339 or the
+live API's exact UTC `YYYY-MM-DD HH:MM:SS` timestamp layout.
 Any missing receipt, old name or VM, pre-issue timestamp, sparse identity,
 duplicate address, or inconsistent readback retains the finalizer.
 
