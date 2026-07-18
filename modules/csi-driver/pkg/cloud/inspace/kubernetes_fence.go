@@ -20,7 +20,7 @@ import (
 )
 
 const (
-	maxKubernetesLeaseResponseBytes    = 1 << 20
+	maxKubernetesAPIResponseBytes      = 1 << 20
 	maxKubernetesLeaseListItems        = 4096
 	mutationFenceManagedLabel          = "storage.inspace.cloud/mutation-fence"
 	mutationFenceKeyAnnotation         = "storage.inspace.cloud/fence-key"
@@ -82,7 +82,7 @@ func (r *KubernetesNodeResolver) Get(ctx context.Context, key string) (*mutation
 
 func (r *KubernetesNodeResolver) List(ctx context.Context, prefix string) ([]mutationFence, error) {
 	query := url.Values{"labelSelector": {mutationFenceManagedLabel + "=true"}}
-	status, data, err := r.mutationLeaseRequest(ctx, http.MethodGet, r.mutationLeaseCollectionPath()+"?"+query.Encode(), nil)
+	status, data, err := r.kubernetesAPIRequest(ctx, http.MethodGet, r.mutationLeaseCollectionPath()+"?"+query.Encode(), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -117,7 +117,7 @@ func (r *KubernetesNodeResolver) Create(ctx context.Context, candidate mutationF
 		return nil, false, err
 	}
 	lease := mutationFenceLease(candidate, r.namespace)
-	status, data, requestErr := r.mutationLeaseRequest(ctx, http.MethodPost, r.mutationLeaseCollectionPath(), lease)
+	status, data, requestErr := r.kubernetesAPIRequest(ctx, http.MethodPost, r.mutationLeaseCollectionPath(), lease)
 	if requestErr == nil && status >= 200 && status < 300 {
 		stored, err := decodeMutationLease(data)
 		if err != nil {
@@ -185,7 +185,7 @@ func (r *KubernetesNodeResolver) SetReceipt(ctx context.Context, fence mutationF
 		}
 	}
 	lease.Metadata.Annotations[mutationFenceReceiptAnnotation] = strings.ToLower(receipt)
-	status, data, requestErr := r.mutationLeaseRequest(ctx, http.MethodPut, r.mutationLeasePath(name), lease)
+	status, data, requestErr := r.kubernetesAPIRequest(ctx, http.MethodPut, r.mutationLeasePath(name), lease)
 	if requestErr == nil && status >= 200 && status < 300 {
 		storedLease, err := decodeMutationLease(data)
 		if err != nil {
@@ -249,7 +249,7 @@ func (r *KubernetesNodeResolver) SetObservation(ctx context.Context, fence mutat
 	} else {
 		lease.Metadata.Annotations[mutationFenceObservationAnnotation] = observation
 	}
-	status, data, requestErr := r.mutationLeaseRequest(ctx, http.MethodPut, r.mutationLeasePath(name), lease)
+	status, data, requestErr := r.kubernetesAPIRequest(ctx, http.MethodPut, r.mutationLeasePath(name), lease)
 	if requestErr == nil && status >= 200 && status < 300 {
 		storedLease, err := decodeMutationLease(data)
 		if err != nil {
@@ -313,7 +313,7 @@ func (r *KubernetesNodeResolver) Delete(ctx context.Context, fence mutationFence
 	}{APIVersion: "v1", Kind: "DeleteOptions"}
 	request.Preconditions.UID = lease.Metadata.UID
 	request.Preconditions.ResourceVersion = lease.Metadata.ResourceVersion
-	deleteStatus, _, deleteErr := r.mutationLeaseRequest(ctx, http.MethodDelete, r.mutationLeasePath(name), request)
+	deleteStatus, _, deleteErr := r.kubernetesAPIRequest(ctx, http.MethodDelete, r.mutationLeasePath(name), request)
 	if deleteErr == nil && deleteStatus != http.StatusNotFound && (deleteStatus < 200 || deleteStatus >= 300) && !ambiguousKubernetesMutationStatus(deleteStatus) {
 		return kubernetesFenceStatusError("complete", deleteStatus)
 	}
@@ -402,7 +402,7 @@ func decodeMutationLease(data []byte) (kubernetesLease, error) {
 func decodeKubernetesLeaseJSON(data []byte, destination any) error {
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.UseNumber()
-	if err := validateKubernetesLeaseJSONValue(decoder); err != nil {
+	if err := validateUniqueJSONValue(decoder); err != nil {
 		return err
 	}
 	if token, err := decoder.Token(); err != io.EOF {
@@ -524,7 +524,7 @@ func decodeSchemaObject(data []byte, fields []string) (map[string]json.RawMessag
 	return canonical, nil
 }
 
-func validateKubernetesLeaseJSONValue(decoder *json.Decoder) error {
+func validateUniqueJSONValue(decoder *json.Decoder) error {
 	token, err := decoder.Token()
 	if err != nil {
 		return fmt.Errorf("invalid JSON: %w", err)
@@ -549,7 +549,7 @@ func validateKubernetesLeaseJSONValue(decoder *json.Decoder) error {
 				return fmt.Errorf("duplicate JSON object key %q", key)
 			}
 			seen[key] = struct{}{}
-			if err := validateKubernetesLeaseJSONValue(decoder); err != nil {
+			if err := validateUniqueJSONValue(decoder); err != nil {
 				return err
 			}
 		}
@@ -563,7 +563,7 @@ func validateKubernetesLeaseJSONValue(decoder *json.Decoder) error {
 		return nil
 	case '[':
 		for decoder.More() {
-			if err := validateKubernetesLeaseJSONValue(decoder); err != nil {
+			if err := validateUniqueJSONValue(decoder); err != nil {
 				return err
 			}
 		}
@@ -581,7 +581,7 @@ func validateKubernetesLeaseJSONValue(decoder *json.Decoder) error {
 }
 
 func (r *KubernetesNodeResolver) getMutationLease(ctx context.Context, name string) (kubernetesLease, int, error) {
-	status, data, err := r.mutationLeaseRequest(ctx, http.MethodGet, r.mutationLeasePath(name), nil)
+	status, data, err := r.kubernetesAPIRequest(ctx, http.MethodGet, r.mutationLeasePath(name), nil)
 	if err != nil {
 		return kubernetesLease{}, 0, err
 	}
@@ -603,7 +603,19 @@ func (r *KubernetesNodeResolver) mutationLeasePath(name string) string {
 	return r.mutationLeaseCollectionPath() + "/" + url.PathEscape(name)
 }
 
-func (r *KubernetesNodeResolver) mutationLeaseRequest(ctx context.Context, method, path string, body any) (int, []byte, error) {
+func (r *KubernetesNodeResolver) kubernetesAPIRequest(ctx context.Context, method, path string, body any) (int, []byte, error) {
+	return r.kubernetesAPIRequestWithLimit(ctx, method, path, body, maxKubernetesAPIResponseBytes)
+}
+
+func (r *KubernetesNodeResolver) kubernetesAPIRequestWithLimit(
+	ctx context.Context,
+	method, path string,
+	body any,
+	maxResponseBytes int64,
+) (int, []byte, error) {
+	if maxResponseBytes <= 0 {
+		return 0, nil, errors.New("Kubernetes API response limit must be positive")
+	}
 	token, err := os.ReadFile(r.tokenPath)
 	if err != nil {
 		return 0, nil, fmt.Errorf("%w: read Kubernetes ServiceAccount token: %v", cloud.ErrUnavailable, err)
@@ -619,7 +631,7 @@ func (r *KubernetesNodeResolver) mutationLeaseRequest(ctx context.Context, metho
 	u := *r.baseURL
 	requestURI, err := url.ParseRequestURI(path)
 	if err != nil {
-		return 0, nil, fmt.Errorf("build Kubernetes mutation Lease URL: %w", err)
+		return 0, nil, fmt.Errorf("build Kubernetes API URL: %w", err)
 	}
 	u.Path = strings.TrimRight(r.baseURL.Path, "/") + requestURI.Path
 	u.RawQuery = requestURI.RawQuery
@@ -634,30 +646,36 @@ func (r *KubernetesNodeResolver) mutationLeaseRequest(ctx context.Context, metho
 	}
 	resp, err := r.client.Do(req)
 	if err != nil {
-		return 0, nil, fmt.Errorf("%w: Kubernetes mutation Lease request: %v", cloud.ErrUnavailable, err)
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return 0, nil, err
+		}
+		return 0, nil, fmt.Errorf("%w: Kubernetes API request: %v", cloud.ErrUnavailable, err)
 	}
 	defer resp.Body.Close()
-	if resp.ContentLength > maxKubernetesLeaseResponseBytes {
+	if resp.ContentLength > maxResponseBytes {
 		return resp.StatusCode, nil, fmt.Errorf(
-			"%w: Kubernetes mutation Lease response exceeds %d bytes",
+			"%w: Kubernetes API response exceeds %d bytes",
 			cloud.ErrUnavailable,
-			maxKubernetesLeaseResponseBytes,
+			maxResponseBytes,
 		)
 	}
-	data, err := io.ReadAll(io.LimitReader(resp.Body, maxKubernetesLeaseResponseBytes+1))
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
 	if err != nil {
-		return resp.StatusCode, nil, fmt.Errorf("%w: read Kubernetes mutation Lease response: %v", cloud.ErrUnavailable, err)
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return resp.StatusCode, nil, err
+		}
+		return resp.StatusCode, nil, fmt.Errorf("%w: read Kubernetes API response: %v", cloud.ErrUnavailable, err)
 	}
-	if len(data) > maxKubernetesLeaseResponseBytes {
+	if int64(len(data)) > maxResponseBytes {
 		return resp.StatusCode, nil, fmt.Errorf(
-			"%w: Kubernetes mutation Lease response exceeds %d bytes",
+			"%w: Kubernetes API response exceeds %d bytes",
 			cloud.ErrUnavailable,
-			maxKubernetesLeaseResponseBytes,
+			maxResponseBytes,
 		)
 	}
 	if resp.ContentLength >= 0 && int64(len(data)) != resp.ContentLength {
 		return resp.StatusCode, nil, fmt.Errorf(
-			"%w: Kubernetes mutation Lease response body length %d does not match declared Content-Length %d",
+			"%w: Kubernetes API response body length %d does not match declared Content-Length %d",
 			cloud.ErrUnavailable,
 			len(data),
 			resp.ContentLength,

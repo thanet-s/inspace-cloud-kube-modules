@@ -552,16 +552,31 @@ func (a *Adapter) DetachVolume(ctx context.Context, location, volumeID, nodeID s
 	if attachedVM == "" {
 		return nil
 	}
+	recoveredMissingNode := false
 	if nodeID != "" {
 		requestedVM, err := a.resolveVM(ctx, location, nodeID)
 		if err != nil {
-			if errors.Is(err, cloud.ErrInvalidNode) {
-				// An old VolumeAttachment may outlive its Kubernetes Node. If
-				// the name no longer resolves, it cannot identify the current
-				// attachment safely; treat this requested pair as unpublished.
-				return nil
+			if errors.Is(err, errKubernetesNodeNotFound) {
+				matches, recoveryErr := a.missingNodeDetachTarget(ctx, location, volumeID, nodeID, attachedVM)
+				if recoveryErr != nil {
+					return recoveryErr
+				}
+				if !matches {
+					// The exact current attachment belongs to a differently
+					// named VM, so this stale requested pair is unpublished.
+					return nil
+				}
+				requestedVM = attachedVM
+				recoveredMissingNode = true
+			} else if errors.Is(err, cloud.ErrInvalidNode) {
+				// Returning success for an unresolved node lets external-attacher
+				// delete its VolumeAttachment finalizer even though the cloud
+				// disk may remain attached. Keep the request retryable unless
+				// exact missing-node recovery above proves the pair.
+				return fmt.Errorf("%w: cannot prove detach target for node %q: %v", cloud.ErrUnavailable, nodeID, err)
+			} else {
+				return err
 			}
-			return err
 		}
 		if requestedVM != attachedVM {
 			// The requested node is already unpublished. Never detach a disk
@@ -572,6 +587,9 @@ func (a *Adapter) DetachVolume(ctx context.Context, location, volumeID, nodeID s
 	intent := diskAttachmentIntent{
 		Operation: "disk-attachment", Location: location,
 		DiskUUID: strings.ToLower(volumeID), BillingAccountID: a.billing, PreviousVMUUID: attachedVM,
+	}
+	if recoveredMissingNode {
+		intent.RecoveryNodeID = strings.TrimSpace(nodeID)
 	}
 	fence, alreadyDone, err := a.prepareAttachmentFence(ctx, intent)
 	if err != nil {
@@ -646,6 +664,21 @@ func (a *Adapter) DetachVolume(ctx context.Context, location, volumeID, nodeID s
 		}
 		return fmt.Errorf("%w: disk %s moved from VM %s to VM %s", cloud.ErrVolumeAttachedElsewhere, volumeID, attachedVM, finalAttachedVM)
 	}
+	if recoveredMissingNode {
+		matches, recoveryErr := a.missingNodeDetachTarget(ctx, location, volumeID, nodeID, attachedVM)
+		if recoveryErr == nil && !matches {
+			recoveryErr = fmt.Errorf(
+				"%w: missing-node detach identity changed after authorization for node %q",
+				cloud.ErrUnavailable, nodeID,
+			)
+		}
+		if recoveryErr != nil {
+			if deleteErr := a.deleteMutationFenceDetached(ctx, fence); deleteErr != nil {
+				return errors.Join(recoveryErr, fmt.Errorf("clear unissued missing-node detach fence: %w", deleteErr))
+			}
+			return recoveryErr
+		}
+	}
 	if reserveErr := requireMutationDispatchReserve(ctx); reserveErr != nil {
 		if deleteErr := a.deleteMutationFenceDetached(ctx, fence); deleteErr != nil {
 			return errors.Join(reserveErr, fmt.Errorf("clear undispatched disk-detach fence: %w", deleteErr))
@@ -654,6 +687,80 @@ func (a *Adapter) DetachVolume(ctx context.Context, location, volumeID, nodeID s
 	}
 	mutationErr := a.api.DetachDisk(ctx, location, attachedVM, volumeID)
 	return a.finishAttachmentMutation(ctx, intent, fence, mutationErr)
+}
+
+// missingNodeDetachTarget is a detach-only migration path for a
+// VolumeAttachment that outlives its Kubernetes Node. It never participates in
+// publish resolution. A current Karpenter v3 VM is accepted only when its
+// canonical account/VPC identity, VM name, guest hostname, ownership record,
+// and disk relationship all bind the missing node name to the one attached VM.
+// A clearly different VM makes the stale pair an idempotent no-op; partial or
+// contradictory identity fails retryably so external-attacher retains its
+// finalizer instead of forgetting a live cloud attachment.
+func (a *Adapter) missingNodeDetachTarget(
+	ctx context.Context,
+	location, volumeID, nodeID, attachedVM string,
+) (bool, error) {
+	nodeID = strings.TrimSpace(nodeID)
+	if !nodeNamePattern.MatchString(nodeID) || strings.HasPrefix(strings.ToLower(nodeID), "inspace://") {
+		return false, fmt.Errorf("%w: missing-node detach received invalid Kubernetes node name %q", cloud.ErrUnavailable, nodeID)
+	}
+	vm, err := a.getOwnedVM(ctx, location, attachedVM)
+	if err != nil {
+		return false, err
+	}
+	if err := requireExactVMAttachmentCollection(vm, volumeID); err != nil {
+		return false, err
+	}
+	if err := rejectPrimaryDiskReference(vm, volumeID); err != nil {
+		return false, err
+	}
+	if rows := vmDiskRows(vm, volumeID); rows != 1 {
+		return false, fmt.Errorf(
+			"%w: exact VM %s reports %d attachment rows for disk %s during missing-node recovery",
+			cloud.ErrUnavailable, attachedVM, rows, volumeID,
+		)
+	}
+
+	vmName := strings.TrimSpace(vm.Name)
+	vmHostname := strings.TrimSpace(vm.Hostname)
+	if vmName == "" || vmHostname == "" || vmName != vmHostname {
+		return false, fmt.Errorf(
+			"%w: exact VM %s has ambiguous name/hostname identity for missing node %q",
+			cloud.ErrUnavailable, attachedVM, nodeID,
+		)
+	}
+	authorityRequest := missingNodeDetachRequest{
+		NodeName: vmName, Location: location, VMUUID: attachedVM,
+		VMName: vmName, VMHostname: vmHostname, VMDescription: vm.Description,
+		DiskUUID: volumeID, NetworkUUID: a.network, BillingAccountID: a.billing,
+	}
+	if _, err := validateMissingNodeDetachRequest(authorityRequest); err != nil {
+		return false, fmt.Errorf(
+			"%w: exact VM %s cannot prove Karpenter identity for missing node %q: %v",
+			cloud.ErrUnavailable, attachedVM, nodeID, err,
+		)
+	}
+	if vmName != nodeID {
+		// The disk is attached to a complete, self-consistent v3 worker
+		// identity other than the requested Node. The requested pair is
+		// therefore already unpublished; never detach the current owner.
+		return false, nil
+	}
+	authorizer, ok := a.nodes.(missingNodeDetachAuthorizer)
+	if !ok {
+		return false, fmt.Errorf(
+			"%w: node resolver cannot authorize Karpenter missing-node detach",
+			cloud.ErrUnavailable,
+		)
+	}
+	if err := authorizer.AuthorizeMissingNodeDetach(ctx, authorityRequest); err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return false, err
+		}
+		return false, fmt.Errorf("%w: authorize missing-node detach: %v", cloud.ErrUnavailable, err)
+	}
+	return true, nil
 }
 
 // waitForAttachment makes ControllerPublish/Unpublish completion match CSI
@@ -1021,7 +1128,7 @@ func (a *Adapter) resolveVM(ctx context.Context, location, nodeID string) (strin
 			if errors.Is(err, cloud.ErrUnavailable) {
 				return "", err
 			}
-			return "", fmt.Errorf("%w: resolve Kubernetes node %q: %v", cloud.ErrInvalidNode, providerID, err)
+			return "", fmt.Errorf("%w: resolve Kubernetes node %q: %w", cloud.ErrInvalidNode, providerID, err)
 		}
 		providerID = resolved
 	}

@@ -24,6 +24,8 @@ const serviceAccountPath = "/var/run/secrets/kubernetes.io/serviceaccount"
 
 var nodeNamePattern = regexp.MustCompile(`^[a-z0-9](?:[-a-z0-9.]{0,251}[a-z0-9])?$`)
 
+var errKubernetesNodeNotFound = errors.New("Kubernetes node not found")
+
 // KubernetesNodeResolver performs Node provider-ID reads and persists CSI
 // cloud-mutation fences as coordination.k8s.io Leases without pulling the full
 // client-go dependency graph. It uses the rotating projected ServiceAccount
@@ -127,15 +129,21 @@ func (r *KubernetesNodeResolver) ProviderIDForNode(ctx context.Context, nodeName
 	req.Header.Set("Accept", "application/json")
 	resp, err := r.client.Do(req)
 	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return "", err
+		}
 		return "", fmt.Errorf("%w: query Kubernetes node: %v", cloud.ErrUnavailable, err)
 	}
 	defer resp.Body.Close()
 	data, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return "", err
+		}
 		return "", fmt.Errorf("%w: read Kubernetes node: %v", cloud.ErrUnavailable, err)
 	}
 	if resp.StatusCode == http.StatusNotFound {
-		return "", fmt.Errorf("Kubernetes node %q not found", nodeName)
+		return "", fmt.Errorf("%w: %q", errKubernetesNodeNotFound, nodeName)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {

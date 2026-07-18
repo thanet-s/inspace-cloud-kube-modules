@@ -30,6 +30,7 @@ type diskAttachmentIntent struct {
 	BillingAccountID int64  `json:"billingAccountID"`
 	DesiredVMUUID    string `json:"desiredVMUUID,omitempty"`
 	PreviousVMUUID   string `json:"previousVMUUID,omitempty"`
+	RecoveryNodeID   string `json:"recoveryNodeID,omitempty"`
 }
 
 const (
