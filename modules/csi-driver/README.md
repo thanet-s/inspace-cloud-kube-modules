@@ -106,6 +106,10 @@ credential as administrator privileges.
 
 Only `topology.inspace.cloud/location=<configured-location>` is accepted.
 Unknown, empty, or conflicting topology segments are rejected.
+The paired Karpenter provider normalizes this CSI-owned key to its canonical
+`inspace.cloud/location` catalog requirement. A bound RWO volume can therefore
+request replacement capacity without an explicit CSI-topology requirement in
+the NodePool.
 
 ## Controller and node modes
 

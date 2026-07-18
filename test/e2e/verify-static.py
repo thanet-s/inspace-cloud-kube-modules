@@ -1538,6 +1538,7 @@ def verify_public_node_local_e2e_contract(
 
 
 def main() -> None:
+    repository = repository_root()
     host = (ROOT / "run.sh").read_text(encoding="utf-8")
     dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
     init_playbook = (ROOT / "init-cluster.yml").read_text(encoding="utf-8")
@@ -1588,7 +1589,13 @@ def main() -> None:
     ansible_cfg = (ROOT / "ansible.cfg").read_text(encoding="utf-8")
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     release_workflow = (
-        repository_root() / ".github/workflows/release.yaml"
+        repository / ".github/workflows/release.yaml"
+    ).read_text(encoding="utf-8")
+    karpenter_catalog = (
+        repository / "modules/karpenter-provider/pkg/catalog/catalog.go"
+    ).read_text(encoding="utf-8")
+    csi_driver = (
+        repository / "modules/csi-driver/pkg/driver/driver.go"
     ).read_text(encoding="utf-8")
     node_lb_service_names = (
         "inspace-e2e-node-traefik",
@@ -2176,6 +2183,14 @@ def main() -> None:
           values: ["1"]""") == 1 and
             "key: inspace.cloud/instance-memory" not in nodeclass,
             "E2E general NodePool must require CPU Gt 1 without an instance-memory selector")
+    require(
+        'CSITopologyLocationKey = "topology.inspace.cloud/location"' in karpenter_catalog
+        and 'TopologyLocationKey        = "topology.inspace.cloud/location"' in csi_driver
+        and "karpv1.NormalizedLabels[CSITopologyLocationKey] = LabelLocation"
+        in karpenter_catalog
+        and "key: topology.inspace.cloud/location" not in nodeclass,
+        "Karpenter must normalize CSI PV topology without a NodePool workaround",
+    )
     require('(.spec | has("hostPoolSelector") | not)' in playbook and
             ".status.hostPoolUUIDs | sort" in playbook and
             '.key == "inspace.cloud/instance-family"' in playbook and

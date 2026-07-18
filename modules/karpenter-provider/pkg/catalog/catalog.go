@@ -15,13 +15,14 @@ import (
 )
 
 const (
-	LabelFamily         = "inspace.cloud/instance-family"
-	LabelHostClass      = "inspace.cloud/host-class"
-	LabelInstanceCPU    = "inspace.cloud/instance-cpu"
-	LabelInstanceMemory = "inspace.cloud/instance-memory"
-	LabelLocation       = "inspace.cloud/location"
-	RegionThailand      = "thailand"
-	DefaultDiskGiB      = int32(40)
+	LabelFamily            = "inspace.cloud/instance-family"
+	LabelHostClass         = "inspace.cloud/host-class"
+	LabelInstanceCPU       = "inspace.cloud/instance-cpu"
+	LabelInstanceMemory    = "inspace.cloud/instance-memory"
+	LabelLocation          = "inspace.cloud/location"
+	CSITopologyLocationKey = "topology.inspace.cloud/location"
+	RegionThailand         = "thailand"
+	DefaultDiskGiB         = int32(40)
 
 	monthlyCPUPriceTHB       = 60.0
 	monthlyMemoryGiBPriceTHB = 30.0
@@ -51,6 +52,11 @@ type Options struct {
 func init() {
 	karpv1.WellKnownLabels.Insert(LabelFamily, LabelHostClass, LabelInstanceCPU, LabelInstanceMemory, LabelLocation)
 	karpv1.WellKnownLabelsForOfferings.Insert(LabelHostClass)
+	// CSI persists its driver-owned topology key in PV node affinity. Normalize
+	// that alias to the location requirement advertised by every catalog shape
+	// so an existing volume can trigger replacement capacity without a
+	// user-authored NodePool workaround.
+	karpv1.NormalizedLabels[CSITopologyLocationKey] = LabelLocation
 }
 
 // New returns the complete, finite 31-variant InSpace catalog. Prices are

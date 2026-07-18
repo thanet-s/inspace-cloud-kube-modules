@@ -39,6 +39,12 @@ weights. Specify the requirement whenever hardware identity matters.
 NodeClass readiness validates both frozen class-to-pool UUID mappings and
 reports them as `status.hostPoolUUIDs`.
 
+CSI reports location through `topology.inspace.cloud/location`, while the
+catalog's canonical scheduling label remains `inspace.cloud/location`. The
+provider normalizes the CSI key to the catalog key before Karpenter evaluates
+bound-volume topology. Existing RWO volumes can therefore trigger replacement
+capacity without adding a duplicate location requirement to every NodePool.
+
 Catalog offering prices use only the compute rates derived from the current
 InSpace custom-VM calculator: `monthly compute THB = CPU cores × 60 + RAM GiB
 × 30`, converted to hourly THB with 730 billing hours per month. Root-disk cost
