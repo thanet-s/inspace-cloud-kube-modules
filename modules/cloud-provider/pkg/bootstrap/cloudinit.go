@@ -216,6 +216,9 @@ func RenderCloudInitJSON(input CloudInitInput) (string, error) {
 	addFile("/usr/local/sbin/inspace-bootstrap-rke2", script, "0700")
 	addFile("/var/lib/inspace/rke2-config", config, "0600")
 	addFile("/var/lib/inspace/rke2-cilium-config", ciliumConfig, "0600")
+	if input.SingleControlPlane {
+		addFile("/var/lib/inspace/rke2-coredns-config", renderRKE2SingleControlPlaneCoreDNSConfig(), "0600")
+	}
 	addFile("/var/lib/inspace/rke2-cilium-private-load-balancer", ciliumLoadBalancerConfig, "0600")
 	addFile("/var/lib/inspace/rke2-kube-vip", kubeVIPConfig, "0600")
 	if input.BootstrapCache != nil {
@@ -381,6 +384,20 @@ spec:
     k8sServiceHost: localhost
     k8sServicePort: 6443
 `, operatorValues, yamlString(podCIDR), qps, burst)
+}
+
+func renderRKE2SingleControlPlaneCoreDNSConfig() string {
+	return `apiVersion: helm.cattle.io/v1
+kind: HelmChartConfig
+metadata:
+  name: rke2-coredns
+  namespace: kube-system
+spec:
+  valuesContent: |-
+    replicaCount: 1
+    autoscaler:
+      enabled: false
+`
 }
 
 func renderCiliumPrivateLoadBalancerManifest(start, stop string) string {
@@ -577,6 +594,10 @@ func renderInstallScript(input CloudInitInput) string {
 	if input.BootstrapCache == nil {
 		return renderDirectInstallScript(input)
 	}
+	singleControlPlaneCoreDNSInstall := ""
+	if input.SingleControlPlane {
+		singleControlPlaneCoreDNSInstall = "install -m 0600 /var/lib/inspace/rke2-coredns-config /var/lib/rancher/rke2/server/manifests/rke2-coredns-config.yaml\n"
+	}
 	releaseBase := "https://github.com/rancher/rke2/releases/download/" + url.PathEscape(input.RKE2Version)
 	cacheWait := "cache_curl_option=\n"
 	cacheHostsSetup := renderNodeCacheHostsSetup(input.BootstrapCache)
@@ -645,7 +666,7 @@ install -m 0600 /var/lib/inspace/rke2-config /etc/rancher/rke2/config.yaml
 sed -i "s/__PRIVATE_IP__/$PRIVATE_IP/g" /etc/rancher/rke2/config.yaml
 chmod 0600 /etc/rancher/rke2/config.yaml
 install -m 0600 /var/lib/inspace/rke2-cilium-config /var/lib/rancher/rke2/server/manifests/rke2-cilium-config.yaml
-install -m 0600 /var/lib/inspace/rke2-cilium-private-load-balancer /var/lib/rancher/rke2/server/manifests/inspace-private-load-balancer.yaml
+%sinstall -m 0600 /var/lib/inspace/rke2-cilium-private-load-balancer /var/lib/rancher/rke2/server/manifests/inspace-private-load-balancer.yaml
 install -m 0600 /var/lib/inspace/rke2-kube-vip /var/lib/rancher/rke2/agent/pod-manifests/kube-vip.yaml
 sed -i "s/__PRIVATE_IFACE__/$PRIVATE_IF/g" /var/lib/rancher/rke2/agent/pod-manifests/kube-vip.yaml
 
@@ -681,10 +702,14 @@ until systemctl is-active --quiet rke2-server.service && [ -s /etc/rancher/rke2/
   if systemctl is-failed --quiet rke2-server.service || [ "$attempt" -ge 180 ]; then exit 1; fi
   sleep 5
 done
-`, strings.TrimSpace(renderUbuntuRepositoryAndResolverCommands(input.NodeName)), renderAPTUpgradeContinuation(input.SkipOSUpgrade, "\t  "), strings.TrimSpace(renderDisableAutomaticAPTUpdatesCommands()), input.PrivateSubnet, input.VirtualIPv4, cacheHostsSetup, strings.TrimSpace(strings.TrimPrefix(renderDisableUFWScript(), "#!/bin/sh\nset -eu\n")), cacheWait, input.RKE2Version, releaseBase)
+`, strings.TrimSpace(renderUbuntuRepositoryAndResolverCommands(input.NodeName)), renderAPTUpgradeContinuation(input.SkipOSUpgrade, "\t  "), strings.TrimSpace(renderDisableAutomaticAPTUpdatesCommands()), input.PrivateSubnet, input.VirtualIPv4, cacheHostsSetup, singleControlPlaneCoreDNSInstall, strings.TrimSpace(strings.TrimPrefix(renderDisableUFWScript(), "#!/bin/sh\nset -eu\n")), cacheWait, input.RKE2Version, releaseBase)
 }
 
 func renderDirectInstallScript(input CloudInitInput) string {
+	singleControlPlaneCoreDNSInstall := ""
+	if input.SingleControlPlane {
+		singleControlPlaneCoreDNSInstall = "install -m 0600 /var/lib/inspace/rke2-coredns-config /var/lib/rancher/rke2/server/manifests/rke2-coredns-config.yaml\n"
+	}
 	releaseBase := "https://github.com/rancher/rke2/releases/download/" + url.PathEscape(input.RKE2Version)
 	return fmt.Sprintf(`#!/bin/sh
 set -eu
@@ -736,7 +761,7 @@ install -m 0600 /var/lib/inspace/rke2-config /etc/rancher/rke2/config.yaml
 sed -i "s/__PRIVATE_IP__/$PRIVATE_IP/g" /etc/rancher/rke2/config.yaml
 chmod 0600 /etc/rancher/rke2/config.yaml
 install -m 0600 /var/lib/inspace/rke2-cilium-config /var/lib/rancher/rke2/server/manifests/rke2-cilium-config.yaml
-install -m 0600 /var/lib/inspace/rke2-cilium-private-load-balancer /var/lib/rancher/rke2/server/manifests/inspace-private-load-balancer.yaml
+%sinstall -m 0600 /var/lib/inspace/rke2-cilium-private-load-balancer /var/lib/rancher/rke2/server/manifests/inspace-private-load-balancer.yaml
 install -m 0600 /var/lib/inspace/rke2-kube-vip /var/lib/rancher/rke2/agent/pod-manifests/kube-vip.yaml
 sed -i "s/__PRIVATE_IFACE__/$PRIVATE_IF/g" /var/lib/rancher/rke2/agent/pod-manifests/kube-vip.yaml
 
@@ -770,7 +795,7 @@ until systemctl is-active --quiet rke2-server.service && [ -s /etc/rancher/rke2/
   if systemctl is-failed --quiet rke2-server.service || [ "$attempt" -ge 180 ]; then exit 1; fi
   sleep 5
 done
-`, strings.TrimSpace(renderUbuntuRepositoryAndResolverCommands(input.NodeName)), renderAPTUpgradeContinuation(input.SkipOSUpgrade, "\t  "), strings.TrimSpace(renderDisableAutomaticAPTUpdatesCommands()), input.PrivateSubnet, input.VirtualIPv4, strings.TrimSpace(strings.TrimPrefix(renderDisableUFWScript(), "#!/bin/sh\nset -eu\n")), input.RKE2Version, releaseBase)
+`, strings.TrimSpace(renderUbuntuRepositoryAndResolverCommands(input.NodeName)), renderAPTUpgradeContinuation(input.SkipOSUpgrade, "\t  "), strings.TrimSpace(renderDisableAutomaticAPTUpdatesCommands()), input.PrivateSubnet, input.VirtualIPv4, singleControlPlaneCoreDNSInstall, strings.TrimSpace(strings.TrimPrefix(renderDisableUFWScript(), "#!/bin/sh\nset -eu\n")), input.RKE2Version, releaseBase)
 }
 
 func sortedUniquePorts(ports []int) []int {

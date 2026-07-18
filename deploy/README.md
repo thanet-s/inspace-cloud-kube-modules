@@ -47,7 +47,10 @@ Set `control_plane_replicas` to:
 Two is rejected. Replica count is immutable after creation; changing one to
 three or three to one requires a complete, explicit destroy/recreate lifecycle.
 Both layouts keep application workloads off the tainted fixed control plane
-and start with zero Karpenter workers.
+and start with zero Karpenter workers. The one-server layout pins CoreDNS to
+one replica and disables its proportional autoscaler; otherwise a temporary
+worker would receive a second CoreDNS Pod and could never become empty for
+Karpenter consolidation.
 
 ## Commands
 
@@ -76,7 +79,8 @@ serialization are compared using their API default of `false`. It then:
 7. on a one-server topology, temporarily schedules only RKE2's packaged
    installation Jobs on cp0, restores both the control-plane and cloud-provider
    startup taints to their original state, and verifies zero workers before
-   Karpenter exists;
+   Karpenter exists; its bootstrap Helm configuration also keeps CoreDNS at
+   one cp0 replica so an application worker can return to zero after use;
 8. installs exact-version OCI charts and the default Karpenter resources.
 
 `update` does not replace fixed VMs or rewrite bootstrap cloud-init. It puts

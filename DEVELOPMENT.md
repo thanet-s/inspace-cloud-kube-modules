@@ -158,6 +158,10 @@ cloud-init.
 RKE2 uses its bundled Cilium chart in native-routing mode. Cilium installs
 direct pod-CIDR routes on the shared VPC, performs eBPF IPv4 masquerading for
 internet egress, and fully replaces kube-proxy with eBPF service handling.
+The one-control-plane topology renders a bootstrap-time CoreDNS
+`HelmChartConfig` with one replica and no proportional autoscaler. This keeps
+the first elastic worker removable under `WhenEmpty`; the three-control-plane
+topology retains RKE2's packaged CoreDNS defaults.
 
 A private kube-vip address inside the VPC is advertised by control-plane nodes
 with ARP leader election. It is the stable RKE2 API endpoint on TCP/6443 and
