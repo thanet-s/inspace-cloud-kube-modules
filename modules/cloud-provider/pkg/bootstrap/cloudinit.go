@@ -133,6 +133,10 @@ type CloudInitInput struct {
 	TLSSubjectAltNames           []string
 	Disable                      []string
 	BootstrapCache               *NodeCacheConfig
+	// SingleControlPlane sizes packaged components that otherwise require two
+	// distinct schedulable nodes. It must remain false for the established
+	// three-control-plane cloud-init contract.
+	SingleControlPlane bool
 	// SkipOSUpgrade removes only apt-get upgrade from the bounded package
 	// stage. Repository setup, apt-get update, and required installs remain.
 	SkipOSUpgrade bool
@@ -181,7 +185,7 @@ func RenderCloudInitJSON(input CloudInitInput) (string, error) {
 		return "", err
 	}
 	config := renderRKE2Config(input)
-	ciliumConfig := renderRKE2CiliumConfig(input.PodCIDR, privatePool.AddressCount)
+	ciliumConfig := renderRKE2CiliumConfig(input.PodCIDR, privatePool.AddressCount, input.SingleControlPlane)
 	ciliumLoadBalancerConfig := renderCiliumPrivateLoadBalancerManifest(input.PrivateLoadBalancerPoolStart, input.PrivateLoadBalancerPoolStop)
 	kubeVIPConfig := renderKubeVIPStaticPod(input.VirtualIPv4, input.BootstrapCache)
 	script := renderInstallScript(input)
@@ -339,7 +343,7 @@ func renderRKE2Config(input CloudInitInput) string {
 	return strings.Join(lines, "\n") + "\n"
 }
 
-func renderRKE2CiliumConfig(podCIDR string, privateLoadBalancerAddressCount uint64) string {
+func renderRKE2CiliumConfig(podCIDR string, privateLoadBalancerAddressCount uint64, singleControlPlane bool) string {
 	qps := (privateLoadBalancerAddressCount + 4) / 5
 	if qps < 10 {
 		qps = 10
@@ -348,6 +352,10 @@ func renderRKE2CiliumConfig(podCIDR string, privateLoadBalancerAddressCount uint
 	if burst < 20 {
 		burst = 20
 	}
+	operatorValues := ""
+	if singleControlPlane {
+		operatorValues = "    operator:\n      replicas: 1\n"
+	}
 	return fmt.Sprintf(`apiVersion: helm.cattle.io/v1
 kind: HelmChartConfig
 metadata:
@@ -355,7 +363,7 @@ metadata:
   namespace: kube-system
 spec:
   valuesContent: |-
-    routingMode: native
+%s    routingMode: native
     ipv4NativeRoutingCIDR: %s
     autoDirectNodeRoutes: true
     kubeProxyReplacement: true
@@ -372,7 +380,7 @@ spec:
       mode: kubernetes
     k8sServiceHost: localhost
     k8sServicePort: 6443
-`, yamlString(podCIDR), qps, burst)
+`, operatorValues, yamlString(podCIDR), qps, burst)
 }
 
 func renderCiliumPrivateLoadBalancerManifest(start, stop string) string {

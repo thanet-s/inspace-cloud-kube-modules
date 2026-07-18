@@ -2828,7 +2828,8 @@ func (r *Reconciler) desiredControlPlaneVMRequest(cluster *v1alpha1.InSpaceClust
 		PrivateLoadBalancerPoolStart: cluster.Spec.Network.PrivateLoadBalancerPool.Start,
 		PrivateLoadBalancerPoolStop:  cluster.Spec.Network.PrivateLoadBalancerPool.Stop,
 		TLSSubjectAltNames:           tlsNames, Disable: cluster.Spec.RKE2.Disable,
-		BootstrapCache: cache, SkipOSUpgrade: cluster.Spec.RKE2.SkipOSUpgrade,
+		BootstrapCache: cache, SingleControlPlane: controlPlaneReplicaCount(cluster) == 1,
+		SkipOSUpgrade: cluster.Spec.RKE2.SkipOSUpgrade,
 	})
 	if err != nil {
 		return inspace.CreateVMRequest{}, err

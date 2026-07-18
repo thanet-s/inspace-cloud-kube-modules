@@ -64,7 +64,8 @@ deploy/run.sh tunnel "$PWD/deploy/inventory.yml"
 bootstrap-spec drift before touching the persisted `cluster.yaml`; this avoids
 erasing uncertain cloud-mutation receipts. Before its first cloud mutation it
 also persists the bootstrap-controller version that must later resume or
-destroy that ledger. It then:
+destroy that ledger. Boolean fields omitted by the controller's canonical YAML
+serialization are compared using their API default of `false`. It then:
 
 1. generates and persists the RKE2 token and optional cache PKI seed;
 2. runs the exact released bootstrap controller to API-level readiness;
@@ -72,7 +73,10 @@ destroy that ledger. It then:
 4. pins bastion and private control-plane SSH host keys;
 5. retrieves a kubeconfig whose endpoint is only the local bastion tunnel;
 6. waits for the requested one or three Ready servers;
-7. installs exact-version OCI charts and the default Karpenter resources.
+7. on a one-server topology, temporarily schedules only RKE2's packaged
+   installation Jobs on cp0, restores its `NoSchedule` taint, and verifies
+   zero workers before Karpenter exists;
+8. installs exact-version OCI charts and the default Karpenter resources.
 
 `update` does not replace fixed VMs or rewrite bootstrap cloud-init. It puts
 `control_plane_extra_config` in RKE2's operator fragment and restarts at most

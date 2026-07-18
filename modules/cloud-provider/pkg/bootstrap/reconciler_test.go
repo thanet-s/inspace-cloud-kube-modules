@@ -4455,17 +4455,28 @@ func TestPrivateLoadBalancerPoolVPCValidationAndCiliumRateSizing(t *testing.T) {
 			}
 		})
 	}
-	minimumRate := renderRKE2CiliumConfig("10.42.0.0/16", 40)
+	minimumRate := renderRKE2CiliumConfig("10.42.0.0/16", 40, false)
 	if !strings.Contains(minimumRate, "qps: 10\n      burst: 20") {
 		t.Fatalf("minimum Cilium L2 rate limit is wrong: %s", minimumRate)
 	}
-	scaledRate := renderRKE2CiliumConfig("10.42.0.0/16", 51)
+	scaledRate := renderRKE2CiliumConfig("10.42.0.0/16", 51, false)
 	if !strings.Contains(scaledRate, "qps: 11\n      burst: 22") {
 		t.Fatalf("scaled Cilium L2 rate limit is wrong: %s", scaledRate)
 	}
-	maximumRate := renderRKE2CiliumConfig("10.42.0.0/16", 256)
+	maximumRate := renderRKE2CiliumConfig("10.42.0.0/16", 256, false)
 	if !strings.Contains(maximumRate, "qps: 52\n      burst: 104") {
 		t.Fatalf("maximum Cilium L2 rate limit is wrong: %s", maximumRate)
+	}
+	if strings.Contains(minimumRate, "operator:") {
+		t.Fatalf("three-control-plane Cilium values changed unexpectedly: %s", minimumRate)
+	}
+	singleControlPlane := renderRKE2CiliumConfig("10.42.0.0/16", 40, true)
+	const singleOperatorValues = "    operator:\n      replicas: 1\n"
+	if !strings.Contains(singleControlPlane, singleOperatorValues) {
+		t.Fatalf("single-control-plane Cilium operator is not sized to one replica: %s", singleControlPlane)
+	}
+	if strings.Replace(singleControlPlane, singleOperatorValues, "", 1) != minimumRate {
+		t.Fatal("single-control-plane Cilium rendering changed more than operator replicas")
 	}
 }
 
