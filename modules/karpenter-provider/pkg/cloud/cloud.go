@@ -11,8 +11,10 @@ import (
 )
 
 var (
-	ErrNotFound          = errors.New("cloud resource not found")
-	ErrOwnershipMismatch = errors.New("cloud resource ownership does not match")
+	ErrNotFound                    = errors.New("cloud resource not found")
+	ErrOwnershipMismatch           = errors.New("cloud resource ownership does not match")
+	ErrAttachedNonPrimaryVolumes   = errors.New("VM has attached non-primary block volumes")
+	ErrVMStorageInventoryUncertain = errors.New("VM storage inventory is not authoritative")
 	// ErrCreateAttemptPending means a durable pre-POST fence exists but the
 	// previous attempt is still inside the cloud visibility ambiguity window.
 	ErrCreateAttemptPending = errors.New("durable VM create attempt remains ambiguous")

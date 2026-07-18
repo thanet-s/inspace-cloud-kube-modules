@@ -108,6 +108,12 @@ system images directly from the upstream hosts.
 | Public load balancing | TCP through an InSpace NLB; TCP/UDP through managed shards or selected endpoint-local nodes |
 | Private load balancing | Cilium LB IPAM and L2 Announcements |
 
+> [!WARNING]
+> Do not delete a worker VM through the InSpace dashboard or API while any
+> non-primary block volume is attached. InSpace can delete those volumes with
+> the VM. Use Kubernetes/Karpenter termination so CSI can detach them first;
+> see [VM deletion safety](modules/csi-driver/README.md#vm-deletion-safety).
+
 ## Documentation
 
 - [Helm installation and configuration](charts/inspace-cloud-kube-modules/README.md)

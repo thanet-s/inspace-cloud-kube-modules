@@ -369,7 +369,7 @@ rule applies to all 22 write methods in the shared client:
 | Relationship creation | `AttachDisk`, `AssignFloatingIP`, `AssignFirewallToVM`, `AddLoadBalancerTarget`, `AddLoadBalancerRule` | Fence the exact resource pair or rule before POST. Treat exact duplicate relationship rows as one set member, but reject malformed rows or the same resource on a different owner. |
 | Deterministic replacement | `UpdateFloatingIP`, `UpdateFirewall` | Persist the exact desired payload/generation, issue once, then compare authoritative readback with both the applied and pending payload. A third state fails closed. |
 | Relationship removal | `DetachDisk`, `UnassignFloatingIP`, `UnassignFirewallFromVM`, `RemoveLoadBalancerTarget`, `RemoveLoadBalancerRule` | Persist the exact stable pair/UUID and an issued receipt before dispatch. Once issued, never repeat the removal merely because the relationship remains visible; require exact authoritative absence or explicit operator resolution. |
-| Resource deletion | `DeleteVM`, `DeleteDisk`, `DeleteFloatingIP`, `DeleteFirewall`, `DeleteLoadBalancer` | Delete only an exact durably owned UUID/address after persisting an issued receipt. Never replay an issued delete after any returned result; keep the finalizer or teardown receipt until repeated authoritative absence releases dependents and ownership state. |
+| Resource deletion | `DeleteVM`, `DeleteDisk`, `DeleteFloatingIP`, `DeleteFirewall`, `DeleteLoadBalancer` | Delete only an exact durably owned UUID/address after persisting an issued receipt. A VM must additionally report exactly one primary root disk and zero attached non-primary block volumes. Never replay an issued delete after any returned result; keep the finalizer or teardown receipt until repeated authoritative absence releases dependents and ownership state. |
 
 The shared client never automatically replays POST, PUT, PATCH, or DELETE, and
 blocks redirects for those methods. Every error returned after dispatch is
@@ -537,6 +537,17 @@ Get/List/VPC absence, removes only the exact Floating IP, proves VM and
 FIP-assignment absence again, and finally removes every stale firewall
 assignment for the UUID. The shared firewall itself is not deleted with an
 individual worker.
+
+VM DELETE has an additional fail-closed storage invariant. The first canonical
+read must contain exactly one primary root disk and no non-primary entries
+before deletion authorization. After the removal-mutation CAS and all ownership
+proofs, a final exact read repeats the same check immediately before the SDK
+call. Any attached non-primary block volume, sparse inventory, or ambiguous
+primary layout prevents dispatch; a newly issued receipt is rejected, the
+NodeClaim finalizer remains, and no VM dependent is removed. The API has no
+conditional DELETE, so this is the narrowest provider-side race window rather
+than an atomic cloud guarantee. Direct dashboard/API VM deletion bypasses the
+guard and can delete all attached non-primary block volumes.
 
 Karpenter VM creation also uses a durable one-POST fence. After its issue CAS,
 fresh deterministic-name and ownership inventory either adopts one exact VM or

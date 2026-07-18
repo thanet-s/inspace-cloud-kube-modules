@@ -393,9 +393,11 @@ func TestTerminationRecoveryRejectsObservationPredatingDeletion(t *testing.T) {
 
 func TestTerminationRecoveryAcceptsOnlyTypedNodeClaimNotFound(t *testing.T) {
 	tests := map[string]error{
-		"nil":     nil,
-		"generic": errors.New("temporary cloud failure"),
-		"pending": cloudapi.ErrCreateAttemptPending,
+		"nil":                          nil,
+		"generic":                      errors.New("temporary cloud failure"),
+		"pending":                      cloudapi.ErrCreateAttemptPending,
+		"attached non-primary volumes": cloudapi.ErrAttachedNonPrimaryVolumes,
+		"uncertain storage inventory":  cloudapi.ErrVMStorageInventoryUncertain,
 	}
 	for name, deleteErr := range tests {
 		t.Run(name, func(t *testing.T) {
