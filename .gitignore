@@ -24,3 +24,9 @@ __pycache__/
 
 # Local full-cluster E2E journals, kubeconfigs, generated tokens, and host keys.
 .e2e/
+
+# Operator-owned deployment inventory, credentials, kubeconfigs, and lifecycle
+# state. Only deploy/inventory.example.yml is committed.
+deploy/inventory.yml
+deploy/inventory/
+deploy/.state/

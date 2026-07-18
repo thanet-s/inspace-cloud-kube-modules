@@ -188,8 +188,8 @@ func (s InSpaceClusterSpec) Validate() []error {
 	if s.CredentialsSecretRef.Name == "" || s.CredentialsSecretRef.Key == "" {
 		add("spec.credentialsSecretRef", "name and key are required")
 	}
-	if s.ControlPlane.Replicas != 3 {
-		add("spec.controlPlane.replicas", "must be exactly 3 in v1alpha1")
+	if s.ControlPlane.Replicas != 1 && s.ControlPlane.Replicas != 3 {
+		add("spec.controlPlane.replicas", "must be either 1 or 3")
 	}
 	machine := s.ControlPlane.Machine
 	if machine.VCPU < 2 || machine.VCPU > 16 {
@@ -337,7 +337,7 @@ func (c InSpaceCluster) Validate() []error {
 		})
 	}
 	if c.Spec.ControlPlane.Replicas == 0 {
-		errs = append(errs, fmt.Errorf("spec.controlPlane.replicas: must be explicitly set to 3"))
+		errs = append(errs, fmt.Errorf("spec.controlPlane.replicas: must be explicitly set to 1 or 3"))
 		return errs
 	}
 	return append(errs, c.Spec.Validate()...)

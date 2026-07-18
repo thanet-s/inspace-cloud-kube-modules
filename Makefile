@@ -2,7 +2,7 @@ SHELL := /bin/sh
 
 MODULES := modules/client modules/cloud-provider modules/csi-driver modules/karpenter-provider
 
-.PHONY: all fmt test smoke cache-registry-smoke vet helm-verify helm-package e2e-static live-harness-verify release-notes-verify verify images status live-audit live-test cluster-e2e cluster-e2e-init cluster-e2e-test cluster-e2e-shell cluster-e2e-destroy
+.PHONY: all fmt test smoke cache-registry-smoke vet helm-verify helm-package deploy-verify e2e-static live-harness-verify release-notes-verify verify images status live-audit live-test cluster-e2e cluster-e2e-init cluster-e2e-test cluster-e2e-shell cluster-e2e-destroy
 
 all: test
 
@@ -58,6 +58,14 @@ helm-package: helm-verify
 	helm package charts/inspace-cloud-kube-modules-crds --destination dist
 	helm package charts/inspace-cloud-kube-modules --destination dist
 
+deploy-verify:
+	python3 deploy/verify-static.py
+	python3 -m py_compile deploy/scripts/discover_bootstrap.py
+	@set -eu; for script in deploy/run.sh deploy/scripts/*.sh; do \
+		bash -n "$$script"; \
+	done
+	sh -n deploy/templates/apply-control-plane-config.sh
+
 e2e-static:
 	python3 test/e2e/verify-static.py
 	python3 test/e2e/test-public-node-local-verifier.py
@@ -72,7 +80,7 @@ release-notes-verify:
 	@./scripts/test-filter-release-notes.sh
 	@./scripts/test-verify-release-tag.sh
 
-verify: test smoke vet helm-verify e2e-static live-harness-verify release-notes-verify
+verify: test smoke vet helm-verify deploy-verify e2e-static live-harness-verify release-notes-verify
 
 images:
 	docker build --platform=linux/amd64 -f modules/cloud-provider/Dockerfile -t inspace-cloud-controller-manager:dev .

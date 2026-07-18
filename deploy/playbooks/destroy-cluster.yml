@@ -1,0 +1,242 @@
+---
+- name: Safely destroy one journaled InSpace RKE2 cluster
+  hosts: localhost
+  gather_facts: false
+  vars:
+    deploy_create_state_dir: false
+  tasks:
+    - name: Validate inventory, topology, tools, and SSH identity
+      ansible.builtin.include_tasks: tasks/preflight.yml
+
+    - name: Require the API token only in the process environment
+      ansible.builtin.assert:
+        that: lookup('env', 'INSPACE_API_TOKEN') | length > 0
+        fail_msg: "Export INSPACE_API_TOKEN; do not store it in inventory."
+      no_log: true
+
+    - name: Load and validate the deployment journal
+      ansible.builtin.include_tasks: tasks/load-state.yml
+
+    - name: Require an exact typed cluster-name destruction confirmation
+      ansible.builtin.assert:
+        that:
+          - confirm_cluster_name | default('') == cluster_name
+          - deployment_state.clusterName == confirm_cluster_name
+        fail_msg: >-
+          Export CONFIRM_CLUSTER_DESTROY={{ cluster_name }} and rerun destroy.
+          No Kubernetes or cloud mutation was attempted.
+
+    - name: Start the private API tunnel before deleting Kubernetes owners
+      ansible.builtin.include_tasks: tasks/start-tunnel.yml
+
+    - name: Refuse bootstrap deletion while PVC or PV ownership remains
+      ansible.builtin.shell: |
+        set -euo pipefail
+        kubeconfig={{ (deploy_state_dir + '/kubeconfig.yaml') | quote }}
+        test "$(kubectl --kubeconfig "$kubeconfig" get pvc -A -o json | jq '.items | length')" -eq 0
+        test "$(kubectl --kubeconfig "$kubeconfig" get pv -o json | jq '.items | length')" -eq 0
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Delete every LoadBalancer Service while its owning CCM is healthy
+      ansible.builtin.shell: |
+        set -euo pipefail
+        kubeconfig={{ (deploy_state_dir + '/kubeconfig.yaml') | quote }}
+        kubectl --kubeconfig "$kubeconfig" get service -A -o json |
+          jq -r '.items[] | select(.spec.type == "LoadBalancer") | [.metadata.namespace,.metadata.name] | @tsv' |
+          while IFS="$(printf '\t')" read -r namespace name; do
+            test -z "$namespace" || kubectl --kubeconfig "$kubeconfig" -n "$namespace" delete service "$name" --wait=true --timeout=15m
+          done
+      args:
+        executable: /bin/bash
+      changed_when: true
+
+    - name: Delete every Karpenter NodePool to terminate worker and NodeLB capacity
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - --kubeconfig
+          - "{{ deploy_state_dir }}/kubeconfig.yaml"
+          - delete
+          - nodepool
+          - --all
+          - --wait=false
+      changed_when: true
+
+    - name: Wait for all NodeClaims and non-control-plane nodes to disappear
+      ansible.builtin.shell: |
+        set -euo pipefail
+        kubeconfig={{ (deploy_state_dir + '/kubeconfig.yaml') | quote }}
+        test "$(kubectl --kubeconfig "$kubeconfig" get nodeclaim -o json | jq '.items | length')" -eq 0
+        test "$(kubectl --kubeconfig "$kubeconfig" get nodes -o json | jq \
+          '[.items[] | select(.metadata.labels | has("node-role.kubernetes.io/control-plane") | not)] | length')" -eq 0
+      args:
+        executable: /bin/bash
+      register: deploy_worker_cleanup
+      changed_when: false
+      retries: 180
+      delay: 10
+      until: deploy_worker_cleanup.rc == 0
+
+    - name: Refuse controller removal while volume attachments remain
+      ansible.builtin.command:
+        argv:
+          - sh
+          - -ceu
+          - >-
+            test "$(kubectl --kubeconfig "$1" get volumeattachment -o json |
+            jq '.items | length')" -eq 0
+          - sh
+          - "{{ deploy_state_dir }}/kubeconfig.yaml"
+      changed_when: false
+
+    - name: Delete all InSpace NodeClasses after NodeClaims are absent
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - --kubeconfig
+          - "{{ deploy_state_dir }}/kubeconfig.yaml"
+          - delete
+          - inspacenodeclass
+          - --all
+          - --wait=true
+          - --timeout=10m
+      changed_when: true
+
+    - name: Uninstall CCM CSI and Karpenter
+      ansible.builtin.command:
+        argv:
+          - helm
+          - --kubeconfig
+          - "{{ deploy_state_dir }}/kubeconfig.yaml"
+          - uninstall
+          - inspace
+          - --namespace
+          - kube-system
+          - --wait
+          - --timeout
+          - 15m
+          - --ignore-not-found
+      changed_when: true
+
+    - name: Remove in-cluster cloud credentials and registration token
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - --kubeconfig
+          - "{{ deploy_state_dir }}/kubeconfig.yaml"
+          - -n
+          - kube-system
+          - delete
+          - secret
+          - inspace-cloud-credentials
+          - inspace-rke2-agent-token
+          - --ignore-not-found
+          - --wait=true
+      changed_when: true
+
+    - name: Uninstall the InSpace CRDs after all custom resources are absent
+      ansible.builtin.command:
+        argv:
+          - helm
+          - --kubeconfig
+          - "{{ deploy_state_dir }}/kubeconfig.yaml"
+          - uninstall
+          - inspace-crds
+          - --namespace
+          - kube-system
+          - --wait
+          - --timeout
+          - 10m
+          - --ignore-not-found
+      changed_when: true
+
+    - name: Stop the local API tunnel before fixed infrastructure deletion
+      ansible.builtin.command:
+        argv:
+          - "{{ deploy_root }}/scripts/api-tunnel.sh"
+          - stop
+          - "{{ deploy_state_dir }}"
+      changed_when: true
+
+    - name: Pull the bootstrap controller version that owns the durable ledger
+      ansible.builtin.command:
+        argv:
+          - docker
+          - pull
+          - "ghcr.io/thanet-s/inspace-cloud-controller-manager:{{ deployment_state.bootstrapControllerVersion }}"
+      changed_when: true
+
+    - name: Delete only journaled bootstrap-owned infrastructure
+      ansible.builtin.command:
+        argv:
+          - docker
+          - run
+          - --rm
+          - "--user={{ lookup('pipe', 'id -u') }}:{{ lookup('pipe', 'id -g') }}"
+          - --entrypoint
+          - /usr/local/bin/inspace-cluster-controller
+          - --env
+          - INSPACE_ALLOW_REMOTE_MUTATIONS
+          - --env
+          - INSPACE_API_URL
+          - --env
+          - INSPACE_API_TOKEN
+          - --mount
+          - "type=bind,src={{ deploy_state_dir }},dst=/state"
+          - "ghcr.io/thanet-s/inspace-cloud-controller-manager:{{ deployment_state.bootstrapControllerVersion }}"
+          - --cluster-config
+          - /state/cluster.yaml
+          - --delete
+          - --interval
+          - 10s
+          - --operation-timeout
+          - 2h
+          - --management-cidr
+          - "{{ management_cidr }}"
+          - --management-tcp-ports
+          - "22"
+          - --output=json
+      environment:
+        INSPACE_ALLOW_REMOTE_MUTATIONS: "true"
+        INSPACE_API_URL: "{{ inspace_api_url }}"
+        INSPACE_API_TOKEN: "{{ lookup('env', 'INSPACE_API_TOKEN') }}"
+      register: deploy_destroy_controller
+      changed_when: true
+      no_log: true
+
+    - name: Decode the authoritative destroy result
+      ansible.builtin.set_fact:
+        deploy_destroy_result: >-
+          {{ (deploy_destroy_controller.stdout_lines | select('match', '^\{') | list | last) | from_json }}
+      no_log: true
+
+    - name: Require owner-scoped bootstrap deletion to converge
+      ansible.builtin.assert:
+        that:
+          - deploy_destroy_result.done | bool
+          - deploy_destroy_result.owner == deployment_state.owner
+          - deploy_destroy_result.remaining | default([]) | length == 0
+        fail_msg: "Bootstrap controller did not prove owned infrastructure absent."
+
+    - name: Persist the final destroy receipt
+      ansible.builtin.copy:
+        content: "{{ deploy_destroy_result | to_nice_json }}\n"
+        dest: "{{ deploy_state_dir }}/destroy-result.json"
+        mode: "0600"
+
+    - name: Mark the local deployment journal destroyed
+      ansible.builtin.copy:
+        content: >-
+          {{ deployment_state |
+             combine({'destroyed': true, 'destroyResult': deploy_destroy_result}, recursive=true) |
+             to_nice_json }}{{ '\n' }}
+        dest: "{{ deploy_state_dir }}/state.json"
+        mode: "0600"
+
+    - name: Report safe destruction
+      ansible.builtin.debug:
+        msg: >-
+          Cluster {{ cluster_name }} is destroyed. The VPC, manually managed
+          floating IPs, and unrelated account resources were not deletion targets.

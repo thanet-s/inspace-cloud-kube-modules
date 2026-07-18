@@ -1,0 +1,47 @@
+apiVersion: infrastructure.inspace.cloud/v1alpha1
+kind: InSpaceCluster
+metadata:
+  name: {{ cluster_name }}
+  namespace: inspace-system
+spec:
+  location: {{ inspace_location }}
+  billingAccountID: {{ inspace_billing_account_id }}
+  credentialsSecretRef:
+    name: inspace-cloud-credentials
+    key: api-token
+  controlPlane:
+    replicas: {{ control_plane_replicas }}
+    machine:
+      vcpu: {{ control_plane_vcpu }}
+      memoryMiB: {{ control_plane_memory_mib }}
+      rootDiskGiB: {{ control_plane_root_disk_gib }}
+      hostPoolUUID: {{ inspace_amd_host_pool_uuid }}
+      image:
+        osName: ubuntu
+        osVersion: "24.04"
+  bootstrapCache:
+    directDownload: {{ bootstrap_direct_download | bool | ternary('true', 'false') }}
+  rke2:
+    version: {{ rke2_version }}
+    skipOSUpgrade: {{ skip_os_upgrade | bool | ternary('true', 'false') }}
+    tokenSecretRef:
+      name: inspace-rke2-agent-token
+      key: token
+    disable:
+      - rke2-ingress-nginx
+    tlsSubjectAltNames:
+      - "{{ control_plane_vip }}"
+  network:
+    uuid: {{ inspace_network_uuid }}
+    podCIDR: {{ pod_cidr }}
+    serviceCIDR: {{ service_cidr }}
+    privateLoadBalancerPool:
+      start: "{{ private_load_balancer_pool_start }}"
+      stop: "{{ private_load_balancer_pool_stop }}"
+  firewall:
+    managed: true
+  publicIPv4:
+    managed: true
+  endpoint:
+    virtualIPv4: "{{ control_plane_vip }}"
+    port: 6443

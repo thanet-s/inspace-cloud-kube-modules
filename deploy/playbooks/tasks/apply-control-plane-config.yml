@@ -1,0 +1,20 @@
+---
+- name: Render the operator-owned RKE2 config fragment
+  ansible.builtin.template:
+    src: "{{ deploy_root }}/templates/control-plane-extra-config.yaml.j2"
+    dest: "{{ deploy_state_dir }}/control-plane-extra-config.yaml"
+    mode: "0600"
+
+- name: Render the fixed remote config installer
+  ansible.builtin.template:
+    src: "{{ deploy_root }}/templates/apply-control-plane-config.sh"
+    dest: "{{ deploy_state_dir }}/apply-control-plane-config.sh"
+    mode: "0700"
+
+- name: Apply RKE2 configuration one control-plane server at a time
+  ansible.builtin.include_tasks: update-one-control-plane.yml
+  loop: "{{ deployment_state.controlPlanes }}"
+  loop_control:
+    loop_var: deploy_control_plane
+    index_var: deploy_cp_index
+    label: "{{ deploy_control_plane.name }}"

@@ -52,8 +52,9 @@ The bootstrap-owned bastion is fixed to Ubuntu 24.04, 1 vCPU, 2 GiB RAM, and a
 ### Node naming and preparation
 
 The control-plane VM names, guest hostnames, and Kubernetes Node names are
-exactly `<InSpaceCluster metadata.name>-cp0`, `-cp1`, and `-cp2`. The bastion is
-exactly `<InSpaceCluster metadata.name>-bastion`. Cluster names are limited to
+exactly `<InSpaceCluster metadata.name>-cp0` for one-server topology, with
+`-cp1` and `-cp2` added for three-server HA topology. The bastion is exactly
+`<InSpaceCluster metadata.name>-bastion`. Cluster names are limited to
 55 characters so every generated hostname remains a DNS label.
 Bootstrap FIPs use the same cluster prefix (`-bastion-ip`, `-cp0-ip` through
 `-cp2-ip`). Firewall names also begin with the cluster name and retain the

@@ -1,0 +1,123 @@
+---
+- name: Roll operator RKE2 configuration and upgrade cloud modules
+  hosts: localhost
+  gather_facts: false
+  vars:
+    deploy_create_state_dir: false
+  tasks:
+    - name: Validate inventory, topology, tools, and SSH identity
+      ansible.builtin.include_tasks: tasks/preflight.yml
+
+    - name: Require the API token for refreshing the in-cluster Secret
+      ansible.builtin.assert:
+        that: lookup('env', 'INSPACE_API_TOKEN') | length > 0
+        fail_msg: "Export INSPACE_API_TOKEN; do not store it in inventory."
+      no_log: true
+
+    - name: Load and validate the deployment journal
+      ansible.builtin.include_tasks: tasks/load-state.yml
+
+    - name: Load immutable bootstrap output for chart and NodeClass rendering
+      ansible.builtin.set_fact:
+        bootstrap_result: "{{ lookup('file', deploy_state_dir + '/bootstrap-result.json') | from_json }}"
+
+    - name: Start the private API tunnel and wait for readiness
+      ansible.builtin.include_tasks: tasks/start-tunnel.yml
+
+    - name: Apply operator RKE2 configuration with one-at-a-time restarts
+      ansible.builtin.include_tasks: tasks/apply-control-plane-config.yml
+
+    - name: Refresh the cloud API Secret
+      ansible.builtin.shell: |
+        set -euo pipefail
+        kubectl --kubeconfig {{ (deploy_state_dir + '/kubeconfig.yaml') | quote }} \
+          -n kube-system create secret generic inspace-cloud-credentials \
+          --from-literal="api-token=$INSPACE_API_TOKEN" \
+          --from-literal="billing-account-id={{ inspace_billing_account_id }}" \
+          --dry-run=client -o yaml | \
+          kubectl --kubeconfig {{ (deploy_state_dir + '/kubeconfig.yaml') | quote }} apply -f -
+      args:
+        executable: /bin/bash
+      environment:
+        INSPACE_API_TOKEN: "{{ lookup('env', 'INSPACE_API_TOKEN') }}"
+      changed_when: true
+      no_log: true
+
+    - name: Render updated chart values
+      ansible.builtin.template:
+        src: "{{ deploy_root }}/templates/chart-values.yaml.j2"
+        dest: "{{ deploy_state_dir }}/chart-values.yaml"
+        mode: "0600"
+
+    - name: Upgrade the exact CRDs chart
+      ansible.builtin.command:
+        argv:
+          - helm
+          - --kubeconfig
+          - "{{ deploy_state_dir }}/kubeconfig.yaml"
+          - upgrade
+          - --install
+          - inspace-crds
+          - oci://ghcr.io/thanet-s/charts/inspace-cloud-kube-modules-crds
+          - --version
+          - "{{ modules_version }}"
+          - --namespace
+          - kube-system
+          - --wait
+          - --timeout
+          - 5m
+      changed_when: true
+
+    - name: Upgrade the exact CCM CSI and Karpenter chart
+      ansible.builtin.command:
+        argv:
+          - helm
+          - --kubeconfig
+          - "{{ deploy_state_dir }}/kubeconfig.yaml"
+          - upgrade
+          - --install
+          - inspace
+          - oci://ghcr.io/thanet-s/charts/inspace-cloud-kube-modules
+          - --version
+          - "{{ modules_version }}"
+          - --namespace
+          - kube-system
+          - --values
+          - "{{ deploy_state_dir }}/chart-values.yaml"
+          - --wait
+          - --timeout
+          - 15m
+      changed_when: true
+
+    - name: Render the updated default Karpenter topology
+      ansible.builtin.template:
+        src: "{{ deploy_root }}/templates/karpenter.yaml.j2"
+        dest: "{{ deploy_state_dir }}/karpenter.yaml"
+        mode: "0600"
+
+    - name: Apply the updated default NodeClass and NodePool
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - --kubeconfig
+          - "{{ deploy_state_dir }}/kubeconfig.yaml"
+          - apply
+          - -f
+          - "{{ deploy_state_dir }}/karpenter.yaml"
+      changed_when: true
+
+    - name: Persist active module version without changing bootstrap authority
+      ansible.builtin.copy:
+        content: >-
+          {{ deployment_state |
+             combine({'modulesVersion': modules_version}, recursive=true) |
+             to_nice_json }}{{ '\n' }}
+        dest: "{{ deploy_state_dir }}/state.json"
+        mode: "0600"
+
+    - name: Report the completed rolling update
+      ansible.builtin.debug:
+        msg: >-
+          Cluster {{ cluster_name }} now runs cloud modules {{ modules_version }}.
+          Bootstrap destroy authority remains pinned to
+          {{ deployment_state.bootstrapControllerVersion }}.

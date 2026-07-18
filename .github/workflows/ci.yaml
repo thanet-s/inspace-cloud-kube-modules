@@ -234,7 +234,12 @@ jobs:
           ./scripts/verify-bootstrap-manifests.sh
 
       - name: Validate Docker-only E2E launcher syntax
-        run: bash -n test/e2e/run.sh
+        run: |
+          bash -n test/e2e/run.sh
+          python3 deploy/verify-static.py
+          python3 -m py_compile deploy/scripts/discover_bootstrap.py
+          bash -n deploy/run.sh deploy/scripts/api-tunnel.sh
+          sh -n deploy/templates/apply-control-plane-config.sh
 
   e2e-harness:
     name: E2E harness
@@ -274,4 +279,14 @@ jobs:
             ansible-playbook --inventory /opt/e2e/inventory.yml /opt/e2e/init-cluster.yml --syntax-check
             ansible-playbook --inventory /opt/e2e/inventory.yml /opt/e2e/test.yml --syntax-check
             ansible-playbook --inventory /opt/e2e/inventory.yml /opt/e2e/destroy-cluster.yml --syntax-check
+            for playbook in \
+              /workspace/deploy/playbooks/init-cluster.yml \
+              /workspace/deploy/playbooks/update-control-plane.yml \
+              /workspace/deploy/playbooks/status.yml \
+              /workspace/deploy/playbooks/tunnel.yml \
+              /workspace/deploy/playbooks/destroy-cluster.yml; do
+              ansible-playbook \
+                --inventory /workspace/deploy/inventory.example.yml \
+                "$playbook" --syntax-check
+            done
           '

@@ -7,10 +7,10 @@
 Cloud integrations for running self-managed RKE2 clusters on
 [InSpace Cloud](https://inspace.cloud/).
 
-The project provides a fixed highly available control plane, native Kubernetes
-cloud integration, block storage, and elastic Karpenter workers. It is designed
-for clusters built directly on InSpace virtual machines rather than a managed
-Kubernetes service.
+The project provides either a low-cost single-server or highly available
+three-server control plane, native Kubernetes cloud integration, block storage,
+and elastic Karpenter workers. It is designed for clusters built directly on
+InSpace virtual machines rather than a managed Kubernetes service.
 
 > [!NOTE]
 > Review the supported scope and test the release in an isolated account before
@@ -18,7 +18,8 @@ Kubernetes service.
 
 ## Highlights
 
-- Three-node RKE2 control plane with embedded etcd and a dedicated bastion.
+- One-node low-cost or three-node HA RKE2 control plane with embedded etcd and
+  a dedicated bastion.
 - Private, bastion-backed bootstrap cache by default, with an explicit
   direct-download mode.
 - Cilium native routing, eBPF masquerading, and full kube-proxy replacement.
@@ -33,7 +34,7 @@ Kubernetes service.
 | Component | Responsibility |
 | --- | --- |
 | [`modules/client`](modules/client) | Kubernetes-independent InSpace API client |
-| [`modules/cloud-provider`](modules/cloud-provider) | External CCM and fixed RKE2 control-plane bootstrap |
+| [`modules/cloud-provider`](modules/cloud-provider) | External CCM and one-or-three-node RKE2 control-plane bootstrap |
 | [`modules/csi-driver`](modules/csi-driver) | RWO block-volume CSI controller and node plugin |
 | [`modules/karpenter-provider`](modules/karpenter-provider) | `InSpaceNodeClass`, instance catalog, and elastic worker lifecycle |
 
@@ -68,8 +69,9 @@ The detailed networking, ownership, and cleanup invariants are documented in the
 
 1. Prepare an InSpace VPC, an unused private control-plane VIP, and a private
    Service VIP range excluded from VM and NLB allocation.
-2. Bootstrap the bastion and three RKE2 servers using the
-   [control-plane guide](modules/cloud-provider/README.md#fixed-control-plane-controller).
+2. Copy the [deployment inventory](deploy/inventory.example.yml), choose one
+   or three RKE2 servers, and run the
+   [Ansible deployment workflow](deploy/README.md).
 3. Create the API and RKE2 agent-token Secrets described in the
    [Helm chart guide](charts/inspace-cloud-kube-modules/README.md#secret-contracts).
 4. Install the CRDs first, followed by the workload chart:
@@ -117,6 +119,7 @@ system images directly from the upstream hosts.
 ## Documentation
 
 - [Helm installation and configuration](charts/inspace-cloud-kube-modules/README.md)
+- [Ansible cluster lifecycle](deploy/README.md)
 - [Control-plane bootstrap and CCM](modules/cloud-provider/README.md)
 - [CSI driver](modules/csi-driver/README.md)
 - [Karpenter provider](modules/karpenter-provider/README.md)

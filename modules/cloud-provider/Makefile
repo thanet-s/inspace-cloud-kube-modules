@@ -12,7 +12,7 @@ test:
 	GOWORK=$(GOWORK) go test ./...
 
 smoke:
-	GOWORK=$(GOWORK) go test ./pkg/bootstrap -run '^(TestReconcileBuildsBastionThenExactlyThreeControlPlaneVMs|TestReconcileSequencesControlPlaneCreatesAfterPriorFirewallReadback)$$' -count=1 -v
+	GOWORK=$(GOWORK) go test ./pkg/bootstrap -run '^(TestReconcileBuildsBastionThenExactlyThreeControlPlaneVMs|TestReconcileAndDestroySingleControlPlaneTopology|TestReconcileSequencesControlPlaneCreatesAfterPriorFirewallReadback)$$' -count=1 -v
 	GOWORK=$(GOWORK) go test ./pkg/cloudprovider -run '^(TestPublicLoadBalancerUsesExplicitOwnedFloatingIP|TestNodeLoadBalancerReconcileSmokeCreatesOwnedKarpenterAndDatapathResources)$$' -count=1 -v
 
 vet:
