@@ -82,6 +82,10 @@ def main() -> None:
         < init.index("INSPACE_ALLOW_REMOTE_MUTATIONS"),
         "bootstrap destroy authority is not pinned before bootstrap mutation",
     )
+    require(
+        init.count("linux/amd64") == 2 and destroy.count("linux/amd64") == 2,
+        "bootstrap controller pull/run does not pin the published x86 platform",
+    )
 
     for forbidden in (
         "'token'",

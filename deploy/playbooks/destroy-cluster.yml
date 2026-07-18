@@ -165,6 +165,8 @@
         argv:
           - docker
           - pull
+          - --platform
+          - linux/amd64
           - "ghcr.io/thanet-s/inspace-cloud-controller-manager:{{ deployment_state.bootstrapControllerVersion }}"
       changed_when: true
 
@@ -173,6 +175,8 @@
         argv:
           - docker
           - run
+          - --platform
+          - linux/amd64
           - --rm
           - "--user={{ lookup('pipe', 'id -u') }}:{{ lookup('pipe', 'id -g') }}"
           - --entrypoint
