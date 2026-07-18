@@ -33,7 +33,7 @@ func expectedDestroyRemovalNames(cluster *v1alpha1.InSpaceCluster, key, kind str
 	case kind == deleteAttemptKindFirewall && key == destroyFirewallNodesKey:
 		return current.NodeFirewall, legacy.NodeFirewall, nil
 	}
-	for slot := 0; slot < ControlPlaneReplicas; slot++ {
+	for slot := 0; slot < controlPlaneReplicaCount(cluster); slot++ {
 		if kind == deleteAttemptKindFloatingIP && key == destroyFIPControlPlaneKey(slot) {
 			return current.ControlPlaneFIP[slot], legacy.ControlPlaneFIP[slot], nil
 		}

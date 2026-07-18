@@ -77,7 +77,7 @@ func expectedVMNameForDeleteKey(cluster *v1alpha1.InSpaceCluster, key string) (s
 	if key == deleteAttemptBastion {
 		return currentBastionName(cluster.Metadata.Name), nil
 	}
-	for slot := 0; slot < ControlPlaneReplicas; slot++ {
+	for slot := 0; slot < controlPlaneReplicaCount(cluster); slot++ {
 		if key == controlPlaneDeleteAttemptKey(slot) {
 			return controlPlaneName(cluster.Metadata.Name, slot), nil
 		}
@@ -89,7 +89,7 @@ func deleteKeyForVMName(cluster *v1alpha1.InSpaceCluster, name string) (string, 
 	if name == currentBastionName(cluster.Metadata.Name) || name == legacyBastionName(ownerKey(cluster)) {
 		return deleteAttemptBastion, nil
 	}
-	for slot := 0; slot < ControlPlaneReplicas; slot++ {
+	for slot := 0; slot < controlPlaneReplicaCount(cluster); slot++ {
 		if name == controlPlaneName(cluster.Metadata.Name, slot) || name == legacyControlPlaneName(ownerKey(cluster), slot) {
 			return controlPlaneDeleteAttemptKey(slot), nil
 		}
@@ -138,7 +138,7 @@ func validateVMDeleteAttempt(cluster *v1alpha1.InSpaceCluster, key string, attem
 	if key == deleteAttemptBastion {
 		legacyName = legacyBastionName(ownerKey(cluster))
 	} else {
-		for slot := 0; slot < ControlPlaneReplicas; slot++ {
+		for slot := 0; slot < controlPlaneReplicaCount(cluster); slot++ {
 			if key == controlPlaneDeleteAttemptKey(slot) {
 				legacyName = legacyControlPlaneName(ownerKey(cluster), slot)
 			}
@@ -575,14 +575,15 @@ func (r *Reconciler) authorizeVMDeleteDispatch(
 		return false, fmt.Errorf("bootstrap: refusing to delete VM %q without exactly one configured-VPC membership", attempt.ResourceName)
 	}
 
-	owned, controlPlaneNames, bastionName, err := uniqueDestroyVMs([]inspace.VM{*detail}, ownerKey(cluster), cluster.Metadata.Name)
+	replicas := controlPlaneReplicaCount(cluster)
+	owned, controlPlaneNames, bastionName, err := uniqueDestroyVMs([]inspace.VM{*detail}, ownerKey(cluster), cluster.Metadata.Name, replicas)
 	if err != nil {
 		return false, err
 	}
 	if ownedVM := owned[attempt.ResourceName]; ownedVM == nil || !strings.EqualFold(ownedVM.UUID, attempt.ResourceUUID) {
 		return false, fmt.Errorf("bootstrap: refusing to delete VM %q outside its owned bootstrap slot", attempt.ResourceName)
 	}
-	if err := validateDestroyVMOwnership(owned, ownerKey(cluster), cluster.Metadata.Name, bastionName, controlPlaneNames); err != nil {
+	if err := validateDestroyVMOwnership(owned, ownerKey(cluster), cluster.Metadata.Name, bastionName, controlPlaneNames, replicas); err != nil {
 		return false, err
 	}
 	return true, nil

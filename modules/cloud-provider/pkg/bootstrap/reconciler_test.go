@@ -139,6 +139,84 @@ func TestReconcileBuildsBastionThenExactlyThreeControlPlaneVMs(t *testing.T) {
 	}
 }
 
+func TestReconcileAndDestroySingleControlPlaneTopology(t *testing.T) {
+	api := newFakeAPI()
+	cluster := testCluster()
+	cluster.Spec.ControlPlane.Replicas = 1
+	reconciler := testReconciler(api)
+
+	result := reconcileUntilReady(t, reconciler, cluster)
+	if !result.Ready || len(result.ControlPlaneVMs) != 1 {
+		t.Fatalf("single-control-plane result=%#v", result)
+	}
+	if len(api.vms) != 2 || len(api.vmCreates) != 2 {
+		t.Fatalf("VMs=%d creates=%d, want bastion+cp0", len(api.vms), len(api.vmCreates))
+	}
+	if mustVM(t, api.vms, "unit-cp0") == nil {
+		t.Fatal("cp0 was not created")
+	}
+	for _, forbidden := range []string{"unit-cp1", "unit-cp2"} {
+		for _, request := range api.vmCreates {
+			if request.Name == forbidden {
+				t.Fatalf("single-control-plane reconciliation created %q", forbidden)
+			}
+		}
+	}
+	names := currentBootstrapResourceNames(cluster.Metadata.Name, ownerKey(cluster))
+	nodeFirewall := mustFirewall(t, api.firewalls, names.NodeFirewall)
+	if len(nodeFirewall.ResourcesAssigned) != 1 {
+		t.Fatalf("node firewall assignments=%#v, want only cp0", nodeFirewall.ResourcesAssigned)
+	}
+	if len(api.floatingIPs) != 2 {
+		t.Fatalf("floating IPs=%#v, want bastion+cp0", api.floatingIPs)
+	}
+
+	destroy := destroyUntilDone(t, reconciler, cluster)
+	if !destroy.Done || len(api.vms) != 0 || len(api.firewalls) != 0 || len(api.floatingIPs) != 0 {
+		t.Fatalf("single-control-plane destroy did not converge: result=%#v vms=%#v firewalls=%#v fips=%#v", destroy, api.vms, api.firewalls, api.floatingIPs)
+	}
+}
+
+func TestSingleControlPlaneRejectsOutOfRangeMutationReceipts(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*v1alpha1.InSpaceCluster)
+	}{
+		{
+			name: "create",
+			mutate: func(cluster *v1alpha1.InSpaceCluster) {
+				cluster.Status.CreateAttempts = map[string]v1alpha1.ResourceCreateAttemptStatus{
+					controlPlaneCreateAttemptKey(1): {},
+				}
+			},
+		},
+		{
+			name: "delete",
+			mutate: func(cluster *v1alpha1.InSpaceCluster) {
+				cluster.Status.DeleteAttempts = map[string]v1alpha1.ResourceDeleteAttemptStatus{
+					controlPlaneDeleteAttemptKey(2): {},
+				}
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cluster := testCluster()
+			cluster.Spec.ControlPlane.Replicas = 1
+			test.mutate(cluster)
+			api := newFakeAPI()
+			reconciler := testReconciler(api)
+
+			if _, err := reconciler.Reconcile(context.Background(), cluster, "unit-test-secret-token"); err == nil || !strings.Contains(err.Error(), "outside the configured 1-control-plane topology") {
+				t.Fatalf("out-of-range receipt error=%v", err)
+			}
+			if len(api.events) != 0 {
+				t.Fatalf("out-of-range receipt allowed cloud API mutations: %v", api.events)
+			}
+		})
+	}
+}
+
 func TestManagedBastionFirewallAllowsOnlyManagementICMP(t *testing.T) {
 	const managementCIDR = "203.0.113.10/32"
 	const privateSubnet = "10.20.30.0/24"

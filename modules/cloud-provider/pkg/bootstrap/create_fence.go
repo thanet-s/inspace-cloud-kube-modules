@@ -106,7 +106,7 @@ func floatingIPUpdateAttemptKey(cluster *v1alpha1.InSpaceCluster, name string) (
 	if name == current.BastionFloatingIP || name == legacy.BastionFloatingIP {
 		return createAttemptBastionFloatingIPUpdate, nil
 	}
-	for slot := 0; slot < ControlPlaneReplicas; slot++ {
+	for slot := 0; slot < controlPlaneReplicaCount(cluster); slot++ {
 		if name == current.ControlPlaneFIP[slot] || name == legacy.ControlPlaneFIP[slot] {
 			return controlPlaneFloatingIPUpdateAttemptKey(slot), nil
 		}

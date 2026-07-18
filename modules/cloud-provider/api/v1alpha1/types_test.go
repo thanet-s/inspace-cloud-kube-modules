@@ -9,12 +9,15 @@ import (
 )
 
 func TestControlPlaneReplicaValidation(t *testing.T) {
-	spec := validSpec()
-	spec.ControlPlane.Replicas = 3
-	if errs := spec.Validate(); len(errs) != 0 {
-		t.Errorf("replicas 3: unexpected validation errors: %v", errs)
+	for _, replicas := range []int32{1, 3} {
+		spec := validSpec()
+		spec.ControlPlane.Replicas = replicas
+		if errs := spec.Validate(); len(errs) != 0 {
+			t.Errorf("replicas %d: unexpected validation errors: %v", replicas, errs)
+		}
 	}
-	for _, replicas := range []int32{0, 1, 2, 4, 5, 7} {
+	for _, replicas := range []int32{0, 2, 4, 5, 7} {
+		spec := validSpec()
 		spec.ControlPlane.Replicas = replicas
 		if errs := spec.Validate(); len(errs) == 0 {
 			t.Errorf("replicas %d: expected validation error", replicas)
@@ -194,6 +197,8 @@ func TestControlPlaneCRDMatchesMachineValidationContract(t *testing.T) {
 		"bootstrapCache:\n                  type: object",
 		"directDownload:\n                      type: boolean\n                      default: false",
 		"skipOSUpgrade:\n                      type: boolean\n                      default: false",
+		"replicas:\n                      type: integer\n                      format: int32\n                      enum:\n                        - 1\n                        - 3",
+		"rule: self == oldSelf\n                          message: control-plane replica count is immutable after cluster creation",
 	} {
 		if !strings.Contains(crd, required) {
 			t.Errorf("CRD does not contain validation contract fragment %q", required)

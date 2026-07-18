@@ -71,8 +71,12 @@ spec:
                     replicas:
                       type: integer
                       format: int32
-                      minimum: 3
-                      maximum: 3
+                      enum:
+                        - 1
+                        - 3
+                      x-kubernetes-validations:
+                        - rule: self == oldSelf
+                          message: control-plane replica count is immutable after cluster creation
                     machine:
                       type: object
                       required: [vcpu, memoryMiB, rootDiskGiB, hostPoolUUID, image]

@@ -42,7 +42,8 @@ func fixedFirewallAssignmentSlots(cluster *v1alpha1.InSpaceCluster) []fixedFirew
 	owner := ownerKey(cluster)
 	current := currentBootstrapResourceNames(cluster.Metadata.Name, owner)
 	legacy := legacyBootstrapResourceNames(owner)
-	slots := make([]fixedFirewallAssignmentSlot, 0, ControlPlaneReplicas+1)
+	replicas := controlPlaneReplicaCount(cluster)
+	slots := make([]fixedFirewallAssignmentSlot, 0, replicas+1)
 	slots = append(slots, fixedFirewallAssignmentSlot{
 		assignmentKey: createAttemptBastionFirewallAssignment,
 		vmCreateKey:   createAttemptBastionVM,
@@ -55,7 +56,7 @@ func fixedFirewallAssignmentSlots(cluster *v1alpha1.InSpaceCluster) []fixedFirew
 		currentFIP:    current.BastionFloatingIP,
 		legacyFIP:     legacy.BastionFloatingIP,
 	})
-	for slot := 0; slot < ControlPlaneReplicas; slot++ {
+	for slot := 0; slot < replicas; slot++ {
 		slots = append(slots, fixedFirewallAssignmentSlot{
 			assignmentKey: controlPlaneFirewallAssignmentAttemptKey(slot),
 			vmCreateKey:   controlPlaneCreateAttemptKey(slot),
