@@ -23,20 +23,20 @@ SPEC.loader.exec_module(VERIFIER)
 class ParseRemoteAddressTests(unittest.TestCase):
     def test_accepts_plain_ipv4(self) -> None:
         self.assertEqual(
-            VERIFIER.parse_remote_address("58.8.188.141"),
-            ipaddress.ip_address("58.8.188.141"),
+            VERIFIER.parse_remote_address("203.0.113.10"),
+            ipaddress.ip_address("203.0.113.10"),
         )
 
     def test_normalizes_bracketed_ipv4_mapped_ipv6(self) -> None:
         self.assertEqual(
-            VERIFIER.parse_remote_address("[::ffff:58.8.188.141]"),
-            ipaddress.ip_address("58.8.188.141"),
+            VERIFIER.parse_remote_address("[::ffff:203.0.113.10]"),
+            ipaddress.ip_address("203.0.113.10"),
         )
 
     def test_normalizes_unbracketed_ipv4_mapped_ipv6(self) -> None:
         self.assertEqual(
-            VERIFIER.parse_remote_address("::ffff:58.8.188.141"),
-            ipaddress.ip_address("58.8.188.141"),
+            VERIFIER.parse_remote_address("::ffff:203.0.113.10"),
+            ipaddress.ip_address("203.0.113.10"),
         )
 
     def test_retains_native_ipv6_for_caller_policy(self) -> None:
