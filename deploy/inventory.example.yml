@@ -24,7 +24,7 @@ all:
 
     # Use an exact published version. Release candidates are supported for
     # acceptance testing, for example 0.7.0-rc.1.
-    modules_version: 0.7.0
+    modules_version: 0.7.1
     rke2_version: v1.35.6+rke2r1
     control_plane_vcpu: 2
     control_plane_memory_mib: 4096
