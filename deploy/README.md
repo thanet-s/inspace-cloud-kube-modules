@@ -6,6 +6,13 @@ released CCM/CSI/Karpenter charts, creates a default AMD EPYC worker
 `InSpaceNodeClass` and `NodePool`, performs rolling operator configuration, and
 destroys only the journaled cluster.
 
+New v0.8.0 clusters enable Cilium Egress Gateway during immutable control-plane
+bootstrap. After initialization, operators can apply
+[`../charts/inspace-cloud-kube-modules/examples/egress-gateway-static.yaml`](../charts/inspace-cloud-kube-modules/examples/egress-gateway-static.yaml)
+to maintain two tainted, egress-only Karpenter nodes for selected workloads.
+Clusters bootstrapped by an older release require an explicit
+destroy/recreate lifecycle to acquire this immutable Cilium setting.
+
 The release E2E suite remains in `test/e2e/`. It deliberately has stricter
 isolated-account assertions and is not the production inventory.
 

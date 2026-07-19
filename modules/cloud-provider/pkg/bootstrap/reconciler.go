@@ -956,6 +956,7 @@ func validateDestroyVMOwnership(vms map[string]*inspace.VM, owner, clusterName, 
 	hasControlPlaneV6 := false
 	hasControlPlaneV7 := false
 	hasControlPlaneV8 := false
+	hasControlPlaneV9 := false
 	bastionSchema := 0
 	for name, vm := range vms {
 		if vm == nil || !vmUUIDPattern.MatchString(vm.UUID) {
@@ -977,6 +978,7 @@ func validateDestroyVMOwnership(vms map[string]*inspace.VM, owner, clusterName, 
 			if name == controlPlaneNames[candidate] {
 				slot = candidate
 				if name == controlPlaneName(clusterName, candidate) {
+					prefixes = append(prefixes, fmt.Sprintf("inspace-rke2-cp/v9 owner=%s slot=%d spec=", owner, slot))
 					prefixes = append(prefixes, fmt.Sprintf("inspace-rke2-cp/v8 owner=%s slot=%d spec=", owner, slot))
 					prefixes = append(prefixes, fmt.Sprintf("inspace-rke2-cp/v7 owner=%s slot=%d spec=", owner, slot))
 					prefixes = append(prefixes, fmt.Sprintf("inspace-rke2-cp/v6 owner=%s slot=%d spec=", owner, slot))
@@ -1015,6 +1017,7 @@ func validateDestroyVMOwnership(vms map[string]*inspace.VM, owner, clusterName, 
 			hasControlPlaneV6 = hasControlPlaneV6 || strings.HasPrefix(matchedPrefix, "inspace-rke2-cp/v6 ")
 			hasControlPlaneV7 = hasControlPlaneV7 || strings.HasPrefix(matchedPrefix, "inspace-rke2-cp/v7 ")
 			hasControlPlaneV8 = hasControlPlaneV8 || strings.HasPrefix(matchedPrefix, "inspace-rke2-cp/v8 ")
+			hasControlPlaneV9 = hasControlPlaneV9 || strings.HasPrefix(matchedPrefix, "inspace-rke2-cp/v9 ")
 		} else {
 			switch {
 			case strings.HasPrefix(matchedPrefix, "inspace-rke2-bastion/v1 "):
@@ -1031,7 +1034,7 @@ func validateDestroyVMOwnership(vms map[string]*inspace.VM, owner, clusterName, 
 		}
 	}
 	schemaCount := 0
-	for _, present := range []bool{hasControlPlaneV2, hasControlPlaneV3, hasControlPlaneV4, hasControlPlaneV5, hasControlPlaneV6, hasControlPlaneV7, hasControlPlaneV8} {
+	for _, present := range []bool{hasControlPlaneV2, hasControlPlaneV3, hasControlPlaneV4, hasControlPlaneV5, hasControlPlaneV6, hasControlPlaneV7, hasControlPlaneV8, hasControlPlaneV9} {
 		if present {
 			schemaCount++
 		}
@@ -1053,13 +1056,15 @@ func validateDestroyVMOwnership(vms map[string]*inspace.VM, owner, clusterName, 
 			controlPlaneSchema = 7
 		} else if hasControlPlaneV8 {
 			controlPlaneSchema = 8
+		} else if hasControlPlaneV9 {
+			controlPlaneSchema = 9
 		}
 		expectedControlPlaneSchema := bastionSchema
 		if bastionSchema == 1 {
 			expectedControlPlaneSchema = 2
 		}
 		compatible := expectedControlPlaneSchema == controlPlaneSchema ||
-			(bastionSchema == 6 && (controlPlaneSchema == 7 || controlPlaneSchema == 8))
+			(bastionSchema == 6 && (controlPlaneSchema == 7 || controlPlaneSchema == 8 || controlPlaneSchema == 9))
 		if !compatible {
 			return errors.New("bootstrap: refusing incoherent teardown ownership schema: bastion and control planes use incompatible schemas")
 		}
@@ -2851,7 +2856,7 @@ func (r *Reconciler) desiredControlPlaneVMRequest(cluster *v1alpha1.InSpaceClust
 		return inspace.CreateVMRequest{}, err
 	}
 	sum := sha256.Sum256(data)
-	request.Description = fmt.Sprintf("inspace-rke2-cp/v8 owner=%s slot=%d spec=%s", owner, slot, hex.EncodeToString(sum[:]))
+	request.Description = fmt.Sprintf("inspace-rke2-cp/v9 owner=%s slot=%d spec=%s", owner, slot, hex.EncodeToString(sum[:]))
 	return request, nil
 }
 

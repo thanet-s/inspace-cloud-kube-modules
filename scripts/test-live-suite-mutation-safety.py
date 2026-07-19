@@ -204,6 +204,7 @@ def suite_env(server: FakeServer, state_dir: pathlib.Path, external_firewall: bo
             "INSPACE_LIVE_READBACK_DELAY_SECONDS": "0",
             "INSPACE_LIVE_ABSENCE_OBSERVATIONS": "3",
             "INSPACE_LIVE_DESTRUCTIVE_ABSENCE_DELAY_SECONDS": "0",
+            "INSPACE_SKIP_DOTENV": "true",
             # Default durable mode must never invoke the legacy module targets.
             "MAKE": "/usr/bin/false",
         }
@@ -250,6 +251,7 @@ def audit_env(server: FakeServer) -> dict[str, str]:
             "INSPACE_API_TOKEN": "test-token",
             "INSPACE_LOCATION": "bkk01",
             "INSPACE_LIVE_RESOURCE_PREFIX": "inspace-e2e-",
+            "INSPACE_SKIP_DOTENV": "true",
         }
     )
     return env

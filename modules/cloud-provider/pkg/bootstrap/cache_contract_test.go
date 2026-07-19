@@ -511,14 +511,14 @@ func TestSingleControlPlaneCachedInstallIncludesCoreDNSOverride(t *testing.T) {
 	cacheContractAssertShell(t, script)
 }
 
-func TestDirectControlPlaneCloudInitV8OwnershipBytes(t *testing.T) {
+func TestDirectControlPlaneCloudInitV9OwnershipBytes(t *testing.T) {
 	raw, err := RenderCloudInitJSON(cacheContractControlPlaneInput())
 	if err != nil {
 		t.Fatal(err)
 	}
-	const v8DirectHash = "4cd8841c3ed53c0386e93081f31b69dc075bdeb3ded8ab89ac1d6e7115170a59"
-	if got := fmt.Sprintf("%x", sha256.Sum256([]byte(raw))); got != v8DirectHash {
-		t.Fatalf("direct control-plane cloud-init hash=%s, want frozen v8 hash %s", got, v8DirectHash)
+	const v9DirectHash = "8f54ffa1bf48519a1834c8c23cc2833eb22c91e335471a2f713986554e3facb5"
+	if got := fmt.Sprintf("%x", sha256.Sum256([]byte(raw))); got != v9DirectHash {
+		t.Fatalf("direct control-plane cloud-init hash=%s, want frozen v9 hash %s", got, v9DirectHash)
 	}
 }
 

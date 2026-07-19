@@ -77,9 +77,9 @@ and bastion removes any stale `127.0.1.1` mapping, writes exactly
 bounded retry accounts for a short NSS readback delay after a successful file
 append; package installation and resolver replacement do not begin until the
 mapping is visible. Current fixed control-plane ownership records use schema
-v8 because kube-vip's explicit 5/3/1-second election timing and 500-millisecond
-ARP cadence change their immutable RKE2 cloud-init; bastion ownership remains
-v6. Teardown continues to accept schema v7 control planes paired with the same
+v9 because enabling Cilium Egress Gateway changes their immutable RKE2
+cloud-init; bastion ownership remains v6. Teardown continues to accept schema
+v8 control planes paired with the same
 v6 bastion. Karpenter's current immutable bootstrap drift
 schema is `stock-ubuntu-rke2-v12`; this is separate from its cloud VM ownership
 record version.
@@ -157,7 +157,8 @@ cloud-init.
 
 RKE2 uses its bundled Cilium chart in native-routing mode. Cilium installs
 direct pod-CIDR routes on the shared VPC, performs eBPF IPv4 masquerading for
-internet egress, and fully replaces kube-proxy with eBPF service handling.
+internet egress, enables Egress Gateway, and fully replaces kube-proxy with
+eBPF service handling.
 The one-control-plane topology renders a bootstrap-time CoreDNS
 `HelmChartConfig` with one replica and no proportional autoscaler. This keeps
 the first elastic worker removable under `WhenEmpty`; the three-control-plane

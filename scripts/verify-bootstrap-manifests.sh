@@ -10,6 +10,7 @@ standalone_karpenter=$workspace/modules/karpenter-provider/config/controller/con
 root_readme=$workspace/README.md
 chart_readme=$chart/README.md
 chart_notes=$chart/templates/NOTES.txt
+egress_example=$chart/examples/egress-gateway-static.yaml
 tmpdir=$(mktemp -d)
 trap 'rm -rf "$tmpdir"' EXIT INT TERM
 
@@ -238,6 +239,23 @@ require_toleration "$standalone_karpenter"
 test "$(grep -Fc '            - --timeout=600s' "$standalone_csi")" -eq 2
 grep -F '            - name: INSPACE_NETWORK_UUID' "$standalone_karpenter" >/dev/null
 grep -F '            - name: INSPACE_CONTROL_PLANE_VIP' "$standalone_karpenter" >/dev/null
+
+test "$(grep -Fc '  replicas: 2' "$egress_example")" -eq 1
+test "$(grep -Fc '    nodes: 2' "$egress_example")" -eq 1
+test "$(grep -Fc 'inspace.cloud.node-restriction.kubernetes.io/egress-gateway: payment' "$egress_example")" -eq 2
+grep -Fx '        - key: inspace.cloud/egress-gateway' "$egress_example" >/dev/null
+grep -Fx 'kind: CiliumEgressGatewayPolicy' "$egress_example" >/dev/null
+grep -Fx '          io.kubernetes.pod.namespace: payments' "$egress_example" >/dev/null
+grep -Fx '          app.kubernetes.io/name: payment-gateway' "$egress_example" >/dev/null
+grep -Fx '    - 0.0.0.0/0' "$egress_example" >/dev/null
+if grep -Eq '^[[:space:]]+(egressIP|interface):' "$egress_example"; then
+  echo "static egress example pins an egress IP or interface" >&2
+  exit 1
+fi
+if grep -Eq '^[[:space:]]+tolerations:' "$egress_example"; then
+  echo "static egress example lets an application tolerate the gateway taint" >&2
+  exit 1
+fi
 
 for user_document in "$root_readme" "$chart_readme" "$chart_notes" "$workspace/modules/karpenter-provider/README.md"; do
   if grep -F 'hostPoolSelector' "$user_document" >/dev/null; then

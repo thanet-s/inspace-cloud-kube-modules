@@ -257,12 +257,11 @@ guarded owned teardown or obtain provider-side resolution without risking a
 duplicate mutation. Continuous mode and `--once` do not install the overall
 deadline.
 
-New control-plane owner/spec records use schema v8 because kube-vip's explicit
-5/3/1-second election timing and 500-millisecond ARP cadence are part of their
-immutable RKE2 cloud-init contract. Bastion records remain at v6.
-Reconciliation does not adopt an older fixed VM into v8; use an explicit
+New control-plane owner/spec records use schema v9 because enabling Cilium
+Egress Gateway changes their immutable RKE2 cloud-init contract. Bastion
+records remain at v6. Reconciliation does not adopt an older fixed VM into v9; use an explicit
 destroy/recreate lifecycle. Owned teardown continues to recognize supported
-older fixed-node schemas, including schema v7 control planes paired with the
+older fixed-node schemas, including schema v8 control planes paired with the
 unchanged v6 bastion.
 
 New bootstrap FIPs are `<metadata.name>-bastion-ip` and
