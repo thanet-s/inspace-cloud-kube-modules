@@ -7,22 +7,41 @@ This repository implements the InSpace provider for Karpenter `v1.14.0` and RKE2
 - Location `bkk01`, Linux/amd64, on-demand capacity
 - `intel-scalable` host pool `aac7dd66-f390-4edd-80c0-dd7cae49bd99`
 - `amd-epyc` host pool `6976fdc8-4492-465b-bd16-9ad5f6b00b03`
-- The original 24-shape matrix: `compute`, `general`, and `memory` families at
-  1, 2, and 4 GiB/vCPU for CPU sizes `2, 4, 6, 8, 10, 12, 14, 16`
-- Two additional single-core standard shapes, `is-general-1c-2g` and
-  `is-memory-1c-4g`; `is-general-1c-2g` is the smallest advertised shape
-- The `extra-memory` family at 8 GiB/vCPU for CPU sizes `1, 2, 4, 6, 8`;
-  it stops at 8 vCPU because instances cannot exceed 64 GiB RAM
+- A finite 31-shape catalog across `compute`, `general`, `memory`, and
+  `extra-memory` families
 - Maximum 16 vCPU / 64 GiB across the catalog
 - Ubuntu 24.04 and an exactly pinned RKE2 agent version
 - Ephemeral root disks; persistent workload data belongs on RWO CSI volumes
 - One immutable, inclusive 16-to-256-address RFC1918 Service VIP range reserved
   from worker NIC allocation
 
-Variant names describe raw VM capacity, for example `is-general-1c-2g`,
-`is-extra-memory-1c-8g`, `is-general-2c-4g`, and
-`is-extra-memory-8c-64g`. Allocatable disk reserves 8 GiB for Ubuntu/RKE2 plus
-a 4 GiB eviction threshold.
+## VM shape matrix
+
+Each cell is the VM's RAM in GiB for that vCPU count and family. A dash means
+the combination is not advertised.
+
+| vCPU | `compute` (1 GiB/vCPU) | `general` (2 GiB/vCPU) | `memory` (4 GiB/vCPU) | `extra-memory` (8 GiB/vCPU) |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | — | 2 GiB | 4 GiB | 8 GiB |
+| 2 | 2 GiB | 4 GiB | 8 GiB | 16 GiB |
+| 4 | 4 GiB | 8 GiB | 16 GiB | 32 GiB |
+| 6 | 6 GiB | 12 GiB | 24 GiB | 48 GiB |
+| 8 | 8 GiB | 16 GiB | 32 GiB | 64 GiB |
+| 10 | 10 GiB | 20 GiB | 40 GiB | — |
+| 12 | 12 GiB | 24 GiB | 48 GiB | — |
+| 14 | 14 GiB | 28 GiB | 56 GiB | — |
+| 16 | 16 GiB | 32 GiB | 64 GiB | — |
+
+Instance-type names use
+`is-<family>-<vCPU>c-<memory-GiB>g`; for example,
+`is-general-1c-2g`, `is-compute-6c-6g`, and
+`is-extra-memory-8c-64g`. The smallest shape is 1 vCPU / 2 GiB. The
+`extra-memory` family stops at 8 vCPU so no shape exceeds InSpace's 64 GiB VM
+limit.
+
+The NodeClass sets the root-disk capacity independently of the shape. Karpenter
+reserves 8 GiB of ephemeral storage for Ubuntu/RKE2 and a further 4 GiB as the
+eviction threshold when calculating allocatable storage.
 
 Every catalog shape advertises numeric `inspace.cloud/instance-cpu` (cores)
 and `inspace.cloud/instance-memory` (MiB) labels. NodePool requirements can use
