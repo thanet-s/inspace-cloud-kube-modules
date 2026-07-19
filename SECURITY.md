@@ -2,8 +2,9 @@
 
 ## Supported versions
 
-Until the first stable release, only the most recent published release is
-supported. After `v1.0.0`, the latest minor release will receive security fixes.
+Before `v1.0.0`, only the latest stable release receives security fixes.
+Release candidates are supported only for acceptance testing. Starting with
+`v1.0.0`, the latest minor release will receive security fixes.
 
 ## Reporting a vulnerability
 

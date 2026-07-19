@@ -29,7 +29,10 @@ all:
     control_plane_vcpu: 2
     control_plane_memory_mib: 4096
     control_plane_root_disk_gib: 60
+    # Applies to the bastion, fixed control planes, and generated Karpenter
+    # NodeClass. True skips only apt-get upgrade and is intended for tests.
     skip_os_upgrade: false
+    # False uses the bastion cache for both fixed and Karpenter nodes.
     bootstrap_direct_download: false
 
     ssh_username: inspace

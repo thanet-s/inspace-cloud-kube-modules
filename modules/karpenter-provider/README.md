@@ -1,6 +1,9 @@
 # Karpenter Provider for InSpace
 
-This repository implements the InSpace provider for Karpenter `v1.14.0` and RKE2. It includes a production API adapter, `InSpaceNodeClass`, a 31-variant instance catalog, stock-Ubuntu bootstrap, NodeClass readiness reconciliation, and a runnable Karpenter controller command.
+This module implements the InSpace provider for Karpenter `v1.14.0` and RKE2.
+It includes a production API adapter, `InSpaceNodeClass`, a 31-variant instance
+catalog, stock-Ubuntu bootstrap, NodeClass readiness reconciliation, and a
+runnable Karpenter controller command.
 
 ## Supported contract
 
@@ -335,11 +338,11 @@ compare canonical VM name, capacity, image, host pool, VPC, billing account,
 and exactly one primary root disk against that record before reporting a worker
 healthy. Complete established v1 and v2 records remain available for compatible
 read and ownership-checked deletion. Both legacy schemas derive capacity from
-the frozen 24-variant set, which intentionally excludes the current single-core
-ownership shapes and the entire `extra-memory` family, and derive
-the pool UUID from the frozen host-class mapping. Current-schema ownership
-supports both current single-core standard shapes. A v1 record additionally
-uses the NodeClaim name as its VM/node name. Partial or
+the frozen 24-variant set, which intentionally excludes all three current
+single-core shapes and the entire `extra-memory` family, and derive the pool
+UUID from the frozen host-class mapping. Current v3 ownership supports all 31
+catalog shapes. A v1 record additionally uses the NodeClaim name as its VM/node
+name. Partial or
 contradictory exact fields fail closed; operators should recycle any legacy
 worker whose identity cannot be derived.
 
@@ -362,8 +365,10 @@ must be usable hosts inside `spec.networkUUID`; the range must exclude the RKE2
 supervisor VIP, Cilium pod CIDR `10.42.0.0/16`, and Kubernetes Service CIDR
 `10.43.0.0/16`. Every NodeClass must exactly equal the controller-wide
 `INSPACE_PRIVATE_LOAD_BALANCER_POOL_START` and
-`INSPACE_PRIVATE_LOAD_BALANCER_POOL_STOP` values. This provider reserves and
-audits the range; Cilium LB IPAM/L2 configuration is a separate cluster concern.
+`INSPACE_PRIVATE_LOAD_BALANCER_POOL_STOP` values. The operator must reserve the
+range outside normal InSpace allocation because the API has no range-reservation
+operation. This provider audits collisions and fails closed; Cilium LB IPAM/L2
+configuration is a separate cluster concern.
 
 NodeClass readiness also verifies that its firewall:
 
@@ -581,7 +586,8 @@ versions. Its host launcher invokes Docker only; provisioning, parallel waits,
 validation, and cleanup run through Ansible inside the disposable runner image.
 It proves one Ready worker has the persisted VM UUID in the configured VPC,
 the matching provider ID, and one private `InternalIP` inside that VPC subnet;
-then it schedules the RWO/TCP-NLB workload and requires zero owned resources
-after teardown.
+then it exercises worker replacement with CSI detach/reattach, the paid TCP
+NLB, managed Node-LB shards, and endpoint-local edge capacity before requiring
+zero owned resources after teardown.
 
 The local `replace github.com/thanet-s/inspace-cloud-kube-modules/modules/client => ../client` resolves the Kubernetes-independent shared API client inside this monorepo.

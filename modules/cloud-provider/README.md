@@ -1,8 +1,8 @@
 # cloud-provider-inspace
 
-InSpace Cloud integration for Kubernetes/RKE2. This repository contains the
-shared location-aware API client, an external cloud-controller-manager (CCM),
-and the fixed one-or-three-server RKE2 bootstrap reconciler.
+InSpace Cloud integration for Kubernetes/RKE2. This module provides an external
+cloud-controller-manager (CCM) and the fixed one-or-three-server RKE2 bootstrap
+reconciler, using the repository's shared location-aware API client.
 
 ## Implemented
 
@@ -11,9 +11,10 @@ and the fixed one-or-three-server RKE2 bootstrap reconciler.
 - Canonical node provider IDs: `inspace://<location>/<vm-uuid>`.
 - Kubernetes `InstancesV2`: private VM address as `InternalIP`, explicitly
   assigned floating IPv4 as `ExternalIP`, location as zone.
-- Kubernetes `LoadBalancer` has two disjoint paths: private Services use
-  Cilium LB-IPAM plus L2 announcements, while explicitly public TCP Services
-  use deterministic InSpace NLB/FIP ownership.
+- Kubernetes `LoadBalancer` has distinct private and public paths. Private
+  Services use Cilium LB-IPAM plus L2 announcements. Public Services can use a
+  deterministic paid TCP-only InSpace NLB, CCM-managed shared or dedicated
+  Node-LB shards, or operator-owned endpoint-local edge nodes.
 - A reconciler that first creates one fixed Ubuntu 24.04 bastion
   (1 vCPU/2048 MiB/30 GiB), then creates either one low-cost or exactly three
   HA Ubuntu 24.04 RKE2 servers in deterministic slot order. Each server's restrictive firewall
@@ -116,9 +117,9 @@ deterministic slot order with a hard creation bound of one. Each VM's
 restrictive firewall assignment must be authoritatively visible before the
 next VM POST. `spec.controlPlane.replicas` is required, immutable, and accepts
 only `1` or `3`; two-server embedded-etcd topology is deliberately unsupported.
-next VM POST; protected servers may continue booting in parallel, and
-slot-ordered errors retain every successful VM for the next pass. Each server
-must use exactly Ubuntu 24.04 with 2-16 vCPUs and 4096-65536 MiB memory.
+Protected servers may continue booting in parallel, and slot-ordered errors
+retain every successful VM for the next pass. Each server must use exactly
+Ubuntu 24.04 with 2-16 vCPUs and 4096-65536 MiB memory.
 
 Bootstrap persists bounded mutation ledgers in status. `status.createAttempts`
 holds fourteen create/assignment/update slots: two firewall creates, four VM
@@ -616,8 +617,9 @@ The isolated API lifecycle suite and the destructive
 [full-cluster release acceptance test](../../test/e2e/README.md) are separate
 from ordinary verification. The latter boots exactly three RKE2 servers,
 checks embedded-etcd and CCM convergence, installs the released CSI and
-Karpenter components, exercises an elastic worker/RWO volume/public TCP NLB,
-and requires an exact zero-owned-resource cloud audit after teardown.
+Karpenter components, exercises elastic workers, CSI detach/reattach, private
+Cilium L2 Services, the paid TCP NLB, managed Node-LB shards, and endpoint-local
+edge nodes, then requires an exact zero-owned-resource cloud audit.
 
 ## Remaining production gaps
 
