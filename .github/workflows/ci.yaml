@@ -238,7 +238,7 @@ jobs:
           bash -n test/e2e/run.sh
           python3 deploy/verify-static.py
           python3 -m py_compile deploy/scripts/discover_bootstrap.py
-          bash -n deploy/run.sh deploy/scripts/api-tunnel.sh
+          bash -n deploy/run.sh deploy/container-entrypoint.sh deploy/scripts/api-tunnel.sh
           sh -n deploy/templates/apply-control-plane-config.sh
 
   e2e-harness:
@@ -265,6 +265,16 @@ jobs:
           cache-from: type=gha,scope=ci-e2e-harness-amd64
           cache-to: type=gha,mode=max,scope=ci-e2e-harness-amd64
 
+      - name: Build the dependency-locked operator deploy runner
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: deploy/Dockerfile
+          load: true
+          tags: local/inspace-deploy-runner:ci
+          cache-from: type=gha,scope=ci-deploy-runner-amd64
+          cache-to: type=gha,mode=max,scope=ci-deploy-runner-amd64
+
       - name: Verify Ansible and runner syntax without live mutations
         shell: bash
         run: |
@@ -289,4 +299,12 @@ jobs:
                 --inventory /workspace/deploy/inventory.example.yml \
                 "$playbook" --syntax-check
             done
+          '
+          docker run --rm \
+            --entrypoint /bin/bash \
+            local/inspace-deploy-runner:ci -ceu '
+            test "$(ansible-playbook --version | awk "NR == 1 { print \$3 }")" = 2.21.2
+            test "$(kubectl version --client -o json | jq -r .clientVersion.gitVersion)" = v1.35.6
+            helm version --short | grep -Eq "^v3\\.18\\.4\\+g[0-9a-f]+$"
+            test "$(docker --version | awk "{ sub(/,$/, \"\", \$3); print \$3 }")" = 29.4.0
           '

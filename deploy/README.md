@@ -11,17 +11,33 @@ isolated-account assertions and is not the production inventory.
 
 ## Requirements
 
-- macOS or Linux management host with `ansible-core 2.21`, Docker, Helm,
-  kubectl, OpenSSH, OpenSSL, Python 3, and jq
-- Docker support for running `linux/amd64` images; Apple Silicon Docker Desktop
-  uses its built-in x86 emulation because InSpace and current release images
-  are x86-64 only
+- macOS or Linux management host with Git, Docker, and an accessible
+  `/var/run/docker.sock`
+- Docker support for running `linux/amd64` images. The dependency-locked
+  Ansible runner uses the management host's native Docker architecture; on
+  Apple Silicon, only the released bootstrap controller uses Docker Desktop's
+  x86 emulation because current InSpace VMs and controller images are x86-64
 - one existing InSpace VPC, an unused private control-plane VIP, and a private
   Service VIP range of 16–256 addresses excluded from normal cloud allocation
 - an exact released module version
 - an SSH private/public key pair; private keys are used locally and never sent
   to InSpace, while the public key is supplied to VM creation
 - `INSPACE_API_TOKEN` exported in the process environment
+
+The launcher builds a local operator image from `deploy/Dockerfile` on first
+use. Ubuntu, Docker CLI, Helm, Ansible Core and every Python package are
+version-and-digest or exact-version locked; kubectl uses an exact version with
+upstream checksum verification. The image is addressed by a fingerprint of
+the committed deploy runner sources, so it is reused until runner code or its
+dependency lock changes.
+
+Inventory is never copied into that image. `deploy/run.sh` bind-mounts the
+selected inventory read-only for every invocation, so editing configuration
+does not rebuild the image. It also bind-mounts `deploy/.state/` read-write at
+the same absolute path, the SSH key directory read-only at its same absolute
+path, and the Docker socket for exact released bootstrap-controller execution.
+The Docker build context excludes real inventories, SSH material and lifecycle
+state.
 
 Copy and edit the example without committing it:
 
@@ -30,6 +46,14 @@ cp deploy/inventory.example.yml deploy/inventory.yml
 chmod 600 deploy/inventory.yml
 export INSPACE_API_TOKEN='...'
 ```
+
+By default, key paths in inventory must be absolute paths beneath
+`$HOME/.ssh`. Set `INSPACE_DEPLOY_SSH_DIR` to the common parent directory when
+the pair is stored elsewhere; that directory is mounted read-only at the same
+absolute path. `INSPACE_DEPLOY_STATE_ROOT` can similarly relocate the durable
+state root. A prebuilt image may be selected with
+`INSPACE_DEPLOY_RUNNER_IMAGE`; the launcher never silently rebuilds an
+explicitly selected image.
 
 The real inventory, generated tokens, kubeconfig, host-key pins, bootstrap
 ledger, and lifecycle journal are ignored by Git under `deploy/.state/`.
@@ -94,7 +118,10 @@ single-server cluster, an RKE2 restart necessarily causes brief API downtime.
 
 `tunnel` starts or reuses the SSH control connection and prints the local
 kubeconfig path. The kubeconfig uses `127.0.0.1:16443` with the private VIP as
-its TLS server name; it never exposes a control-plane FIP as a public API.
+its TLS server name; it never exposes a control-plane FIP as a public API. The
+launcher keeps this one container running and publishes its tunnel only on
+host loopback. Repeating `tunnel` reuses it. `destroy` stops that tunnel
+container before beginning the guarded teardown.
 
 ## Safe destroy
 

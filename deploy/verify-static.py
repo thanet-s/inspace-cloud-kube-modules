@@ -24,6 +24,10 @@ def require(value: bool, message: str) -> None:
 def main() -> None:
     inventory = read("deploy/inventory.example.yml")
     gitignore = read(".gitignore")
+    dockerignore = read(".dockerignore")
+    dockerfile = read("deploy/Dockerfile")
+    dependency_lock = read("deploy/requirements.lock.txt")
+    container_entrypoint = read("deploy/container-entrypoint.sh")
     cluster_template = read("deploy/templates/cluster.yaml.j2")
     init = read("deploy/playbooks/init-cluster.yml")
     update = read("deploy/playbooks/update-control-plane.yml")
@@ -45,6 +49,26 @@ def main() -> None:
     )
     for ignored in ("deploy/inventory.yml", "deploy/inventory/", "deploy/.state/"):
         require(ignored in gitignore, f"missing Git exclusion {ignored}")
+        require(ignored in dockerignore, f"missing Docker exclusion {ignored}")
+    require(
+        "ubuntu:26.04@sha256:" in dockerfile
+        and "docker:29.4.0-cli@sha256:" in dockerfile,
+        "deploy runner base or Docker CLI image is not digest locked",
+    )
+    require(
+        "ansible-core==2.21.2" in dependency_lock
+        and all(
+            line == "" or line.startswith("#") or re.search(r"^[A-Za-z0-9_.-]+==[^=]+$", line)
+            for line in dependency_lock.splitlines()
+        ),
+        "deploy Python dependency lock contains an unpinned requirement",
+    )
+    require(
+        "KUBECTL_VERSION=v1.35.6" in dockerfile
+        and "alpine/helm:3.18.4@sha256:" in dockerfile
+        and dockerfile.count("sha256sum --check") == 1,
+        "deploy kubectl or Helm dependency is not exactly verified",
+    )
     require(
         "replicas: {{ control_plane_replicas }}" in cluster_template,
         "cluster template pins a topology instead of using inventory",
@@ -159,6 +183,9 @@ def main() -> None:
         )
 
     for path in (
+        "deploy/Dockerfile",
+        "deploy/container-entrypoint.sh",
+        "deploy/requirements.lock.txt",
         "deploy/run.sh",
         "deploy/scripts/api-tunnel.sh",
         "deploy/scripts/discover_bootstrap.py",
@@ -174,6 +201,33 @@ def main() -> None:
     require(
         re.search(r"init \| update \| status \| tunnel \| destroy", run) is not None,
         "launcher does not expose the full lifecycle",
+    )
+    for fragment in (
+        "type=bind,src=$inventory,dst=/run/config/inventory.yml,readonly",
+        "type=bind,src=$ssh_dir,dst=$ssh_dir,readonly",
+        "type=bind,src=$state_root,dst=$state_root",
+        "type=bind,src=/var/run/docker.sock,dst=/var/run/docker.sock",
+        "local/inspace-deploy-runner:$runner_arch-$fingerprint",
+    ):
+        require(fragment in run, f"containerized launcher lacks {fragment}")
+    require(
+        "ansible-playbook" not in run,
+        "host launcher still depends on a host Ansible installation",
+    )
+    require(
+        "INSPACE_DEPLOY_RUNNER_PLATFORM:-linux/amd64" not in run
+        and 'INSPACE_DEPLOY_RUNNER_PLATFORM:-}' in run,
+        "deploy runner forces x86 instead of using the management host architecture",
+    )
+    require(
+        "INSPACE_DEPLOY_STATE_ROOT" in preflight
+        and "INSPACE_DEPLOY_STATE_ROOT" in container_entrypoint,
+        "container state path is not shared with nested Docker safely",
+    )
+    require(
+        "/state/ssh-public-key" in init
+        and "src={{ ssh_public_key_file_expanded }}" not in init,
+        "nested bootstrap still asks the host daemon to mount a container-only SSH path",
     )
     print("deploy static contracts: ok")
 
