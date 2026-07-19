@@ -416,16 +416,20 @@ make cluster-e2e-shell
 Preserved phase runs continue to incur charges until `cluster-e2e-destroy`
 completes.
 
-The runner image is built and executed as `linux/amd64` by default, matching
-the x86-64 AMD EPYC pool used by every E2E VM. A future ARM-backed test account
-can opt in without changing the launcher:
+The runner image is built and executed for the Docker daemon's native platform
+by default. On Apple Silicon this keeps Ansible, Python, kubectl, Helm, and the
+bootstrap helper on `linux/arm64`; the released controller images selected for
+the x86-64 InSpace VMs remain `linux/amd64`.
+
+Use an explicit runner override only when emulation or a fixed local platform is
+intentionally required:
 
 ```sh
 export INSPACE_E2E_RUNNER_PLATFORM='linux/arm64'
 ```
 
-Only `linux/amd64` and `linux/arm64` are accepted. The selected platform is
-applied to both the Docker build and the Docker run.
+Only `linux/amd64` and `linux/arm64` are accepted. When unset, no Docker
+`--platform` option is passed, so Docker selects the local platform.
 
 Required `.env` values are `INSPACE_API_URL`, `INSPACE_API_TOKEN`,
 `INSPACE_LOCATION`, `INSPACE_BILLING_ACCOUNT_ID`, `INSPACE_NETWORK_UUID`,

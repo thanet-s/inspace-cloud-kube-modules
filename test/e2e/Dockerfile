@@ -1,7 +1,5 @@
 # syntax=docker/dockerfile:1.7
 
-ARG CONTROLLER_IMAGE=ghcr.io/thanet-s/inspace-cloud-controller-manager:0.1.0
-
 FROM golang:1.26.5-bookworm AS local-controller-builder
 
 WORKDIR /src
@@ -65,16 +63,15 @@ RUN chmod 0755 /opt/e2e/run.sh /opt/e2e/scripts/*.sh /opt/e2e/scripts/*.py && \
 WORKDIR /opt/e2e
 ENTRYPOINT ["/usr/bin/tini", "-g", "--", "/opt/e2e/scripts/container-entrypoint.sh"]
 
-# Pull-request and local non-live validation compiles the controller from the
-# checkout. The destructive launcher never selects this target.
+# Pull-request and local non-live validation compile the controller from the
+# checkout for the Docker daemon's native architecture.
 FROM base AS local-validation
 COPY --from=local-controller-builder /out/inspace-cluster-controller /usr/local/bin/inspace-cluster-controller
 
-# Live release acceptance copies the bootstrap binary from the exact published
-# controller image tag. This makes mixing local bootstrap code with released
-# charts/controller images structurally impossible.
-FROM ${CONTROLLER_IMAGE} AS published-controller
-
+# Live release acceptance is permitted only from a clean checkout whose HEAD is
+# the exact canonical release tag. Build the bootstrap helper from that bound
+# source so Ansible and its helper remain native on ARM Macs. The in-cluster
+# images are still independently verified and selected as linux/amd64 artifacts.
 FROM base AS published-live
 ARG E2E_RELEASE_VERSION
 ARG E2E_RELEASE_REVISION
@@ -101,4 +98,4 @@ LABEL io.inspace.e2e.release-version=${E2E_RELEASE_VERSION} \
       io.inspace.e2e.controller-platform-digest=${E2E_CCM_PLATFORM_DIGEST} \
       io.inspace.e2e.crds-chart-digest=${E2E_CRDS_CHART_DIGEST} \
       io.inspace.e2e.modules-chart-digest=${E2E_MODULES_CHART_DIGEST}
-COPY --from=published-controller /usr/local/bin/inspace-cluster-controller /usr/local/bin/inspace-cluster-controller
+COPY --from=local-controller-builder /out/inspace-cluster-controller /usr/local/bin/inspace-cluster-controller
