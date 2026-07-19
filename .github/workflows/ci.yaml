@@ -303,7 +303,7 @@ jobs:
           docker run --rm \
             --entrypoint /bin/bash \
             local/inspace-deploy-runner:ci -ceu '
-            test "$(ansible-playbook --version | awk "NR == 1 { print \$3 }")" = 2.21.2
+            test "$(ansible-playbook --version | awk "NR == 1 { gsub(/[][]/, \"\", \$3); print \$3 }")" = 2.21.2
             test "$(kubectl version --client -o json | jq -r .clientVersion.gitVersion)" = v1.35.6
             helm version --short | grep -Eq "^v3\\.18\\.4\\+g[0-9a-f]+$"
             test "$(docker --version | awk "{ sub(/,$/, \"\", \$3); print \$3 }")" = 29.4.0
