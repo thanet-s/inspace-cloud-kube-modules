@@ -3,7 +3,7 @@ set -eu
 
 workspace=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 
-if [ -f "$workspace/.env" ]; then
+if [ "${INSPACE_SKIP_DOTENV:-false}" != true ] && [ -f "$workspace/.env" ]; then
   set -a
   # shellcheck disable=SC1091
   . "$workspace/.env"

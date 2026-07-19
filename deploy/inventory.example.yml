@@ -23,8 +23,8 @@ all:
     service_cidr: 10.43.0.0/16
 
     # Use an exact published version. Release candidates are supported for
-    # acceptance testing, for example 0.7.0-rc.1.
-    modules_version: 0.7.1
+    # acceptance testing, for example 0.8.0-rc.1.
+    modules_version: 0.8.0
     rke2_version: v1.35.6+rke2r1
     control_plane_vcpu: 2
     control_plane_memory_mib: 4096

@@ -1,0 +1,86 @@
+# InSpace Cloud has no managed NAT gateway. This pool provides a NAT-like
+# egress path for selected workloads: Cilium routes and SNATs their public
+# traffic through one of these nodes, and InSpace exposes the node through its
+# floating public IPv4 for external-provider allowlists.
+#
+# This static pool supplies two dedicated Cilium egress gateway nodes. It
+# reuses the example InSpaceNodeClass, which must keep reservePublicIPv4: true.
+# Application Pods do not run on these nodes: do not add the taint toleration
+# below to payment-gateway or other ordinary workloads.
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: payment-egress
+spec:
+  # Static capacity is independent of pending Pod demand.
+  replicas: 2
+  limits:
+    # Keep the pool at no more than two billable nodes. This prevents surge
+    # replacement; a replacement may therefore be delete-before-create.
+    nodes: 2
+  template:
+    metadata:
+      labels:
+        # NodeRestriction prevents a kubelet from self-selecting as a gateway.
+        inspace.cloud.node-restriction.kubernetes.io/egress-gateway: payment
+    spec:
+      expireAfter: Never
+      nodeClassRef:
+        group: karpenter.inspace.cloud
+        kind: InSpaceNodeClass
+        name: ubuntu-workers
+      taints:
+        - key: inspace.cloud/egress-gateway
+          value: payment
+          effect: NoSchedule
+      requirements:
+        - key: inspace.cloud/instance-family
+          operator: In
+          values: [general]
+        - key: inspace.cloud/instance-cpu
+          operator: In
+          values: ["1"]
+        - key: inspace.cloud/instance-memory
+          operator: In
+          values: ["2048"]
+        - key: inspace.cloud/host-class
+          operator: In
+          values: [amd-epyc]
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: [on-demand]
+        - key: kubernetes.io/arch
+          operator: In
+          values: [amd64]
+        - key: kubernetes.io/os
+          operator: In
+          values: [linux]
+  disruption:
+    # Static pools are not consolidated. These settings also prevent voluntary
+    # disruption of the allowlisted gateway nodes.
+    consolidateAfter: Never
+    budgets:
+      - nodes: "0"
+---
+# This policy is cluster-scoped: metadata.namespace must be omitted.
+# It selects payment-gateway Pods in the payments namespace wherever those
+# Pods run, then sends their public IPv4 traffic through the dedicated pool.
+apiVersion: cilium.io/v2
+kind: CiliumEgressGatewayPolicy
+metadata:
+  name: payment-gateway
+spec:
+  selectors:
+    - podSelector:
+        matchLabels:
+          io.kubernetes.pod.namespace: payments
+          app.kubernetes.io/name: payment-gateway
+  destinationCIDRs:
+    - 0.0.0.0/0
+  egressGateway:
+    nodeSelector:
+      matchLabels:
+        inspace.cloud.node-restriction.kubernetes.io/egress-gateway: payment
+    # Deliberately omit both egressIP and interface. Cilium uses the first IPv4
+    # address on the interface that owns the node's default route. InSpace then
+    # exposes that node through its assigned floating public IPv4.

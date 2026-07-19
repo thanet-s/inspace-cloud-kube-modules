@@ -23,6 +23,8 @@ InSpace virtual machines rather than a managed Kubernetes service.
 - Private, bastion-backed bootstrap cache by default, with an explicit
   direct-download mode.
 - Cilium native routing, eBPF masquerading, and full kube-proxy replacement.
+- Cilium Egress Gateway for sending selected workload traffic through
+  dedicated, tainted static Karpenter nodes.
 - External cloud-controller-manager for node addresses, paid InSpace NLBs, and
   managed-shard or endpoint-local Cilium node load balancers.
 - CSI driver for dynamically provisioned `ReadWriteOnce` block volumes.

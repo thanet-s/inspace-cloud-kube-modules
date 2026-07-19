@@ -3264,7 +3264,7 @@ func TestDestroyConvergesForV4OwnershipRecords(t *testing.T) {
 	bastion.Description = strings.Replace(bastion.Description, "inspace-rke2-bastion/v6 ", "inspace-rke2-bastion/v4 ", 1)
 	for slot := 0; slot < ControlPlaneReplicas; slot++ {
 		controlPlane := mustVM(t, api.vms, controlPlaneName(cluster.Metadata.Name, slot))
-		controlPlane.Description = strings.Replace(controlPlane.Description, "inspace-rke2-cp/v8 ", "inspace-rke2-cp/v4 ", 1)
+		controlPlane.Description = strings.Replace(controlPlane.Description, "inspace-rke2-cp/v9 ", "inspace-rke2-cp/v4 ", 1)
 	}
 
 	result := destroyUntilDone(t, reconciler, cluster)
@@ -3283,7 +3283,7 @@ func TestDestroyConvergesForV5OwnershipRecords(t *testing.T) {
 	bastion.Description = strings.Replace(bastion.Description, "inspace-rke2-bastion/v6 ", "inspace-rke2-bastion/v5 ", 1)
 	for slot := 0; slot < ControlPlaneReplicas; slot++ {
 		controlPlane := mustVM(t, api.vms, controlPlaneName(cluster.Metadata.Name, slot))
-		controlPlane.Description = strings.Replace(controlPlane.Description, "inspace-rke2-cp/v8 ", "inspace-rke2-cp/v5 ", 1)
+		controlPlane.Description = strings.Replace(controlPlane.Description, "inspace-rke2-cp/v9 ", "inspace-rke2-cp/v5 ", 1)
 	}
 
 	result := destroyUntilDone(t, reconciler, cluster)
@@ -3300,7 +3300,7 @@ func TestDestroyConvergesForV6OwnershipRecords(t *testing.T) {
 
 	for slot := 0; slot < ControlPlaneReplicas; slot++ {
 		controlPlane := mustVM(t, api.vms, controlPlaneName(cluster.Metadata.Name, slot))
-		controlPlane.Description = strings.Replace(controlPlane.Description, "inspace-rke2-cp/v8 ", "inspace-rke2-cp/v6 ", 1)
+		controlPlane.Description = strings.Replace(controlPlane.Description, "inspace-rke2-cp/v9 ", "inspace-rke2-cp/v6 ", 1)
 	}
 
 	result := destroyUntilDone(t, reconciler, cluster)
@@ -3317,7 +3317,7 @@ func TestDestroyConvergesForV7OwnershipRecords(t *testing.T) {
 
 	for slot := 0; slot < ControlPlaneReplicas; slot++ {
 		controlPlane := mustVM(t, api.vms, controlPlaneName(cluster.Metadata.Name, slot))
-		controlPlane.Description = strings.Replace(controlPlane.Description, "inspace-rke2-cp/v8 ", "inspace-rke2-cp/v7 ", 1)
+		controlPlane.Description = strings.Replace(controlPlane.Description, "inspace-rke2-cp/v9 ", "inspace-rke2-cp/v7 ", 1)
 	}
 
 	result := destroyUntilDone(t, reconciler, cluster)
@@ -3326,7 +3326,24 @@ func TestDestroyConvergesForV7OwnershipRecords(t *testing.T) {
 	}
 }
 
-func TestDestroyConvergesForCurrentV6BastionV8ControlPlanes(t *testing.T) {
+func TestDestroyConvergesForV8OwnershipRecords(t *testing.T) {
+	api := newFakeAPI()
+	cluster := testCluster()
+	reconciler := testReconciler(api)
+	reconcileUntilReady(t, reconciler, cluster)
+
+	for slot := 0; slot < ControlPlaneReplicas; slot++ {
+		controlPlane := mustVM(t, api.vms, controlPlaneName(cluster.Metadata.Name, slot))
+		controlPlane.Description = strings.Replace(controlPlane.Description, "inspace-rke2-cp/v9 ", "inspace-rke2-cp/v8 ", 1)
+	}
+
+	result := destroyUntilDone(t, reconciler, cluster)
+	if !result.Done || len(api.vms) != 0 || len(api.floatingIPs) != 0 || len(api.firewalls) != 0 {
+		t.Fatalf("v8 ownership topology did not converge: result=%#v VMs=%#v FIPs=%#v firewalls=%#v", result, api.vms, api.floatingIPs, api.firewalls)
+	}
+}
+
+func TestDestroyConvergesForCurrentV6BastionV9ControlPlanes(t *testing.T) {
 	api := newFakeAPI()
 	cluster := testCluster()
 	reconciler := testReconciler(api)
@@ -3338,7 +3355,7 @@ func TestDestroyConvergesForCurrentV6BastionV8ControlPlanes(t *testing.T) {
 	}
 	for slot := 0; slot < ControlPlaneReplicas; slot++ {
 		controlPlane := mustVM(t, api.vms, controlPlaneName(cluster.Metadata.Name, slot))
-		if !strings.HasPrefix(controlPlane.Description, "inspace-rke2-cp/v8 ") {
+		if !strings.HasPrefix(controlPlane.Description, "inspace-rke2-cp/v9 ") {
 			t.Fatalf("current control-plane %d ownership = %q", slot, controlPlane.Description)
 		}
 	}
@@ -3354,10 +3371,10 @@ func TestDestroyRejectsIncoherentOwnershipSchemaTopology(t *testing.T) {
 		"v6 bastion with v2 control planes": func(t *testing.T, api *fakeAPI, cluster *v1alpha1.InSpaceCluster) {
 			convertControlPlaneOwnershipToV2(t, api, cluster)
 		},
-		"v1 bastion with v8 control planes": func(t *testing.T, api *fakeAPI, cluster *v1alpha1.InSpaceCluster) {
+		"v1 bastion with v9 control planes": func(t *testing.T, api *fakeAPI, cluster *v1alpha1.InSpaceCluster) {
 			convertBastionToLegacy(t, api, cluster)
 		},
-		"mixed v2 and v8 control planes without bastion": func(t *testing.T, api *fakeAPI, cluster *v1alpha1.InSpaceCluster) {
+		"mixed v2 and v9 control planes without bastion": func(t *testing.T, api *fakeAPI, cluster *v1alpha1.InSpaceCluster) {
 			api.removeVMFromReadback(mustVM(t, api.vms, currentBastionName(cluster.Metadata.Name)).UUID)
 			vm := mustVM(t, api.vms, controlPlaneName(cluster.Metadata.Name, 1))
 			hash := vm.Description[strings.LastIndex(vm.Description, "=")+1:]
@@ -4881,16 +4898,24 @@ func assertControlPlaneCloudInit(t *testing.T, raw, expectedNodeName string, ini
 		BPF                   struct {
 			Masquerade bool `json:"masquerade"`
 		} `json:"bpf"`
+		EgressGateway struct {
+			Enabled bool `json:"enabled"`
+		} `json:"egressGateway"`
 	}
 	if err := yaml.Unmarshal([]byte(helmChartConfig.Spec.ValuesContent), &ciliumValues); err != nil {
 		t.Fatalf("parse generated RKE2 Cilium values: %v", err)
 	}
 	if ciliumValues.RoutingMode != "native" || ciliumValues.IPv4NativeRoutingCIDR != "10.42.0.0/16" ||
 		!ciliumValues.AutoDirectNodeRoutes || !ciliumValues.KubeProxyReplacement || !ciliumValues.EnableIPv4Masquerade ||
-		!ciliumValues.BPF.Masquerade {
+		!ciliumValues.BPF.Masquerade || !ciliumValues.EgressGateway.Enabled {
 		t.Fatalf("generated Cilium native-routing contract=%#v", ciliumValues)
 	}
-	for _, required := range []string{"l2announcements:\n      enabled: true", "defaultLBServiceIPAM: none", "k8sClientRateLimit:\n      qps: 10\n      burst: 20"} {
+	for _, required := range []string{
+		"egressGateway:\n      enabled: true",
+		"l2announcements:\n      enabled: true",
+		"defaultLBServiceIPAM: none",
+		"k8sClientRateLimit:\n      qps: 10\n      burst: 20",
+	} {
 		if !strings.Contains(ciliumConfig, required) {
 			t.Errorf("RKE2 Cilium config lacks %q", required)
 		}
@@ -5171,7 +5196,7 @@ func seedOwnedMutationVMs(t *testing.T, api *fakeAPI, cluster *v1alpha1.InSpaceC
 		if index > 0 {
 			slot := index - 1
 			name = controlPlaneName(cluster.Metadata.Name, slot)
-			description = fmt.Sprintf("inspace-rke2-cp/v8 owner=%s slot=%d spec=%s", owner, slot, strings.Repeat("0", sha256.Size*2))
+			description = fmt.Sprintf("inspace-rke2-cp/v9 owner=%s slot=%d spec=%s", owner, slot, strings.Repeat("0", sha256.Size*2))
 		}
 		vm := inspace.VM{
 			UUID: uuid, Name: name, Hostname: name, Description: description,

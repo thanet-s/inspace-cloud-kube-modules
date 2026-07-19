@@ -410,6 +410,7 @@
           .data["kube-proxy-replacement"] == "true" and
           .data["enable-ipv4-masquerade"] == "true" and
           .data["enable-bpf-masquerade"] == "true" and
+          .data["enable-egress-gateway"] == "true" and
           .data["enable-l2-announcements"] == "true" and
           .data["default-lb-service-ipam"] == "none"'
         kubectl get ciliumloadbalancerippool inspace-private

@@ -311,7 +311,54 @@ See [`service-private-l2.yaml`](examples/service-private-l2.yaml),
 [`service-public-nlb.yaml`](examples/service-public-nlb.yaml),
 [`service-public-node-shared.yaml`](examples/service-public-node-shared.yaml),
 [`service-public-node-dedicated.yaml`](examples/service-public-node-dedicated.yaml),
-and [`service-public-node-local.yaml`](examples/service-public-node-local.yaml).
+[`service-public-node-local.yaml`](examples/service-public-node-local.yaml), and
+[`egress-gateway-static.yaml`](examples/egress-gateway-static.yaml).
+
+## Dedicated workload egress
+
+Bootstrap enables Cilium Egress Gateway together with its required BPF
+masquerading and kube-proxy replacement settings. The
+[`egress-gateway-static.yaml`](examples/egress-gateway-static.yaml) example
+creates a static two-node Karpenter pool and routes public IPv4 traffic from
+`app.kubernetes.io/name: payment-gateway` Pods in the `payments` namespace
+through that pool.
+
+The gateway nodes carry the permanent
+`inspace.cloud/egress-gateway=payment:NoSchedule` taint. Ordinary workloads,
+including `payment-gateway`, must not tolerate it; the Pods remain on normal
+worker nodes and Cilium redirects only their selected egress traffic. Gateway
+selection uses the protected
+`inspace.cloud.node-restriction.kubernetes.io/egress-gateway=payment` label so
+a kubelet cannot nominate itself. The example reuses
+`InSpaceNodeClass/ubuntu-workers`, whose `reservePublicIPv4: true` contract
+gives each gateway node one egress-only InSpace floating IPv4.
+
+The policy intentionally omits both `egressIP` and `interface`. Cilium chooses
+the first address on the interface that owns the default route, and InSpace
+SNAT exposes that node through its floating public IPv4. Once both nodes are
+Ready and CCM has published their external addresses, list the addresses to
+allowlist with the external provider:
+
+```sh
+kubectl get nodes \
+  -l inspace.cloud.node-restriction.kubernetes.io/egress-gateway=payment \
+  -o 'custom-columns=NAME:.metadata.name,PRIVATE:.status.addresses[?(@.type=="InternalIP")].address,PUBLIC:.status.addresses[?(@.type=="ExternalIP")].address'
+```
+
+A single `egressGateway.nodeSelector` matching two nodes uses the first match
+in lexical node-name order. The second node becomes the selected gateway after
+the first stops matching or is removed; it is not an active-active second
+path, so allowlist both public addresses. Gateway changes terminate existing
+egress connections. Static Karpenter capacity fixes the node count, not the
+lifetime of a floating IP: manual deletion, infrastructure failure, or an
+explicitly permitted replacement allocates a new address that must be added to
+the provider allowlist. The example disables expiration, voluntary disruption,
+consolidation, and surge capacity to minimize that churn.
+
+Cilium policy realization for a newly started Pod is not instantaneous. A
+strict external provider allowlist safely rejects any connection that leaves
+before the egress policy is active; applications should retry those initial
+connections.
 
 ## Secret contracts
 

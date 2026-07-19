@@ -1287,11 +1287,13 @@
           .data["kube-proxy-replacement"] == "true" and
           .data["enable-ipv4-masquerade"] == "true" and
           .data["enable-bpf-masquerade"] == "true" and
+          .data["enable-egress-gateway"] == "true" and
           .data["enable-l2-announcements"] == "true" and
           .data["default-lb-service-ipam"] == "none"'
         values=$(kubectl -n kube-system get helmchartconfig rke2-cilium -o jsonpath='{.spec.valuesContent}')
         grep -Eq '^[[:space:]]*defaultLBServiceIPAM:[[:space:]]*none[[:space:]]*$' <<<"$values"
         ! grep -Eq '^[[:space:]]*nodeIPAM:[[:space:]]*$' <<<"$values"
+        grep -Eq '^[[:space:]]*egressGateway:[[:space:]]*$' <<<"$values"
         grep -Eq '^[[:space:]]*l2announcements:[[:space:]]*$' <<<"$values"
         export E2E_CILIUM_VALUES="$values"
         python3 - "$INSPACE_PRIVATE_LOAD_BALANCER_POOL_START" "$INSPACE_PRIVATE_LOAD_BALANCER_POOL_STOP" <<'PY'
@@ -1307,6 +1309,7 @@
         qps = max(10, math.ceil(addresses / 5))
         assert values["enableIPv4Masquerade"] is True
         assert values["bpf"]["masquerade"] is True
+        assert values["egressGateway"]["enabled"] is True
         assert values["l2announcements"]["enabled"] is True
         assert values["defaultLBServiceIPAM"] == "none"
         assert "nodeIPAM" not in values

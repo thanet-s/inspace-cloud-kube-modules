@@ -373,6 +373,8 @@ spec:
     enableIPv4Masquerade: true
     bpf:
       masquerade: true
+    egressGateway:
+      enabled: true
     l2announcements:
       enabled: true
     defaultLBServiceIPAM: none
