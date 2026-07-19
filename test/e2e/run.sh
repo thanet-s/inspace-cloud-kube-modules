@@ -32,8 +32,8 @@ ssh_private_key=${INSPACE_E2E_SSH_PRIVATE_KEY:-$HOME/.ssh/id_rsa}
 ssh_public_key=${INSPACE_E2E_SSH_PUBLIC_KEY:-$HOME/.ssh/id_rsa.pub}
 state_volume=${INSPACE_E2E_STATE_VOLUME:-inspace-cloud-rke2-e2e-state}
 runner_image_base=${INSPACE_E2E_RUNNER_IMAGE:-inspace-cloud-rke2-e2e:local}
-runner_platform=${INSPACE_E2E_RUNNER_PLATFORM:-linux/amd64}
 phase=${1:-all}
+runner_platform_args=()
 
 [[ $# -le 1 ]] || { echo "usage: test/e2e/run.sh [all|init|test|shell|destroy]" >&2; exit 2; }
 case "$phase" in
@@ -41,10 +41,16 @@ case "$phase" in
   *) echo "unsupported E2E phase: $phase" >&2; exit 2 ;;
 esac
 
-[[ $runner_platform == linux/amd64 ]] || {
-  echo "INSPACE_E2E_RUNNER_PLATFORM must be linux/amd64 while InSpace is x86-only" >&2
-  exit 2
-}
+if [[ -n ${INSPACE_E2E_RUNNER_PLATFORM:-} ]]; then
+  case "$INSPACE_E2E_RUNNER_PLATFORM" in
+    linux/amd64 | linux/arm64) ;;
+    *)
+      echo "INSPACE_E2E_RUNNER_PLATFORM must be linux/amd64 or linux/arm64" >&2
+      exit 2
+      ;;
+  esac
+  runner_platform_args=(--platform "$INSPACE_E2E_RUNNER_PLATFORM")
+fi
 [[ ${#state_volume} -le 128 && $state_volume =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || {
   echo "INSPACE_E2E_STATE_VOLUME must be a bounded Docker volume name" >&2
   exit 2
@@ -180,10 +186,9 @@ set_runner_build_arguments() {
 build_published_runner() {
   set_runner_build_arguments
   docker build \
-    --platform "$runner_platform" \
+    ${runner_platform_args[@]+"${runner_platform_args[@]}"} \
     --file test/e2e/Dockerfile \
     --target published-live \
-    --build-arg "CONTROLLER_IMAGE=ghcr.io/thanet-s/inspace-cloud-controller-manager@$ccm_platform_digest" \
     "${runner_build_arguments[@]}" \
     --tag "$runner_image" \
     .
@@ -201,7 +206,7 @@ if [[ $phase == destroy ]]; then
     exit 2
   }
   release_environment=$(docker run --rm \
-    --platform "$runner_platform" \
+    ${runner_platform_args[@]+"${runner_platform_args[@]}"} \
     --entrypoint /opt/e2e/scripts/verify-release-images.py \
     --mount "type=volume,src=$state_volume,dst=/state,readonly" \
     "$runner_image" \
@@ -228,14 +233,14 @@ if [[ $phase == destroy ]]; then
   }
 else
   docker build \
-    --platform "$runner_platform" \
+    ${runner_platform_args[@]+"${runner_platform_args[@]}"} \
     --file test/e2e/Dockerfile \
     --target base \
     --tag "$verifier_image" \
     .
   artifact_container_root="/state/release-preflight/v$INSPACE_E2E_VERSION-$release_revision"
   release_environment=$(docker run --rm \
-    --platform "$runner_platform" \
+    ${runner_platform_args[@]+"${runner_platform_args[@]}"} \
     --entrypoint /opt/e2e/scripts/verify-release-images.py \
     --mount "type=volume,src=$state_volume,dst=/state" \
     "$verifier_image" \
@@ -265,7 +270,7 @@ if [[ $phase == shell ]]; then
   interactive_arg=-it
 fi
 docker run --rm ${interactive_arg:+"$interactive_arg"} \
-  --platform "$runner_platform" \
+  ${runner_platform_args[@]+"${runner_platform_args[@]}"} \
   --env "CONFIRM_INSPACE_CLUSTER_E2E=$CONFIRM_INSPACE_CLUSTER_E2E" \
   --env "INSPACE_E2E_VERSION=$INSPACE_E2E_VERSION" \
   --env "INSPACE_E2E_RELEASE_REVISION=$release_revision" \

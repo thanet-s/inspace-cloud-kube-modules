@@ -364,12 +364,10 @@ def verify_host_launcher_external_allow_list() -> None:
             published = [call for call in calls if "--target published-live" in call]
             require(
                 len(published) == 1
-                and (
-                    "CONTROLLER_IMAGE=ghcr.io/thanet-s/inspace-cloud-controller-manager@sha256:"
-                    + "b" * 64
-                ) in published[0]
+                and "CONTROLLER_IMAGE=" not in published[0]
+                and ("E2E_CCM_PLATFORM_DIGEST=sha256:" + "b" * 64) in published[0]
                 and ("E2E_KARPENTER_PLATFORM_DIGEST=sha256:" + "f" * 64) in published[0],
-                "live runner must be built from the verified platform digest set",
+                "live runner must bind the verified platform digest set while compiling its helper natively",
             )
             git_calls = git_log.read_text(encoding="utf-8").splitlines()
             require(
@@ -407,7 +405,7 @@ def verify_host_launcher_external_allow_list() -> None:
                         f"canonical source verifier accepted unsafe {key}",
                     )
                 for key, value in (
-                    ("INSPACE_E2E_RUNNER_PLATFORM", "linux/arm64"),
+                    ("INSPACE_E2E_RUNNER_PLATFORM", "linux/s390x"),
                     ("INSPACE_E2E_STATE_VOLUME", "--privileged"),
                     ("INSPACE_E2E_RUNNER_IMAGE", "--network=host"),
                 ):
@@ -427,7 +425,8 @@ def verify_host_launcher_external_allow_list() -> None:
                     )
         final_run = calls[-1]
         require(
-            (("run --rm -it --platform linux/amd64" in final_run) == (phase == "shell"))
+            (("run --rm -it " in final_run) == (phase == "shell"))
+            and "--platform" not in final_run
             and f"--env INSPACE_E2E_CCM_PLATFORM_DIGEST={'sha256:' + 'b' * 64}" in final_run
             and "--env INSPACE_E2E_RELEASE_REVISION=1111111111111111111111111111111111111111" in final_run
             and final_run.endswith(
@@ -1713,17 +1712,24 @@ def main() -> None:
             "an E2E cloud reader bypasses the shared strict InSpace API boundary",
         )
     require("docker build" in executable_host and "docker run" in executable_host, "host launcher must build and run Docker")
-    require("runner_platform=${INSPACE_E2E_RUNNER_PLATFORM:-linux/amd64}" in executable_host,
-            "E2E runner must default explicitly to linux/amd64")
-    require("[[ $runner_platform == linux/amd64 ]]" in executable_host and
-            "while InSpace is x86-only" in host and
-            "linux/arm64" not in executable_host,
-            "E2E runner must reject arm64 until InSpace offers it")
-    require(executable_host.count('--platform "$runner_platform"') >= 2,
-            "E2E runner platform must be passed to verifier/build and final Docker run")
+    require(
+        "runner_platform_args=()" in executable_host
+        and 'if [[ -n ${INSPACE_E2E_RUNNER_PLATFORM:-} ]]' in executable_host
+        and 'runner_platform_args=(--platform "$INSPACE_E2E_RUNNER_PLATFORM")' in executable_host
+        and "linux/amd64 | linux/arm64" in executable_host,
+        "E2E runner must default to Docker-native architecture with a bounded explicit override",
+    )
+    require(executable_host.count('${runner_platform_args[@]+"${runner_platform_args[@]}"}') >= 5,
+            "E2E runner platform override must cover verifier/build and final Docker run")
     require("--target published-live" in executable_host and
-            "CONTROLLER_IMAGE=ghcr.io/thanet-s/inspace-cloud-controller-manager@$ccm_platform_digest" in executable_host,
-            "normal destructive launcher must copy the bootstrap binary from the verified platform digest")
+            "CONTROLLER_IMAGE=ghcr.io/thanet-s/inspace-cloud-controller-manager@$ccm_platform_digest" not in executable_host,
+            "live E2E must compile its bootstrap helper natively from the exact release-bound source")
+    require(
+        "COPY --from=local-controller-builder /out/inspace-cluster-controller /usr/local/bin/inspace-cluster-controller"
+        in dockerfile
+        and "FROM ${CONTROLLER_IMAGE} AS published-controller" not in dockerfile,
+        "published E2E runner must use the native release-bound bootstrap helper",
+    )
     require(
         "REVISION: ${{ github.sha }}" in release_workflow
         and 'org.opencontainers.image.revision: \\"\\"' in release_workflow
@@ -1763,7 +1769,10 @@ def main() -> None:
             "runner must use one process-group-aware Tini")
     require("FROM base AS local-validation" in dockerfile and
             "FROM base AS published-live" in dockerfile and
-            "COPY --from=published-controller /usr/local/bin/inspace-cluster-controller" in dockerfile,
+            dockerfile.count(
+                "COPY --from=local-controller-builder /out/inspace-cluster-controller "
+                "/usr/local/bin/inspace-cluster-controller"
+            ) == 2,
             "runner must separate local validation from published live acceptance")
     for playbook_name in ("init-cluster.yml", "test.yml", "destroy-cluster.yml"):
         require(f"/opt/e2e/{playbook_name}" in dockerfile,

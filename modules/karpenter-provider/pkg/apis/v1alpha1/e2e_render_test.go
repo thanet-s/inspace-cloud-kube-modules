@@ -29,7 +29,8 @@ func TestClusterE2EHostEntrypointOnlyLaunchesDocker(t *testing.T) {
 		`docker volume create "$state_volume"`,
 		`--file test/e2e/Dockerfile`,
 		`--target published-live`,
-		`CONTROLLER_IMAGE=ghcr.io/thanet-s/inspace-cloud-controller-manager@$ccm_platform_digest`,
+		`E2E_CCM_PLATFORM_DIGEST=$ccm_platform_digest`,
+		`runner_platform_args=(--platform "$INSPACE_E2E_RUNNER_PLATFORM")`,
 		`--tag "$runner_image"`,
 		"docker run --rm",
 		`type=bind,src=$env_file,dst=/run/config/workspace.env,readonly`,
@@ -46,7 +47,7 @@ func TestClusterE2EHostEntrypointOnlyLaunchesDocker(t *testing.T) {
 		`ENTRYPOINT ["/usr/bin/tini", "-g", "--", "/opt/e2e/scripts/container-entrypoint.sh"]`,
 		"FROM base AS local-validation",
 		"FROM base AS published-live",
-		"COPY --from=published-controller /usr/local/bin/inspace-cluster-controller",
+		"COPY --from=local-controller-builder /out/inspace-cluster-controller",
 	} {
 		mustContain(t, "runner Dockerfile", dockerfile, expected)
 	}
