@@ -60,6 +60,27 @@ ledger, and lifecycle journal are ignored by Git under `deploy/.state/`.
 Back up that directory securely. Its `cluster.yaml` contains durable no-replay
 receipts required for safe recovery and destroy.
 
+## Bootstrap download and OS upgrade options
+
+The inventory deliberately uses one setting for each cluster-wide bootstrap
+choice:
+
+| Inventory value | Default | Applies to |
+| --- | --- | --- |
+| `bootstrap_direct_download` | `false` | Bastion cache setup, control-plane downloads, and the generated Karpenter `InSpaceNodeClass` |
+| `skip_os_upgrade` | `false` | Bastion, every fixed control-plane server, and every worker created from the generated Karpenter `InSpaceNodeClass` |
+
+Cached mode (`bootstrap_direct_download: false`) is the normal path. The
+bastion serves the private RKE2 asset and system-image cache, and both fixed
+and elastic nodes use it. Direct mode keeps the bastion for private management
+but makes every node use upstream download locations.
+
+`skip_os_upgrade: true` is intended only for short-lived test clusters. It
+skips the one-time `apt-get upgrade -y`, but still configures mirrors and DNS,
+runs `apt-get update`, installs required packages, and disables later automatic
+APT upgrades. Keep the production default `false` for both control-plane and
+Karpenter nodes.
+
 ## One or three control-plane servers
 
 Set `control_plane_replicas` to:

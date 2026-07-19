@@ -702,13 +702,14 @@ acceptance; its controllers persist their own cloud-mutation receipts.
 
 From a checkout matching an exact published release candidate, the destructive
 release-acceptance suite proves the complete cluster lifecycle: three
-stock-Ubuntu RKE2 control planes with embedded etcd, a bastion, and one
-Karpenter worker, all on the configured AMD EPYC pool; Cilium native routing
-and kube-proxy replacement; CCM node identity; public-IP egress and RKE2 join;
-the default private bootstrap cache and its pinned TLS trust; an RWO CSI volume
-that retains data through pod replacement; and a public TCP NLB response. The
-default workflow finishes with an exact-ownership,
-zero-leftover cloud audit.
+stock-Ubuntu RKE2 control planes with embedded etcd, a bastion, and elastic AMD
+EPYC workers; Cilium native routing and kube-proxy replacement; CCM node
+identity; public-IP egress and RKE2 join; the default private bootstrap cache
+and its pinned TLS trust; an RWO CSI volume that survives Pod replacement and
+worker detach/reattach; private Cilium L2 VIPs and failover; the paid TCP NLB;
+managed shared/dedicated Node-LB shards; and endpoint-local edge replacement.
+The default workflow finishes with an exact-ownership, zero-leftover cloud
+audit.
 
 ```sh
 export INSPACE_E2E_VERSION='<published-version>'

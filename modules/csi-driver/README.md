@@ -1,6 +1,6 @@
 # InSpace CSI driver
 
-CSI v1.12 driver for InSpace block storage. The first release supports ext4
+CSI v1.12 driver for InSpace block storage. The supported contract is ext4
 `SINGLE_NODE_WRITER`, which Kubernetes exposes as `ReadWriteOnce` (RWO).
 
 The production controller uses the shared
@@ -183,9 +183,12 @@ full-cluster release acceptance below. Ordinary `make test`, `make smoke`, and
 
 The separate [full-cluster release acceptance test](../../test/e2e/README.md)
 installs the released CSI controller and node DaemonSet into the real RKE2
-cluster. It provisions and attaches one RWO volume to the Karpenter worker,
-verifies the mounted marker through a pod replacement, then proves the
-VolumeAttachment, PV, PVC, disk, and worker are absent after teardown.
+cluster. It provisions and attaches one RWO volume, verifies the mounted marker
+through a Pod replacement, then requests deletion of the attached worker. The
+test proves Karpenter keeps the VM while the non-primary disk is attached, CSI
+detaches it, replacement capacity reattaches the same disk UUID, and the
+persisted marker remains readable. Final teardown requires the
+VolumeAttachment, PV, PVC, disk, and workers to be absent.
 
 ## Recover an unresolved mutation fence
 
@@ -258,7 +261,7 @@ created out of band with `api-token` and `billing-account-id` keys; no
 credential is stored in this repository.
 
 The current full-cluster test does not replace `csi-sanity`, upstream
-Kubernetes storage conformance, node reboot/remount, forced VM deletion, or
-destructive detach testing; run those before broadening the first-release RWO
-contract. The local `replace` in `go.mod` points at the sibling shared SDK
-module inside this monorepo.
+Kubernetes storage conformance, node reboot/remount, out-of-band dashboard/API
+VM deletion, or destructive detach fault injection; run those before
+broadening the supported RWO contract. The local `replace` in `go.mod` points
+at the sibling shared SDK module inside this monorepo.

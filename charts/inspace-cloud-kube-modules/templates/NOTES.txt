@@ -34,6 +34,11 @@ CCM activates them in this order: durable marker, private VIP, exact firewall
 assignment readback, then public Proxy status. Removal detaches the firewall
 before shrinking either status; shard migration is fail-closed break-before-make.
 
+Endpoint-local public Services explicitly set mode public-node-local and select
+an operator-owned edge pool. CCM publishes only Ready nodes with Ready local
+endpoints and owns their per-Service firewall; it never creates, moves, or
+deletes that pool's VMs or floating IPs.
+
 Public InSpace NLBs remain an explicit paid TCP-only path: leave loadBalancerClass unset,
 set inspace.cloud/load-balancer-scope=public, and set annotation
 service.beta.kubernetes.io/inspace-load-balancer-public=true.
