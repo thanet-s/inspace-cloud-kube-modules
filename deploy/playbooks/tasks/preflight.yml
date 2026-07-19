@@ -1,10 +1,21 @@
 ---
-- name: Resolve deployment paths
+- name: Resolve deployment root paths
   ansible.builtin.set_fact:
     deploy_root: "{{ (playbook_dir + '/..') | realpath }}"
-    deploy_state_dir: "{{ ((playbook_dir + '/../.state/' + cluster_name) | realpath) }}"
+    deploy_state_root: >-
+      {{
+        (
+          lookup('env', 'INSPACE_DEPLOY_STATE_ROOT')
+          | default(playbook_dir + '/../.state', true)
+        )
+        | realpath
+      }}
     ssh_private_key_file_expanded: "{{ ssh_private_key_file | expanduser }}"
     ssh_public_key_file_expanded: "{{ ssh_public_key_file | expanduser }}"
+
+- name: Resolve cluster-scoped deployment state
+  ansible.builtin.set_fact:
+    deploy_state_dir: "{{ ((deploy_state_root + '/' + cluster_name) | realpath) }}"
 
 - name: Require the complete deployment inventory
   ansible.builtin.assert:

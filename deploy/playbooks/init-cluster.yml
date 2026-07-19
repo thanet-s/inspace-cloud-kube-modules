@@ -194,6 +194,13 @@
         - not bootstrap_direct_download | bool
         - not deploy_bootstrap_files.results[3].stat.exists
 
+    - name: Persist the validated public key for the nested controller
+      ansible.builtin.copy:
+        content: "{{ ssh_public_key_text }}\n"
+        dest: "{{ deploy_state_dir }}/ssh-public-key"
+        mode: "0600"
+      no_log: true
+
     - name: Pull the exact bootstrap controller release
       ansible.builtin.command:
         argv:
@@ -229,13 +236,11 @@
           - INSPACE_BOOTSTRAP_CACHE_NOT_BEFORE
           - --mount
           - "type=bind,src={{ deploy_state_dir }},dst=/state"
-          - --mount
-          - "type=bind,src={{ ssh_public_key_file_expanded }},dst=/ssh/public-key,readonly"
           - "ghcr.io/thanet-s/inspace-cloud-controller-manager:{{ bootstrap_controller_version }}"
           - --cluster-config
           - /state/cluster.yaml
           - --ssh-public-key-file
-          - /ssh/public-key
+          - /state/ssh-public-key
           - --ssh-username
           - "{{ ssh_username }}"
           - --management-cidr
@@ -560,4 +565,9 @@
         msg:
           - "Cluster {{ cluster_name }} is ready with {{ control_plane_replicas }} control-plane node(s)."
           - "Kubeconfig: {{ deploy_state_dir }}/kubeconfig.yaml"
-          - "Tunnel: {{ deploy_root }}/run.sh tunnel {{ inventory_file }}"
+          - >-
+            Tunnel: deploy/run.sh tunnel
+            {{
+              lookup('env', 'INSPACE_DEPLOY_HOST_INVENTORY')
+              | default(inventory_file, true)
+            }}

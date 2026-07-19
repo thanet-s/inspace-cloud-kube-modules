@@ -10,6 +10,14 @@ action=$1
 state_dir=$2
 ssh_config=$state_dir/ssh-config
 state=$state_dir/state.json
+bind_address=${INSPACE_DEPLOY_TUNNEL_BIND:-127.0.0.1}
+case "$bind_address" in
+  127.0.0.1 | 0.0.0.0) ;;
+  *)
+    echo "unsupported tunnel bind address: $bind_address" >&2
+    exit 2
+    ;;
+esac
 socket_id=$(python3 -c 'import hashlib,sys; print(hashlib.sha256(sys.argv[1].encode()).hexdigest()[:16])' "$state_dir")
 socket=${TMPDIR:-/tmp}/inspace-api-$socket_id.sock
 
@@ -27,7 +35,7 @@ case "$action" in
     ssh -F "$ssh_config" \
       -M -S "$socket" -f -N \
       -o ExitOnForwardFailure=yes \
-      -L "127.0.0.1:16443:${vip}:6443" \
+      -L "${bind_address}:16443:${vip}:6443" \
       inspace-bastion
     ;;
   stop)

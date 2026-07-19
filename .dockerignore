@@ -23,3 +23,9 @@
 **/*.pfx
 **/__pycache__
 **/*.py[cod]
+
+# Operator inventory, SSH material, and durable lifecycle state are runtime
+# bind mounts and must never enter the dependency-locked deploy image.
+deploy/inventory.yml
+deploy/inventory/
+deploy/.state/
