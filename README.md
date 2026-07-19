@@ -69,34 +69,29 @@ The detailed networking, ownership, and cleanup invariants are documented in the
 
 1. Prepare an InSpace VPC, an unused private control-plane VIP, and a private
    Service VIP range excluded from VM and NLB allocation.
-2. Copy the [deployment inventory](deploy/inventory.example.yml), choose one
-   or three RKE2 servers, and run the
-   [Ansible deployment workflow](deploy/README.md).
-3. Create the API and RKE2 agent-token Secrets described in the
-   [Helm chart guide](charts/inspace-cloud-kube-modules/README.md#secret-contracts).
-4. Install the CRDs first, followed by the workload chart:
+2. Copy the [deployment inventory](deploy/inventory.example.yml), configure the
+   VPC, VIPs, machine sizes, and either one or three RKE2 servers.
+3. Export the InSpace API token and run the
+   [Ansible deployment workflow](deploy/README.md):
 
 ```sh
-export VERSION='<release-version>'
-
-helm upgrade --install inspace-cloud-kube-modules-crds \
-  oci://ghcr.io/thanet-s/charts/inspace-cloud-kube-modules-crds \
-  --version "$VERSION"
-
-helm upgrade --install inspace-cloud-kube-modules \
-  oci://ghcr.io/thanet-s/charts/inspace-cloud-kube-modules \
-  --version "$VERSION" \
-  --namespace kube-system \
-  --values values.yaml
+cp deploy/inventory.example.yml deploy/inventory.yml
+export INSPACE_API_TOKEN='...'
+deploy/run.sh init "$PWD/deploy/inventory.yml"
+deploy/run.sh status "$PWD/deploy/inventory.yml"
+deploy/run.sh tunnel "$PWD/deploy/inventory.yml"
 ```
 
-Start with the [example values](charts/inspace-cloud-kube-modules/examples/values.yaml)
-and keep its VPC UUID, control-plane VIP, and private Service range identical to
-the bootstrap and every `InSpaceNodeClass`. Cached clusters must also give each
-NodeClass the bastion cache address and public CA produced by bootstrap. Set
-`InSpaceCluster.spec.bootstrapCache.directDownload: true` and use the matching
-direct NodeClass mode only when every node should download its RKE2 assets and
-system images directly from the upstream hosts.
+The Ansible workflow creates the API and RKE2 agent-token Secrets, installs the
+CRD chart before the workload chart, and applies the default Karpenter
+NodeClass and zero-at-rest NodePool. It also keeps the VPC, control-plane VIP,
+private Service range, and bootstrap-cache trust consistent across bootstrap
+and the controllers.
+
+For a manual controller-only installation, follow the
+[Helm chart guide](charts/inspace-cloud-kube-modules/README.md#install) and
+start from its
+[example values](charts/inspace-cloud-kube-modules/examples/values.yaml).
 
 ## Supported scope
 
