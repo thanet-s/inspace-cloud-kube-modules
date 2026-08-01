@@ -5,7 +5,7 @@ go 1.26.5
 replace github.com/thanet-s/inspace-cloud-kube-modules/modules/client => ../client
 
 require (
-	github.com/container-storage-interface/spec v1.12.0
+	github.com/container-storage-interface/spec v1.13.0
 	github.com/thanet-s/inspace-cloud-kube-modules/modules/client v0.0.0
 	google.golang.org/grpc v1.82.1
 	google.golang.org/protobuf v1.36.11
