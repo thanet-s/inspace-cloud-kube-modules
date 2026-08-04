@@ -30,6 +30,13 @@ exactly `true` mean amd64 only. Lightweight tag validation, CI Helm
 verification, and final-release jobs use `ubuntu-slim` where the larger image
 toolchain is unnecessary.
 
+Stable releases support two deliberate paths. A direct stable release is
+allowed only when no same-base `vX.Y.Z-rc*` tag exists; create the annotated
+stable tag from `main`, and the complete release quality gate runs against that
+tag. Once any same-base candidate exists, direct release is no longer allowed
+and stable must promote the highest canonical candidate from the exact same
+commit.
+
 Before promoting a release candidate to stable:
 
 1. Independently verify the immutable tag target, release checksums, OCI chart
@@ -64,8 +71,8 @@ Before promoting a release candidate to stable:
 3. Create the stable annotated tag from the same tested commit, then repeat the
    artifact verification for the stable release. The release workflow finds the
    highest canonical same-base `vX.Y.Z-rc.N` tag and rejects the stable tag
-   unless both peel to the same commit. A missing RC, a noncanonical ambiguous
-   same-base RC tag, or a different target fails before artifact publication.
+   unless both peel to the same commit. A noncanonical ambiguous same-base RC
+   tag or a different target fails before artifact publication.
 
 Stable tags additionally update floating minor and `latest` image tags. A
 major alias is published from v1 onward, but never as the ambiguous `:0` tag.

@@ -42,8 +42,8 @@ while IFS= read -r candidate; do
   [[ -z $candidate ]] || rc_like_tags[${#rc_like_tags[@]}]=$candidate
 done < <(git for-each-ref --format='%(refname:strip=2)' "refs/tags/$base-rc*" | LC_ALL=C sort)
 if (( ${#rc_like_tags[@]} == 0 )); then
-  echo "stable release $tag requires at least one same-base vX.Y.Z-rc.N tag" >&2
-  exit 1
+  printf 'stable release %s is a direct release from %s at %s\n' "$tag" "$main_ref" "$tag_commit"
+  exit 0
 fi
 
 highest_number=
