@@ -61,10 +61,11 @@ git -C "$different_commit" commit -qam two
 git -C "$different_commit" tag -am stable v1.2.3
 expect_failure "$different_commit" v1.2.3
 
-missing_rc=$temporary/missing-rc
-new_repository "$missing_rc"
-git -C "$missing_rc" tag -am stable v1.2.3
-expect_failure "$missing_rc" v1.2.3
+direct_stable=$temporary/direct-stable
+new_repository "$direct_stable"
+git -C "$direct_stable" tag -am stable v1.2.3
+direct_output=$(cd "$direct_stable" && "$verifier" v1.2.3 refs/heads/main)
+grep -F "stable release v1.2.3 is a direct release from refs/heads/main" <<<"$direct_output" >/dev/null
 
 ambiguous_rc=$temporary/ambiguous-rc
 new_repository "$ambiguous_rc"
@@ -88,4 +89,4 @@ git -C "$unreachable" commit -qam side
 git -C "$unreachable" tag -am rc.1 v1.2.3-rc.1
 expect_failure "$unreachable" v1.2.3-rc.1
 
-echo "release tag promotion contract verified"
+echo "direct and promoted release tag contracts verified"

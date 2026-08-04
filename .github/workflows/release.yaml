@@ -83,7 +83,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Require main reachability and exact stable RC promotion
+      - name: Require main reachability and a valid stable release path
         shell: bash
         env:
           TAG: ${{ github.ref_name }}
