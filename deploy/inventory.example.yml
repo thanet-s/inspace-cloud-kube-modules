@@ -22,9 +22,9 @@ all:
     pod_cidr: 10.42.0.0/16
     service_cidr: 10.43.0.0/16
 
-    # Use an exact published version. Release candidates are supported for
-    # acceptance testing, for example 0.8.1-rc.1.
-    modules_version: 0.8.1
+    # Use an exact published version. Published release candidates are also
+    # supported for acceptance testing.
+    modules_version: 0.8.2
     rke2_version: v1.35.6+rke2r1
     control_plane_vcpu: 2
     control_plane_memory_mib: 4096
@@ -49,8 +49,8 @@ all:
     karpenter_node_class_name: ubuntu-workers
     karpenter_node_pool_name: general
     karpenter_root_disk_gib: 100
-    karpenter_cpu_limit: "32"
-    karpenter_memory_limit: 64Gi
+    karpenter_cpu_limit: "128"
+    karpenter_memory_limit: 256Gi
     karpenter_instance_families: [general, compute, memory, extra-memory]
     karpenter_min_cpu_exclusive: "1"
     karpenter_consolidate_after: 1m
