@@ -1,6 +1,6 @@
 # Build from the monorepo root:
 #   docker build -f modules/cloud-provider/Dockerfile -t inspace-cloud-controller-manager:dev .
-FROM --platform=$BUILDPLATFORM golang:1.26.5 AS build
+FROM --platform=$BUILDPLATFORM golang:1.27rc2 AS build
 
 ARG TARGETOS
 ARG TARGETARCH
