@@ -1,6 +1,6 @@
 # Build with the monorepo root as context:
 #   docker build --platform=linux/amd64 -f modules/karpenter-provider/Dockerfile .
-FROM --platform=$BUILDPLATFORM golang:1.26.5-bookworm AS build
+FROM --platform=$BUILDPLATFORM golang:1.27rc2-bookworm AS build
 
 ARG TARGETOS
 ARG TARGETARCH
