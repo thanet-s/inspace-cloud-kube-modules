@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 
-FROM golang:1.26.5-bookworm AS local-controller-builder
+FROM golang:1.27rc2-bookworm AS local-controller-builder
 
 WORKDIR /src
 COPY modules/client/go.mod ./modules/client/go.mod
