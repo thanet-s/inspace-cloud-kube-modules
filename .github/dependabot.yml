@@ -2,6 +2,8 @@ version: 2
 updates:
   - package-ecosystem: github-actions
     directory: /
+    # Disable routine version PRs; Dependabot security update PRs remain enabled.
+    open-pull-requests-limit: 0
     schedule:
       interval: weekly
     groups:
@@ -9,6 +11,7 @@ updates:
         patterns: ["*"]
   - package-ecosystem: gomod
     directory: /modules/client
+    open-pull-requests-limit: 0
     schedule:
       interval: weekly
     groups:
@@ -16,6 +19,7 @@ updates:
         patterns: ["*"]
   - package-ecosystem: gomod
     directory: /modules/cloud-provider
+    open-pull-requests-limit: 0
     schedule:
       interval: weekly
     ignore:
@@ -30,6 +34,7 @@ updates:
         patterns: ["*"]
   - package-ecosystem: gomod
     directory: /modules/csi-driver
+    open-pull-requests-limit: 0
     schedule:
       interval: weekly
     groups:
@@ -37,6 +42,7 @@ updates:
         patterns: ["*"]
   - package-ecosystem: gomod
     directory: /modules/karpenter-provider
+    open-pull-requests-limit: 0
     schedule:
       interval: weekly
     ignore:
@@ -55,21 +61,26 @@ updates:
         patterns: ["*"]
   - package-ecosystem: docker
     directory: /modules/cloud-provider
+    open-pull-requests-limit: 0
     schedule:
       interval: weekly
   - package-ecosystem: docker
     directory: /modules/csi-driver
+    open-pull-requests-limit: 0
     schedule:
       interval: weekly
   - package-ecosystem: docker
     directory: /modules/karpenter-provider
+    open-pull-requests-limit: 0
     schedule:
       interval: weekly
   - package-ecosystem: docker
     directory: /test/e2e
+    open-pull-requests-limit: 0
     schedule:
       interval: weekly
   - package-ecosystem: pip
     directory: /test/e2e
+    open-pull-requests-limit: 0
     schedule:
       interval: weekly
