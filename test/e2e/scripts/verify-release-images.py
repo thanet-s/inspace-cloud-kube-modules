@@ -58,6 +58,10 @@ ALLOWED_RELEASE_REDIRECT_HOSTS = {
     "objects.githubusercontent.com",
 }
 RETRYABLE_HTTP_STATUSES = {408, 429, 500, 502, 503, 504}
+# Released workload images are intentionally published for the x86-64 InSpace
+# nodes. Keep registry inspection deterministic when the verifier itself runs
+# natively on an ARM64 workstation.
+SKOPEO_PLATFORM_ARGS = ("--override-os", "linux", "--override-arch", "amd64")
 
 
 class ReleaseRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -357,6 +361,7 @@ def resolve_tag_digest(image: str, version: str) -> str:
         [
             "skopeo",
             "inspect",
+            *SKOPEO_PLATFORM_ARGS,
             "--retry-times",
             "5",
             f"docker://ghcr.io/thanet-s/{image}:{version}",
@@ -375,6 +380,7 @@ def inspect_raw(reference: str) -> object:
             "skopeo",
             "inspect",
             "--raw",
+            *SKOPEO_PLATFORM_ARGS,
             "--retry-times",
             "5",
             "docker://" + reference,
@@ -389,6 +395,7 @@ def inspect_config(reference: str) -> object:
             "skopeo",
             "inspect",
             "--config",
+            *SKOPEO_PLATFORM_ARGS,
             "--retry-times",
             "5",
             "docker://" + reference,
