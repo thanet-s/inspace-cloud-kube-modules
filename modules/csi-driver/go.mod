@@ -1,6 +1,6 @@
 module github.com/thanet-s/inspace-cloud-kube-modules/modules/csi-driver
 
-go 1.26.5
+go 1.26.6
 
 replace github.com/thanet-s/inspace-cloud-kube-modules/modules/client => ../client
 
