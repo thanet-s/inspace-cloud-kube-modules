@@ -26,7 +26,7 @@ const (
 	BootstrapCacheMinFree   = 1_000_000_000
 
 	bootstrapCacheRKE2Version = "v1.36.4+rke2r1"
-	bootstrapCacheRKE2SHA256  = "aa7eea8ec905b89ec9a91443cbe96ddb6cd0fc7d15e422380e192b011e4e130b"
+	bootstrapCacheRKE2SHA256  = "7bcbd3167d6947e1d79cdf722acdc740b28021fefb50dd5b974a1980776d4079"
 
 	cacheNginxImage    = "docker.io/library/nginx:1.30.1-alpine@sha256:c819f83c54b0361f5557601bf5eb4943d09360e7a7fdf426afc466570f45874d"
 	cacheRegistryImage = "docker.io/library/registry:3.0.0@sha256:6c5666b861f3505b116bb9aa9b25175e71210414bd010d92035ff64018f9457e"
