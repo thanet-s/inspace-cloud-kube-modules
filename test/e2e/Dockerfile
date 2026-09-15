@@ -2,6 +2,8 @@
 
 FROM golang:1.27.1-bookworm AS local-controller-builder
 
+ARG E2E_RELEASE_VERSION=dev
+
 WORKDIR /src
 COPY modules/client/go.mod ./modules/client/go.mod
 COPY modules/cloud-provider/go.mod modules/cloud-provider/go.sum ./modules/cloud-provider/
@@ -9,7 +11,8 @@ RUN cd modules/cloud-provider && GOWORK=off go mod download
 COPY modules/client ./modules/client
 COPY modules/cloud-provider ./modules/cloud-provider
 RUN cd modules/cloud-provider && \
-    CGO_ENABLED=0 GOWORK=off go build -trimpath -ldflags='-s -w' \
+    CGO_ENABLED=0 GOWORK=off go build -trimpath \
+      -ldflags="-s -w -X=github.com/thanet-s/inspace-cloud-kube-modules/modules/client/version.Version=${E2E_RELEASE_VERSION}" \
       -o /out/inspace-cluster-controller ./cmd/inspace-cluster-controller
 
 FROM ubuntu:26.04 AS base
