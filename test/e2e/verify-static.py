@@ -3167,7 +3167,7 @@ def main() -> None:
         'f"{cluster_resource_name}-bastion-ip"',
         'bastion_name, bastion_firewall_name, bastion_fip_name = bastion_resource_names(',
         'rf"inspace-rke2-bastion/v6 owner={re.escape(owner)} spec=[0-9a-f]{{64}}"',
-        'rf"inspace-rke2-cp/v8 owner={re.escape(owner)} slot={slot} spec=[0-9a-f]{{64}}"',
+        'rf"inspace-rke2-cp/v9 owner={re.escape(owner)} slot={slot} spec=[0-9a-f]{{64}}"',
         'validate_optional_vm_hostname(bastion, bastion_name, "bastion")',
         '"bastionName": bastion_name',
         '"bastionFloatingIPName": bastion_fip["name"]',
