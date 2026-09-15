@@ -34,7 +34,7 @@ spec:
   # sshUsername: operator
   # sshPublicKey: ssh-ed25519 AAAA... operator@example
   rke2:
-    version: v1.35.6+rke2r1
+    version: v1.36.4+rke2r1
     # Literal private kube-vip inside spec.networkUUID. Agents register on
     # TCP/9345; the same VIP serves the Kubernetes API on TCP/6443.
     server: https://10.20.30.10:9345

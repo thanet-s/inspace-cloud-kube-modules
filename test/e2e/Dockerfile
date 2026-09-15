@@ -15,7 +15,7 @@ RUN cd modules/cloud-provider && \
 FROM ubuntu:26.04 AS base
 
 ARG TARGETARCH
-ARG KUBECTL_VERSION=v1.35.6
+ARG KUBECTL_VERSION=v1.36.4
 ARG HELM_VERSION=v3.18.4
 
 ENV DEBIAN_FRONTEND=noninteractive \

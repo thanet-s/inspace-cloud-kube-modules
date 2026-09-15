@@ -1,9 +1,9 @@
 apiVersion: v2
 name: inspace-cloud-kube-modules-crds
-description: Karpenter v1.14 and InSpace Cloud custom resource definitions
+description: Karpenter v1.14.1 and InSpace Cloud custom resource definitions
 type: application
 version: 0.1.0
-appVersion: "1.14.0"
+appVersion: "1.14.1"
 kubeVersion: ">=1.30.0-0"
 home: https://github.com/thanet-s/inspace-cloud-kube-modules
 sources:

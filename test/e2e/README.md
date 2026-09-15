@@ -10,7 +10,7 @@ CCM platform digest. A separate non-live target compiles local source for CI.
 The host needs Docker and Git but no Go, Helm, kubectl, Ansible, or cloud
 toolchain.
 
-The test creates exactly three fixed RKE2 `v1.35.6+rke2r1` control-plane VMs.
+The test creates exactly three fixed RKE2 `v1.36.4+rke2r1` control-plane VMs.
 The product bootstrap reconciler launches missing control-plane VMs in slot
 order with a hard creation concurrency bound of one, and its result must report
 `maxParallelControlPlaneCreates: 1`. Each VM receives authoritative restrictive
@@ -24,10 +24,11 @@ RKE2 uses Cilium in native-routing mode with the pod CIDR
 `10.42.0.0/16`, and Cilium fully replaces kube-proxy. Acceptance requires the
 Cilium ConfigMap, `auto-direct-node-routes`, live `cilium-dbg status --verbose`
 on every control-plane and worker node, and the absence of kube-proxy
-DaemonSets, pods, and host processes. The unused `rke2-ingress-nginx` addon is
-disabled. The complete audited cache inventory has 34 images; this cluster
-must seed exactly 32 because it omits the disabled addon's webhook-certgen and
-ingress-controller images.
+DaemonSets, pods, and host processes. Both built-in ingress add-ons,
+`rke2-ingress-nginx` and `rke2-traefik`, are disabled so users can install
+their own ingress controller. The complete audited cache inventory has 35
+images; this cluster must seed exactly 32 because it omits the disabled nginx
+webhook-certgen, nginx ingress-controller, and Traefik images.
 
 The API and registration listeners share the configured private kube-vip
 address on TCP/6443 and TCP/9345. No bootstrap NLB or API endpoint FIP exists.

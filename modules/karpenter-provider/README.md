@@ -1,6 +1,6 @@
 # Karpenter Provider for InSpace
 
-This module implements the InSpace provider for Karpenter `v1.14.0` and RKE2.
+This module implements the InSpace provider for Karpenter `v1.14.1` and RKE2.
 It includes a production API adapter, `InSpaceNodeClass`, a 31-variant instance
 catalog, stock-Ubuntu bootstrap, NodeClass readiness reconciliation, and a
 runnable Karpenter controller command.

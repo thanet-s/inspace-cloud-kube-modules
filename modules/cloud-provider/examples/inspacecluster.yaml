@@ -22,7 +22,7 @@ spec:
   bootstrapCache:
     directDownload: false
   rke2:
-    version: v1.35.6+rke2r1
+    version: v1.36.4+rke2r1
     # Short-lived test clusters may opt in; production defaults to upgrading.
     # skipOSUpgrade: true
     tokenSecretRef:
@@ -30,6 +30,7 @@ spec:
       key: token
     disable:
       - rke2-ingress-nginx
+      - rke2-traefik
   network:
     uuid: 11111111-2222-3333-4444-555555555555
     podCIDR: 10.42.0.0/16

@@ -154,9 +154,10 @@ same names to work around an issued entry.
 Cached mode provisions the bastion with Docker from Docker's official Ubuntu
 APT repository, pre-seeds the audited RKE2 release assets and an addon-aware
 system-image inventory, and then exposes them through a private TLS, read-only
-endpoint. The full inventory contains 34 images. If `spec.rke2.disable`
-contains `rke2-ingress-nginx`, its webhook-certgen and ingress-controller
-images are omitted, leaving 32 entries. The endpoint uses the bastion's
+endpoint. The full inventory contains 35 images. The default templates disable
+both `rke2-ingress-nginx` and `rke2-traefik`; their webhook-certgen,
+ingress-controller, and Traefik images are omitted, leaving 32 entries. The
+endpoint uses the bastion's
 API-allocated RFC1918 address—never a manually selected cache VIP—and the
 stable hostname `cache.<metadata.name>.inspace.internal` on TCP/8443.
 Bootstrap writes that binding into each node's `/etc/hosts`, so it does not

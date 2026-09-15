@@ -76,7 +76,7 @@ func (n *InSpaceNodeClass) Validate() field.ErrorList {
 		errs = append(errs, field.Invalid(p.Child("rootDiskGiB"), n.Spec.RootDiskGiB, "must be between 30 and 2000 GiB"))
 	}
 	if !rke2VersionPattern.MatchString(n.Spec.RKE2.Version) {
-		errs = append(errs, field.Invalid(p.Child("rke2", "version"), n.Spec.RKE2.Version, "must look like v1.35.6+rke2r1"))
+		errs = append(errs, field.Invalid(p.Child("rke2", "version"), n.Spec.RKE2.Version, "must look like v1.36.4+rke2r1"))
 	}
 	if _, err := n.Spec.RKE2.ServerVIP(); err != nil {
 		errs = append(errs, field.Invalid(p.Child("rke2", "server"), n.Spec.RKE2.Server, err.Error()))

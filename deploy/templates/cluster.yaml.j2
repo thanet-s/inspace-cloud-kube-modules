@@ -29,6 +29,7 @@ spec:
       key: token
     disable:
       - rke2-ingress-nginx
+      - rke2-traefik
     tlsSubjectAltNames:
       - "{{ control_plane_vip }}"
   network:

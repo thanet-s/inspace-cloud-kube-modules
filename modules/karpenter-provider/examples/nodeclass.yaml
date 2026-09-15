@@ -40,7 +40,7 @@ spec:
   # sshUsername: operator
   # sshPublicKey: ssh-ed25519 AAAA... operator@example
   rke2:
-    version: v1.35.6+rke2r1
+    version: v1.36.4+rke2r1
     # Short-lived test nodes may opt in; production defaults to upgrading.
     # skipOSUpgrade: true
     # Replace with the private RFC1918 supervisor VIP inside networkUUID. It

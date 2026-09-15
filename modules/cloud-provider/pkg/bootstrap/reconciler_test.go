@@ -4415,7 +4415,7 @@ func TestDestroyRejectsAssignmentAndPolicyDriftBeforeMutation(t *testing.T) {
 func TestRenderControlPlaneCloudInitUsesVIPStaticPodAndBoundedBoot(t *testing.T) {
 	raw, err := RenderCloudInitJSON(CloudInitInput{
 		NodeName: "cp-1", NodeExternalIPv4: "203.0.113.11", PrivateSubnet: "10.20.30.0/24", VirtualIPv4: "10.20.30.10",
-		RKE2Version: "v1.35.6+rke2r1", RKE2Token: "token", ServerAddress: "10.20.30.10",
+		RKE2Version: "v1.36.4+rke2r1", RKE2Token: "token", ServerAddress: "10.20.30.10",
 		PodCIDR: "10.42.0.0/16", ServiceCIDR: "10.43.0.0/16",
 		PrivateLoadBalancerPoolStart: "10.20.30.200", PrivateLoadBalancerPoolStop: "10.20.30.239",
 		TLSSubjectAltNames: []string{"10.20.30.10"},
@@ -4429,7 +4429,7 @@ func TestRenderControlPlaneCloudInitUsesVIPStaticPodAndBoundedBoot(t *testing.T)
 func TestRenderSingleControlPlanePinsCoreDNSWithoutChangingThreeControlPlanes(t *testing.T) {
 	input := CloudInitInput{
 		NodeName: "cp-0", NodeExternalIPv4: "203.0.113.10", PrivateSubnet: "10.20.30.0/24", VirtualIPv4: "10.20.30.10",
-		RKE2Version: "v1.35.6+rke2r1", RKE2Token: "token", Initialize: true,
+		RKE2Version: "v1.36.4+rke2r1", RKE2Token: "token", Initialize: true,
 		PodCIDR: "10.42.0.0/16", ServiceCIDR: "10.43.0.0/16",
 		PrivateLoadBalancerPoolStart: "10.20.30.200", PrivateLoadBalancerPoolStop: "10.20.30.239",
 		TLSSubjectAltNames: []string{"10.20.30.10"},
@@ -4475,7 +4475,7 @@ func TestRenderControlPlaneCloudInitRejectsInvalidGuestHostname(t *testing.T) {
 	for _, nodeName := range []string{"UPPER", "contains.dot", strings.Repeat("a", 64)} {
 		_, err := RenderCloudInitJSON(CloudInitInput{
 			NodeName: nodeName, NodeExternalIPv4: "203.0.113.11", PrivateSubnet: "10.20.30.0/24", VirtualIPv4: "10.20.30.10",
-			RKE2Version: "v1.35.6+rke2r1", RKE2Token: "token", ServerAddress: "10.20.30.10",
+			RKE2Version: "v1.36.4+rke2r1", RKE2Token: "token", ServerAddress: "10.20.30.10",
 			PodCIDR: "10.42.0.0/16", ServiceCIDR: "10.43.0.0/16",
 			PrivateLoadBalancerPoolStart: "10.20.30.200", PrivateLoadBalancerPoolStop: "10.20.30.239",
 		})
@@ -4764,7 +4764,7 @@ func testCluster() *v1alpha1.InSpaceCluster {
 				VCPU: 4, MemoryMiB: 8192, RootDiskGiB: 60,
 				HostPoolUUID: "aac7dd66-f390-4edd-80c0-dd7cae49bd99", Image: v1alpha1.ImageSpec{OSName: "ubuntu", OSVersion: "24.04"},
 			}},
-			RKE2: v1alpha1.RKE2Spec{Version: "v1.35.6+rke2r1", TokenSecretRef: v1alpha1.SecretKeyReference{Name: "rke2-token", Key: "token"}, Disable: []string{"rke2-ingress-nginx"}},
+			RKE2: v1alpha1.RKE2Spec{Version: "v1.36.4+rke2r1", TokenSecretRef: v1alpha1.SecretKeyReference{Name: "rke2-token", Key: "token"}, Disable: []string{"rke2-ingress-nginx", "rke2-traefik"}},
 			Network: v1alpha1.NetworkSpec{
 				UUID: "11111111-2222-4333-8444-555555555555", PodCIDR: "10.42.0.0/16", ServiceCIDR: "10.43.0.0/16",
 				PrivateLoadBalancerPool: v1alpha1.PrivateLoadBalancerPoolSpec{Start: "10.20.30.200", Stop: "10.20.30.239"},

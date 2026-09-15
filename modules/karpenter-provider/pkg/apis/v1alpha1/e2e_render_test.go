@@ -79,7 +79,7 @@ func TestClusterE2EProvisionsInOrderAndWaitsForThreeControlPlanesInParallel(t *t
 		t.Fatalf("cluster template spec.controlPlane.replicas=%q, want exactly 3", got)
 	}
 	for _, expected := range []string{
-		"version: v1.35.6+rke2r1",
+		"version: v1.36.4+rke2r1",
 		"name: inspace-rke2-agent-token",
 		"podCIDR: 10.42.0.0/16",
 		"bootstrapCache:",
@@ -318,7 +318,7 @@ func TestClusterE2ERendersRKE2WorkerAndCiliumKubeProxyReplacement(t *testing.T) 
 	playbook := readE2E(t, "init-cluster.yml") + "\n" + readE2E(t, "test.yml")
 	for _, expected := range []string{
 		"rke2:",
-		"version: v1.35.6+rke2r1",
+		"version: v1.36.4+rke2r1",
 		"server: {{ e2e_state.privateRegistrationEndpoint }}",
 		"name: inspace-rke2-agent-token",
 		"key: inspace.cloud/instance-cpu",
@@ -354,7 +354,7 @@ func TestClusterE2ERendersRKE2WorkerAndCiliumKubeProxyReplacement(t *testing.T) 
 		"--management-tcp-ports",
 		`- "22"`,
 		"systemctl is-active --quiet rke2-agent",
-		"/usr/local/bin/rke2 --version | grep -F 'v1.35.6+rke2r1'",
+		"/usr/local/bin/rke2 --version | grep -F 'v1.36.4+rke2r1'",
 		"Verify Cilium native routing and full kube-proxy replacement",
 		`.data["routing-mode"] == "native"`,
 		`.data["ipv4-native-routing-cidr"] == "10.42.0.0/16"`,
