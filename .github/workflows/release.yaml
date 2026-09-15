@@ -504,7 +504,7 @@ jobs:
             --values charts/inspace-cloud-kube-modules/ci/test-values.yaml
           helm package charts/inspace-cloud-kube-modules-crds \
             --version "$VERSION" \
-            --app-version 1.14.0 \
+            --app-version 1.14.1 \
             --destination dist
           helm package charts/inspace-cloud-kube-modules \
             --version "$VERSION" \
