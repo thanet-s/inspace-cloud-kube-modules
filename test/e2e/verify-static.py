@@ -1731,6 +1731,11 @@ def main() -> None:
         "published E2E runner must use the native release-bound bootstrap helper",
     )
     require(
+        "ARG E2E_RELEASE_VERSION=dev" in dockerfile
+        and "-X=github.com/thanet-s/inspace-cloud-kube-modules/modules/client/version.Version=${E2E_RELEASE_VERSION}" in dockerfile,
+        "published E2E runner must bind the bootstrap helper to the exact release version",
+    )
+    require(
         "REVISION: ${{ github.sha }}" in release_workflow
         and 'org.opencontainers.image.revision: \\"\\"' in release_workflow
         and "helm show chart" in release_workflow
