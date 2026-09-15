@@ -50,7 +50,7 @@ func TestClusterNameFitsFixedNodeHostnames(t *testing.T) {
 }
 
 func TestRKE2VersionValidationRequiresExactRelease(t *testing.T) {
-	for _, version := range []string{"v1.35.6+rke2r1", "v1.35.6+rke2r12"} {
+	for _, version := range []string{"v1.36.4+rke2r1", "v1.36.4+rke2r12"} {
 		spec := validSpec()
 		spec.RKE2.Version = version
 		if errs := spec.Validate(); len(errs) != 0 {
@@ -240,7 +240,7 @@ func validSpec() InSpaceClusterSpec {
 			Image:        ImageSpec{OSName: "ubuntu", OSVersion: "24.04"},
 		}},
 		BootstrapCache: BootstrapCacheSpec{},
-		RKE2:           RKE2Spec{Version: "v1.35.6+rke2r1", TokenSecretRef: SecretKeyReference{Name: "token", Key: "token"}},
+		RKE2:           RKE2Spec{Version: "v1.36.4+rke2r1", TokenSecretRef: SecretKeyReference{Name: "token", Key: "token"}},
 		Network: NetworkSpec{
 			UUID: "11111111-2222-3333-4444-555555555555", PodCIDR: "10.42.0.0/16", ServiceCIDR: "10.43.0.0/16",
 			PrivateLoadBalancerPool: PrivateLoadBalancerPoolSpec{Start: "10.20.30.200", Stop: "10.20.30.239"},

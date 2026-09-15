@@ -226,7 +226,7 @@ func smokeNodeClass() *inspacev1.InSpaceNodeClass {
 			SSHUsername:             "inspacee2e",
 			SSHPublicKey:            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINdamAGCsQq31Uv+08lkBzoO4XLz2qYjJa8CGmj3B1Ea smoke@example",
 			RKE2: inspacev1.RKE2Config{
-				Version:        "v1.35.6+rke2r1",
+				Version:        "v1.36.4+rke2r1",
 				Server:         "https://10.0.0.10:9345",
 				TokenSecretRef: inspacev1.SecretKeySelector{Name: inspacev1.RKE2AgentTokenSecretName, Key: inspacev1.RKE2AgentTokenSecretKey},
 			},

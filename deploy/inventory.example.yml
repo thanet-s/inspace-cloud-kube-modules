@@ -24,8 +24,8 @@ all:
 
     # Use an exact published version. Published release candidates are also
     # supported for acceptance testing.
-    modules_version: 0.8.2
-    rke2_version: v1.35.6+rke2r1
+    modules_version: 0.9.0-rc.1
+    rke2_version: v1.36.4+rke2r1
     control_plane_vcpu: 2
     control_plane_memory_mib: 4096
     control_plane_root_disk_gib: 60

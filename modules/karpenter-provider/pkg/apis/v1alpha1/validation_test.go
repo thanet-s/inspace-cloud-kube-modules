@@ -244,7 +244,7 @@ func validNodeClass() *InSpaceNodeClass {
 		ImageSelector:           ImageSelector{OSName: OSNameUbuntu, OSVersion: OSVersionUbuntu},
 		RootDiskGiB:             40,
 		RKE2: RKE2Config{
-			Version:        "v1.35.6+rke2r1",
+			Version:        "v1.36.4+rke2r1",
 			Server:         "https://10.0.0.10:9345",
 			TokenSecretRef: SecretKeySelector{Name: RKE2AgentTokenSecretName, Key: RKE2AgentTokenSecretKey},
 		},

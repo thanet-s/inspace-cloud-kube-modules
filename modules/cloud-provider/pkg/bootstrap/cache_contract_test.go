@@ -112,15 +112,15 @@ func TestCacheTLSContractIsStableP256AndBoundToPersistedInputs(t *testing.T) {
 	}
 }
 
-func TestCacheImageManifestContainsExactlyAuditedThirtyFourImages(t *testing.T) {
+func TestCacheImageManifestContainsExactlyAuditedThirtyFiveImages(t *testing.T) {
 	const moduleVersion = "0.3.1-rc.2"
 	manifest, err := renderCacheImageManifest(bootstrapCacheRKE2Version, moduleVersion, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	lines := strings.Split(strings.TrimSuffix(manifest, "\n"), "\n")
-	if len(lines) != 34 || len(rke2CacheImages) != 26 || len(fixedCacheImages) != 5 {
-		t.Fatalf("cache inventory counts: manifest=%d RKE2=%d fixed=%d, want 34/26/5", len(lines), len(rke2CacheImages), len(fixedCacheImages))
+	if len(lines) != 35 || len(rke2CacheImages) != 27 || len(fixedCacheImages) != 5 {
+		t.Fatalf("cache inventory counts: manifest=%d RKE2=%d fixed=%d, want 35/27/5", len(lines), len(rke2CacheImages), len(fixedCacheImages))
 	}
 
 	sources := make(map[string]struct{}, len(lines))
@@ -162,13 +162,23 @@ func TestCacheImageManifestExcludesDisabledRKE2Ingress(t *testing.T) {
 		t.Fatal(err)
 	}
 	lines := strings.Split(strings.TrimSuffix(manifest, "\n"), "\n")
-	if len(lines) != 32 {
-		t.Fatalf("disabled-ingress cache manifest entries=%d, want 32", len(lines))
+	if len(lines) != 33 {
+		t.Fatalf("disabled-ingress cache manifest entries=%d, want 33", len(lines))
 	}
 	for _, forbidden := range []string{"rancher/kube-webhook-certgen:", "rancher/nginx-ingress-controller:"} {
 		if strings.Contains(manifest, forbidden) {
 			t.Fatalf("disabled ingress cache manifest retains %q", forbidden)
 		}
+	}
+}
+
+func TestCacheImageManifestExcludesDisabledRKE2Traefik(t *testing.T) {
+	manifest, err := renderCacheImageManifest(bootstrapCacheRKE2Version, "0.4.1-rc.2", []string{"rke2-traefik"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(manifest, "rancher/hardened-traefik:v3.7.11-build20260819") {
+		t.Fatal("disabled Traefik cache manifest retains the Traefik image")
 	}
 }
 
@@ -440,7 +450,7 @@ func TestControlPlaneCloudInitUsesPrivateCacheOrDirectUpstreamExclusively(t *tes
 	cachedRegistries := cached["/etc/rancher/rke2/registries.yaml"].Content
 	for _, required := range []string{
 		`system-default-registry: "cache.unit.inspace.internal:8443"`,
-		`https://cache.unit.inspace.internal:8443/rke2/v1.35.6+rke2r1`,
+		`https://cache.unit.inspace.internal:8443/rke2/v1.36.4+rke2r1`,
 		`cache_address='10.20.30.21'`,
 		`cache_hostname='cache.unit.inspace.internal'`,
 		`printf '%s %s # inspace-bootstrap-cache\n' "$cache_address" "$cache_hostname" >>/etc/hosts`,
@@ -479,7 +489,7 @@ func TestControlPlaneCloudInitUsesPrivateCacheOrDirectUpstreamExclusively(t *tes
 	}
 	if strings.Contains(direct["/var/lib/inspace/rke2-config"].Content, "system-default-registry") ||
 		strings.Contains(directScript, ".inspace.internal") ||
-		!strings.Contains(directScript, "https://github.com/rancher/rke2/releases/download/v1.35.6+rke2r1") ||
+		!strings.Contains(directScript, "https://github.com/rancher/rke2/releases/download/v1.36.4+rke2r1") ||
 		!strings.Contains(direct["/var/lib/inspace/rke2-kube-vip"].Content, kubeVIPImage) {
 		t.Fatalf("direct control-plane mode no longer uses exact upstream artifacts:\n%s", directScript)
 	}
@@ -516,7 +526,7 @@ func TestDirectControlPlaneCloudInitV9OwnershipBytes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	const v9DirectHash = "8f54ffa1bf48519a1834c8c23cc2833eb22c91e335471a2f713986554e3facb5"
+	const v9DirectHash = "1304eed8a8f626c625d3ee1aef0c84023b082f73682491a58da63d71eccfb7ad"
 	if got := fmt.Sprintf("%x", sha256.Sum256([]byte(raw))); got != v9DirectHash {
 		t.Fatalf("direct control-plane cloud-init hash=%s, want frozen v9 hash %s", got, v9DirectHash)
 	}

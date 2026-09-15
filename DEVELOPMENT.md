@@ -115,9 +115,10 @@ per-cluster name `cache.<cluster>.inspace.internal` in node `/etc/hosts` files
 and serves TLS on TCP/8443. The listener binds only that private address. The
 bastion cache pre-seeds the audited RKE2 release assets and an addon-aware
 system-image inventory; it is not a general-purpose pull-through proxy. The
-complete inventory contains 34 images. When `spec.rke2.disable` contains
-`rke2-ingress-nginx`, bootstrap excludes its webhook-certgen and ingress
-controller images, producing the 32-image seed used by the E2E cluster. Its
+complete inventory contains 35 images. The default templates disable both
+`rke2-ingress-nginx` and `rke2-traefik`, so bootstrap excludes the nginx
+webhook-certgen, nginx ingress-controller, and Traefik images, producing the
+32-image seed used by the E2E cluster. Its
 dedicated 10 GB filesystem reserves 1 GB of free space. Daily maintenance
 prunes unpinned RKE2 artifacts and local Docker data older than 30 days.
 

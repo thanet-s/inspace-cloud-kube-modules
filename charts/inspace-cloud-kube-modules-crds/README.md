@@ -1,6 +1,6 @@
 # InSpace Cloud Kubernetes CRDs
 
-This chart installs the four unmodified Karpenter `v1.14.0` core CRDs and the
+This chart installs the four unmodified Karpenter `v1.14.1` core CRDs and the
 two CRDs owned by this repository. Install or upgrade it before the workload
 chart. CRDs are ordinary templates in this dedicated chart, matching the
 upstream Karpenter CRD-chart release model, so `helm upgrade` updates their
@@ -20,7 +20,7 @@ helm upgrade --install inspace-cloud-kube-modules-crds \
 ```
 
 The Karpenter files are copied byte-for-byte from
-`sigs.k8s.io/karpenter@v1.14.0/pkg/apis/crds`:
+`sigs.k8s.io/karpenter@v1.14.1/pkg/apis/crds`:
 
 | File | SHA-256 |
 | --- | --- |

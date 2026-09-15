@@ -23,7 +23,7 @@ spec:
     # Use the bastion cache address and CA here when the cluster cache is on.
     directDownload: true
   rke2:
-    version: v1.35.6+rke2r1
+    version: v1.36.4+rke2r1
     server: https://10.20.30.10:9345
     tokenSecretRef:
       name: inspace-rke2-agent-token

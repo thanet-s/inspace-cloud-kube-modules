@@ -22,13 +22,14 @@ spec:
   bootstrapCache:
     directDownload: false
   rke2:
-    version: v1.35.6+rke2r1
+    version: v1.36.4+rke2r1
     skipOSUpgrade: true
     tokenSecretRef:
       name: inspace-rke2-agent-token
       key: token
     disable:
       - rke2-ingress-nginx
+      - rke2-traefik
     tlsSubjectAltNames:
       - "{{ lookup('env', 'INSPACE_CONTROL_PLANE_VIP') }}"
   network:

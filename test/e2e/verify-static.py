@@ -800,7 +800,7 @@ def verify_durable_release_state_contract() -> None:
                 ),
                 encoding="utf-8",
             )
-            app_version = "1.14.0" if chart.endswith("-crds") else version
+            app_version = "1.14.1" if chart.endswith("-crds") else version
             package_result = subprocess.run(
                 [
                     "helm", "package", str(source),
@@ -864,7 +864,7 @@ def verify_durable_release_state_contract() -> None:
             charts[chart] = {
                 "name": chart,
                 "version": version,
-                "appVersion": "1.14.0" if chart.endswith("-crds") else version,
+                "appVersion": "1.14.1" if chart.endswith("-crds") else version,
                 "source": release_module.REPOSITORY_URL,
                 "revision": revision,
                 "filename": filename,
@@ -2207,9 +2207,10 @@ def main() -> None:
     ):
         require(marker in playbook, f"playbook is missing contract marker: {marker}")
 
-    require("version: v1.35.6+rke2r1" in cluster, "control plane must pin supported RKE2")
+    require("version: v1.36.4+rke2r1" in cluster, "control plane must pin supported RKE2")
     require("rootDiskGiB: 60" in cluster, "E2E control planes must use 60 GiB root disks")
     require("rke2-ingress-nginx" in cluster, "unused RKE2 ingress must be disabled")
+    require("rke2-traefik" in cluster, "unused RKE2 Traefik ingress must be disabled")
     require("virtualIPv4:" in cluster and "public:" not in cluster and "host:" not in cluster,
             "cluster endpoint must be only the configured private VIP")
     require("routing-mode" in playbook and "kube-proxy-replacement" in playbook,
@@ -2276,7 +2277,7 @@ def main() -> None:
             'select(.name=="csi-provisioner") | [.args[] | select(. == "--timeout=600s")] | length' in init_playbook and
             'select(.name=="csi-attacher") | [.args[] | select(. == "--timeout=600s")] | length' in init_playbook,
             "released chart installation must route its audited system images through the cache and retain both safe CSI RPC timeouts")
-    cached_pause = "rancher/mirrored-pause:3.6@sha256:c2280d2f5f56cf9c9a01bb64b2db4651e35efd6d62a54dcfc12049fe6449c5e4"
+    cached_pause = "rancher/mirrored-pause:3.10.2@sha256:412c4a7219cb8a299a37337f3d87810c5340095322e15594a1637785adad0f17"
     require(f"image: {{{{ e2e_state.bootstrapCacheRegistry }}}}/{cached_pause}" in trigger and
             playbook.count(cached_pause) == 2,
             "the Karpenter capacity trigger must use the audited node-bootstrap pause image")
@@ -3132,6 +3133,7 @@ def main() -> None:
         "/etc/inspace-cache/images.tsv)\" -eq 32",
         '$2 == "rancher/kube-webhook-certgen:v1.14.5-hardened2" { count++ } END { print count + 0 }\' /etc/inspace-cache/images.tsv)" -eq 0',
         '$2 == "rancher/nginx-ingress-controller:v1.14.5-hardened2" { count++ } END { print count + 0 }\' /etc/inspace-cache/images.tsv)" -eq 0',
+        '$2 == "rancher/hardened-traefik:v3.7.11-build20260819" { count++ } END { print count + 0 }\' /etc/inspace-cache/images.tsv)" -eq 0',
         'test "$image_count" -eq 32',
         '"${resolve[@]}" "$cache_endpoint/healthz"',
         '"${resolve[@]}" "$cache_endpoint/v2/"',

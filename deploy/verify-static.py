@@ -64,7 +64,7 @@ def main() -> None:
         "deploy Python dependency lock contains an unpinned requirement",
     )
     require(
-        "KUBECTL_VERSION=v1.35.6" in dockerfile
+        "KUBECTL_VERSION=v1.36.4" in dockerfile
         and "alpine/helm:3.18.4@sha256:" in dockerfile
         and dockerfile.count("sha256sum --check") == 1,
         "deploy kubectl or Helm dependency is not exactly verified",

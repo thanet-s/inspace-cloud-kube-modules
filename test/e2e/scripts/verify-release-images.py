@@ -511,7 +511,7 @@ def validate_chart_package(
     if result.returncode != 0:
         raise RuntimeError(f"helm could not inspect released chart {chart}: {result.stderr.strip()}")
     metadata = result.stdout
-    app_version = "1.14.0" if chart.endswith("-crds") else version
+    app_version = "1.14.1" if chart.endswith("-crds") else version
     if (
         chart_scalar(metadata, "name") != chart
         or chart_scalar(metadata, "version") != version
@@ -732,7 +732,7 @@ def validate_release_images_document(
     for chart in CHART_NAMES:
         record = charts[chart]
         filename = f"{chart}-{version}.tgz"
-        app_version = "1.14.0" if chart.endswith("-crds") else version
+        app_version = "1.14.1" if chart.endswith("-crds") else version
         if (
             not isinstance(record, dict)
             or set(record)

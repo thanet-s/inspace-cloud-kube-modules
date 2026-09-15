@@ -925,7 +925,7 @@ func providerNodeClass() *inspacev1.InSpaceNodeClass {
 			ImageSelector:           inspacev1.ImageSelector{OSName: inspacev1.OSNameUbuntu, OSVersion: inspacev1.OSVersionUbuntu},
 			RootDiskGiB:             40,
 			RKE2: inspacev1.RKE2Config{
-				Version:        "v1.35.6+rke2r1",
+				Version:        "v1.36.4+rke2r1",
 				Server:         "https://10.0.0.10:9345",
 				TokenSecretRef: inspacev1.SecretKeySelector{Name: inspacev1.RKE2AgentTokenSecretName, Key: inspacev1.RKE2AgentTokenSecretKey},
 			},
