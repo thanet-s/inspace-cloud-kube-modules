@@ -97,3 +97,33 @@ oci://ghcr.io/thanet-s/charts/inspace-cloud-kube-modules
 
 The release token is the workflow-scoped `GITHUB_TOKEN`; no long-lived
 registry credential or InSpace API token is used by release automation.
+
+## Known open issue: bastion/control-plane floating-IP allocation has no bad-address detection
+
+`v0.9.0-rc.9` failed the live E2E test stage on a bad worker floating IP
+(fixed by the bad-floating-IP cache and fast registration-timeout
+controller). Validating that fix then hit an unrelated problem three
+times in a row: the bastion VM was handed the exact same address
+(`199.21.172.40`) on three consecutive live `all` runs (rc.10, rc.11,
+rc.12), each time dropping its SSH session mid cloud-init wait
+(`Connection ... closed`). Three-for-three on one address rules out
+ordinary shared-pool bad luck and points at InSpace handing back the
+most-recently-freed address rather than randomizing across the pool.
+
+Bastion and control-plane floating IPs are auto-assigned as a side
+effect of VM creation (`modules/cloud-provider/pkg/bootstrap`); the
+bootstrap reconciler never calls `CreateFloatingIP` directly and has no
+way to reject a specific address and ask for another. This differs from
+worker nodes, where Karpenter's own NodeClaim lifecycle gives the
+`BadFloatingIPStore` a signal to act on. No equivalent signal path
+exists from the E2E harness's SSH-level observation into the Go
+reconciler today.
+
+`v0.9.0` was promoted from `v0.9.0-rc.13`, which passed a full live
+`all` E2E run cleanly, after adding a cooldown delay before retrying a
+failed init attempt (`INSPACE_E2E_INIT_RETRY_COOLDOWN_SECONDS`, default
+300s) gave the pool enough time to stop handing back the same address.
+That cooldown is a harness-level mitigation, not a fix: a real fix
+needs bad-address detection and rejection in the production bootstrap
+reconciler itself, deserving its own design pass rather than a rushed
+change to its create-attempt fencing.
