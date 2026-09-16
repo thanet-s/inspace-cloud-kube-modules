@@ -81,7 +81,7 @@ the exact-VPC private-IP, verified-UFW, and bounded-agent-start contract, so
 existing
 K3s-backed NodeClaims are treated as drifted and replaced through Karpenter's
 normal disruption controls after their NodeClasses are migrated.
-The current immutable bootstrap schema is `stock-ubuntu-rke2-v12`; it omits
+The current immutable bootstrap schema is `stock-ubuntu-rke2-v13`; it omits
 NodeRestriction-protected labels from kubelet bootstrap while retaining them
 for Karpenter to apply after registration. Workers rendered with older
 bootstrap schemas are eligible for normal Karpenter drift replacement.
