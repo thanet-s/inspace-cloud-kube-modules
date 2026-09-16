@@ -97,3 +97,18 @@ oci://ghcr.io/thanet-s/charts/inspace-cloud-kube-modules
 
 The release token is the workflow-scoped `GITHUB_TOKEN`; no long-lived
 registry credential or InSpace API token is used by release automation.
+
+## Known open candidates
+
+`v0.9.0-rc.9` failed the live E2E test stage: the
+`inspace-e2e-public-local` Deployment never rolled out within its 30-minute
+retry budget (`test/e2e/test.yml`, "Wait for CCM to authorize the edge Node
+and schedule its local Pod"). Per the promotion rule above, **do not promote
+`v0.9.0-rc.9` to stable.** Static review of the NodePool/Deployment
+label, taint, and toleration wiring found no mismatch; the stall is a
+runtime condition, most likely on the same class of bad-egress issue this
+release line already mitigates elsewhere. Two fixes landed on `main` after
+rc.9 was cut: the bad-floating-IP cache and fast registration-timeout
+controller, and diagnostic capture (node/pod/event dump) on this specific
+test task. A fresh candidate (e.g. `v0.9.0-rc.10`) must be cut from `main`
+and pass a full live `test/e2e/run.sh all` run before any stable promotion.
