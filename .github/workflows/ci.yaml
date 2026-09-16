@@ -35,10 +35,10 @@ jobs:
             cache_dependency_path: modules/karpenter-provider/go.sum
     steps:
       - name: Check out source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: actions/checkout@v7
 
       - name: Set up Go
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        uses: actions/setup-go@v7
         with:
           go-version-file: ${{ matrix.directory }}/go.mod
           cache: true
@@ -77,7 +77,7 @@ jobs:
         working-directory: ${{ matrix.directory }}
         env:
           GOWORK: "off"
-        run: go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
 
   containers:
     name: Container / ${{ matrix.image }} / ${{ matrix.arch }}
@@ -102,13 +102,13 @@ jobs:
             dockerfile: modules/karpenter-provider/Dockerfile
     steps:
       - name: Check out source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: actions/checkout@v7
 
       - name: Set up Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        uses: docker/setup-buildx-action@v4
 
       - name: Build linux/${{ matrix.arch }} image natively
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: ${{ matrix.dockerfile }}
@@ -170,7 +170,7 @@ jobs:
     runs-on: ubuntu-slim
     steps:
       - name: Check out source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: actions/checkout@v7
 
       - name: Verify release-note filtering
         run: ./scripts/test-filter-release-notes.sh
@@ -179,9 +179,9 @@ jobs:
         run: python3 scripts/test-live-suite-mutation-safety.py
 
       - name: Set up Helm
-        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        uses: azure/setup-helm@v5
         with:
-          version: v4.2.3
+          version: v4.3.0
 
       - name: Verify vendored CRDs
         shell: bash
@@ -246,16 +246,16 @@ jobs:
     runs-on: ubuntu-26.04
     steps:
       - name: Check out source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: actions/checkout@v7
 
       - name: Set up Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        uses: docker/setup-buildx-action@v4
 
       - name: Verify writable seed and read-only registry modes
         run: ./scripts/verify-cache-registry.sh
 
       - name: Build the container-only Ansible runner
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: test/e2e/Dockerfile
@@ -266,7 +266,7 @@ jobs:
           cache-to: type=gha,mode=max,scope=ci-e2e-harness-amd64
 
       - name: Build the dependency-locked operator deploy runner
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: deploy/Dockerfile
@@ -303,8 +303,8 @@ jobs:
           docker run --rm \
             --entrypoint /bin/bash \
             local/inspace-deploy-runner:ci -ceu '
-            test "$(ansible-playbook --version | awk "NR == 1 { gsub(/[][]/, \"\", \$3); print \$3 }")" = 2.21.2
+            test "$(ansible-playbook --version | awk "NR == 1 { gsub(/[][]/, \"\", \$3); print \$3 }")" = 2.21.4
             test "$(kubectl version --client -o json | jq -r .clientVersion.gitVersion)" = v1.36.4
-            helm version --short | grep -Eq "^v3\\.18\\.4\\+g[0-9a-f]+$"
-            test "$(docker --version | awk "{ sub(/,$/, \"\", \$3); print \$3 }")" = 29.4.0
+            helm version --short | grep -Eq "^v4\\.3\\.0\\+g[0-9a-f]+$"
+            test "$(docker --version | awk "{ sub(/,$/, \"\", \$3); print \$3 }")" = 29.8.1
           '
