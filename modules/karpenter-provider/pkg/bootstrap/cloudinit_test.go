@@ -192,8 +192,8 @@ func TestRenderOmitsNodeRestrictionProtectedLabelsWithoutMutatingInput(t *testin
 }
 
 func TestBootstrapSchemaVersion(t *testing.T) {
-	if SchemaVersion != "stock-ubuntu-rke2-v12" {
-		t.Fatalf("bootstrap schema = %q, want protected-label filtering version v12", SchemaVersion)
+	if SchemaVersion != "stock-ubuntu-rke2-v13" {
+		t.Fatalf("bootstrap schema = %q, want floating-IP internet-egress gate version v13", SchemaVersion)
 	}
 }
 
@@ -349,8 +349,8 @@ func TestRenderedShellScriptsHaveValidSyntax(t *testing.T) {
 		}
 		checked++
 	}
-	if checked != 11 {
-		t.Fatalf("syntax-checked %d shell scripts, want eleven; runcmd=%#v", checked, doc.RunCmd)
+	if checked != 12 {
+		t.Fatalf("syntax-checked %d shell scripts, want twelve; runcmd=%#v", checked, doc.RunCmd)
 	}
 }
 
@@ -721,6 +721,7 @@ func TestBootstrapOrchestratorIsFailFastAndDisablesFirewallAfterAdditionalData(t
 	}
 	additionalIndex := strings.Index(orchestrator, "cloud-init-per once inspace-additional-user-data")
 	prepareIndex := strings.Index(orchestrator, "/usr/local/sbin/inspace-prepare-kubernetes-node")
+	waitForInternetIndex := strings.Index(orchestrator, "/usr/local/sbin/inspace-wait-for-internet")
 	prerequisitesIndex := strings.Index(orchestrator, "/usr/local/sbin/inspace-install-prerequisites")
 	disableAPTIndex := strings.Index(orchestrator, "/usr/local/sbin/inspace-disable-automatic-apt-updates")
 	reassertAPTIndex := strings.LastIndex(orchestrator, "/usr/local/sbin/inspace-disable-automatic-apt-updates")
@@ -730,7 +731,7 @@ func TestBootstrapOrchestratorIsFailFastAndDisablesFirewallAfterAdditionalData(t
 	disableIndex := strings.Index(orchestrator, "/usr/local/sbin/inspace-disable-host-firewall")
 	verifyIndex := strings.Index(orchestrator, "/usr/local/sbin/inspace-verify-host-firewall")
 	startIndex := strings.Index(orchestrator, "/usr/local/sbin/inspace-start-rke2-agent")
-	if prepareIndex < 0 || prerequisitesIndex <= prepareIndex || disableAPTIndex <= prerequisitesIndex || installIndex <= disableAPTIndex || detectIndex <= installIndex || additionalIndex <= detectIndex || reassertAPTIndex <= additionalIndex || tuningIndex <= reassertAPTIndex || disableIndex <= tuningIndex || verifyIndex <= disableIndex || startIndex <= verifyIndex || strings.Count(orchestrator, "/usr/local/sbin/inspace-disable-automatic-apt-updates") != 2 {
+	if prepareIndex < 0 || waitForInternetIndex <= prepareIndex || prerequisitesIndex <= waitForInternetIndex || disableAPTIndex <= prerequisitesIndex || installIndex <= disableAPTIndex || detectIndex <= installIndex || additionalIndex <= detectIndex || reassertAPTIndex <= additionalIndex || tuningIndex <= reassertAPTIndex || disableIndex <= tuningIndex || verifyIndex <= disableIndex || startIndex <= verifyIndex || strings.Count(orchestrator, "/usr/local/sbin/inspace-disable-automatic-apt-updates") != 2 {
 		t.Fatalf("unsafe orchestrator order\n%s", orchestrator)
 	}
 
@@ -743,7 +744,7 @@ if [ "$name" = "${FAIL_STEP:-}" ]; then exit 1; fi
 exit 0
 `
 	for _, name := range []string{
-		"inspace-prepare-kubernetes-node", "inspace-install-prerequisites", "inspace-disable-automatic-apt-updates", "inspace-install-rke2", "inspace-detect-private-ip", "inspace-apply-node-tuning",
+		"inspace-prepare-kubernetes-node", "inspace-wait-for-internet", "inspace-install-prerequisites", "inspace-disable-automatic-apt-updates", "inspace-install-rke2", "inspace-detect-private-ip", "inspace-apply-node-tuning",
 		"inspace-additional-user-data", "inspace-disable-host-firewall", "inspace-verify-host-firewall", "inspace-start-rke2-agent", "cloud-init-per",
 	} {
 		writeExecutable(t, filepath.Join(stubDir, name), stub)
@@ -772,13 +773,18 @@ exit 0
 	if strings.Contains(log, "inspace-start-rke2-agent") {
 		t.Fatalf("agent start ran after firewall verification failure\n%s", log)
 	}
-	wantBeforeFailure := "inspace-prepare-kubernetes-node\ninspace-install-prerequisites\ninspace-disable-automatic-apt-updates\ninspace-install-rke2\ninspace-detect-private-ip\ncloud-init-per\ninspace-disable-automatic-apt-updates\ninspace-apply-node-tuning\ninspace-disable-host-firewall\ninspace-verify-host-firewall\n"
+	wantBeforeFailure := "inspace-prepare-kubernetes-node\ninspace-wait-for-internet\ninspace-install-prerequisites\ninspace-disable-automatic-apt-updates\ninspace-install-rke2\ninspace-detect-private-ip\ncloud-init-per\ninspace-disable-automatic-apt-updates\ninspace-apply-node-tuning\ninspace-disable-host-firewall\ninspace-verify-host-firewall\n"
 	if log != wantBeforeFailure {
 		t.Fatalf("failure order differs\ngot:\n%swant:\n%s", log, wantBeforeFailure)
 	}
 
+	log, err = run("inspace-wait-for-internet")
+	if err == nil || log != "inspace-prepare-kubernetes-node\ninspace-wait-for-internet\n" {
+		t.Fatalf("internet-egress-gate failure did not stop orchestrator: err=%v log=%q", err, log)
+	}
+
 	log, err = run("inspace-install-prerequisites")
-	if err == nil || log != "inspace-prepare-kubernetes-node\ninspace-install-prerequisites\n" {
+	if err == nil || log != "inspace-prepare-kubernetes-node\ninspace-wait-for-internet\ninspace-install-prerequisites\n" {
 		t.Fatalf("prerequisite failure did not stop orchestrator: err=%v log=%q", err, log)
 	}
 }
