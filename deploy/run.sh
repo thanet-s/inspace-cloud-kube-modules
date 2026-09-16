@@ -148,6 +148,7 @@ common_args=(
   --env "INSPACE_DEPLOY_HOST_GID=$(id -g)"
   --env INSPACE_API_TOKEN
   --env CONFIRM_CLUSTER_DESTROY
+  --env INSPACE_CONFIRM_RKE2_VERSION_SKIP
 )
 if [[ -n ${INSPACE_DEPLOY_RUNNER_PLATFORM:-} ]]; then
   common_args=(

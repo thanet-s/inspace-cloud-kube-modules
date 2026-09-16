@@ -135,14 +135,47 @@ serialization are compared using their API default of `false`. It then:
    one cp0 replica so an application worker can return to zero after use;
 8. installs exact-version OCI charts and the default Karpenter resources.
 
-`update` does not replace fixed VMs or rewrite bootstrap cloud-init. It puts
-`control_plane_extra_config` in RKE2's operator fragment and restarts at most
-one server at a time, waiting for Node and API readiness before continuing.
+`update` does not replace fixed VMs or rewrite bootstrap cloud-init, and it is
+the single command for both kinds of day-2 upgrade:
+
+- **Cloud-module upgrade**: it refreshes the in-cluster API Secret, upgrades
+  the CRD and workload OCI charts to `modules_version`, and reapplies the
+  default Karpenter NodeClass/NodePool. Because the NodeClass identity changes
+  whenever its rendered RKE2 version or image changes, Karpenter's built-in
+  drift detection automatically replaces existing elastic workers with nodes
+  running the new version, respecting NodePool disruption budgets — no manual
+  worker action is required.
+- **Control-plane RKE2 version upgrade**: when `rke2_version` in the inventory
+  differs from the version currently reported by the running control plane,
+  `update` downloads the exact upstream RKE2 release directly (bypassing the
+  bastion bootstrap cache, which pins exactly one audited version per
+  controller build), verifies its published checksum, and swaps the binary on
+  one control-plane server at a time — stopping `rke2-server`, replacing
+  `/usr/local/bin/rke2`, and restarting — waiting for that Node to be Ready and
+  the cluster API to recover before moving to the next server. This is the
+  same fail-closed one-at-a-time sequencing already used for
+  `control_plane_extra_config` changes, so embedded-etcd quorum is preserved
+  throughout (at most one of three servers is ever down).
+
+  A downgrade or a jump of more than one RKE2 minor version is refused unless
+  the operator exports `INSPACE_CONFIRM_RKE2_VERSION_SKIP=<cluster-name>`,
+  matching this project's typed-confirmation pattern for other destructive or
+  unusual operations. A **cached-mode** cluster (`bootstrap_direct_download:
+  false`) can only reach a version its bastion cache manifest supports; since
+  that manifest is pinned per controller release (see
+  [DEVELOPMENT.md](../DEVELOPMENT.md#bastion-bootstrap-cache)), an RKE2
+  version bump on a cached cluster is normally paired with a
+  `modules_version` bump to a release that pins the new version. A
+  **direct-download** cluster (`bootstrap_direct_download: true`) can upgrade
+  to any valid RKE2 release independently of `modules_version`.
+
+`update` still puts `control_plane_extra_config` in RKE2's operator fragment
+after any RKE2 binary upgrade, restarting at most one server at a time.
 Topology, identity, control-plane taints, packaged-component disablement, CNI,
-CIDR, token, data-directory, and registry keys are blocked because the
-bootstrap controller owns them. It then upgrades the CRD
-and workload charts and reapplies the default NodeClass/NodePool. On a
-single-server cluster, an RKE2 restart necessarily causes brief API downtime.
+CIDR, token, data-directory, and registry keys remain blocked because the
+bootstrap controller owns them; replica-count and machine-shape changes still
+require the explicit destroy/recreate lifecycle. On a single-server cluster,
+each RKE2 restart necessarily causes brief API downtime.
 
 `tunnel` starts or reuses the SSH control connection and prints the local
 kubeconfig path. The kubeconfig uses `127.0.0.1:16443` with the private VIP as
@@ -173,8 +206,12 @@ destroy stops instead of bypassing CSI, CCM, Karpenter, or ownership checks.
 
 ## Limits
 
-Fixed control-plane shape, image, RKE2 version, bootstrap cache mode, network,
-VIP, and replica-count updates are not in-place operations. The bootstrap
-controller rejects immutable VM drift. `update` is for the allowlisted
-operator RKE2 fragment and released cloud-module upgrades; machine replacement
-remains a planned, explicit lifecycle.
+Fixed control-plane shape, image, bootstrap cache mode, network, VIP, and
+replica-count updates are not in-place operations; the bootstrap controller
+rejects immutable VM drift for those fields. RKE2 *version* is the one
+exception: `update` performs an in-place, one-at-a-time control-plane binary
+upgrade (see above) and elastic workers converge automatically through
+Karpenter drift-replacement. `update` otherwise covers the allowlisted
+operator RKE2 fragment and released cloud-module upgrades; machine shape and
+replica-count replacement remain a planned, explicit destroy/recreate
+lifecycle.

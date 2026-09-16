@@ -24,6 +24,9 @@
     - name: Start the private API tunnel and wait for readiness
       ansible.builtin.include_tasks: tasks/start-tunnel.yml
 
+    - name: Upgrade the RKE2 binary one control-plane server at a time when requested
+      ansible.builtin.include_tasks: tasks/apply-rke2-upgrade.yml
+
     - name: Apply operator RKE2 configuration with one-at-a-time restarts
       ansible.builtin.include_tasks: tasks/apply-control-plane-config.yml
 
