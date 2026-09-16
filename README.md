@@ -69,6 +69,13 @@ The detailed networking, ownership, and cleanup invariants are documented in the
 
 ## Getting started
 
+Evaluating the code without an InSpace account? Clone the repo and run
+`make verify` — module tests, smoke tests, and Helm/static checks all run
+against fakes and loopback servers, no cloud credentials required. See
+[DEVELOPMENT.md](DEVELOPMENT.md#local-verification) for the full command list.
+
+To deploy a real cluster:
+
 1. Prepare an InSpace VPC, an unused private control-plane VIP, and a private
    Service VIP range excluded from VM and NLB allocation.
 2. Copy the [deployment inventory](deploy/inventory.example.yml), configure the
@@ -122,6 +129,7 @@ start from its
 - [Karpenter provider](modules/karpenter-provider/README.md)
 - [Development and testing](DEVELOPMENT.md)
 - [Contributing](CONTRIBUTING.md)
+- [Code of Conduct](CODE_OF_CONDUCT.md)
 - [Release process](RELEASING.md)
 - [Security policy](SECURITY.md)
 
