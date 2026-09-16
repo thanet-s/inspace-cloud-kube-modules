@@ -1098,15 +1098,15 @@ func createFenceTestNodeClaim() *karpv1.NodeClaim {
 
 func createFenceTestIdentity(claim *karpv1.NodeClaim) (createFenceBinding, createFenceCleanupIdentity) {
 	return createFenceBinding{
-			NodeClaimUID: string(claim.UID), IdempotencyKeyHash: createFenceHash(string(claim.UID)),
-			RequestHash: createFenceHash("request"), SpecHash: "spec", BootstrapHash: "bootstrap",
-		}, createFenceCleanupIdentity{
-			ClusterName: "cluster-a", Location: "bkk01", NetworkUUID: "11111111-1111-4111-8111-111111111111",
-			ControlPlaneVIP: "10.0.0.10", PrivateLoadBalancerPoolStart: "10.0.0.200", PrivateLoadBalancerPoolStop: "10.0.0.219",
-			FirewallUUID: "33333333-3333-4333-8333-333333333333", FirewallProfile: inspacev1.FirewallProfilePrivateWorker,
-			NodeClaimName: claim.Name,
-			VMName:        "cluster-a-karp-general-abc12", BillingAccountID: 1, OwnershipKeyHash: cloudapi.OwnershipKeyHash(string(claim.UID)),
-		}
+		NodeClaimUID: string(claim.UID), IdempotencyKeyHash: createFenceHash(string(claim.UID)),
+		RequestHash: createFenceHash("request"), SpecHash: "spec", BootstrapHash: "bootstrap",
+	}, createFenceCleanupIdentity{
+		ClusterName: "cluster-a", Location: "bkk01", NetworkUUID: "11111111-1111-4111-8111-111111111111",
+		ControlPlaneVIP: "10.0.0.10", PrivateLoadBalancerPoolStart: "10.0.0.200", PrivateLoadBalancerPoolStop: "10.0.0.219",
+		FirewallUUID: "33333333-3333-4333-8333-333333333333", FirewallProfile: inspacev1.FirewallProfilePrivateWorker,
+		NodeClaimName: claim.Name,
+		VMName:        "cluster-a-karp-general-abc12", BillingAccountID: 1, OwnershipKeyHash: cloudapi.OwnershipKeyHash(string(claim.UID)),
+	}
 }
 
 func observeTestFloatingIPUpdate(
