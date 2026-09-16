@@ -52,11 +52,11 @@ def main() -> None:
         require(ignored in dockerignore, f"missing Docker exclusion {ignored}")
     require(
         "ubuntu:26.04@sha256:" in dockerfile
-        and "docker:29.4.0-cli@sha256:" in dockerfile,
+        and "docker:29.8.1-cli@sha256:" in dockerfile,
         "deploy runner base or Docker CLI image is not digest locked",
     )
     require(
-        "ansible-core==2.21.2" in dependency_lock
+        "ansible-core==2.21.4" in dependency_lock
         and all(
             line == "" or line.startswith("#") or re.search(r"^[A-Za-z0-9_.-]+==[^=]+$", line)
             for line in dependency_lock.splitlines()
@@ -65,7 +65,7 @@ def main() -> None:
     )
     require(
         "KUBECTL_VERSION=v1.36.4" in dockerfile
-        and "alpine/helm:3.18.4@sha256:" in dockerfile
+        and "alpine/helm:4.3.0@sha256:" in dockerfile
         and dockerfile.count("sha256sum --check") == 1,
         "deploy kubectl or Helm dependency is not exactly verified",
     )

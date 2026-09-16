@@ -1,9 +1,9 @@
 # syntax=docker/dockerfile:1.7
 
-FROM docker:29.4.0-cli@sha256:2efe7c8e806b35050def6ba1ba0ddad67b521a0a6d37f4910b3d88f11b495d03 AS docker-cli
-FROM alpine/helm:3.18.4@sha256:e7ecbf4a200dea73d64bfb8cb0936829164945f2b4d02a0274093073ee8d264f AS helm
+FROM docker:29.8.1-cli@sha256:1b0a4c8c69b84185904584e05e5d3b6e6b5f01d1339dcfbe1cd7dfa5d5ac7543 AS docker-cli
+FROM alpine/helm:4.3.0@sha256:377d0fc44fb5513cc6efd7b04e5a44d732fa82df2389aa03097f1aa0e103a731 AS helm
 
-FROM ubuntu:26.04@sha256:3131b4cc82a783df6c9df078f86e01819a13594b865c2cad47bd1bca2b7063bb
+FROM ubuntu:26.04@sha256:61ebaa5cc23ca45450db85eac015435199ec569e28ec222ea13f2aed2110b8a6
 
 ARG TARGETARCH
 ARG KUBECTL_VERSION=v1.36.4
