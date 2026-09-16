@@ -1889,22 +1889,43 @@
           changed_when: true
 
         - name: Wait for CCM to authorize the edge Node and schedule its local Pod
-          ansible.builtin.shell: |
-            set -euo pipefail
-            label={{ ('karpenter.sh/nodepool=' + e2e_public_local_nodepool_name) | quote }}
-            pool={{ e2e_public_local_pool | quote }}
-            nodes=$(kubectl get nodes -l "$label" -o json)
-            test "$(jq '.items | length' <<<"$nodes")" -eq 1
-            jq -e --arg pool "$pool" 'all(.items[];
-              .metadata.labels["inspace.cloud.node-restriction.kubernetes.io/public-local-pool"] == $pool)' <<<"$nodes"
-            kubectl -n default rollout status deployment/inspace-e2e-public-local --timeout=30s
-          args:
-            executable: /bin/bash
-          register: e2e_public_local_authorized
-          changed_when: false
-          retries: 180
-          delay: 10
-          until: e2e_public_local_authorized.rc == 0
+          block:
+            - name: Wait for CCM to authorize the edge Node and schedule its local Pod
+              ansible.builtin.shell: |
+                set -euo pipefail
+                label={{ ('karpenter.sh/nodepool=' + e2e_public_local_nodepool_name) | quote }}
+                pool={{ e2e_public_local_pool | quote }}
+                nodes=$(kubectl get nodes -l "$label" -o json)
+                test "$(jq '.items | length' <<<"$nodes")" -eq 1
+                jq -e --arg pool "$pool" 'all(.items[];
+                  .metadata.labels["inspace.cloud.node-restriction.kubernetes.io/public-local-pool"] == $pool)' <<<"$nodes"
+                kubectl -n default rollout status deployment/inspace-e2e-public-local --timeout=30s
+              args:
+                executable: /bin/bash
+              register: e2e_public_local_authorized
+              changed_when: false
+              retries: 180
+              delay: 10
+              until: e2e_public_local_authorized.rc == 0
+          rescue:
+            - name: Capture public-node-local pod diagnostics before failing
+              ansible.builtin.shell: |
+                set +e
+                echo "=== nodes ==="
+                kubectl get nodes -l "karpenter.sh/nodepool={{ e2e_public_local_nodepool_name }}" -o wide
+                echo "=== pods ==="
+                kubectl -n default get pods -l app=inspace-e2e-public-local -o wide
+                echo "=== describe pods ==="
+                kubectl -n default describe pods -l app=inspace-e2e-public-local
+                echo "=== events ==="
+                kubectl -n default get events --sort-by=.lastTimestamp | tail -n 40
+              args:
+                executable: /bin/bash
+              changed_when: false
+              failed_when: false
+            - name: Re-raise the original public-node-local authorization failure
+              ansible.builtin.fail:
+                msg: "{{ e2e_public_local_authorized.msg | default('CCM failed to authorize the edge Node / schedule its local Pod within the retry budget') }}"
 
         - name: Prove public-node-local TCP UDP status firewall FIP identity and client source
           ansible.builtin.command:
