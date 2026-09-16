@@ -1,7 +1,15 @@
 # Contributing
 
 Contributions are licensed under Apache-2.0. By submitting a contribution, you
-agree that it may be distributed under that license.
+agree that it may be distributed under that license. Participation is
+governed by the [Code of Conduct](CODE_OF_CONDUCT.md).
+
+New to this repo? Start with [README.md](README.md) for what the project
+does, then [DEVELOPMENT.md](DEVELOPMENT.md) for workspace setup (`go.work`,
+per-module `GOWORK=off` testing), the full local verification suite, and the
+network/ownership/cleanup invariants every controller change must preserve.
+No InSpace account is needed to build, test, or review code: `make verify`
+and `make smoke` run entirely against fakes/loopback.
 
 Before opening a pull request:
 
