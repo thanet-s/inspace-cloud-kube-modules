@@ -425,6 +425,21 @@ failing Create or Delete. A NodeClaim that registers a Node normally, even on
 its first attempt, never has its floating IP recorded. Deleting the
 ConfigMap is always safe; it is recreated on the next launch failure.
 
+Karpenter's own registration-liveness timeout is a fixed, unconfigurable 15
+minutes, and it is what normally notices and replaces a NodeClaim stuck on a
+bad floating IP the *first* time that exact address shows up (before the
+cache above has anything to skip). `FastRegistrationTimeoutController`
+shortens that to 9 minutes, but only for a NodeClass with
+`RKE2.SkipOSUpgrade: true`. That flag removes cloud-init's own up-to-10-minute
+package-preparation budget (`package_deadline` in `cloudinit.go`) from a
+healthy boot, which is what makes a materially shorter timeout safe; without
+it, a legitimately slow security-update mirror can by itself approach 15
+minutes with nothing wrong, so a NodeClass that keeps the OS upgrade is left
+entirely to Karpenter's stock timeout. The controller takes exactly the same
+action Karpenter's own liveness controller takes -- deleting the NodeClaim
+object -- just sooner, so it feeds the bad-floating-IP cache above exactly as
+the stock timeout would.
+
 ## RKE2 agent bootstrap
 
 `cloud_init` is sent as an API-compatible JSON object. On stock Ubuntu 24.04 it:
