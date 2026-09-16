@@ -401,6 +401,30 @@ selectors. The generated `NoSchedule` taint is only a placement guard.
 
 Worker network policy relies on the validated InSpace cloud firewall. Generated bootstrap does not install or enable UFW. One `set -eu` orchestrator runs every bootstrap stage in order, executes `additionalUserData`, reapplies the required node tuning, then disables and verifies UFW before it can start RKE2. The RKE2 service also has an `ExecStartPre` verifier, so initial launch and later restarts fail unless `ufw status` is inactive and its unit is inactive and disabled (an absent unit is safe). It never flushes or rewrites iptables/nftables, which belong to Cilium and RKE2. The adapter replaces a single strict VPC-subnet placeholder with the exact API-reported prefix before VM creation. Bootstrap then requires exactly one guest address in that prefix and writes it as `node-ip`; it never chooses the default interface or mistakes the floating address for a NIC address. It does not set `node-external-ip` and has no external-address placeholder. The external CCM is authoritative: it reads the VM's private address and exact Floating-IP assignment from the InSpace API and publishes them as `InternalIP` and `ExternalIP`. InSpace service targets use the private node address. Deletion dispatches the exact VM UUID first, proves core absence, removes the exact Floating IP, proves full dependent absence, and only then removes every stale firewall attachment for that UUID.
 
+### Known-bad floating IP cache
+
+Some InSpace floating IPs have no working internet egress; `waitForInternet`
+bootstrap gate (see [RKE2 agent bootstrap](#rke2-agent-bootstrap)) exits
+before RKE2 install on the guest, so the Node never registers and Karpenter's
+own registration-liveness timeout eventually deletes and replaces that
+NodeClaim. `Delete()` treats a NodeClaim that never satisfied its
+`Registered` condition as a signal that its exact floating IP may be bad and
+records the address, with a timestamp, in a single `ConfigMap` named
+`inspace-bad-floating-ips` in the controller's namespace. `Create()` checks a
+newly assigned address against that record; if it was marked bad within the
+last 30 days, the just-created VM is deleted immediately and Create returns a
+retryable error, skipping the wait for the guest to fail its own connectivity
+gate and for Karpenter's liveness timeout to notice. InSpace floating IPs are
+drawn from a shared, reused pool, so a persistently bad address is more
+likely to repeat within that window than a genuinely transient one.
+
+This is a best-effort speed optimization, not an ownership or safety
+mechanism: it never blocks or authorizes a cloud mutation, and any error
+reading or writing the ConfigMap is treated as "not known bad" rather than
+failing Create or Delete. A NodeClaim that registers a Node normally, even on
+its first attempt, never has its floating IP recorded. Deleting the
+ConfigMap is always safe; it is recreated on the next launch failure.
+
 ## RKE2 agent bootstrap
 
 `cloud_init` is sent as an API-compatible JSON object. On stock Ubuntu 24.04 it:

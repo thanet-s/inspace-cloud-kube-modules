@@ -55,6 +55,9 @@ type Options struct {
 	// CacheHealthProber is injectable for deterministic tests. Nil uses the
 	// strict private-HTTPS implementation.
 	CacheHealthProber CacheHealthProber
+	// BadFloatingIPs is optional. Nil disables the known-bad-floating-IP
+	// fast path entirely; Create and Delete behave exactly as before.
+	BadFloatingIPs BadFloatingIPStore
 }
 
 type CloudProvider struct {
@@ -414,6 +417,16 @@ func (p *CloudProvider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim)
 		Capacity:    copyResourceList(instanceType.Capacity),
 		Allocatable: copyResourceList(instanceType.Allocatable()),
 	}
+	if p.opts.BadFloatingIPs != nil {
+		// Best-effort fast path only: a store error must never block node
+		// provisioning, so any failure here is treated as "not known bad".
+		if bad, checkErr := p.opts.BadFloatingIPs.IsRecentlyBad(ctx, vm.PublicIPv4); checkErr == nil && bad {
+			if deleteErr := p.Delete(ctx, created); deleteErr != nil && !cloudprovider.IsNodeClaimNotFoundError(deleteErr) {
+				return nil, fmt.Errorf("deleting VM %s on known-bad floating IP %s: %w", vm.UUID, vm.PublicIPv4, deleteErr)
+			}
+			return nil, fmt.Errorf("floating IP %s was recorded bad by a previous provisioning failure within the last %s; deleted VM %s and requesting a fresh attempt", vm.PublicIPv4, badFloatingIPRetention, vm.UUID)
+		}
+	}
 	return created, nil
 }
 
@@ -421,6 +434,15 @@ func (p *CloudProvider) Delete(ctx context.Context, nodeClaim *karpv1.NodeClaim)
 	id, err := providerid.Parse(nodeClaim.Status.ProviderID)
 	if err != nil {
 		return fmt.Errorf("parsing provider ID for deletion: %w", err)
+	}
+	if publicIP := nodeClaim.Annotations[AnnotationPublicIPv4]; publicIP != "" && p.opts.BadFloatingIPs != nil &&
+		!nodeClaim.StatusConditions().Get(karpv1.ConditionTypeRegistered).IsTrue() {
+		// A NodeClaim deleted before it ever registered a Node is the
+		// strongest signal available, without new VM-to-controller
+		// plumbing, that this specific launch failed outright -- most
+		// commonly a floating IP with no working internet egress. This is a
+		// best-effort record: a store error must never block deletion.
+		_ = p.opts.BadFloatingIPs.RecordBad(ctx, publicIP)
 	}
 	deleteIdentity := cloudapi.DeleteVMIdentity{
 		FloatingIPName: nodeClaim.Annotations[AnnotationFloatingIP],

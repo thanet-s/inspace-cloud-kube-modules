@@ -85,6 +85,15 @@ rules:
     resources: ["secrets"]
     resourceNames: ["inspace-rke2-agent-token"]
     verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    # Kubernetes RBAC cannot constrain create by resourceName. Reads and
+    # writes below are limited to the one fixed bad floating-IP cache name.
+    verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["inspace-bad-floating-ips"]
+    verbs: ["get", "update"]
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
     # Kubernetes RBAC cannot constrain create by resourceName. Reads remain

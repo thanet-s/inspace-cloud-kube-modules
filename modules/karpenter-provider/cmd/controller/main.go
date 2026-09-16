@@ -79,10 +79,14 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	badFloatingIPs, err := provider.NewKubernetesBadFloatingIPStore(op.GetClient(), op.GetAPIReader(), cfg.secretNamespace)
+	if err != nil {
+		return err
+	}
 	undecorated, err := provider.New(cloud, resolver, provider.Options{
 		ClusterName: cfg.clusterName, DefaultNodeClassName: cfg.defaultNodeClass, Location: cfg.location,
 		NetworkUUID: cfg.networkUUID, ControlPlaneVIP: cfg.controlPlaneVIP, PrivateLoadBalancerPool: cfg.privateLoadBalancerPool,
-		CreateFenceStore: createFences,
+		CreateFenceStore: createFences, BadFloatingIPs: badFloatingIPs,
 	})
 	if err != nil {
 		return err
