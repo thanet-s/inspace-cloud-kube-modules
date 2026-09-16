@@ -665,10 +665,22 @@ trap 'cleanup_on_signal TERM' TERM
 case "$phase" in
   all)
     recover_previous_run_for_all
-    start_new_run
-    set +e
-    run_ansible /opt/e2e/init-cluster.yml
-    suite_status=$?
+    init_attempt=1
+    init_max_attempts=2
+    while :; do
+      start_new_run
+      set +e
+      run_ansible /opt/e2e/init-cluster.yml
+      suite_status=$?
+      (( suite_status == 0 || init_attempt >= init_max_attempts )) && break
+      echo "init attempt $init_attempt/$init_max_attempts failed; destroying and retrying with a fresh run in case of a transient provisioning fault (e.g. a bad floating IP)" >&2
+      cleanup_current_run || {
+        echo "cleanup after failed init attempt $init_attempt did not converge; refusing retry" >&2
+        break
+      }
+      set -e
+      init_attempt=$((init_attempt + 1))
+    done
     if (( suite_status == 0 )); then
       run_ansible /opt/e2e/test.yml
       suite_status=$?
