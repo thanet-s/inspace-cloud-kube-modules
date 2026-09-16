@@ -1,0 +1,42 @@
+---
+- name: Read the currently running control-plane RKE2 version
+  ansible.builtin.command:
+    argv:
+      - kubectl
+      - --kubeconfig
+      - "{{ deploy_state_dir }}/kubeconfig.yaml"
+      - get
+      - node
+      - "{{ deployment_state.controlPlanes[0].name }}"
+      - -o
+      - jsonpath={.status.nodeInfo.kubeletVersion}
+  register: deploy_current_rke2_version
+  changed_when: false
+
+- name: Roll out an RKE2 control-plane version upgrade one server at a time
+  when: deploy_current_rke2_version.stdout != rke2_version
+  block:
+    - name: Require RKE2 upgrade version-skew and downgrade safety
+      ansible.builtin.command:
+        argv:
+          - python3
+          - "{{ deploy_root }}/scripts/validate_rke2_upgrade.py"
+          - "{{ deploy_current_rke2_version.stdout }}"
+          - "{{ rke2_version }}"
+          - "{{ (lookup('env', 'INSPACE_CONFIRM_RKE2_VERSION_SKIP') == cluster_name) | ternary('true', 'false') }}"
+      changed_when: false
+
+    - name: Upgrade the RKE2 binary one control-plane server at a time
+      ansible.builtin.include_tasks: upgrade-one-control-plane.yml
+      loop: "{{ deployment_state.controlPlanes }}"
+      loop_control:
+        loop_var: deploy_control_plane
+        index_var: deploy_cp_index
+        label: "{{ deploy_control_plane.name }}"
+
+    - name: Report the completed RKE2 version upgrade
+      ansible.builtin.debug:
+        msg: >-
+          Cluster {{ cluster_name }} control plane now runs RKE2 {{ rke2_version }}
+          (was {{ deploy_current_rke2_version.stdout }}). Elastic Karpenter workers
+          converge to this version through normal NodeClass-drift replacement.

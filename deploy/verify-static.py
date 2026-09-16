@@ -152,6 +152,28 @@ def main() -> None:
         "bootstrapControllerVersion" in update,
         "module update does not preserve bootstrap destroy authority",
     )
+    require(
+        "tasks/apply-rke2-upgrade.yml" in update,
+        "update lifecycle does not roll out in-place RKE2 binary upgrades",
+    )
+    rke2_upgrade_task = read("deploy/playbooks/tasks/apply-rke2-upgrade.yml")
+    rke2_upgrade_validator = read("deploy/scripts/validate_rke2_upgrade.py")
+    run_launcher = read("deploy/run.sh")
+    require(
+        "INSPACE_CONFIRM_RKE2_VERSION_SKIP" in rke2_upgrade_task
+        and "INSPACE_CONFIRM_RKE2_VERSION_SKIP" in rke2_upgrade_validator
+        and "INSPACE_CONFIRM_RKE2_VERSION_SKIP" in run_launcher,
+        "RKE2 upgrade lacks a downgrade/minor-skip safety confirmation",
+    )
+    require(
+        "is_downgrade" in rke2_upgrade_validator and "skips_minor" in rke2_upgrade_validator,
+        "RKE2 upgrade does not guard against downgrade or multi-minor-version skew",
+    )
+    rke2_upgrade_script = read("deploy/templates/upgrade-rke2-server.sh")
+    require(
+        "sha256sum" in rke2_upgrade_script and "systemctl stop rke2-server" in rke2_upgrade_script,
+        "RKE2 binary upgrade script does not verify checksums or stop the service before replacing it",
+    )
 
     ordered_destroy = (
         "Refuse bootstrap deletion while PVC or PV ownership remains",
