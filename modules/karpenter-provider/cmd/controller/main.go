@@ -79,10 +79,14 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	badFloatingIPs, err := provider.NewKubernetesBadFloatingIPStore(op.GetClient(), op.GetAPIReader(), cfg.secretNamespace)
+	if err != nil {
+		return err
+	}
 	undecorated, err := provider.New(cloud, resolver, provider.Options{
 		ClusterName: cfg.clusterName, DefaultNodeClassName: cfg.defaultNodeClass, Location: cfg.location,
 		NetworkUUID: cfg.networkUUID, ControlPlaneVIP: cfg.controlPlaneVIP, PrivateLoadBalancerPool: cfg.privateLoadBalancerPool,
-		CreateFenceStore: createFences,
+		CreateFenceStore: createFences, BadFloatingIPs: badFloatingIPs,
 	})
 	if err != nil {
 		return err
@@ -103,11 +107,15 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	fastRegistrationTimeoutController, err := provider.NewFastRegistrationTimeoutController(op.GetClient(), op.GetAPIReader(), resolver)
+	if err != nil {
+		return err
+	}
 	allControllers := controllers.NewControllers(
 		ctx, op.Manager, op.Clock, op.GetClient(), op.EventRecorder, cloudProvider,
 		undecorated, clusterState, op.InstanceTypeStore,
 	)
-	allControllers = append(allControllers, nodeClassController, createFenceController, terminationRecoveryController)
+	allControllers = append(allControllers, nodeClassController, createFenceController, terminationRecoveryController, fastRegistrationTimeoutController)
 	op.WithControllers(ctx, allControllers...).Start(ctx)
 	return nil
 }
