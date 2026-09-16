@@ -563,6 +563,10 @@
         'cloud-init status --wait >/dev/null 2>&1 || test $? -eq 2'
       become: true
       changed_when: false
+      register: e2e_bastion_cloud_init
+      retries: 2
+      delay: 10
+      until: e2e_bastion_cloud_init.rc == 0
 
     - name: Prove the bastion private address Ubuntu version and cloud-firewall-only state
       ansible.builtin.shell: |
@@ -760,6 +764,10 @@
         'cloud-init status --wait >/dev/null 2>&1 || test $? -eq 2'
       become: true
       changed_when: false
+      register: e2e_control_plane_cloud_init
+      retries: 2
+      delay: 10
+      until: e2e_control_plane_cloud_init.rc == 0
 
     - name: Detect completed product node preparation on every control plane
       ansible.builtin.stat:
@@ -2001,6 +2009,10 @@
         'cloud-init status --wait >/dev/null 2>&1 || test $? -eq 2'
       become: true
       changed_when: false
+      register: e2e_worker_cloud_init
+      retries: 2
+      delay: 10
+      until: e2e_worker_cloud_init.rc == 0
 
     - name: Verify cloud-init Ubuntu and the RKE2 agent
       ansible.builtin.shell: |
