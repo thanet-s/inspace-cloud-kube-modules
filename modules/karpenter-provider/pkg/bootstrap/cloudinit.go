@@ -23,7 +23,7 @@ import (
 // RKE2.SkipOSUpgrade are already included in both provider drift hashes and do
 // not require a global replacement of nodes whose spec retains the default.
 const (
-	SchemaVersion         = "stock-ubuntu-rke2-v12"
+	SchemaVersion         = "stock-ubuntu-rke2-v13"
 	VPCSubnetPlaceholder  = "__INSPACE_VPC_SUBNET__"
 	NativeRoutingPodCIDR  = "10.42.0.0/16"
 	KubernetesServiceCIDR = "10.43.0.0/16"
@@ -313,6 +313,20 @@ until systemctl is-active --quiet rke2-agent.service; do
 	sleep 5
 done
 `
+	waitForInternet := `#!/bin/sh
+set -eu
+network_deadline=$(( $(date +%s) + 300 ))
+attempt=0
+until ping -c 1 -W 2 8.8.8.8 >/dev/null 2>&1; do
+  attempt=$((attempt + 1))
+  if [ "$(date +%s)" -ge "$network_deadline" ]; then
+    echo "no internet egress to 8.8.8.8 after $attempt attempts" >&2
+    exit 1
+  fi
+  echo "waiting for floating-IP internet egress (attempt $attempt)" >&2
+  sleep 5
+done
+`
 	aptUpgradeContinuation := ""
 	if !config.SkipOSUpgrade {
 		aptUpgradeContinuation = `     run_package_command env NEEDRESTART_MODE=a DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=30 upgrade -y && \` + "\n"
@@ -463,6 +477,7 @@ tar -xzf "$tmpdir/rke2.linux-amd64.tar.gz" -C /usr/local
 			encodedWriteFile("/var/lib/inspace/ubuntu.sources", "0644", ubuntuSources),
 			encodedWriteFile("/var/lib/inspace/static-resolv.conf", "0644", staticResolver),
 			encodedWriteFile("/usr/local/sbin/inspace-prepare-kubernetes-node", "0700", prepareHost),
+			encodedWriteFile("/usr/local/sbin/inspace-wait-for-internet", "0700", waitForInternet),
 			encodedWriteFile("/usr/local/sbin/inspace-install-prerequisites", "0700", prerequisites),
 			encodedWriteFile("/usr/local/sbin/inspace-disable-automatic-apt-updates", "0700", disableAutomaticAPTUpdates),
 			encodedWriteFile("/usr/local/sbin/inspace-install-rke2", "0700", install),
@@ -484,6 +499,7 @@ tar -xzf "$tmpdir/rke2.linux-amd64.tar.gz" -C /usr/local
 	orchestrator.WriteString(`#!/bin/sh
 set -eu
 /usr/local/sbin/inspace-prepare-kubernetes-node
+/usr/local/sbin/inspace-wait-for-internet
 /usr/local/sbin/inspace-install-prerequisites
 /usr/local/sbin/inspace-disable-automatic-apt-updates
 /usr/local/sbin/inspace-install-rke2
