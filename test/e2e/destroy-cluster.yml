@@ -253,8 +253,8 @@
         executable: /bin/bash
       register: e2e_cleanup_storage_quiesced
       changed_when: false
-      retries: 180
-      delay: 10
+      retries: 600
+      delay: 3
       until: e2e_cleanup_storage_quiesced.rc == 0
       when: e2e_cleanup_state.kubernetesOwnersPossible | default(false) | bool
 
@@ -267,8 +267,8 @@
         executable: /bin/bash
       register: e2e_cleanup_public_local_service
       changed_when: false
-      retries: 180
-      delay: 10
+      retries: 600
+      delay: 3
       until: e2e_cleanup_public_local_service.rc == 0
       when: e2e_cleanup_state.kubernetesOwnersPossible | default(false) | bool
 
@@ -290,8 +290,8 @@
         executable: /bin/bash
       register: e2e_cleanup_cilium_private_lb_quiesced
       changed_when: false
-      retries: 180
-      delay: 10
+      retries: 600
+      delay: 3
       until: e2e_cleanup_cilium_private_lb_quiesced.rc == 0
       when: e2e_cleanup_state.kubernetesOwnersPossible | default(false) | bool
 
@@ -309,8 +309,8 @@
           - "{{ e2e_baseline_inventory_file }}"
       register: e2e_cleanup_node_lb_quiesced
       changed_when: false
-      retries: 180
-      delay: 10
+      retries: 600
+      delay: 3
       until: e2e_cleanup_node_lb_quiesced.rc == 0
       no_log: true
       when: e2e_cleanup_state.kubernetesOwnersPossible | default(false) | bool
@@ -359,8 +359,8 @@
         executable: /bin/bash
       register: e2e_cleanup_public_local_capacity
       changed_when: false
-      retries: 180
-      delay: 10
+      retries: 600
+      delay: 3
       until: e2e_cleanup_public_local_capacity.rc == 0
       when: e2e_cleanup_state.kubernetesOwnersPossible | default(false) | bool
 
@@ -406,8 +406,8 @@
         executable: /bin/bash
       register: e2e_cleanup_worker_quiesced
       changed_when: false
-      retries: 180
-      delay: 10
+      retries: 600
+      delay: 3
       until: e2e_cleanup_worker_quiesced.rc == 0
       when: e2e_cleanup_state.kubernetesOwnersPossible | default(false) | bool
 
@@ -440,8 +440,8 @@
           - bootstrap-only
       register: e2e_cleanup_owner_audit
       changed_when: false
-      retries: 180
-      delay: 10
+      retries: 600
+      delay: 3
       until: e2e_cleanup_owner_audit.rc == 0
       no_log: true
       when: e2e_cleanup_state.kubernetesOwnersPossible | default(false) | bool
@@ -499,7 +499,7 @@
           - "{{ e2e_cluster_file }}"
           - --delete
           - --interval
-          - 10s
+          - 3s
           - --output=json
           - --management-cidr
           - "{{ e2e_cleanup_state.managementCIDR }}"
@@ -535,8 +535,8 @@
           - zero
       register: e2e_final_audit
       changed_when: false
-      retries: 90
-      delay: 10
+      retries: 300
+      delay: 3
       until: e2e_final_audit.rc == 0
       no_log: true
 
@@ -549,8 +549,8 @@
           - "{{ e2e_baseline_inventory_file }}"
       register: e2e_final_account_inventory
       changed_when: false
-      retries: 90
-      delay: 10
+      retries: 300
+      delay: 3
       until: >-
         e2e_final_account_inventory.rc == 0 and
         (e2e_final_account_inventory.stdout | from_json).matches | bool
