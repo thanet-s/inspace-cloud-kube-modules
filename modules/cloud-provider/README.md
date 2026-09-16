@@ -595,7 +595,7 @@ shard aggregate only.
 
 ## Development and verification
 
-Requires Go 1.26.5.
+Requires Go 1.27.1.
 
 ```sh
 make test

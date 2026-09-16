@@ -133,7 +133,7 @@ func TestClusterE2EProvisionsInOrderAndWaitsForThreeControlPlanesInParallel(t *t
 		"22",
 		"--until-ready",
 		"--interval",
-		"15s",
+		"5s",
 		"--output=json",
 	})
 	requireTaskScalar(t, launch, "register", "e2e_bootstrap_wait")
@@ -440,12 +440,12 @@ func TestClusterE2ECleanupIsBoundedFailClosedAndOrdered(t *testing.T) {
 	}
 	for _, expected := range []string{
 		"cloud infrastructure is the fail-closed outcome",
-		"retries: 180",
-		"delay: 10",
+		"retries: 600",
+		"delay: 3",
 		"until: e2e_cleanup_storage_quiesced.rc == 0",
 		"until: e2e_cleanup_worker_quiesced.rc == 0",
 		"Destroy only bootstrap-controller-owned infrastructure synchronously",
-		"retries: 90",
+		"retries: 300",
 		"until: e2e_cleanup_owner_audit.rc == 0",
 		"until: e2e_final_audit.rc == 0",
 	} {
