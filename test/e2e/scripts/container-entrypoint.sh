@@ -678,6 +678,13 @@ case "$phase" in
         echo "cleanup after failed init attempt $init_attempt did not converge; refusing retry" >&2
         break
       }
+      init_retry_cooldown_seconds=${INSPACE_E2E_INIT_RETRY_COOLDOWN_SECONDS:-300}
+      [[ $init_retry_cooldown_seconds =~ ^[0-9]+$ && $init_retry_cooldown_seconds -le 3600 ]] || {
+        echo "INSPACE_E2E_INIT_RETRY_COOLDOWN_SECONDS must be an integer at most 3600" >&2
+        break
+      }
+      echo "cooling down ${init_retry_cooldown_seconds}s before retry, so an auto-assigned address just freed by teardown is less likely to be handed straight back" >&2
+      sleep "$init_retry_cooldown_seconds"
       set -e
       init_attempt=$((init_attempt + 1))
     done
