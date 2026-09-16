@@ -1949,7 +1949,7 @@ def main() -> None:
             '"22"',
             "--until-ready",
             "--interval",
-            "15s",
+            "5s",
             "--output=json",
         ],
         "bootstrap launch argv must be the canonical until-ready controller invocation",

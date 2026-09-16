@@ -339,7 +339,7 @@
           - "22"
           - --until-ready
           - --interval
-          - 15s
+          - 5s
           - --output=json
       environment:
         INSPACE_ALLOW_REMOTE_MUTATIONS: "true"

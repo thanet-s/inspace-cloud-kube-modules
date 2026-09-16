@@ -81,7 +81,7 @@ v9 because enabling Cilium Egress Gateway changes their immutable RKE2
 cloud-init; bastion ownership remains v6. Teardown continues to accept schema
 v8 control planes paired with the same
 v6 bastion. Karpenter's current immutable bootstrap drift
-schema is `stock-ubuntu-rke2-v12`; this is separate from its cloud VM ownership
+schema is `stock-ubuntu-rke2-v13`; this is separate from its cloud VM ownership
 record version.
 
 Control planes, workers, and the bastion use TOT as the primary Ubuntu mirror

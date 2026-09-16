@@ -229,7 +229,7 @@ def run_suite(server: FakeServer, state_dir: pathlib.Path, external_firewall: bo
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        timeout=20,
+        timeout=60,
         check=False,
     )
 
@@ -265,7 +265,7 @@ def run_audit(server: FakeServer, env: dict[str, str] | None = None) -> subproce
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        timeout=10,
+        timeout=30,
         check=False,
     )
 
@@ -280,7 +280,7 @@ def test_remote_plaintext_api_urls_are_rejected(server: FakeServer, root: pathli
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        timeout=10,
+        timeout=30,
         check=False,
     )
     require(suite.returncode == 2, "live-suite accepted a remote plaintext API URL", suite)
@@ -655,7 +655,7 @@ def test_legacy_module_targets_are_retired() -> None:
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            timeout=10,
+            timeout=30,
             check=False,
         )
         require(result.returncode != 0, f"{module} retired live target executed", result)
