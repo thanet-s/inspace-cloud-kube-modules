@@ -634,3 +634,170 @@ func TestDeleteLoopRetriesRawEOFAmbiguousOutcomeAndConverges(t *testing.T) {
 		t.Fatalf("ambiguous wrapper did not preserve or classify raw EOF: %v", ambiguousErr)
 	}
 }
+
+// stepClock returns a fake now() that advances by step on every call,
+// starting one step past epoch, so tests can make check() cross a bounded
+// timeout after an exact, deterministic number of calls instead of racing a
+// real timer.
+func stepClock(step time.Duration) func() time.Time {
+	calls := 0
+	return func() time.Time {
+		calls++
+		return time.Unix(0, 0).Add(time.Duration(calls) * step)
+	}
+}
+
+func TestFloatingIPReachabilityGateAcceptsAnAlreadyReachableResultImmediately(t *testing.T) {
+	reconciler := &sequenceReconciler{reconcileResults: []bootstrap.Result{
+		{Ready: true, Owner: "owner", BastionPublicIPv4: "203.0.113.1", Message: "ready"},
+	}}
+	var stdout, stderr bytes.Buffer
+
+	err := runControllerLoop(context.Background(), reconciler, &v1alpha1.InSpaceCluster{}, "token", controllerLoopOptions{
+		UntilReady: true, Interval: time.Millisecond, OutputFormat: "json",
+		StandardOutput: &stdout, StandardError: &stderr,
+		FloatingIPReachabilityTimeout: time.Minute,
+		dialTCP:                       func(context.Context, string, time.Duration) error { return nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reconciler.reconcileCalls != 1 || reconciler.destroyCalls != 0 {
+		t.Fatalf("reachable loop calls: reconcile=%d destroy=%d", reconciler.reconcileCalls, reconciler.destroyCalls)
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("reachable loop wrote unexpected stderr: %q", stderr.String())
+	}
+}
+
+func TestFloatingIPReachabilityGateWaitsThenRecreatesThenSucceeds(t *testing.T) {
+	readyBad := bootstrap.Result{Ready: true, Owner: "owner", BastionPublicIPv4: "203.0.113.1", Message: "ready"}
+	readyGood := bootstrap.Result{Ready: true, Owner: "owner", BastionPublicIPv4: "203.0.113.2", Message: "ready"}
+	reconciler := &sequenceReconciler{
+		reconcileResults: []bootstrap.Result{readyBad, readyBad, readyBad, readyGood},
+		destroyResults:   []bootstrap.DestroyResult{{Done: true, Owner: "owner"}},
+	}
+	var stdout, stderr bytes.Buffer
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	err := runControllerLoop(ctx, reconciler, &v1alpha1.InSpaceCluster{}, "token", controllerLoopOptions{
+		UntilReady: true, Interval: time.Millisecond, OutputFormat: "json",
+		StandardOutput: &stdout, StandardError: &stderr,
+		FloatingIPReachabilityTimeout: 2 * time.Minute,
+		nowFunc:                       stepClock(time.Minute),
+		dialTCP: func(_ context.Context, address string, _ time.Duration) error {
+			if address == "203.0.113.1" {
+				return errors.New("connection refused")
+			}
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reconciler.reconcileCalls != 4 {
+		t.Fatalf("reconcile calls = %d, want 4", reconciler.reconcileCalls)
+	}
+	if reconciler.destroyCalls != 1 {
+		t.Fatalf("destroy calls = %d, want 1", reconciler.destroyCalls)
+	}
+	if !strings.Contains(stderr.String(), "203.0.113.1") || !strings.Contains(stderr.String(), "destroying and retrying once") {
+		t.Fatalf("stderr missing recreate log: %q", stderr.String())
+	}
+}
+
+func TestFloatingIPReachabilityGateGivesUpAfterExhaustingRecreateBudget(t *testing.T) {
+	readyBad := bootstrap.Result{Ready: true, Owner: "owner", BastionPublicIPv4: "203.0.113.1", Message: "ready"}
+	stillBad := bootstrap.Result{Ready: true, Owner: "owner", BastionPublicIPv4: "203.0.113.9", Message: "ready"}
+	// With a 1-minute clock step and a 2-minute timeout, an address needs to
+	// be observed unreachable on 3 consecutive checks before it crosses the
+	// threshold (the 1st check only records the baseline). The first three
+	// results exhaust the single recreate attempt on 203.0.113.1; the next
+	// three drive the post-recreate address, 203.0.113.9, to the same
+	// threshold again, which the exhausted budget must accept instead of
+	// destroying a second time.
+	reconciler := &sequenceReconciler{
+		reconcileResults: []bootstrap.Result{readyBad, readyBad, readyBad, stillBad, stillBad, stillBad},
+		destroyResults:   []bootstrap.DestroyResult{{Done: true, Owner: "owner"}},
+	}
+	var stdout, stderr bytes.Buffer
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	err := runControllerLoop(ctx, reconciler, &v1alpha1.InSpaceCluster{}, "token", controllerLoopOptions{
+		UntilReady: true, Interval: time.Millisecond, OutputFormat: "json",
+		StandardOutput: &stdout, StandardError: &stderr,
+		FloatingIPReachabilityTimeout: 2 * time.Minute,
+		nowFunc:                       stepClock(time.Minute),
+		dialTCP:                       func(context.Context, string, time.Duration) error { return errors.New("connection refused") },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reconciler.destroyCalls != 1 {
+		t.Fatalf("destroy calls = %d, want exactly 1 (budget of %d)", reconciler.destroyCalls, maxFloatingIPRecreateAttempts)
+	}
+	if reconciler.reconcileCalls != 6 {
+		t.Fatalf("reconcile calls = %d, want 6", reconciler.reconcileCalls)
+	}
+	if !strings.Contains(stderr.String(), "recreate budget is exhausted") {
+		t.Fatalf("stderr missing exhausted-budget log: %q", stderr.String())
+	}
+}
+
+func TestFloatingIPReachabilityGateDisabledByDefaultNeverDials(t *testing.T) {
+	dialCalls := 0
+	reconciler := &sequenceReconciler{reconcileResults: []bootstrap.Result{
+		{Ready: true, Owner: "owner", BastionPublicIPv4: "203.0.113.1", Message: "ready"},
+	}}
+	var stdout, stderr bytes.Buffer
+
+	err := runControllerLoop(context.Background(), reconciler, &v1alpha1.InSpaceCluster{}, "token", controllerLoopOptions{
+		UntilReady: true, Interval: time.Millisecond, OutputFormat: "json",
+		StandardOutput: &stdout, StandardError: &stderr,
+		dialTCP: func(context.Context, string, time.Duration) error {
+			dialCalls++
+			return errors.New("should never be called")
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dialCalls != 0 {
+		t.Fatalf("dial calls = %d, want 0 when FloatingIPReachabilityTimeout is unset", dialCalls)
+	}
+	if reconciler.destroyCalls != 0 {
+		t.Fatalf("destroy calls = %d, want 0", reconciler.destroyCalls)
+	}
+}
+
+func TestFloatingIPReachabilityGateProbesControlPlaneAddressesToo(t *testing.T) {
+	reconciler := &sequenceReconciler{reconcileResults: []bootstrap.Result{
+		{
+			Ready: true, Owner: "owner", BastionPublicIPv4: "203.0.113.1",
+			ControlPlanePublicIPv4: []string{"203.0.113.10", "203.0.113.11", "203.0.113.12"},
+			Message:                "ready",
+		},
+	}}
+	var stdout, stderr bytes.Buffer
+	dialed := map[string]bool{}
+
+	err := runControllerLoop(context.Background(), reconciler, &v1alpha1.InSpaceCluster{}, "token", controllerLoopOptions{
+		UntilReady: true, Interval: time.Millisecond, OutputFormat: "json",
+		StandardOutput: &stdout, StandardError: &stderr,
+		FloatingIPReachabilityTimeout: time.Minute,
+		dialTCP: func(_ context.Context, address string, _ time.Duration) error {
+			dialed[address] = true
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"203.0.113.1", "203.0.113.10", "203.0.113.11", "203.0.113.12"} {
+		if !dialed[want] {
+			t.Fatalf("address %q was never dialed; dialed=%v", want, dialed)
+		}
+	}
+}

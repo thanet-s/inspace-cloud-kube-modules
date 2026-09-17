@@ -258,6 +258,17 @@ guarded owned teardown or obtain provider-side resolution without risking a
 duplicate mutation. Continuous mode and `--once` do not install the overall
 deadline.
 
+InSpace's floating-IP pool has occasionally handed a bastion or control-plane
+VM an address with no working SSH/internet path. VM create has no field to
+reject or exclude a specific address, so `--until-ready` mode also probes port
+22 on every publicly addressed VM once the cluster reports Ready; if one stays
+unreachable past `--floating-ip-reachability-timeout` (default `5m`), it
+destroys the cluster and retries once with a fresh Reconcile before giving up
+and returning that first Ready result. This is a detect-and-retry mitigation
+at the one layer that can act automatically without spending an operator's
+time on it, not a fix for the underlying gap; see RELEASING.md's known-issue
+entry. Set it to `0` to disable the probe entirely.
+
 New control-plane owner/spec records use schema v9 because enabling Cilium
 Egress Gateway changes their immutable RKE2 cloud-init contract. Bastion
 records remain at v6. Reconciliation does not adopt an older fixed VM into v9; use an explicit

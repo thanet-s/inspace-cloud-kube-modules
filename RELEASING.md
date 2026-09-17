@@ -144,13 +144,37 @@ opts in; it still requires deriving the same `confirm_cluster_name` the
 `destroy` playbook itself asserts against, so it can only ever destroy
 the exact cluster `init` was just asked to create.
 
-Both remain harness/operator-level mitigations, not a fix: a real fix
-needs bad-address detection and rejection in the production bootstrap
-reconciler itself (`modules/cloud-provider/pkg/bootstrap`), which has no
-`CreateFloatingIP` call to reject an address against and no signal today
-from SSH/cloud-init-level observation into the Go reconciler. That gap is
-real but is a large, correctness-sensitive addition to an already
-intricate idempotent create-attempt fencing state machine (intent/issued/
-rejected/materialized phases, CAS-based drift detection, ambiguous-PATCH
-replay protection) — it deserves its own design pass, live validation
-budget, and review, not a change folded into this release.
+Both of those remain harness/operator-level mitigations layered on top of
+the actual gap: the bootstrap reconciler itself
+(`modules/cloud-provider/pkg/bootstrap`) has no `CreateFloatingIP` call to
+reject an address against — `CreateVMRequest` has no field to request or
+exclude one, so InSpace decides the address as a side effect of VM
+creation with zero API-level control. There is also no signal path from
+SSH/cloud-init-level observation into the Go reconciler: the bootstrap
+process that provisions a cluster's VMs exits once cloud resources exist,
+well before cloud-init or SSH even start, so it cannot itself learn that a
+guest never came up. Detecting and rejecting a specific address inside
+the reconciler's create-attempt fencing (intent/issued/rejected/
+materialized phases, CAS-based drift detection, ambiguous-PATCH replay
+protection) would need a real SSH-capable signal this component has never
+had, and remains a large, correctness-sensitive change that deserves its
+own design pass rather than a rushed addition to that state machine.
+
+What `inspace-cluster-controller --until-ready` *can* do without that new
+signal: once Reconcile reports the cluster Ready, it already knows every
+bastion and control-plane VM's public floating IPv4
+(`bootstrap.Result.BastionPublicIPv4`/`ControlPlanePublicIPv4`) from the
+same API calls that provisioned them. It now probes TCP/22 on each one; if
+any stays unreachable past `--floating-ip-reachability-timeout` (default
+`5m`), it destroys the cluster and retries once with a fresh Reconcile
+before accepting defeat and returning the original Ready result — see
+[modules/cloud-provider/README.md](modules/cloud-provider/README.md). This
+runs automatically for every caller of `--until-ready` (both `test/e2e`
+and `deploy/`), ahead of and independently from the ansible-level
+mitigations above, without needing SSH credentials or a real session:
+a bare TCP connect only catches an address that never opens the port at
+all, not one that completes a handshake and then drops a live session
+mid-command (the exact rc.10–rc.12 signature), so the ansible-level
+retries remain the layer that catches that narrower case. None of this
+changes what "Ready" means for any caller that leaves the timeout at its
+default or sets it to `0`.
