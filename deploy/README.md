@@ -135,6 +135,19 @@ serialization are compared using their API default of `false`. It then:
    one cp0 replica so an application worker can return to zero after use;
 8. installs exact-version OCI charts and the default Karpenter resources.
 
+InSpace's floating-IP pool has occasionally handed a bastion or control-plane
+VM an address with no working SSH/internet path, hanging `init` on cloud-init
+or SSH waits until they time out. Setting
+`INSPACE_DEPLOY_INIT_AUTO_RECOVER=true` authorizes `init` to destroy and retry
+the exact cluster named by the given inventory, unattended, once, if it does
+not converge — the same class of advance authorization
+`CONFIRM_CLUSTER_DESTROY` grants for a single explicit destroy, just given up
+front instead of typed again mid-run. It is opt-in and defaults to `false`;
+without it, a failed `init` stops and leaves the cluster for the operator to
+inspect or destroy manually. `INSPACE_DEPLOY_INIT_RETRY_COOLDOWN_SECONDS`
+(default `300`, max `3600`) sets the delay between the destroy and the retry,
+giving the pool time to stop handing back the same just-freed address.
+
 `update` does not replace fixed VMs or rewrite bootstrap cloud-init, and it is
 the single command for both kinds of day-2 upgrade:
 

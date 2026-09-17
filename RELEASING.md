@@ -127,3 +127,30 @@ That cooldown is a harness-level mitigation, not a fix: a real fix
 needs bad-address detection and rejection in the production bootstrap
 reconciler itself, deserving its own design pass rather than a rushed
 change to its create-attempt fencing.
+
+The real `deploy/` lifecycle (not just the E2E harness) hit the same
+class of exposure: `deploy/playbooks/init-cluster.yml`'s control-plane
+cloud-init wait had no retry at all, and `deploy/container-entrypoint.sh`
+had no recovery path, so a bad bastion or control-plane address simply
+failed the whole `init` run for an operator standing up a real cluster.
+Both are now mitigated the same way as the E2E harness: the cloud-init
+wait retries (`retries: 2`, `delay: 10`), and an opt-in
+`INSPACE_DEPLOY_INIT_AUTO_RECOVER=true` lets `init` destroy and retry
+the named cluster once, after a cooldown
+(`INSPACE_DEPLOY_INIT_RETRY_COOLDOWN_SECONDS`, default 300s), if it does
+not converge — see [deploy/README.md](deploy/README.md). It defaults to
+`false` so existing fail-closed behavior is unchanged unless an operator
+opts in; it still requires deriving the same `confirm_cluster_name` the
+`destroy` playbook itself asserts against, so it can only ever destroy
+the exact cluster `init` was just asked to create.
+
+Both remain harness/operator-level mitigations, not a fix: a real fix
+needs bad-address detection and rejection in the production bootstrap
+reconciler itself (`modules/cloud-provider/pkg/bootstrap`), which has no
+`CreateFloatingIP` call to reject an address against and no signal today
+from SSH/cloud-init-level observation into the Go reconciler. That gap is
+real but is a large, correctness-sensitive addition to an already
+intricate idempotent create-attempt fencing state machine (intent/issued/
+rejected/materialized phases, CAS-based drift detection, ambiguous-PATCH
+replay protection) — it deserves its own design pass, live validation
+budget, and review, not a change folded into this release.
