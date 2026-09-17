@@ -189,6 +189,7 @@ type Result struct {
 	BastionVMUUID                  string        `json:"bastionVMUUID,omitempty"`
 	BastionPublicIPv4              string        `json:"bastionPublicIPv4,omitempty"`
 	BastionPrivateIPv4             string        `json:"bastionPrivateIPv4,omitempty"`
+	ControlPlanePublicIPv4         []string      `json:"controlPlanePublicIPv4,omitempty"`
 	BootstrapCacheEndpoint         string        `json:"bootstrapCacheEndpoint,omitempty"`
 	BootstrapCacheRegistry         string        `json:"bootstrapCacheRegistry,omitempty"`
 	BootstrapCacheAddress          string        `json:"bootstrapCacheAddress,omitempty"`
@@ -542,6 +543,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, cluster *v1alpha1.InSpaceClu
 		return baseResult(controlled, "waiting for control-plane firewall assignment readback"), nil
 	}
 
+	controlPlaneFIPs := make([]string, replicas)
 	for slot := 0; slot < replicas; slot++ {
 		vm := controlled[slot]
 		if err := validateOwnedVM(vm, desiredRequests[slot], network); err != nil {
@@ -557,7 +559,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, cluster *v1alpha1.InSpaceClu
 		if err := validateVMPrivateIPv4(vm, network.Subnet, cluster.Spec.Endpoint.VirtualIPv4, privatePool); err != nil {
 			return Result{}, err
 		}
-		_, ready, err := r.ensureOwnedAutoFloatingIP(ctx, cluster, resourceNames.ControlPlaneFIP[slot], vm, floatingByName[resourceNames.ControlPlaneFIP[slot]])
+		cpFIP, ready, err := r.ensureOwnedAutoFloatingIP(ctx, cluster, resourceNames.ControlPlaneFIP[slot], vm, floatingByName[resourceNames.ControlPlaneFIP[slot]])
 		if err != nil {
 			return Result{}, err
 		}
@@ -565,10 +567,14 @@ func (r *Reconciler) Reconcile(ctx context.Context, cluster *v1alpha1.InSpaceClu
 			result := baseResult(controlled, "waiting for control-plane auto floating IP assignments")
 			return result, nil
 		}
+		if cpFIP != nil {
+			controlPlaneFIPs[slot] = cpFIP.Address
+		}
 	}
 	result := baseResult(controlled, "infrastructure reconciled; RKE2 API health is not yet probed")
 	result.Ready = true
 	result.RequeueAfter = 0
+	result.ControlPlanePublicIPv4 = controlPlaneFIPs
 	return result, nil
 }
 

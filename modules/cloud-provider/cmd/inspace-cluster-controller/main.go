@@ -44,6 +44,19 @@ type controllerLoopOptions struct {
 	OutputFormat          string
 	StandardOutput        io.Writer
 	StandardError         io.Writer
+	// FloatingIPReachabilityTimeout bounds how long a Ready bastion or
+	// control-plane VM's auto-assigned public floating IPv4 may stay
+	// unreachable on port 22 before --until-ready destroys the cluster and
+	// retries once for a fresh address. Zero disables the check. InSpace has
+	// no API to reject or exclude a specific address on VM create, so this is
+	// a detect-and-retry mitigation, not a true fix; see RELEASING.md's
+	// known-issue entry.
+	FloatingIPReachabilityTimeout time.Duration
+	// floatingIPDialTimeout, dialTCP, and nowFunc are test seams; production
+	// leaves them zero/nil for a real 5s TCP dial and the real clock.
+	floatingIPDialTimeout time.Duration
+	dialTCP               func(ctx context.Context, address string, timeout time.Duration) error
+	nowFunc               func() time.Time
 }
 
 // The shared HTTP client permits a synchronous VM create to run for up to five
@@ -52,6 +65,168 @@ type controllerLoopOptions struct {
 // disconnects can still be adopted and protected without replaying the POST.
 const defaultIssuedVMCreateTimeout = 10 * time.Minute
 const defaultOperationTimeout = 30 * time.Minute
+
+// defaultFloatingIPReachabilityTimeout is deliberately patient: VMs commonly
+// take well over a minute to finish booting and start sshd, and this check
+// only exists to fail faster than the much longer Ansible cloud-init/SSH
+// wait budgets in test/e2e and deploy/, not to race them.
+const defaultFloatingIPReachabilityTimeout = 5 * time.Minute
+const defaultFloatingIPDialTimeout = 5 * time.Second
+
+// maxFloatingIPRecreateAttempts bounds how many times one --until-ready run
+// destroys and retries the cluster for a sustained-unreachable floating IP.
+// It mirrors the single extra attempt already used by the E2E harness and
+// deploy/'s own INSPACE_*_INIT_AUTO_RECOVER mitigations at the layers above
+// this one.
+const maxFloatingIPRecreateAttempts = 1
+
+// reachabilityDecision is floatingIPReachabilityGate.check's verdict for one
+// Ready result.
+type reachabilityDecision int
+
+const (
+	// reachabilityDone means the caller should treat the cluster as finished:
+	// every address is reachable, the check is disabled, or the recreate
+	// budget is already spent.
+	reachabilityDone reachabilityDecision = iota
+	// reachabilityWait means some address is unreachable but still within its
+	// grace window; the caller should keep polling Reconcile.
+	reachabilityWait
+	// reachabilityRecreate means some address has been unreachable past the
+	// configured timeout and a recreate attempt remains; the caller should
+	// destroy the cluster and retry a fresh Reconcile.
+	reachabilityRecreate
+)
+
+// floatingIPReachabilityGate tracks, across repeated Reconcile calls within
+// one --until-ready run, how long each currently assigned public floating
+// IPv4 has stayed unreachable on port 22. It has no persisted state: it lives
+// only for the lifetime of one runControllerLoop call, which is exactly the
+// one bounded bring-up this mitigation is scoped to.
+type floatingIPReachabilityGate struct {
+	unreachableSince map[string]time.Time
+	recreateAttempts int
+}
+
+func defaultDialTCP(ctx context.Context, address string, timeout time.Duration) error {
+	dialer := net.Dialer{Timeout: timeout}
+	conn, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(address, "22"))
+	if err != nil {
+		return err
+	}
+	return conn.Close()
+}
+
+// check probes every publicly addressed VM in a Ready result and decides
+// whether the caller should finish, keep polling, or destroy and retry. It
+// never returns reachabilityRecreate more than maxFloatingIPRecreateAttempts
+// times per gate instance.
+func (g *floatingIPReachabilityGate) check(ctx context.Context, options controllerLoopOptions, result bootstrap.Result, stderr io.Writer) reachabilityDecision {
+	if options.FloatingIPReachabilityTimeout <= 0 {
+		return reachabilityDone
+	}
+	addresses := make([]string, 0, 1+len(result.ControlPlanePublicIPv4))
+	if result.BastionPublicIPv4 != "" {
+		addresses = append(addresses, result.BastionPublicIPv4)
+	}
+	for _, address := range result.ControlPlanePublicIPv4 {
+		if address != "" {
+			addresses = append(addresses, address)
+		}
+	}
+	if g.unreachableSince == nil {
+		g.unreachableSince = make(map[string]time.Time)
+	}
+	// Addresses change across a destroy+recreate; drop tracking for any that
+	// are no longer part of this result so a fresh address starts its own
+	// bounded window instead of inheriting a stale timestamp.
+	for tracked := range g.unreachableSince {
+		if !slices.Contains(addresses, tracked) {
+			delete(g.unreachableSince, tracked)
+		}
+	}
+	dial := options.dialTCP
+	if dial == nil {
+		dial = defaultDialTCP
+	}
+	dialTimeout := options.floatingIPDialTimeout
+	if dialTimeout <= 0 {
+		dialTimeout = defaultFloatingIPDialTimeout
+	}
+	now := options.nowFunc
+	if now == nil {
+		now = time.Now
+	}
+	nowValue := now()
+	oldestAddress := ""
+	var oldestSince time.Time
+	for _, address := range addresses {
+		if dial(ctx, address, dialTimeout) == nil {
+			delete(g.unreachableSince, address)
+			continue
+		}
+		since, tracked := g.unreachableSince[address]
+		if !tracked {
+			since = nowValue
+			g.unreachableSince[address] = since
+		}
+		if oldestAddress == "" || since.Before(oldestSince) {
+			oldestAddress, oldestSince = address, since
+		}
+	}
+	if oldestAddress == "" {
+		return reachabilityDone
+	}
+	waited := nowValue.Sub(oldestSince)
+	if waited < options.FloatingIPReachabilityTimeout {
+		return reachabilityWait
+	}
+	if g.recreateAttempts >= maxFloatingIPRecreateAttempts {
+		fmt.Fprintf(
+			stderr,
+			"floating IP %s stayed unreachable on port 22 for %s but the recreate budget is exhausted; leaving the cluster for manual recovery\n",
+			oldestAddress, waited.Round(time.Second),
+		)
+		return reachabilityDone
+	}
+	fmt.Fprintf(
+		stderr,
+		"floating IP %s stayed unreachable on port 22 for %s; InSpace has no API to reject that address, so destroying and retrying once for a fresh one\n",
+		oldestAddress, waited.Round(time.Second),
+	)
+	g.recreateAttempts++
+	g.unreachableSince = nil
+	return reachabilityRecreate
+}
+
+// destroyUntilDone drives Destroy to completion, retrying transient errors on
+// the same interval as the reconcile loop. It is used to recover from a
+// sustained floating-IP reachability failure, not for the explicit --delete
+// CLI path, which reports its own progress through emitDestroyResult.
+func destroyUntilDone(ctx context.Context, reconciler infrastructureReconciler, cluster *v1alpha1.InSpaceCluster, options controllerLoopOptions) error {
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		result, err := reconciler.Destroy(ctx, cluster)
+		if err != nil {
+			if !isRetryable(err) {
+				return err
+			}
+			fmt.Fprintf(options.StandardError, "transient destroy error while recovering from a bad floating IP; retrying: %v\n", err)
+			if !waitFor(ctx, options.Interval) {
+				return ctx.Err()
+			}
+			continue
+		}
+		if result.Done {
+			return nil
+		}
+		if !waitFor(ctx, options.Interval) {
+			return ctx.Err()
+		}
+	}
+}
 
 var bootstrapCacheImageNames = []string{
 	"inspace-cloud-controller-manager",
@@ -122,6 +297,7 @@ func run() error {
 	var deleteOwned bool
 	var issuedVMCreateTimeout time.Duration
 	var operationTimeout time.Duration
+	var floatingIPReachabilityTimeout time.Duration
 	flag.StringVar(&configPath, "cluster-config", "", "path to an InSpaceCluster YAML file")
 	flag.BoolVar(&once, "once", false, "perform one reconciliation and exit")
 	flag.DurationVar(&interval, "interval", 20*time.Second, "minimum reconciliation interval")
@@ -138,6 +314,13 @@ func run() error {
 		"operation-timeout",
 		defaultOperationTimeout,
 		"overall deadline for --until-ready or multi-pass --delete",
+	)
+	flag.DurationVar(
+		&floatingIPReachabilityTimeout,
+		"floating-ip-reachability-timeout",
+		defaultFloatingIPReachabilityTimeout,
+		"in --until-ready mode, how long a Ready bastion/control-plane floating IPv4 may stay unreachable on port 22 "+
+			"before destroying and retrying once for a fresh address; 0 disables the check",
 	)
 	flag.StringVar(&output, "output", "text", "result output format: text or json")
 	flag.StringVar(&sshPublicKeyFile, "ssh-public-key-file", "", "path to one OpenSSH public key (never a private key)")
@@ -161,6 +344,9 @@ func run() error {
 	}
 	if operationTimeout <= 0 {
 		return errors.New("--operation-timeout must be positive")
+	}
+	if floatingIPReachabilityTimeout < 0 {
+		return errors.New("--floating-ip-reachability-timeout must not be negative")
 	}
 	if output != "text" && output != "json" {
 		return errors.New("--output must be text or json")
@@ -226,6 +412,7 @@ func run() error {
 		Once: once, UntilReady: untilReady, DeleteOwned: deleteOwned,
 		Interval: interval, IssuedVMCreateTimeout: issuedVMCreateTimeout, OperationTimeout: operationTimeout, OutputFormat: output,
 		StandardOutput: os.Stdout, StandardError: os.Stderr,
+		FloatingIPReachabilityTimeout: floatingIPReachabilityTimeout,
 	})
 }
 
@@ -234,6 +421,7 @@ func runControllerLoop(ctx context.Context, reconciler infrastructureReconciler,
 	operationTimeout := options.OperationTimeout
 	var lastOperationError error
 	var lastProgress string
+	reachability := &floatingIPReachabilityGate{}
 	boundedOperation := !options.Once && (options.UntilReady || options.DeleteOwned)
 	if boundedOperation {
 		if operationTimeout <= 0 {
@@ -355,7 +543,25 @@ func runControllerLoop(ctx context.Context, reconciler infrastructureReconciler,
 			return nil
 		}
 		if options.UntilReady && result.Ready {
-			return nil
+			switch reachability.check(loopCtx, options, result, options.StandardError) {
+			case reachabilityDone:
+				return nil
+			case reachabilityRecreate:
+				if destroyErr := destroyUntilDone(loopCtx, reconciler, cluster, options); destroyErr != nil {
+					if deadlineErr := operationDeadlineError(); deadlineErr != nil {
+						return deadlineErr
+					}
+					return fmt.Errorf("destroying cluster after a sustained floating-IP reachability failure: %w", destroyErr)
+				}
+				if deadlineErr := operationDeadlineError(); deadlineErr != nil {
+					return deadlineErr
+				}
+				continue
+			case reachabilityWait:
+				// Fall through to the normal interval wait below and poll
+				// Reconcile again; Ready's RequeueAfter is always 0, so
+				// options.Interval alone paces the re-check.
+			}
 		}
 		wait := result.RequeueAfter
 		if wait < options.Interval {
