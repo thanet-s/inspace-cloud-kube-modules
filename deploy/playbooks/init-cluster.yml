@@ -423,7 +423,11 @@
       loop_control:
         index_var: deploy_cp_index
         label: "{{ item.name }}"
+      register: deploy_control_plane_cloud_init
       changed_when: false
+      retries: 2
+      delay: 10
+      until: deploy_control_plane_cloud_init.rc == 0
 
     - name: Read the administrator kubeconfig from cp0
       ansible.builtin.command:
