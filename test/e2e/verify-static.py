@@ -2001,7 +2001,7 @@ def main() -> None:
     require("\n      ansible.builtin.command:" in private_ssh_probe,
             "private control-plane SSH probe must be a command task")
     require_unrestricted_parallel_task(private_ssh_probe)
-    require_yaml_key(private_ssh_probe, 6, "retries", "120")
+    require_yaml_key(private_ssh_probe, 6, "retries", "60")
     require_yaml_key(private_ssh_probe, 6, "delay", "5")
     require_yaml_key(private_ssh_probe, 6, "until", "e2e_private_ssh_probe.rc == 0")
     host_key_wait = named_yaml_sequence_item(
@@ -2021,7 +2021,7 @@ def main() -> None:
             "control-plane authenticated SSH wait must use wait_for_connection")
     require_yaml_key(connection_wait, 8, "connect_timeout", "10")
     require_yaml_key(connection_wait, 8, "sleep", "5")
-    require_yaml_key(connection_wait, 8, "timeout", "1200")
+    require_yaml_key(connection_wait, 8, "timeout", "300")
     cloud_init_wait = named_yaml_sequence_item(
         control_plane_wait_play, "Wait for cloud-init completion on every control plane in parallel", 4
     )
