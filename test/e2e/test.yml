@@ -1921,8 +1921,12 @@
                 kubectl -n default get events --sort-by=.lastTimestamp | tail -n 40
               args:
                 executable: /bin/bash
+              register: e2e_public_local_diagnostics
               changed_when: false
               failed_when: false
+            - name: Print public-node-local pod diagnostics
+              ansible.builtin.debug:
+                var: e2e_public_local_diagnostics.stdout_lines
             - name: Re-raise the original public-node-local authorization failure
               ansible.builtin.fail:
                 msg: "{{ e2e_public_local_authorized.msg | default('CCM failed to authorize the edge Node / schedule its local Pod within the retry budget') }}"
