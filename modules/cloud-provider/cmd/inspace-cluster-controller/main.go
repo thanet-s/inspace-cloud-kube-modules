@@ -6,6 +6,8 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -13,6 +15,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/url"
 	"os"
 	"os/signal"
 	"slices"
@@ -656,7 +659,36 @@ func isRetryable(err error) bool {
 		return apiErr.Retryable
 	}
 	var networkErr net.Error
-	return errors.As(err, &networkErr) && (networkErr.Timeout() || networkErr.Temporary())
+	if errors.As(err, &networkErr) && (networkErr.Timeout() || networkErr.Temporary()) {
+		return true
+	}
+	return isTransientReadTransportFailure(err)
+}
+
+// isTransientReadTransportFailure recognizes an http.Client.Do failure of an
+// idempotent GET (net/http reports every such failure as a *url.Error whose Op
+// is the request method). EOF, reset or refused connections, DNS lookups, and
+// TLS handshake failures never reach the API, and re-reading is always safe.
+// Mutation transport failures stay permanent here: their possible commit is
+// only retried through the reconciler's durable ambiguity sentinels above.
+// Certificate verification failures and caller cancellation are not transient.
+func isTransientReadTransportFailure(err error) bool {
+	var transportErr *url.Error
+	if !errors.As(err, &transportErr) || transportErr.Op != "Get" {
+		return false
+	}
+	if errors.Is(transportErr.Err, context.Canceled) {
+		return false
+	}
+	var verificationErr *tls.CertificateVerificationError
+	var unknownAuthorityErr x509.UnknownAuthorityError
+	var hostnameErr x509.HostnameError
+	var invalidCertificateErr x509.CertificateInvalidError
+	if errors.As(transportErr.Err, &verificationErr) || errors.As(transportErr.Err, &unknownAuthorityErr) ||
+		errors.As(transportErr.Err, &hostnameErr) || errors.As(transportErr.Err, &invalidCertificateErr) {
+		return false
+	}
+	return true
 }
 
 func waitFor(ctx context.Context, duration time.Duration) bool {

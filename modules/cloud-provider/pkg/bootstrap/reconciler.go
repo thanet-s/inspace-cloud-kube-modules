@@ -36,6 +36,15 @@ const (
 	defaultCreatedVMRecoveryTimeout          = 15 * time.Second
 	defaultCreatedVMFloatingIPCleanupTimeout = 10 * time.Second
 	defaultCreatedVMDeleteTimeout            = 10 * time.Second
+	// A malformed create is rolled back seconds after its POST, often before
+	// the auto-assigned public IPv4 is listed. The initiating call polls this
+	// long for that address before leaving the rollback durably pending.
+	defaultRollbackFloatingIPDiscoveryWait     = 30 * time.Second
+	defaultRollbackFloatingIPDiscoveryInterval = 2 * time.Second
+	// Destroy waits this long, per process, for an owned VM's auto floating
+	// IP to become visible before deleting the VM without it. Deleting first
+	// releases the address nameless and unassigned, beyond ownership proof.
+	defaultDestroyFloatingIPObservationWait = 10 * time.Minute
 )
 
 var (
@@ -164,6 +173,15 @@ type Reconciler struct {
 	createdVMDeleteTimeout               time.Duration
 	vmAbsenceObservationMinInterval      time.Duration
 	firewallAssignmentProtectionDeadline time.Duration
+
+	rollbackFloatingIPDiscoveryWait     time.Duration
+	rollbackFloatingIPDiscoveryInterval time.Duration
+	destroyFloatingIPObservationWait    time.Duration
+	// unobservedFloatingIPSince records, per VM UUID, when Destroy first saw
+	// an owned VM whose auto floating IP was not visible. It is deliberately
+	// in-memory: a restart only lengthens the bounded wait.
+	unobservedFloatingIPMu    sync.Mutex
+	unobservedFloatingIPSince map[string]time.Time
 }
 
 type privateIPv4Range struct {
@@ -311,6 +329,9 @@ func (r *Reconciler) Reconcile(ctx context.Context, cluster *v1alpha1.InSpaceClu
 		result.Owner = owner
 		return result, nil
 	}
+	if err := rejectForeignOwnedBootstrapNames(byName, owner, cluster); err != nil {
+		return Result{}, err
+	}
 	floatingIPSnapshot, err := r.API.ListFloatingIPs(ctx, cluster.Spec.Location, nil)
 	if err != nil {
 		return Result{}, err
@@ -344,7 +365,12 @@ func (r *Reconciler) Reconcile(ctx context.Context, cluster *v1alpha1.InSpaceClu
 	if err := validateManagedBastionFirewall(bastionFirewall, cluster, network.Subnet, owner, resourceNames.BastionFirewall, r.ManagementCIDR); err != nil {
 		return Result{}, err
 	}
-	if err := validateOwnedFirewallAssignments(nodeFirewall, controlPlaneUUIDSet(byName, currentControlPlaneNames(cluster.Metadata.Name), replicas)); err != nil {
+	nodeAllowed, err := r.nodeFirewallAllowedAssignments(ctx, cluster, nodeFirewall, vms,
+		controlPlaneUUIDSet(byName, currentControlPlaneNames(cluster.Metadata.Name), replicas))
+	if err != nil {
+		return Result{}, err
+	}
+	if err := validateOwnedFirewallAssignments(nodeFirewall, nodeAllowed); err != nil {
 		return Result{}, fmt.Errorf("bootstrap: node firewall assignment drift: %w", err)
 	}
 	if err := validateOwnedFirewallAssignments(bastionFirewall, bastionUUIDSet(byName, bastionVMName)); err != nil {
@@ -670,11 +696,13 @@ func (r *Reconciler) Destroy(ctx context.Context, cluster *v1alpha1.InSpaceClust
 	floatingNames := []string{bastionIPName}
 	floatingDeleteKeys := map[string]string{bastionIPName: destroyFIPBastionKey}
 	floatingVMByName := map[string]*inspace.VM{bastionIPName: ownedVMs[bastionVMName]}
+	floatingNameByVMName := map[string]string{bastionVMName: bastionIPName}
 	for slot := 0; slot < replicas; slot++ {
 		name := resourceNames.ControlPlaneFIP[slot]
 		floatingNames = append(floatingNames, name)
 		floatingDeleteKeys[name] = destroyFIPControlPlaneKey(slot)
 		floatingVMByName[name] = ownedVMs[controlPlaneNames[slot]]
+		floatingNameByVMName[controlPlaneNames[slot]] = name
 	}
 	for _, name := range floatingNames {
 		item := floatingByName[name]
@@ -852,6 +880,26 @@ func (r *Reconciler) Destroy(ctx context.Context, cluster *v1alpha1.InSpaceClust
 		}
 		if deletion, exists := durableDeletions[deleteKey]; exists && deletion.Phase == deletePhaseAbsent {
 			return result, fmt.Errorf("bootstrap: VM %q reappeared after durable authoritative absence", name)
+		}
+		if _, exists := durableDeletions[deleteKey]; !exists {
+			// Every bootstrap VM owns an auto-assigned public IPv4 that is found
+			// by name or by assignment to the live VM. When neither is visible
+			// yet (for example a VM destroyed inside Reconcile's "waiting for
+			// auto floating IP assignment" window), deleting the VM would release
+			// the address nameless and unassigned, beyond any later ownership
+			// proof. Only a durable removal receipt for this slot proves the
+			// address was handled; otherwise wait a bounded time for it.
+			floatingName := floatingNameByVMName[name]
+			if _, handled := r.deleteAttempt(cluster, floatingDeleteKeys[floatingName]); !handled {
+				waited, bound, pending := r.destroyFloatingIPObservationPending(vm.UUID, time.Now())
+				if pending {
+					result.Message = fmt.Sprintf(
+						"waiting up to %s for auto floating IP %q of VM %q to become visible before deleting the VM (waited %s)",
+						bound, floatingName, name, waited.Round(time.Second),
+					)
+					return result, nil
+				}
+			}
 		}
 		if err := r.ensureVMDeleteAttempt(ctx, cluster, deleteKey, deletePurposeDestroy, vm, firewallUUID, ""); err != nil {
 			return result, err
@@ -1117,6 +1165,28 @@ func (r *Reconciler) canonicalOwnedVMDetails(ctx context.Context, location strin
 	return details, "", nil
 }
 
+// destroyFloatingIPObservationPending reports whether Destroy must keep
+// waiting for the auto floating IP of the exact VM UUID to become visible.
+// The wait starts at the first call for that UUID in this process and ends
+// after the configured bound, when the address is treated as externally
+// released so an operator-removed IP cannot wedge teardown forever.
+func (r *Reconciler) destroyFloatingIPObservationPending(vmUUID string, now time.Time) (time.Duration, time.Duration, bool) {
+	bound := configuredDuration(r.destroyFloatingIPObservationWait, defaultDestroyFloatingIPObservationWait)
+	key := strings.ToLower(vmUUID)
+	r.unobservedFloatingIPMu.Lock()
+	defer r.unobservedFloatingIPMu.Unlock()
+	if r.unobservedFloatingIPSince == nil {
+		r.unobservedFloatingIPSince = make(map[string]time.Time)
+	}
+	since, tracked := r.unobservedFloatingIPSince[key]
+	if !tracked {
+		since = now
+		r.unobservedFloatingIPSince[key] = since
+	}
+	waited := now.Sub(since)
+	return waited, bound, waited < bound
+}
+
 func configuredDuration(value, fallback time.Duration) time.Duration {
 	if value > 0 {
 		return value
@@ -1204,6 +1274,15 @@ func (r *Reconciler) rollbackMalformedCreatedVM(ctx context.Context, cluster *v1
 		return errors.Join(responseErr, err)
 	}
 	done, rollbackErr := r.reconcileRollbackDelete(rollbackCtx, cluster, deleteKey)
+	// The VM is never deleted before its auto floating IP is identified. A
+	// just-created VM's address is usually listed within seconds, so keep this
+	// call bounded but patient before leaving the rollback durably pending.
+	discoveryDeadline := time.Now().Add(configuredDuration(r.rollbackFloatingIPDiscoveryWait, defaultRollbackFloatingIPDiscoveryWait))
+	for !done && r.rollbackAwaitsFloatingIPIdentity(cluster, deleteKey) && time.Now().Before(discoveryDeadline) {
+		timer := time.NewTimer(configuredDuration(r.rollbackFloatingIPDiscoveryInterval, defaultRollbackFloatingIPDiscoveryInterval))
+		<-timer.C
+		done, rollbackErr = r.reconcileRollbackDelete(rollbackCtx, cluster, deleteKey)
+	}
 	// Containment of a newly created but unprotected public VM is the one path
 	// that deliberately waits for the second observation in the initiating
 	// call. Each observation still performs independent exact-detail, location
@@ -1228,6 +1307,11 @@ func (r *Reconciler) rollbackMalformedCreatedVM(ctx context.Context, cluster *v1
 		rollbackErr = fmt.Errorf("%w: malformed VM %s rollback is durably pending", ErrCreateAttemptPending, vm.UUID)
 	}
 	return errors.Join(responseErr, rollbackErr)
+}
+
+func (r *Reconciler) rollbackAwaitsFloatingIPIdentity(cluster *v1alpha1.InSpaceCluster, deleteKey string) bool {
+	attempt, exists := r.deleteAttempt(cluster, deleteKey)
+	return exists && attempt.Purpose == deletePurposeRollback && attempt.Phase == deletePhaseRollbackFIPDiscovery
 }
 
 func (r *Reconciler) ensureManagedVMCreate(
@@ -1618,7 +1702,12 @@ func (r *Reconciler) readVMCreateDispatchAuthority(
 	}
 	ownedVMs = canonicalOwnedVMs
 	controlPlaneNames := currentControlPlaneNames(clusterName)
-	if err := validateOwnedFirewallAssignments(nodeFirewall, controlPlaneUUIDSet(ownedVMs, controlPlaneNames, replicas)); err != nil {
+	nodeAllowed, err := r.nodeFirewallAllowedAssignments(ctx, cluster, nodeFirewall, listedVMs,
+		controlPlaneUUIDSet(ownedVMs, controlPlaneNames, replicas))
+	if err != nil {
+		return nil, false, err
+	}
+	if err := validateOwnedFirewallAssignments(nodeFirewall, nodeAllowed); err != nil {
 		return nil, false, fmt.Errorf("bootstrap: node firewall assignment drift before VM create: %w", err)
 	}
 	if err := validateOwnedFirewallAssignments(bastionFirewall, bastionUUIDSet(ownedVMs, currentBastionName(clusterName))); err != nil {
@@ -4076,6 +4165,53 @@ func selectDestroyBootstrapResourceNames(floatingIPs []inspace.FloatingIP, firew
 		return legacy, nil
 	}
 	return current, nil
+}
+
+// rejectForeignOwnedBootstrapNames fails fast, before any mutation, when a
+// deterministic bootstrap VM name is held by a VM whose ownership record names
+// another owner. VM and floating-IP names derive from metadata.name only, so
+// two InSpaceClusters with the same name in different namespaces collide.
+// Existing names are kept for compatibility; the collision is reported as a
+// permanent, explicit error instead of a create that can never converge.
+func rejectForeignOwnedBootstrapNames(byName map[string]*inspace.VM, owner string, cluster *v1alpha1.InSpaceCluster) error {
+	names := make([]string, 0, len(byName))
+	for name := range byName {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		vm := byName[name]
+		if vm == nil {
+			continue
+		}
+		recordOwner, ok := bootstrapOwnershipRecordOwner(vm.Description)
+		if !ok || recordOwner == owner {
+			continue
+		}
+		return fmt.Errorf(
+			"bootstrap: VM %q is owned by a different InSpaceCluster (owner %s, this cluster %s/%s is owner %s); "+
+				"bootstrap VM names are not namespaced, so two clusters named %q cannot share location %s",
+			name, recordOwner, cluster.Metadata.Namespace, cluster.Metadata.Name, owner, cluster.Metadata.Name, cluster.Spec.Location,
+		)
+	}
+	return nil
+}
+
+// bootstrapOwnershipRecordOwner returns the owner key of a bastion or
+// control-plane ownership record ("inspace-rke2-<role>/vN owner=<16 hex> ...").
+func bootstrapOwnershipRecordOwner(description string) (string, bool) {
+	fields := strings.Fields(description)
+	if len(fields) < 2 || (!strings.HasPrefix(fields[0], "inspace-rke2-bastion/") && !strings.HasPrefix(fields[0], "inspace-rke2-cp/")) {
+		return "", false
+	}
+	value, found := strings.CutPrefix(fields[1], "owner=")
+	if !found || len(value) != 16 {
+		return "", false
+	}
+	if _, err := hex.DecodeString(value); err != nil || strings.ToLower(value) != value {
+		return "", false
+	}
+	return value, true
 }
 
 func uniqueOwnedVMs(vms []inspace.VM, owner, clusterName string, replicas int) (map[string]*inspace.VM, error) {
