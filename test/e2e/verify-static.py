@@ -2970,6 +2970,19 @@ def main() -> None:
     require("cilium.io/IPsUsed" in cleanup and
             "Wait for private Cilium L2 leases and LB IPAM allocations to quiesce" in cleanup,
             "cleanup must release both private VIPs before Karpenter teardown")
+    # Cilium never deletes an L2 announcement Lease, and its release update can
+    # fail with "context canceled" when the Service is deleted, leaving a
+    # stale holder forever. Cleanup must accept an absent, unheld, or expired
+    # Lease instead of requiring the object to disappear.
+    private_lease_quiesce = named_yaml_sequence_item(
+        cleanup, "Wait for private Cilium L2 leases and LB IPAM allocations to quiesce", 4
+    )
+    require('get lease "$lease" --ignore-not-found -o json' in private_lease_quiesce and
+            '(.spec.holderIdentity // "") == ""' in private_lease_quiesce and
+            ".spec.leaseDurationSeconds" in private_lease_quiesce and
+            "fromdateiso8601" in private_lease_quiesce and
+            '-o name)"' not in private_lease_quiesce,
+            "cleanup must treat an unheld or expired private L2 Lease as released")
 
     require("private Cilium L2 Service unexpectedly owns an InSpace NLB" in service_cloud and
             "private Cilium L2 Service unexpectedly owns an InSpace FIP" in service_cloud and
