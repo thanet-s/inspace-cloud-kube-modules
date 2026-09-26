@@ -71,10 +71,11 @@ func (c *nodeLoadBalancerController) sync(ctx context.Context, key string) error
 
 	defaults := nodeLoadBalancerDefaults{NodesPerShard: c.provider.config.NodeLoadBalancer.NodesPerShard}
 	if _, err := parseNodeLoadBalancerService(service, defaults); err != nil {
+		eventErr := c.recordNodeLoadBalancerReservedPortEvent(ctx, service, err)
 		if containsString(service.Finalizers, nodeLoadBalancerFinalizer) {
-			return errors.Join(err, c.quarantineAggregateService(ctx, service))
+			return errors.Join(err, eventErr, c.quarantineAggregateService(ctx, service))
 		}
-		return err
+		return errors.Join(err, eventErr)
 	}
 	if shardName, ownershipErr := c.validateEstablishedAggregateShardAnchor(ctx, service); ownershipErr != nil {
 		return c.failAggregateShardClosed(ctx, shardName, ownershipErr)
