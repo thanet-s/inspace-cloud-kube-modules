@@ -580,6 +580,62 @@ func TestNodeLoadBalancerFirewallRelationTransientRemovalOmissionNeverReissues(t
 	}
 }
 
+func TestNodeLoadBalancerFirewallRelationUncommittedUnassignIsResentAfterRetireInterval(t *testing.T) {
+	ctx := context.Background()
+	service := nodeLoadBalancerTestService("relation-resend", "relation-resend-uid", corev1.ProtocolTCP, 443)
+	api := &transientlyOmittedUnassignAPI{fakeAPI: &fakeAPI{
+		vms: []inspace.VM{{UUID: testFirewallRelationVMUUID, BillingAccountID: 42, NetworkUUID: testNetworkUUID}},
+		firewalls: []inspace.Firewall{{
+			UUID: testFirewallRelationFirewallUUID,
+			ResourcesAssigned: []inspace.FirewallResource{{
+				ResourceType: "vm", ResourceUUID: testFirewallRelationVMUUID,
+			}},
+		}},
+	}}
+	api.listCalls = 2 // disable the transient omission; every read shows the relation
+	provider := newTestProvider(t, api)
+	provider.kubeClient = kubefake.NewSimpleClientset(service.DeepCopy())
+	now := time.Date(2026, 7, 17, 2, 0, 0, 0, time.UTC)
+	controller := &nodeLoadBalancerController{
+		provider: provider, firewallRelationNow: func() time.Time { return now },
+		firewallRelationAbsentDelay: nodeLoadBalancerAbsenceConfirmationDelay,
+	}
+	owner := withoutFirewallRelationCloudAuthorityForFenceTest(controller.serviceFirewallRelationOwner(service))
+	desired := &nodeLoadBalancerFirewallRelationFence{
+		operation:    nodeLoadBalancerFirewallRelationUnassign,
+		firewallUUID: testFirewallRelationFirewallUUID,
+		vmUUID:       testFirewallRelationVMUUID,
+	}
+	if converged, err := controller.reconcileNodeLoadBalancerFirewallRelation(ctx, owner, desired); err == nil || converged {
+		t.Fatalf("uncommitted unassign did not remain fenced: converged=%t err=%v", converged, err)
+	}
+	// Within the in-flight window the receipt still blocks duplicate dispatch.
+	now = now.Add(nodeLoadBalancerAbsenceConfirmationDelay + time.Second)
+	if converged, err := controller.reconcileNodeLoadBalancerFirewallRelation(ctx, owner, desired); err == nil || converged {
+		t.Fatalf("early retry crossed the fence: converged=%t err=%v", converged, err)
+	}
+	if api.unassignCalls != 1 {
+		t.Fatalf("early retry re-sent unassign: calls=%d", api.unassignCalls)
+	}
+	// After the retire interval, an unchanged fresh readback proves the request
+	// did not commit: the stale receipt is retired, then the relation re-issued.
+	now = now.Add(nodeLoadBalancerFirewallRelationRetireDelay)
+	if converged, err := controller.reconcileNodeLoadBalancerFirewallRelation(ctx, owner, nil); err != nil || converged {
+		t.Fatalf("stale receipt retirement = converged=%t err=%v", converged, err)
+	}
+	stored := getNodeLoadBalancerTestService(t, ctx, provider, service.Namespace, service.Name)
+	if stored.Annotations[annotationNodeLoadBalancerFirewallRelationIssued] != "" ||
+		stored.Annotations[annotationNodeLoadBalancerFirewallRelationOwnerUID] != "" {
+		t.Fatalf("stale relation receipt was not retired: %#v", stored.Annotations)
+	}
+	if _, err := controller.reconcileNodeLoadBalancerFirewallRelation(ctx, owner, desired); err == nil {
+		t.Fatal("re-sent ambiguous unassign returned nil")
+	}
+	if api.unassignCalls != 2 {
+		t.Fatalf("uncommitted unassign was not re-sent: calls=%d", api.unassignCalls)
+	}
+}
+
 func TestNodeLoadBalancerFirewallDetachRequiresSpacedExactDeletedVMProof(t *testing.T) {
 	ctx := context.Background()
 	api := &fakeAPI{firewalls: []inspace.Firewall{{
