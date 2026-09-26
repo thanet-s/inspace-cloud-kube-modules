@@ -28,7 +28,10 @@ case "$ubuntu_codename" in
 esac
 sed "s/@UBUNTU_CODENAME@/$ubuntu_codename/g" /var/lib/inspace/ubuntu.sources >/etc/apt/sources.list.d/ubuntu.sources
 chmod 0644 /etc/apt/sources.list.d/ubuntu.sources
-! grep -Fq '@UBUNTU_CODENAME@' /etc/apt/sources.list.d/ubuntu.sources
+if grep -Fq '@UBUNTU_CODENAME@' /etc/apt/sources.list.d/ubuntu.sources; then
+  echo "installed Ubuntu sources still contain a release placeholder" >&2
+  exit 1
+fi
 `
 }
 
@@ -49,6 +52,9 @@ fi
 if [ -f /etc/adduser.conf ]; then
   sed -Ei 's|^#?[[:space:]]*DSHELL=.*|DSHELL=/bin/bash|' /etc/adduser.conf
 fi
-! awk -F: '($3 == 0 || ($3 >= 1000 && $3 < 65534)) && $7 ~ /^(\/usr)?\/bin\/(sh|dash)$/' /etc/passwd | grep -q .
+if awk -F: '($3 == 0 || ($3 >= 1000 && $3 < 65534)) && $7 ~ /^(\/usr)?\/bin\/(sh|dash)$/' /etc/passwd | grep -q .; then
+  echo "a login account still uses /bin/sh or dash" >&2
+  exit 1
+fi
 `
 }

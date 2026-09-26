@@ -2949,8 +2949,12 @@ func (a *Adapter) DeleteVM(ctx context.Context, location, uuid, clusterName, nod
 		}
 	}
 	// Before detaching any firewall, require the core indexes and every active
-	// FIP assignment to agree that the exact VM UUID is gone.
-	if absenceErr := a.waitForAuthorizedVMAbsence(ctx, location, effectiveNetworkUUID, uuid, "after dependent cleanup", tombstoneVerifier); absenceErr != nil {
+	// FIP assignment to agree that the exact VM UUID is gone. Core absence was
+	// already proven with spaced reads and persisted above, the exact FIP was
+	// proven absent with its own spaced reads, and a firewall DELETE re-proves
+	// core absence with spaced reads immediately before dispatch. One complete
+	// corroborated read therefore suffices here instead of a second full proof.
+	if absenceErr := a.confirmAuthorizedVMAbsence(ctx, location, effectiveNetworkUUID, uuid, "after dependent cleanup", tombstoneVerifier); absenceErr != nil {
 		return absenceErr
 	}
 	if err := a.detachFirewallAfterVMDeletion(ctx, location, effectiveNetworkUUID, baseFirewallUUID, uuid, expectedBillingAccountID, deleteBaseFirewallDetachmentAuthority(identity), tombstoneVerifier); err != nil {
@@ -3318,11 +3322,11 @@ func validateDurableDeleteLookupIdentity(identity cloudapi.DeleteVMIdentity, exp
 // Without exact deletion authority, an HTTP-200 Deleted tombstone remains
 // visible and fail closed.
 func (a *Adapter) waitForVMAbsence(ctx context.Context, location, networkUUID, uuid, phase string) error {
-	return a.waitForVMAbsenceWithDependents(ctx, location, networkUUID, uuid, phase, true, nil)
+	return a.waitForVMAbsenceWithDependents(ctx, location, networkUUID, uuid, phase, true, nil, destructiveAbsenceConfirmations)
 }
 
 func (a *Adapter) waitForVMCoreAbsence(ctx context.Context, location, networkUUID, uuid, phase string) error {
-	return a.waitForVMAbsenceWithDependents(ctx, location, networkUUID, uuid, phase, false, nil)
+	return a.waitForVMAbsenceWithDependents(ctx, location, networkUUID, uuid, phase, false, nil, destructiveAbsenceConfirmations)
 }
 
 func (a *Adapter) waitForAuthorizedVMAbsence(
@@ -3330,7 +3334,7 @@ func (a *Adapter) waitForAuthorizedVMAbsence(
 	location, networkUUID, uuid, phase string,
 	verifier *deletedVMTombstoneVerifier,
 ) error {
-	return a.waitForVMAbsenceWithDependents(ctx, location, networkUUID, uuid, phase, true, verifier)
+	return a.waitForVMAbsenceWithDependents(ctx, location, networkUUID, uuid, phase, true, verifier, destructiveAbsenceConfirmations)
 }
 
 func (a *Adapter) waitForAuthorizedVMCoreAbsence(
@@ -3338,20 +3342,34 @@ func (a *Adapter) waitForAuthorizedVMCoreAbsence(
 	location, networkUUID, uuid, phase string,
 	verifier *deletedVMTombstoneVerifier,
 ) error {
-	return a.waitForVMAbsenceWithDependents(ctx, location, networkUUID, uuid, phase, false, verifier)
+	return a.waitForVMAbsenceWithDependents(ctx, location, networkUUID, uuid, phase, false, verifier, destructiveAbsenceConfirmations)
+}
+
+// confirmAuthorizedVMAbsence re-checks, with one complete corroborated read,
+// that a VM whose core absence was already proven with spaced reads is still
+// absent and that no active floating IP remains assigned to it. It is only
+// for a caller that already holds that spaced proof: any contrary observation
+// still waits, bounded, for convergence exactly like the full proof.
+func (a *Adapter) confirmAuthorizedVMAbsence(
+	ctx context.Context,
+	location, networkUUID, uuid, phase string,
+	verifier *deletedVMTombstoneVerifier,
+) error {
+	return a.waitForVMAbsenceWithDependents(ctx, location, networkUUID, uuid, phase, true, verifier, 1)
 }
 
 // waitForVMAbsenceWithDependents never turns a DELETE response alone into
-// state. It requires three spaced exact-GET negatives, each corroborated by a
-// valid location-wide VM list and configured VPC without the UUID. A canonical
-// HTTP-200 Deleted tombstone is one exact-GET negative only when the caller
-// supplies full immutable deletion authority; generic callers retain the old
-// fail-closed behavior.
+// state. It requires spaced exact-GET negatives (three for every fresh proof),
+// each corroborated by a valid location-wide VM list and configured VPC
+// without the UUID. A canonical HTTP-200 Deleted tombstone is one exact-GET
+// negative only when the caller supplies full immutable deletion authority;
+// generic callers retain the old fail-closed behavior.
 func (a *Adapter) waitForVMAbsenceWithDependents(
 	ctx context.Context,
 	location, networkUUID, uuid, phase string,
 	includeFloatingIP bool,
 	verifier *deletedVMTombstoneVerifier,
+	requiredConfirmations int,
 ) error {
 	readbackCtx, cancel := context.WithTimeout(ctx, a.destructiveAbsenceTimeout)
 	defer cancel()
@@ -3450,8 +3468,8 @@ func (a *Adapter) waitForVMAbsenceWithDependents(
 						}
 					}
 					absenceConfirmations++
-					lastObservation = fmt.Errorf("VM %s absence confirmation %d of %d %s", uuid, absenceConfirmations, destructiveAbsenceConfirmations, phase)
-					if absenceConfirmations == destructiveAbsenceConfirmations {
+					lastObservation = fmt.Errorf("VM %s absence confirmation %d of %d %s", uuid, absenceConfirmations, requiredConfirmations, phase)
+					if absenceConfirmations >= requiredConfirmations {
 						return nil
 					}
 				}
@@ -3632,7 +3650,12 @@ func (a *Adapter) deleteCanonicalVM(ctx context.Context, location, uuid string, 
 		return cloudapi.RemovalMutationAuthorization{}, fmt.Errorf("%w: %w", errRemovalFenceInvalid, err)
 	}
 	if !authorization.AllowMutation {
-		return authorization, fmt.Errorf("%w: VM %s DELETE already has an issued durable receipt", cloudapi.ErrCreateAttemptPending, uuid)
+		issuedErr := fmt.Errorf("%w: VM %s DELETE already has an issued durable receipt", cloudapi.ErrCreateAttemptPending, uuid)
+		if !authorization.Active || authorization.Fence.Phase != cloudapi.RemovalMutationIssued || authorization.Fence.RemovalMutation != mutation ||
+			!authority.complete() || proveMutationTarget == nil {
+			return authorization, issuedErr
+		}
+		return authorization, a.resendIssuedVMDelete(ctx, location, uuid, proveMutationTarget, issuedErr)
 	}
 	if proveMutationTarget == nil {
 		if !a.allowUnfencedTestMutations {
@@ -3668,6 +3691,45 @@ func (a *Adapter) deleteCanonicalVM(ctx context.Context, location, uuid string, 
 		return authorization, fmt.Errorf("%w: VM %s DELETE was locally blocked before dispatch: %w", errVMDeleteUndispatched, uuid, errors.Join(deleteErr, rejectErr))
 	}
 	return authorization, deleteErr
+}
+
+// resendIssuedVMDelete recovers an issued VM DELETE whose earlier dispatch
+// returned without committing (HTTP 5xx/429 or a client timeout); otherwise
+// the VM would stay billed and its NodeClaim finalizer would never clear.
+// DELETE of one exact VM UUID is idempotent, so re-sending it cannot harm
+// anything while that exact owned VM is still present. The earlier request may
+// still be applying, so the fresh ownership-verifying mutation-target proof
+// must hold across spaced canonical reads first. Any failed or absent read
+// stays read-only and leaves the caller's absence proof to decide. The receipt
+// is never rejected here: an earlier dispatch of it may still commit.
+func (a *Adapter) resendIssuedVMDelete(
+	ctx context.Context,
+	location, uuid string,
+	proveMutationTarget func(context.Context) error,
+	issuedErr error,
+) error {
+	for confirmation := 1; confirmation <= destructiveAbsenceConfirmations; confirmation++ {
+		if confirmation > 1 {
+			if err := waitForReadback(ctx, a.destructiveAbsenceReadInterval); err != nil {
+				return errors.Join(issuedErr, fmt.Errorf("proving issued VM %s DELETE did not commit: %w", uuid, err))
+			}
+		}
+		if err := proveMutationTarget(ctx); err != nil {
+			return errors.Join(issuedErr, fmt.Errorf("issued VM %s DELETE presence proof %d of %d: %w",
+				uuid, confirmation, destructiveAbsenceConfirmations, err))
+		}
+	}
+	if volumeErr := a.proveVMDeleteVolumeSafety(ctx, location, uuid); volumeErr != nil {
+		return errors.Join(errVMDeleteUndispatched, issuedErr,
+			fmt.Errorf("fresh attached-volume guard blocked re-sending VM %s DELETE: %w", uuid, volumeErr))
+	}
+	requestCtx, cancel := context.WithTimeout(ctx, a.networkAttachmentRequestTimeout)
+	defer cancel()
+	deleteErr := a.api.DeleteVM(requestCtx, location, uuid)
+	if errors.Is(deleteErr, sdk.ErrMutationBlocked) {
+		return fmt.Errorf("%w: re-sent VM %s DELETE was locally blocked before dispatch: %w", errVMDeleteUndispatched, uuid, deleteErr)
+	}
+	return deleteErr
 }
 
 func (a *Adapter) authorizeRemovalMutation(
@@ -6037,11 +6099,13 @@ func (a *Adapter) detachExactFirewallRelationAfterVMDeletion(
 	authority baseFirewallDetachmentAuthority,
 	tombstoneVerifier *deletedVMTombstoneVerifier,
 ) error {
-	// POST and DELETE mutate the same firewall relationship collection. Hold the
-	// same per-firewall gate from the fresh pre-delete read until three exact
-	// absence reads, so scale-up and scale-down cannot overlap on that endpoint.
-	release := a.acquireFirewallAssignmentGate(location, firewallUUID)
-	defer release()
+	// POST and DELETE mutate the same firewall relationship collection. Each
+	// DELETE holds the per-firewall gate from its fresh exact pre-delete read
+	// through its first authoritative readback, so scale-up and scale-down never
+	// overlap on that endpoint. Read-only observations take no gate: holding it
+	// through the spaced absence confirmations would starve same-firewall
+	// launches of their protection deadline. Across controllers, the durable
+	// slot keeps other claims' POSTs out until relation absence is observed.
 	readbackCtx, cancel := context.WithTimeout(ctx, a.destructiveAbsenceTimeout)
 	defer cancel()
 	if authority.fenced && !authority.complete() {
@@ -6052,25 +6116,42 @@ func (a *Adapter) detachExactFirewallRelationAfterVMDeletion(
 		// tokenless mutation authority to the shipped SDK adapter.
 		authority = baseFirewallDetachmentAuthority{}
 	}
+	var releaseGate func()
+	releaseMutationGate := func() {
+		if releaseGate != nil {
+			releaseGate()
+			releaseGate = nil
+		}
+	}
+	defer releaseMutationGate()
+	// The durable slot is taken only when the relation is seen present, or to
+	// retire an earlier issued receipt once absence is authoritative, so a
+	// relation that is already gone never blocks launches while it is confirmed.
 	var fence cloudapi.FirewallDetachmentFence
-	allowDELETE := !authority.fenced
+	authorized := !authority.fenced
+	// freshIssue marks POST-style one-shot authority minted for this invocation:
+	// its first DELETE needs no presence proof and, if never dispatched, is
+	// rejected on exit. An inherited issued receipt may already have been
+	// dispatched by an earlier invocation and is re-sent only after spaced reads.
+	freshIssue := !authority.fenced
+	dispatchable := !authority.fenced
 	deleteAttempted := false
-	if authority.fenced {
+	authorize := func() (cloudapi.FirewallDetachmentAuthorization, error) {
 		authorization, err := authority.authorize(readbackCtx, vmUUID)
 		if err != nil {
-			return fmt.Errorf("authorizing durable base-firewall detachment for VM %s: %w", vmUUID, err)
+			return cloudapi.FirewallDetachmentAuthorization{}, fmt.Errorf("authorizing durable base-firewall detachment for VM %s: %w", vmUUID, err)
 		}
-		fence = authorization.Fence
-		if !strings.EqualFold(fence.VMUUID, vmUUID) || !strings.EqualFold(fence.FirewallUUID, firewallUUID) ||
-			!createAttemptTokenPattern.MatchString(fence.IssueID) ||
-			(fence.Phase != cloudapi.FirewallAssignmentIssued && fence.Phase != cloudapi.FirewallAssignmentObserved) ||
-			(authorization.AllowDELETE && fence.Phase != cloudapi.FirewallAssignmentIssued) {
-			return fmt.Errorf("%w: durable base-firewall detachment identity changed for VM %s", cloudapi.ErrOwnershipMismatch, vmUUID)
+		candidate := authorization.Fence
+		if !strings.EqualFold(candidate.VMUUID, vmUUID) || !strings.EqualFold(candidate.FirewallUUID, firewallUUID) ||
+			!createAttemptTokenPattern.MatchString(candidate.IssueID) ||
+			(candidate.Phase != cloudapi.FirewallAssignmentIssued && candidate.Phase != cloudapi.FirewallAssignmentObserved) ||
+			(authorization.AllowDELETE && candidate.Phase != cloudapi.FirewallAssignmentIssued) {
+			return cloudapi.FirewallDetachmentAuthorization{}, fmt.Errorf("%w: durable base-firewall detachment identity changed for VM %s", cloudapi.ErrOwnershipMismatch, vmUUID)
 		}
-		allowDELETE = authorization.AllowDELETE
+		return authorization, nil
 	}
 	rejectUndispatched := func(cause error) error {
-		if !authority.fenced || !allowDELETE || deleteAttempted {
+		if !authority.fenced || !freshIssue || deleteAttempted {
 			return cause
 		}
 		rejectCtx, rejectCancel := context.WithTimeout(context.WithoutCancel(ctx), a.networkAttachmentRequestTimeout)
@@ -6084,6 +6165,13 @@ func (a *Adapter) detachExactFirewallRelationAfterVMDeletion(
 			cloudapi.ErrCreateAttemptPending, vmUUID, cause)
 	}
 	absenceConfirmations := 0
+	// presenceConfirmations counts spaced reads that still show the exact
+	// relation after the last DELETE (or, for an inherited issued receipt,
+	// since this invocation started). DELETE of one exact VM/firewall pair is
+	// idempotent, so once the relation stays visible across those reads, an
+	// earlier dispatch demonstrably did not commit and may be re-sent.
+	presenceConfirmations := 0
+	justDispatched := false
 	var lastObservation, mutationErr error
 	readbackDelay := a.networkAttachmentReadbackMinDelay
 	for {
@@ -6094,12 +6182,18 @@ func (a *Adapter) detachExactFirewallRelationAfterVMDeletion(
 			return rejectUndispatched(fmt.Errorf("firewall %s relation cleanup for deleted VM %s stopped: %w", firewallUUID, vmUUID,
 				errors.Join(errFirewallCleanupUncertain, lastObservation, mutationErr, readbackErr)))
 		}
+		dispatched := false
 		if err != nil {
 			lastObservation = fmt.Errorf("listing firewall %s relation for deleted VM %s: %w", firewallUUID, vmUUID, err)
 			if !isRetryableReadback(readbackCtx, err) {
 				return rejectUndispatched(errors.Join(mutationErr, lastObservation))
 			}
 		} else {
+			// This successful read is the authoritative readback of any DELETE
+			// dispatched under the gate; later reads are observation only.
+			releaseMutationGate()
+			countPresence := !justDispatched
+			justDispatched = false
 			firewall, validationErr := findFirewallInList(firewalls, firewallUUID, location)
 			if validationErr == nil {
 				validationErr = validateFirewallBillingAccount(*firewall, billingAccountID)
@@ -6128,15 +6222,29 @@ func (a *Adapter) detachExactFirewallRelationAfterVMDeletion(
 				}
 			}
 			if !present {
+				presenceConfirmations = 0
 				absenceConfirmations++
 				lastObservation = fmt.Errorf("firewall %s relation absence confirmation %d of %d for VM %s", firewallUUID, absenceConfirmations, destructiveAbsenceConfirmations, vmUUID)
 				if absenceConfirmations == destructiveAbsenceConfirmations {
-					if authority.fenced && fence.Phase == cloudapi.FirewallAssignmentIssued {
-						observeCtx, observeCancel := context.WithTimeout(context.WithoutCancel(ctx), a.networkAttachmentRequestTimeout)
-						observeErr := authority.observe(observeCtx, fence)
-						observeCancel()
-						if observeErr != nil {
-							return fmt.Errorf("persisting authoritative base-firewall detachment absence for VM %s: %w", vmUUID, observeErr)
+					if authority.fenced {
+						if !authorized {
+							// Nothing was mutated here. Authorize only now, briefly, so an
+							// earlier issued receipt for this exact detachment is retired
+							// by the authoritative absence just observed.
+							authorization, authorizeErr := authorize()
+							if authorizeErr != nil {
+								return authorizeErr
+							}
+							fence = authorization.Fence
+							authorized = true
+						}
+						if fence.Phase == cloudapi.FirewallAssignmentIssued {
+							observeCtx, observeCancel := context.WithTimeout(context.WithoutCancel(ctx), a.networkAttachmentRequestTimeout)
+							observeErr := authority.observe(observeCtx, fence)
+							observeCancel()
+							if observeErr != nil {
+								return fmt.Errorf("persisting authoritative base-firewall detachment absence for VM %s: %w", vmUUID, observeErr)
+							}
 						}
 					}
 					return nil
@@ -6144,23 +6252,65 @@ func (a *Adapter) detachExactFirewallRelationAfterVMDeletion(
 			} else {
 				absenceConfirmations = 0
 				lastObservation = fmt.Errorf("VM %s remains assigned to firewall %s", vmUUID, firewallUUID)
-				if allowDELETE && !deleteAttempted {
-					// The deletion fence was persisted before the relation read above.
+				if !authorized {
+					authorization, authorizeErr := authorize()
+					if authorizeErr != nil {
+						return authorizeErr
+					}
+					fence = authorization.Fence
+					authorized = true
+					freshIssue = authorization.AllowDELETE
+					dispatchable = fence.Phase == cloudapi.FirewallAssignmentIssued
+				}
+				if countPresence {
+					presenceConfirmations++
+				}
+				firstDispatch := freshIssue && !deleteAttempted
+				if dispatchable && (firstDispatch || presenceConfirmations >= destructiveAbsenceConfirmations) {
+					if !firstDispatch && authority.fenced {
+						// Re-check durable ownership immediately before a re-send: the
+						// NodeClaim must still own this VM and this exact issued receipt
+						// must still hold the firewall slot.
+						authorization, authorizeErr := authorize()
+						if authorizeErr != nil {
+							return authorizeErr
+						}
+						if authorization.AllowDELETE || authorization.Fence != fence {
+							return fmt.Errorf("%w: durable base-firewall detachment receipt changed before re-sending for VM %s", cloudapi.ErrOwnershipMismatch, vmUUID)
+						}
+					}
+					presenceConfirmations = 0
+					// The durable receipt was persisted before the relation read above.
 					// Re-prove the VM absent from every canonical core index after that
-					// CAS, then re-read the exact firewall relationship immediately
-					// before DELETE so UUID reuse or relation drift cannot redirect it.
-					if proofErr := a.proveFreshFirewallDetachmentTarget(readbackCtx, location, networkUUID, firewallUUID, vmUUID, billingAccountID, tombstoneVerifier); proofErr != nil {
+					// CAS, then re-read the exact firewall relationship in-gate
+					// immediately before DELETE so UUID reuse or relation drift cannot
+					// redirect it.
+					if proofErr := a.proveDeletedVMForFirewallDetachment(readbackCtx, location, networkUUID, vmUUID, tombstoneVerifier); proofErr != nil {
+						return rejectUndispatched(
+							fmt.Errorf("fresh mutation-target proof blocked base-firewall detachment for VM %s: %w", vmUUID, proofErr),
+						)
+					}
+					releaseGate = a.acquireFirewallAssignmentGate(location, firewallUUID)
+					if proofErr := a.proveExactFirewallDetachmentRelation(readbackCtx, location, firewallUUID, vmUUID, billingAccountID); proofErr != nil {
 						return rejectUndispatched(
 							fmt.Errorf("fresh mutation-target proof blocked base-firewall detachment for VM %s: %w", vmUUID, proofErr),
 						)
 					}
 					requestCtx, requestCancel := context.WithTimeout(readbackCtx, a.networkAttachmentRequestTimeout)
 					deleteAttempted = true
+					dispatched = true
+					justDispatched = true
 					unassignErr := a.api.UnassignFirewallFromVM(requestCtx, location, firewallUUID, vmUUID)
 					requestCancel()
 					if unassignErr != nil {
 						mutationErr = fmt.Errorf("unassigning firewall %s from deleted VM %s: %w", firewallUUID, vmUUID, unassignErr)
 						if isDefinitiveFirewallAssignmentRejection(unassignErr) && authority.fenced {
+							if !firstDispatch {
+								// An earlier dispatch of this receipt may still commit, so it
+								// must stay issued; the next pass may re-send it.
+								return fmt.Errorf("%w: re-sent base-firewall detachment for VM %s was locally blocked before dispatch: %v",
+									cloudapi.ErrCreateAttemptPending, vmUUID, mutationErr)
+							}
 							rejectCtx, rejectCancel := context.WithTimeout(context.WithoutCancel(ctx), a.networkAttachmentRequestTimeout)
 							rejectErr := authority.reject(rejectCtx, fence)
 							rejectCancel()
@@ -6171,9 +6321,14 @@ func (a *Adapter) detachExactFirewallRelationAfterVMDeletion(
 				}
 			}
 		}
-		if absenceConfirmations > 0 {
+		switch {
+		case dispatched:
+			// Keep the gate only briefly: the next successful read is this
+			// DELETE's authoritative readback and releases it.
+			readbackDelay = a.networkAttachmentReadbackMinDelay
+		case absenceConfirmations > 0 || (dispatchable && presenceConfirmations > 0):
 			readbackDelay = a.destructiveAbsenceReadInterval
-		} else {
+		default:
 			readbackDelay = nextReadbackDelay(readbackDelay, a.networkAttachmentReadbackMaxDelay)
 		}
 		if err := waitForReadback(readbackCtx, readbackDelay); err != nil {
@@ -6183,18 +6338,27 @@ func (a *Adapter) detachExactFirewallRelationAfterVMDeletion(
 	}
 }
 
-func (a *Adapter) proveFreshFirewallDetachmentTarget(
+// proveDeletedVMForFirewallDetachment re-proves, with spaced reads, that the
+// VM is absent from every canonical core index before its firewall relation
+// may be removed. It is read-only and runs outside the firewall gate.
+func (a *Adapter) proveDeletedVMForFirewallDetachment(
 	ctx context.Context,
-	location, networkUUID, firewallUUID, vmUUID string,
-	billingAccountID int64,
+	location, networkUUID, vmUUID string,
 	tombstoneVerifier *deletedVMTombstoneVerifier,
 ) error {
 	if strings.TrimSpace(networkUUID) == "" {
 		return fmt.Errorf("%w: configured VPC UUID is required for firewall detachment", cloudapi.ErrOwnershipMismatch)
 	}
-	if err := a.waitForAuthorizedVMCoreAbsence(ctx, location, networkUUID, vmUUID, "during base-firewall detachment authorization", tombstoneVerifier); err != nil {
-		return err
-	}
+	return a.waitForAuthorizedVMCoreAbsence(ctx, location, networkUUID, vmUUID, "during base-firewall detachment authorization", tombstoneVerifier)
+}
+
+// proveExactFirewallDetachmentRelation is the in-gate read immediately before
+// DELETE: the owned firewall must still carry exactly one relation to the VM.
+func (a *Adapter) proveExactFirewallDetachmentRelation(
+	ctx context.Context,
+	location, firewallUUID, vmUUID string,
+	billingAccountID int64,
+) error {
 	requestCtx, cancel := context.WithTimeout(ctx, a.networkAttachmentRequestTimeout)
 	firewalls, err := a.api.ListFirewalls(requestCtx, location)
 	cancel()

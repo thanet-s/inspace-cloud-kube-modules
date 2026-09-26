@@ -2627,47 +2627,6 @@ func TestFirewallRelationshipGateSerializesTwoDetachesThroughReadback(t *testing
 	}
 }
 
-func TestDurableFirewallDetachHTTP500AndRestartNeverReplayIssuedDelete(t *testing.T) {
-	const (
-		firewallUUID = "33333333-3333-4333-8333-333333333333"
-		vmUUID       = "11111111-1111-4111-8111-111111111111"
-		issueID      = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-	)
-	firewall := secureFirewall()
-	firewall.UUID = firewallUUID
-	firewall.ResourcesAssigned = []sdk.FirewallResource{{ResourceType: "vm", ResourceUUID: vmUUID}}
-	api := &fakeAPI{firewalls: []sdk.Firewall{firewall}, unassignFirewallErrors: []error{&sdk.APIError{StatusCode: 500}}}
-	adapter, _ := New(api)
-	configureFastNetworkReadback(adapter, boundedReadbackTestTimeout)
-	authorizeCalls := 0
-	authority := baseFirewallDetachmentAuthority{
-		fenced: true,
-		authorize: func(context.Context, string) (cloudapi.FirewallDetachmentAuthorization, error) {
-			authorizeCalls++
-			return cloudapi.FirewallDetachmentAuthorization{
-				Fence: cloudapi.FirewallDetachmentFence{
-					VMUUID: vmUUID, FirewallUUID: firewallUUID, Phase: cloudapi.FirewallAssignmentIssued, IssueID: issueID,
-				},
-				AllowDELETE: authorizeCalls == 1,
-			}, nil
-		},
-		observe: func(context.Context, cloudapi.FirewallDetachmentFence) error { return nil },
-		reject:  func(context.Context, cloudapi.FirewallDetachmentFence) error { return nil },
-	}
-	for attempt := 0; attempt < 2; attempt++ {
-		err := adapter.detachFirewallAfterVMDeletion(context.Background(), "bkk01", "network-1", firewallUUID, vmUUID, firewall.BillingAccountID, authority)
-		if !errors.Is(err, errFirewallCleanupUncertain) || !errors.Is(err, context.DeadlineExceeded) {
-			t.Fatalf("attempt %d error = %v, want still-visible ambiguous DELETE", attempt+1, err)
-		}
-	}
-	if countOperation(api.operations, "unassign-firewall") != 1 {
-		t.Fatalf("ambiguous DELETE replayed across loop/restart: operations=%v", api.operations)
-	}
-	if !firewallHasVM(api.firewalls[0], vmUUID) {
-		t.Fatal("HTTP 500 test double unexpectedly removed the relation")
-	}
-}
-
 func TestDeletedNodeLoadBalancerVMDetachesOnlyKarpenterBaseFirewall(t *testing.T) {
 	const vmUUID = "11111111-1111-4111-8111-111111111111"
 	base := secureFirewall()
@@ -5111,7 +5070,7 @@ func TestDeleteLiveVMRejectsUnassignedRenamedFIPAtDurableAddress(t *testing.T) {
 	}
 }
 
-func TestDeleteDoesNotReplayAmbiguousFirewallRemovalWhileRelationRemainsVisible(t *testing.T) {
+func TestDeleteResendsUncommittedFirewallRemovalOnlyAfterSpacedPresence(t *testing.T) {
 	api := &fakeAPI{
 		unassignFloatingIPErrors: []error{&sdk.APIError{StatusCode: 404}},
 		deleteFloatingIPErrors:   []error{&sdk.APIError{StatusCode: 404}},
@@ -5124,9 +5083,8 @@ func TestDeleteDoesNotReplayAmbiguousFirewallRemovalWhileRelationRemainsVisible(
 		t.Fatal(err)
 	}
 	api.operations = nil
-	err = adapter.DeleteVM(context.Background(), "bkk01", created.UUID, "cluster-a", "nodeclaim-a", cloudapi.DeleteVMIdentity{})
-	if !errors.Is(err, errFirewallCleanupUncertain) || !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("DeleteVM() error = %v, want ambiguous firewall removal to remain pending", err)
+	if err := adapter.DeleteVM(context.Background(), "bkk01", created.UUID, "cluster-a", "nodeclaim-a", cloudapi.DeleteVMIdentity{}); err != nil {
+		t.Fatalf("DeleteVM() error = %v, want the still-visible relation removed by an exact re-send", err)
 	}
 	if got := countOperation(api.operations, "unassign-floating-ip"); got != 0 {
 		t.Fatalf("VM delete auto-unassigned the floating IP but cleanup retried unassign %d times; operations=%v", got, api.operations)
@@ -5134,11 +5092,13 @@ func TestDeleteDoesNotReplayAmbiguousFirewallRemovalWhileRelationRemainsVisible(
 	if got := countOperation(api.operations, "delete-floating-ip"); got != 2 {
 		t.Fatalf("floating IP delete attempts=%d, want retry after stale 404; operations=%v", got, api.operations)
 	}
-	if got := countOperation(api.operations, "unassign-firewall"); got != 1 {
-		t.Fatalf("firewall unassign attempts=%d, want exactly one after dispatched HTTP 404; operations=%v", got, api.operations)
+	// The dispatched HTTP 404 did not remove the relation. Spaced reads kept
+	// showing it, so exactly one idempotent re-send of the same pair follows.
+	if got := countOperation(api.operations, "unassign-firewall"); got != 2 {
+		t.Fatalf("firewall unassign attempts=%d, want the failed dispatch plus one re-send; operations=%v", got, api.operations)
 	}
-	if len(api.floatingIPs) != 0 || !firewallHasVM(api.firewalls[0], created.UUID) {
-		t.Fatalf("ambiguous firewall removal state was not retained exactly: FIPs=%#v firewall=%#v", api.floatingIPs, api.firewalls[0])
+	if len(api.floatingIPs) != 0 || firewallHasVM(api.firewalls[0], created.UUID) || api.firewallDetachedWhileVMVisible {
+		t.Fatalf("firewall removal did not converge safely: FIPs=%#v firewall=%#v", api.floatingIPs, api.firewalls[0])
 	}
 }
 

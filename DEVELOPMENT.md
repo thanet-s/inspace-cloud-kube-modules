@@ -376,7 +376,7 @@ rule applies to all 22 write methods in the shared client:
 | Relationship creation | `AttachDisk`, `AssignFloatingIP`, `AssignFirewallToVM`, `AddLoadBalancerTarget`, `AddLoadBalancerRule` | Fence the exact resource pair or rule before POST. Treat exact duplicate relationship rows as one set member, but reject malformed rows or the same resource on a different owner. |
 | Deterministic replacement | `UpdateFloatingIP`, `UpdateFirewall` | Persist the exact desired payload/generation, issue once, then compare authoritative readback with both the applied and pending payload. A third state fails closed. |
 | Relationship removal | `DetachDisk`, `UnassignFloatingIP`, `UnassignFirewallFromVM`, `RemoveLoadBalancerTarget`, `RemoveLoadBalancerRule` | Persist the exact stable pair/UUID and an issued receipt before dispatch. Once issued, never repeat the removal merely because the relationship remains visible; require exact authoritative absence or explicit operator resolution. |
-| Resource deletion | `DeleteVM`, `DeleteDisk`, `DeleteFloatingIP`, `DeleteFirewall`, `DeleteLoadBalancer` | Delete only an exact durably owned UUID/address after persisting an issued receipt. A VM must additionally report exactly one primary root disk and zero attached non-primary block volumes. Never replay an issued delete after any returned result; keep the finalizer or teardown receipt until repeated authoritative absence releases dependents and ownership state. |
+| Resource deletion | `DeleteVM`, `DeleteDisk`, `DeleteFloatingIP`, `DeleteFirewall`, `DeleteLoadBalancer` | Delete only an exact durably owned UUID/address after persisting an issued receipt. A VM must additionally report exactly one primary root disk and zero attached non-primary block volumes. Never replay an issued delete after any returned result (the only exception is Karpenter's exact VM DELETE and base-firewall unassign, described below); keep the finalizer or teardown receipt until repeated authoritative absence releases dependents and ownership state. |
 
 The shared client never automatically replays POST, PUT, PATCH, or DELETE, and
 blocks redirects for those methods. Every error returned after dispatch is
@@ -426,7 +426,11 @@ Durable anchors are component-specific:
   firewalls may progress independently. Karpenter persists the issued receipt
   and terminal result; terminal destructive/removal state requires three fresh
   authoritative observations at least 30 seconds apart. A restart before the
-  terminal write safely starts that observation sequence again.
+  terminal write safely starts that observation sequence again. An issued VM
+  DELETE or base-firewall unassign whose target is still visible in three
+  spaced authoritative reads, with ownership re-verified, did not commit; the
+  same exact-UUID DELETE is idempotent and is re-sent under the same receipt
+  rather than wedging deletion. A CREATE or POST is never re-sent.
 
 Karpenter owns and removes only the exact private base-firewall relationship
 persisted in its NodeClaim receipt. CCM exclusively owns the shared ICMP,
