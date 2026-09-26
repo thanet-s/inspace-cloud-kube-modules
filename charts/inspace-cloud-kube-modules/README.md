@@ -433,6 +433,13 @@ below 600 seconds. Shortening any of these sidecar deadlines can cancel and
 strand the original no-replay Lease or cause overlapping retries while the
 mutation proof is still running.
 
+## CSI volume size limit
+
+`csi.maxVolumeSizeGiB` defaults to `2000`, the largest disk the InSpace
+console offers. The controller rejects any PVC create or expansion above it
+with `OutOfRange` before calling the InSpace API. Lower values are allowed;
+the schema rejects values above 2000.
+
 ## CSI volume expansion
 
 `csi.storageClass.allowVolumeExpansion` defaults to `true`. Raise a PVC's

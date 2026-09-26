@@ -25,6 +25,13 @@ finishes. A delete is refused while the disk is attached. It is also refused if
 the InSpace disk has snapshots: the native delete API would delete those
 snapshots too, so the driver fails safely instead.
 
+## Volume size limit
+
+The controller refuses to create or expand a volume above 2000 GiB, the largest
+disk the InSpace console offers. Such a request fails with `OutOfRange` before
+any InSpace API call. Set a lower cap with `--max-volume-size-gib` (chart value
+`csi.maxVolumeSizeGiB`); the chart rejects values above 2000.
+
 ## Volume expansion
 
 The StorageClass sets `allowVolumeExpansion: true`. To grow a volume, raise the

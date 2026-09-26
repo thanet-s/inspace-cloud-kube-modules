@@ -2487,6 +2487,7 @@ def main() -> None:
             "compare" in node_lb_exercise and
             "--baseline" in node_lb_exercise and
             "continuous-http-probe.py" in node_lb_exercise and
+            "--max-outage\n              - \"10\"" in node_lb_exercise and
             "--policy-change\n              - expanded" in node_lb_exercise and
             "--policy-change\n              - shrunk" in node_lb_exercise and
             "--require-new-uid\n              - inspace-e2e-node-shared-b" in node_lb_exercise and

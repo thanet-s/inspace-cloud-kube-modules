@@ -81,6 +81,10 @@ csi:
     tag: ""
     digest: ""
     pullPolicy: IfNotPresent
+  # Largest volume the controller creates or expands, in GiB. It matches the
+  # 2000 GB disk ceiling in the InSpace console; larger PVC requests fail with
+  # OutOfRange before any InSpace API call.
+  maxVolumeSizeGiB: 2000
   controller:
     replicaCount: 1
     serviceAccount:

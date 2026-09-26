@@ -113,10 +113,11 @@
     "csi": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["enabled", "image", "controller", "node", "sidecars", "storageClass"],
+      "required": ["enabled", "image", "maxVolumeSizeGiB", "controller", "node", "sidecars", "storageClass"],
       "properties": {
         "enabled": {"type": "boolean"},
         "image": {"$ref": "#/definitions/image"},
+        "maxVolumeSizeGiB": {"type": "integer", "minimum": 1, "maximum": 2000},
         "controller": {
           "type": "object",
           "additionalProperties": false,

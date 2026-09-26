@@ -2,9 +2,11 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
+	"math"
 	"os"
 	"os/signal"
 	"strconv"
@@ -30,12 +32,18 @@ func main() {
 	apiBaseURL := flag.String("api-base-url", envOr("INSPACE_API_BASE_URL", "https://api.inspace.cloud"), "InSpace API base URL")
 	networkUUID := flag.String("network-uuid", os.Getenv("INSPACE_NETWORK_UUID"), "expected InSpace VPC UUID for CSI target VMs")
 	billingAccountID := flag.Int64("billing-account-id", envInt64("INSPACE_BILLING_ACCOUNT_ID"), "InSpace billing account ID (required for global tokens)")
+	maxVolumeSizeGiB := flag.Int64("max-volume-size-gib", driver.DefaultMaxVolumeSize/gib, "largest volume the controller creates or expands, in GiB")
 	developmentFake := flag.Bool("development-fake", false, "use in-memory adapters; NEVER use for real workloads")
 	showVersion := flag.Bool("version", false, "print version")
 	flag.Parse()
 	if *showVersion {
 		fmt.Printf("inspace-csi-driver %s\n", buildversion.Version)
 		return
+	}
+
+	maxVolumeSize, err := maxVolumeSizeBytes(*maxVolumeSizeGiB)
+	if err != nil {
+		log.Fatalf("invalid --max-volume-size-gib: %v", err)
 	}
 
 	driverMode := driver.Mode(strings.ToLower(strings.TrimSpace(*mode)))
@@ -79,7 +87,6 @@ func main() {
 			if strings.TrimSpace(*nodeID) == "" {
 				log.Fatal("node mode requires --node-id or NODE_ID")
 			}
-			var err error
 			mounter, err = hostlinux.New()
 			if err != nil {
 				log.Fatalf("configure Linux mounter: %v", err)
@@ -92,6 +99,7 @@ func main() {
 	}
 	d, err := driver.New(driver.Config{
 		Mode: driverMode, PluginVersion: buildversion.Version, Location: *location, NodeID: *nodeID,
+		MaxVolumeSize: maxVolumeSize,
 	}, provider, mounter)
 	if err != nil {
 		log.Fatalf("configure driver: %v", err)
@@ -101,6 +109,18 @@ func main() {
 	if err := d.Serve(ctx, *endpoint); err != nil {
 		log.Fatalf("serve: %v", err)
 	}
+}
+
+const gib int64 = 1024 * 1024 * 1024
+
+func maxVolumeSizeBytes(sizeGiB int64) (int64, error) {
+	if sizeGiB <= 0 {
+		return 0, errors.New("must be a positive number of GiB")
+	}
+	if sizeGiB > math.MaxInt64/gib {
+		return 0, errors.New("overflows int64 bytes")
+	}
+	return sizeGiB * gib, nil
 }
 
 func envOr(name, fallback string) string {
