@@ -193,6 +193,50 @@ func TestWriteGatewayAPICRDsPrintsOnlyThePinnedBundle(t *testing.T) {
 	}
 }
 
+func TestWriteBootstrapCacheRefreshManifestPrintsThisReleasesCacheContract(t *testing.T) {
+	var output bytes.Buffer
+	if err := writeBootstrapCacheRefreshManifest(&output, "1.2.0", "", " rke2-ingress-nginx, rke2-traefik ,", ""); err != nil {
+		t.Fatal(err)
+	}
+	want, err := bootstrap.RenderCacheRefreshManifest("", "1.2.0", []string{"rke2-ingress-nginx", "rke2-traefik"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if output.String() != want || !strings.Contains(want, "image\tdocker://ghcr.io/thanet-s/inspace-csi-driver:1.2.0\tthanet-s/inspace-csi-driver:1.2.0\n") {
+		t.Fatalf("printed refresh manifest:\n%s\nwant:\n%s", output.String(), want)
+	}
+
+	digests := `{"inspace-cloud-controller-manager":"sha256:` + strings.Repeat("1", 64) +
+		`","inspace-csi-driver":"sha256:` + strings.Repeat("2", 64) +
+		`","karpenter-provider-inspace":"sha256:` + strings.Repeat("3", 64) + `"}`
+	output.Reset()
+	if err := writeBootstrapCacheRefreshManifest(&output, "1.2.0", "", "", digests); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output.String(), "image\tdocker://ghcr.io/thanet-s/inspace-csi-driver@sha256:"+strings.Repeat("2", 64)+"\tthanet-s/inspace-csi-driver:1.2.0\n") {
+		t.Fatalf("module digests were not applied:\n%s", output.String())
+	}
+
+	for name, call := range map[string]func(io.Writer) error{
+		"development build": func(w io.Writer) error {
+			return writeBootstrapCacheRefreshManifest(w, "dev", "", "", "")
+		},
+		"unaudited RKE2": func(w io.Writer) error {
+			return writeBootstrapCacheRefreshManifest(w, "1.2.0", "v1.36.4+rke2r1", "", "")
+		},
+		"malformed digests": func(w io.Writer) error {
+			return writeBootstrapCacheRefreshManifest(w, "1.2.0", "", "", `{"inspace-csi-driver":"latest"}`)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var refused bytes.Buffer
+			if err := call(&refused); err == nil || refused.Len() != 0 {
+				t.Fatalf("printed=%q err=%v, want refusal before output", refused.String(), err)
+			}
+		})
+	}
+}
+
 func TestParseTCPPorts(t *testing.T) {
 	ports, err := parseTCPPorts("22, 6443,30080")
 	if err != nil {

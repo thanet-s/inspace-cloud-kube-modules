@@ -120,7 +120,20 @@ complete inventory contains 36 images. The default templates disable both
 webhook-certgen, nginx ingress-controller, and Traefik images, producing the
 33-image seed used by the E2E cluster. Its
 dedicated 10 GB filesystem reserves 1 GB of free space. Daily maintenance
-prunes unpinned RKE2 artifacts and local Docker data older than 30 days.
+prunes local Docker data older than 30 days and keeps every verified RKE2
+release directory.
+
+The seed covers only the release that built the bastion. `deploy update`
+adds a later release's entries before upgrading RKE2 or the charts:
+`inspace-cluster-controller --print-bootstrap-cache-refresh` prints this
+release's seed contract (`bootstrap.RenderCacheRefreshManifest`: the
+checksum-pinned RKE2 archive plus exactly the `images.tsv` lines, or only the
+kube-vip, CSI sidecar, and module images when RKE2 stays), and
+`deploy/templates/refresh-bootstrap-cache.sh` adds the missing entries on the
+bastion by their verified linux/amd64 digests without ever overwriting a tag.
+`TestCacheRefreshManifestEqualsTheBootstrapSeedContract` keeps the two
+contracts identical, and `deploy/scripts/test_refresh_bootstrap_cache.py`
+exercises the bastion script offline.
 
 Cached initialization and reconciliation require two persistent controller
 inputs. `INSPACE_BOOTSTRAP_CACHE_KEY` is an operator secret containing exactly

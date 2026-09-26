@@ -290,6 +290,28 @@ func writeGatewayAPICRDs(w io.Writer, bundle []byte) error {
 	return err
 }
 
+// writeBootstrapCacheRefreshManifest prints this release's bastion cache
+// contract for `deploy update`. The whole manifest is rendered before the
+// first byte is written, so a refusal never leaves a partial plan.
+func writeBootstrapCacheRefreshManifest(w io.Writer, moduleVersion, rke2Version, disable, rawModuleImageDigests string) error {
+	moduleImageDigests, err := parseBootstrapCacheImageDigests(rawModuleImageDigests)
+	if err != nil {
+		return err
+	}
+	var disabled []string
+	for _, component := range strings.Split(disable, ",") {
+		if component = strings.TrimSpace(component); component != "" {
+			disabled = append(disabled, component)
+		}
+	}
+	manifest, err := bootstrap.RenderCacheRefreshManifest(rke2Version, moduleVersion, disabled, moduleImageDigests)
+	if err != nil {
+		return err
+	}
+	_, err = io.WriteString(w, manifest)
+	return err
+}
+
 func main() {
 	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -313,6 +335,9 @@ func run() error {
 	var operationTimeout time.Duration
 	var floatingIPReachabilityTimeout time.Duration
 	var printGatewayAPICRDs bool
+	var printBootstrapCacheRefresh bool
+	var bootstrapCacheRKE2Version string
+	var bootstrapCacheDisable string
 	flag.StringVar(&configPath, "cluster-config", "", "path to an InSpaceCluster YAML file")
 	flag.BoolVar(&once, "once", false, "perform one reconciliation and exit")
 	flag.DurationVar(&interval, "interval", 20*time.Second, "minimum reconciliation interval")
@@ -346,6 +371,15 @@ func run() error {
 	flag.BoolVar(&printGatewayAPICRDs, "print-gateway-api-crds", false,
 		"print the embedded, SHA-256 pinned Gateway API "+bootstrap.GatewayAPIBundleVersion+" standard CRD bundle that "+
 			"spec.network.gatewayAPI control planes wait for at "+bootstrap.GatewayAPIStandardInstallNodePath+", then exit")
+	flag.BoolVar(&printBootstrapCacheRefresh, "print-bootstrap-cache-refresh", false,
+		"print the bastion bootstrap-cache entries this release needs (the checksum-pinned RKE2 archive and the "+
+			"digest-pinned images of its seed contract) for an existing cache, then exit; "+
+			"INSPACE_BOOTSTRAP_CACHE_IMAGE_DIGESTS optionally pins the module images")
+	flag.StringVar(&bootstrapCacheRKE2Version, "bootstrap-cache-rke2-version", "",
+		"with --print-bootstrap-cache-refresh: the RKE2 release the cluster moves to, which must be this release's "+
+			"audited cache release; empty lists only chart-owned images for a module-only upgrade")
+	flag.StringVar(&bootstrapCacheDisable, "bootstrap-cache-disable", "",
+		"with --print-bootstrap-cache-refresh: comma-separated spec.rke2.disable add-ons whose images are omitted")
 	flag.Parse()
 	if version {
 		fmt.Printf("inspace-cluster-controller %s\n", buildversion.Version)
@@ -353,6 +387,10 @@ func run() error {
 	}
 	if printGatewayAPICRDs {
 		return writeGatewayAPICRDs(os.Stdout, bootstrap.GatewayAPIStandardInstall())
+	}
+	if printBootstrapCacheRefresh {
+		return writeBootstrapCacheRefreshManifest(os.Stdout, buildversion.Version, bootstrapCacheRKE2Version,
+			bootstrapCacheDisable, os.Getenv("INSPACE_BOOTSTRAP_CACHE_IMAGE_DIGESTS"))
 	}
 	if configPath == "" {
 		return errors.New("--cluster-config is required")

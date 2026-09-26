@@ -243,6 +243,32 @@ giving the pool time to stop handing back the same just-freed address.
 `update` does not replace fixed VMs or rewrite bootstrap cloud-init, and it is
 the single command for both kinds of day-2 upgrade:
 
+- **Bootstrap cache refresh** (cached mode only; a no-op for
+  `bootstrap_direct_download: true`): the bastion cache is read-only, is not a
+  pull-through proxy, and was seeded once with the images of the release that
+  built it. Cached nodes pull every RKE2 system image and every chart image
+  (CCM, CSI and its sidecars, Karpenter) through it, and Karpenter workers
+  download their RKE2 archive from it. So before `update` touches RKE2 or the
+  charts, it runs the target `modules_version` controller image offline
+  (`inspace-cluster-controller --print-bootstrap-cache-refresh`) to print that
+  release's own cache seed contract, and adds exactly those entries on the
+  bastion. When `update` moves RKE2 the list is the checksum-pinned RKE2
+  archive and every image of the full seed; otherwise it is only the kube-vip,
+  CSI sidecar, and module images. The bastion resolves each source to its
+  linux/amd64 manifest digest (a digest-pinned source must return exactly the
+  pinned bytes) and imports only missing tags, by that digest, with the same
+  `skopeo` options as the build-time seed. It never deletes an entry and never
+  overwrites a tag that holds another digest or an RKE2 archive with another
+  checksum; either stops `update` before any change. The registry becomes
+  writable only on the bastion's loopback while images are imported and is
+  always restored to read-only; the private TLS endpoint stays GET/HEAD-only.
+  Every entry is then read back through that endpoint, a write probe must be
+  refused, and the whole step is bounded to 45 minutes. Each refresh adds to
+  the cache's fixed 10 GB filesystem, which keeps a 1 GB reserve; a refresh
+  that would cross it fails. The refresh also installs the current daily
+  maintenance script, which keeps every refreshed RKE2 release instead of
+  aging out all but the bootstrap one. Only a target release that supports
+  `--print-bootstrap-cache-refresh` can update a cached cluster.
 - **Cloud-module upgrade**: it refreshes the in-cluster API Secret, upgrades
   the CRD and workload OCI charts to `modules_version`, and reapplies the
   default Karpenter NodeClass/NodePool. Because the NodeClass identity changes
@@ -253,9 +279,9 @@ the single command for both kinds of day-2 upgrade:
 - **Control-plane RKE2 version upgrade**: when `rke2_version` in the inventory
   differs from the RKE2 version recorded in the deployment journal (the
   init-time version until the first upgrade) or from the kubelet version the
-  running control plane reports, `update` downloads the exact upstream RKE2 release directly (bypassing the
-  bastion bootstrap cache, which pins exactly one audited version per
-  controller build), verifies its published checksum, and swaps the binary on
+  running control plane reports, `update` downloads the exact upstream RKE2
+  release archive onto each server directly from GitHub, verifies its
+  published checksum, and swaps the binary on
   one control-plane server at a time — stopping `rke2-server`, replacing
   `/usr/local/bin/rke2`, and restarting — waiting for that Node to be Ready and
   the cluster API to recover before moving to the next server. This is the
@@ -274,12 +300,14 @@ the single command for both kinds of day-2 upgrade:
   the operator exports `INSPACE_CONFIRM_RKE2_VERSION_SKIP=<cluster-name>`,
   matching this project's typed-confirmation pattern for other destructive or
   unusual operations. A **cached-mode** cluster (`bootstrap_direct_download:
-  false`) can only reach a version its bastion cache manifest supports; since
-  that manifest is pinned per controller release (see
-  [DEVELOPMENT.md](../DEVELOPMENT.md#bastion-bootstrap-cache)), an RKE2
-  version bump on a cached cluster is normally paired with a
-  `modules_version` bump to a release that pins the new version. A
-  **direct-download** cluster (`bootstrap_direct_download: true`) can upgrade
+  false`) still pulls the new release's system images from the bastion, so it
+  can move only to the one RKE2 release its target `modules_version` pins
+  (see [DEVELOPMENT.md](../DEVELOPMENT.md#bastion-bootstrap-cache)); the
+  bootstrap cache refresh above adds that release first and refuses any other
+  `rke2_version` before a server is touched. An RKE2 upgrade on a cached
+  cluster is therefore paired with a `modules_version` that pins the new
+  release, and a `modules_version` bump alone keeps the running RKE2 release.
+  A **direct-download** cluster (`bootstrap_direct_download: true`) can upgrade
   to any valid RKE2 release independently of `modules_version`.
 
 `update` still puts `control_plane_extra_config` in RKE2's operator fragment

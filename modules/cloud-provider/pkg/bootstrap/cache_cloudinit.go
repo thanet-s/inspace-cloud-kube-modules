@@ -74,7 +74,7 @@ func RenderCacheBastionCloudInitJSON(input CacheBastionCloudInitInput) (string, 
 	}{
 		{"/usr/local/sbin/inspace-bootstrap-cache-bastion", renderCacheBastionBootstrapScript(input), "0700"},
 		{"/usr/local/sbin/inspace-cache-start", renderCacheStartScript(input), "0700"},
-		{"/usr/local/sbin/inspace-cache-maintain", renderCacheMaintenanceScript(input.RKE2Version), "0700"},
+		{"/usr/local/sbin/inspace-cache-maintain", cacheMaintenanceScript, "0700"},
 		{"/etc/docker/daemon.json", cacheDockerDaemonJSON, "0644"},
 		{"/etc/inspace-cache/nginx.conf", renderCacheNginxConfig(), "0644"},
 		{"/etc/inspace-cache/registry.yml", cacheRegistryConfig, "0644"},
@@ -603,13 +603,16 @@ done
 `)
 }
 
-func renderCacheMaintenanceScript(pinnedVersion string) string {
-	return strings.ReplaceAll(`#!/bin/sh
+// cacheMaintenanceScript keeps every verified RKE2 release directory: the
+// bootstrap seed and each release `deploy update` adds stay served to
+// Karpenter workers for the cluster's life. NGINX reads never refresh a
+// release directory's atime, so age-based pruning would silently remove the
+// release the NodeClass requests. deploy/templates/refresh-bootstrap-cache.sh
+// installs these exact bytes on bastions built by earlier releases.
+const cacheMaintenanceScript = `#!/bin/sh
 set -eu
 cache_root=/var/lib/inspace/bootstrap-cache
-pinned_version=__PINNED_VERSION__
 test "$(findmnt -n -o TARGET "$cache_root")" = "$cache_root"
-find "$cache_root/artifacts/rke2" -mindepth 1 -maxdepth 1 -type d ! -name "$pinned_version" -atime +30 -exec rm -rf -- {} +
 docker container prune --force --filter until=720h >/dev/null
 docker image prune --force --filter until=720h >/dev/null
 available="$(df --output=avail -B1 "$cache_root" | tail -1 | tr -d ' ')"
@@ -618,8 +621,7 @@ if [ "$available" -lt 1000000000 ]; then
   echo "bootstrap cache has less than 1 GB free" >&2
   exit 1
 fi
-`, "__PINNED_VERSION__", pinnedVersion)
-}
+`
 
 func shellSingleQuote(value string) string {
 	return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'"
