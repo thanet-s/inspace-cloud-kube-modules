@@ -407,14 +407,18 @@ Some InSpace floating IPs have no working internet egress; `waitForInternet`
 bootstrap gate (see [RKE2 agent bootstrap](#rke2-agent-bootstrap)) exits
 before RKE2 install on the guest, so the Node never registers and Karpenter's
 own registration-liveness timeout eventually deletes and replaces that
-NodeClaim. `Delete()` treats a NodeClaim that never satisfied its
-`Registered` condition as a signal that its exact floating IP may be bad and
-records the address, with a timestamp, in a single `ConfigMap` named
-`inspace-bad-floating-ips` in the controller's namespace. `Create()` checks a
-newly assigned address against that record; if it was marked bad within the
-last 30 days, the just-created VM is deleted immediately and Create returns a
-retryable error, skipping the wait for the guest to fail its own connectivity
-gate and for Karpenter's liveness timeout to notice. InSpace floating IPs are
+NodeClaim. `Delete()` treats a NodeClaim whose `Registered` condition stayed
+unsatisfied for at least the 9-minute fast registration timeout as a signal
+that its exact floating IP may be bad and records the address, with a
+timestamp, in a single `ConfigMap` named `inspace-bad-floating-ips` in the
+controller's namespace. A NodeClaim deleted sooner was removed for another
+reason and records nothing, and an address that is already recorded keeps its
+original timestamp. `Create()` checks a newly assigned address against that
+record; if it was marked bad within the last 30 days, the just-created VM is
+deleted immediately (without refreshing the record) and Create returns an
+insufficient-capacity error, so Karpenter replaces the NodeClaim at once
+instead of waiting for the guest to fail its own connectivity gate and for the
+liveness timeout to notice. InSpace floating IPs are
 drawn from a shared, reused pool, so a persistently bad address is more
 likely to repeat within that window than a genuinely transient one.
 

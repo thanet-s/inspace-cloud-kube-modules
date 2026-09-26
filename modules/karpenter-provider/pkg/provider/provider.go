@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/awslabs/operatorpkg/status"
 	corev1 "k8s.io/api/core/v1"
@@ -66,6 +67,7 @@ type CloudProvider struct {
 	opts     Options
 	cache    CacheHealthProber
 	fences   CreateFenceStore
+	now      func() time.Time
 }
 
 func New(cloud cloudapi.Cloud, resolver NodeClassResolver, opts Options) (*CloudProvider, error) {
@@ -96,7 +98,7 @@ func New(cloud cloudapi.Cloud, resolver NodeClassResolver, opts Options) (*Cloud
 	if cache == nil {
 		cache = HTTPSCacheHealthProber{}
 	}
-	return &CloudProvider{cloud: cloud, resolver: resolver, opts: opts, cache: cache, fences: opts.CreateFenceStore}, nil
+	return &CloudProvider{cloud: cloud, resolver: resolver, opts: opts, cache: cache, fences: opts.CreateFenceStore, now: time.Now}, nil
 }
 
 func (p *CloudProvider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim) (*karpv1.NodeClaim, error) {
@@ -421,28 +423,59 @@ func (p *CloudProvider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim)
 		// Best-effort fast path only: a store error must never block node
 		// provisioning, so any failure here is treated as "not known bad".
 		if bad, checkErr := p.opts.BadFloatingIPs.IsRecentlyBad(ctx, vm.PublicIPv4); checkErr == nil && bad {
-			if deleteErr := p.Delete(ctx, created); deleteErr != nil && !cloudprovider.IsNodeClaimNotFoundError(deleteErr) {
+			// This deletion is our own choice, not evidence about the address,
+			// so it must not refresh the existing bad-address entry.
+			if deleteErr := p.delete(ctx, created, false); deleteErr != nil && !cloudprovider.IsNodeClaimNotFoundError(deleteErr) {
 				return nil, fmt.Errorf("deleting VM %s on known-bad floating IP %s: %w", vm.UUID, vm.PublicIPv4, deleteErr)
 			}
-			return nil, fmt.Errorf("floating IP %s was recorded bad by a previous provisioning failure within the last %s; deleted VM %s and requesting a fresh attempt", vm.PublicIPv4, badFloatingIPRetention, vm.UUID)
+			// The durable create fence is already materialized for this NodeClaim,
+			// so retrying the same claim cannot launch a replacement VM. An
+			// insufficient-capacity error makes Karpenter delete this claim and
+			// provision a fresh one immediately instead of waiting for the
+			// registration timeout.
+			return nil, cloudprovider.NewInsufficientCapacityError(fmt.Errorf(
+				"floating IP %s was recorded bad by a previous provisioning failure within the last %s; deleted VM %s and requesting a fresh NodeClaim",
+				vm.PublicIPv4, badFloatingIPRetention, vm.UUID))
 		}
 	}
 	return created, nil
 }
 
 func (p *CloudProvider) Delete(ctx context.Context, nodeClaim *karpv1.NodeClaim) error {
+	return p.delete(ctx, nodeClaim, true)
+}
+
+// recordRegistrationTimeoutFloatingIP remembers the floating IP of a NodeClaim
+// that is being deleted after it stayed unregistered for at least the
+// shortest registration timeout. That is the strongest signal available,
+// without new VM-to-controller plumbing, that this specific launch failed
+// outright -- most commonly a floating IP with no working internet egress.
+// Earlier deletions have other causes and say nothing about the address. An
+// existing entry is never refreshed, so repeated deletions cannot extend it.
+// This is a best-effort record: a store error must never block deletion.
+func (p *CloudProvider) recordRegistrationTimeoutFloatingIP(ctx context.Context, nodeClaim *karpv1.NodeClaim) {
+	publicIP := nodeClaim.Annotations[AnnotationPublicIPv4]
+	if publicIP == "" || p.opts.BadFloatingIPs == nil {
+		return
+	}
+	registered := nodeClaim.StatusConditions().Get(karpv1.ConditionTypeRegistered)
+	if registered == nil || registered.IsTrue() || registered.LastTransitionTime.IsZero() ||
+		p.now().Sub(registered.LastTransitionTime.Time) < fastRegistrationTimeout {
+		return
+	}
+	if bad, err := p.opts.BadFloatingIPs.IsRecentlyBad(ctx, publicIP); err != nil || bad {
+		return
+	}
+	_ = p.opts.BadFloatingIPs.RecordBad(ctx, publicIP)
+}
+
+func (p *CloudProvider) delete(ctx context.Context, nodeClaim *karpv1.NodeClaim, recordBadFloatingIP bool) error {
 	id, err := providerid.Parse(nodeClaim.Status.ProviderID)
 	if err != nil {
 		return fmt.Errorf("parsing provider ID for deletion: %w", err)
 	}
-	if publicIP := nodeClaim.Annotations[AnnotationPublicIPv4]; publicIP != "" && p.opts.BadFloatingIPs != nil &&
-		!nodeClaim.StatusConditions().Get(karpv1.ConditionTypeRegistered).IsTrue() {
-		// A NodeClaim deleted before it ever registered a Node is the
-		// strongest signal available, without new VM-to-controller
-		// plumbing, that this specific launch failed outright -- most
-		// commonly a floating IP with no working internet egress. This is a
-		// best-effort record: a store error must never block deletion.
-		_ = p.opts.BadFloatingIPs.RecordBad(ctx, publicIP)
+	if recordBadFloatingIP {
+		p.recordRegistrationTimeoutFloatingIP(ctx, nodeClaim)
 	}
 	deleteIdentity := cloudapi.DeleteVMIdentity{
 		FloatingIPName: nodeClaim.Annotations[AnnotationFloatingIP],
