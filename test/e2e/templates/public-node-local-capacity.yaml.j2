@@ -15,7 +15,7 @@ spec:
   firewallProfile: public-node-local
   imageSelector:
     osName: {{ lookup('env', 'INSPACE_OS_NAME') | default('ubuntu', true) }}
-    osVersion: "{{ lookup('env', 'INSPACE_OS_VERSION') | default('24.04', true) }}"
+    osVersion: "{{ lookup('env', 'INSPACE_OS_VERSION') | default('26.04', true) }}"
   rootDiskGiB: 30
   bootstrapCache:
     directDownload: false

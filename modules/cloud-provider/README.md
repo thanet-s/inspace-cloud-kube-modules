@@ -15,9 +15,9 @@ reconciler, using the repository's shared location-aware API client.
   Services use Cilium LB-IPAM plus L2 announcements. Public Services can use a
   deterministic paid TCP-only InSpace NLB, CCM-managed shared or dedicated
   Node-LB shards, or operator-owned endpoint-local edge nodes.
-- A reconciler that first creates one fixed Ubuntu 24.04 bastion
+- A reconciler that first creates one fixed Ubuntu bastion on the control-plane release
   (1 vCPU/2048 MiB/30 GiB), then creates either one low-cost or exactly three
-  HA Ubuntu 24.04 RKE2 servers in deterministic slot order. Each server's restrictive firewall
+  HA Ubuntu 26.04 RKE2 servers in deterministic slot order. Each server's restrictive firewall
   assignment is authoritatively proven before the next VM POST; already
   protected servers may continue booting in parallel. The API and RKE2
   registration use a caller-selected private VPC VIP; bootstrap creates no
@@ -119,7 +119,9 @@ next VM POST. `spec.controlPlane.replicas` is required, immutable, and accepts
 only `1` or `3`; two-server embedded-etcd topology is deliberately unsupported.
 Protected servers may continue booting in parallel, and slot-ordered errors
 retain every successful VM for the next pass. Each server must use exactly
-Ubuntu 24.04 with 2-16 vCPUs and 4096-65536 MiB memory.
+Ubuntu 26.04 or 24.04 with 2-16 vCPUs and 4096-65536 MiB memory. Every
+node switches `/bin/sh` login shells to `/bin/bash` and derives its APT
+suites (`resolute` or `noble`) from the booted release.
 
 Bootstrap persists bounded mutation ledgers in status. `status.createAttempts`
 holds fourteen create/assignment/update slots: two firewall creates, four VM

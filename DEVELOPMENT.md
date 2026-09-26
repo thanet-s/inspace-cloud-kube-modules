@@ -45,8 +45,8 @@ enabled for cluster networking. Ansible reaches private node addresses through
 the bastion. A VM is not ready until its intended cloud firewall assignment has
 been read back and verified.
 
-The bootstrap-owned bastion is fixed to Ubuntu 24.04, 1 vCPU, 2 GiB RAM, and a
-30 GiB root disk. Fixed control-plane nodes require Ubuntu 24.04 with at least
+The bootstrap-owned bastion uses the control-plane Ubuntu release, 1 vCPU, 2 GiB RAM, and a
+30 GiB root disk. Fixed control-plane nodes require Ubuntu 26.04 (or 24.04) with at least
 2 vCPUs and 4 GiB RAM.
 
 ### Node naming and preparation

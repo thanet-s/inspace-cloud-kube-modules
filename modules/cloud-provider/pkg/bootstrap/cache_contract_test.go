@@ -526,7 +526,7 @@ func TestDirectControlPlaneCloudInitV9OwnershipBytes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	const v9DirectHash = "1304eed8a8f626c625d3ee1aef0c84023b082f73682491a58da63d71eccfb7ad"
+	const v9DirectHash = "7f87513ec082776419f979dcb8d35dcbfede75e8bb7f3d25e82048fb2365814f"
 	if got := fmt.Sprintf("%x", sha256.Sum256([]byte(raw))); got != v9DirectHash {
 		t.Fatalf("direct control-plane cloud-init hash=%s, want frozen v9 hash %s", got, v9DirectHash)
 	}

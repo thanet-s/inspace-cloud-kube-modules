@@ -606,7 +606,9 @@
         esac
         . /etc/os-release
         test "$ID" = ubuntu
-        test "$VERSION_ID" = 24.04
+        test "$VERSION_ID" = {{ e2e_os_version | quote }}
+        ! awk -F: '($3 == 0 || ($3 >= 1000 && $3 < 65534)) && $7 ~ /^(\/usr)?\/bin\/(sh|dash)$/' /etc/passwd | grep -q .
+        test "$(grep -E '^SHELL=' /etc/default/useradd)" = SHELL=/bin/bash
       args:
         executable: /bin/bash
       become: true
@@ -822,13 +824,13 @@
         content: |
           Types: deb
           URIs: mirror+file:/etc/apt/mirrors/inspace-ubuntu.list
-          Suites: noble noble-updates noble-backports
+          Suites: {{ e2e_ubuntu_codename }} {{ e2e_ubuntu_codename }}-updates {{ e2e_ubuntu_codename }}-backports
           Components: main restricted universe multiverse
           Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
 
           Types: deb
           URIs: mirror+file:/etc/apt/mirrors/inspace-ubuntu.list
-          Suites: noble-security
+          Suites: {{ e2e_ubuntu_codename }}-security
           Components: main restricted universe multiverse
           Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
         dest: /etc/apt/sources.list.d/ubuntu.sources
@@ -1101,8 +1103,8 @@
         grep -Fqx $'http://mirror1.totbb.net/ubuntu/\tpriority:1' /etc/apt/mirrors/inspace-ubuntu.list
         grep -Fqx $'https://mirror.kku.ac.th/ubuntu/\tpriority:2' /etc/apt/mirrors/inspace-ubuntu.list
         test "$(grep -Fc 'URIs: mirror+file:/etc/apt/mirrors/inspace-ubuntu.list' /etc/apt/sources.list.d/ubuntu.sources)" -eq 2
-        grep -Fqx 'Suites: noble noble-updates noble-backports' /etc/apt/sources.list.d/ubuntu.sources
-        grep -Fqx 'Suites: noble-security' /etc/apt/sources.list.d/ubuntu.sources
+        grep -Fqx 'Suites: {{ e2e_ubuntu_codename }} {{ e2e_ubuntu_codename }}-updates {{ e2e_ubuntu_codename }}-backports' /etc/apt/sources.list.d/ubuntu.sources
+        grep -Fqx 'Suites: {{ e2e_ubuntu_codename }}-security' /etc/apt/sources.list.d/ubuntu.sources
         test ! -L /etc/resolv.conf
         grep -Fqx 'nameserver 8.8.8.8' /etc/resolv.conf
         grep -Fqx 'nameserver 8.8.4.4' /etc/resolv.conf
@@ -1142,7 +1144,9 @@
         esac
         . /etc/os-release
         test "$ID" = ubuntu
-        test "$VERSION_ID" = 24.04
+        test "$VERSION_ID" = {{ e2e_os_version | quote }}
+        ! awk -F: '($3 == 0 || ($3 >= 1000 && $3 < 65534)) && $7 ~ /^(\/usr)?\/bin\/(sh|dash)$/' /etc/passwd | grep -q .
+        test "$(grep -E '^SHELL=' /etc/default/useradd)" = SHELL=/bin/bash
       args:
         executable: /bin/bash
       become: true
@@ -2048,8 +2052,8 @@
         grep -Fqx $'http://mirror1.totbb.net/ubuntu/\tpriority:1' /etc/apt/mirrors/inspace-ubuntu.list
         grep -Fqx $'https://mirror.kku.ac.th/ubuntu/\tpriority:2' /etc/apt/mirrors/inspace-ubuntu.list
         test "$(grep -Fc 'URIs: mirror+file:/etc/apt/mirrors/inspace-ubuntu.list' /etc/apt/sources.list.d/ubuntu.sources)" -eq 2
-        grep -Fqx 'Suites: noble noble-updates noble-backports' /etc/apt/sources.list.d/ubuntu.sources
-        grep -Fqx 'Suites: noble-security' /etc/apt/sources.list.d/ubuntu.sources
+        grep -Fqx 'Suites: {{ e2e_ubuntu_codename }} {{ e2e_ubuntu_codename }}-updates {{ e2e_ubuntu_codename }}-backports' /etc/apt/sources.list.d/ubuntu.sources
+        grep -Fqx 'Suites: {{ e2e_ubuntu_codename }}-security' /etc/apt/sources.list.d/ubuntu.sources
         test ! -L /etc/resolv.conf
         grep -Fqx 'nameserver 8.8.8.8' /etc/resolv.conf
         grep -Fqx 'nameserver 8.8.4.4' /etc/resolv.conf
@@ -2093,7 +2097,9 @@
         esac
         . /etc/os-release
         test "$ID" = ubuntu
-        test "$VERSION_ID" = 24.04
+        test "$VERSION_ID" = {{ e2e_os_version | quote }}
+        ! awk -F: '($3 == 0 || ($3 >= 1000 && $3 < 65534)) && $7 ~ /^(\/usr)?\/bin\/(sh|dash)$/' /etc/passwd | grep -q .
+        test "$(grep -E '^SHELL=' /etc/default/useradd)" = SHELL=/bin/bash
       args:
         executable: /bin/bash
       become: true

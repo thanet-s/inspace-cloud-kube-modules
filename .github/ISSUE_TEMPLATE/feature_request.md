@@ -23,7 +23,7 @@ Any workarounds you're using today, or other approaches you considered.
 ## Supported-scope impact
 
 Does this fit the current [supported scope](../../README.md#supported-scope)
-(Ubuntu 24.04, `linux/amd64`, RKE2, Cilium native routing)? If it extends
+(Ubuntu 26.04, `linux/amd64`, RKE2, Cilium native routing)? If it extends
 that scope, say so explicitly.
 
 ## Additional context

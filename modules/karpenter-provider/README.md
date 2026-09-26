@@ -13,7 +13,7 @@ runnable Karpenter controller command.
 - A finite 31-shape catalog across `compute`, `general`, `memory`, and
   `extra-memory` families
 - Maximum 16 vCPU / 64 GiB across the catalog
-- Ubuntu 24.04 and an exactly pinned RKE2 agent version
+- Ubuntu 26.04 (24.04 still accepted), a bash login shell, and an exactly pinned RKE2 agent version
 - Ephemeral root disks; persistent workload data belongs on RWO CSI volumes
 - One immutable, inclusive 16-to-256-address RFC1918 Service VIP range reserved
   from worker NIC allocation
@@ -442,7 +442,7 @@ the stock timeout would.
 
 ## RKE2 agent bootstrap
 
-`cloud_init` is sent as an API-compatible JSON object. On stock Ubuntu 24.04 it:
+`cloud_init` is sent as an API-compatible JSON object. On stock Ubuntu 26.04 or 24.04 it:
 
 - sets `/etc/hostname`, the active guest hostname, and RKE2 `node-name` to the
   same validated worker name;

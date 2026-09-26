@@ -17,7 +17,7 @@ spec:
   firewallProfile: public-node-local
   imageSelector:
     osName: ubuntu
-    osVersion: "24.04"
+    osVersion: "26.04"
   rootDiskGiB: 30
   bootstrapCache:
     # Use the bastion cache address and CA here when the cluster cache is on.

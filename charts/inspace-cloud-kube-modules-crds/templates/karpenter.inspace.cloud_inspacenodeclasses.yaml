@@ -127,7 +127,7 @@ spec:
                       enum: [ubuntu]
                     osVersion:
                       type: string
-                      enum: ["24.04"]
+                      enum: ["24.04", "26.04"]
                 rootDiskGiB:
                   type: integer
                   format: int32

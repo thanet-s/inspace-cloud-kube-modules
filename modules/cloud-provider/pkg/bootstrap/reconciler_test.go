@@ -37,7 +37,7 @@ func TestReconcileBuildsBastionThenExactlyThreeControlPlaneVMs(t *testing.T) {
 		t.Fatalf("first reconcile did not create only the bastion: result=%#v creates=%#v", first, api.vmCreates)
 	}
 	if api.vmCreates[0].VCPU != BastionVCPU || api.vmCreates[0].MemoryMiB != BastionMemoryMiB || api.vmCreates[0].DiskGiB != BastionRootDiskGiB ||
-		api.vmCreates[0].OSName != "ubuntu" || api.vmCreates[0].OSVersion != "24.04" {
+		api.vmCreates[0].OSName != "ubuntu" || api.vmCreates[0].OSVersion != "26.04" {
 		t.Fatalf("bastion shape = %#v", api.vmCreates[0])
 	}
 	owner := ownerKey(cluster)
@@ -4762,7 +4762,7 @@ func testCluster() *v1alpha1.InSpaceCluster {
 			CredentialsSecretRef: v1alpha1.SecretKeyReference{Name: "inspace-api", Key: "apikey"},
 			ControlPlane: v1alpha1.ControlPlaneSpec{Replicas: 3, Machine: v1alpha1.MachineSpec{
 				VCPU: 4, MemoryMiB: 8192, RootDiskGiB: 60,
-				HostPoolUUID: "aac7dd66-f390-4edd-80c0-dd7cae49bd99", Image: v1alpha1.ImageSpec{OSName: "ubuntu", OSVersion: "24.04"},
+				HostPoolUUID: "aac7dd66-f390-4edd-80c0-dd7cae49bd99", Image: v1alpha1.ImageSpec{OSName: "ubuntu", OSVersion: "26.04"},
 			}},
 			RKE2: v1alpha1.RKE2Spec{Version: "v1.36.4+rke2r1", TokenSecretRef: v1alpha1.SecretKeyReference{Name: "rke2-token", Key: "token"}, Disable: []string{"rke2-ingress-nginx", "rke2-traefik"}},
 			Network: v1alpha1.NetworkSpec{
@@ -5089,7 +5089,8 @@ func assertUbuntuRepositoryAndResolver(t *testing.T, files map[string]string, sc
 	}
 	for _, required := range []string{
 		"install -m 0644 /var/lib/inspace/ubuntu-mirrors.list /etc/apt/mirrors/inspace-ubuntu.list",
-		"install -m 0644 /var/lib/inspace/ubuntu.sources /etc/apt/sources.list.d/ubuntu.sources",
+		strings.TrimSpace(renderUbuntuSourcesInstallCommands()),
+		strings.TrimSpace(renderBashLoginShellCommands()),
 		"install -m 0644 /var/lib/inspace/static-resolv.conf /etc/resolv.conf",
 		"systemctl disable --now systemd-resolved.service", "systemctl mask systemd-resolved.service",
 		"test ! -L /etc/resolv.conf", "nameserver 8.8.8.8", "nameserver 8.8.4.4",
