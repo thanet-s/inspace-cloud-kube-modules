@@ -49,3 +49,17 @@
       - persisted_inspace_cluster.spec.rke2.get('skipOSUpgrade', false) | bool == skip_os_upgrade | bool
       - persisted_inspace_cluster.spec.bootstrapCache.get('directDownload', false) | bool == bootstrap_direct_download | bool
     fail_msg: "The deployment journal belongs to another cluster or topology."
+
+# These settings live in the immutable control-plane cloud-init and the on-disk
+# rke2-cilium HelmChartConfig; update never rewrites either.
+- name: Require the creation-time Cilium load-balancer settings
+  ansible.builtin.assert:
+    that:
+      - persisted_inspace_cluster.spec.network.get('loadBalancerAlgorithm', '') == deploy_load_balancer_algorithm
+      - persisted_inspace_cluster.spec.network.get('serviceTopology', false) | bool == deploy_service_topology | bool
+    fail_msg: >-
+      load_balancer_algorithm and service_topology are fixed at cluster creation
+      (this cluster: load_balancer_algorithm
+      "{{ persisted_inspace_cluster.spec.network.get('loadBalancerAlgorithm', '') }}",
+      service_topology {{ persisted_inspace_cluster.spec.network.get('serviceTopology', false) | bool | lower }});
+      restore those inventory values. Changing them requires a new cluster.
