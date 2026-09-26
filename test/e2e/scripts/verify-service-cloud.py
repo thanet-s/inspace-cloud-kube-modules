@@ -92,6 +92,12 @@ def require_exact_load_balancer_inventory(
         )
 
 
+def require_private_service_identities(private_lb_names: set[str], private_fip_names: set[str]) -> None:
+    """Require the journaled private-a and private-b identities, plus private-local once its case ran."""
+    if len(private_lb_names) not in (2, 3) or len(private_fip_names) != len(private_lb_names):
+        raise SystemExit("workload ownership journal lacks the exact private Service identities")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--state", required=True)
@@ -168,8 +174,9 @@ def main() -> None:
         print(json.dumps({"public": "absent"}, sort_keys=True))
         return
 
-    if not public_lb_name or not public_fip_name or len(private_lb_names) != 2 or len(private_fip_names) != 2:
-        raise SystemExit("workload ownership journal lacks the exact three Service identities")
+    if not public_lb_name or not public_fip_name:
+        raise SystemExit("workload ownership journal lacks the public Service identity")
+    require_private_service_identities(private_lb_names, private_fip_names)
     if len(public_lbs) != 1 or len(public_fips) != 1:
         raise SystemExit("public Service must own exactly one InSpace NLB and one FIP")
     load_balancer = public_lbs[0]
