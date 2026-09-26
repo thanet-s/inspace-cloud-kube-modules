@@ -3708,6 +3708,22 @@ def main() -> None:
     service_cloud_module = load_script_module(
         "e2e_verify_service_cloud_static", ROOT / "scripts/verify-service-cloud.py"
     )
+    # persist-workload.py journals private-a and private-b, plus private-local
+    # once the ETP=Local L2 case has run; the v1.1.0-rc.6 E2E failed because
+    # the verifier demanded exactly two.
+    for lb_count, fip_count, accepted in (
+        (2, 2, True), (3, 3, True), (1, 1, False), (4, 4, False), (3, 2, False),
+    ):
+        lb_names = {f"k8s-cluster-private-{index}" for index in range(lb_count)}
+        fip_names = {f"k8s-cluster-private-{index}-ip" for index in range(fip_count)}
+        try:
+            service_cloud_module.require_private_service_identities(lb_names, fip_names)
+            outcome = True
+        except SystemExit:
+            outcome = False
+        require(outcome == accepted,
+                f"service cloud verifier must {'accept' if accepted else 'reject'} "
+                f"{lb_count} private NLB and {fip_count} FIP identities")
     with tempfile.TemporaryDirectory() as directory:
         immutable_baseline = pathlib.Path(directory) / "baseline-inventory.json"
         immutable_baseline.write_text(json.dumps({
