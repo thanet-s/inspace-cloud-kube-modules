@@ -1733,13 +1733,15 @@ case "$arguments" in
     fi
     exit 0 ;;
   *" exec cilium-a -c cilium-agent -- cilium-dbg metrics list -p drift_checker_config_delta -o json "*)
-    echo '[{"name":"cilium_drift_checker_config_delta","labels":{},"value":0}]'
+    # Cilium 1.20 encodes models.Metric with omitempty, so an in-sync gauge of 0
+    # has no "value" (or "labels") field at all.
+    echo '[{"name":"cilium_drift_checker_config_delta"}]'
     exit 0 ;;
   *" exec cilium-b -c cilium-agent -- cilium-dbg metrics list -p drift_checker_config_delta -o json "*)
     case $FAKE_SCENARIO in
       drifted) echo '[{"name":"cilium_drift_checker_config_delta","labels":{},"value":3}]' ;;
       absent) echo '[]' ;;
-      *) echo '[{"name":"cilium_drift_checker_config_delta","labels":{},"value":0}]' ;;
+      *) echo '[{"name":"cilium_drift_checker_config_delta"}]' ;;
     esac
     exit 0 ;;
 esac

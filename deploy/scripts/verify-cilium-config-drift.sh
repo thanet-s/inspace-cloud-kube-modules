@@ -6,6 +6,8 @@
 # keys whose value differs from the settings the running agent started with.
 # A non-zero value means a setting changed without an agent restart. The gauge
 # is read with `cilium-dbg metrics list`, so no Prometheus endpoint is needed.
+# Its JSON omits "value" when the gauge is 0 (omitempty), so a listed metric
+# without a value means zero; a missing metric entry still fails.
 # The deploy and E2E copies of this script are kept byte-identical.
 set -euo pipefail
 
@@ -42,7 +44,7 @@ while IFS=$'\t' read -r pod node; do
     cilium-dbg metrics list -p drift_checker_config_delta -o json) ||
     fail "cannot read metrics from Cilium agent $pod on node $node"
   delta=$(jq -er '
-    [.[] | select(.name == "cilium_drift_checker_config_delta") | .value] |
+    [.[] | select(.name == "cilium_drift_checker_config_delta") | (.value // 0)] |
     if length == 1 and (.[0] | type) == "number" then .[0] else error("absent") end' \
     <<<"$metrics" 2>/dev/null) ||
     fail "Cilium agent $pod on node $node does not publish cilium_drift_checker_config_delta"
