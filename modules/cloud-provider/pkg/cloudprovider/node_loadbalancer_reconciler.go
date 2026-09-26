@@ -5118,7 +5118,9 @@ func (c *nodeLoadBalancerController) cleanupService(ctx context.Context, service
 		c.queue.AddAfter(service.Namespace+"/"+service.Name, nodeLoadBalancerRetry)
 		return nil
 	}
-	confirmedAbsent, changed, err := c.recordFirewallAbsence(
+	// The pass that records the final spaced absence proof continues straight
+	// to finalization; only an unfinished proof waits for the spacing delay.
+	confirmedAbsent, _, err := c.recordFirewallAbsence(
 		ctx,
 		service,
 		annotationNodeLoadBalancerCleanupFWAbsent,
@@ -5129,7 +5131,7 @@ func (c *nodeLoadBalancerController) cleanupService(ctx context.Context, service
 	if err != nil {
 		return err
 	}
-	if changed || !confirmedAbsent {
+	if !confirmedAbsent {
 		c.queue.AddAfter(service.Namespace+"/"+service.Name, nodeLoadBalancerAbsenceConfirmationDelay)
 		return nil
 	}
@@ -5685,7 +5687,9 @@ func (c *nodeLoadBalancerController) deleteOwnedServiceFirewall(ctx context.Cont
 			current = updated
 			target = uuid
 		}
-		confirmed, changed, confirmErr := c.recordFirewallAbsence(
+		// The pass that records the final spaced absence proof may clear the
+		// receipt immediately; the clear re-checks the persisted count.
+		confirmed, _, confirmErr := c.recordFirewallAbsence(
 			ctx,
 			current,
 			annotationNodeLoadBalancerCleanupFWAbsent,
@@ -5693,7 +5697,7 @@ func (c *nodeLoadBalancerController) deleteOwnedServiceFirewall(ctx context.Cont
 			c.nodeLoadBalancerFirewallRelationTime(),
 			time.Time{},
 		)
-		if confirmErr != nil || changed || !confirmed {
+		if confirmErr != nil || !confirmed {
 			return false, confirmErr
 		}
 		cleared, _, clearErr := c.updateExactParentService(ctx, current, func(copy *corev1.Service) (bool, error) {

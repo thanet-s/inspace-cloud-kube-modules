@@ -2085,7 +2085,9 @@ func (c *nodeLoadBalancerController) cleanupPublicNodeLocal(ctx context.Context,
 		c.requeuePublicNodeLocal(key)
 		return nil
 	}
-	confirmedAbsent, changed, err := c.recordFirewallAbsence(
+	// The pass that records the final spaced absence proof continues straight
+	// to finalization; only an unfinished proof waits for the spacing delay.
+	confirmedAbsent, _, err := c.recordFirewallAbsence(
 		ctx,
 		service,
 		annotationNodeLoadBalancerCleanupFWAbsent,
@@ -2096,7 +2098,7 @@ func (c *nodeLoadBalancerController) cleanupPublicNodeLocal(ctx context.Context,
 	if err != nil {
 		return err
 	}
-	if changed || !confirmedAbsent {
+	if !confirmedAbsent {
 		if c.queue != nil {
 			c.queue.AddAfter(key, nodeLoadBalancerAbsenceConfirmationDelay)
 		}
