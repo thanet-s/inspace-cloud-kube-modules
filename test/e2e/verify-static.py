@@ -2209,6 +2209,91 @@ def verify_gateway_api_e2e_contract(
             "E2E README must document the Gateway API acceptance case")
 
 
+def verify_rke2_agent_token_e2e(init_playbook: str) -> None:
+    """Workers join with a separate agent token; the server token stays on servers."""
+    require(
+        'e2e_agent_token_file: "{{ lookup(\'env\', \'E2E_STATE_DIR\') }}/rke2-agent-token"' in init_playbook,
+        "E2E must keep the RKE2 agent token in its own state file",
+    )
+    stat = named_yaml_sequence_item(init_playbook, "Check whether an RKE2 agent join token already exists for a resumed run", 4)
+    generate = named_yaml_sequence_item(init_playbook, "Generate the separate RKE2 agent join token inside the runner", 4)
+    persist = named_yaml_sequence_item(init_playbook, "Persist the RKE2 agent join token with restrictive permissions", 4)
+    validate = named_yaml_sequence_item(init_playbook, "Require a separate persisted RKE2 agent join token", 4)
+    require(
+        'path: "{{ e2e_agent_token_file }}"' in stat
+        and 'argv: [openssl, rand, -hex, "32"]' in generate
+        and "no_log: true" in generate
+        and "when: not e2e_agent_token_stat.stat.exists" in generate
+        and 'dest: "{{ e2e_agent_token_file }}"' in persist
+        and 'mode: "0600"' in persist
+        and "no_log: true" in persist,
+        "E2E must generate a 256-bit agent token and persist it mode 0600 without logging",
+    )
+    require(
+        init_playbook.index("- name: Persist the RKE2 agent join token with restrictive permissions\n")
+        < init_playbook.index("- name: Persist the RKE2 registration token with restrictive permissions\n"),
+        "E2E must persist the agent token before the server token",
+    )
+    require(
+        "e2e_persisted_agent_token.stat.mode == '0600'" in validate
+        and "lookup('file', e2e_agent_token_file) is match('^[0-9a-f]{64}$')" in validate
+        and "lookup('file', e2e_agent_token_file) | trim != lookup('file', e2e_token_file) | trim" in validate
+        and "no_log: true" in validate,
+        "E2E must prove the agent token is 0600, 256-bit hex, and distinct from the server token",
+    )
+    reconcile = named_yaml_sequence_item(init_playbook, "Run the bootstrap reconciler synchronously to readiness", 4)
+    require(
+        "INSPACE_RKE2_AGENT_TOKEN: \"{{ lookup('file', e2e_agent_token_file) | trim }}\"" in reconcile
+        and "no_log: true" in reconcile
+        and re.search(r"--[a-z-]*agent-token", reconcile) is None,
+        "the E2E bootstrap controller must receive the agent token only through its environment",
+    )
+    secret = named_yaml_sequence_item(init_playbook, "Create the cloud and RKE2 registration secrets", 4)
+    agent_secret = secret[secret.index("create secret generic inspace-rke2-agent-token"):]
+    require(
+        '--from-file="token={{ e2e_state_dir }}/rke2-agent-token"' in agent_secret
+        and "/rke2-token" not in agent_secret
+        and "no_log: true" in secret,
+        "the E2E worker Secret must carry the agent token, never the server token",
+    )
+
+
+def verify_credentials_stay_off_argv(repository: pathlib.Path) -> None:
+    """No playbook, script, or runbook puts a credential on a command line."""
+    roots = ("deploy", "test/e2e", "scripts", "modules", "charts", "README.md", "DEVELOPMENT.md")
+    suffixes = {".yml", ".yaml", ".sh", ".md", ".j2", ".txt"}
+    checked = 0
+    for root in roots:
+        base = repository / root
+        paths = [base] if base.is_file() else sorted(base.rglob("*")) if base.is_dir() else []
+        for path in paths:
+            if not path.is_file() or path.suffix not in suffixes:
+                continue
+            text = path.read_text(encoding="utf-8", errors="replace")
+            relative = path.relative_to(repository)
+            checked += 1
+            require(
+                re.search(r"--from-literal=[\"']?[\w.-]*token", text, re.IGNORECASE) is None,
+                f"{relative} passes a token to kubectl --from-literal, exposing it in argv",
+            )
+            require(
+                re.search(r"-H\s+[\"']apikey:\s*\$", text) is None,
+                f"{relative} passes the API token as a curl command-line header",
+            )
+    require(checked > 0, "credential argv scan found no files")
+    secret = named_yaml_sequence_item(
+        (ROOT / "init-cluster.yml").read_text(encoding="utf-8"), "Create the cloud and RKE2 registration secrets", 4
+    )
+    require(
+        "umask 077\n" in secret
+        and "secret_dir=$(mktemp -d)\n" in secret
+        and "trap 'rm -rf -- \"$secret_dir\"' EXIT\n" in secret
+        and "printf '%s' \"$INSPACE_API_TOKEN\" >\"$secret_dir/api-token\"\n" in secret
+        and '--from-file="api-token=$secret_dir/api-token"' in secret,
+        "E2E must hand the API token to kubectl through a removed 0600 file",
+    )
+
+
 def main() -> None:
     repository = repository_root()
     host = (ROOT / "run.sh").read_text(encoding="utf-8")
@@ -4490,6 +4575,8 @@ def main() -> None:
         and "\n      until: e2e_final_audit.rc == 0" in final_audit_task,
         "cleanup retries must use cloud-audit semantic exit statuses without parsing failed stdout",
     )
+    verify_rke2_agent_token_e2e(init_playbook)
+    verify_credentials_stay_off_argv(repository)
     print("E2E static contract verified (no live resources touched)")
 
 

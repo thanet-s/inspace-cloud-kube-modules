@@ -545,11 +545,14 @@ Recovery is an explicit, issue-bound protocol:
    LOCATION=$(jq -r '.metadata.annotations["karpenter.inspace.cloud/create-fence"] | fromjson | .cleanup.location' "$NODECLAIM.before-recovery.json")
    NETWORK_UUID=$(jq -r '.metadata.annotations["karpenter.inspace.cloud/create-fence"] | fromjson | .cleanup.networkUUID' "$NODECLAIM.before-recovery.json")
    BILLING_ID=$(jq -r '.metadata.annotations["karpenter.inspace.cloud/create-fence"] | fromjson | .cleanup.billingAccountID' "$NODECLAIM.before-recovery.json")
-   curl -fsS -H "apikey: $INSPACE_API_TOKEN" "https://api.inspace.cloud/v1/$LOCATION/user-resource/vm/list" >vm-list.json
-   curl -fsS -H "apikey: $INSPACE_API_TOKEN" "https://api.inspace.cloud/v1/$LOCATION/network/network/$NETWORK_UUID" >vpc.json
-   curl -fsS -H "apikey: $INSPACE_API_TOKEN" "https://api.inspace.cloud/v1/$LOCATION/network/ip_addresses?billing_account_id=$BILLING_ID" >floating-ips.json
+   # Pass the API token on stdin, not argv, so other local users cannot read it
+   # from the process table. printf is a shell builtin.
+   api() { printf 'apikey: %s\n' "$INSPACE_API_TOKEN" | curl -fsS -H @- "$@"; }
+   api "https://api.inspace.cloud/v1/$LOCATION/user-resource/vm/list" >vm-list.json
+   api "https://api.inspace.cloud/v1/$LOCATION/network/network/$NETWORK_UUID" >vpc.json
+   api "https://api.inspace.cloud/v1/$LOCATION/network/ip_addresses?billing_account_id=$BILLING_ID" >floating-ips.json
    # Run this for every candidate UUID found in any of those three views.
-   curl -fsS -G -H "apikey: $INSPACE_API_TOKEN" \
+   api -G \
      --data-urlencode "uuid=$VM_UUID" \
      "https://api.inspace.cloud/v1/$LOCATION/user-resource/vm" >"vm-$VM_UUID.json"
    ```
@@ -609,7 +612,7 @@ kubectl apply -f config/crd/bases/karpenter.inspace.cloud_inspacenodeclasses.yam
 kubectl apply -f config/controller/controller.yaml
 ```
 
-Create two distinct Secrets in `karpenter`: `inspace-api` for the controller's cloud credential and `inspace-rke2-agent-token` for the disposable RKE2 join token. Never reuse the API credential as the join token.
+Create two distinct Secrets in `karpenter`: `inspace-api` for the controller's cloud credential and `inspace-rke2-agent-token` for the disposable RKE2 join token. Never reuse the API credential as the join token. The join token must be the cluster's RKE2 agent token (the servers' `agent-token`), never the server token: every worker stores it in `/etc/rancher/rke2/config.yaml`, and the server token can read the cluster's bootstrap data (CA and etcd keys) from the supervisor.
 
 The command at `cmd/controller` requires:
 

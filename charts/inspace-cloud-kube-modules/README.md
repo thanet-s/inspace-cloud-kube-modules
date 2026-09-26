@@ -380,7 +380,9 @@ controllers refer to one existing Secret in the release namespace:
 
 Karpenter's RKE2 join token is intentionally separate. The provider validates
 the fixed `Secret/inspace-rke2-agent-token` key `token`; it cannot be pointed at
-the cloud API credential. Prefer creating both Secrets outside Helm. Setting
+the cloud API credential. Store the servers' RKE2 `agent-token` there, never the
+server token: every worker receives this value, and the server token can read
+the cluster's CA and etcd keys from the supervisor. Prefer creating both Secrets outside Helm. Setting
 `karpenter.agentTokenSecret.create=true` is provided for automation but stores
 the agent token in Helm release data.
 

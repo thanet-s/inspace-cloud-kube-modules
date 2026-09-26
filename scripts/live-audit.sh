@@ -25,9 +25,11 @@ esac
 prefix=${INSPACE_LIVE_RESOURCE_PREFIX:-inspace-e2e-}
 api_root=${INSPACE_API_URL%/}/v1
 
+# The API token reaches curl on stdin, never in argv where any local user can
+# read it from the process table; printf is a shell builtin.
 get() {
-  curl --fail --silent --show-error --max-time 30 \
-    -H "apikey: $INSPACE_API_TOKEN" "$1"
+  printf 'apikey: %s\n' "$INSPACE_API_TOKEN" |
+    curl --fail --silent --show-error --max-time 30 -H @- "$1"
 }
 
 locations_response=$(get "$api_root/config/locations")

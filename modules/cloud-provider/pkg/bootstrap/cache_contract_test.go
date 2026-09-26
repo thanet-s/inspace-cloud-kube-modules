@@ -587,8 +587,10 @@ func TestDirectControlPlaneCloudInitV9OwnershipBytes(t *testing.T) {
 	// The fixture renders bootstrapCacheRKE2Version, so this hash moves with
 	// each audited RKE2 release even when the renderer is unchanged
 	// (v1.36.4+rke2r1 rendered 7362af1d...). The optional Cilium
-	// load-balancer settings are omitted here and must add no bytes.
-	const v9DirectHash = "d0e02293426fc7c175413a8ea922c58b2d22b3f9653db444f2a379f3a4dca1f0"
+	// load-balancer settings are omitted here and must add no bytes. The
+	// fixture carries a separate agent token, as every new cluster does; the
+	// rendering without one stays frozen at legacyV9DirectHash.
+	const v9DirectHash = "6cc0a7658e68a2ce9064b19ce903627ed81c6e1b4a958412beebd536002a6e11"
 	if got := fmt.Sprintf("%x", sha256.Sum256([]byte(raw))); got != v9DirectHash {
 		t.Fatalf("direct control-plane cloud-init hash=%s, want frozen v9 hash %s", got, v9DirectHash)
 	}
@@ -651,7 +653,7 @@ func cacheContractTLSSeed(key []byte, owner, hostname string, notBefore time.Tim
 func cacheContractControlPlaneInput() CloudInitInput {
 	return CloudInitInput{
 		NodeName: "unit-cp0", PrivateSubnet: "10.20.30.0/24", VirtualIPv4: "10.20.30.10",
-		RKE2Version: bootstrapCacheRKE2Version, RKE2Token: "unit-test-token", Initialize: true,
+		RKE2Version: bootstrapCacheRKE2Version, RKE2Token: "unit-test-token", RKE2AgentToken: "unit-test-agent-token", Initialize: true,
 		PodCIDR: "10.42.0.0/16", ServiceCIDR: "10.43.0.0/16",
 		PrivateLoadBalancerPoolStart: "10.20.30.200", PrivateLoadBalancerPoolStop: "10.20.30.239",
 		TLSSubjectAltNames: []string{"10.20.30.10"}, Disable: []string{"rke2-ingress-nginx"},

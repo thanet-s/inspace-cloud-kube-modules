@@ -284,6 +284,21 @@ func TestParseBootstrapCacheImageDigests(t *testing.T) {
 	}
 }
 
+func TestLoadRKE2AgentTokenIsOptionalAndDistinct(t *testing.T) {
+	t.Setenv("INSPACE_RKE2_AGENT_TOKEN", "")
+	if token, err := loadRKE2AgentToken("server-token"); err != nil || token != "" {
+		t.Fatalf("absent agent token = %q, %v", token, err)
+	}
+	t.Setenv("INSPACE_RKE2_AGENT_TOKEN", " agent-token\n")
+	if token, err := loadRKE2AgentToken("server-token"); err != nil || token != "agent-token" {
+		t.Fatalf("agent token = %q, %v", token, err)
+	}
+	t.Setenv("INSPACE_RKE2_AGENT_TOKEN", "server-token")
+	if _, err := loadRKE2AgentToken("server-token"); err == nil {
+		t.Fatal("accepted an agent token equal to the server token")
+	}
+}
+
 func TestLoadBootstrapCacheSettingsRequiresPersistedKeyAndRealInitializationTime(t *testing.T) {
 	cluster := &v1alpha1.InSpaceCluster{}
 	notBefore := time.Now().UTC().Add(-time.Minute).Truncate(time.Second)
