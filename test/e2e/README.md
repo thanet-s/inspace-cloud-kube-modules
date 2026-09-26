@@ -213,7 +213,11 @@ TCP/80 collision must receive another shard/firewall, and dedicated mode must
 remain separate. An unconditional cleanup block removes the Services,
 datapath children, NodePools, NodeClaims, nodes, aggregate and ICMP firewalls,
 VMs, FIPs, workload, and generated NodeClass through that finalizer-safe
-cleanup path. The global
+cleanup path. After a passing Node-LB block, that cleanup drains while the
+endpoint-local block runs; its absence proof waits until endpoint-local cleanup
+is done, because the endpoint-local Service firewall and datapath share the
+`inlb-*` names that proof forbids. After a failing Node-LB block, the proof runs
+at once. The global
 ICMP firewall must be absent and the complete cloud-resource inventory must
 equal its pre-Node-LB snapshot. The deployments, PVC, private Services,
 cluster, and general worker remain available to later checks or a preserved
@@ -299,11 +303,13 @@ later default `all` run from cleaning them implicitly. Owner removal is ordered:
    Services, including controller-owned `inlb-dp-*` datapaths; endpoint-local
    Service finalization must finish before its user-owned edge capacity moves;
 2. pods, PV, and VolumeAttachments must disappear;
-3. both private `cilium-l2announce-*` Leases must disappear and
-   `CiliumLoadBalancerIPPool/inspace-private` must report zero used IPs;
-4. managed Node-LB NodePools/NodeClaims/nodes, the endpoint-local static
-   NodePool/NodeClaims/nodes, and the general NodePool/NodeClaims/nodes, then
-   their NodeClasses;
+3. both private `cilium-l2announce-*` Leases must be absent, unheld, or
+   expired, and `CiliumLoadBalancerIPPool/inspace-private` must report zero
+   used IPs (a pool that a partial init never created counts as released);
+4. the endpoint-local static and general NodePools are deleted together; the
+   managed Node-LB, endpoint-local, and general NodePools/NodeClaims/nodes
+   then drain in parallel, and each NodeClass is deleted only after its own
+   capacity is gone;
 5. CSI/CCM/Karpenter-owned disks, workers, floating IPs, and service NLB must
    be absent before controller charts are removed; Karpenter deletes its named
    FIP before deleting the worker VM because VM deletion only leaves that FIP

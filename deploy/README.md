@@ -88,6 +88,21 @@ runs `apt-get update`, installs required packages, and disables later automatic
 APT upgrades. Keep the production default `false` for both control-plane and
 Karpenter nodes.
 
+## Ubuntu release
+
+`os_version` selects the Ubuntu release for the fixed control-plane servers,
+the bastion (which follows them), and the generated Karpenter
+`InSpaceNodeClass`. It must be exactly `"24.04"` or `"26.04"`; quote it in
+inventory. `"26.04"` requires `modules_version` `1.1.0-rc.3` or later, because
+earlier controllers accept only `24.04`, and preflight rejects the combination.
+When `os_version` is omitted, a cluster that already has a persisted bootstrap
+spec keeps the release it was built with, so `update` never replaces its
+workers with another release and a resumed `init` still matches that spec; a
+new cluster uses `"26.04"`. Setting a different release on an existing cluster
+fails a resumed `init`. On `update` it changes only the NodeClass, so
+Karpenter drift replaces the workers while the fixed control planes keep
+their release.
+
 ## One or three control-plane servers
 
 Set `control_plane_replicas` to:

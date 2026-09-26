@@ -276,6 +276,11 @@
     # fail with "context canceled" when the Service is deleted, leaving a stale
     # holder forever. An absent, unheld, or expired (two lease durations past
     # its last renewal) Lease means no agent still announces the VIP.
+    # A partial init may never have created the private pool (or the Cilium
+    # CRD); no VIP can have been allocated from a pool that does not exist. A
+    # present pool must still report IPsUsed == 0. A present pool without that
+    # condition has an unknown allocation state (the operator has not yet
+    # published its counts), so it keeps the wait fail-closed.
     - name: Wait for private Cilium L2 leases and LB IPAM allocations to quiesce
       ansible.builtin.shell: |
         set -euo pipefail
@@ -292,11 +297,17 @@
                 + 2 * (.spec.leaseDurationSeconds // 15) < $now)' <<<"$lease_json" >/dev/null
           fi
         done
-        kubectl --kubeconfig "{{ e2e_kubeconfig }}" \
-          get ciliumloadbalancerippool inspace-private -o json | jq -e '
-          any(.status.conditions[]?;
-            .type == "cilium.io/IPsUsed" and
-            (.message | tonumber) == 0)'
+        resources=$(kubectl --kubeconfig "{{ e2e_kubeconfig }}" api-resources -o name)
+        if grep -qx ciliumloadbalancerippools.cilium.io <<<"$resources"; then
+          pool_json=$(kubectl --kubeconfig "{{ e2e_kubeconfig }}" \
+            get ciliumloadbalancerippool inspace-private --ignore-not-found -o json)
+          if [[ -n $pool_json ]]; then
+            jq -e '
+              any(.status.conditions[]?;
+                .type == "cilium.io/IPsUsed" and
+                (.message | tonumber) == 0)' <<<"$pool_json" >/dev/null
+          fi
+        fi
       args:
         executable: /bin/bash
       register: e2e_cleanup_cilium_private_lb_quiesced
@@ -304,6 +315,38 @@
       retries: 600
       delay: 3
       until: e2e_cleanup_cilium_private_lb_quiesced.rc == 0
+      when: e2e_cleanup_state.kubernetesOwnersPossible | default(false) | bool
+
+    # The Node-LB, endpoint-local edge, and general worker teardowns own
+    # disjoint NodePools, so both user-owned NodePools are deleted as soon as
+    # the workload, storage, endpoint-local Service, and private VIP gates
+    # pass. The waits below then overlap with every controller's cleanup; each
+    # NodeClass is still deleted only after its own capacity is proven absent.
+    - name: Delete the public-node-local static NodePool while Karpenter is running
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - --kubeconfig
+          - "{{ e2e_kubeconfig }}"
+          - delete
+          - nodepool
+          - "{{ e2e_cleanup_state.publicLocalNodePoolName | default('edge') }}"
+          - --ignore-not-found
+          - --wait=false
+      changed_when: true
+      when: e2e_cleanup_state.kubernetesOwnersPossible | default(false) | bool
+
+    - name: Delete the NodePool while Karpenter is still running
+      ansible.builtin.shell: |
+        set -euo pipefail
+        resources=$(kubectl --kubeconfig "{{ e2e_kubeconfig }}" api-resources -o name)
+        if grep -qx nodepools.karpenter.sh <<<"$resources"; then
+          kubectl --kubeconfig "{{ e2e_kubeconfig }}" delete nodepool \
+            "{{ e2e_cleanup_state.nodePoolName }}" --ignore-not-found --wait=false
+        fi
+      args:
+        executable: /bin/bash
+      changed_when: true
       when: e2e_cleanup_state.kubernetesOwnersPossible | default(false) | bool
 
     - name: Wait for every managed Node-LB owner to quiesce
@@ -342,20 +385,6 @@
       changed_when: true
       when: e2e_cleanup_state.kubernetesOwnersPossible | default(false) | bool
 
-    - name: Delete the public-node-local static NodePool while Karpenter is running
-      ansible.builtin.command:
-        argv:
-          - kubectl
-          - --kubeconfig
-          - "{{ e2e_kubeconfig }}"
-          - delete
-          - nodepool
-          - "{{ e2e_cleanup_state.publicLocalNodePoolName | default('edge') }}"
-          - --ignore-not-found
-          - --wait=false
-      changed_when: true
-      when: e2e_cleanup_state.kubernetesOwnersPossible | default(false) | bool
-
     - name: Wait for public-node-local NodeClaims and Nodes to disappear
       ansible.builtin.shell: |
         set -euo pipefail
@@ -387,19 +416,6 @@
           - --ignore-not-found
           - --wait=true
           - --timeout=5m
-      changed_when: true
-      when: e2e_cleanup_state.kubernetesOwnersPossible | default(false) | bool
-
-    - name: Delete the NodePool while Karpenter is still running
-      ansible.builtin.shell: |
-        set -euo pipefail
-        resources=$(kubectl --kubeconfig "{{ e2e_kubeconfig }}" api-resources -o name)
-        if grep -qx nodepools.karpenter.sh <<<"$resources"; then
-          kubectl --kubeconfig "{{ e2e_kubeconfig }}" delete nodepool \
-            "{{ e2e_cleanup_state.nodePoolName }}" --ignore-not-found --wait=false
-        fi
-      args:
-        executable: /bin/bash
       changed_when: true
       when: e2e_cleanup_state.kubernetesOwnersPossible | default(false) | bool
 

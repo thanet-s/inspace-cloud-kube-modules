@@ -49,6 +49,39 @@
       - karpenter_instance_families | length > 0
     fail_msg: "Deployment inventory is incomplete or violates the supported v0.7 topology."
 
+- name: Inspect the persisted bootstrap spec for its Ubuntu release
+  ansible.builtin.stat:
+    path: "{{ deploy_state_dir }}/cluster.yaml"
+  register: deploy_persisted_cluster_spec
+
+# An omitted os_version keeps an existing cluster on the release it was built
+# with, so update never drifts its workers to another release and a resumed
+# init still matches the persisted spec. A new cluster defaults to 26.04.
+- name: Resolve the Ubuntu release for control planes and Karpenter workers
+  ansible.builtin.set_fact:
+    deploy_os_version: "{{ os_version | default(deploy_persisted_os_version, true) | string }}"
+  vars:
+    deploy_persisted_os_version: >-
+      {{
+        (lookup('file', deploy_state_dir + '/cluster.yaml') | from_yaml).spec.controlPlane.machine.image.osVersion
+        if deploy_persisted_cluster_spec.stat.exists else '26.04'
+      }}
+
+- name: Require a supported Ubuntu release
+  ansible.builtin.assert:
+    that:
+      - deploy_os_version in ['24.04', '26.04']
+    fail_msg: "os_version must be exactly \"24.04\" or \"26.04\" (quote it in inventory)."
+
+- name: Require cloud modules that accept the selected Ubuntu release
+  ansible.builtin.assert:
+    that:
+      - deploy_os_version == '24.04' or modules_version is version('1.1.0-rc.3', '>=', version_type='semver')
+    fail_msg: >-
+      os_version 26.04 requires modules_version 1.1.0-rc.3 or later; earlier
+      controllers accept only 24.04. Raise modules_version or set
+      os_version: "24.04".
+
 - name: Reject bootstrap-owned RKE2 keys from operator extra configuration
   ansible.builtin.assert:
     that:

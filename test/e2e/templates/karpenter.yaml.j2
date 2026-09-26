@@ -40,6 +40,8 @@ spec:
     memory: 16Gi
   template:
     spec:
+      # Bound drain so a stuck Pod or VolumeAttachment cannot stall teardown.
+      terminationGracePeriod: 5m
       nodeClassRef:
         group: karpenter.inspace.cloud
         kind: InSpaceNodeClass

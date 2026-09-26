@@ -428,8 +428,18 @@
       loop_control:
         index_var: deploy_cp_index
         label: "{{ item.name }}"
+      register: deploy_control_plane_egress
       changed_when: false
+      # ssh exits 255 only for its own transport failure: retry that alone.
+      # An in-guest timeout or error is final, so the 5-minute deadline is
+      # never multiplied.
+      failed_when: deploy_control_plane_egress.rc != 0
+      retries: 3
+      delay: 10
+      until: deploy_control_plane_egress.rc != 255
 
+    # One 40-minute in-guest deadline covers a cold-cache boot. cloud-init
+    # reports a final result, so only ssh transport failures are retried.
     - name: Wait for control-plane cloud-init completion
       ansible.builtin.command:
         argv:
@@ -438,7 +448,7 @@
           - "{{ deploy_state_dir }}/ssh-config"
           - "inspace-cp{{ deploy_cp_index }}"
           - >-
-            sudo timeout --kill-after=5s 4800s sh -c
+            sudo timeout --kill-after=5s 2400s sh -c
             'cloud-init status --wait >/dev/null 2>&1 || test $? -eq 2'
       loop: "{{ deployment_state.controlPlanes }}"
       loop_control:
@@ -446,9 +456,10 @@
         label: "{{ item.name }}"
       register: deploy_control_plane_cloud_init
       changed_when: false
-      retries: 2
+      failed_when: deploy_control_plane_cloud_init.rc != 0
+      retries: 3
       delay: 10
-      until: deploy_control_plane_cloud_init.rc == 0
+      until: deploy_control_plane_cloud_init.rc != 255
 
     - name: Read the administrator kubeconfig from cp0
       ansible.builtin.command:
