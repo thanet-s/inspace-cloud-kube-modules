@@ -117,7 +117,7 @@ func defaultDialTCP(ctx context.Context, address string, timeout time.Duration) 
 	return conn.Close()
 }
 
-// check probes every publicly addressed VM in a Ready result and decides
+// check probes the bastion floating IPv4 of a Ready result and decides
 // whether the caller should finish, keep polling, or destroy and retry. It
 // never returns reachabilityRecreate more than maxFloatingIPRecreateAttempts
 // times per gate instance.
@@ -125,14 +125,13 @@ func (g *floatingIPReachabilityGate) check(ctx context.Context, options controll
 	if options.FloatingIPReachabilityTimeout <= 0 {
 		return reachabilityDone
 	}
-	addresses := make([]string, 0, 1+len(result.ControlPlanePublicIPv4))
+	// Only the bastion floating IPv4 admits port 22 from the management
+	// client. The managed node firewall admits inbound traffic only from the
+	// private subnet and pod CIDR, so a healthy control-plane floating IPv4
+	// never answers here; its egress is proven from inside through the bastion.
+	addresses := make([]string, 0, 1)
 	if result.BastionPublicIPv4 != "" {
 		addresses = append(addresses, result.BastionPublicIPv4)
-	}
-	for _, address := range result.ControlPlanePublicIPv4 {
-		if address != "" {
-			addresses = append(addresses, address)
-		}
 	}
 	if g.unreachableSince == nil {
 		g.unreachableSince = make(map[string]time.Time)
@@ -319,7 +318,7 @@ func run() error {
 		&floatingIPReachabilityTimeout,
 		"floating-ip-reachability-timeout",
 		defaultFloatingIPReachabilityTimeout,
-		"in --until-ready mode, how long a Ready bastion/control-plane floating IPv4 may stay unreachable on port 22 "+
+		"in --until-ready mode, how long a Ready bastion floating IPv4 may stay unreachable on port 22 "+
 			"before destroying and retrying once for a fresh address; 0 disables the check",
 	)
 	flag.StringVar(&output, "output", "text", "result output format: text or json")

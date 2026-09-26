@@ -161,11 +161,10 @@ had, and remains a large, correctness-sensitive change that deserves its
 own design pass rather than a rushed addition to that state machine.
 
 What `inspace-cluster-controller --until-ready` *can* do without that new
-signal: once Reconcile reports the cluster Ready, it already knows every
-bastion and control-plane VM's public floating IPv4
-(`bootstrap.Result.BastionPublicIPv4`/`ControlPlanePublicIPv4`) from the
-same API calls that provisioned them. It now probes TCP/22 on each one; if
-any stays unreachable past `--floating-ip-reachability-timeout` (default
+signal: once Reconcile reports the cluster Ready, it already knows the
+bastion's public floating IPv4 (`bootstrap.Result.BastionPublicIPv4`) from
+the same API calls that provisioned it. It probes TCP/22 on that address; if
+it stays unreachable past `--floating-ip-reachability-timeout` (default
 `5m`), it destroys the cluster and retries once with a fresh Reconcile
 before accepting defeat and returning the original Ready result — see
 [modules/cloud-provider/README.md](modules/cloud-provider/README.md). This
@@ -178,3 +177,14 @@ mid-command (the exact rc.10–rc.12 signature), so the ansible-level
 retries remain the layer that catches that narrower case. None of this
 changes what "Ready" means for any caller that leaves the timeout at its
 default or sets it to `0`.
+
+Control-plane floating IPv4s are deliberately not probed from outside. The
+managed node firewall admits inbound traffic only from the private subnet and
+pod CIDR, so port 22 on a healthy control-plane address never answers the
+management client; probing it (as v1.0.0 through v1.1.0-rc.3 did) destroyed
+and recreated every healthy cluster once and waited out the timeout twice,
+about 22 extra minutes per `init`, without ever telling a bad address from a
+good one. Instead, both `test/e2e` and `deploy/` init prove each control
+plane's internet egress from inside, through the bastion, before the long
+cloud-init wait, so a bad control-plane address fails `init` in about a
+minute and reaches the existing destroy-and-retry path.

@@ -263,10 +263,14 @@ deadline.
 InSpace's floating-IP pool has occasionally handed a bastion or control-plane
 VM an address with no working SSH/internet path. VM create has no field to
 reject or exclude a specific address, so `--until-ready` mode also probes port
-22 on every publicly addressed VM once the cluster reports Ready; if one stays
+22 on the bastion floating IPv4 once the cluster reports Ready; if it stays
 unreachable past `--floating-ip-reachability-timeout` (default `5m`), it
 destroys the cluster and retries once with a fresh Reconcile before giving up
-and returning that first Ready result. This is a detect-and-retry mitigation
+and returning that first Ready result. Control-plane floating IPv4s are not
+probed: the managed node firewall admits inbound traffic only from the private
+subnet and pod CIDR, so a healthy control plane never answers from outside.
+Their internet egress is proven from inside, through the bastion, by the
+`test/e2e` and `deploy/` init playbooks. This is a detect-and-retry mitigation
 at the one layer that can act automatically without spending an operator's
 time on it, not a fix for the underlying gap; see RELEASING.md's known-issue
 entry. Set it to `0` to disable the probe entirely.

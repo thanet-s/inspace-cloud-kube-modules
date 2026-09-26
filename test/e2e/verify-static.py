@@ -2039,6 +2039,19 @@ def main() -> None:
     require_yaml_key(connection_wait, 8, "connect_timeout", "10")
     require_yaml_key(connection_wait, 8, "sleep", "5")
     require_yaml_key(connection_wait, 8, "timeout", "300")
+    egress_name = "Prove every control plane reaches the internet through its floating IP"
+    control_plane_egress = named_yaml_sequence_item(control_plane_wait_play, egress_name, 4)
+    require_unrestricted_parallel_task(control_plane_egress)
+    require("\n      ansible.builtin.raw: >-" in control_plane_egress and
+            "https://registry-1.docker.io/v2/" in control_plane_egress and
+            "https://ghcr.io/v2/" in control_plane_egress and
+            " -f" not in control_plane_egress,
+            "control-plane egress must be proven from inside, accepting any HTTP answer")
+    require_yaml_key(control_plane_egress, 6, "retries", "5")
+    require_yaml_key(control_plane_egress, 6, "until", "e2e_control_plane_egress.rc == 0")
+    require(control_plane_wait_play.index(egress_name) <
+            control_plane_wait_play.index("Wait for cloud-init completion on every control plane in parallel"),
+            "control-plane egress must be proven before the long cloud-init wait")
     cloud_init_wait = named_yaml_sequence_item(
         control_plane_wait_play, "Wait for cloud-init completion on every control plane in parallel", 4
     )

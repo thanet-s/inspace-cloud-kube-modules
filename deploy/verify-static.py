@@ -47,6 +47,21 @@ def main() -> None:
         is None,
         "example inventory stores a token",
     )
+    egress_name = "Prove every control plane reaches the internet through its floating IP"
+    require(
+        egress_name in init
+        and init.index(egress_name) < init.index("Wait for control-plane cloud-init completion"),
+        "control-plane egress must be proven before the long cloud-init wait",
+    )
+    egress_task = init[init.index(egress_name):init.index("Wait for control-plane cloud-init completion")]
+    require(
+        '"inspace-cp{{ deploy_cp_index }}"' in egress_task
+        and "https://registry-1.docker.io/v2/" in egress_task
+        and "https://ghcr.io/v2/" in egress_task
+        and " -f" not in egress_task
+        and "until: deploy_control_plane_egress.rc == 0" in egress_task,
+        "control-plane egress must be proven from inside through the bastion",
+    )
     for ignored in ("deploy/inventory.yml", "deploy/inventory/", "deploy/.state/"):
         require(ignored in gitignore, f"missing Git exclusion {ignored}")
         require(ignored in dockerignore, f"missing Docker exclusion {ignored}")

@@ -760,6 +760,20 @@
         sleep: 5
         timeout: 300
 
+    # The node firewall admits no inbound traffic from the internet, so a bad
+    # control-plane floating IPv4 can only be seen from inside: prove egress
+    # before the long cloud-init wait so the init retry replaces it quickly.
+    - name: Prove every control plane reaches the internet through its floating IP
+      ansible.builtin.raw: >-
+        timeout --kill-after=5s 60s sh -c
+        'curl -sS -o /dev/null --connect-timeout 10 --max-time 20 https://registry-1.docker.io/v2/ &&
+        curl -sS -o /dev/null --connect-timeout 10 --max-time 20 https://ghcr.io/v2/'
+      changed_when: false
+      register: e2e_control_plane_egress
+      retries: 5
+      delay: 10
+      until: e2e_control_plane_egress.rc == 0
+
     - name: Wait for cloud-init completion on every control plane in parallel
       ansible.builtin.raw: >-
         timeout --kill-after=5s 4800s sh -c

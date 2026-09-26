@@ -772,7 +772,11 @@ func TestFloatingIPReachabilityGateDisabledByDefaultNeverDials(t *testing.T) {
 	}
 }
 
-func TestFloatingIPReachabilityGateProbesControlPlaneAddressesToo(t *testing.T) {
+// The managed node firewall admits inbound traffic only from the private
+// subnet and pod CIDR, so a healthy control-plane floating IPv4 never answers
+// on port 22 from the management client. Only the bastion address is a real
+// signal; probing control-plane addresses recreated every healthy cluster.
+func TestFloatingIPReachabilityGateProbesOnlyTheBastion(t *testing.T) {
 	reconciler := &sequenceReconciler{reconcileResults: []bootstrap.Result{
 		{
 			Ready: true, Owner: "owner", BastionPublicIPv4: "203.0.113.1",
@@ -787,17 +791,30 @@ func TestFloatingIPReachabilityGateProbesControlPlaneAddressesToo(t *testing.T) 
 		UntilReady: true, Interval: time.Millisecond, OutputFormat: "json",
 		StandardOutput: &stdout, StandardError: &stderr,
 		FloatingIPReachabilityTimeout: time.Minute,
+		nowFunc:                       stepClock(time.Hour),
 		dialTCP: func(_ context.Context, address string, _ time.Duration) error {
 			dialed[address] = true
-			return nil
+			if address == "203.0.113.1" {
+				return nil
+			}
+			return errors.New("i/o timeout")
 		},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"203.0.113.1", "203.0.113.10", "203.0.113.11", "203.0.113.12"} {
-		if !dialed[want] {
-			t.Fatalf("address %q was never dialed; dialed=%v", want, dialed)
+	if !dialed["203.0.113.1"] {
+		t.Fatalf("bastion address was never dialed; dialed=%v", dialed)
+	}
+	for _, firewalled := range []string{"203.0.113.10", "203.0.113.11", "203.0.113.12"} {
+		if dialed[firewalled] {
+			t.Fatalf("firewalled control-plane address %q was dialed; dialed=%v", firewalled, dialed)
 		}
+	}
+	if reconciler.reconcileCalls != 1 || reconciler.destroyCalls != 0 {
+		t.Fatalf("healthy cluster calls: reconcile=%d destroy=%d, want 1 and 0", reconciler.reconcileCalls, reconciler.destroyCalls)
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("healthy cluster wrote unexpected stderr: %q", stderr.String())
 	}
 }
