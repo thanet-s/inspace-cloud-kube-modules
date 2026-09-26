@@ -676,7 +676,7 @@ Enable it only when creating a cluster:
 spec:
   rke2:
     version: v1.36.5-rc2+rke2r1   # must bundle Cilium 1.20+
-    disable: [rke2-ingress-nginx, rke2-traefik]
+    disable: [rke2-ingress-nginx, rke2-traefik, rke2-traefik-crd]
   network:
     gatewayAPI:
       enabled: true
@@ -684,8 +684,9 @@ spec:
 
 Validation requires an RKE2 release whose rke2-cilium chart is Cilium 1.20 or
 newer (`v1.34.12+`, `v1.35.9+`, `v1.36.5+`, or `v1.37.0+`); Cilium 1.19 reads
-only Gateway API v1.4-era CRD versions. `rke2-traefik` must stay disabled
-because its CRD chart ships its own Gateway API CRDs, and neither
+only Gateway API v1.4-era CRD versions. `rke2-traefik` and `rke2-traefik-crd`
+must be disabled because the Traefik CRD chart (installed even when
+`rke2-traefik` is disabled) ships its own Gateway API CRDs, and neither
 `rke2-gateway-api-crd` nor `inspace-gateway-api-crds` may be disabled: RKE2
 deletes the resources of a disabled manifest. The setting is rendered only into
 immutable control-plane bootstrap, so the CRD rejects changing it and a cluster

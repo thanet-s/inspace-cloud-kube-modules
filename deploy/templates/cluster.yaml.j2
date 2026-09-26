@@ -30,6 +30,9 @@ spec:
     disable:
       - rke2-ingress-nginx
       - rke2-traefik
+{% if gateway_api_enabled | default(false) | bool %}
+      - rke2-traefik-crd
+{% endif %}
     tlsSubjectAltNames:
       - "{{ control_plane_vip }}"
   network:

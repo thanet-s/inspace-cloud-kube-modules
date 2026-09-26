@@ -135,10 +135,20 @@ def verify_gateway_api(inventory: str, cluster_template: str, preflight: str, in
         ("deploy", cluster_template),
         ("E2E", read("test/e2e/templates/cluster.yaml.j2")),
     ):
-        disabled = re.search(r"(?m)^    disable:\n((?:      - .*\n)+)", template)
+        # Gateway API also needs rke2-traefik-crd disabled: its bundled Gateway
+        # API CRDs cannot be imported over ours, so its helm-install job would
+        # crash-loop (seen live in the v1.1.0-rc.7 E2E).
+        expected = {
+            "deploy": "      - rke2-ingress-nginx\n      - rke2-traefik\n"
+                      "{% if gateway_api_enabled | default(false) | bool %}\n"
+                      "      - rke2-traefik-crd\n{% endif %}\n",
+            "E2E": "      - rke2-ingress-nginx\n      - rke2-traefik\n      - rke2-traefik-crd\n",
+        }[label]
+        disabled = re.search(r"(?m)^    disable:\n((?:(?:      - .*|\{%.*%\})\n)+)", template)
         require(
-            disabled is not None and disabled.group(1) == "      - rke2-ingress-nginx\n      - rke2-traefik\n",
-            f"{label} cluster template must disable exactly rke2-ingress-nginx and rke2-traefik",
+            disabled is not None and disabled.group(1) == expected,
+            f"{label} cluster template must disable exactly rke2-ingress-nginx and rke2-traefik, "
+            "plus rke2-traefik-crd with Gateway API",
         )
         require("rke2-gateway-api-crd" not in template,
                 f"{label} cluster template must never disable rke2-gateway-api-crd")

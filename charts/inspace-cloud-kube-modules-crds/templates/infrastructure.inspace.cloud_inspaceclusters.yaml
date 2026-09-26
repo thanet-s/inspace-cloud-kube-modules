@@ -46,8 +46,8 @@ spec:
               x-kubernetes-validations:
                 - rule: '!self.endpoint.virtualIPv4.startsWith("10.42.") && !self.endpoint.virtualIPv4.startsWith("10.43.")'
                   message: control-plane virtualIPv4 must not overlap podCIDR or serviceCIDR
-                - rule: '!has(self.network.gatewayAPI) || !self.network.gatewayAPI.enabled || (has(self.rke2.disable) && self.rke2.disable.exists(component, component == "rke2-traefik"))'
-                  message: network.gatewayAPI.enabled requires rke2.disable to include rke2-traefik
+                - rule: '!has(self.network.gatewayAPI) || !self.network.gatewayAPI.enabled || (has(self.rke2.disable) && self.rke2.disable.exists(component, component == "rke2-traefik") && self.rke2.disable.exists(component, component == "rke2-traefik-crd"))'
+                  message: network.gatewayAPI.enabled requires rke2.disable to include rke2-traefik and rke2-traefik-crd
                 - rule: '!has(self.network.gatewayAPI) || !self.network.gatewayAPI.enabled || !has(self.rke2.disable) || !self.rke2.disable.exists(component, component == "rke2-gateway-api-crd" || component == "inspace-gateway-api-crds")'
                   message: network.gatewayAPI.enabled forbids disabling its CRD owner rke2-gateway-api-crd or inspace-gateway-api-crds
               properties:

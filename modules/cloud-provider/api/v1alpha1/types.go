@@ -322,6 +322,12 @@ func (s InSpaceClusterSpec) Validate() []error {
 		if !slices.Contains(s.RKE2.Disable, "rke2-traefik") {
 			add("spec.network.gatewayAPI.enabled", "requires spec.rke2.disable to include rke2-traefik because its chart installs conflicting Gateway API CRDs")
 		}
+		// Disabling rke2-traefik alone still installs rke2-traefik-crd, whose
+		// bundled Gateway API CRDs cannot be imported over ours, so its
+		// helm-install job would crash-loop forever.
+		if !slices.Contains(s.RKE2.Disable, "rke2-traefik-crd") {
+			add("spec.network.gatewayAPI.enabled", "requires spec.rke2.disable to include rke2-traefik-crd because its chart bundles conflicting Gateway API CRDs")
+		}
 		for _, owner := range gatewayAPICRDOwners {
 			if slices.Contains(s.RKE2.Disable, owner) {
 				add("spec.rke2.disable", "must not disable "+owner+" while spec.network.gatewayAPI.enabled is true")

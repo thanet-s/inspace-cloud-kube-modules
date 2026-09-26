@@ -154,6 +154,7 @@ func TestReconcilePropagatesGatewayAPIToEveryFixedServerOnly(t *testing.T) {
 		cluster := testCluster()
 		// testCluster pins the audited v1.36.5-rc2 release, which bundles Cilium 1.20.2.
 		cluster.Spec.Network.GatewayAPI.Enabled = true
+		cluster.Spec.RKE2.Disable = append(cluster.Spec.RKE2.Disable, "rke2-traefik-crd")
 		reconciler := testReconciler(api)
 		if cached {
 			cluster.Spec.BootstrapCache.DirectDownload = false
