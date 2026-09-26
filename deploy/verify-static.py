@@ -144,6 +144,106 @@ def verify_gateway_api(inventory: str, cluster_template: str, preflight: str, in
     require("needs no Traefik" in readme, "README must state that Gateway API needs no Traefik")
 
 
+def verify_update_cache_refresh(update: str) -> None:
+    """`update` refreshes a cached bastion before any RKE2 or chart upgrade."""
+    refresh = read("deploy/playbooks/tasks/refresh-bootstrap-cache.yml")
+    script = read("deploy/templates/refresh-bootstrap-cache.sh")
+    readme = read("deploy/README.md")
+    ci = read(".github/workflows/ci.yaml")
+    include = "- name: Add this release's digest-pinned entries to the bastion bootstrap cache\n"
+    order = [
+        update.find(value)
+        for value in (
+            "include_tasks: tasks/start-tunnel.yml",
+            include,
+            "include_tasks: tasks/apply-rke2-upgrade.yml",
+            "include_tasks: tasks/apply-control-plane-config.yml",
+            "- name: Upgrade the exact CRDs chart\n",
+            "- name: Upgrade the exact CCM CSI and Karpenter chart\n",
+            "- name: Apply the updated default NodeClass and NodePool\n",
+        )
+    ]
+    require(
+        all(offset >= 0 for offset in order) and order == sorted(order),
+        "update must refresh the bastion bootstrap cache after the tunnel and before any RKE2, config, chart, or NodeClass change",
+    )
+    block = task_block(update, include.removeprefix("- name: ").rstrip("\n"))
+    require(
+        "ansible.builtin.include_tasks: tasks/refresh-bootstrap-cache.yml" in block
+        and "when: not bootstrap_direct_download | bool" in block,
+        "the cache refresh must run for every cached cluster and be a no-op for directDownload clusters",
+    )
+    print_task = task_block(refresh, "Print the target release's bootstrap cache refresh manifest offline")
+    for fragment in (
+        "docker run --platform linux/amd64 --rm --network=none",
+        "--entrypoint /usr/local/bin/inspace-cluster-controller",
+        '"ghcr.io/thanet-s/inspace-cloud-controller-manager:{{ modules_version }}"',
+        "--print-bootstrap-cache-refresh",
+        "--bootstrap-cache-rke2-version",
+        "--bootstrap-cache-disable",
+        "persisted_inspace_cluster.spec.rke2.disable",
+        'mv -f "$manifest.partial" "$manifest"',
+    ):
+        require(fragment in print_task, f"the refresh manifest must be printed offline by the exact target release: {fragment}")
+    require(
+        "deploy_recorded_rke2_version != rke2_version" in refresh
+        and "if deploy_recorded_rke2_version != rke2_version else ''" in refresh,
+        "the refresh must add the RKE2 release only when update moves RKE2, and chart images otherwise",
+    )
+    target_check = task_block(refresh, "Require the refresh manifest to target modules_version")
+    require(
+        all(
+            f"('\\tthanet-s/{component}:' ~ modules_version ~ '\\n') in deploy_cache_refresh_lines" in target_check
+            for component in ("inspace-cloud-controller-manager", "inspace-csi-driver", "karpenter-provider-inspace")
+        )
+        and "deploy_cache_refresh_rke2_version | regex_escape" in target_check,
+        "the printed manifest must be proven to belong to modules_version and the requested RKE2 release",
+    )
+    run_task = task_block(refresh, "Import missing digest-verified entries into the bastion bootstrap cache")
+    for fragment in (
+        "- timeout\n",
+        "- inspace-bastion\n",
+        "sudo sh /tmp/inspace-refresh-bootstrap-cache.sh /tmp/inspace-bootstrap-cache-refresh.tsv",
+        "bootstrap_result.bootstrapCacheRegistry",
+        "changed_when: \"'changed' in deploy_bootstrap_cache_refresh.stdout_lines\"",
+    ):
+        require(fragment in run_task, f"the bastion cache refresh must run bounded over the pinned SSH hop: {fragment}")
+    require(
+        "templates/refresh-bootstrap-cache.sh" in refresh and "inspace-bastion:/tmp/inspace-refresh-bootstrap-cache.sh" in refresh,
+        "the fixed refresh script must be copied to the bastion",
+    )
+    for fragment in (
+        "refusing to overwrite it",
+        "skopeo copy --retry-times 8 --preserve-digests --override-os linux --override-arch amd64",
+        'exec 9>"$cache_root/locks-seed"',
+        "REGISTRY_READONLY=true",
+        "docker compose up -d --wait --force-recreate registry nginx",
+        '[ "$probe" = 405 ]',
+        '--cacert "$ca_file"',
+        "deadline=$(( $(date +%s) + 2400 ))",
+    ):
+        require(fragment in script, f"the bastion refresh script lost a safety property: {fragment}")
+    maintenance = re.search(
+        r"const cacheMaintenanceScript = `([^`]*)`",
+        read("modules/cloud-provider/pkg/bootstrap/cache_cloudinit.go"),
+    )
+    embedded = re.search(r"<<'MAINTAIN'\n(.*?)MAINTAIN\n", script, re.S)
+    require(
+        maintenance is not None and embedded is not None and embedded.group(1) == maintenance.group(1),
+        "the refresh script must install exactly the bootstrap cache maintenance script",
+    )
+    require(
+        "--print-bootstrap-cache-refresh" in readme
+        and "bypassing the\n  bastion bootstrap cache" not in readme,
+        "deploy README must describe the bootstrap cache refresh that update performs",
+    )
+    require(
+        "python3 deploy/scripts/test_refresh_bootstrap_cache.py" in ci
+        and "sh -n deploy/templates/refresh-bootstrap-cache.sh" in ci,
+        "CI must run the offline bastion cache refresh tests",
+    )
+
+
 def main() -> None:
     inventory = read("deploy/inventory.example.yml")
     gitignore = read(".gitignore")
@@ -358,6 +458,7 @@ def main() -> None:
         "bootstrap controller pull/run/print does not pin the published x86 platform",
     )
     verify_gateway_api(inventory, cluster_template, preflight, init, destroy)
+    verify_update_cache_refresh(update)
     load_state = read("deploy/playbooks/tasks/load-state.yml")
     single_cp_settle = read("deploy/playbooks/tasks/settle-single-control-plane.yml")
     for fragment in (

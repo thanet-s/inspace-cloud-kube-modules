@@ -240,6 +240,8 @@ jobs:
           python3 -m py_compile deploy/scripts/discover_bootstrap.py
           bash -n deploy/run.sh deploy/container-entrypoint.sh deploy/scripts/api-tunnel.sh
           sh -n deploy/templates/apply-control-plane-config.sh
+          sh -n deploy/templates/refresh-bootstrap-cache.sh
+          python3 deploy/scripts/test_refresh_bootstrap_cache.py
 
   e2e-harness:
     name: E2E harness

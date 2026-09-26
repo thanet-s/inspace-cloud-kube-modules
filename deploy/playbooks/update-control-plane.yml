@@ -27,6 +27,12 @@
     - name: Start the private API tunnel and wait for readiness
       ansible.builtin.include_tasks: tasks/start-tunnel.yml
 
+    # Cached nodes pull every RKE2 system image, chart image, and Karpenter
+    # worker RKE2 archive from the bastion, which serves only what it holds.
+    - name: Add this release's digest-pinned entries to the bastion bootstrap cache
+      ansible.builtin.include_tasks: tasks/refresh-bootstrap-cache.yml
+      when: not bootstrap_direct_download | bool
+
     - name: Upgrade the RKE2 binary one control-plane server at a time when requested
       ansible.builtin.include_tasks: tasks/apply-rke2-upgrade.yml
 

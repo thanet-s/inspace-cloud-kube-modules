@@ -1,0 +1,103 @@
+---
+# The bastion cache is read-only and serves only what was seeded into it, but
+# cached nodes pull every RKE2 system image and every chart image through it.
+# Before update moves RKE2 or the charts, add exactly the entries the target
+# release's own seed contract lists. The target controller prints them
+# offline; the bastion only adds missing, digest-verified entries.
+- name: Require the recorded bootstrap cache endpoint
+  ansible.builtin.assert:
+    that:
+      - bootstrap_result.bootstrapCacheRegistry | default('') is match('^cache\\.[a-z0-9-]+\\.inspace\\.internal:8443$')
+    fail_msg: "bootstrap-result.json has no bootstrap cache endpoint for this cached cluster."
+
+# An unchanged RKE2 release is already cached, so a module-only upgrade lists
+# only chart images. When update moves RKE2, the target release must pin
+# exactly that release; the controller refuses any other.
+- name: Select the RKE2 release the bootstrap cache refresh must add
+  ansible.builtin.set_fact:
+    deploy_cache_refresh_rke2_version: "{{ rke2_version if deploy_recorded_rke2_version != rke2_version else '' }}"
+    deploy_cache_refresh_manifest: "{{ deploy_state_dir }}/bootstrap-cache-refresh.tsv"
+
+- name: Pull the target controller release for the bootstrap cache refresh
+  ansible.builtin.command:
+    argv:
+      - docker
+      - pull
+      - --platform
+      - linux/amd64
+      - "ghcr.io/thanet-s/inspace-cloud-controller-manager:{{ modules_version }}"
+  changed_when: false
+
+- name: Print the target release's bootstrap cache refresh manifest offline
+  ansible.builtin.shell: |
+    set -euo pipefail
+    manifest={{ deploy_cache_refresh_manifest | quote }}
+    if ! docker run --platform linux/amd64 --rm --network=none \
+      --entrypoint /usr/local/bin/inspace-cluster-controller \
+      "ghcr.io/thanet-s/inspace-cloud-controller-manager:{{ modules_version }}" \
+      --print-bootstrap-cache-refresh \
+      --bootstrap-cache-rke2-version {{ deploy_cache_refresh_rke2_version | quote }} \
+      --bootstrap-cache-disable {{ persisted_inspace_cluster.spec.rke2.disable | default([]) | join(',') | quote }} \
+      >"$manifest.partial"; then
+      rm -f "$manifest.partial"
+      echo "modules_version {{ modules_version }} cannot refresh this cluster's bootstrap cache for RKE2 {{ rke2_version }}." >&2
+      echo "A cached cluster can move only to the RKE2 release its target modules_version pins, and only to a release that supports --print-bootstrap-cache-refresh." >&2
+      exit 1
+    fi
+    chmod 0600 "$manifest.partial"
+    mv -f "$manifest.partial" "$manifest"
+  args:
+    executable: /bin/bash
+  changed_when: false
+
+- name: Require the refresh manifest to target modules_version
+  ansible.builtin.assert:
+    that:
+      - >-
+        ('\tthanet-s/inspace-cloud-controller-manager:' ~ modules_version ~ '\n') in deploy_cache_refresh_lines and
+        ('\tthanet-s/inspace-csi-driver:' ~ modules_version ~ '\n') in deploy_cache_refresh_lines and
+        ('\tthanet-s/karpenter-provider-inspace:' ~ modules_version ~ '\n') in deploy_cache_refresh_lines
+      - >-
+        deploy_cache_refresh_rke2_version == '' or
+        (deploy_cache_refresh_lines is match('rke2\t' ~ (deploy_cache_refresh_rke2_version | regex_escape) ~ '\t[0-9a-f]{64}\n'))
+    fail_msg: "The printed bootstrap cache refresh manifest does not belong to modules_version {{ modules_version }} and RKE2 {{ rke2_version }}."
+  vars:
+    deploy_cache_refresh_lines: "{{ lookup('file', deploy_cache_refresh_manifest, rstrip=false) }}"
+
+- name: Copy the fixed bootstrap cache refresh script to the bastion
+  ansible.builtin.command:
+    argv:
+      - scp
+      - -F
+      - "{{ deploy_state_dir }}/ssh-config"
+      - "{{ deploy_root }}/templates/refresh-bootstrap-cache.sh"
+      - inspace-bastion:/tmp/inspace-refresh-bootstrap-cache.sh
+  changed_when: false
+
+- name: Copy the bootstrap cache refresh manifest to the bastion
+  ansible.builtin.command:
+    argv:
+      - scp
+      - -F
+      - "{{ deploy_state_dir }}/ssh-config"
+      - "{{ deploy_cache_refresh_manifest }}"
+      - inspace-bastion:/tmp/inspace-bootstrap-cache-refresh.tsv
+  changed_when: false
+
+# The script bounds itself to 40 minutes; the outer timeout also covers SSH.
+- name: Import missing digest-verified entries into the bastion bootstrap cache
+  ansible.builtin.command:
+    argv:
+      - timeout
+      - --kill-after=30s
+      - 45m
+      - ssh
+      - -F
+      - "{{ deploy_state_dir }}/ssh-config"
+      - inspace-bastion
+      - >-
+        sudo sh /tmp/inspace-refresh-bootstrap-cache.sh /tmp/inspace-bootstrap-cache-refresh.tsv
+        {{ bootstrap_result.bootstrapCacheRegistry | quote }} &&
+        rm -f /tmp/inspace-refresh-bootstrap-cache.sh /tmp/inspace-bootstrap-cache-refresh.tsv
+  register: deploy_bootstrap_cache_refresh
+  changed_when: "'changed' in deploy_bootstrap_cache_refresh.stdout_lines"

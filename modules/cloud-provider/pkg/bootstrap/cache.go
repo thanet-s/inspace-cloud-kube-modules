@@ -338,33 +338,59 @@ func renderCacheImageManifest(rke2Version, moduleVersion string, disabled []stri
 }
 
 func renderCacheImageManifestWithDigests(rke2Version, moduleVersion string, disabled []string, moduleImageDigests map[string]string) (string, error) {
+	images, err := cacheImageInventory(rke2Version, moduleVersion, disabled, moduleImageDigests)
+	if err != nil {
+		return "", err
+	}
+	var result strings.Builder
+	for _, image := range images {
+		fmt.Fprintf(&result, "%s\t%s\n", image.Source, image.Target)
+	}
+	return result.String(), nil
+}
+
+// RenderCacheRefreshManifest prints the entries `deploy update` adds to an
+// existing bastion cache before it upgrades RKE2 or the charts. It is the
+// bastion seed contract of this release, never a second inventory: one
+// "rke2<TAB>version<TAB>sha256" line for the checksum-pinned release archive
+// Karpenter workers download, followed by "image<TAB>source<TAB>target" lines
+// identical to images.tsv. An empty rke2Version keeps the running RKE2
+// release, whose images the cache already holds, and lists only the fixed
+// and module images this release's chart renders.
+func RenderCacheRefreshManifest(rke2Version, moduleVersion string, disabled []string, moduleImageDigests map[string]string) (string, error) {
+	var images []cachedImage
+	var err error
+	if rke2Version == "" {
+		images, err = cacheChartImageInventory(moduleVersion, moduleImageDigests)
+	} else {
+		images, err = cacheImageInventory(rke2Version, moduleVersion, disabled, moduleImageDigests)
+	}
+	if err != nil {
+		return "", err
+	}
+	var result strings.Builder
+	if rke2Version != "" {
+		fmt.Fprintf(&result, "rke2\t%s\t%s\n", bootstrapCacheRKE2Version, bootstrapCacheRKE2SHA256)
+	}
+	for _, image := range images {
+		fmt.Fprintf(&result, "image\t%s\t%s\n", image.Source, image.Target)
+	}
+	return result.String(), nil
+}
+
+func cacheImageInventory(rke2Version, moduleVersion string, disabled []string, moduleImageDigests map[string]string) ([]cachedImage, error) {
 	if rke2Version != bootstrapCacheRKE2Version {
-		return "", fmt.Errorf("bootstrap cache has no audited image inventory for RKE2 %s; use %s or set spec.bootstrapCache.directDownload=true", rke2Version, bootstrapCacheRKE2Version)
+		return nil, fmt.Errorf("bootstrap cache has no audited image inventory for RKE2 %s; use %s or set spec.bootstrapCache.directDownload=true", rke2Version, bootstrapCacheRKE2Version)
 	}
-	if !moduleVersionPattern.MatchString(moduleVersion) {
-		return "", fmt.Errorf("bootstrap cache requires an exact released module version, got %q", moduleVersion)
-	}
-	if moduleImageDigests != nil {
-		if len(moduleImageDigests) != len(moduleImageNames) {
-			return "", fmt.Errorf("bootstrap cache module image digests must contain exactly %d entries", len(moduleImageNames))
-		}
-		for _, component := range moduleImageNames {
-			digest, ok := moduleImageDigests[component]
-			if !ok || !imageDigestPattern.MatchString(digest) {
-				return "", fmt.Errorf("bootstrap cache module image digest for %s must be sha256:<64 lowercase hex>", component)
-			}
-		}
-		for component := range moduleImageDigests {
-			if !slices.Contains(moduleImageNames, component) {
-				return "", fmt.Errorf("bootstrap cache module image digest contains unknown component %q", component)
-			}
-		}
+	chartImages, err := cacheChartImageInventory(moduleVersion, moduleImageDigests)
+	if err != nil {
+		return nil, err
 	}
 	disabledSet := make(map[string]struct{}, len(disabled))
 	for _, component := range disabled {
 		disabledSet[component] = struct{}{}
 	}
-	images := make([]cachedImage, 0, len(rke2CacheImages)+len(fixedCacheImages)+3)
+	images := make([]cachedImage, 0, len(rke2CacheImages)+len(chartImages))
 	// Disabled add-ons are matched by repository, not tag, so a release
 	// refresh cannot silently re-admit an add-on image whose tag moved.
 	for _, image := range rke2CacheImages {
@@ -379,6 +405,32 @@ func renderCacheImageManifestWithDigests(rke2Version, moduleVersion string, disa
 		}
 		images = append(images, image)
 	}
+	return append(images, chartImages...), nil
+}
+
+// cacheChartImageInventory is the kube-vip, CSI sidecar, and released module
+// part of the cache: everything that is not an RKE2 system image.
+func cacheChartImageInventory(moduleVersion string, moduleImageDigests map[string]string) ([]cachedImage, error) {
+	if !moduleVersionPattern.MatchString(moduleVersion) {
+		return nil, fmt.Errorf("bootstrap cache requires an exact released module version, got %q", moduleVersion)
+	}
+	if moduleImageDigests != nil {
+		if len(moduleImageDigests) != len(moduleImageNames) {
+			return nil, fmt.Errorf("bootstrap cache module image digests must contain exactly %d entries", len(moduleImageNames))
+		}
+		for _, component := range moduleImageNames {
+			digest, ok := moduleImageDigests[component]
+			if !ok || !imageDigestPattern.MatchString(digest) {
+				return nil, fmt.Errorf("bootstrap cache module image digest for %s must be sha256:<64 lowercase hex>", component)
+			}
+		}
+		for component := range moduleImageDigests {
+			if !slices.Contains(moduleImageNames, component) {
+				return nil, fmt.Errorf("bootstrap cache module image digest contains unknown component %q", component)
+			}
+		}
+	}
+	images := make([]cachedImage, 0, len(fixedCacheImages)+len(moduleImageNames))
 	images = append(images, fixedCacheImages...)
 	for _, component := range moduleImageNames {
 		sourceReference := "docker://ghcr.io/thanet-s/" + component + ":" + moduleVersion
@@ -390,9 +442,5 @@ func renderCacheImageManifestWithDigests(rke2Version, moduleVersion string, disa
 			Target: "thanet-s/" + component + ":" + moduleVersion,
 		})
 	}
-	var result strings.Builder
-	for _, image := range images {
-		fmt.Fprintf(&result, "%s\t%s\n", image.Source, image.Target)
-	}
-	return result.String(), nil
+	return images, nil
 }
