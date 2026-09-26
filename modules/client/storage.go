@@ -112,6 +112,38 @@ func (c *Client) AttachDisk(ctx context.Context, location, vmUUID, diskUUID stri
 	return &result, err
 }
 
+// ResizeAttachedDisk grows a disk while it is attached to vmUUID. InSpace only
+// exposes disk resize through the VM storage route and rejects a size smaller
+// than the current one, so sizeGiB is an absolute target rather than a delta.
+func (c *Client) ResizeAttachedDisk(ctx context.Context, location, vmUUID, diskUUID string, sizeGiB int) (*VMStorage, error) {
+	if sizeGiB <= 0 {
+		return nil, errors.New("inspace: disk size must be positive")
+	}
+	if err := validateUUID("VM", vmUUID); err != nil {
+		return nil, err
+	}
+	if err := validateUUID("disk", diskUUID); err != nil {
+		return nil, err
+	}
+	path, err := c.locationPath(location, "user-resource/vm/storage")
+	if err != nil {
+		return nil, err
+	}
+	var result VMStorage
+	err = c.do(ctx, http.MethodPatch, path, nil, url.Values{
+		"uuid":      {vmUUID},
+		"disk_uuid": {diskUUID},
+		"size_gb":   {strconv.Itoa(sizeGiB)},
+	}, &result)
+	if err == nil {
+		err = validateExpectedResponseUUID("resized disk", result.UUID, diskUUID)
+	}
+	if err == nil && result.SizeGiB < sizeGiB {
+		err = fmt.Errorf("inspace: resized disk %s reports %d GiB, want at least %d GiB", diskUUID, result.SizeGiB, sizeGiB)
+	}
+	return &result, err
+}
+
 func (c *Client) DetachDisk(ctx context.Context, location, vmUUID, diskUUID string) error {
 	if err := validateUUID("VM", vmUUID); err != nil {
 		return err

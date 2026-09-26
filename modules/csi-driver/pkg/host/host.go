@@ -6,7 +6,13 @@ import (
 	"errors"
 )
 
-var ErrMountConflict = errors.New("target is mounted from a different source")
+var (
+	ErrMountConflict = errors.New("target is mounted from a different source")
+	// ErrDeviceNotResized means the guest still reports a block device smaller
+	// than an expansion requires. A provider resize can reach the guest after
+	// the controller call returns, so callers should retry.
+	ErrDeviceNotResized = errors.New("block device has not reached the requested size")
+)
 
 // Mounter abstracts all host mutation. The CSI protocol package never invokes
 // mount, mkfs, udev, or filesystem syscalls directly.
@@ -24,6 +30,10 @@ type Mounter interface {
 	FormatAndMount(ctx context.Context, devicePath, target, fsType string, mountFlags []string) error
 	BindMount(ctx context.Context, source, target string, readOnly bool, mountFlags []string) error
 	Unmount(ctx context.Context, target string) error
+	// ExpandFilesystem waits until devicePath reports at least minimumBytes,
+	// grows the filesystem mounted at mountPath to fill it, and returns the
+	// device size. It returns ErrDeviceNotResized while the device is smaller.
+	ExpandFilesystem(ctx context.Context, devicePath, mountPath string, minimumBytes int64) (int64, error)
 }
 
 // Mount describes fake mounter state and is useful in smoke assertions.

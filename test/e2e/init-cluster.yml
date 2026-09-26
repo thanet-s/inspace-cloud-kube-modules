@@ -637,7 +637,7 @@
           test "$(docker inspect --format '{{ '{{' }}.State.Health.Status{{ '}}' }}' "$container_id")" = healthy
         done
         test "$(docker compose -f "$compose_file" ps --services --status running | wc -l)" -eq 2
-        test "$(awk -F '\t' 'NF == 2 { count++ } END { print count + 0 }' /etc/inspace-cache/images.tsv)" -eq 32
+        test "$(awk -F '\t' 'NF == 2 { count++ } END { print count + 0 }' /etc/inspace-cache/images.tsv)" -eq 33
         test "$(awk -F '\t' '$2 == "rancher/kube-webhook-certgen:v1.14.5-hardened2" { count++ } END { print count + 0 }' /etc/inspace-cache/images.tsv)" -eq 0
         test "$(awk -F '\t' '$2 == "rancher/nginx-ingress-controller:v1.14.5-hardened2" { count++ } END { print count + 0 }' /etc/inspace-cache/images.tsv)" -eq 0
         test "$(awk -F '\t' '$2 == "rancher/hardened-traefik:v3.7.11-build20260819" { count++ } END { print count + 0 }' /etc/inspace-cache/images.tsv)" -eq 0
@@ -699,7 +699,7 @@
             "$cache_endpoint/v2/$repository/manifests/$reference" >/dev/null
           image_count=$((image_count + 1))
         done </etc/inspace-cache/images.tsv
-        test "$image_count" -eq 32
+        test "$image_count" -eq 33
         write_status=$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
           --cacert "$cache_ca" "${resolve[@]}" --request POST \
           "$cache_endpoint/v2/inspace-e2e-write-denied/blobs/uploads/")
@@ -1734,6 +1734,10 @@
         test "$(kubectl -n kube-system get deployment/inspace-csi-controller -o json | jq -r '.spec.template.spec.containers[] | select(.name=="csi-attacher") | .image')" = \
           "$registry/sig-storage/csi-attacher:v4.8.1"
         test "$(kubectl -n kube-system get deployment/inspace-csi-controller -o json | jq -r '.spec.template.spec.containers[] | select(.name=="csi-attacher") | [.args[] | select(. == "--timeout=600s")] | length')" = \
+          "1"
+        test "$(kubectl -n kube-system get deployment/inspace-csi-controller -o json | jq -r '.spec.template.spec.containers[] | select(.name=="csi-resizer") | .image')" = \
+          "$registry/sig-storage/csi-resizer:v1.13.2"
+        test "$(kubectl -n kube-system get deployment/inspace-csi-controller -o json | jq -r '.spec.template.spec.containers[] | select(.name=="csi-resizer") | [.args[] | select(. == "--timeout=600s")] | length')" = \
           "1"
         test "$(kubectl -n kube-system get deployment/inspace-csi-controller -o json | jq -r '.spec.template.spec.containers[] | select(.name=="liveness-probe") | .image')" = \
           "$registry/sig-storage/livenessprobe:v2.15.0"

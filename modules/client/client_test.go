@@ -705,6 +705,14 @@ func TestMutationResponsesRequireCanonicalExpectedIdentity(t *testing.T) {
 			_, err := client.AttachDisk(ctx, "bkk01", vmUUID, diskUUID)
 			return err
 		}},
+		{name: "resized wrong disk", status: http.StatusOK, body: `{"uuid":"99999999-aaaa-4bbb-8ccc-dddddddddddd","size":60}`, call: func(ctx context.Context, client *inspace.Client) error {
+			_, err := client.ResizeAttachedDisk(ctx, "bkk01", vmUUID, diskUUID, 60)
+			return err
+		}},
+		{name: "resized disk below requested size", status: http.StatusOK, body: `{"uuid":"` + diskUUID + `","size":50}`, call: func(ctx context.Context, client *inspace.Client) error {
+			_, err := client.ResizeAttachedDisk(ctx, "bkk01", vmUUID, diskUUID, 60)
+			return err
+		}},
 		{name: "created floating IP malformed address", status: http.StatusCreated, body: `{"address":"10.0.0.1"}`, call: func(ctx context.Context, client *inspace.Client) error {
 			_, err := client.CreateFloatingIP(ctx, "bkk01", inspace.CreateFloatingIPRequest{Name: "owned", BillingAccountID: 42})
 			return err
@@ -933,6 +941,10 @@ func TestMutationSuccessResponseShapeAndStatusAreFailClosed(t *testing.T) {
 		}},
 		{name: "AttachDisk", successStatus: http.StatusOK, call: func(ctx context.Context, client *inspace.Client) error {
 			_, err := client.AttachDisk(ctx, "bkk01", vmUUID, diskUUID)
+			return err
+		}},
+		{name: "ResizeAttachedDisk", successStatus: http.StatusOK, call: func(ctx context.Context, client *inspace.Client) error {
+			_, err := client.ResizeAttachedDisk(ctx, "bkk01", vmUUID, diskUUID, 60)
 			return err
 		}},
 		{name: "DetachDisk", successStatus: http.StatusOK, call: func(ctx context.Context, client *inspace.Client) error {
@@ -1461,6 +1473,10 @@ func TestEveryMutationEndpointRejectsUndocumentedSuccessStatuses(t *testing.T) {
 		{name: "DetachDisk", body: `{"success":true}`, call: func(ctx context.Context, client *inspace.Client) error {
 			return client.DetachDisk(ctx, "bkk01", vmUUID, diskUUID)
 		}},
+		{name: "ResizeAttachedDisk", body: `{"uuid":"` + diskUUID + `","size":60}`, call: func(ctx context.Context, client *inspace.Client) error {
+			_, err := client.ResizeAttachedDisk(ctx, "bkk01", vmUUID, diskUUID, 60)
+			return err
+		}},
 		{name: "CreateFloatingIP", body: `{"address":"` + floatingIP + `"}`, call: func(ctx context.Context, client *inspace.Client) error {
 			_, err := client.CreateFloatingIP(ctx, "bkk01", inspace.CreateFloatingIPRequest{Name: "owned", BillingAccountID: 42})
 			return err
@@ -1528,8 +1544,8 @@ func TestEveryMutationEndpointRejectsUndocumentedSuccessStatuses(t *testing.T) {
 			return client.RemoveLoadBalancerRule(ctx, "bkk01", lbUUID, ruleUUID)
 		}},
 	}
-	if len(calls) != 22 {
-		t.Fatalf("mutation route table has %d entries, want all 22 exported mutations", len(calls))
+	if len(calls) != 23 {
+		t.Fatalf("mutation route table has %d entries, want all 23 exported mutations", len(calls))
 	}
 	for _, status := range []int{http.StatusAccepted, http.StatusPartialContent} {
 		for _, call := range calls {
@@ -1968,6 +1984,36 @@ func TestUpdateFloatingIPValidatesRequestBeforeTransport(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			if _, err := client.UpdateFloatingIP(context.Background(), "bkk01", test.address, test.request); err == nil {
 				t.Fatal("UpdateFloatingIP accepted invalid input")
+			}
+		})
+	}
+}
+
+func TestResizeAttachedDiskValidatesRequestBeforeTransport(t *testing.T) {
+	client, err := inspace.NewClient(inspace.Options{
+		BaseURL:                   "https://api.example.invalid",
+		APIKey:                    "test-key",
+		HTTPClient:                &http.Client{Transport: &panicTransport{}},
+		DangerouslyAllowMutations: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name     string
+		vmUUID   string
+		diskUUID string
+		sizeGiB  int
+	}{
+		{name: "zero size", vmUUID: vmUUID, diskUUID: diskUUID, sizeGiB: 0},
+		{name: "negative size", vmUUID: vmUUID, diskUUID: diskUUID, sizeGiB: -1},
+		{name: "invalid VM", vmUUID: "not-a-uuid", diskUUID: diskUUID, sizeGiB: 60},
+		{name: "invalid disk", vmUUID: vmUUID, diskUUID: "not-a-uuid", sizeGiB: 60},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := client.ResizeAttachedDisk(context.Background(), "bkk01", test.vmUUID, test.diskUUID, test.sizeGiB); err == nil {
+				t.Fatal("ResizeAttachedDisk accepted invalid input")
 			}
 		})
 	}

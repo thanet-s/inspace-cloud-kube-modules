@@ -86,6 +86,10 @@ func (a *detachFenceAPI) AttachDisk(context.Context, string, string, string) (*s
 	return nil, errors.New("unexpected AttachDisk")
 }
 
+func (a *detachFenceAPI) ResizeAttachedDisk(context.Context, string, string, string, int) (*sdk.VMStorage, error) {
+	return nil, errors.New("unexpected ResizeAttachedDisk")
+}
+
 func (a *detachFenceAPI) DetachDisk(_ context.Context, _ string, vmID, diskID string) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()

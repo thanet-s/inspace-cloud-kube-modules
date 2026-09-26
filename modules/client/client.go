@@ -475,6 +475,7 @@ var endpointContracts = []endpointContract{
 	{http.MethodPost, "/v1/{location}/network/load_balancers/{uuid}/forwarding_rules", statusOKOnly, successJSON},
 	{http.MethodPut, "/v1/{location}/network/firewalls/{uuid}", statusOKOnly, successJSON},
 	{http.MethodPatch, "/v1/{location}/network/ip_addresses/{address}", statusOKOnly, successJSON},
+	{http.MethodPatch, "/v1/{location}/user-resource/vm/storage", statusOKOnly, successJSON},
 
 	// The VM API reference does not state a success response. The live API can
 	// return either an empty 204 or a JSON-bearing 200. The body is never used

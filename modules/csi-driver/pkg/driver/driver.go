@@ -144,6 +144,8 @@ func cloudStatus(operation string, err error) error {
 		return status.Error(codes.NotFound, operation+": volume not found")
 	case errors.Is(err, cloud.ErrVolumeAttachedElsewhere):
 		return status.Error(codes.FailedPrecondition, operation+": volume is attached to another node")
+	case errors.Is(err, cloud.ErrVolumeNotAttached):
+		return status.Error(codes.FailedPrecondition, operation+": volume must be attached to a node; only online expansion is supported")
 	case errors.Is(err, cloud.ErrIncompatibleVolume):
 		return status.Error(codes.AlreadyExists, operation+": same-named volume is incompatible")
 	case errors.Is(err, cloud.ErrSnapshotsPresent):
@@ -174,6 +176,8 @@ func hostStatus(operation string, err error) error {
 		return status.Error(codes.DeadlineExceeded, operation+": deadline exceeded")
 	case errors.Is(err, host.ErrMountConflict):
 		return status.Errorf(codes.FailedPrecondition, "%s: target has a conflicting mount", operation)
+	case errors.Is(err, host.ErrDeviceNotResized):
+		return status.Errorf(codes.Unavailable, "%s: block device has not grown yet", operation)
 	}
 	return status.Errorf(codes.Internal, "%s failed: %v", operation, err)
 }

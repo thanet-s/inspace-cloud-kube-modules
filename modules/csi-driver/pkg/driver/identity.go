@@ -20,6 +20,8 @@ func (d *Driver) GetPluginCapabilities(context.Context, *csi.GetPluginCapabiliti
 	if d.controllerEnabled() {
 		capabilities = append(capabilities,
 			&csi.PluginCapability{Type: &csi.PluginCapability_Service_{Service: &csi.PluginCapability_Service{Type: csi.PluginCapability_Service_CONTROLLER_SERVICE}}},
+			// InSpace resizes a disk only through its VM attachment.
+			&csi.PluginCapability{Type: &csi.PluginCapability_VolumeExpansion_{VolumeExpansion: &csi.PluginCapability_VolumeExpansion{Type: csi.PluginCapability_VolumeExpansion_ONLINE}}},
 		)
 	}
 	return &csi.GetPluginCapabilitiesResponse{Capabilities: capabilities}, nil

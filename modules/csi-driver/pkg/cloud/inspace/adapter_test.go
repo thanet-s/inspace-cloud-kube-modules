@@ -60,6 +60,11 @@ type fakeAPI struct {
 	networkVMUUIDs         []string
 	omitNetworkMembership  bool
 	networkError           error
+	resizeCalls            int
+	lastResizeVM           string
+	lastResizeGiB          int
+	resizeMutationError    error
+	suppressResizeCommit   bool
 }
 
 // detailSequenceAPI can replace a specific canonical detail read while all
@@ -378,7 +383,7 @@ func (f *fakeAPI) ListVMs(context.Context, string) ([]sdk.VM, error) {
 }
 
 func (f *fakeAPI) mutationCalls() int {
-	return f.createCalls + f.deleteCalls + f.attachCalls + f.detachCalls
+	return f.createCalls + f.deleteCalls + f.attachCalls + f.detachCalls + f.resizeCalls
 }
 
 func (f *fakeAPI) GetVM(_ context.Context, _ string, id string) (*sdk.VM, error) {
@@ -456,6 +461,32 @@ func (f *fakeAPI) DetachDisk(_ context.Context, _ string, vmID, diskID string) e
 		return nil
 	}
 	return apiNotFound("VM")
+}
+
+func (f *fakeAPI) ResizeAttachedDisk(_ context.Context, _ string, vmID, diskID string, sizeGiB int) (*sdk.VMStorage, error) {
+	for i := range f.vms {
+		if f.vms[i].UUID != vmID {
+			continue
+		}
+		for j := range f.vms[i].Storage {
+			if f.vms[i].Storage[j].UUID != diskID {
+				continue
+			}
+			f.resizeCalls++
+			f.lastResizeVM, f.lastResizeGiB = vmID, sizeGiB
+			if !f.suppressResizeCommit {
+				f.vms[i].Storage[j].SizeGiB = sizeGiB
+				for k := range f.disks {
+					if f.disks[k].UUID == diskID {
+						f.disks[k].SizeGiB = sizeGiB
+					}
+				}
+			}
+			return &sdk.VMStorage{UUID: diskID, SizeGiB: sizeGiB}, f.resizeMutationError
+		}
+		return nil, apiNotFound("disk")
+	}
+	return nil, apiNotFound("VM")
 }
 
 func (f *fakeAPI) revealCreatedDisk() {

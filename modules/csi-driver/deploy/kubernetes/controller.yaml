@@ -93,6 +93,18 @@ spec:
           volumeMounts:
             - name: socket-dir
               mountPath: /csi
+        - name: resizer
+          image: registry.k8s.io/sig-storage/csi-resizer:v1.13.2
+          args:
+            - --csi-address=/csi/csi.sock
+            # Allows 2m preflight before the driver requires an 8m dispatch reserve.
+            - --timeout=600s
+            - --leader-election
+            # Online expansion only; no offline in-use retry or Pod informer.
+            - --handle-volume-inuse-error=false
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
         - name: liveness-probe
           image: registry.k8s.io/sig-storage/livenessprobe:v2.15.0
           args:

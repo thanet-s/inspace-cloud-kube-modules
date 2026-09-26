@@ -11,7 +11,7 @@ metadata:
   {{- end }}
 provisioner: csi.inspace.cloud
 reclaimPolicy: {{ .Values.csi.storageClass.reclaimPolicy }}
-allowVolumeExpansion: false
+allowVolumeExpansion: {{ .Values.csi.storageClass.allowVolumeExpansion }}
 volumeBindingMode: {{ .Values.csi.storageClass.volumeBindingMode }}
 parameters:
   csi.storage.k8s.io/fstype: {{ .Values.csi.storageClass.fsType | quote }}

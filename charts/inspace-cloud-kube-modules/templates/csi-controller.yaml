@@ -119,6 +119,22 @@ spec:
             allowPrivilegeEscalation: false
             capabilities:
               drop: ["ALL"]
+        - name: csi-resizer
+          image: {{ include "inspace.systemImage" (dict "root" . "image" .Values.csi.sidecars.resizer.image) }}
+          args:
+            - --csi-address=/csi/csi.sock
+            - --timeout={{ .Values.csi.sidecars.resizer.timeoutSeconds }}s
+            - --leader-election
+            # The driver supports online expansion only; it never needs the
+            # offline in-use retry path or its Pod informer.
+            - --handle-volume-inuse-error=false
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
         - name: liveness-probe
           image: {{ include "inspace.systemImage" (dict "root" . "image" .Values.csi.sidecars.livenessProbe.image) }}
           args:

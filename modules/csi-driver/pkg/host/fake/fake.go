@@ -11,15 +11,19 @@ import (
 )
 
 type Mounter struct {
-	mu      sync.Mutex
-	mounts  map[string]host.Mount
-	devices map[string]int
+	mu          sync.Mutex
+	mounts      map[string]host.Mount
+	devices     map[string]int
+	deviceSizes map[string]int64
+	expansions  map[string]int
 }
 
 func New() *Mounter {
 	return &Mounter{
-		mounts:  make(map[string]host.Mount),
-		devices: make(map[string]int),
+		mounts:      make(map[string]host.Mount),
+		devices:     make(map[string]int),
+		deviceSizes: make(map[string]int64),
+		expansions:  make(map[string]int),
 	}
 }
 
@@ -81,6 +85,37 @@ func (m *Mounter) Unmount(_ context.Context, target string) error {
 	defer m.mu.Unlock()
 	delete(m.mounts, target)
 	return nil
+}
+
+// ExpandFilesystem treats a device without an explicit SetDeviceSize as
+// already grown to the requested size.
+func (m *Mounter) ExpandFilesystem(_ context.Context, devicePath, mountPath string, minimumBytes int64) (int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.mounts[mountPath]; !ok {
+		return 0, fmt.Errorf("filesystem is not mounted: %s", mountPath)
+	}
+	size, known := m.deviceSizes[devicePath]
+	if !known {
+		size = minimumBytes
+	}
+	if size < minimumBytes {
+		return 0, fmt.Errorf("%w: %s has %d bytes, want %d", host.ErrDeviceNotResized, devicePath, size, minimumBytes)
+	}
+	m.expansions[devicePath]++
+	return size, nil
+}
+
+func (m *Mounter) SetDeviceSize(devicePath string, bytes int64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.deviceSizes[devicePath] = bytes
+}
+
+func (m *Mounter) FilesystemExpansions(devicePath string) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.expansions[devicePath]
 }
 
 func (m *Mounter) Mount(target string) (host.Mount, bool) {
