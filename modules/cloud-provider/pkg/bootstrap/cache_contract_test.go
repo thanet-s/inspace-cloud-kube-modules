@@ -586,7 +586,8 @@ func TestDirectControlPlaneCloudInitV9OwnershipBytes(t *testing.T) {
 	}
 	// The fixture renders bootstrapCacheRKE2Version, so this hash moves with
 	// each audited RKE2 release even when the renderer is unchanged
-	// (v1.36.4+rke2r1 rendered 7362af1d...).
+	// (v1.36.4+rke2r1 rendered 7362af1d...). The optional Cilium
+	// load-balancer settings are omitted here and must add no bytes.
 	const v9DirectHash = "d0e02293426fc7c175413a8ea922c58b2d22b3f9653db444f2a379f3a4dca1f0"
 	if got := fmt.Sprintf("%x", sha256.Sum256([]byte(raw))); got != v9DirectHash {
 		t.Fatalf("direct control-plane cloud-init hash=%s, want frozen v9 hash %s", got, v9DirectHash)
