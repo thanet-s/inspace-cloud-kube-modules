@@ -174,8 +174,9 @@ the single command for both kinds of day-2 upgrade:
   running the new version, respecting NodePool disruption budgets — no manual
   worker action is required.
 - **Control-plane RKE2 version upgrade**: when `rke2_version` in the inventory
-  differs from the version currently reported by the running control plane,
-  `update` downloads the exact upstream RKE2 release directly (bypassing the
+  differs from the RKE2 version recorded in the deployment journal (the
+  init-time version until the first upgrade) or from the kubelet version the
+  running control plane reports, `update` downloads the exact upstream RKE2 release directly (bypassing the
   bastion bootstrap cache, which pins exactly one audited version per
   controller build), verifies its published checksum, and swaps the binary on
   one control-plane server at a time — stopping `rke2-server`, replacing
@@ -183,7 +184,14 @@ the single command for both kinds of day-2 upgrade:
   the cluster API to recover before moving to the next server. This is the
   same fail-closed one-at-a-time sequencing already used for
   `control_plane_extra_config` changes, so embedded-etcd quorum is preserved
-  throughout (at most one of three servers is ever down).
+  throughout (at most one of three servers is ever down). After every server
+  runs the new release, `update` records it as `rke2Version` in `state.json`;
+  `cluster.yaml` keeps the init-time version because it remains the bootstrap
+  and destroy authority. Only `update` accepts an inventory `rke2_version`
+  that differs from the recorded one. An RKE2 release candidate such as
+  `v1.36.5-rc2+rke2r1` ships the GA kubelet, so its nodes report
+  `v1.36.5+rke2r1`; the journal is what distinguishes the candidate from its
+  GA release, and moving from the candidate to GA is an ordinary upgrade.
 
   A downgrade or a jump of more than one RKE2 minor version is refused unless
   the operator exports `INSPACE_CONFIRM_RKE2_VERSION_SKIP=<cluster-name>`,

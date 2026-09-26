@@ -154,6 +154,53 @@ read-only registry plus NGINX use bounded incremental retry, with at most nine
 Compose attempts, so a transient Docker startup race does not abandon
 cloud-init.
 
+#### Refreshing the audited RKE2 release
+
+The cache serves exactly one RKE2 release, currently the release candidate
+`v1.36.5-rc2+rke2r1` (Kubernetes 1.36.5, rke2-cilium 1.20.200 / Cilium
+1.20.2). `bootstrapCacheRKE2Version` in
+`modules/cloud-provider/pkg/bootstrap/cache.go` is the source of truth; the
+tarball checksum `bootstrapCacheRKE2SHA256` and the 27-entry
+`rke2CacheImages` inventory are derived from that release's public assets:
+
+- the checksum is the `rke2.linux-amd64.tar.gz` line of `sha256sum-amd64.txt`;
+- the inventory is `rke2-images-core`, `rke2-images-ingress-nginx`, and
+  `rke2-images-cilium` `.linux-amd64.txt`, in file order, with the two
+  ingress-nginx images placed right after `mirrored-pause`;
+- each source pins the tag's top-level index digest, the SHA-256 of
+  `docker buildx imagetools inspect --raw <image>` (not a per-platform
+  manifest digest). The six fixed CSI sidecar and kube-vip images and the
+  module images are not part of this set.
+
+`scripts/rke2-cache-inventory.py <version>` performs exactly these steps and
+prints the Go values; `--check` verifies `cache.go` against a release instead.
+It needs Docker buildx and public GitHub and Docker Hub access.
+
+Moving to another release, for example from the candidate to GA
+`v1.36.5+rke2r1`, is mechanical:
+
+1. Paste the script's output over the two constants and the
+   `rke2CacheImages` entries.
+2. Replace the old version string everywhere it is pinned:
+   `git grep -l 'v1.36.5-rc2+rke2r1' | xargs sed -i 's/v1\.36\.5-rc2+rke2r1/v1.36.5+rke2r1/g'`
+   (examples, E2E templates and checks, deploy inventory example, and test
+   fixtures).
+3. Update `v9DirectHash` in `cache_contract_test.go`: the direct control-plane
+   fixture renders `bootstrapCacheRKE2Version`, so only the version moves it.
+4. For a GA release, drop the single release-candidate alternative
+   (`|v1\.36\.5-rc2\+rke2r1`) from the Go RKE2 version patterns, all four CRD
+   copies, `deploy/playbooks/tasks/preflight.yml`, and
+   `AUDITED_PRERELEASES` in `deploy/scripts/validate_rke2_upgrade.py`, and
+   drop the candidate-specific validation test cases (step 2 turns them into
+   GA cases). The CRD and preflight static checks compare those copies with
+   the Go validators.
+5. When the bundled Cilium minor changes, render the new rke2-cilium chart
+   with the values in `renderRKE2CiliumConfig` and compare the resulting
+   `cilium-config` keys the E2E asserts, and read Cilium's upgrade notes.
+
+Disabled ingress add-ons are filtered by repository, not tag, so a refreshed
+release cannot re-admit their images.
+
 ### RKE2, Cilium, and the control-plane VIP
 
 RKE2 uses its bundled Cilium chart in native-routing mode. Cilium installs

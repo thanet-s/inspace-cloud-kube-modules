@@ -185,7 +185,7 @@ func TestBashLoginShellPostconditionStopsTheScript(t *testing.T) {
 func TestWorkerHostScriptsHaveNoNegatedAssertions(t *testing.T) {
 	data, err := RenderCloudInit(Config{
 		NodeName: "worker-1", Server: "https://10.0.0.10:9345", Token: "secret-token",
-		RKE2Version: "v1.36.4+rke2r1",
+		RKE2Version: "v1.36.5-rc2+rke2r1",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -213,7 +213,7 @@ func TestWorkerHostScriptsHaveNoNegatedAssertions(t *testing.T) {
 func TestWorkerHostPreparationSetsUbuntuSourcesAndBashLoginShell(t *testing.T) {
 	data, err := RenderCloudInit(Config{
 		NodeName: "worker-1", Server: "https://10.0.0.10:9345", Token: "secret-token",
-		RKE2Version: "v1.36.4+rke2r1",
+		RKE2Version: "v1.36.5-rc2+rke2r1",
 	})
 	if err != nil {
 		t.Fatal(err)

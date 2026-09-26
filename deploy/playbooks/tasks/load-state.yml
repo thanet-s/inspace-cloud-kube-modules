@@ -14,6 +14,13 @@
     deployment_state: "{{ lookup('file', deploy_state_dir + '/state.json') | from_json }}"
     persisted_inspace_cluster: "{{ lookup('file', deploy_state_dir + '/cluster.yaml') | from_yaml }}"
 
+# cluster.yaml stays the init-time bootstrap/destroy authority, so its RKE2
+# version never moves. The journal's rke2Version records the release `update`
+# last rolled onto every control-plane server; older journals omit it.
+- name: Resolve the recorded control-plane RKE2 version
+  ansible.builtin.set_fact:
+    deploy_recorded_rke2_version: "{{ deployment_state.get('rke2Version', persisted_inspace_cluster.spec.rke2.version) }}"
+
 - name: Bind local state to the selected inventory
   ansible.builtin.assert:
     that:
@@ -38,7 +45,7 @@
       - persisted_inspace_cluster.spec.controlPlane.machine.memoryMiB | int == control_plane_memory_mib | int
       - persisted_inspace_cluster.spec.controlPlane.machine.rootDiskGiB | int == control_plane_root_disk_gib | int
       - persisted_inspace_cluster.spec.controlPlane.machine.hostPoolUUID == inspace_amd_host_pool_uuid
-      - persisted_inspace_cluster.spec.rke2.version == rke2_version
+      - deploy_recorded_rke2_version == rke2_version or (deploy_allow_rke2_version_change | default(false) | bool)
       - persisted_inspace_cluster.spec.rke2.get('skipOSUpgrade', false) | bool == skip_os_upgrade | bool
       - persisted_inspace_cluster.spec.bootstrapCache.get('directDownload', false) | bool == bootstrap_direct_download | bool
     fail_msg: "The deployment journal belongs to another cluster or topology."

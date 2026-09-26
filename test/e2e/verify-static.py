@@ -2494,7 +2494,7 @@ def main() -> None:
     ):
         require(marker in playbook, f"playbook is missing contract marker: {marker}")
 
-    require("version: v1.36.4+rke2r1" in cluster, "control plane must pin supported RKE2")
+    require("version: v1.36.5-rc2+rke2r1" in cluster, "control plane must pin supported RKE2")
     require("rootDiskGiB: 60" in cluster, "E2E control planes must use 60 GiB root disks")
     require("rke2-ingress-nginx" in cluster, "unused RKE2 ingress must be disabled")
     require("rke2-traefik" in cluster, "unused RKE2 Traefik ingress must be disabled")
@@ -3444,9 +3444,9 @@ def main() -> None:
         '-verify_hostname "$cache_host"',
         'cmp -s /etc/inspace-cache/tls/server.crt "$served_certificate"',
         "/etc/inspace-cache/images.tsv)\" -eq 33",
-        '$2 == "rancher/kube-webhook-certgen:v1.14.5-hardened2" { count++ } END { print count + 0 }\' /etc/inspace-cache/images.tsv)" -eq 0',
-        '$2 == "rancher/nginx-ingress-controller:v1.14.5-hardened2" { count++ } END { print count + 0 }\' /etc/inspace-cache/images.tsv)" -eq 0',
-        '$2 == "rancher/hardened-traefik:v3.7.11-build20260819" { count++ } END { print count + 0 }\' /etc/inspace-cache/images.tsv)" -eq 0',
+        'index($2, "rancher/kube-webhook-certgen:") == 1 { count++ } END { print count + 0 }\' /etc/inspace-cache/images.tsv)" -eq 0',
+        'index($2, "rancher/nginx-ingress-controller:") == 1 { count++ } END { print count + 0 }\' /etc/inspace-cache/images.tsv)" -eq 0',
+        'index($2, "rancher/hardened-traefik:") == 1 { count++ } END { print count + 0 }\' /etc/inspace-cache/images.tsv)" -eq 0',
         'test "$image_count" -eq 33',
         '"${resolve[@]}" "$cache_endpoint/healthz"',
         '"${resolve[@]}" "$cache_endpoint/v2/"',

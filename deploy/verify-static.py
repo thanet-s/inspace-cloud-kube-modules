@@ -236,6 +236,40 @@ def main() -> None:
         "sha256sum" in rke2_upgrade_script and "systemctl stop rke2-server" in rke2_upgrade_script,
         "RKE2 binary upgrade script does not verify checksums or stop the service before replacing it",
     )
+    # The init-time InSpaceCluster record keeps its original RKE2 version (it is
+    # bootstrap/destroy authority), so the journal records the version the
+    # control plane was last upgraded to and only `update` may move it.
+    require(
+        "persisted_inspace_cluster.spec.rke2.version == rke2_version" not in load_state
+        and "deployment_state.get('rke2Version', persisted_inspace_cluster.spec.rke2.version)" in load_state
+        and "deploy_allow_rke2_version_change | default(false) | bool" in load_state
+        and "deploy_allow_rke2_version_change: true" in update,
+        "deployment journal blocks the documented in-place RKE2 version upgrade",
+    )
+    require(
+        "deploy_recorded_rke2_version != rke2_version" in rke2_upgrade_task
+        and "- \"{{ deploy_recorded_rke2_version }}\"" in rke2_upgrade_task
+        and "combine({'rke2Version': rke2_version}" in rke2_upgrade_task,
+        "RKE2 upgrade is not gated on and does not record the exact journaled RKE2 version",
+    )
+    # RKE2 release candidates ship the GA hardened kubelet, whose reported
+    # version omits the -rcN suffix.
+    kubelet_form = "rke2_version | regex_replace('-rc[0-9]+[+]', '+')"
+    one_upgrade = read("deploy/playbooks/tasks/upgrade-one-control-plane.yml")
+    require(
+        kubelet_form in rke2_upgrade_task and "deploy_expected_kubelet_version" in one_upgrade
+        and "failed_when: deploy_control_plane_upgraded_version.stdout != rke2_version" not in one_upgrade,
+        "RKE2 upgrade readback does not map a release candidate to its kubelet version",
+    )
+    go_pattern = re.search(
+        r"rke2VersionPattern = regexp\.MustCompile\(`([^`]+)`\)",
+        read("modules/cloud-provider/api/v1alpha1/types.go"),
+    )
+    require(
+        go_pattern is not None
+        and f"rke2_version is match('{go_pattern.group(1).replace(chr(92), chr(92) * 2)}')" in preflight,
+        "deploy preflight RKE2 version pattern differs from the InSpaceCluster validator",
+    )
 
     ordered_destroy = (
         "Refuse bootstrap deletion while PVC or PV ownership remains",

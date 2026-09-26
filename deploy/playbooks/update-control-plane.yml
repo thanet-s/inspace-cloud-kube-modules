@@ -4,6 +4,9 @@
   gather_facts: false
   vars:
     deploy_create_state_dir: false
+    # Only update may move the recorded RKE2 version, through the guarded
+    # one-server-at-a-time upgrade in tasks/apply-rke2-upgrade.yml.
+    deploy_allow_rke2_version_change: true
   tasks:
     - name: Validate inventory, topology, tools, and SSH identity
       ansible.builtin.include_tasks: tasks/preflight.yml
