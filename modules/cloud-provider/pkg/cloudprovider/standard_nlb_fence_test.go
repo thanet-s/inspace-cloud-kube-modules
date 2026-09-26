@@ -3,6 +3,7 @@ package cloudprovider
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -315,6 +316,7 @@ func TestOnlyTypedLocalBlockIsKnownPreDispatch(t *testing.T) {
 		{name: "server error", err: &inspace.APIError{StatusCode: 503, Retryable: true}},
 		{name: "transport", err: errors.New("connection reset")},
 		{name: "preflight block", err: inspace.ErrMutationBlocked, preDispatch: true},
+		{name: "local SDK rejection", err: fmt.Errorf("wrapped: %w", inspace.ErrMutationNotDispatched), preDispatch: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			if got := standardNLBMutationKnownPreDispatch(test.err); got != test.preDispatch {

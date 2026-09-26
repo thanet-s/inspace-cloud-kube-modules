@@ -187,4 +187,8 @@ about 22 extra minutes per `init`, without ever telling a bad address from a
 good one. Instead, both `test/e2e` and `deploy/` init prove each control
 plane's internet egress from inside, through the bastion, before the long
 cloud-init wait. A fresh address gets up to 5 minutes; a bad control-plane
-address then fails `init` and reaches the existing destroy-and-retry path.
+address then fails `init` quickly. Only the E2E `all` phase destroys and
+retries automatically (once). The standalone E2E `init` phase preserves the
+failed cluster, and `deploy/` destroys and retries only when
+`INSPACE_DEPLOY_INIT_AUTO_RECOVER=true` (default `false`); otherwise the
+operator must destroy the cluster and run `init` again.

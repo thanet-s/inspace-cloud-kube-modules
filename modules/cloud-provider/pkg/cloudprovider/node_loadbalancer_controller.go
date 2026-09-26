@@ -206,6 +206,9 @@ func parseNodeLoadBalancerService(service *corev1.Service, defaults nodeLoadBala
 	if err != nil {
 		return nodeLoadBalancerIntent{}, err
 	}
+	if err := validateNodeLoadBalancerPortsNotReserved(ports); err != nil {
+		return nodeLoadBalancerIntent{}, err
+	}
 	existingShard := strings.TrimSpace(annotations[annotationNodeLoadBalancerShard])
 	if mode == nodeLoadBalancerModeLocal && existingShard != "" {
 		return nodeLoadBalancerIntent{}, errors.New("node load balancer: public-node-local mode cannot retain a managed shard assignment")
@@ -346,6 +349,72 @@ func nodeLoadBalancerPortClaims(service *corev1.Service) ([]nodeLoadBalancerPort
 	}
 	sortNodeLoadBalancerPorts(claims)
 	return claims, nil
+}
+
+// nodeLoadBalancerReservedPort is one host or cluster port range that a Node-LB
+// Service must never claim. Every Node-LB mode opens its claimed ports on the
+// node public firewall from the Service source ranges (any source by default)
+// and makes Cilium serve that port on node IPs, so claiming one of these would
+// either expose a host/cluster daemon to the Internet or hijack its traffic.
+type nodeLoadBalancerReservedPort struct {
+	Protocol corev1.Protocol
+	First    int32
+	Last     int32
+	Reason   string
+}
+
+// nodeLoadBalancerReservedPorts is the single source of truth for ports that a
+// Node-LB Service may not claim. Keep each entry narrowly scoped to the
+// protocol the daemon actually uses so unrelated user ports stay available.
+var nodeLoadBalancerReservedPorts = []nodeLoadBalancerReservedPort{
+	// OpenSSH on every VM; exposing or shadowing it breaks break-glass access.
+	{Protocol: corev1.ProtocolTCP, First: 22, Last: 22, Reason: "SSH"},
+	// etcd client (2379), peer (2380), and metrics (2381) on RKE2 servers.
+	{Protocol: corev1.ProtocolTCP, First: 2379, Last: 2381, Reason: "etcd"},
+	// Cilium agent node-to-node health checks.
+	{Protocol: corev1.ProtocolTCP, First: 4240, Last: 4240, Reason: "Cilium health"},
+	// Hubble server (4244) and Hubble relay (4245).
+	{Protocol: corev1.ProtocolTCP, First: 4244, Last: 4245, Reason: "Hubble"},
+	// kube-apiserver (6443) and the RKE2 agent's local API server proxy (6444).
+	{Protocol: corev1.ProtocolTCP, First: 6443, Last: 6444, Reason: "Kubernetes API server"},
+	// Cilium VXLAN overlay if tunnel routing is ever enabled.
+	{Protocol: corev1.ProtocolUDP, First: 8472, Last: 8472, Reason: "Cilium VXLAN"},
+	// RKE2 supervisor/registration endpoint on servers.
+	{Protocol: corev1.ProtocolTCP, First: 9345, Last: 9345, Reason: "RKE2 supervisor"},
+	// Cilium agent/operator/Envoy Prometheus endpoints bound on host network.
+	{Protocol: corev1.ProtocolTCP, First: 9962, Last: 9964, Reason: "Cilium metrics"},
+	// Local containerd CRI streaming server.
+	{Protocol: corev1.ProtocolTCP, First: 10010, Last: 10010, Reason: "containerd streaming"},
+	// kubelet healthz (10248), kube-proxy/Cilium KPR metrics and health
+	// (10249, 10256), kubelet API (10250), controller-manager (10257),
+	// cloud-controller-manager (10258), and scheduler (10259).
+	{Protocol: corev1.ProtocolTCP, First: 10248, Last: 10259, Reason: "Kubernetes node and control-plane components"},
+	// Default Kubernetes NodePort range; Cilium kube-proxy replacement serves
+	// other Services' NodePorts on the same node IPs.
+	{Protocol: corev1.ProtocolTCP, First: 30000, Last: 32767, Reason: "Kubernetes NodePort range"},
+	{Protocol: corev1.ProtocolUDP, First: 30000, Last: 32767, Reason: "Kubernetes NodePort range"},
+	// Cilium WireGuard transparent encryption if it is ever enabled.
+	{Protocol: corev1.ProtocolUDP, First: 51871, Last: 51871, Reason: "Cilium WireGuard"},
+}
+
+var errNodeLoadBalancerReservedPort = errors.New("node load balancer: reserved port")
+
+// validateNodeLoadBalancerPortsNotReserved rejects the whole Service when any
+// claimed port overlaps a reserved host/cluster port. Rejecting at parse time
+// routes an already-admitted Service through the invalid-Service quarantine,
+// which withdraws its public firewall rules and Cilium frontend.
+func validateNodeLoadBalancerPortsNotReserved(claims []nodeLoadBalancerPortClaim) error {
+	for _, claim := range claims {
+		for _, reserved := range nodeLoadBalancerReservedPorts {
+			if claim.Protocol == reserved.Protocol && claim.Port >= reserved.First && claim.Port <= reserved.Last {
+				return fmt.Errorf(
+					"%w: %s/%d is reserved for %s on cluster nodes and cannot be exposed by a Node-LB Service",
+					errNodeLoadBalancerReservedPort, claim.Protocol, claim.Port, reserved.Reason,
+				)
+			}
+		}
+	}
+	return nil
 }
 
 type mutableNodeLoadBalancerShard struct {

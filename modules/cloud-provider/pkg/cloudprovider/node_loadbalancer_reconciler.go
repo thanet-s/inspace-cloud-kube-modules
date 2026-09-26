@@ -2116,6 +2116,11 @@ func (c *nodeLoadBalancerController) ensureServiceFirewall(ctx context.Context, 
 		}
 		pendingFirewall := pendingFirewallByName
 		if pendingFirewall == nil {
+			if pendingIssued != "" && service.Annotations[annotationNodeLoadBalancerPendingFWRejected] == pendingIssued {
+				// The provider definitively rejected this exact create and the
+				// deterministic name is absent in this fresh List.
+				return nil, "", false, c.retireRejectedServiceFirewallCreate(ctx, service, pendingIssued, pendingIssuedAt)
+			}
 			if pendingIssued != "" {
 				return nil, "", false, fmt.Errorf(
 					"node load balancer: Service firewall create attempt %s issued at %s remains ambiguous; waiting for deterministic-name adoption or operator resolution",
@@ -2332,12 +2337,14 @@ func (c *nodeLoadBalancerController) validateServiceFirewallAssignmentMutation(
 	return nil
 }
 
-// nodeLoadBalancerMutationKnownPreDispatch identifies the only error that
-// proves the cloud request never left this process. Every HTTP response and
-// transport error is post-dispatch ambiguous and must retain its issued
-// receipt until exact desired-state readback resolves it.
+// nodeLoadBalancerMutationKnownPreDispatch identifies the only SDK errors that
+// prove the cloud request never left this process: the non-loopback mutation
+// block and local validation, request construction, or an already-done context
+// before the HTTP client is invoked. Every HTTP response and transport error is
+// post-dispatch ambiguous and must retain its issued receipt until exact
+// desired-state readback resolves it.
 func nodeLoadBalancerMutationKnownPreDispatch(err error) bool {
-	return errors.Is(err, inspace.ErrMutationBlocked)
+	return errors.Is(err, inspace.ErrMutationBlocked) || errors.Is(err, inspace.ErrMutationNotDispatched)
 }
 
 func newNodeLoadBalancerFirewallCreateIssuedToken() (string, error) {
@@ -2474,6 +2481,9 @@ func (c *nodeLoadBalancerController) createServiceFirewallFromIssuedIntent(
 		}
 		committed, recoveryErr := c.resolveServiceFirewallCreateReadback(ctx, current, desired)
 		if recoveryErr != nil {
+			if nodeLoadBalancerCreateRejectionProvable(err, recoveryErr) {
+				return errors.Join(createErr, recoveryErr, c.markServiceFirewallCreateRejected(ctx, current, token, issuedAt))
+			}
 			return errors.Join(createErr, recoveryErr)
 		}
 		if committed {
@@ -2545,7 +2555,7 @@ func (c *nodeLoadBalancerController) resolveServiceFirewallCreateReadback(
 		}
 		return true, nil
 	}
-	return false, fmt.Errorf("node load balancer: Service firewall create outcome remains ambiguous after exact name absence readback")
+	return false, fmt.Errorf("node load balancer: Service firewall create outcome remains ambiguous after %w", errNodeLoadBalancerCreateAbsentAfterResponse)
 }
 
 func (c *nodeLoadBalancerController) ensurePendingFirewallCreateIntent(ctx context.Context, service *corev1.Service, name string) (*corev1.Service, bool, error) {
@@ -2575,6 +2585,7 @@ func (c *nodeLoadBalancerController) ensurePendingFirewallCreateIntent(ctx conte
 		delete(copy.Annotations, annotationNodeLoadBalancerPendingFirewall)
 		delete(copy.Annotations, annotationNodeLoadBalancerPendingFWIssued)
 		delete(copy.Annotations, annotationNodeLoadBalancerPendingFWIssuedAt)
+		delete(copy.Annotations, annotationNodeLoadBalancerPendingFWRejected)
 		delete(copy.Annotations, annotationNodeLoadBalancerPendingFWDelete)
 		delete(copy.Annotations, annotationNodeLoadBalancerPendingFWAbsent)
 		delete(copy.Annotations, annotationNodeLoadBalancerPendingFWChecked)
@@ -2610,6 +2621,7 @@ func (c *nodeLoadBalancerController) ensurePendingFirewallMetadata(ctx context.C
 		copy.Annotations[annotationNodeLoadBalancerPendingFirewall] = uuid
 		delete(copy.Annotations, annotationNodeLoadBalancerPendingFWIssued)
 		delete(copy.Annotations, annotationNodeLoadBalancerPendingFWIssuedAt)
+		delete(copy.Annotations, annotationNodeLoadBalancerPendingFWRejected)
 		delete(copy.Annotations, annotationNodeLoadBalancerPendingFWAbsent)
 		delete(copy.Annotations, annotationNodeLoadBalancerPendingFWChecked)
 		return true, nil
@@ -2644,6 +2656,7 @@ func (c *nodeLoadBalancerController) clearPendingFirewallMetadata(ctx context.Co
 		delete(copy.Annotations, annotationNodeLoadBalancerPendingFWStarted)
 		delete(copy.Annotations, annotationNodeLoadBalancerPendingFWIssued)
 		delete(copy.Annotations, annotationNodeLoadBalancerPendingFWIssuedAt)
+		delete(copy.Annotations, annotationNodeLoadBalancerPendingFWRejected)
 		delete(copy.Annotations, annotationNodeLoadBalancerPendingFWDelete)
 		delete(copy.Annotations, annotationNodeLoadBalancerPendingFWAbsent)
 		delete(copy.Annotations, annotationNodeLoadBalancerPendingFWChecked)
@@ -2658,7 +2671,7 @@ func (c *nodeLoadBalancerController) clearPendingFirewallMetadata(ctx context.Co
 // resetServiceFirewallCreateAfterProvenNonDispatch resets only the exact
 // create-issued receipt won by this invocation. Callers have proof that no
 // provider HTTP mutation was dispatched: either final authority rejected the
-// operation before the SDK call, or the SDK returned ErrMutationBlocked. The
+// operation before the SDK call, or the SDK returned a typed pre-dispatch error. The
 // staged deterministic identity remains intact for a safe later retry.
 func (c *nodeLoadBalancerController) resetServiceFirewallCreateAfterProvenNonDispatch(
 	ctx context.Context,
@@ -2692,6 +2705,7 @@ func (c *nodeLoadBalancerController) resetServiceFirewallCreateAfterProvenNonDis
 		}
 		delete(copy.Annotations, annotationNodeLoadBalancerPendingFWIssued)
 		delete(copy.Annotations, annotationNodeLoadBalancerPendingFWIssuedAt)
+		delete(copy.Annotations, annotationNodeLoadBalancerPendingFWRejected)
 		return true, nil
 	})
 	if err != nil {
@@ -2743,6 +2757,7 @@ func (c *nodeLoadBalancerController) promotePendingFirewallMetadata(
 			annotationNodeLoadBalancerPendingFWStarted,
 			annotationNodeLoadBalancerPendingFWIssued,
 			annotationNodeLoadBalancerPendingFWIssuedAt,
+			annotationNodeLoadBalancerPendingFWRejected,
 			annotationNodeLoadBalancerPendingFWDelete,
 			annotationNodeLoadBalancerPendingFWAbsent,
 			annotationNodeLoadBalancerPendingFWChecked,
@@ -5118,7 +5133,9 @@ func (c *nodeLoadBalancerController) cleanupService(ctx context.Context, service
 		c.queue.AddAfter(service.Namespace+"/"+service.Name, nodeLoadBalancerRetry)
 		return nil
 	}
-	confirmedAbsent, changed, err := c.recordFirewallAbsence(
+	// The pass that records the final spaced absence proof continues straight
+	// to finalization; only an unfinished proof waits for the spacing delay.
+	confirmedAbsent, _, err := c.recordFirewallAbsence(
 		ctx,
 		service,
 		annotationNodeLoadBalancerCleanupFWAbsent,
@@ -5129,7 +5146,7 @@ func (c *nodeLoadBalancerController) cleanupService(ctx context.Context, service
 	if err != nil {
 		return err
 	}
-	if changed || !confirmedAbsent {
+	if !confirmedAbsent {
 		c.queue.AddAfter(service.Namespace+"/"+service.Name, nodeLoadBalancerAbsenceConfirmationDelay)
 		return nil
 	}
@@ -5252,6 +5269,7 @@ func (c *nodeLoadBalancerController) cleanupService(ctx context.Context, service
 			annotationNodeLoadBalancerPendingFWStarted,
 			annotationNodeLoadBalancerPendingFWIssued,
 			annotationNodeLoadBalancerPendingFWIssuedAt,
+			annotationNodeLoadBalancerPendingFWRejected,
 			annotationNodeLoadBalancerPendingFWDelete,
 			annotationNodeLoadBalancerPendingFWAbsent,
 			annotationNodeLoadBalancerPendingFWChecked,
@@ -5685,7 +5703,9 @@ func (c *nodeLoadBalancerController) deleteOwnedServiceFirewall(ctx context.Cont
 			current = updated
 			target = uuid
 		}
-		confirmed, changed, confirmErr := c.recordFirewallAbsence(
+		// The pass that records the final spaced absence proof may clear the
+		// receipt immediately; the clear re-checks the persisted count.
+		confirmed, _, confirmErr := c.recordFirewallAbsence(
 			ctx,
 			current,
 			annotationNodeLoadBalancerCleanupFWAbsent,
@@ -5693,7 +5713,7 @@ func (c *nodeLoadBalancerController) deleteOwnedServiceFirewall(ctx context.Cont
 			c.nodeLoadBalancerFirewallRelationTime(),
 			time.Time{},
 		)
-		if confirmErr != nil || changed || !confirmed {
+		if confirmErr != nil || !confirmed {
 			return false, confirmErr
 		}
 		cleared, _, clearErr := c.updateExactParentService(ctx, current, func(copy *corev1.Service) (bool, error) {
@@ -5765,10 +5785,17 @@ func (c *nodeLoadBalancerController) deleteOwnedServiceFirewall(ctx context.Cont
 		}
 		return false, nil
 	}
+	previousIssuedAt := issuedAt
 	if issuedAt != "" {
-		// A durable issued receipt is immutable after the request boundary. Even
-		// exact visibility can be stale and must never authorize a replay.
-		return false, nil
+		// A durable issued receipt blocks concurrent or immediate duplicate
+		// dispatch; a fresh positive read can be stale. Once the same owned,
+		// unassigned UUID is still listed a full resend interval after the
+		// issue, the DELETE evidently did not commit. Re-sending an exact,
+		// ownership-rechecked UUID DELETE is idempotent, so re-issue it.
+		resend, resendErr := nodeLoadBalancerFirewallDeleteResendDue(issuedAt, c.nodeLoadBalancerFirewallRelationTime())
+		if resendErr != nil || !resend {
+			return false, resendErr
+		}
 	}
 	issuedAt = c.nodeLoadBalancerFirewallRelationTime().Format(time.RFC3339Nano)
 	issuedService, winner, issueErr := c.updateExactParentService(ctx, current, func(copy *corev1.Service) (bool, error) {
@@ -5785,7 +5812,9 @@ func (c *nodeLoadBalancerController) deleteOwnedServiceFirewall(ctx context.Cont
 		if storedTarget != "" && storedTarget != uuid {
 			return false, fmt.Errorf("node load balancer: concurrent Service firewall delete targets %s, not %s", storedTarget, uuid)
 		}
-		if storedIssued != "" {
+		// Only the exact observed receipt may be replaced; a concurrent
+		// issue or re-issue wins and this invocation sends nothing.
+		if storedIssued != previousIssuedAt {
 			return false, nil
 		}
 		copy.Annotations[annotationNodeLoadBalancerFWDeleteTarget] = uuid
@@ -5846,6 +5875,24 @@ func (c *nodeLoadBalancerController) deleteOwnedServiceFirewall(ctx context.Cont
 		return false, fmt.Errorf("node load balancer: delete firewall %s: %w", uuid, deleteErr)
 	}
 	return false, nil
+}
+
+// nodeLoadBalancerFirewallDeleteResendDelay is how long an issued firewall
+// DELETE must remain unresolved before the same exact UUID may be re-sent. It
+// exceeds the SDK mutation timeout, so the earlier request can no longer be in
+// flight, plus one absence-observation interval for list convergence.
+const nodeLoadBalancerFirewallDeleteResendDelay = nodeLoadBalancerShardFirewallMutationTimeout + nodeLoadBalancerAbsenceConfirmationDelay
+
+// nodeLoadBalancerFirewallDeleteResendDue reports whether an issued DELETE
+// receipt is old enough that a still-listed firewall proves the request did
+// not commit. Callers must still re-check exact ownership and assignments,
+// and must CAS-replace the exact observed receipt before re-sending.
+func nodeLoadBalancerFirewallDeleteResendDue(issuedAt string, now time.Time) (bool, error) {
+	issued, err := time.Parse(time.RFC3339Nano, issuedAt)
+	if err != nil {
+		return false, fmt.Errorf("node load balancer: invalid firewall delete issue timestamp %q: %w", issuedAt, err)
+	}
+	return !now.Before(issued.Add(nodeLoadBalancerFirewallDeleteResendDelay)), nil
 }
 
 func (c *nodeLoadBalancerController) resetServiceFirewallDeleteAfterProvenNonDispatch(
@@ -5939,6 +5986,7 @@ func clearServiceFirewallDeleteState(annotations map[string]string, uuid string)
 			annotationNodeLoadBalancerPendingFWStarted,
 			annotationNodeLoadBalancerPendingFWIssued,
 			annotationNodeLoadBalancerPendingFWIssuedAt,
+			annotationNodeLoadBalancerPendingFWRejected,
 			annotationNodeLoadBalancerPendingFWDelete,
 			annotationNodeLoadBalancerPendingFWAbsent,
 			annotationNodeLoadBalancerPendingFWChecked,

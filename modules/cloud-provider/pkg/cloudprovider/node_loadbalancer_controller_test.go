@@ -473,6 +473,103 @@ func TestParseNodeLoadBalancerRejectsInvalidShapesAndContracts(t *testing.T) {
 	}
 }
 
+func TestParseNodeLoadBalancerRejectsReservedHostAndClusterPorts(t *testing.T) {
+	for _, claim := range []struct {
+		protocol corev1.Protocol
+		port     int32
+	}{
+		{corev1.ProtocolTCP, 22},
+		{corev1.ProtocolTCP, 2379},
+		{corev1.ProtocolTCP, 2380},
+		{corev1.ProtocolTCP, 2381},
+		{corev1.ProtocolTCP, 4240},
+		{corev1.ProtocolTCP, 4244},
+		{corev1.ProtocolTCP, 6443},
+		{corev1.ProtocolTCP, 6444},
+		{corev1.ProtocolUDP, 8472},
+		{corev1.ProtocolTCP, 9345},
+		{corev1.ProtocolTCP, 10250},
+		{corev1.ProtocolTCP, 10256},
+		{corev1.ProtocolUDP, 51871},
+		{corev1.ProtocolTCP, 30000},
+		{corev1.ProtocolUDP, 32767},
+	} {
+		t.Run(string(claim.protocol)+"/"+strconv.Itoa(int(claim.port)), func(t *testing.T) {
+			service := nodeLoadBalancerTestService("web", "web-uid", corev1.ProtocolTCP, 443)
+			service.Spec.Ports = append(service.Spec.Ports, corev1.ServicePort{Name: "reserved", Protocol: claim.protocol, Port: claim.port})
+			_, err := parseNodeLoadBalancerService(service, nodeLoadBalancerDefaults{NodesPerShard: 1})
+			if err == nil || !strings.Contains(err.Error(), "reserved") {
+				t.Fatalf("parse error = %v, want reserved-port rejection", err)
+			}
+			local := nodeLoadBalancerTestService("web", "web-uid", claim.protocol, claim.port)
+			local.Annotations[annotationNodeLoadBalancerMode] = nodeLoadBalancerModeLocal
+			local.Annotations[annotationNodeLoadBalancerPool] = "edge"
+			local.Spec.ExternalTrafficPolicy = corev1.ServiceExternalTrafficPolicyLocal
+			if _, err := parseNodeLoadBalancerService(local, nodeLoadBalancerDefaults{NodesPerShard: 1}); err == nil || !strings.Contains(err.Error(), "reserved") {
+				t.Fatalf("public-node-local parse error = %v, want reserved-port rejection", err)
+			}
+		})
+	}
+	// Protocol-specific reservations must not over-block the other protocol.
+	for _, allowed := range []struct {
+		protocol corev1.Protocol
+		port     int32
+	}{
+		{corev1.ProtocolUDP, 22},
+		{corev1.ProtocolTCP, 8472},
+		{corev1.ProtocolTCP, 80},
+		{corev1.ProtocolUDP, 53},
+		{corev1.ProtocolTCP, 29999},
+		{corev1.ProtocolTCP, 32768},
+	} {
+		service := nodeLoadBalancerTestService("web", "web-uid", allowed.protocol, allowed.port)
+		if _, err := parseNodeLoadBalancerService(service, nodeLoadBalancerDefaults{NodesPerShard: 1}); err != nil {
+			t.Fatalf("%s/%d rejected: %v", allowed.protocol, allowed.port, err)
+		}
+	}
+}
+
+func TestNodeLoadBalancerSyncRejectsReservedPortWithSingleWarningEvent(t *testing.T) {
+	ctx := context.Background()
+	service := nodeLoadBalancerTestService("ssh", "9f5db76f-90c1-4ee5-9067-9a3db48e3c9b", corev1.ProtocolTCP, 22)
+	api := &fakeAPI{}
+	provider := newTestProvider(t, api)
+	provider.config.NodeLoadBalancer = NodeLoadBalancerConfig{Enabled: true, DefaultNodeClass: "workers", NodesPerShard: 1}
+	provider.kubeClient = kubefake.NewSimpleClientset(service.DeepCopy())
+	provider.dynamicClient = newNodeLoadBalancerTestDynamicClient()
+	serviceIndexer := newNamespacedIndexer()
+	if err := serviceIndexer.Add(service.DeepCopy()); err != nil {
+		t.Fatal(err)
+	}
+	controller := &nodeLoadBalancerController{
+		provider: provider, services: corelisters.NewServiceLister(serviceIndexer),
+		nodes: corelisters.NewNodeLister(cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})),
+		queue: workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]()),
+	}
+	defer controller.queue.ShutDown()
+	for i := 0; i < 2; i++ {
+		if err := controller.sync(ctx, "default/ssh"); err == nil || !strings.Contains(err.Error(), "reserved for SSH") {
+			t.Fatalf("sync %d error = %v, want reserved-port rejection", i, err)
+		}
+	}
+	stored, err := provider.kubeClient.CoreV1().Services("default").Get(ctx, "ssh", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if containsString(stored.Finalizers, nodeLoadBalancerFinalizer) || stored.Annotations[annotationNodeLoadBalancerShard] != "" {
+		t.Fatalf("reserved-port Service was admitted: %#v", stored.ObjectMeta)
+	}
+	events, err := provider.kubeClient.CoreV1().Events("default").List(ctx, metav1.ListOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events.Items) != 1 || events.Items[0].Reason != "NodeLoadBalancerReservedPort" ||
+		events.Items[0].Type != corev1.EventTypeWarning || events.Items[0].InvolvedObject.UID != service.UID ||
+		!strings.Contains(events.Items[0].Message, "TCP/22") {
+		t.Fatalf("reserved-port events = %#v", events.Items)
+	}
+}
+
 func TestValidateNodeLoadBalancerShapeEnforcesNodeLBMinimum(t *testing.T) {
 	for name, shape := range map[string]struct {
 		cpu       int32

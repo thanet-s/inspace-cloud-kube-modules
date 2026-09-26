@@ -30,6 +30,7 @@ import (
 	discoverylisters "k8s.io/client-go/listers/discovery/v1"
 	"k8s.io/client-go/tools/cache"
 	cloud "k8s.io/cloud-provider"
+	cloudproviderapi "k8s.io/cloud-provider/api"
 	"k8s.io/klog/v2"
 
 	"github.com/thanet-s/inspace-cloud-kube-modules/modules/client"
@@ -73,7 +74,11 @@ const (
 	standardNLBDeleteLoadBalancer = "delete-load-balancer"
 
 	standardNLBRemovalAbsenceDelay = 30 * time.Second
-	durableReceiptWriteTimeout     = 10 * time.Second
+	// standardNLBRemovalRetryDelay is the fixed requeue for a durably pending
+	// removal. Resolution needs spaced readbacks, not exponential backoff that
+	// could stretch a Service deletion to the controller's five-minute ceiling.
+	standardNLBRemovalRetryDelay = 10 * time.Second
+	durableReceiptWriteTimeout   = 10 * time.Second
 )
 
 var errStandardNLBRemovalPending = errors.New("cloudprovider: public NLB removal remains durably pending")
@@ -1058,7 +1063,7 @@ func (p *Provider) issueStandardNLBMutation(
 }
 
 func standardNLBMutationKnownPreDispatch(err error) bool {
-	return errors.Is(err, inspace.ErrMutationBlocked)
+	return errors.Is(err, inspace.ErrMutationBlocked) || errors.Is(err, inspace.ErrMutationNotDispatched)
 }
 
 func standardNLBMutationError(action string, err error) error {
@@ -1191,11 +1196,30 @@ func (p *Provider) issueStandardNLBRemoval(
 	return fence, raw, err == nil, err
 }
 
+// standardNLBRemovalPendingError keeps errStandardNLBRemovalPending matchable
+// with errors.Is and also carries a cloud-provider RetryError. The upstream
+// Service controller requeues a RetryError at its fixed delay instead of its
+// exponential backoff when the error reaches it through %w wrapping.
+type standardNLBRemovalPendingError struct {
+	message string
+	retry   *cloudproviderapi.RetryError
+}
+
+func (e *standardNLBRemovalPendingError) Error() string { return e.message }
+
+func (e *standardNLBRemovalPendingError) Unwrap() []error {
+	return []error{errStandardNLBRemovalPending, e.retry}
+}
+
 func standardNLBRemovalPending(fence standardNLBMutationFence) error {
-	return fmt.Errorf(
-		"%w: %s issued at %s remains unresolved behind its durable Service receipt; refusing a second mutation",
+	message := fmt.Sprintf(
+		"%v: %s issued at %s remains unresolved behind its durable Service receipt; refusing a second mutation",
 		errStandardNLBRemovalPending, fence.Operation, fence.IssuedAt,
 	)
+	return &standardNLBRemovalPendingError{
+		message: message,
+		retry:   cloudproviderapi.NewRetryError(message, standardNLBRemovalRetryDelay),
+	}
 }
 
 func (p *Provider) GetLoadBalancer(ctx context.Context, _ string, service *corev1.Service) (*corev1.LoadBalancerStatus, bool, error) {

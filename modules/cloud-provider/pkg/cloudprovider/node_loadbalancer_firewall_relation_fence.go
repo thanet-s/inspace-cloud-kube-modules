@@ -229,6 +229,24 @@ func advanceNodeLoadBalancerFirewallRelationObservation(
 	return true, true, nil
 }
 
+// nodeLoadBalancerFirewallRelationRetireDelay is how long an issued
+// assign/unassign receipt must remain unresolved before a fresh unchanged
+// readback may retire it. It exceeds the SDK mutation timeout, so the issued
+// request can no longer be in flight, plus one convergence interval.
+const nodeLoadBalancerFirewallRelationRetireDelay = nodeLoadBalancerShardFirewallMutationTimeout + nodeLoadBalancerAbsenceConfirmationDelay
+
+// nodeLoadBalancerFirewallRelationRetireDue reports whether a receipt whose
+// relation is still unchanged in a fresh authoritative read is old enough to
+// prove that its request did not commit. Only the caller's full pre-dispatch
+// authority may then send the exact relation mutation again.
+func nodeLoadBalancerFirewallRelationRetireDue(fence nodeLoadBalancerFirewallRelationFence, now time.Time) (bool, error) {
+	issuedAt, err := time.Parse(time.RFC3339Nano, fence.issuedAt)
+	if err != nil {
+		return false, fmt.Errorf("node load balancer: invalid firewall relation issue timestamp %q: %w", fence.issuedAt, err)
+	}
+	return !now.Before(issuedAt.Add(nodeLoadBalancerFirewallRelationRetireDelay)), nil
+}
+
 func sameNodeLoadBalancerFirewallRelationIssue(left, right nodeLoadBalancerFirewallRelationFence) bool {
 	return left.operation == right.operation &&
 		strings.EqualFold(left.firewallUUID, right.firewallUUID) &&
@@ -1069,13 +1087,33 @@ func (c *nodeLoadBalancerController) reconcileNodeLoadBalancerFirewallRelation(
 		if readbackErr != nil {
 			return false, readbackErr
 		}
-		cleared, observationChanged, observationErr := advanceNodeLoadBalancerFirewallRelationObservation(
-			values,
-			existing,
-			converged,
-			c.nodeLoadBalancerFirewallRelationTime(),
-			c.nodeLoadBalancerFirewallRelationAbsenceDelay(),
-		)
+		retire := false
+		if !converged {
+			retire, readbackErr = nodeLoadBalancerFirewallRelationRetireDue(existing, c.nodeLoadBalancerFirewallRelationTime())
+			if readbackErr != nil {
+				return false, readbackErr
+			}
+		}
+		cleared, observationChanged, observationErr := false, false, error(nil)
+		if retire {
+			// The issued request can no longer be in flight, and this fresh
+			// authoritative read still shows the relation unchanged, so it did
+			// not commit. Retire only this exact stale receipt; the caller's next
+			// pass re-derives the relation it still wants and issues it through
+			// the full pre-dispatch authority. Concurrent or immediate duplicate
+			// dispatch stays fenced until the retirement interval elapses.
+			delete(values, annotationNodeLoadBalancerFirewallRelationIssued)
+			delete(values, annotationNodeLoadBalancerFirewallRelationOwnerUID)
+			cleared, observationChanged = true, true
+		} else {
+			cleared, observationChanged, observationErr = advanceNodeLoadBalancerFirewallRelationObservation(
+				values,
+				existing,
+				converged,
+				c.nodeLoadBalancerFirewallRelationTime(),
+				c.nodeLoadBalancerFirewallRelationAbsenceDelay(),
+			)
+		}
 		if observationErr != nil {
 			return false, observationErr
 		}
@@ -1283,7 +1321,7 @@ func (c *nodeLoadBalancerController) reconcileNodeLoadBalancerFirewallRelation(
 	} else {
 		mutationErr = c.provider.api.UnassignFirewallFromVM(ctx, c.provider.config.Location, issuedFence.firewallUUID, issuedFence.vmUUID)
 	}
-	if errors.Is(mutationErr, inspace.ErrMutationBlocked) {
+	if nodeLoadBalancerMutationKnownPreDispatch(mutationErr) {
 		// The SDK produced this typed error before dispatch. Clear only the exact
 		// UID-pinned receipt using a detached bounded context; a canceled caller
 		// must not strand authority that provably never crossed the HTTP boundary.

@@ -45,6 +45,8 @@ spec:
         inspace.cloud.node-restriction.kubernetes.io/public-local-pool: {{ e2e_public_local_pool }}
     spec:
       expireAfter: Never
+      # Bound drain so a stuck Pod or VolumeAttachment cannot stall teardown.
+      terminationGracePeriod: 5m
       nodeClassRef:
         group: karpenter.inspace.cloud
         kind: InSpaceNodeClass

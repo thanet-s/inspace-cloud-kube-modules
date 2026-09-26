@@ -18,6 +18,7 @@ import (
 	dynamicfake "k8s.io/client-go/dynamic/fake"
 	kubefake "k8s.io/client-go/kubernetes/fake"
 	cloud "k8s.io/cloud-provider"
+	cloudproviderapi "k8s.io/cloud-provider/api"
 
 	"github.com/thanet-s/inspace-cloud-kube-modules/modules/client"
 )
@@ -1537,8 +1538,35 @@ func requireStandardNLBConvergence(t *testing.T, reconcile func() error) {
 		if !errors.Is(err, errStandardNLBRemovalPending) {
 			t.Fatal(err)
 		}
+		requireStandardNLBRemovalRetryAfter(t, err)
 	}
 	t.Fatal("standard NLB cleanup did not converge within 32 reconciliations")
+}
+
+// requireStandardNLBRemovalRetryAfter proves a pending removal asks the
+// upstream Service controller for a short fixed requeue instead of falling
+// into its exponential backoff, even when joined with other errors.
+func requireStandardNLBRemovalRetryAfter(t *testing.T, err error) {
+	t.Helper()
+	var retry *cloudproviderapi.RetryError
+	if !errors.As(err, &retry) {
+		t.Fatalf("pending removal error %v does not carry a RetryError", err)
+	}
+	if retry.RetryAfter() != standardNLBRemovalRetryDelay {
+		t.Fatalf("pending removal retry after %s, want %s", retry.RetryAfter(), standardNLBRemovalRetryDelay)
+	}
+	if !strings.Contains(err.Error(), "remains unresolved behind its durable Service receipt") {
+		t.Fatalf("pending removal message lost detail: %v", err)
+	}
+}
+
+func TestStandardNLBRemovalPendingRequestsFixedRetry(t *testing.T) {
+	err := standardNLBRemovalPending(standardNLBMutationFence{Operation: standardNLBDeleteLoadBalancer, IssuedAt: "2026-01-01T00:00:00Z"})
+	if !errors.Is(err, errStandardNLBRemovalPending) {
+		t.Fatalf("pending removal error %v lost its sentinel", err)
+	}
+	requireStandardNLBRemovalRetryAfter(t, err)
+	requireStandardNLBRemovalRetryAfter(t, fmt.Errorf("failed to ensure load balancer: %w", errors.Join(errors.New("observe"), err)))
 }
 
 type memoryStandardNLBServiceStore struct {

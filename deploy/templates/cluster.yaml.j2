@@ -18,7 +18,7 @@ spec:
       hostPoolUUID: {{ inspace_amd_host_pool_uuid }}
       image:
         osName: ubuntu
-        osVersion: "26.04"
+        osVersion: "{{ deploy_os_version }}"
   bootstrapCache:
     directDownload: {{ bootstrap_direct_download | bool | ternary('true', 'false') }}
   rke2:

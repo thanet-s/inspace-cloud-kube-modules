@@ -63,6 +63,52 @@ def main() -> None:
         and "'until curl " in egress_task,
         "control-plane egress must be proven from inside through the bastion",
     )
+    # The local ssh client exits 255 only for its own transport failure. Retry
+    # that alone, so one SSH blip cannot fail init while a real in-guest
+    # timeout (124) or cloud-init error still fails on its single attempt.
+    cloud_init_name = "Wait for control-plane cloud-init completion"
+    cloud_init_task = init[init.index(cloud_init_name):init.index("Read the administrator kubeconfig from cp0")]
+    for task, register, timeout in (
+        (egress_task, "deploy_control_plane_egress", "300s"),
+        (cloud_init_task, "deploy_control_plane_cloud_init", "2400s"),
+    ):
+        require(
+            f"timeout --kill-after=5s {timeout} sh -c" in task
+            and f"register: {register}\n" in task
+            and f"until: {register}.rc != 255\n" in task
+            and f"failed_when: {register}.rc != 0\n" in task
+            and "retries: 3\n" in task
+            and "delay: 10\n" in task,
+            f"{register} must retry only ssh transport failures (255) around one {timeout} in-guest deadline",
+        )
+
+    karpenter_template = read("deploy/templates/karpenter.yaml.j2")
+    readme = read("deploy/README.md")
+    for label, template in (("cluster", cluster_template), ("Karpenter", karpenter_template)):
+        require(
+            'osVersion: "{{ deploy_os_version }}"' in template
+            and '"26.04"' not in template
+            and '"24.04"' not in template,
+            f"{label} template must render the validated inventory os_version",
+        )
+    require(
+        "deploy_os_version: \"{{ os_version | default(deploy_persisted_os_version, true) | string }}\"" in preflight
+        and ".spec.controlPlane.machine.image.osVersion" in preflight
+        and "if deploy_persisted_cluster_spec.stat.exists else '26.04'" in preflight
+        and "deploy_os_version in ['24.04', '26.04']" in preflight
+        and "deploy_os_version == '24.04' or modules_version is version('1.1.0-rc.3', '>=', version_type='semver')"
+        in preflight
+        and preflight.index("Require the complete deployment inventory")
+        < preflight.index("Require cloud modules that accept the selected Ubuntu release"),
+        "preflight must keep a persisted release (else 26.04), allow only 24.04/26.04, "
+        "and require 1.1.0-rc.3+ for 26.04",
+    )
+    require(
+        re.search(r"(?m)^    os_version: \"26\.04\"$", inventory) is not None
+        and re.search(r"(?m)^    modules_version: 1\.1\.0-rc\.4$", inventory) is not None
+        and "`os_version`" in readme,
+        "example inventory and README must document os_version with a 26.04-capable modules_version",
+    )
     for ignored in ("deploy/inventory.yml", "deploy/inventory/", "deploy/.state/"):
         require(ignored in gitignore, f"missing Git exclusion {ignored}")
         require(ignored in dockerignore, f"missing Docker exclusion {ignored}")
