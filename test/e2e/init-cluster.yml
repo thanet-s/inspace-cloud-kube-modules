@@ -640,9 +640,9 @@
         done
         test "$(docker compose -f "$compose_file" ps --services --status running | wc -l)" -eq 2
         test "$(awk -F '\t' 'NF == 2 { count++ } END { print count + 0 }' /etc/inspace-cache/images.tsv)" -eq 33
-        test "$(awk -F '\t' '$2 == "rancher/kube-webhook-certgen:v1.14.5-hardened2" { count++ } END { print count + 0 }' /etc/inspace-cache/images.tsv)" -eq 0
-        test "$(awk -F '\t' '$2 == "rancher/nginx-ingress-controller:v1.14.5-hardened2" { count++ } END { print count + 0 }' /etc/inspace-cache/images.tsv)" -eq 0
-        test "$(awk -F '\t' '$2 == "rancher/hardened-traefik:v3.7.11-build20260819" { count++ } END { print count + 0 }' /etc/inspace-cache/images.tsv)" -eq 0
+        test "$(awk -F '\t' 'index($2, "rancher/kube-webhook-certgen:") == 1 { count++ } END { print count + 0 }' /etc/inspace-cache/images.tsv)" -eq 0
+        test "$(awk -F '\t' 'index($2, "rancher/nginx-ingress-controller:") == 1 { count++ } END { print count + 0 }' /etc/inspace-cache/images.tsv)" -eq 0
+        test "$(awk -F '\t' 'index($2, "rancher/hardened-traefik:") == 1 { count++ } END { print count + 0 }' /etc/inspace-cache/images.tsv)" -eq 0
         test "$(cat /var/lib/inspace/bootstrap-cache/state/ready)" = ready
         for certificate in "$cache_ca" /etc/inspace-cache/tls/server.crt; do
           certificate_text=$(openssl x509 -in "$certificate" -noout -text)
@@ -1081,7 +1081,7 @@
         printf '%s' {{ e2e_cache_ca_bundle | quote }} | cmp -s - /etc/rancher/rke2/bootstrap-cache-ca.crt
         test "$(grep -Fc -- "  \"$cache_registry\":" /etc/rancher/rke2/registries.yaml)" -eq 1
         grep -Fqx -- '      ca_file: /etc/rancher/rke2/bootstrap-cache-ca.crt' /etc/rancher/rke2/registries.yaml
-        /usr/local/bin/rke2 --version | grep -F 'v1.36.4+rke2r1'
+        /usr/local/bin/rke2 --version | grep -F 'v1.36.5-rc2+rke2r1'
         kube_vip_manifest=/var/lib/rancher/rke2/agent/pod-manifests/kube-vip.yaml
         grep -F "$cache_registry/kube-vip/kube-vip:v1.2.1@sha256:44035f68040c9eb99103c65f1f9ab9698d93f9f272110825705338ac1926f3d9" \
           "$kube_vip_manifest"
@@ -2049,7 +2049,7 @@
       ansible.builtin.shell: |
         set -euo pipefail
         systemctl is-active --quiet rke2-agent
-        /usr/local/bin/rke2 --version | grep -F 'v1.36.4+rke2r1'
+        /usr/local/bin/rke2 --version | grep -F 'v1.36.5-rc2+rke2r1'
         grep -F -- 'server: "{{ e2e_private_registration_endpoint }}"' /etc/rancher/rke2/config.yaml
         grep -Fqx -- 'node-name: "{{ e2e_node_name }}"' /etc/rancher/rke2/config.yaml
         cache_registry={{ e2e_cache_registry | quote }}

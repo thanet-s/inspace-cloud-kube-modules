@@ -25,7 +25,7 @@ func TestRenderIncludesExactlyOneRegistrationTaint(t *testing.T) {
 		NodeName:    "worker-1",
 		Server:      "https://10.0.0.10:9345",
 		Token:       "secret-token",
-		RKE2Version: "v1.36.4+rke2r1",
+		RKE2Version: "v1.36.5-rc2+rke2r1",
 		Labels:      map[string]string{"example.com/workload": "true"},
 		Taints: []corev1.Taint{
 			karpv1.UnregisteredNoExecuteTaint,
@@ -91,7 +91,7 @@ func TestRenderIncludesExactlyOneRegistrationTaint(t *testing.T) {
 		"example.com/workload=true",
 		"rke2.linux-amd64.tar.gz",
 		"sha256sum-amd64.txt",
-		"v1.36.4+rke2r1",
+		"v1.36.5-rc2+rke2r1",
 		"/etc/rancher/rke2/config.yaml",
 		`ip -o -4 addr show to "$vpc_subnet" scope global`,
 		`[ "$(printf '%s\n' "$vpc_identities" | awk 'NF { count++ } END { print count + 0 }')" -eq 1 ]`,
@@ -157,7 +157,7 @@ func TestRenderOmitsNodeRestrictionProtectedLabelsWithoutMutatingInput(t *testin
 
 	data, err := RenderCloudInit(Config{
 		NodeName: "worker-1", Server: "https://10.0.0.10:9345", Token: "secret-token",
-		RKE2Version: "v1.36.4+rke2r1", Labels: labels,
+		RKE2Version: "v1.36.5-rc2+rke2r1", Labels: labels,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -200,7 +200,7 @@ func TestBootstrapSchemaVersion(t *testing.T) {
 func TestSkipOSUpgradePreservesWorkerPackageAndMirrorWork(t *testing.T) {
 	data, err := RenderCloudInit(Config{
 		NodeName: "worker-1", Server: "https://10.0.0.10:9345", Token: "secret-token",
-		RKE2Version: "v1.36.4+rke2r1", SkipOSUpgrade: true,
+		RKE2Version: "v1.36.5-rc2+rke2r1", SkipOSUpgrade: true,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -239,7 +239,7 @@ func TestRenderPrivateBootstrapCacheOnlyRewritesSystemInfrastructure(t *testing.
 	caBundle := bootstrapTestCABundle(t)
 	data, err := RenderCloudInit(Config{
 		NodeName: "worker-1", Server: "https://10.0.0.10:9345", Token: "secret-token",
-		RKE2Version: "v1.36.4+rke2r1",
+		RKE2Version: "v1.36.5-rc2+rke2r1",
 		BootstrapCache: &CacheConfig{
 			Host: "cache.test-cluster.inspace.internal", Address: "10.20.30.20", CABundle: caBundle,
 		},
@@ -277,7 +277,7 @@ func TestRenderPrivateBootstrapCacheOnlyRewritesSystemInfrastructure(t *testing.
 	install := writeFileContent(t, doc, "/usr/local/sbin/inspace-install-rke2")
 	for _, expected := range []string{
 		"https://cache.test-cluster.inspace.internal:8443/healthz",
-		"https://cache.test-cluster.inspace.internal:8443/rke2/v1.36.4+rke2r1",
+		"https://cache.test-cluster.inspace.internal:8443/rke2/v1.36.5-rc2+rke2r1",
 		`--cacert "$cache_ca"`,
 		"bootstrap cache did not become healthy",
 	} {
@@ -299,7 +299,7 @@ func TestRenderPrivateBootstrapCacheOnlyRewritesSystemInfrastructure(t *testing.
 
 func TestRenderDirectDownloadOmitsEveryCacheArtifact(t *testing.T) {
 	data, err := RenderCloudInit(Config{
-		NodeName: "worker-1", Server: "https://10.0.0.10:9345", Token: "secret-token", RKE2Version: "v1.36.4+rke2r1",
+		NodeName: "worker-1", Server: "https://10.0.0.10:9345", Token: "secret-token", RKE2Version: "v1.36.5-rc2+rke2r1",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -323,15 +323,26 @@ func TestRenderDirectDownloadOmitsEveryCacheArtifact(t *testing.T) {
 	if strings.Contains(decoded, "system-default-registry") || strings.Contains(decoded, "inspace-bootstrap-cache") || strings.Contains(decoded, "/healthz") {
 		t.Fatalf("direct-download cloud-init retained private cache wiring:\n%s", decoded)
 	}
-	if !strings.Contains(decoded, "https://github.com/rancher/rke2/releases/download/v1.36.4+rke2r1") {
+	if !strings.Contains(decoded, "https://github.com/rancher/rke2/releases/download/v1.36.5-rc2+rke2r1") {
 		t.Fatal("direct-download cloud-init lost the pinned upstream RKE2 release URL")
+	}
+}
+
+func TestRenderRejectsUnauditedRKE2PreRelease(t *testing.T) {
+	for _, version := range []string{"v1.36.5-rc1+rke2r1", "v1.37.1-rc2+rke2r1", "v1.36.5-rc2", "v1.36.5"} {
+		_, err := RenderCloudInit(Config{
+			NodeName: "worker-1", Server: "https://10.0.0.10:9345", Token: "secret-token", RKE2Version: version,
+		})
+		if err == nil || !strings.Contains(err.Error(), "RKE2 version") {
+			t.Errorf("version %q: err=%v, want RKE2 version rejection", version, err)
+		}
 	}
 }
 
 func TestRenderedShellScriptsHaveValidSyntax(t *testing.T) {
 	data, err := RenderCloudInit(Config{
 		NodeName: "worker-1", Server: "https://10.0.0.10:9345", Token: "secret-token",
-		RKE2Version: "v1.36.4+rke2r1", AdditionalScript: "touch /opt/ran",
+		RKE2Version: "v1.36.5-rc2+rke2r1", AdditionalScript: "touch /opt/ran",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -357,7 +368,7 @@ func TestRenderedShellScriptsHaveValidSyntax(t *testing.T) {
 func TestRenderedHostPreparationAndNodeTuningContracts(t *testing.T) {
 	data, err := RenderCloudInit(Config{
 		NodeName: "worker-1", Server: "https://10.0.0.10:9345", Token: "secret-token",
-		RKE2Version: "v1.36.4+rke2r1",
+		RKE2Version: "v1.36.5-rc2+rke2r1",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -433,7 +444,7 @@ func TestRenderedHostPreparationAndNodeTuningContracts(t *testing.T) {
 func TestRenderedBootstrapDisablesAutomaticAPTOnlyAfterInitialPackages(t *testing.T) {
 	data, err := RenderCloudInit(Config{
 		NodeName: "worker-1", Server: "https://10.0.0.10:9345", Token: "secret-token",
-		RKE2Version: "v1.36.4+rke2r1",
+		RKE2Version: "v1.36.5-rc2+rke2r1",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -534,7 +545,7 @@ esac
 func TestRenderedHostFirewallAndRetryContracts(t *testing.T) {
 	data, err := RenderCloudInit(Config{
 		NodeName: "worker-1", Server: "https://10.0.0.10:9345", Token: "secret-token",
-		RKE2Version: "v1.36.4+rke2r1",
+		RKE2Version: "v1.36.5-rc2+rke2r1",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -638,7 +649,7 @@ esac
 func TestRenderedAgentStartIsBoundedAndFailFast(t *testing.T) {
 	data, err := RenderCloudInit(Config{
 		NodeName: "worker-1", Server: "https://10.0.0.10:9345", Token: "secret-token",
-		RKE2Version: "v1.36.4+rke2r1",
+		RKE2Version: "v1.36.5-rc2+rke2r1",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -708,7 +719,7 @@ exit 0
 func TestBootstrapOrchestratorIsFailFastAndDisablesFirewallAfterAdditionalData(t *testing.T) {
 	data, err := RenderCloudInit(Config{
 		NodeName: "worker-1", Server: "https://10.0.0.10:9345", Token: "secret-token",
-		RKE2Version: "v1.36.4+rke2r1", AdditionalScript: "ufw --force enable",
+		RKE2Version: "v1.36.5-rc2+rke2r1", AdditionalScript: "ufw --force enable",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -792,7 +803,7 @@ exit 0
 func TestRenderedRetryLoopsStopAfterSixtyAttempts(t *testing.T) {
 	data, err := RenderCloudInit(Config{
 		NodeName: "worker-1", Server: "https://10.0.0.10:9345", Token: "secret-token",
-		RKE2Version: "v1.36.4+rke2r1",
+		RKE2Version: "v1.36.5-rc2+rke2r1",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -859,7 +870,7 @@ download_asset "https://example.invalid/rke2.tar.gz" "$DOWNLOAD_OUTPUT"
 func TestResolveVPCSubnetRequiresExactlyOneSafePlaceholder(t *testing.T) {
 	data, err := RenderCloudInit(Config{
 		NodeName: "worker-1", Server: "https://10.0.0.10:9345", Token: "secret-token",
-		RKE2Version: "v1.36.4+rke2r1",
+		RKE2Version: "v1.36.5-rc2+rke2r1",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -892,7 +903,7 @@ func TestResolveVPCSubnetRequiresExactlyOneSafePlaceholder(t *testing.T) {
 func TestRenderRequiresExactRKE2ReleaseAndSupervisorEndpoint(t *testing.T) {
 	base := Config{
 		NodeName: "worker-1", Server: "https://10.0.0.10:9345", Token: "secret-token",
-		RKE2Version: "v1.36.4+rke2r1",
+		RKE2Version: "v1.36.5-rc2+rke2r1",
 	}
 	for name, mutate := range map[string]func(*Config){
 		"invalid hostname":   func(config *Config) { config.NodeName = "Invalid_Worker" },
@@ -918,7 +929,7 @@ func TestRenderRequiresExactRKE2ReleaseAndSupervisorEndpoint(t *testing.T) {
 
 func TestRenderRejectsInvalidPrivateCache(t *testing.T) {
 	base := Config{
-		NodeName: "worker-1", Server: "https://10.0.0.10:9345", Token: "secret-token", RKE2Version: "v1.36.4+rke2r1",
+		NodeName: "worker-1", Server: "https://10.0.0.10:9345", Token: "secret-token", RKE2Version: "v1.36.5-rc2+rke2r1",
 		BootstrapCache: &CacheConfig{Host: "cache.test-cluster.inspace.internal", Address: "10.20.30.20", CABundle: bootstrapTestCABundle(t)},
 	}
 	for name, mutate := range map[string]func(*Config){
@@ -941,7 +952,7 @@ func TestRenderRejectsInvalidPrivateCache(t *testing.T) {
 func TestAdditionalScriptUsesCloudInitOnceSemaphore(t *testing.T) {
 	data, err := RenderCloudInit(Config{
 		NodeName: "worker-1", Server: "https://10.0.0.10:9345", Token: "secret-token",
-		RKE2Version: "v1.36.4+rke2r1", AdditionalScript: "touch /opt/ran",
+		RKE2Version: "v1.36.5-rc2+rke2r1", AdditionalScript: "touch /opt/ran",
 	})
 	if err != nil {
 		t.Fatal(err)

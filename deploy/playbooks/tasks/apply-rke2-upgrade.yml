@@ -13,15 +13,24 @@
   register: deploy_current_rke2_version
   changed_when: false
 
+# An RKE2 release candidate ships the GA hardened kubelet, so a node running
+# v1.36.5-rc2+rke2r1 reports kubelet v1.36.5+rke2r1. The kubelet therefore
+# cannot tell a candidate from its GA; the journaled exact version can.
+- name: Derive the kubelet version the requested RKE2 release reports
+  ansible.builtin.set_fact:
+    deploy_expected_kubelet_version: "{{ rke2_version | regex_replace('-rc[0-9]+[+]', '+') }}"
+
 - name: Roll out an RKE2 control-plane version upgrade one server at a time
-  when: deploy_current_rke2_version.stdout != rke2_version
+  when: >-
+    deploy_recorded_rke2_version != rke2_version or
+    deploy_current_rke2_version.stdout != deploy_expected_kubelet_version
   block:
     - name: Require RKE2 upgrade version-skew and downgrade safety
       ansible.builtin.command:
         argv:
           - python3
           - "{{ deploy_root }}/scripts/validate_rke2_upgrade.py"
-          - "{{ deploy_current_rke2_version.stdout }}"
+          - "{{ deploy_recorded_rke2_version }}"
           - "{{ rke2_version }}"
           - "{{ (lookup('env', 'INSPACE_CONFIRM_RKE2_VERSION_SKIP') == cluster_name) | ternary('true', 'false') }}"
       changed_when: false
@@ -34,9 +43,20 @@
         index_var: deploy_cp_index
         label: "{{ deploy_control_plane.name }}"
 
+    - name: Record the RKE2 version every control-plane server now runs
+      ansible.builtin.set_fact:
+        deployment_state: "{{ deployment_state | combine({'rke2Version': rke2_version}, recursive=true) }}"
+        deploy_recorded_rke2_version: "{{ rke2_version }}"
+
+    - name: Persist the upgraded RKE2 version in the deployment journal
+      ansible.builtin.copy:
+        content: "{{ deployment_state | to_nice_json }}{{ '\n' }}"
+        dest: "{{ deploy_state_dir }}/state.json"
+        mode: "0600"
+
     - name: Report the completed RKE2 version upgrade
       ansible.builtin.debug:
         msg: >-
           Cluster {{ cluster_name }} control plane now runs RKE2 {{ rke2_version }}
-          (was {{ deploy_current_rke2_version.stdout }}). Elastic Karpenter workers
+          (kubelet was {{ deploy_current_rke2_version.stdout }}). Elastic Karpenter workers
           converge to this version through normal NodeClass-drift replacement.

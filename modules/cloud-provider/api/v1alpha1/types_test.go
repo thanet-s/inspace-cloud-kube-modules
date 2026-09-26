@@ -50,14 +50,18 @@ func TestClusterNameFitsFixedNodeHostnames(t *testing.T) {
 }
 
 func TestRKE2VersionValidationRequiresExactRelease(t *testing.T) {
-	for _, version := range []string{"v1.36.4+rke2r1", "v1.36.4+rke2r12"} {
+	for _, version := range []string{"v1.36.4+rke2r1", "v1.36.4+rke2r12", "v1.36.5-rc2+rke2r1"} {
 		spec := validSpec()
 		spec.RKE2.Version = version
 		if errs := spec.Validate(); len(errs) != 0 {
 			t.Errorf("version %q: unexpected validation errors: %v", version, errs)
 		}
 	}
-	for _, version := range []string{"", "latest", "v1.35.6", "v1.35.6+rke2", "1.35.6+rke2r1", "v1.35+rke2r1"} {
+	for _, version := range []string{
+		"", "latest", "v1.35.6", "v1.35.6+rke2", "1.35.6+rke2r1", "v1.35+rke2r1",
+		// Only the single audited release candidate is accepted.
+		"v1.36.5-rc1+rke2r1", "v1.36.5-rc2+rke2r2", "v1.37.1-rc2+rke2r1", "v1.36.5-rc2", "v1.36.5-rc2+rke2r1x",
+	} {
 		spec := validSpec()
 		spec.RKE2.Version = version
 		if errs := spec.Validate(); len(errs) == 0 {
@@ -204,6 +208,9 @@ func TestControlPlaneCRDMatchesMachineValidationContract(t *testing.T) {
 			t.Errorf("CRD does not contain validation contract fragment %q", required)
 		}
 	}
+	if want := "pattern: '" + rke2VersionPattern.String() + "'"; strings.Count(crd, want) != 1 {
+		t.Errorf("CRD RKE2 version pattern must equal the Go validator %q", want)
+	}
 	cacheStart := strings.Index(crd, "\n                bootstrapCache:")
 	cacheEnd := strings.Index(crd[cacheStart+1:], "\n                rke2:")
 	if cacheStart < 0 || cacheEnd < 0 {
@@ -240,7 +247,7 @@ func validSpec() InSpaceClusterSpec {
 			Image:        ImageSpec{OSName: "ubuntu", OSVersion: "24.04"},
 		}},
 		BootstrapCache: BootstrapCacheSpec{},
-		RKE2:           RKE2Spec{Version: "v1.36.4+rke2r1", TokenSecretRef: SecretKeyReference{Name: "token", Key: "token"}},
+		RKE2:           RKE2Spec{Version: "v1.36.5-rc2+rke2r1", TokenSecretRef: SecretKeyReference{Name: "token", Key: "token"}},
 		Network: NetworkSpec{
 			UUID: "11111111-2222-3333-4444-555555555555", PodCIDR: "10.42.0.0/16", ServiceCIDR: "10.43.0.0/16",
 			PrivateLoadBalancerPool: PrivateLoadBalancerPoolSpec{Start: "10.20.30.200", Stop: "10.20.30.239"},

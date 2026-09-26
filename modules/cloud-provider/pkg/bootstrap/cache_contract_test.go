@@ -177,8 +177,66 @@ func TestCacheImageManifestExcludesDisabledRKE2Traefik(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(manifest, "rancher/hardened-traefik:v3.7.11-build20260819") {
+	if strings.Contains(manifest, "rancher/hardened-traefik:") {
 		t.Fatal("disabled Traefik cache manifest retains the Traefik image")
+	}
+	if lines := strings.Split(strings.TrimSuffix(manifest, "\n"), "\n"); len(lines) != 35 {
+		t.Fatalf("disabled-Traefik cache manifest entries=%d, want 35", len(lines))
+	}
+}
+
+func TestCacheImageManifestExcludesBothDisabledIngressAddons(t *testing.T) {
+	manifest, err := renderCacheImageManifest(bootstrapCacheRKE2Version, "0.4.1-rc.2", []string{"rke2-ingress-nginx", "rke2-traefik"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lines := strings.Split(strings.TrimSuffix(manifest, "\n"), "\n"); len(lines) != 33 {
+		t.Fatalf("default-template cache manifest entries=%d, want 33", len(lines))
+	}
+	for _, forbidden := range []string{"rancher/kube-webhook-certgen:", "rancher/nginx-ingress-controller:", "rancher/hardened-traefik:"} {
+		if strings.Contains(manifest, forbidden) {
+			t.Fatalf("default-template cache manifest retains %q", forbidden)
+		}
+	}
+}
+
+func TestControlPlaneCloudInitAcceptsOnlyTheAuditedRKE2PreRelease(t *testing.T) {
+	input := cacheContractControlPlaneInput()
+	input.RKE2Version = "v1.36.5-rc2+rke2r1"
+	if _, err := RenderCloudInitJSON(input); err != nil {
+		t.Fatalf("audited release candidate rejected: %v", err)
+	}
+	for _, version := range []string{"v1.36.5-rc1+rke2r1", "v1.37.1-rc2+rke2r1", "v1.36.5-rc2", "v1.36.5-rc2+rke2r1 "} {
+		input := cacheContractControlPlaneInput()
+		input.RKE2Version = version
+		if _, err := RenderCloudInitJSON(input); err == nil || !strings.Contains(err.Error(), "RKE2 version") {
+			t.Errorf("version %q: err=%v, want RKE2 version rejection", version, err)
+		}
+	}
+}
+
+// The RKE2 inventory is regenerated from the release's
+// rke2-images-{core,ingress-nginx,cilium}.linux-amd64.txt assets (see
+// DEVELOPMENT.md). Its runtime image is the one tag that always embeds the
+// release version, so it proves the inventory and the pinned version moved
+// together.
+func TestCacheRKE2InventoryMatchesPinnedRelease(t *testing.T) {
+	runtimeTarget := "rancher/rke2-runtime:" + strings.Replace(bootstrapCacheRKE2Version, "+", "-", 1)
+	found := 0
+	for _, image := range rke2CacheImages {
+		if !strings.HasPrefix(image.Source, "docker://docker.io/rancher/") || !imageDigestPattern.MatchString(image.Source[strings.LastIndex(image.Source, "@")+1:]) {
+			t.Errorf("RKE2 cache source is not a digest-pinned docker.io/rancher image: %s", image.Source)
+		}
+		repository := strings.TrimPrefix(image.Source[:strings.LastIndex(image.Source, "@")], "docker://docker.io/")
+		if !strings.HasPrefix(image.Target, repository+":") {
+			t.Errorf("RKE2 cache target %s does not name source repository %s", image.Target, repository)
+		}
+		if image.Target == runtimeTarget {
+			found++
+		}
+	}
+	if found != 1 {
+		t.Fatalf("RKE2 cache inventory contains %d copies of %s, want exactly one", found, runtimeTarget)
 	}
 }
 
@@ -450,7 +508,7 @@ func TestControlPlaneCloudInitUsesPrivateCacheOrDirectUpstreamExclusively(t *tes
 	cachedRegistries := cached["/etc/rancher/rke2/registries.yaml"].Content
 	for _, required := range []string{
 		`system-default-registry: "cache.unit.inspace.internal:8443"`,
-		`https://cache.unit.inspace.internal:8443/rke2/v1.36.4+rke2r1`,
+		`https://cache.unit.inspace.internal:8443/rke2/v1.36.5-rc2+rke2r1`,
 		`cache_address='10.20.30.21'`,
 		`cache_hostname='cache.unit.inspace.internal'`,
 		`printf '%s %s # inspace-bootstrap-cache\n' "$cache_address" "$cache_hostname" >>/etc/hosts`,
@@ -489,7 +547,7 @@ func TestControlPlaneCloudInitUsesPrivateCacheOrDirectUpstreamExclusively(t *tes
 	}
 	if strings.Contains(direct["/var/lib/inspace/rke2-config"].Content, "system-default-registry") ||
 		strings.Contains(directScript, ".inspace.internal") ||
-		!strings.Contains(directScript, "https://github.com/rancher/rke2/releases/download/v1.36.4+rke2r1") ||
+		!strings.Contains(directScript, "https://github.com/rancher/rke2/releases/download/v1.36.5-rc2+rke2r1") ||
 		!strings.Contains(direct["/var/lib/inspace/rke2-kube-vip"].Content, kubeVIPImage) {
 		t.Fatalf("direct control-plane mode no longer uses exact upstream artifacts:\n%s", directScript)
 	}
@@ -526,7 +584,10 @@ func TestDirectControlPlaneCloudInitV9OwnershipBytes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	const v9DirectHash = "7362af1d28403eb90da8d277d2d51eb2debc10b8ecaba93c3075ccb942e86161"
+	// The fixture renders bootstrapCacheRKE2Version, so this hash moves with
+	// each audited RKE2 release even when the renderer is unchanged
+	// (v1.36.4+rke2r1 rendered 7362af1d...).
+	const v9DirectHash = "d0e02293426fc7c175413a8ea922c58b2d22b3f9653db444f2a379f3a4dca1f0"
 	if got := fmt.Sprintf("%x", sha256.Sum256([]byte(raw))); got != v9DirectHash {
 		t.Fatalf("direct control-plane cloud-init hash=%s, want frozen v9 hash %s", got, v9DirectHash)
 	}

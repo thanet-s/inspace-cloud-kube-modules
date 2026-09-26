@@ -19,8 +19,10 @@ import (
 )
 
 var (
-	uuidPattern        = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$`)
-	rke2VersionPattern = regexp.MustCompile(`^v[0-9]+\.[0-9]+\.[0-9]+\+rke2r[0-9]+$`)
+	uuidPattern = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$`)
+	// Exact GA releases plus the single audited release candidate pinned by
+	// the cloud-provider bootstrap cache. Keep in sync with the CRD.
+	rke2VersionPattern = regexp.MustCompile(`^(v[0-9]+\.[0-9]+\.[0-9]+\+rke2r[0-9]+|v1\.36\.5-rc2\+rke2r1)$`)
 	sshUsernamePattern = regexp.MustCompile(`^[a-z_][a-z0-9_-]{0,29}$`)
 )
 
@@ -77,7 +79,7 @@ func (n *InSpaceNodeClass) Validate() field.ErrorList {
 		errs = append(errs, field.Invalid(p.Child("rootDiskGiB"), n.Spec.RootDiskGiB, "must be between 30 and 2000 GiB"))
 	}
 	if !rke2VersionPattern.MatchString(n.Spec.RKE2.Version) {
-		errs = append(errs, field.Invalid(p.Child("rke2", "version"), n.Spec.RKE2.Version, "must look like v1.36.4+rke2r1"))
+		errs = append(errs, field.Invalid(p.Child("rke2", "version"), n.Spec.RKE2.Version, "must be an exact release such as v1.36.5+rke2r1"))
 	}
 	if _, err := n.Spec.RKE2.ServerVIP(); err != nil {
 		errs = append(errs, field.Invalid(p.Child("rke2", "server"), n.Spec.RKE2.Server, err.Error()))

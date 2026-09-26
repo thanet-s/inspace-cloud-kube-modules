@@ -62,7 +62,7 @@
       - jsonpath={.status.nodeInfo.kubeletVersion}
   register: deploy_control_plane_upgraded_version
   changed_when: false
-  failed_when: deploy_control_plane_upgraded_version.stdout != rke2_version
+  failed_when: deploy_control_plane_upgraded_version.stdout != deploy_expected_kubelet_version
 
 - name: Require the private API to recover before upgrading the next server
   ansible.builtin.command:

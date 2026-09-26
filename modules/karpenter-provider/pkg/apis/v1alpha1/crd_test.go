@@ -34,7 +34,7 @@ func TestInSpaceNodeClassCRDMatchesContract(t *testing.T) {
 		"rke2:",
 		"skipOSUpgrade:",
 		"Omitted or false performs the production OS package",
-		`\+rke2r[0-9]+$`,
+		"pattern: '" + rke2VersionPattern.String() + "'",
 		":9345$",
 		"!self.startsWith('https://10.42.')",
 		"!self.startsWith('https://10.43.')",
