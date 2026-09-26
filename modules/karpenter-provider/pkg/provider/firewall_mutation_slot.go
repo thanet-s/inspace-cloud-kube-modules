@@ -168,14 +168,13 @@ func (s *kubernetesCreateFenceStore) firewallMutationSlotTerminal(ctx context.Co
 	if value.Phase == cloudapi.FirewallAssignmentObserved || value.Phase == cloudapi.FirewallAssignmentRejected {
 		return true, nil
 	}
-	if value.Operation == firewallMutationDetach {
-		return false, nil
-	}
 	var claim karpv1.NodeClaim
 	err := s.reader.Get(ctx, types.NamespacedName{Name: value.NodeClaimName}, &claim)
 	if apierrors.IsNotFound(err) {
 		// The provider finalizer prevents disappearance until cloud cleanup has
-		// converged. Exact object absence therefore retires this old owner.
+		// converged, and a detach is only ever finished through its owner.
+		// Exact object absence therefore retires this old owner for either
+		// operation; otherwise an operator-removed owner would wedge the slot.
 		return true, nil
 	}
 	if err != nil {
@@ -183,6 +182,12 @@ func (s *kubernetesCreateFenceStore) firewallMutationSlotTerminal(ctx context.Co
 	}
 	if string(claim.UID) != value.NodeClaimUID {
 		return true, nil
+	}
+	if value.Operation == firewallMutationDetach {
+		// A live owner keeps its issued detach until authoritative relation
+		// absence is observed. Its adapter may re-send the exact idempotent
+		// unassign after spaced readbacks still show the relation present.
+		return false, nil
 	}
 	record, err := decodeCreateFence(claim.Annotations[AnnotationCreateFence])
 	if err != nil {
