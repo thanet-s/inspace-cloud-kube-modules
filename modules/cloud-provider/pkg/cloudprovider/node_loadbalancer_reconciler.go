@@ -3656,9 +3656,23 @@ func desiredNodeLoadBalancerDatapath(service *corev1.Service, name, shard string
 			IPFamilyPolicy:                service.Spec.IPFamilyPolicy,
 			IPFamilies:                    append([]corev1.IPFamily(nil), service.Spec.IPFamilies...),
 			InternalTrafficPolicy:         service.Spec.InternalTrafficPolicy,
-			TrafficDistribution:           service.Spec.TrafficDistribution,
+			TrafficDistribution:           nodeLoadBalancerDatapathTrafficDistribution(service),
 		},
 	}
+}
+
+// nodeLoadBalancerDatapathTrafficDistribution copies an explicit parent
+// preference and otherwise asks Cilium to prefer a backend on the LB node that
+// received the packet. Cilium 1.20 honors PreferSameNode for every frontend of
+// the child (including its ETP=Cluster LoadBalancer VIPs) when
+// enable-service-topology is on, and falls back to all backends when the node
+// has no active local backend, so the default never blackholes traffic.
+func nodeLoadBalancerDatapathTrafficDistribution(service *corev1.Service) *string {
+	value := corev1.ServiceTrafficDistributionPreferSameNode
+	if service.Spec.TrafficDistribution != nil && *service.Spec.TrafficDistribution != "" {
+		value = *service.Spec.TrafficDistribution
+	}
+	return &value
 }
 
 func copyStringMap(input map[string]string) map[string]string {
