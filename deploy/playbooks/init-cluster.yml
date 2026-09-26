@@ -412,6 +412,7 @@
     # The node firewall admits no inbound traffic from the internet, so a bad
     # control-plane floating IPv4 can only be seen from inside: prove egress
     # before the long cloud-init wait so a bad address fails init quickly.
+    # Any HTTP answer proves egress; a fresh address gets up to 5 minutes.
     - name: Prove every control plane reaches the internet through its floating IP
       ansible.builtin.command:
         argv:
@@ -420,18 +421,14 @@
           - "{{ deploy_state_dir }}/ssh-config"
           - "inspace-cp{{ deploy_cp_index }}"
           - >-
-            timeout --kill-after=5s 60s sh -c
-            'curl -sS -o /dev/null --connect-timeout 10 --max-time 20 https://registry-1.docker.io/v2/ &&
-            curl -sS -o /dev/null --connect-timeout 10 --max-time 20 https://ghcr.io/v2/'
+            timeout --kill-after=5s 300s sh -c
+            'until curl -sS -o /dev/null --connect-timeout 10 --max-time 20 https://registry-1.docker.io/v2/ &&
+            curl -sS -o /dev/null --connect-timeout 10 --max-time 20 https://ghcr.io/v2/; do sleep 5; done'
       loop: "{{ deployment_state.controlPlanes }}"
       loop_control:
         index_var: deploy_cp_index
         label: "{{ item.name }}"
-      register: deploy_control_plane_egress
       changed_when: false
-      retries: 5
-      delay: 10
-      until: deploy_control_plane_egress.rc == 0
 
     - name: Wait for control-plane cloud-init completion
       ansible.builtin.command:

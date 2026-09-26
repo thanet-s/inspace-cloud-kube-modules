@@ -2045,10 +2045,10 @@ def main() -> None:
     require("\n      ansible.builtin.raw: >-" in control_plane_egress and
             "https://registry-1.docker.io/v2/" in control_plane_egress and
             "https://ghcr.io/v2/" in control_plane_egress and
+            "timeout --kill-after=5s 300s sh -c" in control_plane_egress and
+            "'until curl " in control_plane_egress and
             " -f" not in control_plane_egress,
-            "control-plane egress must be proven from inside, accepting any HTTP answer")
-    require_yaml_key(control_plane_egress, 6, "retries", "5")
-    require_yaml_key(control_plane_egress, 6, "until", "e2e_control_plane_egress.rc == 0")
+            "control-plane egress must be proven from inside within 5 minutes, accepting any HTTP answer")
     require(control_plane_wait_play.index(egress_name) <
             control_plane_wait_play.index("Wait for cloud-init completion on every control plane in parallel"),
             "control-plane egress must be proven before the long cloud-init wait")

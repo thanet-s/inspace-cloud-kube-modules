@@ -59,7 +59,8 @@ def main() -> None:
         and "https://registry-1.docker.io/v2/" in egress_task
         and "https://ghcr.io/v2/" in egress_task
         and " -f" not in egress_task
-        and "until: deploy_control_plane_egress.rc == 0" in egress_task,
+        and "timeout --kill-after=5s 300s sh -c" in egress_task
+        and "'until curl " in egress_task,
         "control-plane egress must be proven from inside through the bastion",
     )
     for ignored in ("deploy/inventory.yml", "deploy/inventory/", "deploy/.state/"):

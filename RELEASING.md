@@ -186,5 +186,5 @@ and recreated every healthy cluster once and waited out the timeout twice,
 about 22 extra minutes per `init`, without ever telling a bad address from a
 good one. Instead, both `test/e2e` and `deploy/` init prove each control
 plane's internet egress from inside, through the bastion, before the long
-cloud-init wait, so a bad control-plane address fails `init` in about a
-minute and reaches the existing destroy-and-retry path.
+cloud-init wait. A fresh address gets up to 5 minutes; a bad control-plane
+address then fails `init` and reaches the existing destroy-and-retry path.
