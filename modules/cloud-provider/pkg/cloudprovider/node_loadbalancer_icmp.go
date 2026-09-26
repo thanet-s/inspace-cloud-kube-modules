@@ -172,7 +172,7 @@ func (c *nodeLoadBalancerController) ensureClusterICMPFirewall(
 	pendingName := annotations[annotationNodeLoadBalancerICMPPendingName]
 	pendingStarted := annotations[annotationNodeLoadBalancerICMPPendingStarted]
 	createIssued := annotations[annotationNodeLoadBalancerICMPCreateIssued]
-	deleteTarget, _, receiptErr := nodeLoadBalancerFirewallDeleteReceipt(
+	deleteTarget, deleteIssuedAt, receiptErr := nodeLoadBalancerFirewallDeleteReceipt(
 		annotations,
 		annotationNodeLoadBalancerICMPDeleteTarget,
 		annotationNodeLoadBalancerICMPDeleteIssued,
@@ -183,7 +183,9 @@ func (c *nodeLoadBalancerController) ensureClusterICMPFirewall(
 		return nil, false, fmt.Errorf("node load balancer: parse cluster ICMP firewall delete receipt: %w", receiptErr)
 	}
 	if deleteTarget != "" {
-		return nil, false, errors.New("node load balancer: cluster ICMP firewall deletion remains fenced")
+		return nil, false, c.resolveLiveClusterICMPDeleteFence(
+			ctx, nodeClassName, ownerUID, annotations, items, desired, deleteTarget, deleteIssuedAt,
+		)
 	}
 	if currentUUID != "" && !validNodeLoadBalancerCloudUUID(currentUUID) {
 		return nil, false, fmt.Errorf("node load balancer: invalid persisted cluster ICMP firewall UUID %q", currentUUID)
@@ -874,6 +876,145 @@ func (c *nodeLoadBalancerController) clearManagedNodeClassICMPAnnotationsForUID(
 			delete(values, key)
 		}
 	})
+}
+
+// resolveLiveClusterICMPDeleteFence recovers a cluster ICMP delete receipt
+// found on a live (not deleting) NodeClass. The last Service owner stages or
+// issues this DELETE, but a new owner can appear before the NodeClass is
+// deleted. Without resolution every aggregate sync would fail closed forever.
+//
+//   - A staged target whose DELETE was never issued is simply withdrawn.
+//   - An issued DELETE is resolved by readback. While the request may still be
+//     in flight nothing changes. Afterwards, a still-listed exact owned
+//     firewall proves the DELETE did not commit and is re-adopted; otherwise
+//     spaced exact-UUID absence retires the receipt and the normal ensure path
+//     creates a replacement.
+//
+// It returns nil only after a durable transition or while waiting for spaced
+// evidence; callers stop the pass either way and re-read on the next one.
+func (c *nodeLoadBalancerController) resolveLiveClusterICMPDeleteFence(
+	ctx context.Context,
+	nodeClassName string,
+	ownerUID types.UID,
+	annotations map[string]string,
+	items []inspace.Firewall,
+	desired desiredNodeLoadBalancerFirewall,
+	deleteTarget, deleteIssuedAt string,
+) error {
+	currentUUID := annotations[annotationNodeLoadBalancerICMPFirewallUUID]
+	pendingUUID := annotations[annotationNodeLoadBalancerICMPPendingUUID]
+	if (currentUUID != "" && currentUUID != deleteTarget) || (pendingUUID != "" && pendingUUID != deleteTarget) {
+		return errors.New("node load balancer: cluster ICMP firewall delete target conflicts with live NodeClass identity")
+	}
+	receiptUnchanged := func(values map[string]string) bool {
+		return values[annotationNodeLoadBalancerICMPDeleteTarget] == deleteTarget &&
+			values[annotationNodeLoadBalancerICMPDeleteIssued] == deleteIssuedAt &&
+			values[annotationNodeLoadBalancerICMPFirewallUUID] == currentUUID &&
+			values[annotationNodeLoadBalancerICMPPendingUUID] == pendingUUID
+	}
+	withdraw := func(adopt bool) error {
+		changed, err := c.updateManagedNodeClassAnnotationsForUID(ctx, nodeClassName, ownerUID, func(values map[string]string) {
+			if !receiptUnchanged(values) {
+				return
+			}
+			for _, key := range []string{
+				annotationNodeLoadBalancerICMPDeleteTarget,
+				annotationNodeLoadBalancerICMPDeleteIssued,
+				annotationNodeLoadBalancerICMPCleanupAbsent,
+				annotationNodeLoadBalancerICMPCleanupChecked,
+			} {
+				delete(values, key)
+			}
+			if adopt {
+				values[annotationNodeLoadBalancerICMPFirewallUUID] = deleteTarget
+				for _, key := range []string{
+					annotationNodeLoadBalancerICMPPendingUUID, annotationNodeLoadBalancerICMPPendingName,
+					annotationNodeLoadBalancerICMPPendingStarted, annotationNodeLoadBalancerICMPCreateIssued,
+				} {
+					delete(values, key)
+				}
+				return
+			}
+			if values[annotationNodeLoadBalancerICMPFirewallUUID] == deleteTarget {
+				delete(values, annotationNodeLoadBalancerICMPFirewallUUID)
+			}
+			if values[annotationNodeLoadBalancerICMPPendingUUID] == deleteTarget {
+				for _, key := range []string{
+					annotationNodeLoadBalancerICMPPendingUUID, annotationNodeLoadBalancerICMPPendingName,
+					annotationNodeLoadBalancerICMPPendingStarted, annotationNodeLoadBalancerICMPCreateIssued,
+				} {
+					delete(values, key)
+				}
+			}
+			delete(values, annotationNodeLoadBalancerICMPAbsent)
+			delete(values, annotationNodeLoadBalancerICMPAbsentChecked)
+		})
+		if err != nil {
+			return fmt.Errorf("node load balancer: resolve cluster ICMP delete fence on live NodeClass: %w", err)
+		}
+		if !changed {
+			return errors.New("node load balancer: cluster ICMP delete fence changed during live-owner resolution")
+		}
+		return nil
+	}
+	if deleteIssuedAt == "" {
+		// DELETE authority was staged but never crossed the request boundary.
+		return withdraw(true)
+	}
+
+	var target *inspace.Firewall
+	for index := range items {
+		item := items[index]
+		if item.UUID == deleteTarget {
+			if target != nil {
+				return fmt.Errorf("node load balancer: cluster ICMP firewall delete target UUID %s appears multiple times", deleteTarget)
+			}
+			copy := item
+			target = &copy
+			continue
+		}
+		if item.EffectiveName() == desired.Request.DisplayName {
+			return fmt.Errorf("node load balancer: managed cluster ICMP name resolves to UUID %s, not delete target %s", item.UUID, deleteTarget)
+		}
+	}
+	if target != nil {
+		if target.EffectiveName() != desired.Request.DisplayName ||
+			!nodeLoadBalancerClusterICMPFirewallOwned(*target, c.provider.config.ClusterID, c.provider.config.BillingAccountID) {
+			return fmt.Errorf("node load balancer: cluster ICMP firewall delete target %s lost exact ownership", deleteTarget)
+		}
+		due, err := nodeLoadBalancerFirewallDeleteResendDue(deleteIssuedAt, time.Now().UTC())
+		if err != nil {
+			return err
+		}
+		if !due {
+			return fmt.Errorf(
+				"node load balancer: cluster ICMP firewall delete issued at %s may still be in flight; waiting before re-adopting it for live Services",
+				deleteIssuedAt,
+			)
+		}
+		if annotations[annotationNodeLoadBalancerICMPCleanupAbsent] != "" ||
+			annotations[annotationNodeLoadBalancerICMPCleanupChecked] != "" {
+			// A reappearance invalidates partial absence evidence; restart the
+			// resolution from a fresh read on the next pass.
+			_, err := c.updateManagedNodeClassAnnotationsForUID(ctx, nodeClassName, ownerUID, func(values map[string]string) {
+				if receiptUnchanged(values) {
+					delete(values, annotationNodeLoadBalancerICMPCleanupAbsent)
+					delete(values, annotationNodeLoadBalancerICMPCleanupChecked)
+				}
+			})
+			return err
+		}
+		return withdraw(true)
+	}
+	confirmed, _, err := c.recordNodeClassFirewallAbsenceForUID(
+		ctx, nodeClassName, ownerUID,
+		annotationNodeLoadBalancerICMPCleanupAbsent, annotationNodeLoadBalancerICMPCleanupChecked,
+		time.Now().UTC(), time.Time{},
+	)
+	if err != nil || !confirmed {
+		return err
+	}
+	return withdraw(false)
 }
 
 func mapsEqualStringString(left, right map[string]string) bool {
