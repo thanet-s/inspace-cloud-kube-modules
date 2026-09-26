@@ -150,6 +150,7 @@
         - public-node-local-service.yaml
         - public-node-local-present.json
         - private-local-service.yaml
+        - gateway.yaml
 
     - name: Heal state left by an interrupted acceptance run
       ansible.builtin.shell: |
@@ -209,6 +210,33 @@
           - --ignore-not-found
           - --wait=false
       changed_when: true
+
+    # Deleting the Gateway makes Cilium delete its generated paid-NLB Service;
+    # deleting only that Service would let Cilium recreate it.
+    - name: Remove stale Gateway API acceptance owners
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - -n
+          - default
+          - delete
+          - gateways.gateway.networking.k8s.io/inspace-e2e-gateway
+          - httproutes.gateway.networking.k8s.io/inspace-e2e-gateway
+          - --ignore-not-found
+          - --wait=false
+      changed_when: true
+
+    - name: Wait for the stale Gateway Service owner to disappear
+      ansible.builtin.shell: |
+        set -euo pipefail
+        test -z "$(kubectl -n default get service/cilium-gateway-inspace-e2e-gateway --ignore-not-found -o name)"
+      args:
+        executable: /bin/bash
+      register: e2e_stale_gateway_service_cleanup
+      changed_when: false
+      retries: 180
+      delay: 10
+      until: e2e_stale_gateway_service_cleanup.rc == 0
 
     - name: Wait for the stale public-node-local Service firewall owner to disappear
       ansible.builtin.shell: |
@@ -1508,6 +1536,166 @@
       retries: 120
       delay: 5
       until: e2e_final_public_cleanup.rc == 0
+      no_log: true
+
+    # Gateway API reuses the Ready worker and the private-a backend. It runs
+    # alone after the paid Service is gone, so exactly one paid NLB exists.
+    - name: Render the paid public Gateway API acceptance route
+      ansible.builtin.template:
+        src: templates/gateway.yaml.j2
+        dest: "{{ e2e_state_dir }}/gateway.yaml"
+        mode: "0600"
+
+    - name: Apply the paid public Gateway and its HTTPRoute
+      ansible.builtin.command:
+        argv: [kubectl, apply, -f, "{{ e2e_state_dir }}/gateway.yaml"]
+      changed_when: true
+
+    - name: Journal the Gateway Service cloud identity before convergence
+      ansible.builtin.shell: |
+        set -euo pipefail
+        kubectl -n default get service/cilium-gateway-inspace-e2e-gateway -o name >/dev/null
+        /opt/e2e/scripts/persist-workload.py \
+          --state "{{ e2e_state_file }}" \
+          --kubeconfig "{{ e2e_kubeconfig }}"
+        jq -e '.gatewayServiceLoadBalancerName | startswith("k8s-")' "{{ e2e_state_file }}" >/dev/null
+      args:
+        executable: /bin/bash
+      register: e2e_gateway_journal
+      changed_when: true
+      retries: 60
+      delay: 5
+      until: e2e_gateway_journal.rc == 0
+
+    - name: Prove the Gateway Service carries the paid public NLB contract
+      ansible.builtin.shell: |
+        set -euo pipefail
+        kubectl -n default get service/cilium-gateway-inspace-e2e-gateway -o json | jq -e '
+          .spec.type == "LoadBalancer" and
+          .metadata.labels["inspace.cloud/load-balancer-scope"] == "public" and
+          .metadata.annotations["service.beta.kubernetes.io/inspace-load-balancer-public"] == "true" and
+          .spec.loadBalancerClass == null and
+          .spec.externalTrafficPolicy == "Cluster" and
+          (.spec.selector // {}) == {} and
+          ([.spec.ports[] | {port, protocol, nodePort: (.nodePort | type)}] ==
+            [{"port": 80, "protocol": "TCP", "nodePort": "number"}]) and
+          ([.metadata.ownerReferences[] | select(.controller == true)] | length == 1) and
+          any(.metadata.ownerReferences[];
+            .controller == true and .kind == "Gateway" and .name == "inspace-e2e-gateway")'
+        kubectl -n default get service/cilium-gateway-inspace-e2e-gateway -o jsonpath='{.spec.ports[0].nodePort}'
+      args:
+        executable: /bin/bash
+      register: e2e_gateway_service
+      changed_when: false
+      retries: 60
+      delay: 5
+      until: e2e_gateway_service.rc == 0
+
+    - name: Wait for the programmed Gateway public address
+      ansible.builtin.shell: |
+        set -euo pipefail
+        kubectl -n default get gateway/inspace-e2e-gateway -o json | jq -er '
+          select(any(.status.conditions[]?; .type == "Programmed" and .status == "True")) |
+          .status.addresses[0].value'
+      args:
+        executable: /bin/bash
+      register: e2e_gateway_address
+      changed_when: false
+      retries: 120
+      delay: 5
+      until: e2e_gateway_address.rc == 0 and e2e_gateway_address.stdout | length > 0
+
+    - name: Validate the Gateway address is public IPv4
+      ansible.builtin.command:
+        argv:
+          - python3
+          - -c
+          - >-
+            import ipaddress,sys;
+            a=ipaddress.ip_address(sys.argv[1]);
+            assert a.version == 4 and not a.is_private and not a.is_loopback and not a.is_multicast
+          - "{{ e2e_gateway_address.stdout }}"
+      changed_when: false
+
+    - name: Prove exact paid public NLB ownership for the Gateway Service
+      ansible.builtin.command:
+        argv:
+          - /opt/e2e/scripts/verify-service-cloud.py
+          - --state
+          - "{{ e2e_state_file }}"
+          - --immutable-baseline
+          - "{{ e2e_baseline_inventory_file }}"
+          - --service
+          - gateway
+          - --node-port
+          - "{{ e2e_gateway_service.stdout_lines | last }}"
+          - --public
+          - present
+      register: e2e_gateway_cloud_proof
+      changed_when: false
+      retries: 120
+      delay: 5
+      until: >-
+        e2e_gateway_cloud_proof.rc == 0 and
+        (e2e_gateway_cloud_proof.stdout | from_json).publicIPv4 == e2e_gateway_address.stdout
+      no_log: true
+
+    - name: Require HTTPRoute routing to the private-a backend through the Gateway NLB
+      ansible.builtin.uri:
+        url: "http://{{ e2e_gateway_address.stdout }}/"
+        headers:
+          Host: gateway.inspace-e2e.test
+        return_content: true
+        timeout: 10
+        use_proxy: false
+      register: e2e_gateway_route_response
+      retries: 120
+      delay: 5
+      until: >-
+        e2e_gateway_route_response.status == 200 and
+        e2e_gateway_route_response.content | trim == e2e_marker + '-private-a'
+
+    - name: Require the Gateway to reject an unrouted host
+      ansible.builtin.uri:
+        url: "http://{{ e2e_gateway_address.stdout }}/"
+        headers:
+          Host: unrouted.inspace-e2e.test
+        status_code: 404
+        timeout: 10
+        use_proxy: false
+      register: e2e_gateway_unrouted_response
+      retries: 12
+      delay: 5
+      until: e2e_gateway_unrouted_response.status == 404
+
+    - name: Delete the paid public Gateway and its HTTPRoute
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - -n
+          - default
+          - delete
+          - gateways.gateway.networking.k8s.io/inspace-e2e-gateway
+          - httproutes.gateway.networking.k8s.io/inspace-e2e-gateway
+          - --wait=false
+      changed_when: true
+
+    - name: Require Gateway Service NLB and FIP cleanup
+      ansible.builtin.shell: |
+        set -euo pipefail
+        test -z "$(kubectl -n default get service/cilium-gateway-inspace-e2e-gateway --ignore-not-found -o name)"
+        kubectl -n default get service/inspace-e2e-private-a >/dev/null
+        /opt/e2e/scripts/verify-service-cloud.py \
+          --state "{{ e2e_state_file }}" \
+          --immutable-baseline "{{ e2e_baseline_inventory_file }}" \
+          --public absent >/dev/null
+      args:
+        executable: /bin/bash
+      register: e2e_gateway_cleanup
+      changed_when: false
+      retries: 120
+      delay: 5
+      until: e2e_gateway_cleanup.rc == 0
       no_log: true
 
     - name: Require the immutable zero-NLB anchor before Node-LB baseline capture

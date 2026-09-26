@@ -167,6 +167,21 @@ def main() -> None:
         for ingress in service.get("status", {}).get("loadBalancer", {}).get("ingress", []):
             if ingress.get("ip"):
                 private_service_vips.add(ingress["ip"])
+    # Cilium generates this paid-public Service for the Gateway API case; the
+    # CCM names its NLB and FIP exactly like any other public Service.
+    gateway_service = kubectl(
+        args.kubeconfig, "-n", "default", "get", "service", "cilium-gateway-inspace-e2e-gateway"
+    )
+    if gateway_service:
+        uid = gateway_service.get("metadata", {}).get("uid")
+        if not isinstance(uid, str) or not uid:
+            raise SystemExit("Gateway Service lacks a stable UID")
+        gateway_lb_name = f"k8s-{sha16(state['clusterName'])}-{sha16(uid)}"
+        state.update({
+            "gatewayServiceUID": uid,
+            "gatewayServiceLoadBalancerName": gateway_lb_name,
+            "gatewayServiceFloatingIPName": gateway_lb_name + "-ip",
+        })
     state["privateServiceLoadBalancerNames"] = sorted(private_load_balancers)
     state["privateServiceFloatingIPNames"] = sorted(private_floating_ips)
     state["privateServiceVIPs"] = sorted(private_service_vips)

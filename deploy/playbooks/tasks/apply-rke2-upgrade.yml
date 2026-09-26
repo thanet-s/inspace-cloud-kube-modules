@@ -35,6 +35,35 @@
           - "{{ (lookup('env', 'INSPACE_CONFIRM_RKE2_VERSION_SKIP') == cluster_name) | ternary('true', 'false') }}"
       changed_when: false
 
+    # RKE2 v1.37+ ships rke2-gateway-api-crd, which adopts the same v1.6.1
+    # standard CRDs with takeOwnership. A .skip marker stops RKE2's deploy
+    # controller from re-applying the bootstrap manifest without deleting
+    # anything; removing or disabling it would delete every CRD and Gateway.
+    # Every server is marked before any server runs the new release.
+    - name: Hand the Gateway API CRDs to RKE2's own chart before a v1.37 upgrade
+      ansible.builtin.command:
+        argv:
+          - ssh
+          - -F
+          - "{{ deploy_state_dir }}/ssh-config"
+          - "inspace-cp{{ deploy_cp_index }}"
+          - >-
+            sudo sh -ceu 'manifest=/var/lib/rancher/rke2/server/manifests/inspace-gateway-api-crds.yaml;
+            if [ -f "$manifest" ]; then touch /var/lib/rancher/rke2/server/manifests/inspace-gateway-api-crds.yaml.skip; test -f "$manifest.skip"; fi'
+      loop: "{{ deployment_state.controlPlanes }}"
+      loop_control:
+        index_var: deploy_cp_index
+        label: "{{ item.name }}"
+      register: deploy_gateway_api_handover
+      changed_when: true
+      failed_when: deploy_gateway_api_handover.rc != 0
+      retries: 3
+      delay: 10
+      until: deploy_gateway_api_handover.rc != 255
+      when:
+        - gateway_api_enabled | default(false) | bool
+        - deploy_gateway_api_rke2_release is version('1.37.0', '>=')
+
     - name: Upgrade the RKE2 binary one control-plane server at a time
       ansible.builtin.include_tasks: upgrade-one-control-plane.yml
       loop: "{{ deployment_state.controlPlanes }}"

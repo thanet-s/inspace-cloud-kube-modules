@@ -46,6 +46,10 @@ spec:
               x-kubernetes-validations:
                 - rule: '!self.endpoint.virtualIPv4.startsWith("10.42.") && !self.endpoint.virtualIPv4.startsWith("10.43.")'
                   message: control-plane virtualIPv4 must not overlap podCIDR or serviceCIDR
+                - rule: '!has(self.network.gatewayAPI) || !self.network.gatewayAPI.enabled || (has(self.rke2.disable) && self.rke2.disable.exists(component, component == "rke2-traefik"))'
+                  message: network.gatewayAPI.enabled requires rke2.disable to include rke2-traefik
+                - rule: '!has(self.network.gatewayAPI) || !self.network.gatewayAPI.enabled || !has(self.rke2.disable) || !self.rke2.disable.exists(component, component == "rke2-gateway-api-crd" || component == "inspace-gateway-api-crds")'
+                  message: network.gatewayAPI.enabled forbids disabling its CRD owner rke2-gateway-api-crd or inspace-gateway-api-crds
               properties:
                 location:
                   type: string
@@ -143,8 +147,11 @@ spec:
                     disable:
                       type: array
                       x-kubernetes-list-type: set
+                      maxItems: 32
                       items:
                         type: string
+                        minLength: 1
+                        maxLength: 63
                       x-kubernetes-validations:
                         - rule: 'self.all(component, component != "rke2-cilium")'
                           message: rke2-cilium cannot be disabled while kube-proxy replacement is enabled
@@ -162,6 +169,8 @@ spec:
                       message: loadBalancerAlgorithm is immutable after cluster creation
                     - rule: '(has(self.serviceTopology) && self.serviceTopology) == (has(oldSelf.serviceTopology) && oldSelf.serviceTopology)'
                       message: serviceTopology is immutable after cluster creation
+                    - rule: '(has(self.gatewayAPI) && self.gatewayAPI.enabled) == (has(oldSelf.gatewayAPI) && oldSelf.gatewayAPI.enabled)'
+                      message: gatewayAPI.enabled is fixed at cluster creation
                   properties:
                     uuid:
                       type: string
@@ -228,6 +237,22 @@ spec:
                         Service's PreferSameNode or PreferSameZone
                         trafficDistribution only when it is true. Omitted or
                         false keeps Cilium's default (disabled).
+                    gatewayAPI:
+                      type: object
+                      description: >-
+                        Optional Cilium Gateway API support. It enables
+                        Cilium's Gateway API controller and the cilium
+                        GatewayClass, requires an RKE2 release that bundles
+                        Cilium 1.20 or newer, and is fixed at cluster
+                        creation. Below RKE2 v1.37 each control plane waits
+                        for the delivered, SHA-256 pinned Gateway API v1.6.1
+                        standard CRD bundle (printed by
+                        inspace-cluster-controller --print-gateway-api-crds)
+                        and installs it as an RKE2 server manifest; from v1.37
+                        RKE2's rke2-gateway-api-crd chart owns those CRDs.
+                      properties:
+                        enabled:
+                          type: boolean
                 firewall:
                   type: object
                   required: [managed]

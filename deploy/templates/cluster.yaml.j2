@@ -45,6 +45,10 @@ spec:
 {% if deploy_service_topology | bool %}
     serviceTopology: true
 {% endif %}
+{% if gateway_api_enabled | default(false) | bool %}
+    gatewayAPI:
+      enabled: true
+{% endif %}
   firewall:
     managed: true
   publicIPv4:

@@ -45,6 +45,10 @@ all:
     # Service trafficDistribution, including the Node-LB PreferSameNode default.
     # load_balancer_algorithm: maglev
     # service_topology: true
+    # True enables Cilium Gateway API (pinned v1.6.1 standard CRDs, GatewayClass
+    # "cilium"). It needs an rke2_version that bundles Cilium 1.20 or newer
+    # (v1.34.12+, v1.35.9+, v1.36.5+, v1.37.0+) and is fixed at cluster creation.
+    gateway_api_enabled: false
 
     ssh_username: inspace
     ssh_private_key_file: /home/example/.ssh/id_ed25519

@@ -26,6 +26,9 @@
     e2e_ssh_user: "{{ lookup('env', 'INSPACE_E2E_SSH_USERNAME') | default('inspacee2e', true) }}"
     e2e_management_cidr: "{{ lookup('env', 'INSPACE_MANAGEMENT_CIDR') | default('0.0.0.0/0', true) }}"
     e2e_api_base: "{{ lookup('env', 'INSPACE_API_URL') | regex_replace('/+$', '') }}/v1/{{ lookup('env', 'INSPACE_LOCATION') }}"
+    # Must equal bootstrap.GatewayAPIStandardInstallSHA256 (upstream
+    # gateway-api v1.6.1 standard-install.yaml).
+    e2e_gateway_api_bundle_sha256: 24d931f22abd8e40c973264319ead7cfa09d0fb7716b7ab1ee2ff174cb063a73
   tasks:
     - name: Require an exact released version and isolated-account confirmation
       ansible.builtin.assert:
@@ -160,6 +163,20 @@
         src: templates/cluster.yaml.j2
         dest: "{{ e2e_cluster_file }}"
         mode: "0600"
+
+    # The Gateway API control planes wait for these exact bytes before RKE2
+    # starts; they are embedded in the product controller, never downloaded.
+    - name: Print the pinned Gateway API CRD bundle from the product controller
+      ansible.builtin.shell: |
+        set -euo pipefail
+        bundle={{ (e2e_state_dir + '/gateway-api-standard-install.yaml') | quote }}
+        inspace-cluster-controller --print-gateway-api-crds >"$bundle.partial"
+        test "$(sha256sum "$bundle.partial" | awk '{print $1}')" = {{ e2e_gateway_api_bundle_sha256 | quote }}
+        chmod 0600 "$bundle.partial"
+        mv -f "$bundle.partial" "$bundle"
+      args:
+        executable: /bin/bash
+      changed_when: true
 
     - name: Revalidate the pre-cloud immutable release artifact set
       ansible.builtin.command:
@@ -716,6 +733,8 @@
   gather_facts: false
   strategy: free
   any_errors_fatal: true
+  vars:
+    e2e_gateway_api_bundle_sha256: 24d931f22abd8e40c973264319ead7cfa09d0fb7716b7ab1ee2ff174cb063a73
   tasks:
     - name: Probe every private control-plane SSH port from the bastion in parallel
       ansible.builtin.command:
@@ -759,6 +778,27 @@
         connect_timeout: 10
         sleep: 5
         timeout: 300
+
+    # Product bootstrap blocks before RKE2 starts until this exact bundle is
+    # present, so Cilium sees the Gateway API CRDs at its first start.
+    - name: Deliver the pinned Gateway API CRD bundle to every control plane in parallel
+      ansible.builtin.copy:
+        src: "{{ lookup('env', 'E2E_STATE_DIR') }}/gateway-api-standard-install.yaml"
+        dest: /var/lib/inspace/gateway-api-standard-install.yaml
+        owner: root
+        group: root
+        mode: "0600"
+      become: true
+
+    - name: Require the delivered Gateway API bundle digest on every control plane
+      ansible.builtin.stat:
+        path: /var/lib/inspace/gateway-api-standard-install.yaml
+        checksum_algorithm: sha256
+      become: true
+      register: e2e_gateway_api_bundle
+      failed_when: >-
+        not e2e_gateway_api_bundle.stat.exists or
+        e2e_gateway_api_bundle.stat.checksum != e2e_gateway_api_bundle_sha256
 
     # The node firewall admits no inbound traffic from the internet, so a bad
     # control-plane floating IPv4 can only be seen from inside: prove egress
@@ -1384,6 +1424,28 @@
       retries: 30
       delay: 10
       until: e2e_cilium_config_drift.rc == 0
+
+    - name: Prove Cilium Gateway API with the pinned CRDs and an accepted cilium GatewayClass
+      ansible.builtin.shell: |
+        set -euo pipefail
+        kubectl -n kube-system get configmap cilium-config -o json | jq -e '
+          .data["enable-gateway-api"] == "true"' >/dev/null
+        for crd in gatewayclasses gateways httproutes grpcroutes tlsroutes referencegrants \
+          backendtlspolicies listenersets tcproutes udproutes; do
+          kubectl get crd "$crd.gateway.networking.k8s.io" -o json | jq -e '
+            .metadata.annotations["gateway.networking.k8s.io/bundle-version"] == "v1.6.1" and
+            .metadata.annotations["gateway.networking.k8s.io/channel"] == "standard" and
+            any(.status.conditions[]?; .type == "Established" and .status == "True")' >/dev/null
+        done
+        kubectl -n kube-system rollout status deployment/cilium-operator --timeout=10m
+        kubectl wait --for=condition=Accepted gatewayclass/cilium --timeout=10m
+      args:
+        executable: /bin/bash
+      register: e2e_cilium_gateway_api_ready
+      changed_when: false
+      retries: 60
+      delay: 5
+      until: e2e_cilium_gateway_api_ready.rc == 0
 
     - name: Prove three pinned kube-vip mirror pods and one elected lease holder
       ansible.builtin.shell: |

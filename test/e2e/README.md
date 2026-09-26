@@ -171,6 +171,27 @@ path because the InSpace NLB supports TCP only. After the final public-path
 check, the suite deletes only this paid public Service and requires both its
 NLB and FIP to be absent.
 
+The cluster enables Gateway API (`spec.network.gatewayAPI.enabled`). `init`
+prints the pinned Gateway API v1.6.1 standard CRD bundle from the product
+controller (`--print-gateway-api-crds`), copies it to every control plane before
+the cloud-init wait, and proves its SHA-256 in each guest. After the cluster
+starts it requires `enable-gateway-api` in `cilium-config`, all ten v1.6.1
+standard CRDs, and an `Accepted` `cilium` GatewayClass. Gateway API needs no
+Traefik; `rke2-traefik` stays disabled. With the paid Service gone, the suite
+then applies a `cilium` Gateway whose `spec.infrastructure` labels and
+annotations carry the two paid-public markers, plus an HTTPRoute that sends
+`gateway.inspace-e2e.test` to the existing `inspace-e2e-private-a` backend. It
+reuses the Ready worker, so the only added cost is one short-lived NLB and
+FIP. The suite proves Cilium's generated `cilium-gateway-inspace-e2e-gateway`
+Service is Gateway-owned, selectorless, class-free, and `Cluster`; that the
+CCM owns exactly one NLB forwarding TCP/80 to that Service's NodePort with the
+worker as target; that the runner gets the private-a marker through the
+Gateway's public address with the routed host and a 404 for another host; and,
+after deleting the Gateway, that the Service, NLB, and FIP are gone. The
+Gateway's NLB and FIP names are journaled, so `destroy` deletes the Gateway
+before the workloads, waits for its Service to disappear, and the final cloud
+audit proves no NLB or FIP with those names remains.
+
 The final acceptance block exercises the lower-cost public Node-LB path. Three
 user Services select `loadBalancerClass: inspace.cloud/node`, explicitly set
 `allocateLoadBalancerNodePorts: false`, and omit the mode annotation to prove

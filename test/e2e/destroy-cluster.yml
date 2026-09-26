@@ -200,6 +200,23 @@
       changed_when: true
       when: e2e_cleanup_state.kubernetesOwnersPossible | default(false) | bool
 
+    # Cilium would recreate a deleted Gateway Service while its Gateway exists.
+    # A partial init may not have installed the Gateway API CRDs yet.
+    - name: Delete Gateway API acceptance owners before their generated Services
+      ansible.builtin.shell: |
+        set -euo pipefail
+        kubeconfig={{ e2e_kubeconfig | quote }}
+        if kubectl --kubeconfig "$kubeconfig" api-resources -o name | grep -qx gateways.gateway.networking.k8s.io; then
+          kubectl --kubeconfig "$kubeconfig" -n default delete \
+            gateways.gateway.networking.k8s.io/inspace-e2e-gateway \
+            httproutes.gateway.networking.k8s.io/inspace-e2e-gateway \
+            --ignore-not-found --wait=false
+        fi
+      args:
+        executable: /bin/bash
+      changed_when: true
+      when: e2e_cleanup_state.kubernetesOwnersPossible | default(false) | bool
+
     - name: Delete workload owners before infrastructure owners
       ansible.builtin.command:
         argv:
@@ -271,6 +288,22 @@
       retries: 600
       delay: 3
       until: e2e_cleanup_public_local_service.rc == 0
+      when: e2e_cleanup_state.kubernetesOwnersPossible | default(false) | bool
+
+    # The Gateway Service's paid NLB targets the general worker, so its CCM
+    # cleanup must finish before worker teardown and controller removal.
+    - name: Wait for the Gateway-generated Service owner to disappear
+      ansible.builtin.shell: |
+        set -euo pipefail
+        test -z "$(kubectl --kubeconfig "{{ e2e_kubeconfig }}" -n default \
+          get service/cilium-gateway-inspace-e2e-gateway --ignore-not-found -o name)"
+      args:
+        executable: /bin/bash
+      register: e2e_cleanup_gateway_service
+      changed_when: false
+      retries: 600
+      delay: 3
+      until: e2e_cleanup_gateway_service.rc == 0
       when: e2e_cleanup_state.kubernetesOwnersPossible | default(false) | bool
 
     # Cilium never deletes an L2 announcement Lease, and its release update can

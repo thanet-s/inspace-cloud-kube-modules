@@ -197,6 +197,10 @@ type CloudInitInput struct {
 	// SkipOSUpgrade removes only apt-get upgrade from the bounded package
 	// stage. Repository setup, apt-get update, and required installs remain.
 	SkipOSUpgrade bool
+	// GatewayAPI enables Cilium's Gateway API controller and makes the server
+	// wait for the delivered, digest-pinned Gateway API CRD bundle before RKE2
+	// starts. False keeps the frozen cloud-init bytes.
+	GatewayAPI bool
 	// LoadBalancerAlgorithm is empty (Cilium's default), "random", or
 	// "maglev". Empty renders no algorithm value at all.
 	LoadBalancerAlgorithm string
@@ -265,6 +269,9 @@ func RenderCloudInitJSON(input CloudInitInput) (string, error) {
 	ciliumConfig := renderRKE2CiliumConfig(input.PodCIDR, privatePool.AddressCount, input.SingleControlPlane, ciliumLoadBalancerOptions{
 		Algorithm: input.LoadBalancerAlgorithm, ServiceTopology: input.ServiceTopology,
 	})
+	if input.GatewayAPI {
+		ciliumConfig += renderGatewayAPICiliumValues()
+	}
 	ciliumLoadBalancerConfig := renderCiliumPrivateLoadBalancerManifest(input.PrivateLoadBalancerPoolStart, input.PrivateLoadBalancerPoolStop)
 	kubeVIPConfig := renderKubeVIPStaticPod(input.VirtualIPv4, input.BootstrapCache)
 	script := renderInstallScript(input)
@@ -691,10 +698,7 @@ func renderInstallScript(input CloudInitInput) string {
 	if input.BootstrapCache == nil {
 		return renderDirectInstallScript(input)
 	}
-	singleControlPlaneCoreDNSInstall := ""
-	if input.SingleControlPlane {
-		singleControlPlaneCoreDNSInstall = "install -m 0600 /var/lib/inspace/rke2-coredns-config /var/lib/rancher/rke2/server/manifests/rke2-coredns-config.yaml\n"
-	}
+	optionalServerManifestInstalls := renderOptionalServerManifestInstalls(input)
 	releaseBase := "https://github.com/rancher/rke2/releases/download/" + url.PathEscape(input.RKE2Version)
 	cacheWait := "cache_curl_option=\n"
 	cacheHostsSetup := renderNodeCacheHostsSetup(input.BootstrapCache)
@@ -799,14 +803,21 @@ until systemctl is-active --quiet rke2-server.service && [ -s /etc/rancher/rke2/
   if systemctl is-failed --quiet rke2-server.service || [ "$attempt" -ge 180 ]; then exit 1; fi
   sleep 5
 done
-`, strings.TrimSpace(renderUbuntuRepositoryAndResolverCommands(input.NodeName)), renderAPTUpgradeContinuation(input.SkipOSUpgrade, "\t  "), strings.TrimSpace(renderDisableAutomaticAPTUpdatesCommands()), input.PrivateSubnet, input.VirtualIPv4, cacheHostsSetup, singleControlPlaneCoreDNSInstall, strings.TrimSpace(strings.TrimPrefix(renderDisableUFWScript(), "#!/bin/sh\nset -eu\n")), cacheWait, input.RKE2Version, releaseBase)
+`, strings.TrimSpace(renderUbuntuRepositoryAndResolverCommands(input.NodeName)), renderAPTUpgradeContinuation(input.SkipOSUpgrade, "\t  "), strings.TrimSpace(renderDisableAutomaticAPTUpdatesCommands()), input.PrivateSubnet, input.VirtualIPv4, cacheHostsSetup, optionalServerManifestInstalls, strings.TrimSpace(strings.TrimPrefix(renderDisableUFWScript(), "#!/bin/sh\nset -eu\n")), cacheWait, input.RKE2Version, releaseBase)
+}
+
+// renderOptionalServerManifestInstalls stages opt-in RKE2 server manifests.
+// It is empty for the default three-control-plane contract.
+func renderOptionalServerManifestInstalls(input CloudInitInput) string {
+	installs := ""
+	if input.SingleControlPlane {
+		installs = "install -m 0600 /var/lib/inspace/rke2-coredns-config /var/lib/rancher/rke2/server/manifests/rke2-coredns-config.yaml\n"
+	}
+	return installs + renderGatewayAPIServerManifestInstall(input)
 }
 
 func renderDirectInstallScript(input CloudInitInput) string {
-	singleControlPlaneCoreDNSInstall := ""
-	if input.SingleControlPlane {
-		singleControlPlaneCoreDNSInstall = "install -m 0600 /var/lib/inspace/rke2-coredns-config /var/lib/rancher/rke2/server/manifests/rke2-coredns-config.yaml\n"
-	}
+	optionalServerManifestInstalls := renderOptionalServerManifestInstalls(input)
 	releaseBase := "https://github.com/rancher/rke2/releases/download/" + url.PathEscape(input.RKE2Version)
 	return fmt.Sprintf(`#!/bin/sh
 set -eu
@@ -892,7 +903,7 @@ until systemctl is-active --quiet rke2-server.service && [ -s /etc/rancher/rke2/
   if systemctl is-failed --quiet rke2-server.service || [ "$attempt" -ge 180 ]; then exit 1; fi
   sleep 5
 done
-`, strings.TrimSpace(renderUbuntuRepositoryAndResolverCommands(input.NodeName)), renderAPTUpgradeContinuation(input.SkipOSUpgrade, "\t  "), strings.TrimSpace(renderDisableAutomaticAPTUpdatesCommands()), input.PrivateSubnet, input.VirtualIPv4, singleControlPlaneCoreDNSInstall, strings.TrimSpace(strings.TrimPrefix(renderDisableUFWScript(), "#!/bin/sh\nset -eu\n")), input.RKE2Version, releaseBase)
+`, strings.TrimSpace(renderUbuntuRepositoryAndResolverCommands(input.NodeName)), renderAPTUpgradeContinuation(input.SkipOSUpgrade, "\t  "), strings.TrimSpace(renderDisableAutomaticAPTUpdatesCommands()), input.PrivateSubnet, input.VirtualIPv4, optionalServerManifestInstalls, strings.TrimSpace(strings.TrimPrefix(renderDisableUFWScript(), "#!/bin/sh\nset -eu\n")), input.RKE2Version, releaseBase)
 }
 
 func sortedUniquePorts(ports []int) []int {
