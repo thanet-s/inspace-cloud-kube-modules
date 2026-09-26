@@ -210,8 +210,8 @@ func TestControlPlaneCRDMatchesMachineValidationContract(t *testing.T) {
 		"enabled:\n                          type: boolean\n                firewall:",
 		"rule: '(has(self.gatewayAPI) && self.gatewayAPI.enabled) == (has(oldSelf.gatewayAPI) && oldSelf.gatewayAPI.enabled)'",
 		"message: gatewayAPI.enabled is fixed at cluster creation",
-		`rule: '!has(self.network.gatewayAPI) || !self.network.gatewayAPI.enabled || (has(self.rke2.disable) && self.rke2.disable.exists(component, component == "rke2-traefik"))'`,
-		"message: network.gatewayAPI.enabled requires rke2.disable to include rke2-traefik",
+		`rule: '!has(self.network.gatewayAPI) || !self.network.gatewayAPI.enabled || (has(self.rke2.disable) && self.rke2.disable.exists(component, component == "rke2-traefik") && self.rke2.disable.exists(component, component == "rke2-traefik-crd"))'`,
+		"message: network.gatewayAPI.enabled requires rke2.disable to include rke2-traefik and rke2-traefik-crd",
 		`!self.rke2.disable.exists(component, component == "rke2-gateway-api-crd" || component == "inspace-gateway-api-crds")`,
 		"message: network.gatewayAPI.enabled forbids disabling its CRD owner rke2-gateway-api-crd or inspace-gateway-api-crds",
 	} {
@@ -314,12 +314,12 @@ func TestGatewayAPIRequiresCilium120AndNoTraefikCRDs(t *testing.T) {
 		"v1.34.12+rke2r1", "v1.35.9+rke2r1", "v1.36.5-rc2+rke2r1", "v1.36.5+rke2r1", "v1.36.12+rke2r2",
 		"v1.37.0+rke2r1", "v1.38.1+rke2r1",
 	} {
-		if errs := enabled(version, "rke2-traefik").Validate(); len(errs) != 0 {
+		if errs := enabled(version, "rke2-traefik", "rke2-traefik-crd").Validate(); len(errs) != 0 {
 			t.Errorf("Gateway API on %s rejected: %v", version, errs)
 		}
 	}
 	for _, version := range []string{"v1.33.9+rke2r1", "v1.34.11+rke2r1", "v1.35.8+rke2r1", "v1.36.4+rke2r1"} {
-		errs := enabled(version, "rke2-traefik").Validate()
+		errs := enabled(version, "rke2-traefik", "rke2-traefik-crd").Validate()
 		if !validationFieldReported(errs, "spec.network.gatewayAPI.enabled") {
 			t.Errorf("Gateway API on %s (bundled Cilium < 1.20) accepted: %v", version, errs)
 		}
@@ -328,8 +328,15 @@ func TestGatewayAPIRequiresCilium120AndNoTraefikCRDs(t *testing.T) {
 	if !validationFieldReported(errs, "spec.network.gatewayAPI.enabled") {
 		t.Fatalf("Gateway API with the packaged Traefik Gateway API CRDs accepted: %v", errs)
 	}
+	// Disabling rke2-traefik alone still installs rke2-traefik-crd, whose bundled
+	// Gateway API CRDs collide with ours and crash-loop its helm-install job
+	// (seen live on v1.36.5-rc2 in the v1.1.0-rc.7 E2E).
+	errs = enabled("v1.36.5-rc2+rke2r1", "rke2-traefik").Validate()
+	if !validationFieldReported(errs, "spec.network.gatewayAPI.enabled") {
+		t.Fatalf("Gateway API with rke2-traefik-crd enabled accepted: %v", errs)
+	}
 	for _, owner := range []string{"rke2-gateway-api-crd", "inspace-gateway-api-crds"} {
-		errs := enabled("v1.37.0+rke2r1", "rke2-traefik", owner).Validate()
+		errs := enabled("v1.37.0+rke2r1", "rke2-traefik", "rke2-traefik-crd", owner).Validate()
 		if !validationFieldReported(errs, "spec.rke2.disable") {
 			t.Errorf("Gateway API with its CRD owner %s disabled accepted: %v", owner, errs)
 		}

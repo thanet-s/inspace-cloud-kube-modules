@@ -175,7 +175,8 @@ review the change and restart them.
 `gateway_api_enabled` (default `false`) enables Cilium's Gateway API
 implementation and the `cilium` GatewayClass. Gateway API is served by Cilium
 alone and needs no Traefik: `rke2-traefik` and `rke2-ingress-nginx` stay
-disabled, and `rke2-gateway-api-crd` is never disabled. It requires an `rke2_version`
+disabled, the template also disables `rke2-traefik-crd` (its bundled Gateway
+API CRDs would conflict), and `rke2-gateway-api-crd` is never disabled. It requires an `rke2_version`
 that bundles Cilium 1.20 or newer (`v1.34.12+`, `v1.35.9+`, `v1.36.5+`, or
 `v1.37.0+`; the audited `v1.36.5-rc2+rke2r1` qualifies) and preflight rejects
 older releases. It is fixed at cluster creation: it is rendered only into

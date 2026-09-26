@@ -30,6 +30,7 @@ spec:
     disable:
       - rke2-ingress-nginx
       - rke2-traefik
+      - rke2-traefik-crd
     tlsSubjectAltNames:
       - "{{ lookup('env', 'INSPACE_CONTROL_PLANE_VIP') }}"
   network:

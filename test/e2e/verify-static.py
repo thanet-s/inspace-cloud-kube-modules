@@ -2070,9 +2070,9 @@ def verify_gateway_api_e2e_contract(
 
     network = cluster[cluster.index("\n  network:\n"):cluster.index("\n  firewall:\n") + 1]
     require(
-        "      - rke2-traefik\n" in cluster
+        "      - rke2-traefik\n      - rke2-traefik-crd\n" in cluster
         and "\n    gatewayAPI:\n      enabled: true\n" in network,
-        "E2E cluster must enable network.gatewayAPI with rke2-traefik disabled",
+        "E2E cluster must enable network.gatewayAPI with rke2-traefik and rke2-traefik-crd disabled",
     )
     # From RKE2 v1.37 rke2-gateway-api-crd owns the CRDs and bootstrap waits
     # for nothing; the E2E then must stop delivering the bundle.
