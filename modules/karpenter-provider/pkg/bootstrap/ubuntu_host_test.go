@@ -150,6 +150,66 @@ func TestBashBecomesTheLoginShellForInteractiveAccounts(t *testing.T) {
 	}
 }
 
+// stub replaces a sandbox command with a script that runs before the real one.
+func (s *hostSandbox) stub(name, body string) {
+	s.t.Helper()
+	if err := os.WriteFile(filepath.Join(s.root, "stub", name), []byte("#!/bin/sh\n"+body), 0o755); err != nil {
+		s.t.Fatal(err)
+	}
+}
+
+// The snippets are embedded mid-script, so a failed postcondition must stop
+// the whole script under set -e rather than only set the snippet's status.
+const continuationMarker = "\necho continued-after-failed-postcondition\n"
+
+func TestUbuntuSourcesPostconditionStopsTheScript(t *testing.T) {
+	sandbox := newHostSandbox(t, "VERSION_CODENAME=noble\n", sandboxPasswd)
+	// A sed that copies its input verbatim leaves every placeholder behind.
+	sandbox.stub("sed", "shift\nexec cat \"$@\"\n")
+	output, err := sandbox.run(ubuntuSourcesInstallCommands() + continuationMarker)
+	if err == nil || strings.Contains(output, "continued-after-failed-postcondition") {
+		t.Fatalf("sources install with a surviving placeholder err=%v output=%q, want the script to stop", err, output)
+	}
+}
+
+func TestBashLoginShellPostconditionStopsTheScript(t *testing.T) {
+	sandbox := newHostSandbox(t, "VERSION_CODENAME=resolute\n", sandboxPasswd)
+	// A usermod that reports success without changing passwd leaves sh logins.
+	sandbox.stub("usermod", "exit 0\n")
+	output, err := sandbox.run(bashLoginShellCommands() + continuationMarker)
+	if err == nil || strings.Contains(output, "continued-after-failed-postcondition") {
+		t.Fatalf("login shell setup with unchanged sh logins err=%v output=%q, want the script to stop", err, output)
+	}
+}
+
+func TestWorkerHostScriptsHaveNoNegatedAssertions(t *testing.T) {
+	data, err := RenderCloudInit(Config{
+		NodeName: "worker-1", Server: "https://10.0.0.10:9345", Token: "secret-token",
+		RKE2Version: "v1.36.4+rke2r1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc := mustDocument(t, data)
+	scripts := []string{ubuntuSourcesInstallCommands(), bashLoginShellCommands()}
+	for _, file := range doc.WriteFiles {
+		content, err := decodeWriteFile(file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		scripts = append(scripts, content)
+	}
+	// set -e ignores the status of a command negated with !, so such a line
+	// can never fail the script it guards.
+	for _, script := range scripts {
+		for _, line := range strings.Split(script, "\n") {
+			if strings.HasPrefix(strings.TrimSpace(line), "! ") {
+				t.Errorf("script asserts with a negated command that set -e ignores: %q", line)
+			}
+		}
+	}
+}
+
 func TestWorkerHostPreparationSetsUbuntuSourcesAndBashLoginShell(t *testing.T) {
 	data, err := RenderCloudInit(Config{
 		NodeName: "worker-1", Server: "https://10.0.0.10:9345", Token: "secret-token",

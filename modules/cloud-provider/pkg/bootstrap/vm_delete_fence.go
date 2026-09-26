@@ -646,39 +646,50 @@ func (r *Reconciler) rollbackFloatingIP(ctx context.Context, cluster *v1alpha1.I
 		discoveryCtx, cancel := r.rollbackFloatingIPContext(ctx)
 		items, discoveryErr := r.API.ListFloatingIPs(discoveryCtx, attempt.Location, nil)
 		cancel()
-		var found *inspace.FloatingIP
-		if discoveryErr == nil {
-			for i := range items {
-				item := &items[i]
-				if item.IsDeleted || (item.AssignedTo != attempt.ResourceUUID && item.Name != attempt.FloatingIPName) {
-					continue
-				}
-				if found != nil {
-					return false, fmt.Errorf("bootstrap: rollback found multiple floating IPs for VM %q", attempt.ResourceName)
-				}
-				found = item
-			}
+		// Every bootstrap VM is created with an auto-assigned public IPv4. The
+		// only durable link between that nameless address and this cluster is
+		// its assignment to the exact VM, which VM deletion destroys. Deleting
+		// the VM before the address is recorded would leave a nameless,
+		// unassigned floating IP that no later pass can prove ownership of, and
+		// the post-VM phase would then wait for it forever. Discovery therefore
+		// never advances on a failed or incomplete inventory.
+		if discoveryErr != nil {
+			return false, errors.Join(
+				fmt.Errorf("%w: rollback of VM %q cannot delete the VM before its auto floating IP is identified", ErrCreateAttemptPending, attempt.ResourceName),
+				discoveryErr,
+			)
 		}
-		if found != nil {
-			if found.Name == "" {
-				if err := validateAutoAssignedFloatingIP(found, cluster, vm); err != nil {
-					return false, err
-				}
-			} else if err := validateOwnedFloatingIP(found, cluster, attempt.FloatingIPName, vm); err != nil {
+		var found *inspace.FloatingIP
+		for i := range items {
+			item := &items[i]
+			if item.IsDeleted || (item.AssignedTo != attempt.ResourceUUID && item.Name != attempt.FloatingIPName) {
+				continue
+			}
+			if found != nil {
+				return false, fmt.Errorf("bootstrap: rollback found multiple floating IPs for VM %q", attempt.ResourceName)
+			}
+			found = item
+		}
+		if found == nil {
+			return false, fmt.Errorf("%w: rollback of VM %q is waiting for its auto floating IP to become visible before deleting the VM",
+				ErrCreateAttemptPending, attempt.ResourceName)
+		}
+		if found.Name == "" {
+			if err := validateAutoAssignedFloatingIP(found, cluster, vm); err != nil {
 				return false, err
 			}
+		} else if err := validateOwnedFloatingIP(found, cluster, attempt.FloatingIPName, vm); err != nil {
+			return false, err
 		}
 		err := r.mutateDeleteAttempt(ctx, cluster, key, func(current *v1alpha1.ResourceDeleteAttemptStatus) error {
 			if current.Phase != deletePhaseRollbackFIPDiscovery {
 				return fmt.Errorf("bootstrap: rollback delete attempt %q changed during floating-IP discovery", key)
 			}
-			if found != nil {
-				current.FloatingIPAddress = found.Address
-			}
+			current.FloatingIPAddress = found.Address
 			setDeleteAttemptPhase(current, deletePhaseVMIntent)
 			return nil
 		})
-		return true, errors.Join(discoveryErr, err)
+		return err == nil, err
 	case deletePhaseRollbackFIPAfterVM:
 		readCtx, cancel := r.rollbackFloatingIPContext(ctx)
 		defer cancel()

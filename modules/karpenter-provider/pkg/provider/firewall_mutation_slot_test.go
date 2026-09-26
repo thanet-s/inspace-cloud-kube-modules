@@ -248,6 +248,49 @@ func TestDurableFirewallSlotSerializesAssignmentAndDetachmentAcrossRestart(t *te
 	}
 }
 
+func TestDurableFirewallDetachSlotRetiresWhenItsOwnerNodeClaimIsGone(t *testing.T) {
+	ctx := context.Background()
+	claimA := createFenceTestNodeClaim()
+	claimA.Name, claimA.UID = "general-gone", types.UID("claim-gone")
+	claimB := createFenceTestNodeClaim()
+	claimB.Name, claimB.UID = "general-next", types.UID("claim-next")
+	kubeClient := newFirewallSlotTestClient(t, claimA, claimB)
+	store, _ := NewKubernetesCreateFenceStore(kubeClient, kubeClient, "karpenter")
+	a := prepareIssuedFirewallClaim(t, store, claimA.Name, string(claimA.UID), "11111111-1111-4111-8111-111111111111", "33333333-3333-4333-8333-333333333333")
+	b := prepareIssuedFirewallClaim(t, store, claimB.Name, string(claimB.UID), "22222222-2222-4222-8222-222222222222", "33333333-3333-4333-8333-333333333333")
+	updatedA, assignA, err := store.AuthorizeBaseFirewall(ctx, a.claim, a.binding, a.fence.Token, a.vmUUID)
+	a.claim = updatedA
+	if err != nil || !assignA.AllowPOST {
+		t.Fatalf("initial assignment = %#v, %v", assignA, err)
+	}
+	if a.claim, err = store.ObserveBaseFirewall(ctx, a.claim, a.binding, a.fence.Token, a.vmUUID, assignA.Fence.IssueID); err != nil {
+		t.Fatal(err)
+	}
+	if detachA, err := store.AuthorizeBaseFirewallDetach(ctx, a.claim, a.binding, a.fence.Token, a.vmUUID); err != nil || !detachA.AllowDELETE {
+		t.Fatalf("detachment = %#v, %v", detachA, err)
+	}
+	if _, assignmentB, err := store.AuthorizeBaseFirewall(ctx, b.claim, b.binding, b.fence.Token, b.vmUUID); !errors.Is(err, cloudapi.ErrCreateAttemptPending) || assignmentB.AllowPOST {
+		t.Fatalf("assignment crossed an owned active detachment = %#v, %v", assignmentB, err)
+	}
+	// The provider finalizer keeps the owner until its cleanup converges, so
+	// only an operator override can remove it with the detach still issued.
+	// Nothing can ever finish that receipt, and it must not wedge the firewall.
+	var owner karpv1.NodeClaim
+	if err := kubeClient.Get(ctx, types.NamespacedName{Name: claimA.Name}, &owner); err != nil {
+		t.Fatal(err)
+	}
+	owner.Finalizers = nil
+	if err := kubeClient.Update(ctx, &owner); err != nil {
+		t.Fatal(err)
+	}
+	if err := kubeClient.Delete(ctx, &owner); err != nil {
+		t.Fatal(err)
+	}
+	if _, assignmentB, err := store.AuthorizeBaseFirewall(ctx, b.claim, b.binding, b.fence.Token, b.vmUUID); err != nil || !assignmentB.AllowPOST {
+		t.Fatalf("assignment after the detach owner disappeared = %#v, %v; want POST authority", assignmentB, err)
+	}
+}
+
 func TestDurableFirewallSlotCASAllowsOnlyOneDetachmentDispatcherAcrossStores(t *testing.T) {
 	ctx := context.Background()
 	claim := createFenceTestNodeClaim()

@@ -15,6 +15,7 @@ import (
 type hostSandbox struct {
 	t    *testing.T
 	root string
+	env  []string
 }
 
 func newHostSandbox(t *testing.T, osRelease, passwd string) *hostSandbox {
@@ -35,6 +36,15 @@ func newHostSandbox(t *testing.T, osRelease, passwd string) *hostSandbox {
 	write("etc/adduser.conf", "# adduser defaults\nDSHELL=/bin/sh\n", 0o644)
 	write("bin/bash", "#!/bin/sh\n", 0o755)
 	write("var/lib/inspace/ubuntu.sources", ubuntuAPTSourcesConfig, 0o644)
+	write("var/lib/inspace/static-resolv.conf", staticGoogleResolverConfig, 0o644)
+	// systemctl reports systemd-resolved masked, and active only when the test
+	// sets SANDBOX_RESOLVED_ACTIVE=1.
+	write("stub/systemctl", `#!/bin/sh
+case "$1" in
+  is-enabled) echo masked ;;
+  is-active) [ "${SANDBOX_RESOLVED_ACTIVE:-0}" = 1 ] ;;
+esac
+`, 0o755)
 	// usermod --shell SHELL ACCOUNT rewrites field 7 of the sandbox passwd.
 	write("stub/usermod", `#!/bin/sh
 set -eu
@@ -50,6 +60,7 @@ func (s *hostSandbox) run(script string) (string, error) {
 	for _, path := range []string{
 		"/etc/os-release", "/etc/passwd", "/etc/default/useradd", "/etc/adduser.conf",
 		"/etc/apt/sources.list.d/ubuntu.sources", "/var/lib/inspace/ubuntu.sources",
+		"/etc/resolv.conf", "/var/lib/inspace/static-resolv.conf",
 	} {
 		for _, prefix := range []string{" ", ">", "'", `"`} {
 			script = strings.ReplaceAll(script, prefix+path, prefix+s.root+path)
@@ -60,6 +71,7 @@ func (s *hostSandbox) run(script string) (string, error) {
 	script = strings.ReplaceAll(script, "test -x /bin/bash", "test -x "+s.root+"/bin/bash")
 	command := exec.Command("sh", "-c", "set -eu\n"+script)
 	command.Env = append(os.Environ(), "PATH="+filepath.Join(s.root, "stub")+":"+os.Getenv("PATH"), "SANDBOX="+s.root)
+	command.Env = append(command.Env, s.env...)
 	output, err := command.CombinedOutput()
 	return string(output), err
 }
@@ -194,6 +206,105 @@ func TestEveryBootstrapScriptSetsUbuntuSourcesAndBashLoginShell(t *testing.T) {
 		}
 		if strings.Contains(script, "install -m 0644 /var/lib/inspace/ubuntu.sources") {
 			t.Errorf("%s bootstrap script still installs the sources template verbatim", name)
+		}
+	}
+}
+
+func (s *hostSandbox) stub(name, content string) {
+	s.t.Helper()
+	if err := os.WriteFile(filepath.Join(s.root, "stub", name), []byte(content), 0o755); err != nil {
+		s.t.Fatal(err)
+	}
+}
+
+// renderedStaticResolverCommands extracts the exact rendered static-resolver
+// block (from removing /etc/resolv.conf through the systemd-resolved checks).
+func renderedStaticResolverCommands(t *testing.T) string {
+	t.Helper()
+	rendered := renderUbuntuRepositoryAndResolverCommands("unit-bastion")
+	start := strings.Index(rendered, "rm -f /etc/resolv.conf\n")
+	end := strings.Index(rendered, "grep -Fqx 'http://mirror1.totbb.net/ubuntu/")
+	if start < 0 || end <= start {
+		t.Fatalf("static resolver block not found in:\n%s", rendered)
+	}
+	return rendered[start:end]
+}
+
+// POSIX shells never apply set -e to a command prefixed with "!", so every
+// negative host assertion must fail the script explicitly. Each case forces
+// the asserted condition to be violated and requires that the rendered
+// snippet stops the script: the command after it (as in the real bootstrap
+// script, where more setup always follows) must never run.
+func TestNegativeHostAssertionsFailTheBootstrapScript(t *testing.T) {
+	const continued = "echo bootstrap-continued-after-assertion\n"
+	requireStopped := func(t *testing.T, output string, err error, message string) {
+		t.Helper()
+		if err == nil || strings.Contains(output, "bootstrap-continued-after-assertion") || !strings.Contains(output, message) {
+			t.Fatalf("violated assertion did not stop the script: err=%v output=%q, want %q", err, output, message)
+		}
+	}
+	t.Run("leftover Ubuntu codename placeholder", func(t *testing.T) {
+		sandbox := newHostSandbox(t, "VERSION_CODENAME=resolute\n", sandboxPasswd)
+		// A sed that copies its input unchanged leaves every placeholder.
+		sandbox.stub("sed", "#!/bin/sh\nshift\ncat \"$@\"\n")
+		output, err := sandbox.run(renderUbuntuSourcesInstallCommands() + continued)
+		requireStopped(t, output, err, "@UBUNTU_CODENAME@ placeholder")
+	})
+	t.Run("sh login shell left behind", func(t *testing.T) {
+		sandbox := newHostSandbox(t, "VERSION_CODENAME=resolute\n", sandboxPasswd)
+		// A usermod that changes nothing leaves /bin/sh and dash accounts.
+		sandbox.stub("usermod", "#!/bin/sh\nexit 0\n")
+		output, err := sandbox.run(renderBashLoginShellCommands() + continued)
+		requireStopped(t, output, err, "still uses /bin/sh or dash")
+	})
+	t.Run("systemd-resolved still active", func(t *testing.T) {
+		sandbox := newHostSandbox(t, "VERSION_CODENAME=resolute\n", sandboxPasswd)
+		sandbox.env = []string{"SANDBOX_RESOLVED_ACTIVE=1"}
+		output, err := sandbox.run(renderedStaticResolverCommands(t) + continued)
+		requireStopped(t, output, err, "systemd-resolved.service is still active")
+	})
+	t.Run("systemd-resolved inactive", func(t *testing.T) {
+		sandbox := newHostSandbox(t, "VERSION_CODENAME=resolute\n", sandboxPasswd)
+		if output, err := sandbox.run(renderedStaticResolverCommands(t)); err != nil {
+			t.Fatalf("static resolver setup failed: %v\n%s", err, output)
+		}
+		if got := sandbox.read("etc/resolv.conf"); got != staticGoogleResolverConfig {
+			t.Fatalf("static resolver file = %q", got)
+		}
+	})
+}
+
+func TestBootstrapScriptsHaveNoBangPrefixedAssertions(t *testing.T) {
+	hostname := "cache.unit.inspace.internal"
+	material, err := deriveCacheTLS([]byte("0123456789abcdef0123456789abcdef"), "default/unit:4d7ca80d", hostname, time.Now().UTC().Truncate(time.Second).Add(-time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cachedControlPlane := cacheContractControlPlaneInput()
+	cachedControlPlane.BootstrapCache = &NodeCacheConfig{Address: "10.20.30.21", Hostname: hostname, CABundle: material.CACertificate}
+	rendered := map[string]func() (string, error){
+		"control-plane":        func() (string, error) { return RenderCloudInitJSON(cacheContractControlPlaneInput()) },
+		"cached control-plane": func() (string, error) { return RenderCloudInitJSON(cachedControlPlane) },
+		"bastion":              func() (string, error) { return RenderBastionCloudInitJSON("unit-bastion") },
+		"cache-bastion": func() (string, error) {
+			return RenderCacheBastionCloudInitJSON(CacheBastionCloudInitInput{
+				NodeName: "unit-bastion", PrivateSubnet: "10.20.30.0/24", CacheHostname: hostname,
+				RKE2Version: bootstrapCacheRKE2Version, ModuleVersion: "0.3.1-rc.2",
+				CACertificate: material.CACertificate, ServerCertificate: material.ServerCertificate, ServerPrivateKey: material.ServerPrivateKey,
+			})
+		},
+	}
+	for name, render := range rendered {
+		raw, err := render()
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		for path, content := range decodeWriteFiles(t, raw) {
+			for number, line := range strings.Split(content, "\n") {
+				if strings.HasPrefix(strings.TrimSpace(line), "! ") {
+					t.Errorf("%s %s line %d is a \"!\" assertion that set -e ignores: %q", name, path, number+1, line)
+				}
+			}
 		}
 	}
 }
