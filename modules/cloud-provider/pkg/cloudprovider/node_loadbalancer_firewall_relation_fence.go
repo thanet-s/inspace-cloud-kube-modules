@@ -1283,7 +1283,7 @@ func (c *nodeLoadBalancerController) reconcileNodeLoadBalancerFirewallRelation(
 	} else {
 		mutationErr = c.provider.api.UnassignFirewallFromVM(ctx, c.provider.config.Location, issuedFence.firewallUUID, issuedFence.vmUUID)
 	}
-	if errors.Is(mutationErr, inspace.ErrMutationBlocked) {
+	if nodeLoadBalancerMutationKnownPreDispatch(mutationErr) {
 		// The SDK produced this typed error before dispatch. Clear only the exact
 		// UID-pinned receipt using a detached bounded context; a canceled caller
 		// must not strand authority that provably never crossed the HTTP boundary.

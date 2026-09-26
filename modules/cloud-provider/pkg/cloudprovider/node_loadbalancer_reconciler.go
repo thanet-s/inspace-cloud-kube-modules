@@ -2332,12 +2332,14 @@ func (c *nodeLoadBalancerController) validateServiceFirewallAssignmentMutation(
 	return nil
 }
 
-// nodeLoadBalancerMutationKnownPreDispatch identifies the only error that
-// proves the cloud request never left this process. Every HTTP response and
-// transport error is post-dispatch ambiguous and must retain its issued
-// receipt until exact desired-state readback resolves it.
+// nodeLoadBalancerMutationKnownPreDispatch identifies the only SDK errors that
+// prove the cloud request never left this process: the non-loopback mutation
+// block and local validation, request construction, or an already-done context
+// before the HTTP client is invoked. Every HTTP response and transport error is
+// post-dispatch ambiguous and must retain its issued receipt until exact
+// desired-state readback resolves it.
 func nodeLoadBalancerMutationKnownPreDispatch(err error) bool {
-	return errors.Is(err, inspace.ErrMutationBlocked)
+	return errors.Is(err, inspace.ErrMutationBlocked) || errors.Is(err, inspace.ErrMutationNotDispatched)
 }
 
 func newNodeLoadBalancerFirewallCreateIssuedToken() (string, error) {
@@ -2658,7 +2660,7 @@ func (c *nodeLoadBalancerController) clearPendingFirewallMetadata(ctx context.Co
 // resetServiceFirewallCreateAfterProvenNonDispatch resets only the exact
 // create-issued receipt won by this invocation. Callers have proof that no
 // provider HTTP mutation was dispatched: either final authority rejected the
-// operation before the SDK call, or the SDK returned ErrMutationBlocked. The
+// operation before the SDK call, or the SDK returned a typed pre-dispatch error. The
 // staged deterministic identity remains intact for a safe later retry.
 func (c *nodeLoadBalancerController) resetServiceFirewallCreateAfterProvenNonDispatch(
 	ctx context.Context,

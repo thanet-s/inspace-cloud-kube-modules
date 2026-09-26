@@ -1063,7 +1063,7 @@ func (p *Provider) issueStandardNLBMutation(
 }
 
 func standardNLBMutationKnownPreDispatch(err error) bool {
-	return errors.Is(err, inspace.ErrMutationBlocked)
+	return errors.Is(err, inspace.ErrMutationBlocked) || errors.Is(err, inspace.ErrMutationNotDispatched)
 }
 
 func standardNLBMutationError(action string, err error) error {

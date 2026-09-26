@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strconv"
 	"strings"
 	"sync"
@@ -41,6 +42,7 @@ type ambiguousFirewallRelationAPI struct {
 type blockedFirewallRelationAPI struct {
 	*fakeAPI
 	cancel      context.CancelFunc
+	assignErr   error
 	listCalls   int
 	assignCalls int
 }
@@ -61,6 +63,9 @@ func (a *blockedFirewallRelationAPI) AssignFirewallToVM(context.Context, string,
 	a.assignCalls++
 	if a.cancel != nil {
 		a.cancel()
+	}
+	if a.assignErr != nil {
+		return a.assignErr
 	}
 	return inspace.ErrMutationBlocked
 }
@@ -1802,5 +1807,37 @@ func TestNodeLoadBalancerOnlyTypedLocalBlockIsKnownPreDispatch(t *testing.T) {
 	}
 	if !nodeLoadBalancerMutationKnownPreDispatch(errors.Join(errors.New("wrapped"), inspace.ErrMutationBlocked)) {
 		t.Fatal("typed local mutation block was not recognized through wrapping")
+	}
+	if !nodeLoadBalancerMutationKnownPreDispatch(fmt.Errorf("wrapped: %w", inspace.ErrMutationNotDispatched)) {
+		t.Fatal("typed SDK pre-dispatch rejection was not recognized through wrapping")
+	}
+}
+
+func TestNodeLoadBalancerFirewallRelationNotDispatchedClearsWithoutReadback(t *testing.T) {
+	service := nodeLoadBalancerTestService("relation-local", "relation-local-uid", corev1.ProtocolTCP, 443)
+	notDispatched := fmt.Errorf("inspace: invalid VM UUID: %w", inspace.ErrMutationNotDispatched)
+	api := &blockedFirewallRelationAPI{
+		fakeAPI:   &fakeAPI{firewalls: []inspace.Firewall{{UUID: testFirewallRelationFirewallUUID}}},
+		assignErr: notDispatched,
+	}
+	provider := newTestProvider(t, api)
+	provider.kubeClient = kubefake.NewSimpleClientset(service.DeepCopy())
+	controller := &nodeLoadBalancerController{provider: provider}
+	converged, err := controller.reconcileNodeLoadBalancerFirewallRelation(
+		context.Background(),
+		withoutFirewallRelationCloudAuthorityForFenceTest(controller.serviceFirewallRelationOwner(service)),
+		&nodeLoadBalancerFirewallRelationFence{
+			operation:    nodeLoadBalancerFirewallRelationAssign,
+			firewallUUID: testFirewallRelationFirewallUUID,
+			vmUUID:       testFirewallRelationVMUUID,
+		},
+	)
+	if converged || !errors.Is(err, inspace.ErrMutationNotDispatched) {
+		t.Fatalf("not-dispatched relation mutation result: converged=%t err=%v", converged, err)
+	}
+	stored := getNodeLoadBalancerTestService(t, context.Background(), provider, service.Namespace, service.Name)
+	if stored.Annotations[annotationNodeLoadBalancerFirewallRelationIssued] != "" ||
+		stored.Annotations[annotationNodeLoadBalancerFirewallRelationOwnerUID] != "" {
+		t.Fatalf("not-dispatched relation mutation retained UID-pinned receipt: %#v", stored.Annotations)
 	}
 }

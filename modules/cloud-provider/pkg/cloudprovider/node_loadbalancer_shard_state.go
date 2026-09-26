@@ -661,7 +661,7 @@ func (c *nodeLoadBalancerController) transitionShardFirewallMutation(
 // resetShardFirewallMutationAfterProvenNonDispatch returns the exact issued
 // shard policy transaction to its staged state. Callers have won issuance and
 // proved that no provider HTTP mutation was dispatched, either through final
-// authority rejection or the SDK's typed ErrMutationBlocked result.
+// authority rejection or a typed SDK pre-dispatch result.
 func (c *nodeLoadBalancerController) resetShardFirewallMutationAfterProvenNonDispatch(
 	ctx context.Context,
 	shard string,
