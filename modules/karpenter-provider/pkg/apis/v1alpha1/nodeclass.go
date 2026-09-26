@@ -8,9 +8,10 @@ import (
 )
 
 const (
-	LocationBangkok          = "bkk01"
-	OSNameUbuntu             = "ubuntu"
-	OSVersionUbuntu          = "24.04"
+	LocationBangkok = "bkk01"
+	OSNameUbuntu    = "ubuntu"
+	// OSVersionUbuntu is the default release for new NodeClasses.
+	OSVersionUbuntu          = "26.04"
 	RKE2AgentTokenSecretName = "inspace-rke2-agent-token"
 	RKE2AgentTokenSecretKey  = "token"
 	BootstrapCachePort       = 8443
@@ -105,7 +106,8 @@ type InSpaceNodeClassSpec struct {
 	// ingress firewalls in addition to FirewallUUID.
 	FirewallProfile FirewallProfile `json:"firewallProfile,omitempty"`
 	// ImageSelector selects a stock operating-system image supported by the VM
-	// create API. The first release supports Ubuntu 24.04 only.
+	// create API. Ubuntu 24.04 and 26.04 are supported; see
+	// SupportedUbuntuVersions.
 	ImageSelector ImageSelector `json:"imageSelector"`
 	// RootDiskGiB is ephemeral node storage. Persistent data belongs on CSI volumes.
 	RootDiskGiB int32 `json:"rootDiskGiB"`
@@ -152,6 +154,10 @@ func BootstrapCacheRegistry(clusterName string) string {
 func BootstrapCacheHealthURL(clusterName string) string {
 	return "https://" + BootstrapCacheRegistry(clusterName) + "/healthz"
 }
+
+// SupportedUbuntuVersions lists the audited Ubuntu releases. 24.04 keeps
+// existing NodeClasses valid; 26.04 is the default for new ones.
+var SupportedUbuntuVersions = []string{"24.04", "26.04"}
 
 type ImageSelector struct {
 	OSName    string `json:"osName"`

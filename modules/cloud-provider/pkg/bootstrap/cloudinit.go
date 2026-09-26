@@ -52,15 +52,17 @@ const ubuntuAPTMirrorListConfig = `http://mirror1.totbb.net/ubuntu/	priority:1
 https://mirror.kku.ac.th/ubuntu/	priority:2
 `
 
+// ubuntuAPTSourcesConfig is a template: bootstrap replaces @UBUNTU_CODENAME@
+// with the booted release so one renderer serves Ubuntu 24.04 and 26.04.
 const ubuntuAPTSourcesConfig = `Types: deb
 URIs: mirror+file:/etc/apt/mirrors/inspace-ubuntu.list
-Suites: noble noble-updates noble-backports
+Suites: @UBUNTU_CODENAME@ @UBUNTU_CODENAME@-updates @UBUNTU_CODENAME@-backports
 Components: main restricted universe multiverse
 Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
 
 Types: deb
 URIs: mirror+file:/etc/apt/mirrors/inspace-ubuntu.list
-Suites: noble-security
+Suites: @UBUNTU_CODENAME@-security
 Components: main restricted universe multiverse
 Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
 `
@@ -70,6 +72,44 @@ nameserver 8.8.8.8
 nameserver 8.8.4.4
 options edns0
 `
+
+// renderUbuntuSourcesInstallCommands installs the APT sources for the booted
+// Ubuntu release. Only the audited releases are accepted.
+func renderUbuntuSourcesInstallCommands() string {
+	return `ubuntu_codename=$(. /etc/os-release && printf '%s' "${VERSION_CODENAME:-}")
+case "$ubuntu_codename" in
+  noble|resolute) ;;
+  *)
+    echo "unsupported Ubuntu release codename: $ubuntu_codename" >&2
+    exit 1
+    ;;
+esac
+sed "s/@UBUNTU_CODENAME@/$ubuntu_codename/g" /var/lib/inspace/ubuntu.sources >/etc/apt/sources.list.d/ubuntu.sources
+chmod 0644 /etc/apt/sources.list.d/ubuntu.sources
+! grep -Fq '@UBUNTU_CODENAME@' /etc/apt/sources.list.d/ubuntu.sources
+`
+}
+
+// renderBashLoginShellCommands makes bash the login shell of root and every
+// regular account, and the default for accounts created later. Recent InSpace
+// images create the SSH user with /bin/sh, which breaks bash-syntax sessions.
+func renderBashLoginShellCommands() string {
+	return `test -x /bin/bash
+for login_account in $(awk -F: '($3 == 0 || ($3 >= 1000 && $3 < 65534)) && $7 ~ /^(\/usr)?\/bin\/(sh|dash)$/ { print $1 }' /etc/passwd); do
+  usermod --shell /bin/bash "$login_account"
+done
+touch /etc/default/useradd
+if grep -Eq '^#?[[:space:]]*SHELL=' /etc/default/useradd; then
+  sed -Ei 's|^#?[[:space:]]*SHELL=.*|SHELL=/bin/bash|' /etc/default/useradd
+else
+  printf 'SHELL=/bin/bash\n' >>/etc/default/useradd
+fi
+if [ -f /etc/adduser.conf ]; then
+  sed -Ei 's|^#?[[:space:]]*DSHELL=.*|DSHELL=/bin/bash|' /etc/adduser.conf
+fi
+! awk -F: '($3 == 0 || ($3 >= 1000 && $3 < 65534)) && $7 ~ /^(\/usr)?\/bin\/(sh|dash)$/' /etc/passwd | grep -q .
+`
+}
 
 func renderUbuntuRepositoryAndResolverCommands(nodeName string) string {
 	return `node_name=` + shellSingleQuote(nodeName) + `
@@ -86,8 +126,7 @@ until getent hosts "$node_name" | grep -Eq '^127\.0\.1\.1[[:space:]]'; do
 done
 install -d -m 0755 /etc/apt/mirrors /etc/apt/sources.list.d
 install -m 0644 /var/lib/inspace/ubuntu-mirrors.list /etc/apt/mirrors/inspace-ubuntu.list
-install -m 0644 /var/lib/inspace/ubuntu.sources /etc/apt/sources.list.d/ubuntu.sources
-rm -f /etc/apt/sources.list
+` + renderUbuntuSourcesInstallCommands() + renderBashLoginShellCommands() + `rm -f /etc/apt/sources.list
 rm -f /etc/resolv.conf
 install -m 0644 /var/lib/inspace/static-resolv.conf /etc/resolv.conf
 systemctl disable --now systemd-resolved.service >/dev/null

@@ -394,7 +394,7 @@ func TestRenderedHostPreparationAndNodeTuningContracts(t *testing.T) {
 	if got, want := writeFileContent(t, doc, "/var/lib/inspace/ubuntu-mirrors.list"), "http://mirror1.totbb.net/ubuntu/\tpriority:1\nhttps://mirror.kku.ac.th/ubuntu/\tpriority:2\n"; got != want {
 		t.Fatalf("Ubuntu mirror list differs\ngot:\n%swant:\n%s", got, want)
 	}
-	if got := writeFileContent(t, doc, "/var/lib/inspace/ubuntu.sources"); strings.Count(got, "URIs: mirror+file:/etc/apt/mirrors/inspace-ubuntu.list") != 2 || !strings.Contains(got, "Suites: noble-security") {
+	if got := writeFileContent(t, doc, "/var/lib/inspace/ubuntu.sources"); strings.Count(got, "URIs: mirror+file:/etc/apt/mirrors/inspace-ubuntu.list") != 2 || !strings.Contains(got, "Suites: @UBUNTU_CODENAME@-security") {
 		t.Fatalf("Ubuntu sources do not share the ordered mirror list for update and security suites:\n%s", got)
 	}
 	if got, want := writeFileContent(t, doc, "/var/lib/inspace/static-resolv.conf"), "# Managed by InSpace Kubernetes bootstrap.\nnameserver 8.8.8.8\nnameserver 8.8.4.4\noptions edns0\n"; got != want {

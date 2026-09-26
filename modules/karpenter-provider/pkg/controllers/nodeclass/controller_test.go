@@ -70,7 +70,7 @@ func TestReconcileMarksReadyAfterSecretAndBothHostPoolValidations(t *testing.T) 
 	if err := kubeClient.Get(context.Background(), clientKey(nodeClass.Name), &got); err != nil {
 		t.Fatal(err)
 	}
-	if !got.StatusConditions(status.WithObservedOnly()).IsTrue(status.ConditionReady) || got.Status.ObservedImageID != "ubuntu@24.04" || got.Status.ObservedSpecHash == "" {
+	if !got.StatusConditions(status.WithObservedOnly()).IsTrue(status.ConditionReady) || got.Status.ObservedImageID != "ubuntu@"+inspacev1.OSVersionUbuntu || got.Status.ObservedSpecHash == "" {
 		t.Fatalf("unexpected status %#v", got.Status)
 	}
 	wantHostPoolUUIDs := []string{inspacev1.IntelScalableHostPoolUUID, inspacev1.AMDEPYCHostPoolUUID}

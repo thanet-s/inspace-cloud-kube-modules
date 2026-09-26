@@ -10,6 +10,7 @@ import (
 	"net/netip"
 	"net/url"
 	"regexp"
+	"slices"
 	"strings"
 	"unicode"
 
@@ -69,8 +70,8 @@ func (n *InSpaceNodeClass) Validate() field.ErrorList {
 	if n.Spec.ImageSelector.OSName != OSNameUbuntu {
 		errs = append(errs, field.NotSupported(p.Child("imageSelector", "osName"), n.Spec.ImageSelector.OSName, []string{OSNameUbuntu}))
 	}
-	if n.Spec.ImageSelector.OSVersion != OSVersionUbuntu {
-		errs = append(errs, field.NotSupported(p.Child("imageSelector", "osVersion"), n.Spec.ImageSelector.OSVersion, []string{OSVersionUbuntu}))
+	if !slices.Contains(SupportedUbuntuVersions, n.Spec.ImageSelector.OSVersion) {
+		errs = append(errs, field.NotSupported(p.Child("imageSelector", "osVersion"), n.Spec.ImageSelector.OSVersion, SupportedUbuntuVersions))
 	}
 	if n.Spec.RootDiskGiB < 30 || n.Spec.RootDiskGiB > 2000 {
 		errs = append(errs, field.Invalid(p.Child("rootDiskGiB"), n.Spec.RootDiskGiB, "must be between 30 and 2000 GiB"))

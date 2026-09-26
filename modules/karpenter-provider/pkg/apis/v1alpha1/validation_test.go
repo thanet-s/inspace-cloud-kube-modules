@@ -282,3 +282,23 @@ func testCertificate(t *testing.T, isCA bool) string {
 	}
 	return string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}))
 }
+
+func TestImageSelectorAcceptsSupportedUbuntuReleases(t *testing.T) {
+	if OSVersionUbuntu != "26.04" {
+		t.Fatalf("default Ubuntu release = %q, want 26.04", OSVersionUbuntu)
+	}
+	for _, version := range []string{"24.04", "26.04"} {
+		nodeClass := validNodeClass()
+		nodeClass.Spec.ImageSelector.OSVersion = version
+		if errs := nodeClass.Validate(); len(errs) != 0 {
+			t.Errorf("Ubuntu %s rejected: %v", version, errs)
+		}
+	}
+	for _, version := range []string{"22.04", "26.10", ""} {
+		nodeClass := validNodeClass()
+		nodeClass.Spec.ImageSelector.OSVersion = version
+		if errs := nodeClass.Validate(); len(errs) == 0 {
+			t.Errorf("unsupported Ubuntu %q accepted", version)
+		}
+	}
+}

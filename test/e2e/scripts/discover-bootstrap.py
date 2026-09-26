@@ -218,6 +218,9 @@ def main() -> None:
 
     owner = state["owner"]
     network_uuid = os.environ["INSPACE_NETWORK_UUID"]
+    expected_os_version = os.environ.get("INSPACE_OS_VERSION", "").strip() or "26.04"
+    if expected_os_version not in {"24.04", "26.04"}:
+        raise SystemExit(f"INSPACE_OS_VERSION must be 24.04 or 26.04, got {expected_os_version!r}")
     vip = ipaddress.ip_address(os.environ["INSPACE_CONTROL_PLANE_VIP"])
     pool_start = ipaddress.ip_address(os.environ["INSPACE_PRIVATE_LOAD_BALANCER_POOL_START"])
     pool_stop = ipaddress.ip_address(os.environ["INSPACE_PRIVATE_LOAD_BALANCER_POOL_STOP"])
@@ -306,7 +309,7 @@ def main() -> None:
         bastion.get("vcpu") != 1
         or bastion.get("memory") != 2048
         or bastion.get("os_name") != "ubuntu"
-        or str(bastion.get("os_version")) != "24.04"
+        or str(bastion.get("os_version")) != expected_os_version
         or bastion.get("designated_pool_uuid") != os.environ["INSPACE_AMD_HOST_POOL_UUID"]
         or bastion.get("billing_account") != int(os.environ["INSPACE_BILLING_ACCOUNT_ID"])
         or re.fullmatch(
@@ -316,7 +319,7 @@ def main() -> None:
         or len(root_disks) != 1
         or root_disks[0].get("size") != 30
     ):
-        raise SystemExit("bastion must be exact Ubuntu 24.04 / 1-vCPU / 2-GiB / 30-GiB / configured-pool shape")
+        raise SystemExit(f"bastion must be exact Ubuntu {expected_os_version} / 1-vCPU / 2-GiB / 30-GiB / configured-pool shape")
 
     billing_account = int(os.environ["INSPACE_BILLING_ACCOUNT_ID"])
     addresses = [item for item in api_get("network/ip_addresses") if not item.get("is_deleted", False)]
@@ -348,7 +351,7 @@ def main() -> None:
             vm.get("vcpu") != 2
             or vm.get("memory") != 4096
             or vm.get("os_name") != "ubuntu"
-            or str(vm.get("os_version")) != "24.04"
+            or str(vm.get("os_version")) != expected_os_version
             or vm.get("designated_pool_uuid") != os.environ["INSPACE_AMD_HOST_POOL_UUID"]
             or vm.get("billing_account") != int(os.environ["INSPACE_BILLING_ACCOUNT_ID"])
             or re.fullmatch(
@@ -358,7 +361,7 @@ def main() -> None:
             or len(root_disks) != 1
             or root_disks[0].get("size") != 60
         ):
-            raise SystemExit(f"{name} must be exact Ubuntu 24.04 / 2-vCPU / 4-GiB / 60-GiB control-plane shape")
+            raise SystemExit(f"{name} must be exact Ubuntu {expected_os_version} / 2-vCPU / 4-GiB / 60-GiB control-plane shape")
         if fip.get("assigned_to") != vm.get("uuid"):
             raise SystemExit(f"{name} FIP is not assigned to its exact VM")
         private_value = vm.get("private_ipv4") or fip.get("assigned_to_private_ip")

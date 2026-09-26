@@ -207,8 +207,8 @@ func (s InSpaceClusterSpec) Validate() []error {
 	if machine.Image.OSName != "ubuntu" {
 		add("spec.controlPlane.machine.image.osName", "must be ubuntu in v1alpha1")
 	}
-	if machine.Image.OSVersion != "24.04" {
-		add("spec.controlPlane.machine.image.osVersion", "must be 24.04 in v1alpha1")
+	if machine.Image.OSVersion != "24.04" && machine.Image.OSVersion != "26.04" {
+		add("spec.controlPlane.machine.image.osVersion", "must be 24.04 or 26.04 in v1alpha1")
 	}
 	if !rke2VersionPattern.MatchString(s.RKE2.Version) {
 		add("spec.rke2.version", "must be an exact vX.Y.Z+rke2rN release")

@@ -2886,7 +2886,9 @@ func (r *Reconciler) desiredBastionVMRequest(cluster *v1alpha1.InSpaceCluster, n
 	}
 	reserve := true
 	request := inspace.CreateVMRequest{
-		Name: name, OSName: "ubuntu", OSVersion: "24.04", DiskGiB: BastionRootDiskGiB,
+		// The bastion follows the control-plane Ubuntu release so an existing
+		// 24.04 cluster keeps a matching bastion while new clusters use 26.04.
+		Name: name, OSName: "ubuntu", OSVersion: cluster.Spec.ControlPlane.Machine.Image.OSVersion, DiskGiB: BastionRootDiskGiB,
 		VCPU: BastionVCPU, MemoryMiB: BastionMemoryMiB, DesignatedPoolUUID: cluster.Spec.ControlPlane.Machine.HostPoolUUID,
 		BillingAccountID: cluster.Spec.BillingAccountID, NetworkUUID: cluster.Spec.Network.UUID,
 		Username: r.SSHUsername, PublicKey: r.SSHPublicKey, CloudInit: cloudInit, ReservePublicIP: &reserve,

@@ -1,4 +1,7 @@
 all:
+  vars:
+    e2e_os_version: "{{ lookup('env', 'INSPACE_OS_VERSION') | default('26.04', true) }}"
+    e2e_ubuntu_codename: "{{ {'24.04': 'noble', '26.04': 'resolute'}[e2e_os_version] }}"
   hosts:
     localhost:
       ansible_connection: local

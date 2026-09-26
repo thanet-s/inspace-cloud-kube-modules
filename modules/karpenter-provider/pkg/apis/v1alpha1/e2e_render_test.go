@@ -223,7 +223,7 @@ func TestClusterE2EProvisionsInOrderAndWaitsForThreeControlPlanesInParallel(t *t
 	requireParallelTask(t, sources)
 	sourcesConfig := requireTaskMapping(t, sources, "ansible.builtin.copy")
 	requireMappingString(t, sourcesConfig, "dest", "/etc/apt/sources.list.d/ubuntu.sources")
-	requireMappingContains(t, sourcesConfig, "content", "Suites: noble-security")
+	requireMappingContains(t, sourcesConfig, "content", "Suites: {{ e2e_ubuntu_codename }}-security")
 	resolver := exactAnsibleTask(t, controlPlaneWait, "Configure static Google DNS on every control plane in parallel")
 	requireParallelTask(t, resolver)
 	resolverConfig := requireTaskMapping(t, resolver, "ansible.builtin.copy")

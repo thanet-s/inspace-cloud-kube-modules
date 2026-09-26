@@ -157,18 +157,7 @@ APT::Periodic::Unattended-Upgrade "0";
 	ubuntuMirrorList := `http://mirror1.totbb.net/ubuntu/	priority:1
 https://mirror.kku.ac.th/ubuntu/	priority:2
 `
-	ubuntuSources := `Types: deb
-URIs: mirror+file:/etc/apt/mirrors/inspace-ubuntu.list
-Suites: noble noble-updates noble-backports
-Components: main restricted universe multiverse
-Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
-
-Types: deb
-URIs: mirror+file:/etc/apt/mirrors/inspace-ubuntu.list
-Suites: noble-security
-Components: main restricted universe multiverse
-Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
-`
+	ubuntuSources := ubuntuAPTSourcesTemplate
 	staticResolver := `# Managed by InSpace Kubernetes bootstrap.
 nameserver 8.8.8.8
 nameserver 8.8.4.4
@@ -207,8 +196,7 @@ if [ -f /etc/fstab ]; then
 fi
 install -d -m 0755 /etc/apt/mirrors /etc/apt/sources.list.d
 install -m 0644 /var/lib/inspace/ubuntu-mirrors.list /etc/apt/mirrors/inspace-ubuntu.list
-install -m 0644 /var/lib/inspace/ubuntu.sources /etc/apt/sources.list.d/ubuntu.sources
-rm -f /etc/apt/sources.list
+%s%srm -f /etc/apt/sources.list
 rm -f /etc/resolv.conf
 install -m 0644 /var/lib/inspace/static-resolv.conf /etc/resolv.conf
 systemctl disable --now systemd-resolved.service >/dev/null
@@ -221,7 +209,7 @@ test "$(systemctl is-enabled systemd-resolved.service 2>/dev/null || true)" = ma
 grep -Fqx 'http://mirror1.totbb.net/ubuntu/	priority:1' /etc/apt/mirrors/inspace-ubuntu.list
 grep -Fqx 'https://mirror.kku.ac.th/ubuntu/	priority:2' /etc/apt/mirrors/inspace-ubuntu.list
 test "$(grep -Fc 'URIs: mirror+file:/etc/apt/mirrors/inspace-ubuntu.list' /etc/apt/sources.list.d/ubuntu.sources)" -eq 2
-`, shellQuote(config.NodeName), strings.TrimSpace(cacheHostsCommands))
+`, shellQuote(config.NodeName), strings.TrimSpace(cacheHostsCommands), ubuntuSourcesInstallCommands(), bashLoginShellCommands())
 	applyNodeTuning := `#!/bin/sh
 set -eu
 sysctl --system >/dev/null

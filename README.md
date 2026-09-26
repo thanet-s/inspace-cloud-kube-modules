@@ -106,7 +106,7 @@ start from its
 
 | Area | Current support |
 | --- | --- |
-| Node image | Ubuntu 24.04 |
+| Node image | Ubuntu 26.04 (24.04 still accepted); bash login shell |
 | Architecture | `linux/amd64` |
 | Kubernetes distribution | RKE2 |
 | CNI | Cilium native routing |

@@ -24,7 +24,7 @@ spec:
   firewallUUID: 22222222-2222-4222-8222-222222222222
   imageSelector:
     osName: ubuntu
-    osVersion: "24.04"
+    osVersion: "26.04"
   # This standalone example uses the explicit direct path. For the default
   # cached cluster mode, set directDownload to false and supply the bastion's
   # reconciled private address and public CA bundle instead.

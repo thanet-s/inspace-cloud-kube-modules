@@ -2071,7 +2071,7 @@ def main() -> None:
     )
     require("dest: /etc/apt/sources.list.d/ubuntu.sources" in ubuntu_sources and
             ubuntu_sources.count("URIs: mirror+file:/etc/apt/mirrors/inspace-ubuntu.list") == 2 and
-            "Suites: noble-security" in ubuntu_sources,
+            "Suites: {{ e2e_ubuntu_codename }}-security" in ubuntu_sources,
             "Ansible node preparation must use the ordered mirror list for update and security suites")
     require(init_playbook.count("test ! -s /etc/apt/sources.list") == 2 and
             "test ! -e /etc/apt/sources.list" not in init_playbook,

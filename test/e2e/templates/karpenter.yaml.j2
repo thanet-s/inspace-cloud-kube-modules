@@ -14,7 +14,7 @@ spec:
   firewallUUID: {{ e2e_state.firewallUUID }}
   imageSelector:
     osName: {{ lookup('env', 'INSPACE_OS_NAME') | default('ubuntu', true) }}
-    osVersion: "{{ lookup('env', 'INSPACE_OS_VERSION') | default('24.04', true) }}"
+    osVersion: "{{ lookup('env', 'INSPACE_OS_VERSION') | default('26.04', true) }}"
   rootDiskGiB: 100
   bootstrapCache:
     directDownload: false

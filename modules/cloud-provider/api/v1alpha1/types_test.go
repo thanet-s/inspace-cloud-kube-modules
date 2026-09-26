@@ -183,7 +183,7 @@ func TestControlPlaneCRDMatchesMachineValidationContract(t *testing.T) {
 		"vcpu:\n                          type: integer\n                          format: int32\n                          minimum: 2\n                          maximum: 16",
 		"memoryMiB:\n                          type: integer\n                          format: int32\n                          minimum: 4096\n                          maximum: 65536",
 		"osName:\n                              type: string\n                              enum: [ubuntu]",
-		"osVersion:\n                              type: string\n                              enum: [\"24.04\"]",
+		"osVersion:\n                              type: string\n                              enum: [\"24.04\", \"26.04\"]",
 		"required: [virtualIPv4, port]",
 		"required: [uuid, podCIDR, serviceCIDR, privateLoadBalancerPool]",
 		"required: [start, stop]",
@@ -258,4 +258,21 @@ func mustAddress(t *testing.T, value string) netip.Addr {
 		t.Fatal(err)
 	}
 	return address
+}
+
+func TestControlPlaneImageAcceptsSupportedUbuntuReleases(t *testing.T) {
+	for _, version := range []string{"24.04", "26.04"} {
+		spec := validSpec()
+		spec.ControlPlane.Machine.Image.OSVersion = version
+		if errs := spec.Validate(); len(errs) != 0 {
+			t.Errorf("Ubuntu %s rejected: %v", version, errs)
+		}
+	}
+	for _, version := range []string{"22.04", "26.10", ""} {
+		spec := validSpec()
+		spec.ControlPlane.Machine.Image.OSVersion = version
+		if errs := spec.Validate(); len(errs) == 0 {
+			t.Errorf("unsupported Ubuntu %q accepted", version)
+		}
+	}
 }
