@@ -39,6 +39,20 @@
         executable: /bin/bash
       changed_when: false
 
+    # Cilium recreates a deleted Gateway Service while its Gateway exists, which
+    # would let CCM create a fresh paid NLB. Deleting the Gateways first makes
+    # Cilium delete their Services through the CCM finalizer path below.
+    - name: Delete every Gateway API Gateway before its generated LoadBalancer Services
+      ansible.builtin.shell: |
+        set -euo pipefail
+        kubeconfig={{ (deploy_state_dir + '/kubeconfig.yaml') | quote }}
+        if kubectl --kubeconfig "$kubeconfig" api-resources -o name | grep -qx gateways.gateway.networking.k8s.io; then
+          kubectl --kubeconfig "$kubeconfig" delete gateways.gateway.networking.k8s.io --all -A --wait=true --timeout=15m
+        fi
+      args:
+        executable: /bin/bash
+      changed_when: true
+
     - name: Delete every LoadBalancer Service while its owning CCM is healthy
       ansible.builtin.shell: |
         set -euo pipefail

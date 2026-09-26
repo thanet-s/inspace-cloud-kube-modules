@@ -1,0 +1,41 @@
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: inspace-e2e-gateway
+  namespace: default
+spec:
+  gatewayClassName: cilium
+  # Cilium copies these onto its generated cilium-gateway-inspace-e2e-gateway
+  # LoadBalancer Service, which selects the paid public InSpace NLB.
+  infrastructure:
+    labels:
+      inspace.cloud/load-balancer-scope: public
+    annotations:
+      service.beta.kubernetes.io/inspace-load-balancer-public: "true"
+  listeners:
+    - name: http
+      protocol: HTTP
+      port: 80
+      allowedRoutes:
+        namespaces:
+          from: Same
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: inspace-e2e-gateway
+  namespace: default
+spec:
+  parentRefs:
+    - name: inspace-e2e-gateway
+      sectionName: http
+  hostnames:
+    - gateway.inspace-e2e.test
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        - name: inspace-e2e-private-a
+          port: 80

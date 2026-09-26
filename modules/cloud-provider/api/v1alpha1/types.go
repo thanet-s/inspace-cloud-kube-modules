@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"net/netip"
 	"regexp"
+	"slices"
+	"strconv"
 )
 
 const (
@@ -121,6 +123,65 @@ type NetworkSpec struct {
 	// datapath children, only when it is enabled. False renders no value and
 	// keeps the bootstrap cloud-init bytes. It is fixed at cluster creation.
 	ServiceTopology bool `json:"serviceTopology,omitempty"`
+	// GatewayAPI is omitted when disabled so existing persisted specs and
+	// control-plane cloud-init stay byte-identical.
+	GatewayAPI GatewayAPISpec `json:"gatewayAPI,omitzero"`
+}
+
+// GatewayAPISpec opts a new cluster into Cilium's Gateway API implementation.
+// It is rendered only into immutable control-plane bootstrap, so it is fixed
+// at cluster creation.
+type GatewayAPISpec struct {
+	Enabled bool `json:"enabled,omitempty"`
+}
+
+// gatewayAPIMinimumRKE2Patch is, per RKE2 minor, the first patch release whose
+// bundled rke2-cilium chart is Cilium 1.20 (Gateway API v1.6.1). Every minor
+// from gatewayAPIFirstFullRKE2Minor bundles Cilium 1.20 or newer; older
+// minors never do. Cilium 1.19 only reads Gateway API v1.4-era CRD versions
+// and must not run against the pinned v1.6.1 bundle.
+var gatewayAPIMinimumRKE2Patch = map[int]int{34: 12, 35: 9, 36: 5}
+
+// gatewayAPIFirstFullRKE2Minor is also the first minor whose default
+// rke2-gateway-api-crd chart (Gateway API v1.6.1, takeOwnership) installs the
+// standard CRDs, so bootstrap installs its own pinned bundle only below it.
+const gatewayAPIFirstFullRKE2Minor = 37
+
+// Gateway API CRD owners that must never be disabled while Gateway API is on:
+// RKE2's own chart from v1.37 and the bootstrap-staged manifest below it.
+// RKE2's deploy controller deletes a disabled manifest's resources, which
+// would delete every CRD and Gateway.
+var gatewayAPICRDOwners = []string{"rke2-gateway-api-crd", "inspace-gateway-api-crds"}
+
+var rke2ReleaseNumbersPattern = regexp.MustCompile(`^v1\.([0-9]+)\.([0-9]+)`)
+
+func rke2MinorPatch(version string) (minor, patch int, ok bool) {
+	match := rke2ReleaseNumbersPattern.FindStringSubmatch(version)
+	if match == nil {
+		return 0, 0, false
+	}
+	minor, minorErr := strconv.Atoi(match[1])
+	patch, patchErr := strconv.Atoi(match[2])
+	return minor, patch, minorErr == nil && patchErr == nil
+}
+
+func rke2BundlesCilium120(version string) bool {
+	minor, patch, ok := rke2MinorPatch(version)
+	if !ok {
+		return false
+	}
+	if minor >= gatewayAPIFirstFullRKE2Minor {
+		return true
+	}
+	minimum, known := gatewayAPIMinimumRKE2Patch[minor]
+	return known && patch >= minimum
+}
+
+// RKE2BundlesGatewayAPICRDs reports whether the RKE2 release installs the
+// Gateway API v1.6.1 standard CRDs itself (rke2-gateway-api-crd, v1.37+).
+func RKE2BundlesGatewayAPICRDs(version string) bool {
+	minor, _, ok := rke2MinorPatch(version)
+	return ok && minor >= gatewayAPIFirstFullRKE2Minor
 }
 
 type PrivateLoadBalancerPoolSpec struct {
@@ -243,6 +304,19 @@ func (s InSpaceClusterSpec) Validate() []error {
 	}
 	if !uuidPattern.MatchString(s.Network.UUID) {
 		add("spec.network.uuid", "must be a UUID")
+	}
+	if s.Network.GatewayAPI.Enabled {
+		if !rke2BundlesCilium120(s.RKE2.Version) {
+			add("spec.network.gatewayAPI.enabled", "requires an RKE2 release that bundles Cilium 1.20 or newer (v1.34.12+, v1.35.9+, v1.36.5+, or v1.37.0+)")
+		}
+		if !slices.Contains(s.RKE2.Disable, "rke2-traefik") {
+			add("spec.network.gatewayAPI.enabled", "requires spec.rke2.disable to include rke2-traefik because its chart installs conflicting Gateway API CRDs")
+		}
+		for _, owner := range gatewayAPICRDOwners {
+			if slices.Contains(s.RKE2.Disable, owner) {
+				add("spec.rke2.disable", "must not disable "+owner+" while spec.network.gatewayAPI.enabled is true")
+			}
+		}
 	}
 	if !s.Firewall.Managed {
 		add("spec.firewall.managed", "must be true for owned node and bastion firewalls")

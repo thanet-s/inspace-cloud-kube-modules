@@ -41,6 +41,8 @@ spec:
       stop: "{{ lookup('env', 'INSPACE_PRIVATE_LOAD_BALANCER_POOL_STOP') }}"
     loadBalancerAlgorithm: maglev
     serviceTopology: true
+    gatewayAPI:
+      enabled: true
   firewall:
     managed: true
   publicIPv4:

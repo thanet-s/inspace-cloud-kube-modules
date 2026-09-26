@@ -4,6 +4,10 @@
   gather_facts: false
   vars:
     deploy_create_state_dir: true
+    # Must equal bootstrap.GatewayAPIStandardInstallSHA256 (upstream
+    # gateway-api v1.6.1 standard-install.yaml); control planes refuse any
+    # other bytes.
+    deploy_gateway_api_bundle_sha256: 24d931f22abd8e40c973264319ead7cfa09d0fb7716b7ab1ee2ff174cb063a73
   tasks:
     - name: Validate inventory, topology, tools, and SSH identity
       ansible.builtin.include_tasks: tasks/preflight.yml
@@ -211,6 +215,26 @@
           - "ghcr.io/thanet-s/inspace-cloud-controller-manager:{{ bootstrap_controller_version }}"
       changed_when: true
 
+    # Gateway API control planes wait for this exact bundle before RKE2 starts.
+    # It is embedded in the pinned controller, printed offline, and never
+    # downloaded by a node. A controller without the flag fails here, before
+    # any cloud mutation.
+    - name: Print the pinned Gateway API CRD bundle from the exact bootstrap controller
+      ansible.builtin.shell: |
+        set -euo pipefail
+        bundle={{ (deploy_state_dir + '/gateway-api-standard-install.yaml') | quote }}
+        docker run --platform linux/amd64 --rm --network=none \
+          --entrypoint /usr/local/bin/inspace-cluster-controller \
+          "ghcr.io/thanet-s/inspace-cloud-controller-manager:{{ bootstrap_controller_version }}" \
+          --print-gateway-api-crds >"$bundle.partial"
+        test "$(sha256sum "$bundle.partial" | awk '{print $1}')" = {{ deploy_gateway_api_bundle_sha256 | quote }}
+        chmod 0600 "$bundle.partial"
+        mv -f "$bundle.partial" "$bundle"
+      args:
+        executable: /bin/bash
+      changed_when: true
+      when: deploy_gateway_api_bundle_delivery | bool
+
     - name: Reconcile bootstrap infrastructure synchronously to readiness
       ansible.builtin.command:
         argv:
@@ -409,6 +433,30 @@
         label: "{{ item.item.item.name | default('existing') }}"
       when: not item.skipped | default(false)
 
+    # Each Gateway API control plane blocks before RKE2 starts until this file
+    # has the pinned digest, so Cilium sees the CRDs at its first start. The
+    # copy is re-verified in the guest; ssh exits 255 only for its own
+    # transport failure, which alone is retried.
+    - name: Deliver the pinned Gateway API CRD bundle to every control plane
+      ansible.builtin.shell: |
+        set -euo pipefail
+        ssh -F {{ (deploy_state_dir + '/ssh-config') | quote }} "inspace-cp{{ deploy_cp_index }}" \
+          "sudo sh -ceu 'umask 077; install -d -m 0755 /var/lib/inspace; cat >/var/lib/inspace/gateway-api-standard-install.yaml.partial; test \"\$(sha256sum /var/lib/inspace/gateway-api-standard-install.yaml.partial | cut -d \" \" -f 1)\" = {{ deploy_gateway_api_bundle_sha256 }}; mv -f /var/lib/inspace/gateway-api-standard-install.yaml.partial /var/lib/inspace/gateway-api-standard-install.yaml'" \
+          <{{ (deploy_state_dir + '/gateway-api-standard-install.yaml') | quote }}
+      args:
+        executable: /bin/bash
+      loop: "{{ deployment_state.controlPlanes }}"
+      loop_control:
+        index_var: deploy_cp_index
+        label: "{{ item.name }}"
+      register: deploy_gateway_api_delivery
+      changed_when: true
+      failed_when: deploy_gateway_api_delivery.rc != 0
+      retries: 3
+      delay: 10
+      until: deploy_gateway_api_delivery.rc != 255
+      when: deploy_gateway_api_bundle_delivery | bool
+
     # The node firewall admits no inbound traffic from the internet, so a bad
     # control-plane floating IPv4 can only be seen from inside: prove egress
     # before the long cloud-init wait so a bad address fails init quickly.
@@ -511,6 +559,19 @@
 
     - name: Settle packaged components without provisioning an elastic worker
       ansible.builtin.import_tasks: tasks/settle-single-control-plane.yml
+
+    - name: Require Cilium Gateway API and an accepted cilium GatewayClass
+      ansible.builtin.shell: |
+        set -euo pipefail
+        export KUBECONFIG={{ (deploy_state_dir + '/kubeconfig.yaml') | quote }}
+        kubectl -n kube-system rollout status deployment/cilium-operator --timeout=15m
+        kubectl -n kube-system get configmap cilium-config -o json |
+          jq -e '.data["enable-gateway-api"] == "true"' >/dev/null
+        kubectl wait --for=condition=Accepted gatewayclass/cilium --timeout=15m
+      args:
+        executable: /bin/bash
+      changed_when: false
+      when: gateway_api_enabled | default(false) | bool
 
     - name: Apply optional operator RKE2 configuration with rolling readiness gates
       ansible.builtin.include_tasks: tasks/apply-control-plane-config.yml

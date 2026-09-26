@@ -2048,6 +2048,165 @@ def verify_teardown_timing_contract(
     )
 
 
+def verify_gateway_api_e2e_contract(
+    init_playbook: str,
+    test_playbook: str,
+    cleanup: str,
+    cluster: str,
+    readme: str,
+) -> None:
+    """Gateway API: pinned bundle before RKE2, paid-NLB Gateway, proven cleanup."""
+    repository = repository_root()
+    gateway_go = (repository / "modules/cloud-provider/pkg/bootstrap/gateway_api.go").read_text(encoding="utf-8")
+    pinned = re.search(r'GatewayAPIStandardInstallSHA256 = "([0-9a-f]{64})"', gateway_go)
+    require(pinned is not None, "bootstrap lacks the pinned Gateway API bundle digest")
+    digest = pinned.group(1)
+    gateway = (ROOT / "templates/gateway.yaml.j2").read_text(encoding="utf-8")
+    persist_workload = (ROOT / "scripts/persist-workload.py").read_text(encoding="utf-8")
+    service_cloud = (ROOT / "scripts/verify-service-cloud.py").read_text(encoding="utf-8")
+    cloud_audit = (ROOT / "scripts/cloud-audit.py").read_text(encoding="utf-8")
+
+    network = cluster[cluster.index("\n  network:\n"):cluster.index("\n  firewall:\n") + 1]
+    require(
+        "      - rke2-traefik\n" in cluster
+        and "\n    gatewayAPI:\n      enabled: true\n" in network,
+        "E2E cluster must enable network.gatewayAPI with rke2-traefik disabled",
+    )
+    # From RKE2 v1.37 rke2-gateway-api-crd owns the CRDs and bootstrap waits
+    # for nothing; the E2E then must stop delivering the bundle.
+    e2e_rke2 = re.search(r"(?m)^    version: v1\.([0-9]+)\.", cluster)
+    require(e2e_rke2 is not None and int(e2e_rke2.group(1)) < 37,
+            "E2E delivers the bootstrap Gateway API bundle, which only RKE2 releases below v1.37 wait for")
+
+    render = init_playbook.index("- name: Render the RKE2 bootstrap resource")
+    print_name = "Print the pinned Gateway API CRD bundle from the product controller"
+    print_offset = init_playbook.index(f"- name: {print_name}")
+    first_mutation = init_playbook.index("- name: Run the bootstrap reconciler synchronously to readiness")
+    require(render < print_offset < first_mutation, "Gateway API bundle must be printed and verified before any cloud mutation")
+    print_task = named_yaml_sequence_item(init_playbook, print_name, 4)
+    require(
+        "inspace-cluster-controller --print-gateway-api-crds" in print_task
+        and f"e2e_gateway_api_bundle_sha256: {digest}\n" in init_playbook
+        and "e2e_gateway_api_bundle_sha256" in print_task
+        and 'sha256sum "$bundle.partial"' in print_task,
+        "E2E Gateway API bundle must come from the product controller and match the bootstrap pin",
+    )
+
+    control_plane_wait_play = named_yaml_sequence_item(
+        init_playbook, "Wait for all RKE2 servers independently and in parallel through the bastion", 0
+    )
+    deliver_name = "Deliver the pinned Gateway API CRD bundle to every control plane in parallel"
+    verify_name = "Require the delivered Gateway API bundle digest on every control plane"
+    order = [
+        control_plane_wait_play.index(f"- name: {name}")
+        for name in (
+            "Wait for authenticated SSH on every control plane in parallel",
+            deliver_name,
+            verify_name,
+            "Prove every control plane reaches the internet through its floating IP",
+            "Wait for cloud-init completion on every control plane in parallel",
+        )
+    ]
+    require(order == sorted(order), "Gateway API bundle must reach every server before the cloud-init wait")
+    deliver = named_yaml_sequence_item(control_plane_wait_play, deliver_name, 4)
+    verify = named_yaml_sequence_item(control_plane_wait_play, verify_name, 4)
+    require_unrestricted_parallel_task(deliver)
+    require_unrestricted_parallel_task(verify)
+    require(
+        "ansible.builtin.copy:" in deliver
+        and "dest: /var/lib/inspace/gateway-api-standard-install.yaml" in deliver
+        and 'mode: "0600"' in deliver
+        and "become: true" in deliver
+        and "checksum_algorithm: sha256" in verify
+        and "e2e_gateway_api_bundle_sha256" in verify,
+        "Gateway API delivery must copy the exact bundle and prove its SHA-256 in the guest",
+    )
+
+    cilium_proof = named_yaml_sequence_item(
+        init_playbook, "Prove Cilium Gateway API with the pinned CRDs and an accepted cilium GatewayClass", 4
+    )
+    require(
+        init_playbook.index("- name: Verify Cilium native routing and full kube-proxy replacement plus private L2 configuration")
+        < init_playbook.index("- name: Prove Cilium Gateway API with the pinned CRDs and an accepted cilium GatewayClass")
+        and '.data["enable-gateway-api"] == "true"' in cilium_proof
+        and "gateway.networking.k8s.io/bundle-version" in cilium_proof
+        and "gateway.networking.k8s.io/channel" in cilium_proof
+        and "kubectl wait --for=condition=Accepted gatewayclass/cilium" in cilium_proof,
+        "init must prove Cilium Gateway API, the pinned v1.6.1 standard CRDs, and an accepted GatewayClass",
+    )
+
+    require(
+        "gatewayClassName: cilium" in gateway
+        and "kind: Gateway\n" in gateway
+        and "kind: HTTPRoute\n" in gateway
+        and "inspace.cloud/load-balancer-scope: public" in gateway
+        and 'service.beta.kubernetes.io/inspace-load-balancer-public: "true"' in gateway
+        and "name: inspace-e2e-private-a" in gateway
+        and "gateway.inspace-e2e.test" in gateway
+        and "loadBalancerClass" not in gateway,
+        "E2E Gateway must reuse private-a and select the paid public NLB only through infrastructure markers",
+    )
+    names = (
+        "Remove stale Gateway API acceptance owners",
+        "Wait for the stale Gateway Service owner to disappear",
+        "Require stale paid NLB inventory to return to the immutable account baseline",
+        "Require public NLB FIP cleanup while preserving the remaining workloads",
+        "Render the paid public Gateway API acceptance route",
+        "Apply the paid public Gateway and its HTTPRoute",
+        "Journal the Gateway Service cloud identity before convergence",
+        "Prove the Gateway Service carries the paid public NLB contract",
+        "Wait for the programmed Gateway public address",
+        "Prove exact paid public NLB ownership for the Gateway Service",
+        "Require HTTPRoute routing to the private-a backend through the Gateway NLB",
+        "Require the Gateway to reject an unrouted host",
+        "Delete the paid public Gateway and its HTTPRoute",
+        "Require Gateway Service NLB and FIP cleanup",
+        "Require the immutable zero-NLB anchor before Node-LB baseline capture",
+    )
+    offsets = [test_playbook.find(f"- name: {name}\n") for name in names]
+    require(all(offset >= 0 for offset in offsets) and offsets == sorted(offsets),
+            "Gateway API acceptance must run after paid-NLB cleanup and before the zero-NLB anchor")
+    ownership = named_yaml_sequence_item(test_playbook, "Prove exact paid public NLB ownership for the Gateway Service", 4)
+    cleanup_proof = named_yaml_sequence_item(test_playbook, "Require Gateway Service NLB and FIP cleanup", 4)
+    routing = named_yaml_sequence_item(
+        test_playbook, "Require HTTPRoute routing to the private-a backend through the Gateway NLB", 4
+    )
+    contract = named_yaml_sequence_item(test_playbook, "Prove the Gateway Service carries the paid public NLB contract", 4)
+    require(
+        "--service" in ownership and "gateway" in ownership and "--node-port" in ownership
+        and "--public" in ownership and "present" in ownership
+        and "cilium-gateway-inspace-e2e-gateway" in cleanup_proof and "--public absent" in cleanup_proof
+        and "Host: gateway.inspace-e2e.test" in routing and "e2e_marker + '-private-a'" in routing
+        and '.spec.loadBalancerClass == null' in contract
+        and '.spec.externalTrafficPolicy == "Cluster"' in contract
+        and '(.spec.selector // {}) == {}' in contract
+        and '.kind == "Gateway"' in contract,
+        "Gateway acceptance must prove the Cilium Service contract, exact NLB ownership, L7 routing, and cleanup",
+    )
+    require(
+        '"cilium-gateway-inspace-e2e-gateway"' in persist_workload
+        and '"gatewayServiceLoadBalancerName"' in persist_workload
+        and '"gatewayServiceFloatingIPName"' in persist_workload
+        and 'choices=("web", "gateway")' in service_cloud
+        and '"gatewayServiceLoadBalancerName"' in service_cloud
+        and '"gatewayServiceLoadBalancerName"' in cloud_audit
+        and '"gatewayServiceFloatingIPName"' in cloud_audit,
+        "Gateway Service NLB/FIP names must be journaled, verified, and audited by name",
+    )
+    gateway_delete = "Delete Gateway API acceptance owners before their generated Services"
+    gateway_wait = "Wait for the Gateway-generated Service owner to disappear"
+    require(
+        0 <= cleanup.find(f"- name: {gateway_delete}\n")
+        < cleanup.find("- name: Delete workload owners before infrastructure owners\n")
+        < cleanup.find(f"- name: {gateway_wait}\n")
+        < cleanup.find("- name: Delete the NodePool while Karpenter is still running\n")
+        and "gateways.gateway.networking.k8s.io" in named_yaml_sequence_item(cleanup, gateway_delete, 4),
+        "destroy must delete the Gateway before workloads and prove its Service gone before worker teardown",
+    )
+    require("Gateway API" in readme and "cilium-gateway-inspace-e2e-gateway" in readme,
+            "E2E README must document the Gateway API acceptance case")
+
+
 def main() -> None:
     repository = repository_root()
     host = (ROOT / "run.sh").read_text(encoding="utf-8")
@@ -2146,6 +2305,7 @@ def main() -> None:
         (ROOT / "templates/private-local-service.yaml.j2").read_text(encoding="utf-8"),
         persist_workload,
     )
+    verify_gateway_api_e2e_contract(init_playbook, test_playbook, cleanup, cluster, readme)
     verify_teardown_timing_contract(
         init_playbook,
         test_playbook,
@@ -3552,7 +3712,7 @@ def main() -> None:
         "/opt/e2e/scripts/verify-service-cloud.py"
     )[1:]
     require(
-        len(service_cloud_invocations) == 11
+        len(service_cloud_invocations) == 13
         and all(
             "--immutable-baseline" in invocation[:200]
             and "{{ e2e_baseline_inventory_file }}" in invocation[:200]

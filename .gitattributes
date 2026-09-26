@@ -1,0 +1,2 @@
+# Pinned upstream artifacts are embedded and verified by SHA-256; keep their exact bytes.
+modules/cloud-provider/pkg/bootstrap/gateway-api/** -text
