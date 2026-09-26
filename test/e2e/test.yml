@@ -1460,6 +1460,8 @@
               - "{{ e2e_node_lb_probe_ready }}"
               - --overall-timeout
               - "7200"
+              - --max-outage
+              - "10"
           async: 7500
           poll: 0
           register: e2e_node_lb_continuity_job

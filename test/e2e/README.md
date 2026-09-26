@@ -204,7 +204,10 @@ suite establishes Traefik alone and captures the shard firewall UUID, complete
 VM firewall assignment set, NodePool UID, VM, FIP, private VIP, and Node Ready
 `lastTransitionTime`. A continuous public TCP/80 probe then spans aggregate
 rule expansion, sibling deletion/rule shrink, and same-name/new-UID sibling
-recreation. Every phase must keep those identities and the Ready transition
+recreation. A wrong status or body fails the probe at once. A transport
+timeout fails it only when the frontend stays unreachable for more than 10
+seconds, so one packet lost on the public path from the runner does not fail
+the run. Every phase must keep those identities and the Ready transition
 unchanged while the aggregate rules change exactly as expected. The later
 TCP/80 collision must receive another shard/firewall, and dedicated mode must
 remain separate. An unconditional cleanup block removes the Services,

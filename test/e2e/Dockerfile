@@ -59,6 +59,7 @@ RUN chmod 0755 /opt/e2e/run.sh /opt/e2e/scripts/*.sh /opt/e2e/scripts/*.py && \
     mkdir -p /state /run/config /run/secrets && \
     chmod 0700 /state /run/secrets && \
     python3 /opt/e2e/test-public-node-local-verifier.py && \
+    python3 /opt/e2e/test-continuous-http-probe.py && \
     ansible-playbook --syntax-check -i /opt/e2e/inventory.yml /opt/e2e/init-cluster.yml && \
     ansible-playbook --syntax-check -i /opt/e2e/inventory.yml /opt/e2e/test.yml && \
     ansible-playbook --syntax-check -i /opt/e2e/inventory.yml /opt/e2e/destroy-cluster.yml
