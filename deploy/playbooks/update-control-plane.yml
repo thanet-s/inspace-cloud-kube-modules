@@ -73,9 +73,15 @@
     - name: Refresh the cloud API Secret
       ansible.builtin.shell: |
         set -euo pipefail
+        # The API token reaches kubectl through a removed 0600 file, never
+        # argv; printf is a shell builtin.
+        umask 077
+        secret_dir=$(mktemp -d)
+        trap 'rm -rf -- "$secret_dir"' EXIT
+        printf '%s' "$INSPACE_API_TOKEN" >"$secret_dir/api-token"
         kubectl --kubeconfig {{ (deploy_state_dir + '/kubeconfig.yaml') | quote }} \
           -n kube-system create secret generic inspace-cloud-credentials \
-          --from-literal="api-token=$INSPACE_API_TOKEN" \
+          --from-file="api-token=$secret_dir/api-token" \
           --from-literal="billing-account-id={{ inspace_billing_account_id }}" \
           --dry-run=client -o yaml | \
           kubectl --kubeconfig {{ (deploy_state_dir + '/kubeconfig.yaml') | quote }} apply -f -

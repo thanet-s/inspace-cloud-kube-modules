@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import shutil
 import subprocess
 import tempfile
 import threading
@@ -16,6 +17,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 LIVE_SUITE = ROOT / "scripts" / "live-suite.sh"
 LIVE_AUDIT = ROOT / "scripts" / "live-audit.sh"
+TEST_API_TOKEN = "test-token"
+# Every script run goes through a curl shim that records its argv, so any API
+# token placed on a command line is caught.
+CURL_SHIM: dict[str, str] = {}
 
 
 class CloudState:
@@ -40,6 +45,8 @@ class CloudState:
         self.delete_drifted = False
         self.fail_after_first_absent_delete_read = False
         self.absent_delete_reads = 0
+        self.authorized_requests = 0
+        self.unauthorized_requests = 0
 
     def receipt(self) -> dict | None:
         if self.receipt_path is None:
@@ -64,8 +71,19 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def authorized(self) -> bool:
+        state = self.server.state
+        if self.headers.get("apikey") != TEST_API_TOKEN:
+            state.unauthorized_requests += 1
+            self.send_json(401, {"message": "missing or wrong apikey header"})
+            return False
+        state.authorized_requests += 1
+        return True
+
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler contract
         state = self.server.state
+        if not self.authorized():
+            return
         if self.path == "/v1/config/locations":
             self.send_json(200, state.locations)
         elif self.path == "/v1/bkk01/network/network/11111111-1111-4111-8111-111111111111":
@@ -132,6 +150,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler contract
         state = self.server.state
+        if not self.authorized():
+            return
         if self.path != "/v1/bkk01/network/firewalls":
             self.send_json(404, {"message": "not found"})
             return
@@ -164,6 +184,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_DELETE(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler contract
         state = self.server.state
+        if not self.authorized():
+            return
         prefix = "/v1/bkk01/network/firewalls/"
         if not self.path.startswith(prefix):
             self.send_json(404, {"message": "not found"})
@@ -194,7 +216,7 @@ def suite_env(server: FakeServer, state_dir: pathlib.Path, external_firewall: bo
     env.update(
         {
             "INSPACE_API_URL": f"http://127.0.0.1:{server.server_port}",
-            "INSPACE_API_TOKEN": "test-token",
+            "INSPACE_API_TOKEN": TEST_API_TOKEN,
             "INSPACE_LOCATION": "bkk01",
             "INSPACE_BILLING_ACCOUNT_ID": "42",
             "INSPACE_NETWORK_UUID": "11111111-1111-4111-8111-111111111111",
@@ -217,7 +239,7 @@ def suite_env(server: FakeServer, state_dir: pathlib.Path, external_firewall: bo
     env.pop("INSPACE_AMD_HOST_POOL_UUID", None)
     env.pop("INSPACE_TEST_HOST_POOL_UUID", None)
     env.pop("INSPACE_HOST_POOL_UUID", None)
-    return env
+    return with_curl_shim(env)
 
 
 def run_suite(server: FakeServer, state_dir: pathlib.Path, external_firewall: bool = False) -> subprocess.CompletedProcess[str]:
@@ -248,13 +270,43 @@ def audit_env(server: FakeServer) -> dict[str, str]:
     env.update(
         {
             "INSPACE_API_URL": f"http://127.0.0.1:{server.server_port}",
-            "INSPACE_API_TOKEN": "test-token",
+            "INSPACE_API_TOKEN": TEST_API_TOKEN,
             "INSPACE_LOCATION": "bkk01",
             "INSPACE_LIVE_RESOURCE_PREFIX": "inspace-e2e-",
             "INSPACE_SKIP_DOTENV": "true",
         }
     )
+    return with_curl_shim(env)
+
+
+def install_curl_shim(directory: pathlib.Path) -> None:
+    real_curl = shutil.which("curl")
+    require(real_curl is not None, "the live-suite checks need curl")
+    log = directory / "curl-argv.log"
+    shim = directory / "curl"
+    shim.write_text(
+        "#!/bin/sh\n"
+        f"printf '%s\\n' \"$*\" >>'{log}'\n"
+        f"exec '{real_curl}' \"$@\"\n",
+        encoding="utf-8",
+    )
+    shim.chmod(0o755)
+    CURL_SHIM.update({"dir": str(directory), "log": str(log)})
+
+
+def with_curl_shim(env: dict[str, str]) -> dict[str, str]:
+    if CURL_SHIM:
+        env["PATH"] = CURL_SHIM["dir"] + os.pathsep + env.get("PATH", "")
     return env
+
+
+def test_api_token_never_reaches_curl_argv(server: FakeServer) -> None:
+    log = pathlib.Path(CURL_SHIM["log"])
+    argv = log.read_text(encoding="utf-8") if log.exists() else ""
+    require(argv.count("\n") > 0, "the curl shim recorded no API calls")
+    require(TEST_API_TOKEN not in argv, "the API token appeared in a curl command line")
+    require(server.state.authorized_requests > 0, "no request carried the apikey header")
+    require(server.state.unauthorized_requests == 0, "a request reached the API without the exact apikey header")
 
 
 def run_audit(server: FakeServer, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
@@ -672,6 +724,12 @@ def main() -> None:
         "command -v sha256sum" in script and "command -v shasum" in script,
         "live-suite hash selection must support both Ubuntu sha256sum and macOS shasum",
     )
+    for path in (LIVE_SUITE, LIVE_AUDIT):
+        text = path.read_text(encoding="utf-8")
+        require(
+            "apikey: $" not in text and "printf 'apikey: %s\\n' \"$INSPACE_API_TOKEN\" |" in text and "-H @-" in text,
+            f"{path.name} must pass the API token to curl on stdin, never in argv",
+        )
     state = CloudState()
     server = FakeServer(state)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -679,6 +737,9 @@ def main() -> None:
     try:
         with tempfile.TemporaryDirectory(prefix="inspace-live-suite-test-") as temporary:
             root = pathlib.Path(temporary)
+            shim_dir = root / "curl-shim"
+            shim_dir.mkdir()
+            install_curl_shim(shim_dir)
             test_remote_plaintext_api_urls_are_rejected(server, root)
             test_live_audit_validates_location_schema(server)
             test_committed_500_is_adopted_and_cleaned(server, root)
@@ -694,6 +755,7 @@ def main() -> None:
             test_unresolved_delete_never_replays(server, root)
             test_anchored_uuid_rename_never_clears_delete_receipt(server, root)
             test_adoption_requires_exact_policy_and_no_assignments(server, root)
+            test_api_token_never_reaches_curl_argv(server)
             test_legacy_module_targets_are_retired()
     finally:
         server.shutdown()

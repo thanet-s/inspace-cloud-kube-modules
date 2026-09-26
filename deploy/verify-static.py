@@ -244,6 +244,99 @@ def verify_update_cache_refresh(update: str) -> None:
     )
 
 
+SECRET_FILE_PRELUDE = (
+    "umask 077\n"
+    "        secret_dir=$(mktemp -d)\n"
+    "        trap 'rm -rf -- \"$secret_dir\"' EXIT\n"
+    "        printf '%s' \"$INSPACE_API_TOKEN\" >\"$secret_dir/api-token\"\n"
+)
+
+
+def verify_secret_values_stay_off_argv(playbooks: dict[str, str]) -> None:
+    """Credentials reach kubectl through a 0600 file, never a command line."""
+    for name, text in playbooks.items():
+        require(
+            re.search(r"--from-literal=[\"']?[\w.-]*token", text, re.IGNORECASE) is None,
+            f"{name} passes a token to kubectl with --from-literal, exposing it in argv",
+        )
+        require(
+            re.search(r"apikey: \$", text) is None,
+            f"{name} passes the API token in a curl command-line header",
+        )
+        if "inspace-cloud-credentials" not in text or "create secret generic inspace-cloud-credentials" not in text:
+            continue
+        require(
+            SECRET_FILE_PRELUDE in text
+            and '--from-file="api-token=$secret_dir/api-token"' in text,
+            f"{name} must write the API token to a 0600 temporary file that is always removed",
+        )
+
+
+def verify_rke2_agent_token(init: str, readme: str) -> None:
+    """New clusters give workers a separate agent token, never the server token."""
+    stat_task = task_block(init, "Inspect durable bootstrap files")
+    require(
+        stat_task.index("        - state.json\n") < stat_task.index("        - rke2-agent-token\n"),
+        "the RKE2 agent token file must be appended to the durable bootstrap file inspection",
+    )
+    generate = task_block(init, "Generate the RKE2 agent join token")
+    persist = task_block(init, "Persist the RKE2 agent join token")
+    require(
+        "argv: [openssl, rand, -hex, \"32\"]" in generate
+        and "no_log: true" in generate
+        and "not deploy_bootstrap_files.results[1].stat.exists" in generate
+        and "not deploy_bootstrap_files.results[6].stat.exists" in generate
+        and "bootstrap_controller_version is version('1.1.0-rc.5', '>', version_type='semver')" in generate,
+        "the agent token must be generated only for a new cluster whose pinned controller renders agent-token",
+    )
+    require(
+        'dest: "{{ deploy_state_dir }}/rke2-agent-token"' in persist
+        and 'mode: "0600"' in persist
+        and "no_log: true" in persist,
+        "the agent token must be persisted mode 0600 without logging",
+    )
+    require(
+        init.index("- name: Persist the RKE2 agent join token\n")
+        < init.index("- name: Persist the RKE2 registration token\n"),
+        "the agent token must be persisted before the server token so a partial first run cannot lose it",
+    )
+    validate = task_block(init, "Require a valid separate RKE2 agent join token")
+    require(
+        "deploy_rke2_agent_token_file.stat.mode == '0600'" in validate
+        and "is match('^[0-9a-f]{64}$')" in validate
+        and "!= (lookup('file', deploy_state_dir + '/rke2-token') | trim)" in validate
+        and "no_log: true" in validate,
+        "the persisted agent token must be 0600, 256-bit hex, and distinct from the server token",
+    )
+    reconcile = task_block(init, "Reconcile bootstrap infrastructure synchronously to readiness")
+    require(
+        "          - --env\n          - INSPACE_RKE2_AGENT_TOKEN\n" in reconcile
+        and "INSPACE_RKE2_AGENT_TOKEN: >-" in reconcile
+        and "no_log: true" in reconcile,
+        "the bootstrap controller must receive the agent token only through its environment",
+    )
+    require(
+        re.search(r"--[a-z-]*agent-token", reconcile) is None,
+        "the agent token must never be a controller command-line flag",
+    )
+    secret = task_block(init, "Create or update cloud and RKE2 agent-token Secrets")
+    agent_secret = secret[secret.index("create secret generic inspace-rke2-agent-token"):]
+    require(
+        '--from-file="token={{ deploy_rke2_agent_join_token_file }}"' in agent_secret
+        and "rke2-token" not in agent_secret.replace("inspace-rke2-agent-token", ""),
+        "the worker Secret must be built from the selected agent join token file",
+    )
+    select = task_block(init, "Select the RKE2 agent join token for workers")
+    require(
+        "'/rke2-agent-token' if deploy_rke2_agent_token_file.stat.exists else '/rke2-token'" in select,
+        "workers must get the agent token whenever the cluster has one; only a legacy cluster keeps the server token",
+    )
+    require(
+        "rke2 token rotate" in readme and "agent-token" in readme and "rke2-agent-token" in readme,
+        "README must document the agent token and a manual rotation path",
+    )
+
+
 def main() -> None:
     inventory = read("deploy/inventory.example.yml")
     gitignore = read(".gitignore")
@@ -459,6 +552,11 @@ def main() -> None:
     )
     verify_gateway_api(inventory, cluster_template, preflight, init, destroy)
     verify_update_cache_refresh(update)
+    verify_rke2_agent_token(init, read("deploy/README.md"))
+    verify_secret_values_stay_off_argv({
+        str(path.relative_to(ROOT)): path.read_text(encoding="utf-8")
+        for path in sorted((DEPLOY / "playbooks").rglob("*.yml"))
+    })
     load_state = read("deploy/playbooks/tasks/load-state.yml")
     single_cp_settle = read("deploy/playbooks/tasks/settle-single-control-plane.yml")
     for fragment in (

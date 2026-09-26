@@ -360,11 +360,13 @@ If Kubernetes owners may exist but the API or ownership journal is unusable,
 cleanup preserves infrastructure and fails. That fail-closed behavior avoids
 racing active CSI, CCM, or Karpenter controllers with raw cloud deletion.
 
-State and the generated RKE2 token/kubeconfig live in a Docker volume named
-`inspace-cloud-rke2-e2e-state` by default, never in the repository or image.
-The `.env` file and SSH keys are mode-checked read-only bind mounts excluded
-from the build context. The token file is not copied into Docker container
-metadata. Only the SSH public key is submitted to InSpace.
+State, the generated RKE2 server and agent tokens, and the kubeconfig live in
+a Docker volume named `inspace-cloud-rke2-e2e-state` by default, never in the
+repository or image. The `.env` file and SSH keys are mode-checked read-only
+bind mounts excluded from the build context. The token files are not copied
+into Docker container metadata. Only the SSH public key is submitted to
+InSpace. Control planes get both tokens (`token` and `agent-token`); the
+worker Secret and every worker get only the agent token.
 
 Before a default `all` run, the entrypoint cleans an unfinished non-phased run
 with the same recorded published version and requires its final zero audit. It

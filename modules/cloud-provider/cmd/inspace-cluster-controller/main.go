@@ -438,6 +438,10 @@ func run() error {
 	if !deleteOwned && rke2Token == "" {
 		return errors.New("INSPACE_RKE2_TOKEN is required")
 	}
+	rke2AgentToken, err := loadRKE2AgentToken(rke2Token)
+	if err != nil {
+		return err
+	}
 	cacheKey, cacheNotBefore, err := loadBootstrapCacheSettings(&cluster, deleteOwned)
 	if err != nil {
 		return err
@@ -463,7 +467,7 @@ func run() error {
 		StatusCompareAndSwap: newFileStatusCompareAndSwap(configPath),
 		ManagementCIDR:       managementCIDR, ManagementTCPPorts: ports,
 		BootstrapCacheKey: cacheKey, BootstrapCacheNotBefore: cacheNotBefore, ModuleVersion: buildversion.Version,
-		ModuleImageDigests: moduleImageDigests,
+		ModuleImageDigests: moduleImageDigests, RKE2AgentToken: rke2AgentToken,
 	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
@@ -661,6 +665,17 @@ func emitResult(output io.Writer, format string, result bootstrap.Result) error 
 		result.BastionVMUUID, result.BastionPublicIPv4, result.BastionPrivateIPv4,
 		result.BootstrapCacheEndpoint, result.BootstrapCacheRegistry, result.BootstrapCacheAddress, result.Message)
 	return err
+}
+
+// loadRKE2AgentToken reads the optional separate agent join token. It comes
+// only from the environment, never from a flag, so it cannot appear in a
+// process command line. Empty keeps a cluster created without one unchanged.
+func loadRKE2AgentToken(rke2Token string) (string, error) {
+	agentToken := strings.TrimSpace(os.Getenv("INSPACE_RKE2_AGENT_TOKEN"))
+	if agentToken != "" && agentToken == rke2Token {
+		return "", errors.New("INSPACE_RKE2_AGENT_TOKEN must differ from INSPACE_RKE2_TOKEN")
+	}
+	return agentToken, nil
 }
 
 func loadBootstrapCacheSettings(cluster *v1alpha1.InSpaceCluster, deleting bool) ([]byte, time.Time, error) {

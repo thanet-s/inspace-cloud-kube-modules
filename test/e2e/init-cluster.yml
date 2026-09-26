@@ -12,6 +12,7 @@
     e2e_cluster_file: "{{ lookup('env', 'E2E_STATE_DIR') }}/cluster.yaml"
     e2e_state_file: "{{ lookup('env', 'E2E_STATE_DIR') }}/state.json"
     e2e_token_file: "{{ lookup('env', 'E2E_STATE_DIR') }}/rke2-token"
+    e2e_agent_token_file: "{{ lookup('env', 'E2E_STATE_DIR') }}/rke2-agent-token"
     e2e_bootstrap_cache_key_file: "{{ lookup('env', 'E2E_STATE_DIR') }}/bootstrap-cache-key"
     e2e_bootstrap_cache_not_before_file: "{{ lookup('env', 'E2E_STATE_DIR') }}/bootstrap-cache-not-before"
     e2e_kubeconfig: "{{ lookup('env', 'E2E_STATE_DIR') }}/kubeconfig.yaml"
@@ -73,6 +74,29 @@
       ansible.builtin.set_fact:
         e2e_owner: "{{ ('inspace-e2e/' + e2e_cluster_resource_name) | hash('sha256') | truncate(16, true, '') }}"
 
+    # Workers join with this separate agent token. The server token stays on
+    # control planes, so root on a worker cannot read bootstrap data (CA and
+    # etcd keys) from the supervisor. It is persisted before the server token.
+    - name: Check whether an RKE2 agent join token already exists for a resumed run
+      ansible.builtin.stat:
+        path: "{{ e2e_agent_token_file }}"
+      register: e2e_agent_token_stat
+
+    - name: Generate the separate RKE2 agent join token inside the runner
+      ansible.builtin.command:
+        argv: [openssl, rand, -hex, "32"]
+      register: e2e_generated_agent_token
+      no_log: true
+      when: not e2e_agent_token_stat.stat.exists
+
+    - name: Persist the RKE2 agent join token with restrictive permissions
+      ansible.builtin.copy:
+        content: "{{ e2e_generated_agent_token.stdout }}"
+        dest: "{{ e2e_agent_token_file }}"
+        mode: "0600"
+      no_log: true
+      when: not e2e_agent_token_stat.stat.exists
+
     - name: Check whether an RKE2 token already exists for a resumed run
       ansible.builtin.stat:
         path: "{{ e2e_token_file }}"
@@ -92,6 +116,21 @@
         mode: "0600"
       no_log: true
       when: not e2e_token_stat.stat.exists
+
+    - name: Inspect the persisted RKE2 agent join token
+      ansible.builtin.stat:
+        path: "{{ e2e_agent_token_file }}"
+      register: e2e_persisted_agent_token
+
+    - name: Require a separate persisted RKE2 agent join token
+      ansible.builtin.assert:
+        that:
+          - e2e_persisted_agent_token.stat.isreg
+          - e2e_persisted_agent_token.stat.mode == '0600'
+          - lookup('file', e2e_agent_token_file) is match('^[0-9a-f]{64}$')
+          - lookup('file', e2e_agent_token_file) | trim != lookup('file', e2e_token_file) | trim
+        fail_msg: "The RKE2 agent token must be mode 0600, 64 hexadecimal characters, and distinct from the server token."
+      no_log: true
 
     - name: Check whether a bootstrap cache key already exists for a resumed run
       ansible.builtin.stat:
@@ -363,6 +402,7 @@
         INSPACE_API_URL: "{{ lookup('env', 'INSPACE_API_URL') }}"
         INSPACE_API_TOKEN: "{{ lookup('env', 'INSPACE_API_TOKEN') }}"
         INSPACE_RKE2_TOKEN: "{{ lookup('file', e2e_token_file) | trim }}"
+        INSPACE_RKE2_AGENT_TOKEN: "{{ lookup('file', e2e_agent_token_file) | trim }}"
         INSPACE_BOOTSTRAP_CACHE_KEY: "{{ lookup('file', e2e_bootstrap_cache_key_file) | trim }}"
         INSPACE_BOOTSTRAP_CACHE_NOT_BEFORE: "{{ lookup('file', e2e_bootstrap_cache_not_before_file) | trim }}"
         INSPACE_BOOTSTRAP_CACHE_IMAGE_DIGESTS: >-
@@ -1722,12 +1762,18 @@
     - name: Create the cloud and RKE2 registration secrets
       ansible.builtin.shell: |
         set -euo pipefail
+        # The API token reaches kubectl through a removed 0600 file, never
+        # argv; printf is a shell builtin.
+        umask 077
+        secret_dir=$(mktemp -d)
+        trap 'rm -rf -- "$secret_dir"' EXIT
+        printf '%s' "$INSPACE_API_TOKEN" >"$secret_dir/api-token"
         kubectl -n kube-system create secret generic inspace-cloud-credentials \
-          --from-literal="api-token=$INSPACE_API_TOKEN" \
+          --from-file="api-token=$secret_dir/api-token" \
           --from-literal="billing-account-id=$INSPACE_BILLING_ACCOUNT_ID" \
           --dry-run=client -o yaml | kubectl apply -f -
         kubectl -n kube-system create secret generic inspace-rke2-agent-token \
-          --from-file="token={{ e2e_state_dir }}/rke2-token" \
+          --from-file="token={{ e2e_state_dir }}/rke2-agent-token" \
           --dry-run=client -o yaml | kubectl apply -f -
       args:
         executable: /bin/bash

@@ -214,7 +214,9 @@ also persists the bootstrap-controller version that must later resume or
 destroy that ledger. Boolean fields omitted by the controller's canonical YAML
 serialization are compared using their API default of `false`. It then:
 
-1. generates and persists the RKE2 token and optional cache PKI seed;
+1. generates and persists the RKE2 server token, a separate RKE2 agent token
+   (see [RKE2 join tokens](#rke2-join-tokens)), and the optional cache PKI
+   seed;
 2. runs the exact released bootstrap controller to API-level readiness;
 3. binds its result to the deterministic FIPs;
 4. pins bastion and private control-plane SSH host keys;
@@ -324,6 +326,61 @@ its TLS server name; it never exposes a control-plane FIP as a public API. The
 launcher keeps this one container running and publishes its tunnel only on
 host loopback. Repeating `tunnel` reuses it. `destroy` stops that tunnel
 container before beginning the guarded teardown.
+
+## RKE2 join tokens
+
+RKE2 has two static join secrets. The server token (`rke2-token` in the state
+directory) joins servers and also encrypts the cluster's bootstrap data. Anyone
+holding it can fetch that data, including the CA and etcd keys, from the
+supervisor on port 9345, which is equivalent to cluster-admin. The agent token
+(`rke2-agent-token`) can join only agents.
+
+A new cluster gets both. `init` generates each with `openssl rand -hex 32`,
+stores it mode `0600`, and never logs it. Every control plane is rendered with
+`token:` and `agent-token:`. Only the agent token goes into
+`Secret/inspace-rke2-agent-token`, which Karpenter writes to every worker it
+creates, including public Node-LB workers. The tokens use RKE2's short
+format. The secure `K10<CA hash>::` form cannot be minted up front, because
+the cluster CA does not exist until the first server starts.
+
+A cluster created by an earlier release, or with a `modules_version` of
+`1.1.0-rc.5` or older, has no `rke2-agent-token`. Its servers have no
+`agent-token`, so `init` keeps putting the server token into the worker Secret.
+Nothing changes for it automatically: an agent token is part of every
+control-plane spec hash, so adding one later would stop `init` from adopting
+the existing VMs. `destroy` never reads either token.
+
+### Manual rotation
+
+The steps below edit the servers directly. Afterwards, do not re-run `init`
+for this cluster, because it re-applies the Secret from the original state
+files. `update`, `status`, `tunnel`, and `destroy` never read the join tokens.
+Rotate on one server at a time and wait for that Node to be Ready before you
+continue.
+
+To give a legacy cluster an agent token, or to rotate an existing one:
+
+1. Generate a token: `umask 077; openssl rand -hex 32 >new-agent-token`.
+2. On every control plane, write `agent-token: "<new token>"` to the mode
+   `0600` file `/etc/rancher/rke2/config.yaml.d/50-agent-token.yaml`, then run
+   `systemctl restart rke2-server`. RKE2 uses the last value it reads for a
+   key, so this file overrides any `agent-token:` in
+   `/etc/rancher/rke2/config.yaml`. Every server must use the same value.
+3. Replace the Secret without putting the token on a command line:
+   `kubectl -n kube-system create secret generic inspace-rke2-agent-token --from-file=token=new-agent-token --dry-run=client -o yaml | kubectl apply -f -`.
+4. Replace every existing worker, one at a time, for example with
+   `kubectl delete nodeclaim <name>`. Karpenter creates its replacement with
+   the new token. A worker keeps its old token in
+   `/etc/rancher/rke2/config.yaml` until it is replaced.
+
+A legacy cluster's workers have held the server token, so rotate the server
+token as well after the agent token is in place. On one server, run
+`rke2 token rotate --token <old server token> --new-token <new server token>`.
+Then set `token:` in `/etc/rancher/rke2/config.yaml` to the new value on every
+server and restart them one at a time. Keep the new server token as securely
+as the etcd snapshots, because RKE2 needs it to restore them. Leave the
+state-directory `rke2-token` unchanged: it is the bootstrap ledger's record of
+the original cloud-init, and `destroy` does not need it.
 
 ## Safe destroy
 

@@ -145,6 +145,11 @@ type Reconciler struct {
 	// ModuleImageDigests optionally binds bootstrap-cache source pulls to the
 	// verified linux/amd64 platform manifests for ModuleVersion.
 	ModuleImageDigests map[string]string
+	// RKE2AgentToken is the separate join credential rendered as every
+	// server's agent-token, so workers never hold the server token. It is part
+	// of the control-plane spec hash: a cluster created without it keeps
+	// reconciling without it, and destroy never needs it.
+	RKE2AgentToken string
 
 	// SSHUsername and SSHPublicKey are optional and must be set together. The
 	// public key is sent to InSpace's VM-create API; private key material is
@@ -2923,7 +2928,7 @@ func (r *Reconciler) desiredControlPlaneVMRequest(cluster *v1alpha1.InSpaceClust
 	tlsNames := append([]string{cluster.Spec.Endpoint.VirtualIPv4}, cluster.Spec.RKE2.TLSSubjectAltNames...)
 	cloudInit, err := RenderCloudInitJSON(CloudInitInput{
 		NodeName: controlPlaneName(cluster.Metadata.Name, slot), PrivateSubnet: network.Subnet, VirtualIPv4: cluster.Spec.Endpoint.VirtualIPv4,
-		RKE2Version: cluster.Spec.RKE2.Version, RKE2Token: token, Initialize: slot == 0, ServerAddress: joinAddress,
+		RKE2Version: cluster.Spec.RKE2.Version, RKE2Token: token, RKE2AgentToken: r.RKE2AgentToken, Initialize: slot == 0, ServerAddress: joinAddress,
 		PodCIDR: cluster.Spec.Network.PodCIDR, ServiceCIDR: cluster.Spec.Network.ServiceCIDR,
 		PrivateLoadBalancerPoolStart: cluster.Spec.Network.PrivateLoadBalancerPool.Start,
 		PrivateLoadBalancerPoolStop:  cluster.Spec.Network.PrivateLoadBalancerPool.Stop,

@@ -232,6 +232,9 @@ lease migration without relying on interface names.
 ```sh
 export INSPACE_API_TOKEN='...'
 export INSPACE_RKE2_TOKEN='a-long-random-cluster-token'
+# Separate token that only joins agents; give workers this one, never the
+# server token. Optional, but it must be set from the first reconcile or never.
+export INSPACE_RKE2_AGENT_TOKEN='a-different-long-random-agent-token'
 # Generate and persist these once; reuse the exact values on every reconcile.
 export INSPACE_BOOTSTRAP_CACHE_KEY='<64-lowercase-hex-characters>'
 export INSPACE_BOOTSTRAP_CACHE_NOT_BEFORE='<YYYY-MM-DDTHH:MM:SSZ>'
@@ -247,6 +250,13 @@ go run ./cmd/inspace-cluster-controller \
   --operation-timeout 30m \
   --output=json
 ```
+
+`INSPACE_RKE2_AGENT_TOKEN` is rendered as `agent-token` on every control plane.
+Put only that value into `Secret/inspace-rke2-agent-token`: the server token
+can read the cluster's bootstrap data (CA and etcd keys) from the supervisor.
+Both tokens are read only from the environment, never from flags. The agent
+token is part of each control-plane spec hash, so a cluster created without it
+must keep reconciling without it. Destroy needs neither token.
 
 The SSH username/key and TCP/22 are required because every cluster has the
 fixed bastion. Omitting `--management-cidr` defaults SSH and portless ICMP to

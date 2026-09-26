@@ -28,6 +28,7 @@
         - bootstrap-cache-not-before
         - bootstrap-controller-version
         - state.json
+        - rke2-agent-token
       register: deploy_bootstrap_files
 
     - name: Refuse an unversioned pre-existing bootstrap ledger
@@ -144,6 +145,31 @@
         path: "{{ deploy_state_dir }}/cluster.desired.yaml"
         state: absent
 
+    # Workers get a separate agent token so root on a worker cannot use the
+    # server token to read bootstrap data (CA and etcd keys) from the
+    # supervisor. It is minted only together with a new server token and only
+    # for a pinned controller that renders agent-token on every server. A
+    # cluster created without it keeps joining workers with the server token:
+    # adding it later would change every control-plane spec hash.
+    - name: Generate the RKE2 agent join token
+      ansible.builtin.command:
+        argv: [openssl, rand, -hex, "32"]
+      register: deploy_generated_rke2_agent_token
+      changed_when: true
+      no_log: true
+      when:
+        - not deploy_bootstrap_files.results[1].stat.exists
+        - not deploy_bootstrap_files.results[6].stat.exists
+        - bootstrap_controller_version is version('1.1.0-rc.5', '>', version_type='semver')
+
+    - name: Persist the RKE2 agent join token
+      ansible.builtin.copy:
+        content: "{{ deploy_generated_rke2_agent_token.stdout }}\n"
+        dest: "{{ deploy_state_dir }}/rke2-agent-token"
+        mode: "0600"
+      no_log: true
+      when: deploy_generated_rke2_agent_token is not skipped
+
     - name: Generate the RKE2 registration token
       ansible.builtin.command:
         argv: [openssl, rand, -hex, "32"]
@@ -159,6 +185,29 @@
         mode: "0600"
       no_log: true
       when: not deploy_bootstrap_files.results[1].stat.exists
+
+    - name: Inspect the persisted RKE2 agent join token
+      ansible.builtin.stat:
+        path: "{{ deploy_state_dir }}/rke2-agent-token"
+      register: deploy_rke2_agent_token_file
+
+    - name: Require a valid separate RKE2 agent join token
+      ansible.builtin.assert:
+        that:
+          - deploy_rke2_agent_token_file.stat.isreg
+          - deploy_rke2_agent_token_file.stat.mode == '0600'
+          - (lookup('file', deploy_state_dir + '/rke2-agent-token') | trim) is match('^[0-9a-f]{64}$')
+          - (lookup('file', deploy_state_dir + '/rke2-agent-token') | trim) != (lookup('file', deploy_state_dir + '/rke2-token') | trim)
+        fail_msg: "rke2-agent-token must be a mode 0600, 64-hex-character token distinct from rke2-token."
+      no_log: true
+      when: deploy_rke2_agent_token_file.stat.exists
+
+    # Only a cluster created before the agent token existed has no
+    # rke2-agent-token; its servers accept only the server token for agents.
+    - name: Select the RKE2 agent join token for workers
+      ansible.builtin.set_fact:
+        deploy_rke2_agent_join_token_file: >-
+          {{ deploy_state_dir + ('/rke2-agent-token' if deploy_rke2_agent_token_file.stat.exists else '/rke2-token') }}
 
     - name: Generate the 256-bit bootstrap cache key
       ansible.builtin.command:
@@ -255,6 +304,8 @@
           - --env
           - INSPACE_RKE2_TOKEN
           - --env
+          - INSPACE_RKE2_AGENT_TOKEN
+          - --env
           - INSPACE_BOOTSTRAP_CACHE_KEY
           - --env
           - INSPACE_BOOTSTRAP_CACHE_NOT_BEFORE
@@ -282,6 +333,8 @@
         INSPACE_API_URL: "{{ inspace_api_url }}"
         INSPACE_API_TOKEN: "{{ lookup('env', 'INSPACE_API_TOKEN') }}"
         INSPACE_RKE2_TOKEN: "{{ lookup('file', deploy_state_dir + '/rke2-token') | trim }}"
+        INSPACE_RKE2_AGENT_TOKEN: >-
+          {{ (lookup('file', deploy_state_dir + '/rke2-agent-token') | trim) if deploy_rke2_agent_token_file.stat.exists else '' }}
         INSPACE_BOOTSTRAP_CACHE_KEY: >-
           {{ '' if bootstrap_direct_download | bool else (lookup('file', deploy_state_dir + '/bootstrap-cache-key') | trim) }}
         INSPACE_BOOTSTRAP_CACHE_NOT_BEFORE: >-
@@ -579,13 +632,19 @@
     - name: Create or update cloud and RKE2 agent-token Secrets
       ansible.builtin.shell: |
         set -euo pipefail
+        # The API token reaches kubectl through a removed 0600 file, never
+        # argv; printf is a shell builtin.
+        umask 077
+        secret_dir=$(mktemp -d)
+        trap 'rm -rf -- "$secret_dir"' EXIT
+        printf '%s' "$INSPACE_API_TOKEN" >"$secret_dir/api-token"
         export KUBECONFIG={{ (deploy_state_dir + '/kubeconfig.yaml') | quote }}
         kubectl -n kube-system create secret generic inspace-cloud-credentials \
-          --from-literal="api-token=$INSPACE_API_TOKEN" \
+          --from-file="api-token=$secret_dir/api-token" \
           --from-literal="billing-account-id={{ inspace_billing_account_id }}" \
           --dry-run=client -o yaml | kubectl apply -f -
         kubectl -n kube-system create secret generic inspace-rke2-agent-token \
-          --from-file="token={{ deploy_state_dir }}/rke2-token" \
+          --from-file="token={{ deploy_rke2_agent_join_token_file }}" \
           --dry-run=client -o yaml | kubectl apply -f -
       args:
         executable: /bin/bash

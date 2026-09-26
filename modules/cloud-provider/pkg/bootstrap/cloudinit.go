@@ -208,6 +208,11 @@ type CloudInitInput struct {
 	// requires before it honors a Service's PreferSameNode or PreferSameZone
 	// trafficDistribution. False renders no value at all.
 	ServiceTopology bool
+	// RKE2AgentToken, when set, becomes every server's agent-token, so agents
+	// join with a credential that cannot read server bootstrap data. It must
+	// differ from RKE2Token. Empty keeps the established bytes, where agents
+	// join with RKE2Token.
+	RKE2AgentToken string
 }
 
 // ciliumLoadBalancerOptions are the optional rke2-cilium loadBalancer values.
@@ -228,6 +233,9 @@ func RenderCloudInitJSON(input CloudInitInput) (string, error) {
 	}
 	if !nodeNamePattern.MatchString(input.NodeName) {
 		return "", errors.New("bootstrap: node name must be a lowercase DNS label of at most 63 characters")
+	}
+	if input.RKE2AgentToken != "" && input.RKE2AgentToken == input.RKE2Token {
+		return "", errors.New("bootstrap: RKE2 agent token must differ from the server token")
 	}
 	if input.NodeExternalIPv4 != "" {
 		externalAddress, err := netip.ParseAddr(input.NodeExternalIPv4)
@@ -392,11 +400,16 @@ func renderBastionCloudInitJSON(nodeName string, skipOSUpgrade bool) (string, er
 func renderRKE2Config(input CloudInitInput) string {
 	lines := []string{
 		"token: " + yamlString(input.RKE2Token),
-		"node-name: " + yamlString(input.NodeName),
+	}
+	if input.RKE2AgentToken != "" {
+		lines = append(lines, "agent-token: "+yamlString(input.RKE2AgentToken))
+	}
+	lines = append(lines,
+		"node-name: "+yamlString(input.NodeName),
 		"node-ip: __PRIVATE_IP__",
 		"advertise-address: __PRIVATE_IP__",
-		"cluster-cidr: " + yamlString(input.PodCIDR),
-		"service-cidr: " + yamlString(input.ServiceCIDR),
+		"cluster-cidr: "+yamlString(input.PodCIDR),
+		"service-cidr: "+yamlString(input.ServiceCIDR),
 		"cni: cilium",
 		"disable-kube-proxy: true",
 		"disable-cloud-controller: true",
@@ -405,7 +418,7 @@ func renderRKE2Config(input CloudInitInput) string {
 		"  - node-role.kubernetes.io/control-plane=true:NoSchedule",
 		"kubelet-arg:",
 		"  - cloud-provider=external",
-	}
+	)
 	if input.BootstrapCache != nil {
 		lines = append(lines, "system-default-registry: "+yamlString(input.BootstrapCache.Registry()))
 	}

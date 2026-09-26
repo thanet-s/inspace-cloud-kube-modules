@@ -90,9 +90,15 @@ if ! mkdir "$lock_dir" 2>/dev/null; then
 fi
 lock_held=true
 
+# The API token reaches curl on stdin, never in argv where any local user can
+# read it from the process table; printf is a shell builtin.
+api_curl() {
+  printf 'apikey: %s\n' "$INSPACE_API_TOKEN" |
+    curl --fail --silent --show-error --max-time 30 -H @- "$@"
+}
+
 api_get() {
-  curl --fail --silent --show-error --max-time 30 \
-    -H "apikey: $INSPACE_API_TOKEN" "$1"
+  api_curl "$1"
 }
 
 read_network_subnet() {
@@ -411,8 +417,7 @@ cleanup_receipt() {
       if [ "$final_count" -eq 1 ]; then
         validate_firewall_match "$final_matches" "$uuid" true || return 1
         set +e
-        curl --fail --silent --show-error --max-time 30 -X DELETE \
-          -H "apikey: $INSPACE_API_TOKEN" "$base/network/firewalls/$uuid" >/dev/null
+        api_curl -X DELETE "$base/network/firewalls/$uuid" >/dev/null
         delete_status=$?
         set -e
         if [ "$delete_status" -ne 0 ]; then
@@ -505,8 +510,7 @@ if [ -z "$firewall_uuid" ]; then
       exit 1
     fi
     set +e
-    firewall_response=$(curl --fail --silent --show-error --max-time 30 -X POST \
-      -H "apikey: $INSPACE_API_TOKEN" -H 'Content-Type: application/json' \
+    firewall_response=$(api_curl -X POST -H 'Content-Type: application/json' \
       --data "$payload" "$base/network/firewalls")
     create_status=$?
     set -e
