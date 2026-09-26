@@ -59,6 +59,7 @@ spec:
             - --location=$(INSPACE_LOCATION)
             - --api-base-url=$(INSPACE_API_BASE_URL)
             - --network-uuid=$(INSPACE_NETWORK_UUID)
+            - --max-volume-size-gib={{ .Values.csi.maxVolumeSizeGiB }}
           env:
             - name: INSPACE_LOCATION
               value: {{ .Values.global.inspace.location | quote }}

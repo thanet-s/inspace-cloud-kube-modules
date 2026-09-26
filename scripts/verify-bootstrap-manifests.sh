@@ -128,6 +128,18 @@ test "$(grep -Fc '            - name: INSPACE_NETWORK_UUID' "$tmpdir/csi-control
 grep -Fx '              value: "11111111-1111-4111-8111-111111111111"' "$tmpdir/csi-controller.yaml" >/dev/null
 test "$(grep -Fc '            - --timeout=600s' "$tmpdir/csi-controller.yaml")" -eq 3
 test "$(grep -Fc '            - --handle-volume-inuse-error=false' "$tmpdir/csi-controller.yaml")" -eq 1
+test "$(grep -Fc '            - --max-volume-size-gib=2000' "$tmpdir/csi-controller.yaml")" -eq 1
+helm template bootstrap "$chart" --namespace kube-system --values "$values" \
+  --set csi.maxVolumeSizeGiB=500 \
+  --show-only templates/csi-controller.yaml >"$tmpdir/csi-controller-small-cap.yaml"
+test "$(grep -Fc '            - --max-volume-size-gib=500' "$tmpdir/csi-controller-small-cap.yaml")" -eq 1
+for invalid_cap in 0 2001; do
+  if helm template invalid "$chart" --namespace kube-system --values "$values" \
+    --set "csi.maxVolumeSizeGiB=$invalid_cap" >/dev/null 2>&1; then
+    echo "CSI maximum volume size $invalid_cap GiB unexpectedly rendered" >&2
+    exit 1
+  fi
+done
 
 helm template bootstrap "$chart" --namespace kube-system --values "$values" \
   --set csi.sidecars.provisioner.timeoutSeconds=720 \
@@ -258,6 +270,7 @@ grep -Fx '    resources: ["subjectaccessreviews"]' "$standalone_ccm" >/dev/null
 require_toleration "$standalone_csi"
 require_toleration "$standalone_karpenter"
 test "$(grep -Fc '            - --timeout=600s' "$standalone_csi")" -eq 3
+test "$(grep -Fc '            - --max-volume-size-gib=2000' "$standalone_csi")" -eq 1
 grep -F '            - name: INSPACE_NETWORK_UUID' "$standalone_karpenter" >/dev/null
 grep -F '            - name: INSPACE_CONTROL_PLANE_VIP' "$standalone_karpenter" >/dev/null
 

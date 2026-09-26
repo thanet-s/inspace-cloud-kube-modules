@@ -274,3 +274,37 @@ func TestNodeExpandWaitsForGuestToSeeGrownDevice(t *testing.T) {
 		t.Fatalf("lagging device ran %d filesystem expansion(s)", got)
 	}
 }
+
+func TestDefaultMaximumVolumeSizeIs2000GiB(t *testing.T) {
+	const gib int64 = 1024 * 1024 * 1024
+	if DefaultMaxVolumeSize != 2000*gib {
+		t.Fatalf("DefaultMaxVolumeSize = %d, want %d", DefaultMaxVolumeSize, 2000*gib)
+	}
+	provider := cloudfake.New()
+	d, err := New(Config{Mode: ModeController, Location: "bkk01"}, provider, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if _, err := d.CreateVolume(ctx, &csi.CreateVolumeRequest{
+		Name: "pvc-over-cap", CapacityRange: &csi.CapacityRange{RequiredBytes: 2000*gib + 1},
+		VolumeCapabilities: []*csi.VolumeCapability{rwoCapability()},
+	}); status.Code(err) != codes.OutOfRange {
+		t.Fatalf("create above 2000GiB code = %v, err = %v; want OutOfRange", status.Code(err), err)
+	}
+	if provider.VolumeCount() != 0 {
+		t.Fatalf("create above the cap reached the cloud: %d volume(s)", provider.VolumeCount())
+	}
+	created, err := d.CreateVolume(ctx, &csi.CreateVolumeRequest{
+		Name: "pvc-at-cap", CapacityRange: &csi.CapacityRange{RequiredBytes: 2000 * gib},
+		VolumeCapabilities: []*csi.VolumeCapability{rwoCapability()},
+	})
+	if err != nil {
+		t.Fatalf("create at exactly 2000GiB: %v", err)
+	}
+	if _, err := d.ControllerExpandVolume(ctx, &csi.ControllerExpandVolumeRequest{
+		VolumeId: created.GetVolume().GetVolumeId(), CapacityRange: &csi.CapacityRange{RequiredBytes: 2001 * gib},
+	}); status.Code(err) != codes.OutOfRange {
+		t.Fatalf("expand above 2000GiB code = %v, err = %v; want OutOfRange", status.Code(err), err)
+	}
+}

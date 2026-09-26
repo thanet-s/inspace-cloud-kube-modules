@@ -19,6 +19,10 @@ const (
 	DefaultPluginName          = "csi.inspace.cloud"
 	DefaultPluginVersion       = "dev"
 	DefaultVolumeSize    int64 = 10 * 1024 * 1024 * 1024
+	// DefaultMaxVolumeSize matches the largest disk the InSpace console
+	// offers. Larger CSI requests fail fast with OutOfRange instead of
+	// reaching the provider.
+	DefaultMaxVolumeSize int64 = 2000 * 1024 * 1024 * 1024
 	TopologyLocationKey        = "topology.inspace.cloud/location"
 )
 
@@ -80,6 +84,9 @@ func New(cfg Config, provider cloud.Interface, mounter host.Mounter) (*Driver, e
 	}
 	if cfg.DefaultVolumeSize == 0 {
 		cfg.DefaultVolumeSize = DefaultVolumeSize
+	}
+	if cfg.MaxVolumeSize == 0 {
+		cfg.MaxVolumeSize = DefaultMaxVolumeSize
 	}
 	if cfg.DefaultVolumeSize < 0 || cfg.MaxVolumeSize < 0 || cfg.MaxVolumesPerNode < 0 {
 		return nil, errors.New("size and volume limits cannot be negative")
