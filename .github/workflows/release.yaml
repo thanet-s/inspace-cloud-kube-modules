@@ -436,7 +436,7 @@ jobs:
 
   charts:
     name: OCI Helm charts
-    needs: [validate, quality]
+    needs: [validate, quality, images]
     runs-on: ubuntu-26.04
     permissions:
       contents: read
@@ -452,6 +452,13 @@ jobs:
         uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
         with:
           version: v4.3.0
+
+      - name: Download immutable image digests
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: image-digest-*
+          path: image-digests
+          merge-multiple: true
 
       - name: Log in to GHCR
         shell: bash
@@ -477,7 +484,10 @@ jobs:
             echo "expected exactly three release-managed empty image tags" >&2
             exit 1
           fi
-          sed -i "s/^    tag: \"\"$/    tag: \"$VERSION\"/" "$values_file"
+          # Pin each controller to the exact tag and the immutable image-index
+          # digest recorded after the merged image was read back and attested.
+          # The tag stays for readability; the digest is what the chart renders.
+          python3 scripts/pin-release-chart-images.py "$values_file" image-digests "$VERSION"
           if [[ "$(grep -Fxc "    tag: \"$VERSION\"" "$values_file")" -ne 3 ]]; then
             echo "failed to pin every controller image tag to $VERSION" >&2
             exit 1
@@ -515,6 +525,27 @@ jobs:
             echo "packaged chart does not pin every controller image tag to $VERSION" >&2
             exit 1
           fi
+          packaged_values="$(helm show values "dist/inspace-cloud-kube-modules-$VERSION.tgz")"
+          rendered="$(helm template release-readback "dist/inspace-cloud-kube-modules-$VERSION.tgz" \
+            --namespace kube-system \
+            --values charts/inspace-cloud-kube-modules/ci/test-values.yaml)"
+          for image in \
+            inspace-cloud-controller-manager \
+            inspace-csi-driver \
+            karpenter-provider-inspace; do
+            reference="$(<"image-digests/$image.txt")"
+            repository="${reference%@*}"
+            digest="${reference#*@}"
+            if [[ "$(grep -Fxc "    digest: \"$digest\"" <<<"$packaged_values")" -ne 1 ]]; then
+              echo "packaged chart does not pin every controller image to its release digest: $image" >&2
+              exit 1
+            fi
+            if ! grep -Fq "image: $repository@$digest" <<<"$rendered" ||
+              grep -Fq "image: $repository:" <<<"$rendered"; then
+              echo "packaged chart does not render every controller image by its release digest: $image" >&2
+              exit 1
+            fi
+          done
           for package in \
             "dist/inspace-cloud-kube-modules-crds-$VERSION.tgz" \
             "dist/inspace-cloud-kube-modules-$VERSION.tgz"; do

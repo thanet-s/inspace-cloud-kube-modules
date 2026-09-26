@@ -14,7 +14,11 @@ the three controller images and both Helm charts.
    and reruns the complete CI workflow against the tagged source.
 5. It builds `linux/amd64` images by default, pushes versioned GHCR tags,
    attaches SBOM and keyless GitHub build-provenance attestations, and
-   publishes and attests both OCI charts. Native `linux/arm64` builds remain
+   publishes and attests both OCI charts. The chart job waits for the merged
+   images and runs `scripts/pin-release-chart-images.py`, so the packaged chart
+   sets each controller's `image.tag` to the version and `image.digest` to the
+   recorded image-index digest; it then reads back the packaged values and a
+   render before pushing. Native `linux/arm64` builds remain
    available by setting the repository variable `ENABLE_ARM64_IMAGES=true`.
 6. Only after every image and chart succeeds does the workflow create a draft,
    attach chart archives, `SHA256SUMS`, and immutable image-digest records,

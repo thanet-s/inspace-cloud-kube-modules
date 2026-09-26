@@ -1,6 +1,6 @@
 # Build from the monorepo root:
 #   docker build -f modules/cloud-provider/Dockerfile -t inspace-cloud-controller-manager:dev .
-FROM --platform=$BUILDPLATFORM golang:1.27.1 AS build
+FROM --platform=$BUILDPLATFORM golang:1.27.1@sha256:3680233e3204827fbdc66088528ae6d4b3d034f51d03a99d454f6de034888244 AS build
 
 ARG TARGETOS
 ARG TARGETARCH
@@ -23,7 +23,7 @@ RUN GOWORK=off CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpat
       -ldflags="-s -w -X=github.com/thanet-s/inspace-cloud-kube-modules/modules/client/version.Version=${VERSION}" \
       -o /out/inspace-cluster-controller ./cmd/inspace-cluster-controller
 
-FROM gcr.io/distroless/static-debian12:nonroot
+FROM gcr.io/distroless/static-debian12:nonroot@sha256:afa5c872c891853ca7fcf1f12c3edb23f7eeef36189728842dd51042ff57f7ab
 LABEL org.opencontainers.image.title="InSpace Cloud Controller Manager" \
       org.opencontainers.image.description="External Kubernetes cloud controller manager for InSpace Cloud" \
       org.opencontainers.image.source="https://github.com/thanet-s/inspace-cloud-kube-modules" \

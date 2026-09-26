@@ -79,6 +79,11 @@ updates:
     open-pull-requests-limit: 0
     schedule:
       interval: weekly
+  - package-ecosystem: docker
+    directory: /deploy
+    open-pull-requests-limit: 0
+    schedule:
+      interval: weekly
   - package-ecosystem: pip
     directory: /test/e2e
     open-pull-requests-limit: 0

@@ -12,16 +12,25 @@ global:
       tokenKey: api-token
       billingAccountIDKey: billing-account-id
 
+# Controllers run by the linux/amd64 manifest digest of the exact release. The
+# bootstrap cache mirrors only that manifest (skopeo --preserve-digests), so it
+# serves the same digest the direct ghcr.io path does.
 ccm:
   replicaCount: {{ 1 if control_plane_replicas | int == 1 else 2 }}
+  image:
+    digest: "{{ deploy_modules_release_images['inspace-cloud-controller-manager'].platformDigest }}"
 
 karpenter:
   replicaCount: {{ 1 if control_plane_replicas | int == 1 else 2 }}
+  image:
+    digest: "{{ deploy_modules_release_images['karpenter-provider-inspace'].platformDigest }}"
   clusterName: {{ cluster_name }}
   defaultNodeClass: {{ karpenter_node_class_name }}
   agentTokenSecret:
     create: false
 
 csi:
+  image:
+    digest: "{{ deploy_modules_release_images['inspace-csi-driver'].platformDigest }}"
   storageClass:
     name: inspace-rwo

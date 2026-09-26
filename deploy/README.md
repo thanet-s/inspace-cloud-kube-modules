@@ -67,6 +67,35 @@ ledger, and lifecycle journal are ignored by Git under `deploy/.state/`.
 Back up that directory securely. Its `cluster.yaml` contains durable no-replay
 receipts required for safe recovery and destroy.
 
+## Released image digests
+
+Release tags are mutable, so the lifecycle never pulls a controller image by
+tag. Before the first pull or cluster change, `init`, `update`, and `destroy`
+run `scripts/resolve_release_images.py`. It reads the image-digest records
+attached to the exact, immutable GitHub release, checks each record body
+against the SHA-256 that GitHub reports for the asset, and then reads the
+image index, its linux/amd64 manifest, and that manifest's config from
+ghcr.io by digest. Every body must hash to the digest it was requested by, and
+the config labels must name this repository and the exact version. Every call
+is anonymous.
+
+The bootstrap controller, which receives the InSpace API token and the RKE2
+registration token, then runs as `image@sha256:<index digest>`. Helm installs
+the CCM, CSI, and Karpenter workloads with `image.digest` set to the resolved
+linux/amd64 manifest digest, which is also the digest the bootstrap cache
+stores. The management host therefore needs HTTPS access to `api.github.com`,
+`github.com`, and `ghcr.io`.
+
+Release images also carry keyless build-provenance attestations. The runner
+does not verify them automatically, because `gh attestation verify` needs a
+GitHub token. To check one yourself:
+
+```sh
+gh attestation verify \
+  oci://ghcr.io/thanet-s/inspace-cloud-controller-manager@sha256:<index digest> \
+  --repo thanet-s/inspace-cloud-kube-modules
+```
+
 ## Bootstrap download and OS upgrade options
 
 The inventory deliberately uses one setting for each cluster-wide bootstrap

@@ -26,6 +26,23 @@
           Export CONFIRM_CLUSTER_DESTROY={{ cluster_name }} and rerun destroy.
           No Kubernetes or cloud mutation was attempted.
 
+    # Resolve before any Kubernetes deletion, so an unreachable or invalid
+    # release record stops destroy while the cluster is still intact. The
+    # controller that holds the API token then runs by its immutable digest.
+    - name: Resolve the bootstrap controller image that owns the durable ledger
+      ansible.builtin.command:
+        argv:
+          - python3
+          - "{{ deploy_root }}/scripts/resolve_release_images.py"
+          - "{{ deployment_state.bootstrapControllerVersion }}"
+      register: deploy_destroy_release_images
+      changed_when: false
+
+    - name: Load the ledger-owning controller image reference
+      ansible.builtin.set_fact:
+        deploy_destroy_controller_image: >-
+          {{ (deploy_destroy_release_images.stdout | from_json).images['inspace-cloud-controller-manager'].releaseReference }}
+
     - name: Start the private API tunnel before deleting Kubernetes owners
       ansible.builtin.include_tasks: tasks/start-tunnel.yml
 
@@ -181,7 +198,7 @@
           - pull
           - --platform
           - linux/amd64
-          - "ghcr.io/thanet-s/inspace-cloud-controller-manager:{{ deployment_state.bootstrapControllerVersion }}"
+          - "{{ deploy_destroy_controller_image }}"
       changed_when: true
 
     - name: Delete only journaled bootstrap-owned infrastructure
@@ -203,7 +220,7 @@
           - INSPACE_API_TOKEN
           - --mount
           - "type=bind,src={{ deploy_state_dir }},dst=/state"
-          - "ghcr.io/thanet-s/inspace-cloud-controller-manager:{{ deployment_state.bootstrapControllerVersion }}"
+          - "{{ deploy_destroy_controller_image }}"
           - --cluster-config
           - /state/cluster.yaml
           - --delete

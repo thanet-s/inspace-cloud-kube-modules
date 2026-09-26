@@ -482,8 +482,12 @@ helm upgrade --install inspace-cloud-kube-modules \
 
 Start from [`examples/values.yaml`](examples/values.yaml) and ensure its VPC,
 control-plane VIP, and private load-balancer range exactly match both bootstrap
-and every NodeClass. Pin image
-digests in production with each component's `image.digest` value; when set,
-the digest takes precedence over `image.tag`.
+and every NodeClass. Each component's `image.digest` takes precedence over
+`image.tag`. A published chart already sets `image.tag` to its release version
+and `image.digest` to the immutable image-index digest recorded for that
+release, so its controllers render as `repository@sha256:...`. A mirror behind
+`global.inspace.systemImageRegistry` that stores only one platform manifest,
+such as the bootstrap cache, does not contain the index digest; override each
+`image.digest` with the release's `linux/amd64` manifest digest in that case.
 
 The chart is licensed under Apache-2.0.

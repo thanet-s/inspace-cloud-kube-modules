@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import pathlib
 import re
+import subprocess
 import sys
 
 
@@ -89,7 +90,7 @@ def verify_gateway_api(inventory: str, cluster_template: str, preflight: str, in
     require(
         "--print-gateway-api-crds" in print_task
         and "--network=none" in print_task
-        and "ghcr.io/thanet-s/inspace-cloud-controller-manager:{{ bootstrap_controller_version }}" in print_task
+        and "{{ bootstrap_controller_image | quote }}" in print_task
         and 'sha256sum "$bundle.partial"' in print_task
         and "deploy_gateway_api_bundle_sha256" in print_task,
         "Gateway API bundle must come offline from the exact controller image and match the pin",
@@ -177,7 +178,7 @@ def verify_update_cache_refresh(update: str) -> None:
     for fragment in (
         "docker run --platform linux/amd64 --rm --network=none",
         "--entrypoint /usr/local/bin/inspace-cluster-controller",
-        '"ghcr.io/thanet-s/inspace-cloud-controller-manager:{{ modules_version }}"',
+        "{{ deploy_modules_release_images['inspace-cloud-controller-manager'].releaseReference | quote }}",
         "--print-bootstrap-cache-refresh",
         "--bootstrap-cache-rke2-version",
         "--bootstrap-cache-disable",
@@ -337,6 +338,117 @@ def verify_rke2_agent_token(init: str, readme: str) -> None:
     )
 
 
+def verify_release_image_digests(init: str, update: str, destroy: str) -> None:
+    """The controller and chart images run by immutable digest, never by a mutable tag."""
+    resolver = "{{ deploy_root }}/scripts/resolve_release_images.py"
+    chart_values = read("deploy/templates/chart-values.yaml.j2")
+    readme = read("deploy/README.md")
+    refresh = read("deploy/playbooks/tasks/refresh-bootstrap-cache.yml")
+    for label, playbook in (("init", init), ("update", update), ("destroy", destroy), ("cache refresh", refresh)):
+        require(
+            re.search(r"inspace-cloud-controller-manager:\{\{", playbook) is None
+            and re.search(r"(?m)^\s*-?\s*\"?ghcr\.io/thanet-s/[a-z-]+:", playbook) is None,
+            f"{label} must not pull or run a controller image by a mutable tag",
+        )
+    resolve_bootstrap = task_block(init, "Resolve the immutable bootstrap controller image")
+    resolve_modules = task_block(init, "Resolve the immutable released module images")
+    load_images = task_block(init, "Load the immutable release image references")
+    for task, version in (
+        (resolve_bootstrap, "{{ bootstrap_controller_version }}"),
+        (resolve_modules, "{{ modules_version }}"),
+    ):
+        require(
+            f"- python3\n          - \"{resolver}\"\n          - \"{version}\"\n" in task
+            and "changed_when: false\n" in task,
+            f"init must resolve {version} images from its immutable release records",
+        )
+    require(
+        "bootstrap_controller_image: >-" in load_images
+        and ".images['inspace-cloud-controller-manager'].releaseReference" in load_images
+        and "deploy_modules_release_images: >-" in load_images,
+        "init must load the resolved controller reference and module digests",
+    )
+    pull = task_block(init, "Pull the exact bootstrap controller release")
+    print_bundle = task_block(init, "Print the pinned Gateway API CRD bundle from the exact bootstrap controller")
+    reconcile = task_block(init, "Reconcile bootstrap infrastructure synchronously to readiness")
+    require(
+        init.index("Resolve the immutable bootstrap controller image")
+        < init.index("Resolve the immutable released module images")
+        < init.index("Load the immutable release image references")
+        < init.index("Pull the exact bootstrap controller release"),
+        "init must resolve every release digest before the first controller pull or cloud mutation",
+    )
+    for task in (pull, print_bundle, reconcile):
+        require(
+            "{{ bootstrap_controller_image }}" in task
+            or "{{ bootstrap_controller_image | quote }}" in task,
+            "every init controller pull and run must use the resolved immutable digest",
+        )
+    require(
+        f"- \"{resolver}\"\n          - \"{{{{ modules_version }}}}\"\n"
+        in task_block(update, "Resolve the immutable released module images")
+        and update.index("Resolve the immutable released module images")
+        < update.index("Render updated chart values"),
+        "update must resolve module image digests before rendering chart values",
+    )
+    resolve_destroy = task_block(destroy, "Resolve the bootstrap controller image that owns the durable ledger")
+    require(
+        f"- \"{resolver}\"\n          - \"{{{{ deployment_state.bootstrapControllerVersion }}}}\"\n"
+        in resolve_destroy
+        and "changed_when: false\n" in resolve_destroy
+        and "deploy_destroy_controller_image: >-"
+        in task_block(destroy, "Load the ledger-owning controller image reference")
+        and destroy.index("Require an exact typed cluster-name destruction confirmation")
+        < destroy.index("Resolve the bootstrap controller image that owns the durable ledger")
+        < destroy.index("Start the private API tunnel before deleting Kubernetes owners"),
+        "destroy must resolve the ledger-owning controller digest before any Kubernetes deletion",
+    )
+    require(
+        "deploy_modules_release_images: >-" in task_block(update, "Load the immutable module image digests")
+        and update.index("Resolve the immutable released module images")
+        < update.index("Start the private API tunnel and wait for readiness"),
+        "update must resolve module image digests before any cluster change",
+    )
+    for name in (
+        "Pull the bootstrap controller version that owns the durable ledger",
+        "Delete only journaled bootstrap-owned infrastructure",
+    ):
+        require(
+            "{{ deploy_destroy_controller_image }}" in task_block(destroy, name),
+            f"destroy task '{name}' must use the resolved immutable controller digest",
+        )
+    for key, image in (
+        ("ccm", "inspace-cloud-controller-manager"),
+        ("csi", "inspace-csi-driver"),
+        ("karpenter", "karpenter-provider-inspace"),
+    ):
+        require(
+            re.search(
+                rf"(?ms)^{key}:\n(?:  [^\n]*\n)*?  image:\n"
+                rf"    digest: \"\{{\{{ deploy_modules_release_images\['{image}'\]\.platformDigest \}}\}}\"\n",
+                chart_values,
+            )
+            is not None,
+            f"chart values must pin {key} to the resolved linux/amd64 digest",
+        )
+    require(
+        "resolve_release_images.py" in readme and "immutable" in readme,
+        "deploy README must document release image digest resolution",
+    )
+    unit = subprocess.run(
+        [sys.executable, str(DEPLOY / "scripts" / "test_resolve_release_images.py")],
+        cwd=DEPLOY / "scripts",
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+    require(
+        unit.returncode == 0,
+        "release image resolver unit tests failed: " + (unit.stderr.strip() or unit.stdout.strip()),
+    )
+
+
 def main() -> None:
     inventory = read("deploy/inventory.example.yml")
     gitignore = read(".gitignore")
@@ -490,12 +602,16 @@ def main() -> None:
         "deploy runner base or Docker CLI image is not digest locked",
     )
     require(
-        "ansible-core==2.21.4" in dependency_lock
+        "ansible-core==2.21.4 \\" in dependency_lock
         and all(
-            line == "" or line.startswith("#") or re.search(r"^[A-Za-z0-9_.-]+==[^=]+$", line)
+            line == ""
+            or line.startswith("#")
+            or re.search(r"^[A-Za-z0-9_.-]+==[^=\s]+ \\$", line)
+            or re.search(r"^    --hash=sha256:[0-9a-f]{64}(?: \\)?$", line)
             for line in dependency_lock.splitlines()
-        ),
-        "deploy Python dependency lock contains an unpinned requirement",
+        )
+        and "--require-hashes" in dockerfile,
+        "deploy Python dependency lock contains an unpinned or unhashed requirement",
     )
     require(
         "KUBECTL_VERSION=v1.36.4" in dockerfile
@@ -557,6 +673,7 @@ def main() -> None:
         str(path.relative_to(ROOT)): path.read_text(encoding="utf-8")
         for path in sorted((DEPLOY / "playbooks").rglob("*.yml"))
     })
+    verify_release_image_digests(init, update, destroy)
     load_state = read("deploy/playbooks/tasks/load-state.yml")
     single_cp_settle = read("deploy/playbooks/tasks/settle-single-control-plane.yml")
     for fragment in (
