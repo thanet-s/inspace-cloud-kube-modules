@@ -960,12 +960,23 @@ func (c *nodeLoadBalancerController) reconcileShardFirewallPolicy(
 			if values[annotationNodeLoadBalancerShardFirewallUUID] != appliedUUID {
 				return false, errors.New("node load balancer: applied shard firewall identity changed during absence proof")
 			}
+			// While an applied UUID exists, any issued receipt is a PUT to that
+			// exact UUID. A PUT cannot resurrect a proven-absent server-assigned
+			// UUID, so the stale update intent is cleared with its target;
+			// otherwise the next pass would misread it as an ambiguous create.
 			for _, key := range []string{
 				annotationNodeLoadBalancerShardFirewallUUID,
 				annotationNodeLoadBalancerShardFirewallHash,
 				annotationNodeLoadBalancerShardFirewallLedger,
 				annotationNodeLoadBalancerShardFWAbsent,
 				annotationNodeLoadBalancerShardFWAbsentChecked,
+				annotationNodeLoadBalancerShardFWPendingHash,
+				annotationNodeLoadBalancerShardFWPendingLedger,
+				annotationNodeLoadBalancerShardFWPendingAt,
+				annotationNodeLoadBalancerShardFWIssuedAt,
+				annotationNodeLoadBalancerShardFWPendingUUID,
+				annotationNodeLoadBalancerShardFWCreateAbsent,
+				annotationNodeLoadBalancerShardFWCreateChecked,
 			} {
 				delete(values, key)
 			}
@@ -1221,8 +1232,21 @@ func (c *nodeLoadBalancerController) reconcileShardFirewallPolicy(
 		return state, errors.New("node load balancer: shard firewall create response lacks authoritative readback")
 	}
 
-	if state.AppliedHash == desired.Hash && state.AppliedLedger == desiredLedger {
+	issuedPendingHash := ""
+	if annotations[annotationNodeLoadBalancerShardFWIssuedAt] != "" {
+		issuedPendingHash = annotations[annotationNodeLoadBalancerShardFWPendingHash]
+	}
+	if state.AppliedHash == desired.Hash && state.AppliedLedger == desiredLedger &&
+		(issuedPendingHash == "" || issuedPendingHash == desired.Hash) {
 		state.PolicyReady = true
+	} else if state.AppliedHash == desired.Hash && state.AppliedLedger == desiredLedger {
+		// An issued PUT for a different (possibly broader) policy can still
+		// commit after this readback. Keep the policy unready until the pending
+		// policy is observed and promoted, then converge back to desired.
+		return state, fmt.Errorf(
+			"node load balancer: shard firewall update issued at %s for a different policy remains unresolved; policy is not ready",
+			annotations[annotationNodeLoadBalancerShardFWIssuedAt],
+		)
 	} else if state.AppliedHash == desired.Hash && annotations[annotationNodeLoadBalancerShardFWPendingHash] == "" {
 		_, _, err = c.updateManagedNodePoolAnnotationsForUID(ctx, shard, ownerUID, func(values map[string]string) (bool, error) {
 			values[annotationNodeLoadBalancerShardFirewallLedger] = desiredLedger
