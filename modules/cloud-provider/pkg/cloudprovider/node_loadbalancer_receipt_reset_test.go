@@ -3,6 +3,7 @@ package cloudprovider
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -22,6 +23,26 @@ type nodeLoadBalancerBlockedFirewallDeleteAPI struct {
 func (a *nodeLoadBalancerBlockedFirewallDeleteAPI) DeleteFirewall(context.Context, string, string) error {
 	a.deleteCalls++
 	return inspace.ErrMutationBlocked
+}
+
+func TestNodeLoadBalancerSDKNotDispatchedResetsExactShardCreateReceipt(t *testing.T) {
+	fixture := newAggregateShardFirewallTestFixture(t, aggregateTestService(
+		"local-shard-create",
+		"85555555-2222-4333-8444-555555555555",
+		corev1.ProtocolTCP,
+		443,
+	))
+	fixture.reconcile(t)
+	fixture.api.createFirewallErr = fmt.Errorf("inspace: firewall must have at least one rule: %w", inspace.ErrMutationNotDispatched)
+	if _, err := fixture.controller.reconcileShardFirewallPolicy(fixture.ctx, fixture.shard); !errors.Is(err, inspace.ErrMutationNotDispatched) {
+		t.Fatalf("shard create error = %v", err)
+	}
+	annotations := fixture.pool(t).GetAnnotations()
+	if len(fixture.api.createdFirewalls) != 1 ||
+		annotations[annotationNodeLoadBalancerShardFWPendingHash] == "" ||
+		annotations[annotationNodeLoadBalancerShardFWIssuedAt] != "" {
+		t.Fatalf("shard create receipt did not reset to intent: calls=%d annotations=%#v", len(fixture.api.createdFirewalls), annotations)
+	}
 }
 
 func TestNodeLoadBalancerErrMutationBlockedResetsExactFirewallReceipt(t *testing.T) {

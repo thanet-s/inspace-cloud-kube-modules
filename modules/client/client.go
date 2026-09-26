@@ -29,6 +29,11 @@ const (
 var (
 	// ErrMutationBlocked is returned before an unsafe request can reach the network.
 	ErrMutationBlocked = errors.New("inspace: mutation blocked for non-loopback API endpoint")
+	// ErrMutationNotDispatched marks a mutation rejected by local validation,
+	// request construction, or an already-done context before the HTTP client
+	// was invoked. Callers may treat it exactly like ErrMutationBlocked: the
+	// provider cannot have observed the request.
+	ErrMutationNotDispatched = errors.New("inspace: mutation was not dispatched")
 	// ErrMutationRedirect prevents net/http from replaying a POST, PUT, PATCH,
 	// or DELETE at a redirect target. InSpace mutations do not expose an
 	// idempotency-key contract, so even a same-origin 307/308 is ambiguous.
@@ -183,6 +188,27 @@ func isMutation(method string) bool {
 	}
 }
 
+// mutationNotDispatchedError keeps the original diagnostic text while making
+// the pre-dispatch guarantee matchable with errors.Is.
+type mutationNotDispatchedError struct {
+	err error
+}
+
+func (e *mutationNotDispatchedError) Error() string { return e.err.Error() }
+
+func (e *mutationNotDispatchedError) Unwrap() []error {
+	return []error{e.err, ErrMutationNotDispatched}
+}
+
+// mutationNotDispatched marks err as produced before any network I/O. Use it
+// only on paths that return before httpClient.Do is called.
+func mutationNotDispatched(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &mutationNotDispatchedError{err: err}
+}
+
 func isLiteralLoopback(host string) bool {
 	if strings.EqualFold(host, "localhost") {
 		return true
@@ -206,7 +232,11 @@ func (c *Client) doJSON(ctx context.Context, method, path string, query url.Valu
 	if input != nil {
 		data, err := json.Marshal(input)
 		if err != nil {
-			return fmt.Errorf("inspace: encode %s %s request: %w", method, path, err)
+			encodeErr := fmt.Errorf("inspace: encode %s %s request: %w", method, path, err)
+			if isMutation(method) {
+				return mutationNotDispatched(encodeErr)
+			}
+			return encodeErr
 		}
 		body = bytes.NewReader(data)
 	}
@@ -228,13 +258,25 @@ func (c *Client) doBody(ctx context.Context, method, path string, query url.Valu
 
 	req, err := http.NewRequestWithContext(ctx, method, u.String(), body)
 	if err != nil {
-		return fmt.Errorf("inspace: build request: %w", err)
+		buildErr := fmt.Errorf("inspace: build request: %w", err)
+		if isMutation(method) {
+			return mutationNotDispatched(buildErr)
+		}
+		return buildErr
 	}
 	req.Header.Set("apikey", c.apiKey)
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("User-Agent", c.userAgent)
 	if contentType != "" {
 		req.Header.Set("Content-Type", contentType)
+	}
+	if isMutation(method) {
+		// A context that is already done is the last point where non-dispatch
+		// is provable. Cancellation after this check happens inside Do and
+		// remains an ambiguous transport error for the caller's fence.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return mutationNotDispatched(fmt.Errorf("inspace: %s %s: %w", method, path, ctxErr))
+		}
 	}
 
 	resp, err := c.httpClient.Do(req)

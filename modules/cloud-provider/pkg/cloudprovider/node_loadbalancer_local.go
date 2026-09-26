@@ -79,10 +79,11 @@ func (c *nodeLoadBalancerController) syncPublicNodeLocal(
 		if cause == nil {
 			cause = errors.New("public-node-local: parsed Service mode is not public-node-local")
 		}
+		eventErr := c.recordNodeLoadBalancerReservedPortEvent(ctx, service, cause)
 		if containsString(service.Finalizers, publicNodeLocalFinalizer) {
-			return c.failPublicNodeLocalClosed(ctx, service, cause)
+			return errors.Join(c.failPublicNodeLocalClosed(ctx, service, cause), eventErr)
 		}
-		return cause
+		return errors.Join(cause, eventErr)
 	}
 	if !containsString(service.Finalizers, publicNodeLocalFinalizer) {
 		patched, err := c.ensurePublicNodeLocalFinalizer(ctx, service)
@@ -1331,6 +1332,41 @@ func (c *nodeLoadBalancerController) recordPublicNodeLocalConflictEvent(
 	return err
 }
 
+// recordNodeLoadBalancerReservedPortEvent makes a reserved-port rejection
+// visible on the Service. The Event name is derived from the Service UID and
+// the exact rejection, so retries neither mutate the Service nor spam Events.
+func (c *nodeLoadBalancerController) recordNodeLoadBalancerReservedPortEvent(
+	ctx context.Context,
+	service *corev1.Service,
+	cause error,
+) error {
+	if service == nil || !errors.Is(cause, errNodeLoadBalancerReservedPort) {
+		return nil
+	}
+	now := metav1.Now()
+	_, err := c.provider.kubeClient.CoreV1().Events(service.Namespace).Create(ctx, &corev1.Event{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      service.Name + "." + shortHash(string(service.UID)+"\x00"+cause.Error()),
+			Namespace: service.Namespace,
+		},
+		InvolvedObject: corev1.ObjectReference{
+			APIVersion: "v1", Kind: "Service", Namespace: service.Namespace,
+			Name: service.Name, UID: service.UID,
+		},
+		Reason:         "NodeLoadBalancerReservedPort",
+		Message:        cause.Error(),
+		Source:         corev1.EventSource{Component: "inspace-cloud-controller-manager"},
+		FirstTimestamp: now,
+		LastTimestamp:  now,
+		Count:          1,
+		Type:           corev1.EventTypeWarning,
+	}, metav1.CreateOptions{})
+	if apierrors.IsAlreadyExists(err) {
+		return nil
+	}
+	return err
+}
+
 func (c *nodeLoadBalancerController) clearPublicNodeLocalConflict(ctx context.Context, service *corev1.Service) (bool, error) {
 	_, changed, err := c.updateExactParentService(ctx, service, func(copy *corev1.Service) (bool, error) {
 		if copy.Annotations[annotationPublicNodeLocalConflict] == "" {
@@ -2049,7 +2085,9 @@ func (c *nodeLoadBalancerController) cleanupPublicNodeLocal(ctx context.Context,
 		c.requeuePublicNodeLocal(key)
 		return nil
 	}
-	confirmedAbsent, changed, err := c.recordFirewallAbsence(
+	// The pass that records the final spaced absence proof continues straight
+	// to finalization; only an unfinished proof waits for the spacing delay.
+	confirmedAbsent, _, err := c.recordFirewallAbsence(
 		ctx,
 		service,
 		annotationNodeLoadBalancerCleanupFWAbsent,
@@ -2060,7 +2098,7 @@ func (c *nodeLoadBalancerController) cleanupPublicNodeLocal(ctx context.Context,
 	if err != nil {
 		return err
 	}
-	if changed || !confirmedAbsent {
+	if !confirmedAbsent {
 		if c.queue != nil {
 			c.queue.AddAfter(key, nodeLoadBalancerAbsenceConfirmationDelay)
 		}

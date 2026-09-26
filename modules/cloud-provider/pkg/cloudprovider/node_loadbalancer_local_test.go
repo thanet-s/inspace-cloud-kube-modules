@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"reflect"
 	"sort"
 	"strings"
@@ -331,6 +332,10 @@ func TestPublicNodeLocalManualNodeLifecycleUsesExistingFIP(t *testing.T) {
 		latest, err := provider.kubeClient.CoreV1().Services(service.Namespace).Get(ctx, service.Name, metav1.GetOptions{})
 		if err != nil {
 			t.Fatal(err)
+		}
+		if containsString(latest.Finalizers, publicNodeLocalFinalizer) &&
+			latest.Annotations[annotationNodeLoadBalancerCleanupFWAbsent] == fmt.Sprint(nodeLoadBalancerAbsenceConfirmations) {
+			t.Fatalf("cleanup reconcile %d proved firewall absence but deferred finalization to another requeue", attempt)
 		}
 		if containsString(latest.Finalizers, publicNodeLocalFinalizer) && latest.Annotations[annotationNodeLoadBalancerCleanupFWChecked] != "" {
 			latest = ageNodeLoadBalancerAbsenceEvidence(t, ctx, provider, latest, annotationNodeLoadBalancerCleanupFWChecked)

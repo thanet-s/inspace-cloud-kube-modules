@@ -71,10 +71,11 @@ func (c *nodeLoadBalancerController) sync(ctx context.Context, key string) error
 
 	defaults := nodeLoadBalancerDefaults{NodesPerShard: c.provider.config.NodeLoadBalancer.NodesPerShard}
 	if _, err := parseNodeLoadBalancerService(service, defaults); err != nil {
+		eventErr := c.recordNodeLoadBalancerReservedPortEvent(ctx, service, err)
 		if containsString(service.Finalizers, nodeLoadBalancerFinalizer) {
-			return errors.Join(err, c.quarantineAggregateService(ctx, service))
+			return errors.Join(err, eventErr, c.quarantineAggregateService(ctx, service))
 		}
-		return err
+		return errors.Join(err, eventErr)
 	}
 	if shardName, ownershipErr := c.validateEstablishedAggregateShardAnchor(ctx, service); ownershipErr != nil {
 		return c.failAggregateShardClosed(ctx, shardName, ownershipErr)
@@ -1507,7 +1508,10 @@ func (c *nodeLoadBalancerController) deleteAggregateShardFirewall(ctx context.Co
 		firewall = byPendingUUID
 	}
 	if firewall == nil {
-		if issued := annotations[annotationNodeLoadBalancerShardFWIssuedAt]; issued != "" && appliedUUID == "" && cleanupUUID == "" && deleteTarget == "" {
+		// A definitively rejected create (bound to this exact receipt) instead
+		// falls through to the spaced cleanup absence proof below.
+		if issued := annotations[annotationNodeLoadBalancerShardFWIssuedAt]; issued != "" && appliedUUID == "" && cleanupUUID == "" && deleteTarget == "" &&
+			annotations[annotationNodeLoadBalancerShardFWCreateRejected] != issued {
 			// Empty list responses cannot prove that a paid POST which crossed the
 			// request boundary will never commit later. Retain the exact NodePool
 			// ledger/finalizer until the stable-name firewall becomes observable or
@@ -1595,6 +1599,7 @@ func (c *nodeLoadBalancerController) deleteAggregateShardFirewall(ctx context.Co
 				annotationNodeLoadBalancerShardFWAbsentChecked,
 				annotationNodeLoadBalancerShardFWCreateAbsent,
 				annotationNodeLoadBalancerShardFWCreateChecked,
+				annotationNodeLoadBalancerShardFWCreateRejected,
 				annotationNodeLoadBalancerShardFWCleanupAbsent,
 				annotationNodeLoadBalancerShardFWCleanupCheck,
 				annotationNodeLoadBalancerShardFWCleanupSeen,
@@ -1683,9 +1688,15 @@ func (c *nodeLoadBalancerController) deleteAggregateShardFirewall(ctx context.Co
 		return false, nil
 	}
 	if deleteIssuedAt != "" {
-		// The exact delete receipt is intentionally read-only after dispatch.
-		// A lagging list response must never authorize a second DELETE.
-		return false, nil
+		// The exact delete receipt blocks concurrent or immediate duplicate
+		// dispatch, because a lagging list can still show a deleted firewall.
+		// Only after the full resend interval does a still-listed, owned,
+		// unassigned UUID prove that DELETE did not commit; re-sending that
+		// exact DELETE is idempotent.
+		resend, resendErr := nodeLoadBalancerFirewallDeleteResendDue(deleteIssuedAt, time.Now().UTC())
+		if resendErr != nil || !resend {
+			return false, resendErr
+		}
 	}
 	issuedAt := time.Now().UTC().Format(time.RFC3339Nano)
 	_, winner, issueErr := c.updateManagedNodePoolAnnotationsForUID(ctx, shard, ownerUID, func(values map[string]string) (bool, error) {
@@ -1702,7 +1713,8 @@ func (c *nodeLoadBalancerController) deleteAggregateShardFirewall(ctx context.Co
 		if storedTarget != "" && storedTarget != firewall.UUID {
 			return false, fmt.Errorf("node load balancer: concurrent shard firewall delete targets %s, not %s", storedTarget, firewall.UUID)
 		}
-		if storedIssued != "" {
+		// Only the exact observed receipt may be replaced.
+		if storedIssued != deleteIssuedAt {
 			return false, nil
 		}
 		values[annotationNodeLoadBalancerShardFWDeleteTarget] = firewall.UUID

@@ -627,6 +627,7 @@ func (c *nodeLoadBalancerController) transitionShardFirewallMutation(
 			annotationNodeLoadBalancerShardFWPendingUUID,
 			annotationNodeLoadBalancerShardFWCreateAbsent,
 			annotationNodeLoadBalancerShardFWCreateChecked,
+			annotationNodeLoadBalancerShardFWCreateRejected,
 		} {
 			delete(values, key)
 		}
@@ -661,7 +662,7 @@ func (c *nodeLoadBalancerController) transitionShardFirewallMutation(
 // resetShardFirewallMutationAfterProvenNonDispatch returns the exact issued
 // shard policy transaction to its staged state. Callers have won issuance and
 // proved that no provider HTTP mutation was dispatched, either through final
-// authority rejection or the SDK's typed ErrMutationBlocked result.
+// authority rejection or a typed SDK pre-dispatch result.
 func (c *nodeLoadBalancerController) resetShardFirewallMutationAfterProvenNonDispatch(
 	ctx context.Context,
 	shard string,
@@ -747,7 +748,7 @@ func (c *nodeLoadBalancerController) resolveShardFirewallCreateReadback(
 		}
 		return observed, true, nil
 	}
-	return nil, false, errors.New("node load balancer: shard firewall create outcome remains ambiguous after exact name absence readback")
+	return nil, false, fmt.Errorf("node load balancer: shard firewall create outcome remains ambiguous after %w", errNodeLoadBalancerCreateAbsentAfterResponse)
 }
 
 func (c *nodeLoadBalancerController) resolveShardFirewallUpdateReadback(
@@ -960,12 +961,24 @@ func (c *nodeLoadBalancerController) reconcileShardFirewallPolicy(
 			if values[annotationNodeLoadBalancerShardFirewallUUID] != appliedUUID {
 				return false, errors.New("node load balancer: applied shard firewall identity changed during absence proof")
 			}
+			// While an applied UUID exists, any issued receipt is a PUT to that
+			// exact UUID. A PUT cannot resurrect a proven-absent server-assigned
+			// UUID, so the stale update intent is cleared with its target;
+			// otherwise the next pass would misread it as an ambiguous create.
 			for _, key := range []string{
 				annotationNodeLoadBalancerShardFirewallUUID,
 				annotationNodeLoadBalancerShardFirewallHash,
 				annotationNodeLoadBalancerShardFirewallLedger,
 				annotationNodeLoadBalancerShardFWAbsent,
 				annotationNodeLoadBalancerShardFWAbsentChecked,
+				annotationNodeLoadBalancerShardFWPendingHash,
+				annotationNodeLoadBalancerShardFWPendingLedger,
+				annotationNodeLoadBalancerShardFWPendingAt,
+				annotationNodeLoadBalancerShardFWIssuedAt,
+				annotationNodeLoadBalancerShardFWPendingUUID,
+				annotationNodeLoadBalancerShardFWCreateAbsent,
+				annotationNodeLoadBalancerShardFWCreateChecked,
+				annotationNodeLoadBalancerShardFWCreateRejected,
 			} {
 				delete(values, key)
 			}
@@ -1026,7 +1039,7 @@ func (c *nodeLoadBalancerController) reconcileShardFirewallPolicy(
 				values[annotationNodeLoadBalancerShardFirewallUUID] = current.UUID
 				values[annotationNodeLoadBalancerShardFirewallHash] = pendingHash
 				values[annotationNodeLoadBalancerShardFirewallLedger] = pendingLedger
-				for _, key := range []string{annotationNodeLoadBalancerShardFWPendingHash, annotationNodeLoadBalancerShardFWPendingLedger, annotationNodeLoadBalancerShardFWPendingAt, annotationNodeLoadBalancerShardFWIssuedAt, annotationNodeLoadBalancerShardFWPendingUUID, annotationNodeLoadBalancerShardFWCreateAbsent, annotationNodeLoadBalancerShardFWCreateChecked, annotationNodeLoadBalancerShardFWAbsent, annotationNodeLoadBalancerShardFWAbsentChecked} {
+				for _, key := range []string{annotationNodeLoadBalancerShardFWPendingHash, annotationNodeLoadBalancerShardFWPendingLedger, annotationNodeLoadBalancerShardFWPendingAt, annotationNodeLoadBalancerShardFWIssuedAt, annotationNodeLoadBalancerShardFWPendingUUID, annotationNodeLoadBalancerShardFWCreateAbsent, annotationNodeLoadBalancerShardFWCreateChecked, annotationNodeLoadBalancerShardFWCreateRejected, annotationNodeLoadBalancerShardFWAbsent, annotationNodeLoadBalancerShardFWAbsentChecked} {
 					delete(values, key)
 				}
 				return true, nil
@@ -1044,7 +1057,7 @@ func (c *nodeLoadBalancerController) reconcileShardFirewallPolicy(
 				values[annotationNodeLoadBalancerShardFirewallUUID] = current.UUID
 				values[annotationNodeLoadBalancerShardFirewallHash] = desired.Hash
 				values[annotationNodeLoadBalancerShardFirewallLedger] = desiredLedger
-				for _, key := range []string{annotationNodeLoadBalancerShardFWPendingHash, annotationNodeLoadBalancerShardFWPendingLedger, annotationNodeLoadBalancerShardFWPendingAt, annotationNodeLoadBalancerShardFWIssuedAt, annotationNodeLoadBalancerShardFWPendingUUID, annotationNodeLoadBalancerShardFWCreateAbsent, annotationNodeLoadBalancerShardFWCreateChecked, annotationNodeLoadBalancerShardFWAbsent, annotationNodeLoadBalancerShardFWAbsentChecked} {
+				for _, key := range []string{annotationNodeLoadBalancerShardFWPendingHash, annotationNodeLoadBalancerShardFWPendingLedger, annotationNodeLoadBalancerShardFWPendingAt, annotationNodeLoadBalancerShardFWIssuedAt, annotationNodeLoadBalancerShardFWPendingUUID, annotationNodeLoadBalancerShardFWCreateAbsent, annotationNodeLoadBalancerShardFWCreateChecked, annotationNodeLoadBalancerShardFWCreateRejected, annotationNodeLoadBalancerShardFWAbsent, annotationNodeLoadBalancerShardFWAbsentChecked} {
 					delete(values, key)
 				}
 				return true, nil
@@ -1079,6 +1092,12 @@ func (c *nodeLoadBalancerController) reconcileShardFirewallPolicy(
 				return true, nil
 			})
 			return state, err
+		}
+		if issued := annotations[annotationNodeLoadBalancerShardFWIssuedAt]; issued != "" &&
+			annotations[annotationNodeLoadBalancerShardFWCreateRejected] == issued {
+			// The provider definitively rejected this exact create and the
+			// deterministic name is absent in this fresh List.
+			return state, c.retireRejectedShardFirewallCreate(ctx, shard, ownerUID, annotations)
 		}
 		if annotations[annotationNodeLoadBalancerShardFWPendingHash] != desired.Hash ||
 			annotations[annotationNodeLoadBalancerShardFWPendingLedger] != desiredLedger {
@@ -1170,6 +1189,10 @@ func (c *nodeLoadBalancerController) reconcileShardFirewallPolicy(
 				ctx, shard, ownerUID, expectedMutation, *desired,
 			)
 			if recoveryErr != nil {
+				if nodeLoadBalancerCreateRejectionProvable(createErr, recoveryErr) {
+					return state, errors.Join(wrappedErr, recoveryErr,
+						c.markShardFirewallCreateRejected(ctx, shard, ownerUID, expectedMutation))
+				}
 				return state, errors.Join(wrappedErr, recoveryErr)
 			}
 			if committed {
@@ -1221,8 +1244,21 @@ func (c *nodeLoadBalancerController) reconcileShardFirewallPolicy(
 		return state, errors.New("node load balancer: shard firewall create response lacks authoritative readback")
 	}
 
-	if state.AppliedHash == desired.Hash && state.AppliedLedger == desiredLedger {
+	issuedPendingHash := ""
+	if annotations[annotationNodeLoadBalancerShardFWIssuedAt] != "" {
+		issuedPendingHash = annotations[annotationNodeLoadBalancerShardFWPendingHash]
+	}
+	if state.AppliedHash == desired.Hash && state.AppliedLedger == desiredLedger &&
+		(issuedPendingHash == "" || issuedPendingHash == desired.Hash) {
 		state.PolicyReady = true
+	} else if state.AppliedHash == desired.Hash && state.AppliedLedger == desiredLedger {
+		// An issued PUT for a different (possibly broader) policy can still
+		// commit after this readback. Keep the policy unready until the pending
+		// policy is observed and promoted, then converge back to desired.
+		return state, fmt.Errorf(
+			"node load balancer: shard firewall update issued at %s for a different policy remains unresolved; policy is not ready",
+			annotations[annotationNodeLoadBalancerShardFWIssuedAt],
+		)
 	} else if state.AppliedHash == desired.Hash && annotations[annotationNodeLoadBalancerShardFWPendingHash] == "" {
 		_, _, err = c.updateManagedNodePoolAnnotationsForUID(ctx, shard, ownerUID, func(values map[string]string) (bool, error) {
 			values[annotationNodeLoadBalancerShardFirewallLedger] = desiredLedger

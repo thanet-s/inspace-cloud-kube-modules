@@ -1147,6 +1147,11 @@ func TestNodeLoadBalancerCleanupDiscoversUnannotatedOwnedFirewallToAbsence(t *te
 			t.Fatal(err)
 		}
 		stored = getNodeLoadBalancerTestService(t, ctx, provider, service.Namespace, service.Name)
+		if confirmation == nodeLoadBalancerAbsenceConfirmations {
+			// The pass that records the final spaced absence proof finalizes
+			// immediately instead of waiting for one more confirmation delay.
+			break
+		}
 		if got := stored.Annotations[annotationNodeLoadBalancerCleanupFWAbsent]; got != strconv.Itoa(confirmation) {
 			t.Fatalf("cleanup absence confirmation %d = %q", confirmation, got)
 		}
@@ -1154,10 +1159,6 @@ func TestNodeLoadBalancerCleanupDiscoversUnannotatedOwnedFirewallToAbsence(t *te
 			t.Fatalf("finalizer cleared after only %d absence confirmations", confirmation)
 		}
 	}
-	if err := controller.cleanupService(ctx, stored); err != nil {
-		t.Fatal(err)
-	}
-	stored = getNodeLoadBalancerTestService(t, ctx, provider, service.Namespace, service.Name)
 	if containsString(stored.Finalizers, nodeLoadBalancerFinalizer) {
 		t.Fatalf("finalizer remained after firewall absence was proved: %#v", stored.Finalizers)
 	}
@@ -1261,12 +1262,13 @@ func TestNodeLoadBalancerDeletingServiceRetainsMissingFirewallProofUntilFinaliza
 		current = getNodeLoadBalancerTestService(
 			t, fixture.ctx, fixture.provider, fixture.service.Namespace, fixture.service.Name,
 		)
+		if confirmation == nodeLoadBalancerAbsenceConfirmations {
+			// The final spaced proof finalizes in the same pass.
+			break
+		}
 		if got := current.Annotations[annotationNodeLoadBalancerCleanupFWAbsent]; got != strconv.Itoa(confirmation) {
 			t.Fatalf("cleanup absence confirmation %d = %q", confirmation, got)
 		}
-	}
-	if err := cleanup(); err != nil {
-		t.Fatal(err)
 	}
 	current = getNodeLoadBalancerTestService(
 		t, fixture.ctx, fixture.provider, fixture.service.Namespace, fixture.service.Name,
