@@ -103,6 +103,44 @@ fails a resumed `init`. On `update` it changes only the NodeClass, so
 Karpenter drift replaces the workers while the fixed control planes keep
 their release.
 
+## Cilium load-balancer settings
+
+Two optional inventory values tune the bootstrap-owned `rke2-cilium`
+HelmChartConfig. Omit both to keep Cilium's defaults and the unchanged
+bootstrap spec. Either one requires a `modules_version` newer than
+`1.1.0-rc.4`.
+
+- `load_balancer_algorithm` sets Cilium's `loadBalancer.algorithm`: omitted
+  (Cilium's default, `random`), `"random"`, or `"maglev"`. Maglev
+  consistently hashes north-south Service traffic (Node-LB, NodePort, and
+  LoadBalancer frontends): every node that considers the same backend set
+  selects the same backend for a flow, and removing one backend remaps only its
+  own flows. Cilium's default Maglev table size (16381, suited to about 160
+  backends per Service) and its built-in cluster-wide hash seed are kept.
+  In-cluster ClusterIP traffic uses socket-level load balancing and is not
+  affected.
+- `service_topology` (default `false`) sets Cilium's
+  `loadBalancer.serviceTopology` when `true`.
+  Cilium honors a Service's `trafficDistribution` (`PreferSameNode`,
+  `PreferSameZone`, or `PreferClose`) only when it is enabled. That includes
+  the `PreferSameNode` default that CCM gives every Node-LB datapath Service,
+  which keeps traffic on the receiving LB node when a ready backend runs there
+  (for example an ingress that tolerates the Node-LB taint) and falls back to
+  every backend otherwise.
+
+Both values are creation-time choices. They are written into the immutable
+control-plane cloud-init and the on-disk HelmChartConfig, which `update` never
+rewrites, and `InSpaceCluster` rejects any later change. `update` and every
+other lifecycle command therefore refuse inventory values that differ from
+the persisted bootstrap spec; changing them requires a new cluster.
+
+After control-plane changes, `update` waits for the packaged `rke2-cilium`
+chart Job and then requires every Cilium agent to report zero
+`cilium_drift_checker_config_delta`. A non-zero value means an RKE2 upgrade
+changed `cilium-config` without restarting that agent; `update` stops before
+upgrading the cloud modules and names the affected agents so the operator can
+review the change and restart them.
+
 ## One or three control-plane servers
 
 Set `control_plane_replicas` to:

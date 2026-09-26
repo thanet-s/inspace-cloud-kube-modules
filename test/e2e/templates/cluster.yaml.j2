@@ -39,6 +39,8 @@ spec:
     privateLoadBalancerPool:
       start: "{{ lookup('env', 'INSPACE_PRIVATE_LOAD_BALANCER_POOL_START') }}"
       stop: "{{ lookup('env', 'INSPACE_PRIVATE_LOAD_BALANCER_POOL_STOP') }}"
+    loadBalancerAlgorithm: maglev
+    serviceTopology: true
   firewall:
     managed: true
   publicIPv4:

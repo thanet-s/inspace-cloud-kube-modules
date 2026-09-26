@@ -19,6 +19,12 @@ const (
 	PrivateLoadBalancerPoolMaxAddresses = 256
 	CiliumNativeRoutingPodCIDR          = "10.42.0.0/16"
 	KubernetesServiceCIDR               = "10.43.0.0/16"
+
+	// LoadBalancerAlgorithmRandom and LoadBalancerAlgorithmMaglev are the
+	// Cilium loadBalancer.algorithm values accepted by
+	// spec.network.loadBalancerAlgorithm. Empty keeps Cilium's default.
+	LoadBalancerAlgorithmRandom = "random"
+	LoadBalancerAlgorithmMaglev = "maglev"
 )
 
 var (
@@ -103,6 +109,18 @@ type NetworkSpec struct {
 	PodCIDR                 string                      `json:"podCIDR"`
 	ServiceCIDR             string                      `json:"serviceCIDR"`
 	PrivateLoadBalancerPool PrivateLoadBalancerPoolSpec `json:"privateLoadBalancerPool"`
+	// LoadBalancerAlgorithm optionally selects Cilium's service backend
+	// selection algorithm ("random" or "maglev"). Empty renders no value, so
+	// Cilium keeps its default (random) and the bootstrap cloud-init bytes are
+	// unchanged. It is rendered into the immutable control-plane cloud-init and
+	// is therefore fixed at cluster creation.
+	LoadBalancerAlgorithm string `json:"loadBalancerAlgorithm,omitempty"`
+	// ServiceTopology optionally enables Cilium's loadBalancer.serviceTopology.
+	// Cilium honors a Service's PreferSameNode or PreferSameZone
+	// trafficDistribution, including the PreferSameNode default of Node-LB
+	// datapath children, only when it is enabled. False renders no value and
+	// keeps the bootstrap cloud-init bytes. It is fixed at cluster creation.
+	ServiceTopology bool `json:"serviceTopology,omitempty"`
 }
 
 type PrivateLoadBalancerPoolSpec struct {
@@ -248,6 +266,11 @@ func (s InSpaceClusterSpec) Validate() []error {
 	}
 	if s.Network.ServiceCIDR != KubernetesServiceCIDR {
 		add("spec.network.serviceCIDR", "must be "+KubernetesServiceCIDR+" in v1alpha1")
+	}
+	switch s.Network.LoadBalancerAlgorithm {
+	case "", LoadBalancerAlgorithmRandom, LoadBalancerAlgorithmMaglev:
+	default:
+		add("spec.network.loadBalancerAlgorithm", "must be empty, random, or maglev")
 	}
 	virtualIPv4, virtualErr := netip.ParseAddr(s.Endpoint.VirtualIPv4)
 	if virtualErr != nil || !virtualIPv4.Is4() || !virtualIPv4.IsPrivate() {

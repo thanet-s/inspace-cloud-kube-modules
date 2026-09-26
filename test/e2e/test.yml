@@ -149,6 +149,7 @@
         - public-node-local-capacity.yaml
         - public-node-local-service.yaml
         - public-node-local-present.json
+        - private-local-service.yaml
 
     - name: Heal state left by an interrupted acceptance run
       ansible.builtin.shell: |
@@ -204,6 +205,7 @@
           - service/inspace-e2e-node-shared-conflict
           - service/inspace-e2e-node-dedicated
           - service/inspace-e2e-public-local
+          - service/inspace-e2e-private-local
           - --ignore-not-found
           - --wait=false
       changed_when: true
@@ -390,6 +392,7 @@
     e2e_node_lb_probe_ready: "{{ lookup('env', 'E2E_STATE_DIR') }}/node-load-balancer-probe.ready"
     e2e_public_local_capacity_manifest: "{{ lookup('env', 'E2E_STATE_DIR') }}/public-node-local-capacity.yaml"
     e2e_public_local_service_manifest: "{{ lookup('env', 'E2E_STATE_DIR') }}/public-node-local-service.yaml"
+    e2e_private_local_service_manifest: "{{ lookup('env', 'E2E_STATE_DIR') }}/private-local-service.yaml"
     e2e_public_local_snapshot: "{{ lookup('env', 'E2E_STATE_DIR') }}/public-node-local-present.json"
     e2e_public_local_nodeclass_name: "{{ e2e_state.publicLocalNodeClassName }}"
     e2e_public_local_nodepool_name: "{{ e2e_state.publicLocalNodePoolName }}"
@@ -459,6 +462,16 @@
       args:
         executable: /bin/bash
       changed_when: false
+
+    - name: Require every Cilium agent to run the current cilium-config
+      ansible.builtin.command:
+        argv:
+          - /opt/e2e/scripts/verify-cilium-config-drift.sh
+      register: e2e_cilium_config_drift
+      changed_when: false
+      retries: 30
+      delay: 10
+      until: e2e_cilium_config_drift.rc == 0
 
     - name: Require worker CSI registration
       ansible.builtin.shell: |
@@ -856,6 +869,176 @@
           ansible.builtin.command:
             argv: [kubectl, -n, kube-system, rollout, status, daemonset/cilium, --timeout=10m]
           changed_when: false
+
+    # Cilium 1.20.2 announces an externalTrafficPolicy Local L2 VIP only from a
+    # node with a ready local endpoint; earlier releases could hand the lease to
+    # a node that drops the traffic. The Service reuses the private-a workload,
+    # whose single replica runs on the one worker, so the lease holder must be
+    # that worker. It is deleted again before the paid public-NLB checks.
+    - name: Exercise a private externalTrafficPolicy Local L2 VIP
+      block:
+        - name: Read the running Cilium agent version
+          ansible.builtin.shell: |
+            set -euo pipefail
+            image=$(kubectl -n kube-system get daemonset cilium -o json | jq -er '
+              [.spec.template.spec.containers[] | select(.name == "cilium-agent") | .image] |
+              if length == 1 then .[0] else error("expected exactly one cilium-agent container") end')
+            python3 - "$image" <<'PY'
+            import re
+            import sys
+
+            match = re.search(r":v([0-9]+)\.([0-9]+)\.([0-9]+)(?:@sha256:[0-9a-f]{64})?$", sys.argv[1])
+            if match is None:
+                raise SystemExit(f"cannot read the Cilium agent version from image {sys.argv[1]!r}")
+            print(".".join(match.groups()))
+            PY
+          args:
+            executable: /bin/bash
+          register: e2e_cilium_agent_version
+          changed_when: false
+
+        - name: Require the Cilium release that fixes L2 announcements for Local traffic
+          ansible.builtin.assert:
+            that:
+              - e2e_cilium_agent_version.stdout is version('1.20.2', '>=')
+            fail_msg: >-
+              Cilium {{ e2e_cilium_agent_version.stdout }} predates 1.20.2, which
+              stops L2 announcements from dropping externalTrafficPolicy Local
+              traffic; the private Local VIP contract needs RKE2 v1.36.5-rc2+rke2r1
+              or later.
+
+        - name: Render the private Local L2 Service
+          ansible.builtin.template:
+            src: templates/private-local-service.yaml.j2
+            dest: "{{ e2e_private_local_service_manifest }}"
+            mode: "0600"
+
+        - name: Apply the private Local L2 Service on the existing private-a workload
+          ansible.builtin.command:
+            argv: [kubectl, apply, -f, "{{ e2e_private_local_service_manifest }}"]
+          changed_when: true
+
+        - name: Persist the private Local Service ownership
+          ansible.builtin.command:
+            argv:
+              - /opt/e2e/scripts/persist-workload.py
+              - --state
+              - "{{ e2e_state_file }}"
+              - --kubeconfig
+              - "{{ e2e_kubeconfig }}"
+          changed_when: true
+
+        - name: Require the private Local VIP lease on the only local-endpoint node
+          ansible.builtin.shell: |
+            set -euo pipefail
+            export E2E_PRIVATE_LOCAL_SERVICE_JSON
+            E2E_PRIVATE_LOCAL_SERVICE_JSON=$(kubectl -n default get service inspace-e2e-private-local -o json)
+            jq -e '
+              .metadata.labels["inspace.cloud/load-balancer-scope"] == "private" and
+              .spec.loadBalancerClass == "io.cilium/l2-announcer" and
+              .spec.externalTrafficPolicy == "Local" and
+              .spec.selector == {"app": "inspace-e2e-private-a"} and
+              any(.status.conditions[]?; .type == "cilium.io/IPAMRequestSatisfied" and .status == "True")' \
+              <<<"$E2E_PRIVATE_LOCAL_SERVICE_JSON" >/dev/null
+            vip=$(python3 - "$INSPACE_PRIVATE_LOAD_BALANCER_POOL_START" "$INSPACE_PRIVATE_LOAD_BALANCER_POOL_STOP" \
+              '{{ e2e_private_service_vips | to_json }}' <<'PY'
+            import ipaddress
+            import json
+            import os
+            import sys
+
+            start, stop = map(ipaddress.ip_address, sys.argv[1:3])
+            existing = set(json.loads(sys.argv[3]).values())
+            service = json.loads(os.environ["E2E_PRIVATE_LOCAL_SERVICE_JSON"])
+            ingresses = service.get("status", {}).get("loadBalancer", {}).get("ingress", [])
+            if len(ingresses) != 1 or not ingresses[0].get("ip"):
+                raise SystemExit("private Local Service does not have exactly one LB-IPAM address")
+            address = ipaddress.ip_address(ingresses[0]["ip"])
+            if address.version != 4 or not int(start) <= int(address) <= int(stop):
+                raise SystemExit("private Local VIP is outside the reserved range")
+            if str(address) in existing:
+                raise SystemExit("private Local VIP reuses another private Service VIP")
+            print(address)
+            PY
+            )
+            endpoint_node=$(kubectl -n default get endpointslices \
+              -l kubernetes.io/service-name=inspace-e2e-private-local -o json | jq -er '
+              [.items[].endpoints[]? |
+                select(.conditions.ready == true and (.conditions.terminating // false) == false) |
+                .nodeName] | unique |
+              if length == 1 then .[0] else error("expected exactly one ready local-endpoint node") end')
+            holder=$(kubectl -n kube-system get lease cilium-l2announce-default-inspace-e2e-private-local \
+              -o jsonpath='{.spec.holderIdentity}')
+            test "$holder" = "$endpoint_node"
+            pod=$(kubectl -n kube-system get pods -l k8s-app=cilium \
+              --field-selector "spec.nodeName=$holder" -o jsonpath='{.items[0].metadata.name}')
+            test -n "$pod"
+            state=$(kubectl -n kube-system exec "$pod" -- cilium-dbg shell -- db/show l2-announce)
+            grep -F -- "$vip" <<<"$state" >/dev/null
+            kubectl get ciliumloadbalancerippool inspace-private -o json | jq -e '
+              any(.status.conditions[]?; .type == "cilium.io/IPsUsed" and .message == "3")' >/dev/null
+            printf '%s\n' "$vip"
+          args:
+            executable: /bin/bash
+          register: e2e_private_local_vip
+          changed_when: false
+          retries: 120
+          delay: 5
+          until: e2e_private_local_vip.rc == 0
+
+        - name: Reach the private Local VIP from the VPC bastion
+          ansible.builtin.uri:
+            url: "http://{{ e2e_private_local_vip.stdout | trim }}/"
+            return_content: true
+            timeout: 10
+            use_proxy: false
+          delegate_to: e2e-bastion
+          register: e2e_private_local_response
+          retries: 60
+          delay: 5
+          until: >-
+            e2e_private_local_response.status == 200 and
+            e2e_private_local_response.content | trim == e2e_marker + '-private-a'
+
+        - name: Delete the private Local L2 Service
+          ansible.builtin.command:
+            argv:
+              - kubectl
+              - -n
+              - default
+              - delete
+              - service/inspace-e2e-private-local
+              - --ignore-not-found
+              - --wait=false
+          changed_when: true
+
+        # Cilium never deletes an L2 announcement Lease and its release can
+        # fail when the Service disappears, so an absent, unheld, or expired
+        # (two lease durations past its last renewal) Lease proves no agent
+        # still announces the VIP. The pool must return to the two same-port
+        # private VIPs.
+        - name: Require the private Local Service lease and VIP allocation to disappear
+          ansible.builtin.shell: |
+            set -euo pipefail
+            test -z "$(kubectl -n default get service/inspace-e2e-private-local --ignore-not-found -o name)"
+            lease_json=$(kubectl -n kube-system get lease \
+              cilium-l2announce-default-inspace-e2e-private-local --ignore-not-found -o json)
+            if [[ -n $lease_json ]]; then
+              jq -e --argjson now "$(date -u +%s)" '
+                (.spec.holderIdentity // "") == "" or
+                (((.spec.renewTime // .spec.acquireTime // "1970-01-01T00:00:00Z")
+                  | sub("[.][0-9]+Z$"; "Z") | fromdateiso8601)
+                  + 2 * (.spec.leaseDurationSeconds // 15) < $now)' <<<"$lease_json" >/dev/null
+            fi
+            kubectl get ciliumloadbalancerippool inspace-private -o json | jq -e '
+              any(.status.conditions[]?; .type == "cilium.io/IPsUsed" and .message == "2")' >/dev/null
+          args:
+            executable: /bin/bash
+          register: e2e_private_local_cleanup
+          changed_when: false
+          retries: 60
+          delay: 5
+          until: e2e_private_local_cleanup.rc == 0
 
     - name: Wait for the public TCP load balancer address
       ansible.builtin.shell: |

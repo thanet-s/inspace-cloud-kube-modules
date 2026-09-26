@@ -283,3 +283,48 @@ func TestControlPlaneImageAcceptsSupportedUbuntuReleases(t *testing.T) {
 		}
 	}
 }
+
+func TestLoadBalancerAlgorithmIsOptionalRandomOrMaglev(t *testing.T) {
+	for _, algorithm := range []string{"", LoadBalancerAlgorithmRandom, LoadBalancerAlgorithmMaglev} {
+		spec := validSpec()
+		spec.Network.LoadBalancerAlgorithm = algorithm
+		if errs := spec.Validate(); len(errs) != 0 {
+			t.Errorf("loadBalancerAlgorithm %q rejected: %v", algorithm, errs)
+		}
+	}
+	for _, algorithm := range []string{"Maglev", "MAGLEV", "round_robin", "least_request", " maglev", "maglev "} {
+		spec := validSpec()
+		spec.Network.LoadBalancerAlgorithm = algorithm
+		if errs := spec.Validate(); len(errs) == 0 {
+			t.Errorf("unsupported loadBalancerAlgorithm %q accepted", algorithm)
+		}
+	}
+}
+
+func TestLoadBalancerAlgorithmCRDIsOptionalEnumAndImmutable(t *testing.T) {
+	data, err := os.ReadFile("../../config/crd/bases/infrastructure.inspace.cloud_inspaceclusters.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	crd := string(data)
+	for _, required := range []string{
+		"loadBalancerAlgorithm:\n                      type: string\n                      enum: [random, maglev]",
+		"(has(self.loadBalancerAlgorithm) ? self.loadBalancerAlgorithm : '') == (has(oldSelf.loadBalancerAlgorithm) ? oldSelf.loadBalancerAlgorithm : '')",
+		"loadBalancerAlgorithm is immutable after cluster creation",
+		"serviceTopology:\n                      type: boolean",
+		"(has(self.serviceTopology) && self.serviceTopology) == (has(oldSelf.serviceTopology) && oldSelf.serviceTopology)",
+		"serviceTopology is immutable after cluster creation",
+	} {
+		if !strings.Contains(crd, required) {
+			t.Errorf("CRD does not contain loadBalancerAlgorithm contract fragment %q", required)
+		}
+	}
+	if !strings.Contains(crd, "required: [uuid, podCIDR, serviceCIDR, privateLoadBalancerPool]\n") {
+		t.Fatal("loadBalancerAlgorithm and serviceTopology must stay optional so existing clusters keep Cilium's defaults")
+	}
+	topologyStart := strings.Index(crd, "\n                    serviceTopology:")
+	topologyEnd := strings.Index(crd[topologyStart+1:], "\n                firewall:")
+	if topologyStart < 0 || topologyEnd < 0 || strings.Contains(crd[topologyStart:topologyStart+1+topologyEnd], "default:") {
+		t.Fatal("serviceTopology must have no CRD default; an omitted value must not be persisted as a new field")
+	}
+}

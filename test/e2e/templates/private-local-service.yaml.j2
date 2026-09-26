@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: inspace-e2e-private-local
+  namespace: default
+  labels:
+    inspace.cloud/load-balancer-scope: private
+spec:
+  type: LoadBalancer
+  loadBalancerClass: io.cilium/l2-announcer
+  externalTrafficPolicy: Local
+  selector: {app: inspace-e2e-private-a}
+  ports:
+    - name: http
+      protocol: TCP
+      port: 80
+      targetPort: 80

@@ -39,6 +39,12 @@ all:
     skip_os_upgrade: false
     # False uses the bastion cache for both fixed and Karpenter nodes.
     bootstrap_direct_download: false
+    # Optional Cilium load-balancer settings, fixed at cluster creation.
+    # Omit load_balancer_algorithm for Cilium's default (random) or set
+    # "random" or "maglev". service_topology: true makes Cilium honor
+    # Service trafficDistribution, including the Node-LB PreferSameNode default.
+    # load_balancer_algorithm: maglev
+    # service_topology: true
 
     ssh_username: inspace
     ssh_private_key_file: /home/example/.ssh/id_ed25519

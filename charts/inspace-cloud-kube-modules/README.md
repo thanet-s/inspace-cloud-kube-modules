@@ -88,9 +88,15 @@ taint/toleration and selector surface for the controllers. The
 tolerate it or select a node directly can bypass that placement guard. Cilium
 L2 Announcements is a beta feature and
 works only if the InSpace VPC accepts ARP and gratuitous ARP for VIPs that are
-not assigned to a VM NIC. Validate this behavior in the target VPC. Keep
-`externalTrafficPolicy: Cluster`; Cilium documents `Local` as incompatible with
-L2 Announcements.
+not assigned to a VM NIC. Validate this behavior in the target VPC.
+`externalTrafficPolicy: Cluster` is the default private contract. With the
+bundled Cilium 1.20.2 or later (RKE2 v1.36.5-rc2+rke2r1), a private Service may
+also use `externalTrafficPolicy: Local`: only nodes with a ready local endpoint
+compete for its L2 lease, so the VIP is announced from a node that serves it
+and the client source IP is preserved. The VIP moves only after the serving
+endpoint moves and a new node wins the lease, so run more than one replica
+when the brief failover gap matters. Earlier Cilium releases could announce a
+Local VIP from a node without an endpoint and drop the traffic.
 
 The node-load-balancer class defaults to shared mode when the mode annotation is
 omitted:
@@ -306,7 +312,8 @@ convergence instead. For both `Local` and `Cluster`, nodes labeled
 `node-role.kubernetes.io/master` are excluded from public NLB targets.
 Kubernetes defaults an omitted policy to `Cluster`, so public Services that
 need local-endpoint targeting must set `externalTrafficPolicy: Local`
-explicitly. Private Cilium L2 Services must remain `Cluster`.
+explicitly. Private Cilium L2 Services use `Cluster`, or `Local` with Cilium
+1.20.2 or later as described above.
 See [`service-private-l2.yaml`](examples/service-private-l2.yaml),
 [`service-public-nlb.yaml`](examples/service-public-nlb.yaml),
 [`service-public-node-shared.yaml`](examples/service-public-node-shared.yaml),

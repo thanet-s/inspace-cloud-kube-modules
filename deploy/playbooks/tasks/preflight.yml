@@ -82,6 +82,26 @@
       controllers accept only 24.04. Raise modules_version or set
       os_version: "24.04".
 
+# The optional Cilium load-balancer settings are rendered into the immutable
+# control-plane cloud-init. Omitted values keep Cilium's defaults and the
+# unchanged bootstrap bytes; load-state rejects values that differ from the
+# persisted spec, so they are chosen once at cluster creation.
+- name: Resolve the optional Cilium load-balancer settings
+  ansible.builtin.set_fact:
+    deploy_load_balancer_algorithm: "{{ load_balancer_algorithm | default('', true) | string }}"
+    deploy_service_topology: "{{ service_topology | default(false) | bool }}"
+
+- name: Require supported Cilium load-balancer settings
+  ansible.builtin.assert:
+    that:
+      - deploy_load_balancer_algorithm in ['', 'random', 'maglev']
+      - service_topology is not defined or service_topology is boolean
+      - (deploy_load_balancer_algorithm == '' and not (deploy_service_topology | bool)) or modules_version is version('1.1.0-rc.4', '>', version_type='semver')
+    fail_msg: >-
+      load_balancer_algorithm must be omitted, "random", or "maglev";
+      service_topology must be a boolean; and either setting requires a
+      modules_version newer than 1.1.0-rc.4.
+
 - name: Reject bootstrap-owned RKE2 keys from operator extra configuration
   ansible.builtin.assert:
     that:

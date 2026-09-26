@@ -89,6 +89,11 @@ def node_load_balancer_datapath_name(service: dict) -> str:
     return "inlb-dp-" + node_load_balancer_service_identity(service)
 
 
+def expected_datapath_traffic_distribution(parent_spec: dict) -> str:
+    """Mirror CCM: copy an explicit parent value, else prefer the LB node."""
+    return parent_spec.get("trafficDistribution") or "PreferSameNode"
+
+
 def generated_datapath_owner_name(service: dict) -> str | None:
     metadata = service.get("metadata", {})
     if metadata.get("labels", {}).get(NODE_LOAD_BALANCER_DATAPATH_LABEL) != "true":
@@ -784,6 +789,10 @@ def prove_present(
                 for port in datapath_spec.get("ports", [])
             } == expected_ports,
             f"Service/{datapath_name} must mirror the parent selector and ports",
+        )
+        require(
+            datapath_spec.get("trafficDistribution") == expected_datapath_traffic_distribution(spec),
+            f"Service/{datapath_name} must copy an explicit parent trafficDistribution or default to PreferSameNode",
         )
         private_vip = service_private_vip(datapath)
         require(

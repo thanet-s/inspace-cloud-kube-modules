@@ -1312,7 +1312,9 @@
           .data["enable-bpf-masquerade"] == "true" and
           .data["enable-egress-gateway"] == "true" and
           .data["enable-l2-announcements"] == "true" and
-          .data["default-lb-service-ipam"] == "none"'
+          .data["default-lb-service-ipam"] == "none" and
+          .data["bpf-lb-algorithm"] == "maglev" and
+          .data["enable-service-topology"] == "true"'
         values=$(kubectl -n kube-system get helmchartconfig rke2-cilium -o jsonpath='{.spec.valuesContent}')
         grep -Eq '^[[:space:]]*defaultLBServiceIPAM:[[:space:]]*none[[:space:]]*$' <<<"$values"
         ! grep -Eq '^[[:space:]]*nodeIPAM:[[:space:]]*$' <<<"$values"
@@ -1337,6 +1339,8 @@
         assert values["defaultLBServiceIPAM"] == "none"
         assert "nodeIPAM" not in values
         assert values["k8sClientRateLimit"] == {"qps": qps, "burst": max(20, 2 * qps)}
+        assert values["loadBalancer"] == {"algorithm": "maglev", "serviceTopology": True}
+        assert "maglev" not in values
         PY
         kubectl get ciliumloadbalancerippool inspace-private -o json | jq -e \
           --arg start "$INSPACE_PRIVATE_LOAD_BALANCER_POOL_START" \
@@ -1362,6 +1366,7 @@
         grep -E 'KubeProxyReplacement:[[:space:]]+True' <<<"$cilium_status"
         grep -E '(Routing:.*Native|Direct Routing)' <<<"$cilium_status"
         grep -E 'Masquerading:[[:space:]]+BPF' <<<"$cilium_status"
+        grep -E 'Backend Selection:[[:space:]]+Maglev' <<<"$cilium_status"
       args:
         executable: /bin/bash
       register: e2e_cilium_private_lb_ready
@@ -1369,6 +1374,16 @@
       retries: 120
       delay: 5
       until: e2e_cilium_private_lb_ready.rc == 0
+
+    - name: Require every Cilium agent to run the current cilium-config
+      ansible.builtin.command:
+        argv:
+          - /opt/e2e/scripts/verify-cilium-config-drift.sh
+      register: e2e_cilium_config_drift
+      changed_when: false
+      retries: 30
+      delay: 10
+      until: e2e_cilium_config_drift.rc == 0
 
     - name: Prove three pinned kube-vip mirror pods and one elected lease holder
       ansible.builtin.shell: |

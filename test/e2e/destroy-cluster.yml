@@ -218,6 +218,7 @@
           - service/inspace-e2e-web
           - service/inspace-e2e-private-a
           - service/inspace-e2e-private-b
+          - service/inspace-e2e-private-local
           - service/inspace-e2e-node-traefik
           - service/inspace-e2e-node-shared-b
           - service/inspace-e2e-node-shared-conflict
@@ -286,7 +287,8 @@
         set -euo pipefail
         for lease in \
           cilium-l2announce-default-inspace-e2e-private-a \
-          cilium-l2announce-default-inspace-e2e-private-b; do
+          cilium-l2announce-default-inspace-e2e-private-b \
+          cilium-l2announce-default-inspace-e2e-private-local; do
           lease_json=$(kubectl --kubeconfig "{{ e2e_kubeconfig }}" -n kube-system \
             get lease "$lease" --ignore-not-found -o json)
           if [[ -n $lease_json ]]; then

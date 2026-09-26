@@ -109,6 +109,62 @@ def main() -> None:
         and "`os_version`" in readme,
         "example inventory and README must document os_version with a 26.04-capable modules_version",
     )
+    load_state = read("deploy/playbooks/tasks/load-state.yml")
+    require(
+        "{% if deploy_load_balancer_algorithm %}\n"
+        "    loadBalancerAlgorithm: {{ deploy_load_balancer_algorithm }}\n"
+        "{% endif %}\n"
+        "{% if deploy_service_topology | bool %}\n"
+        "    serviceTopology: true\n"
+        "{% endif %}" in cluster_template,
+        "cluster template must render Cilium load-balancer fields only when the inventory selects them",
+    )
+    require(
+        "deploy_load_balancer_algorithm: \"{{ load_balancer_algorithm | default('', true) | string }}\"" in preflight
+        and "deploy_service_topology: \"{{ service_topology | default(false) | bool }}\"" in preflight
+        and "deploy_load_balancer_algorithm in ['', 'random', 'maglev']" in preflight
+        and "service_topology is not defined or service_topology is boolean" in preflight
+        and "(deploy_load_balancer_algorithm == '' and not (deploy_service_topology | bool)) or "
+        "modules_version is version('1.1.0-rc.4', '>', version_type='semver')" in preflight,
+        "preflight must allow only supported Cilium load-balancer settings on a supporting release",
+    )
+    require(
+        "persisted_inspace_cluster.spec.network.get('loadBalancerAlgorithm', '') == deploy_load_balancer_algorithm"
+        in load_state
+        and "persisted_inspace_cluster.spec.network.get('serviceTopology', false) | bool == deploy_service_topology | bool"
+        in load_state,
+        "every lifecycle command must refuse Cilium load-balancer settings that differ from the immutable bootstrap spec",
+    )
+    require(
+        "`load_balancer_algorithm`" in readme
+        and "`service_topology`" in readme
+        and "creation-time" in readme
+        and re.search(r"(?m)^    # load_balancer_algorithm: maglev$", inventory) is not None
+        and re.search(r"(?m)^    # service_topology: true$", inventory) is not None,
+        "README and example inventory must document the creation-time Cilium load-balancer settings",
+    )
+    drift_script = read("deploy/scripts/verify-cilium-config-drift.sh")
+    require(
+        "cilium_drift_checker_config_delta" in drift_script
+        and "cilium-dbg metrics list -p drift_checker_config_delta -o json" in drift_script,
+        "deploy Cilium drift proof must read the agent drift metric",
+    )
+    helm_wait = "Wait for the rke2-cilium chart install Job after control-plane changes"
+    drift_check = "Require every Cilium agent to run the current cilium-config"
+    require(
+        update.index("tasks/apply-control-plane-config.yml") < update.index(helm_wait) < update.index(drift_check)
+        and update.index(drift_check) < update.index("Upgrade the exact CCM CSI and Karpenter chart"),
+        "update must prove Cilium applied its ConfigMap after RKE2 changes and before chart upgrades",
+    )
+    drift_task = update[update.index(drift_check):update.index("Refresh the cloud API Secret")]
+    require(
+        "{{ deploy_root }}/scripts/verify-cilium-config-drift.sh" in drift_task
+        and "register: deploy_cilium_config_drift" in drift_task
+        and "until: deploy_cilium_config_drift.rc == 0" in drift_task
+        and "retries: 30" in drift_task
+        and "delay: 10" in drift_task,
+        "update Cilium drift proof must be a bounded wait",
+    )
     for ignored in ("deploy/inventory.yml", "deploy/inventory/", "deploy/.state/"):
         require(ignored in gitignore, f"missing Git exclusion {ignored}")
         require(ignored in dockerignore, f"missing Docker exclusion {ignored}")

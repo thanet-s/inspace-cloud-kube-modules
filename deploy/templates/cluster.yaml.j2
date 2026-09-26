@@ -39,6 +39,12 @@ spec:
     privateLoadBalancerPool:
       start: "{{ private_load_balancer_pool_start }}"
       stop: "{{ private_load_balancer_pool_stop }}"
+{% if deploy_load_balancer_algorithm %}
+    loadBalancerAlgorithm: {{ deploy_load_balancer_algorithm }}
+{% endif %}
+{% if deploy_service_topology | bool %}
+    serviceTopology: true
+{% endif %}
   firewall:
     managed: true
   publicIPv4:

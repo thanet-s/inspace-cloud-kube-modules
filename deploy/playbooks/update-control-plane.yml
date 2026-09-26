@@ -33,6 +33,37 @@
     - name: Apply operator RKE2 configuration with one-at-a-time restarts
       ansible.builtin.include_tasks: tasks/apply-control-plane-config.yml
 
+    # An RKE2 upgrade can ship a new rke2-cilium chart whose cilium-config
+    # changes without restarting every agent. Wait for the packaged chart Job,
+    # then require each agent's drift checker to report zero pending keys.
+    - name: Wait for the rke2-cilium chart install Job after control-plane changes
+      ansible.builtin.shell: |
+        set -euo pipefail
+        export KUBECONFIG={{ (deploy_state_dir + '/kubeconfig.yaml') | quote }}
+        job="$(kubectl -n kube-system get helmchart.helm.cattle.io rke2-cilium -o jsonpath='{.status.jobName}')"
+        test -n "$job"
+        kubectl -n kube-system wait --for=condition=complete "job/$job" --timeout=15m
+        kubectl -n kube-system rollout status daemonset/cilium --timeout=15m
+      args:
+        executable: /bin/bash
+      register: deploy_cilium_chart_settled
+      changed_when: false
+      retries: 3
+      delay: 10
+      until: deploy_cilium_chart_settled.rc == 0
+
+    - name: Require every Cilium agent to run the current cilium-config
+      ansible.builtin.command:
+        argv:
+          - "{{ deploy_root }}/scripts/verify-cilium-config-drift.sh"
+      environment:
+        KUBECONFIG: "{{ deploy_state_dir }}/kubeconfig.yaml"
+      register: deploy_cilium_config_drift
+      changed_when: false
+      retries: 30
+      delay: 10
+      until: deploy_cilium_config_drift.rc == 0
+
     - name: Refresh the cloud API Secret
       ansible.builtin.shell: |
         set -euo pipefail

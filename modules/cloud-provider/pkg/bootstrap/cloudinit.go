@@ -10,6 +10,8 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+
+	"github.com/thanet-s/inspace-cloud-kube-modules/modules/cloud-provider/api/v1alpha1"
 )
 
 var (
@@ -195,6 +197,21 @@ type CloudInitInput struct {
 	// SkipOSUpgrade removes only apt-get upgrade from the bounded package
 	// stage. Repository setup, apt-get update, and required installs remain.
 	SkipOSUpgrade bool
+	// LoadBalancerAlgorithm is empty (Cilium's default), "random", or
+	// "maglev". Empty renders no algorithm value at all.
+	LoadBalancerAlgorithm string
+	// ServiceTopology enables Cilium's enable-service-topology, which Cilium
+	// requires before it honors a Service's PreferSameNode or PreferSameZone
+	// trafficDistribution. False renders no value at all.
+	ServiceTopology bool
+}
+
+// ciliumLoadBalancerOptions are the optional rke2-cilium loadBalancer values.
+// The zero value renders no loadBalancer block, keeping the established
+// cloud-init bytes.
+type ciliumLoadBalancerOptions struct {
+	Algorithm       string
+	ServiceTopology bool
 }
 
 // RenderCloudInitJSON returns the JSON object expected by InSpace's
@@ -239,8 +256,15 @@ func RenderCloudInitJSON(input CloudInitInput) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	switch input.LoadBalancerAlgorithm {
+	case "", v1alpha1.LoadBalancerAlgorithmRandom, v1alpha1.LoadBalancerAlgorithmMaglev:
+	default:
+		return "", errors.New("bootstrap: load-balancer algorithm must be empty, random, or maglev")
+	}
 	config := renderRKE2Config(input)
-	ciliumConfig := renderRKE2CiliumConfig(input.PodCIDR, privatePool.AddressCount, input.SingleControlPlane)
+	ciliumConfig := renderRKE2CiliumConfig(input.PodCIDR, privatePool.AddressCount, input.SingleControlPlane, ciliumLoadBalancerOptions{
+		Algorithm: input.LoadBalancerAlgorithm, ServiceTopology: input.ServiceTopology,
+	})
 	ciliumLoadBalancerConfig := renderCiliumPrivateLoadBalancerManifest(input.PrivateLoadBalancerPoolStart, input.PrivateLoadBalancerPoolStop)
 	kubeVIPConfig := renderKubeVIPStaticPod(input.VirtualIPv4, input.BootstrapCache)
 	script := renderInstallScript(input)
@@ -401,7 +425,13 @@ func renderRKE2Config(input CloudInitInput) string {
 	return strings.Join(lines, "\n") + "\n"
 }
 
-func renderRKE2CiliumConfig(podCIDR string, privateLoadBalancerAddressCount uint64, singleControlPlane bool) string {
+// renderRKE2CiliumConfig renders a loadBalancer block only for explicitly
+// selected options, so an omitted algorithm and disabled service topology keep
+// the established bytes. Maglev keeps Cilium's default table size and
+// cluster-wide hash seed. Cilium honors a Service's PreferSameNode or
+// PreferSameZone trafficDistribution (including the Node-LB child default)
+// only with serviceTopology enabled.
+func renderRKE2CiliumConfig(podCIDR string, privateLoadBalancerAddressCount uint64, singleControlPlane bool, loadBalancer ciliumLoadBalancerOptions) string {
 	qps := (privateLoadBalancerAddressCount + 4) / 5
 	if qps < 10 {
 		qps = 10
@@ -413,6 +443,16 @@ func renderRKE2CiliumConfig(podCIDR string, privateLoadBalancerAddressCount uint
 	operatorValues := ""
 	if singleControlPlane {
 		operatorValues = "    operator:\n      replicas: 1\n"
+	}
+	loadBalancerValues := ""
+	if loadBalancer.Algorithm != "" {
+		loadBalancerValues += "      algorithm: " + loadBalancer.Algorithm + "\n"
+	}
+	if loadBalancer.ServiceTopology {
+		loadBalancerValues += "      serviceTopology: true\n"
+	}
+	if loadBalancerValues != "" {
+		loadBalancerValues = "    loadBalancer:\n" + loadBalancerValues
 	}
 	return fmt.Sprintf(`apiVersion: helm.cattle.io/v1
 kind: HelmChartConfig
@@ -432,7 +472,7 @@ spec:
       enabled: true
     l2announcements:
       enabled: true
-    defaultLBServiceIPAM: none
+%s    defaultLBServiceIPAM: none
     k8sClientRateLimit:
       qps: %d
       burst: %d
@@ -440,7 +480,7 @@ spec:
       mode: kubernetes
     k8sServiceHost: localhost
     k8sServicePort: 6443
-`, operatorValues, yamlString(podCIDR), qps, burst)
+`, operatorValues, yamlString(podCIDR), loadBalancerValues, qps, burst)
 }
 
 func renderRKE2SingleControlPlaneCoreDNSConfig() string {
