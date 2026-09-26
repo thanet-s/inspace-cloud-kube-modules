@@ -254,6 +254,36 @@
         mode: "0600"
       no_log: true
 
+    # Release tags are mutable. Both the nested controller, which holds the
+    # API and RKE2 tokens, and the chart workloads run by the image-index
+    # digests recorded in the immutable GitHub releases; the resolver checks
+    # every record and registry body against its digest and the image labels
+    # against the exact version before anything is pulled.
+    - name: Resolve the immutable bootstrap controller image
+      ansible.builtin.command:
+        argv:
+          - python3
+          - "{{ deploy_root }}/scripts/resolve_release_images.py"
+          - "{{ bootstrap_controller_version }}"
+      register: deploy_bootstrap_release_images
+      changed_when: false
+
+    - name: Resolve the immutable released module images
+      ansible.builtin.command:
+        argv:
+          - python3
+          - "{{ deploy_root }}/scripts/resolve_release_images.py"
+          - "{{ modules_version }}"
+      register: deploy_modules_release_images_result
+      changed_when: false
+
+    - name: Load the immutable release image references
+      ansible.builtin.set_fact:
+        bootstrap_controller_image: >-
+          {{ (deploy_bootstrap_release_images.stdout | from_json).images['inspace-cloud-controller-manager'].releaseReference }}
+        deploy_modules_release_images: >-
+          {{ (deploy_modules_release_images_result.stdout | from_json).images }}
+
     - name: Pull the exact bootstrap controller release
       ansible.builtin.command:
         argv:
@@ -261,7 +291,7 @@
           - pull
           - --platform
           - linux/amd64
-          - "ghcr.io/thanet-s/inspace-cloud-controller-manager:{{ bootstrap_controller_version }}"
+          - "{{ bootstrap_controller_image }}"
       changed_when: true
 
     # Gateway API control planes wait for this exact bundle before RKE2 starts.
@@ -274,7 +304,7 @@
         bundle={{ (deploy_state_dir + '/gateway-api-standard-install.yaml') | quote }}
         docker run --platform linux/amd64 --rm --network=none \
           --entrypoint /usr/local/bin/inspace-cluster-controller \
-          "ghcr.io/thanet-s/inspace-cloud-controller-manager:{{ bootstrap_controller_version }}" \
+          {{ bootstrap_controller_image | quote }} \
           --print-gateway-api-crds >"$bundle.partial"
         test "$(sha256sum "$bundle.partial" | awk '{print $1}')" = {{ deploy_gateway_api_bundle_sha256 | quote }}
         chmod 0600 "$bundle.partial"
@@ -311,7 +341,7 @@
           - INSPACE_BOOTSTRAP_CACHE_NOT_BEFORE
           - --mount
           - "type=bind,src={{ deploy_state_dir }},dst=/state"
-          - "ghcr.io/thanet-s/inspace-cloud-controller-manager:{{ bootstrap_controller_version }}"
+          - "{{ bootstrap_controller_image }}"
           - --cluster-config
           - /state/cluster.yaml
           - --ssh-public-key-file

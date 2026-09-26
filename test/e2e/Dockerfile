@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 
-FROM golang:1.27.1-bookworm AS local-controller-builder
+FROM golang:1.27.1-bookworm@sha256:69a7b9788769bec032d238959b61854e9ae87f57be9029ec04e9885fabf99195 AS local-controller-builder
 
 ARG E2E_RELEASE_VERSION=dev
 
@@ -15,7 +15,7 @@ RUN cd modules/cloud-provider && \
       -ldflags="-s -w -X=github.com/thanet-s/inspace-cloud-kube-modules/modules/client/version.Version=${E2E_RELEASE_VERSION}" \
       -o /out/inspace-cluster-controller ./cmd/inspace-cluster-controller
 
-FROM ubuntu:26.04 AS base
+FROM ubuntu:26.04@sha256:da6fc2be547864451aa253836dd926da33623312df4a9a243e35dc877c378a78 AS base
 
 ARG TARGETARCH
 ARG KUBECTL_VERSION=v1.36.4
@@ -34,7 +34,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 -m venv /opt/ansible
 
 COPY test/e2e/requirements.txt /tmp/requirements.txt
-RUN /opt/ansible/bin/pip install --no-cache-dir --disable-pip-version-check \
+RUN /opt/ansible/bin/pip install --no-cache-dir --disable-pip-version-check --require-hashes \
       -r /tmp/requirements.txt && rm -f /tmp/requirements.txt
 
 RUN set -eux; \

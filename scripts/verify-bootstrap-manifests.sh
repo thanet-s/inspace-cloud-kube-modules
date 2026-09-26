@@ -103,6 +103,47 @@ helm template bootstrap "$chart" --namespace kube-system --values "$values" \
 grep -F "          image: $cache_registry/thanet-s/inspace-cloud-controller-manager@$digest" \
   "$tmpdir/cached-digest.yaml" >/dev/null
 
+# A release chart carries the exact tag and the immutable index digest for
+# every controller; the digest must win so pods never resolve the mutable tag.
+csi_digest=sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+karpenter_digest=sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+helm template bootstrap "$chart" --namespace kube-system --values "$values" \
+  --set-string ccm.image.tag=1.2.3 --set-string "ccm.image.digest=$digest" \
+  --set-string csi.image.tag=1.2.3 --set-string "csi.image.digest=$csi_digest" \
+  --set-string karpenter.image.tag=1.2.3 --set-string "karpenter.image.digest=$karpenter_digest" \
+  >"$tmpdir/release-digests.yaml"
+test "$(grep -Fxc "          image: ghcr.io/thanet-s/inspace-cloud-controller-manager@$digest" \
+  "$tmpdir/release-digests.yaml")" -eq 1
+test "$(grep -Fxc "          image: ghcr.io/thanet-s/inspace-csi-driver@$csi_digest" \
+  "$tmpdir/release-digests.yaml")" -eq 2
+test "$(grep -Fxc "          image: ghcr.io/thanet-s/karpenter-provider-inspace@$karpenter_digest" \
+  "$tmpdir/release-digests.yaml")" -eq 1
+if grep -E 'image: ghcr\.io/thanet-s/[a-z-]+:' "$tmpdir/release-digests.yaml" >/dev/null; then
+  echo "a digest-pinned controller image still renders by tag" >&2
+  exit 1
+fi
+
+# The bootstrap cache stores only each release's linux/amd64 manifest, so
+# cache-mode installs override the digests with those platform digests; the
+# rewritten repository must keep them.
+helm template bootstrap "$chart" --namespace kube-system --values "$values" \
+  --set-string "global.inspace.systemImageRegistry=$cache_registry" \
+  --set-string ccm.image.tag=1.2.3 --set-string "ccm.image.digest=$digest" \
+  --set-string csi.image.tag=1.2.3 --set-string "csi.image.digest=$csi_digest" \
+  --set-string karpenter.image.tag=1.2.3 --set-string "karpenter.image.digest=$karpenter_digest" \
+  >"$tmpdir/cached-release-digests.yaml"
+test "$(grep -Fxc "          image: $cache_registry/thanet-s/inspace-cloud-controller-manager@$digest" \
+  "$tmpdir/cached-release-digests.yaml")" -eq 1
+test "$(grep -Fxc "          image: $cache_registry/thanet-s/inspace-csi-driver@$csi_digest" \
+  "$tmpdir/cached-release-digests.yaml")" -eq 2
+test "$(grep -Fxc "          image: $cache_registry/thanet-s/karpenter-provider-inspace@$karpenter_digest" \
+  "$tmpdir/cached-release-digests.yaml")" -eq 1
+if grep -E "image: ($cache_registry/)?(ghcr\\.io/)?thanet-s/[a-z-]+:" \
+  "$tmpdir/cached-release-digests.yaml" >/dev/null; then
+  echo "a digest-pinned cached controller image still renders by tag" >&2
+  exit 1
+fi
+
 helm template bootstrap "$chart" --namespace kube-system --values "$values" \
   --set-string "global.inspace.systemImageRegistry=$cache_registry" \
   --set-string ccm.image.repository=quay.io/example/custom-ccm \

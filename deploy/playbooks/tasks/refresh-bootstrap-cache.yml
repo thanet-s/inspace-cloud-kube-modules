@@ -25,7 +25,7 @@
       - pull
       - --platform
       - linux/amd64
-      - "ghcr.io/thanet-s/inspace-cloud-controller-manager:{{ modules_version }}"
+      - "{{ deploy_modules_release_images['inspace-cloud-controller-manager'].releaseReference }}"
   changed_when: false
 
 - name: Print the target release's bootstrap cache refresh manifest offline
@@ -34,7 +34,7 @@
     manifest={{ deploy_cache_refresh_manifest | quote }}
     if ! docker run --platform linux/amd64 --rm --network=none \
       --entrypoint /usr/local/bin/inspace-cluster-controller \
-      "ghcr.io/thanet-s/inspace-cloud-controller-manager:{{ modules_version }}" \
+      {{ deploy_modules_release_images['inspace-cloud-controller-manager'].releaseReference | quote }} \
       --print-bootstrap-cache-refresh \
       --bootstrap-cache-rke2-version {{ deploy_cache_refresh_rke2_version | quote }} \
       --bootstrap-cache-disable {{ persisted_inspace_cluster.spec.rke2.disable | default([]) | join(',') | quote }} \

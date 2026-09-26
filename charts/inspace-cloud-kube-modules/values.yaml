@@ -38,7 +38,8 @@ ccm:
   replicaCount: 2
   image:
     repository: ghcr.io/thanet-s/inspace-cloud-controller-manager
-    # Empty follows Chart.appVersion; release packaging replaces it with the exact version.
+    # Empty follows Chart.appVersion. Release packaging sets the exact version
+    # and the immutable image-index digest, which takes precedence when set.
     tag: ""
     digest: ""
     pullPolicy: IfNotPresent
@@ -77,7 +78,8 @@ csi:
   enabled: true
   image:
     repository: ghcr.io/thanet-s/inspace-csi-driver
-    # Empty follows Chart.appVersion; release packaging replaces it with the exact version.
+    # Empty follows Chart.appVersion. Release packaging sets the exact version
+    # and the immutable image-index digest, which takes precedence when set.
     tag: ""
     digest: ""
     pullPolicy: IfNotPresent
@@ -169,7 +171,8 @@ karpenter:
   replicaCount: 1
   image:
     repository: ghcr.io/thanet-s/karpenter-provider-inspace
-    # Empty follows Chart.appVersion; release packaging replaces it with the exact version.
+    # Empty follows Chart.appVersion. Release packaging sets the exact version
+    # and the immutable image-index digest, which takes precedence when set.
     tag: ""
     digest: ""
     pullPolicy: IfNotPresent

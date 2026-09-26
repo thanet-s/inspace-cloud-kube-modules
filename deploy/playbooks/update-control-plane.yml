@@ -24,6 +24,22 @@
       ansible.builtin.set_fact:
         bootstrap_result: "{{ lookup('file', deploy_state_dir + '/bootstrap-result.json') | from_json }}"
 
+    # Resolve before any cluster change: the chart workloads run by the
+    # digests recorded in the immutable GitHub release, never by a tag.
+    - name: Resolve the immutable released module images
+      ansible.builtin.command:
+        argv:
+          - python3
+          - "{{ deploy_root }}/scripts/resolve_release_images.py"
+          - "{{ modules_version }}"
+      register: deploy_modules_release_images_result
+      changed_when: false
+
+    - name: Load the immutable module image digests
+      ansible.builtin.set_fact:
+        deploy_modules_release_images: >-
+          {{ (deploy_modules_release_images_result.stdout | from_json).images }}
+
     - name: Start the private API tunnel and wait for readiness
       ansible.builtin.include_tasks: tasks/start-tunnel.yml
 

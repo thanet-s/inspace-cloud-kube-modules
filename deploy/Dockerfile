@@ -24,7 +24,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=docker-cli /usr/local/bin/docker /usr/local/bin/docker
 COPY --from=helm /usr/bin/helm /usr/local/bin/helm
 COPY deploy/requirements.lock.txt /tmp/requirements.lock.txt
-RUN /opt/ansible/bin/pip install --no-cache-dir \
+RUN /opt/ansible/bin/pip install --no-cache-dir --require-hashes \
       -r /tmp/requirements.lock.txt && \
     rm -f /tmp/requirements.lock.txt
 
