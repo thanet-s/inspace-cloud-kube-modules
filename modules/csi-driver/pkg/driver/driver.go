@@ -167,6 +167,9 @@ func cloudStatus(operation string, err error) error {
 		return status.Error(codes.PermissionDenied, operation+": InSpace API denied the operation")
 	case errors.Is(err, cloud.ErrConflict):
 		return status.Error(codes.Aborted, operation+": InSpace API reported a concurrent conflict")
+	case errors.Is(err, cloud.ErrRejected):
+		// Final for this request; keep InSpace's reason (e.g. quota) visible.
+		return status.Errorf(codes.InvalidArgument, "%s: InSpace API rejected the request: %v", operation, err)
 	default:
 		return status.Errorf(codes.Internal, "%s failed: %v", operation, err)
 	}

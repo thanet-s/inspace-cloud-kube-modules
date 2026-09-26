@@ -65,6 +65,7 @@ type fakeAPI struct {
 	lastResizeGiB          int
 	resizeMutationError    error
 	suppressResizeCommit   bool
+	exactDiskReads         int
 }
 
 // detailSequenceAPI can replace a specific canonical detail read while all
@@ -287,6 +288,7 @@ func (f *fakeAPI) CreateDisk(_ context.Context, _ string, req sdk.CreateDiskRequ
 }
 
 func (f *fakeAPI) GetDisk(_ context.Context, _ string, id string) (*sdk.Disk, error) {
+	f.exactDiskReads++
 	if f.mutationCalls() != 0 && f.readbackError != nil {
 		return nil, f.readbackError
 	}

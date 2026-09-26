@@ -18,8 +18,8 @@ import (
 // online-only: a detached disk returns cloud.ErrVolumeNotAttached. The PATCH
 // carries an absolute target size and the API rejects shrinking, so replaying
 // it after an ambiguous response cannot grow the disk twice. That is why this
-// path needs no durable mutation fence; exact disk readback is the only
-// completion authority.
+// path needs no durable mutation fence; exact disk readback is the completion
+// authority. A complete non-retryable rejection returns its cause at once.
 func (a *Adapter) ExpandVolume(ctx context.Context, location, volumeID string, capacityBytes int64) (int64, error) {
 	sizeGiB, err := bytesToGiB(capacityBytes)
 	if err != nil {
@@ -82,6 +82,16 @@ func (a *Adapter) ExpandVolume(ctx context.Context, location, volumeID string, c
 	if errors.Is(mutationErr, sdk.ErrMutationBlocked) {
 		return 0, mutationErr
 	}
+	if rejection := definitiveResizeRejection(mutationErr); rejection != nil {
+		// A complete non-retryable answer is final for this request. One exact
+		// read still accepts a resize that raced in, such as a 409 behind a
+		// concurrent identical PATCH.
+		disk, err := a.getOwnedDisk(ctx, location, volumeID)
+		if err == nil && disk.SizeGiB >= sizeGiB {
+			return diskCapacity(location, disk)
+		}
+		return 0, rejection
+	}
 	readbackCtx, cancel := a.mutationReadbackContext(ctx)
 	defer cancel()
 	resized, err := a.waitForDiskSize(readbackCtx, location, volumeID, sizeGiB)
@@ -90,6 +100,24 @@ func (a *Adapter) ExpandVolume(ctx context.Context, location, volumeID string, c
 			cloud.ErrUnavailable, volumeID, sizeGiB, errors.Join(normalizeAPIError(mutationErr), err))
 	}
 	return diskCapacity(location, resized)
+}
+
+// definitiveResizeRejection classifies a complete, non-retryable 4xx answer to
+// the resize PATCH. Timeouts, throttling, 5xx, and transport errors return nil:
+// their outcome is ambiguous, so exact readback stays the completion authority.
+func definitiveResizeRejection(err error) error {
+	var apiErr *sdk.APIError
+	if !errors.As(err, &apiErr) || apiErr.Retryable {
+		return nil
+	}
+	switch status := apiErr.StatusCode; {
+	case status < 400 || status >= 500, status == 408, status == 425, status == 429:
+		return nil
+	case status == 401 || status == 403 || status == 404 || status == 409:
+		return normalizeAPIError(err)
+	default:
+		return fmt.Errorf("%w: %v", cloud.ErrRejected, err)
+	}
 }
 
 // waitForDiskSize polls exact disk detail because the resize response and VM
