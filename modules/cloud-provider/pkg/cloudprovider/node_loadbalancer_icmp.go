@@ -1194,9 +1194,15 @@ func (c *nodeLoadBalancerController) cleanupClusterICMPFirewall(ctx context.Cont
 			return false, nil
 		}
 		if deleteIssuedAt != "" {
-			// The issued receipt survives stale visibility and restarts. No cloud
-			// readback can authorize a second irreversible request.
-			return false, nil
+			// The issued receipt survives stale visibility and restarts, so an
+			// immediate or concurrent readback never authorizes a duplicate.
+			// Only after the full resend interval does a still-listed, owned,
+			// unassigned UUID prove that DELETE did not commit; re-sending that
+			// exact DELETE is idempotent.
+			resend, resendErr := nodeLoadBalancerFirewallDeleteResendDue(deleteIssuedAt, time.Now().UTC())
+			if resendErr != nil || !resend {
+				return false, resendErr
+			}
 		}
 		issuedAt := time.Now().UTC().Format(time.RFC3339Nano)
 		winner, issueErr := c.updateManagedNodeClassAnnotationsForUID(ctx, nodeClassName, nodeClassUID, func(values map[string]string) {
@@ -1207,7 +1213,8 @@ func (c *nodeLoadBalancerController) cleanupClusterICMPFirewall(ctx context.Cont
 				annotationNodeLoadBalancerICMPCleanupAbsent,
 				annotationNodeLoadBalancerICMPCleanupChecked,
 			)
-			if parseErr != nil || (storedTarget != "" && storedTarget != firewall.UUID) || storedIssued != "" {
+			// Only the exact observed receipt may be replaced.
+			if parseErr != nil || (storedTarget != "" && storedTarget != firewall.UUID) || storedIssued != deleteIssuedAt {
 				return
 			}
 			values[annotationNodeLoadBalancerICMPDeleteTarget] = firewall.UUID

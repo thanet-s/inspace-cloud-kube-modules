@@ -5771,10 +5771,17 @@ func (c *nodeLoadBalancerController) deleteOwnedServiceFirewall(ctx context.Cont
 		}
 		return false, nil
 	}
+	previousIssuedAt := issuedAt
 	if issuedAt != "" {
-		// A durable issued receipt is immutable after the request boundary. Even
-		// exact visibility can be stale and must never authorize a replay.
-		return false, nil
+		// A durable issued receipt blocks concurrent or immediate duplicate
+		// dispatch; a fresh positive read can be stale. Once the same owned,
+		// unassigned UUID is still listed a full resend interval after the
+		// issue, the DELETE evidently did not commit. Re-sending an exact,
+		// ownership-rechecked UUID DELETE is idempotent, so re-issue it.
+		resend, resendErr := nodeLoadBalancerFirewallDeleteResendDue(issuedAt, c.nodeLoadBalancerFirewallRelationTime())
+		if resendErr != nil || !resend {
+			return false, resendErr
+		}
 	}
 	issuedAt = c.nodeLoadBalancerFirewallRelationTime().Format(time.RFC3339Nano)
 	issuedService, winner, issueErr := c.updateExactParentService(ctx, current, func(copy *corev1.Service) (bool, error) {
@@ -5791,7 +5798,9 @@ func (c *nodeLoadBalancerController) deleteOwnedServiceFirewall(ctx context.Cont
 		if storedTarget != "" && storedTarget != uuid {
 			return false, fmt.Errorf("node load balancer: concurrent Service firewall delete targets %s, not %s", storedTarget, uuid)
 		}
-		if storedIssued != "" {
+		// Only the exact observed receipt may be replaced; a concurrent
+		// issue or re-issue wins and this invocation sends nothing.
+		if storedIssued != previousIssuedAt {
 			return false, nil
 		}
 		copy.Annotations[annotationNodeLoadBalancerFWDeleteTarget] = uuid
@@ -5852,6 +5861,24 @@ func (c *nodeLoadBalancerController) deleteOwnedServiceFirewall(ctx context.Cont
 		return false, fmt.Errorf("node load balancer: delete firewall %s: %w", uuid, deleteErr)
 	}
 	return false, nil
+}
+
+// nodeLoadBalancerFirewallDeleteResendDelay is how long an issued firewall
+// DELETE must remain unresolved before the same exact UUID may be re-sent. It
+// exceeds the SDK mutation timeout, so the earlier request can no longer be in
+// flight, plus one absence-observation interval for list convergence.
+const nodeLoadBalancerFirewallDeleteResendDelay = nodeLoadBalancerShardFirewallMutationTimeout + nodeLoadBalancerAbsenceConfirmationDelay
+
+// nodeLoadBalancerFirewallDeleteResendDue reports whether an issued DELETE
+// receipt is old enough that a still-listed firewall proves the request did
+// not commit. Callers must still re-check exact ownership and assignments,
+// and must CAS-replace the exact observed receipt before re-sending.
+func nodeLoadBalancerFirewallDeleteResendDue(issuedAt string, now time.Time) (bool, error) {
+	issued, err := time.Parse(time.RFC3339Nano, issuedAt)
+	if err != nil {
+		return false, fmt.Errorf("node load balancer: invalid firewall delete issue timestamp %q: %w", issuedAt, err)
+	}
+	return !now.Before(issued.Add(nodeLoadBalancerFirewallDeleteResendDelay)), nil
 }
 
 func (c *nodeLoadBalancerController) resetServiceFirewallDeleteAfterProvenNonDispatch(

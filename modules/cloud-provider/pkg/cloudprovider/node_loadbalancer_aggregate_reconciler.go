@@ -1684,9 +1684,15 @@ func (c *nodeLoadBalancerController) deleteAggregateShardFirewall(ctx context.Co
 		return false, nil
 	}
 	if deleteIssuedAt != "" {
-		// The exact delete receipt is intentionally read-only after dispatch.
-		// A lagging list response must never authorize a second DELETE.
-		return false, nil
+		// The exact delete receipt blocks concurrent or immediate duplicate
+		// dispatch, because a lagging list can still show a deleted firewall.
+		// Only after the full resend interval does a still-listed, owned,
+		// unassigned UUID prove that DELETE did not commit; re-sending that
+		// exact DELETE is idempotent.
+		resend, resendErr := nodeLoadBalancerFirewallDeleteResendDue(deleteIssuedAt, time.Now().UTC())
+		if resendErr != nil || !resend {
+			return false, resendErr
+		}
 	}
 	issuedAt := time.Now().UTC().Format(time.RFC3339Nano)
 	_, winner, issueErr := c.updateManagedNodePoolAnnotationsForUID(ctx, shard, ownerUID, func(values map[string]string) (bool, error) {
@@ -1703,7 +1709,8 @@ func (c *nodeLoadBalancerController) deleteAggregateShardFirewall(ctx context.Co
 		if storedTarget != "" && storedTarget != firewall.UUID {
 			return false, fmt.Errorf("node load balancer: concurrent shard firewall delete targets %s, not %s", storedTarget, firewall.UUID)
 		}
-		if storedIssued != "" {
+		// Only the exact observed receipt may be replaced.
+		if storedIssued != deleteIssuedAt {
 			return false, nil
 		}
 		values[annotationNodeLoadBalancerShardFWDeleteTarget] = firewall.UUID
