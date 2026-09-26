@@ -19,8 +19,12 @@ const (
 
 	PrivateLoadBalancerPoolMinAddresses = 16
 	PrivateLoadBalancerPoolMaxAddresses = 256
-	CiliumNativeRoutingPodCIDR          = "10.42.0.0/16"
-	KubernetesServiceCIDR               = "10.43.0.0/16"
+	// spec.rke2.disable bounds keep the CRD's CEL rules that scan the list
+	// within the Kubernetes cost budget.
+	MaxRKE2DisabledComponents  = 32
+	MaxRKE2ComponentNameLength = 63
+	CiliumNativeRoutingPodCIDR = "10.42.0.0/16"
+	KubernetesServiceCIDR      = "10.43.0.0/16"
 
 	// LoadBalancerAlgorithmRandom and LoadBalancerAlgorithmMaglev are the
 	// Cilium loadBalancer.algorithm values accepted by
@@ -297,7 +301,13 @@ func (s InSpaceClusterSpec) Validate() []error {
 	if s.RKE2.TokenSecretRef.Name == "" || s.RKE2.TokenSecretRef.Key == "" {
 		add("spec.rke2.tokenSecretRef", "name and key are required")
 	}
+	if len(s.RKE2.Disable) > MaxRKE2DisabledComponents {
+		add("spec.rke2.disable", fmt.Sprintf("must contain at most %d components", MaxRKE2DisabledComponents))
+	}
 	for _, component := range s.RKE2.Disable {
+		if component == "" || len(component) > MaxRKE2ComponentNameLength {
+			add("spec.rke2.disable", fmt.Sprintf("component names must contain 1 to %d characters", MaxRKE2ComponentNameLength))
+		}
 		if component == "rke2-cilium" {
 			add("spec.rke2.disable", "must not disable rke2-cilium while kube-proxy replacement is enabled")
 		}

@@ -147,8 +147,11 @@ spec:
                     disable:
                       type: array
                       x-kubernetes-list-type: set
+                      maxItems: 32
                       items:
                         type: string
+                        minLength: 1
+                        maxLength: 63
                       x-kubernetes-validations:
                         - rule: 'self.all(component, component != "rke2-cilium")'
                           message: rke2-cilium cannot be disabled while kube-proxy replacement is enabled

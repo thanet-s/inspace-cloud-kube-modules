@@ -3,6 +3,7 @@ package v1alpha1
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/netip"
 	"os"
 	"strings"
@@ -196,7 +197,7 @@ func TestControlPlaneCRDMatchesMachineValidationContract(t *testing.T) {
 		"privateLoadBalancerPool must not overlap podCIDR or serviceCIDR",
 		"privateLoadBalancerPool is immutable",
 		"control-plane virtualIPv4 must not overlap podCIDR or serviceCIDR",
-		"disable:\n                      type: array\n                      x-kubernetes-list-type: set\n                      items:",
+		"disable:\n                      type: array\n                      x-kubernetes-list-type: set\n                      maxItems:",
 		"component != \"rke2-cilium\"",
 		"required: [location, billingAccountID, credentialsSecretRef, controlPlane, bootstrapCache, rke2, network, firewall, publicIPv4, endpoint]",
 		"bootstrapCache:\n                  type: object",
@@ -337,6 +338,39 @@ func TestGatewayAPIRequiresCilium120AndNoTraefikCRDs(t *testing.T) {
 	disabled.RKE2.Version = "v1.36.4+rke2r1"
 	if errs := disabled.Validate(); len(errs) != 0 {
 		t.Fatalf("disabled Gateway API must not constrain RKE2: %v", errs)
+	}
+}
+
+// The Gateway API CEL rules scan spec.rke2.disable, so the list and its items
+// are bounded for the Kubernetes CEL cost budget; Go enforces the same bounds.
+func TestRKE2DisableListIsBounded(t *testing.T) {
+	spec := validSpec()
+	spec.RKE2.Disable = make([]string, MaxRKE2DisabledComponents)
+	for index := range spec.RKE2.Disable {
+		spec.RKE2.Disable[index] = strings.Repeat("a", MaxRKE2ComponentNameLength-3) + fmt.Sprintf("%03d", index)
+	}
+	if errs := spec.Validate(); len(errs) != 0 {
+		t.Fatalf("maximum disable list rejected: %v", errs)
+	}
+	for name, disable := range map[string][]string{
+		"too many":   append(append([]string(nil), spec.RKE2.Disable...), "rke2-extra"),
+		"too long":   {strings.Repeat("a", MaxRKE2ComponentNameLength+1)},
+		"empty name": {""},
+	} {
+		invalid := validSpec()
+		invalid.RKE2.Disable = disable
+		if !validationFieldReported(invalid.Validate(), "spec.rke2.disable") {
+			t.Errorf("%s disable list accepted", name)
+		}
+	}
+	crd, err := os.ReadFile("../../config/crd/bases/infrastructure.inspace.cloud_inspaceclusters.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := fmt.Sprintf("disable:\n                      type: array\n                      x-kubernetes-list-type: set\n                      maxItems: %d\n                      items:\n                        type: string\n                        minLength: 1\n                        maxLength: %d\n",
+		MaxRKE2DisabledComponents, MaxRKE2ComponentNameLength)
+	if !strings.Contains(string(crd), want) {
+		t.Fatalf("CRD disable schema lacks the Go bounds:\n%s", want)
 	}
 }
 
