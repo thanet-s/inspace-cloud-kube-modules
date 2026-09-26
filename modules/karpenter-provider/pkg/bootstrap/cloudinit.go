@@ -22,6 +22,10 @@ import (
 // for an unchanged NodeClass spec. Spec-controlled branches such as
 // RKE2.SkipOSUpgrade are already included in both provider drift hashes and do
 // not require a global replacement of nodes whose spec retains the default.
+// The release-derived APT suites and the bash login-shell switch (v1.1.0-rc.3)
+// deliberately kept v13: a noble node renders the same suites as before, and a
+// login shell does not change Kubernetes behavior, so replacing every worker
+// is not worth it. Existing workers keep their shell until replaced.
 const (
 	SchemaVersion         = "stock-ubuntu-rke2-v13"
 	VPCSubnetPlaceholder  = "__INSPACE_VPC_SUBNET__"

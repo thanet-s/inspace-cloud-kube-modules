@@ -2,9 +2,12 @@ package driver
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
+	"github.com/thanet-s/inspace-cloud-kube-modules/modules/csi-driver/pkg/cloud"
 	cloudfake "github.com/thanet-s/inspace-cloud-kube-modules/modules/csi-driver/pkg/cloud/fake"
 	hostfake "github.com/thanet-s/inspace-cloud-kube-modules/modules/csi-driver/pkg/host/fake"
 	"google.golang.org/grpc/codes"
@@ -306,5 +309,17 @@ func TestDefaultMaximumVolumeSizeIs2000GiB(t *testing.T) {
 		VolumeId: created.GetVolume().GetVolumeId(), CapacityRange: &csi.CapacityRange{RequiredBytes: 2001 * gib},
 	}); status.Code(err) != codes.OutOfRange {
 		t.Fatalf("expand above 2000GiB code = %v, err = %v; want OutOfRange", status.Code(err), err)
+	}
+}
+
+// A final InSpace rejection must reach the PVC as a non-retryable code with its
+// cause, so csi-resizer marks the resize infeasible instead of retrying it.
+func TestCloudStatusReportsRejectedResizeAsInvalidArgumentWithCause(t *testing.T) {
+	err := cloudStatus("ControllerExpandVolume", fmt.Errorf("%w: HTTP 422: disk size exceeds account quota", cloud.ErrRejected))
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("rejected resize code = %v, want InvalidArgument", status.Code(err))
+	}
+	if !strings.Contains(status.Convert(err).Message(), "disk size exceeds account quota") {
+		t.Fatalf("rejected resize status %q lost the InSpace cause", status.Convert(err).Message())
 	}
 }

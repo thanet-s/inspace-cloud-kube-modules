@@ -29,6 +29,10 @@ var (
 	ErrUnauthenticated  = errors.New("cloud authentication failed")
 	ErrPermissionDenied = errors.New("cloud permission denied")
 	ErrConflict         = errors.New("cloud operation conflict")
+	// ErrRejected marks a complete, non-retryable request rejection, such as
+	// an invalid size or an exceeded quota; retrying the same request cannot
+	// succeed.
+	ErrRejected = errors.New("cloud request rejected")
 )
 
 // VolumeSpec is the desired durable state used by EnsureVolume.
