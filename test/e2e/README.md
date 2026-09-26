@@ -26,8 +26,8 @@ Cilium ConfigMap, `auto-direct-node-routes`, live `cilium-dbg status --verbose`
 on every control-plane and worker node, and the absence of kube-proxy
 DaemonSets, pods, and host processes. Both built-in ingress add-ons,
 `rke2-ingress-nginx` and `rke2-traefik`, are disabled so users can install
-their own ingress controller. The complete audited cache inventory has 35
-images; this cluster must seed exactly 32 because it omits the disabled nginx
+their own ingress controller. The complete audited cache inventory has 36
+images; this cluster must seed exactly 33 because it omits the disabled nginx
 webhook-certgen, nginx ingress-controller, and Traefik images.
 
 The API and registration listeners share the configured private kube-vip
@@ -111,7 +111,9 @@ Managed InSpace cloud firewalls are the only host firewalls; guest UFW must be
 inactive and disabled or masked on the control planes, worker, and bastion.
 
 The workload assertions cover a single-node `ReadWriteOnce` CSI disk,
-VolumeAttachment, and persistence through pod replacement. They also create
+VolumeAttachment, and persistence through pod replacement. The suite then grows
+the attached PVC from 1Gi to 2Gi online and requires the PV, PVC status, and
+in-Pod ext4 size to grow while the stored data stays intact. They also create
 two private Services with the same TCP port, private scope label,
 `loadBalancerClass: io.cilium/l2-announcer`, and
 `externalTrafficPolicy: Cluster`. Cilium LoadBalancer IPAM must allocate two

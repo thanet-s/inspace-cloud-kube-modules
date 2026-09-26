@@ -1078,6 +1078,9 @@ def verify_node_load_balancer_helm_contract() -> None:
     csi_adapter_source = (
         repository / "modules/csi-driver/pkg/cloud/inspace/adapter.go"
     ).read_text(encoding="utf-8")
+    csi_expand_source = (
+        repository / "modules/csi-driver/pkg/cloud/inspace/expand.go"
+    ).read_text(encoding="utf-8")
 
     require(yaml_mapping_scalar(values, "ccm", "nodeLoadBalancer", "enabled") == "true",
             "chart must enable the CCM node-load-balancer controller by default")
@@ -1089,14 +1092,17 @@ def verify_node_load_balancer_helm_contract() -> None:
             "chart must leave 2m preflight before the CSI provisioner's 8m dispatch reserve")
     require(yaml_mapping_scalar(values, "csi", "sidecars", "attacher", "timeoutSeconds") == "600",
             "chart must leave 2m preflight before the CSI attacher's 8m dispatch reserve")
+    require(yaml_mapping_scalar(values, "csi", "sidecars", "resizer", "timeoutSeconds") == "600",
+            "chart must leave 2m preflight before the CSI resizer's 8m dispatch reserve")
     require(re.search(r"defaultHTTPTimeout\s*=\s*5\s*\*\s*time\.Minute", client_source) is not None and
             re.search(r"defaultDestructiveReadbackTimeout\s*=\s*2\s*\*\s*time\.Minute",
                       csi_adapter_source) is not None and
             re.search(r"minimumMutationDispatchReserve\s*=\s*8\s*\*\s*time\.Minute",
                       csi_adapter_source) is not None,
             "CSI sidecar timeout proof must remain bound to the 5m SDK, 2m destructive, and 8m dispatch defaults")
-    require(csi_adapter_source.count("requireMutationDispatchReserve(ctx)") == 4,
-            "all four CSI disk mutations must retain the final 8m dispatch-reserve guard")
+    require(csi_adapter_source.count("requireMutationDispatchReserve(ctx)") == 4 and
+            csi_expand_source.count("requireMutationDispatchReserve(ctx)") == 1,
+            "all five CSI disk mutations must retain the final 8m dispatch-reserve guard")
 
     render_command = [
         "helm", "template", "verify", str(chart), "--namespace", "kube-system",
@@ -1118,8 +1124,8 @@ def verify_node_load_balancer_helm_contract() -> None:
         rendered, "Deployment", "verify-inspace-cloud-kube-modules-csi-controller"
     )
     require(
-        csi_deployment.count("            - --timeout=600s") == 2,
-        "rendered CSI provisioner and attacher must each have a 600-second RPC timeout",
+        csi_deployment.count("            - --timeout=600s") == 3,
+        "rendered CSI provisioner, attacher, and resizer must each have a 600-second RPC timeout",
     )
     csi_role = manifest_document(
         rendered, "ClusterRole", "verify-inspace-cloud-kube-modules-csi-controller"
@@ -1206,6 +1212,17 @@ def verify_node_load_balancer_helm_contract() -> None:
     require(
         unsafe_csi_attacher_timeout.returncode != 0,
         "Helm must reject a CSI attacher RPC timeout below the safe 600-second floor",
+    )
+    unsafe_csi_resizer_timeout = subprocess.run(
+        [*render_command, "--set", "csi.sidecars.resizer.timeoutSeconds=599"],
+        cwd=repository,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    require(
+        unsafe_csi_resizer_timeout.returncode != 0,
+        "Helm must reject a CSI resizer RPC timeout below the safe 600-second floor",
     )
     disabled_ccm_role = manifest_document(
         disabled_result.stdout, "ClusterRole", "verify-inspace-cloud-kube-modules-ccm"
@@ -2276,12 +2293,24 @@ def main() -> None:
             "/usr/local/sbin/inspace-bootstrap-rke2" in init_playbook and
             "/usr/local/sbin/inspace-install-prerequisites" in init_playbook,
             "live bootstrap acceptance must prove the E2E upgrade bypass on bastion, control planes, and workers")
+    pvc_expansion = named_yaml_sequence_item(
+        test_playbook, "Expand the live RWO PVC online and require a larger disk and filesystem", 4
+    )
+    require('"storage":"2Gi"' in pvc_expansion and
+            "--for=jsonpath='{.status.capacity.storage}'=2Gi" in pvc_expansion and
+            'test "$after" -ge $((before + 900 * 1024 * 1024))' in pvc_expansion and
+            "e2e-persistence-sentinel" in pvc_expansion and
+            test_playbook.index("Prove pod replacement retained the exact disk marker") <
+            test_playbook.index("Expand the live RWO PVC online"),
+            "live acceptance must grow the attached RWO PVC online and prove the larger ext4 filesystem keeps its data")
     require('"global.inspace.systemImageRegistry={{ e2e_state.bootstrapCacheRegistry }}"' in init_playbook and
             '"$registry/thanet-s/inspace-cloud-controller-manager@$ccm_digest"' in init_playbook and
             '"$registry/sig-storage/csi-provisioner:v5.2.0"' in init_playbook and
             'select(.name=="csi-provisioner") | [.args[] | select(. == "--timeout=600s")] | length' in init_playbook and
-            'select(.name=="csi-attacher") | [.args[] | select(. == "--timeout=600s")] | length' in init_playbook,
-            "released chart installation must route its audited system images through the cache and retain both safe CSI RPC timeouts")
+            'select(.name=="csi-attacher") | [.args[] | select(. == "--timeout=600s")] | length' in init_playbook and
+            '"$registry/sig-storage/csi-resizer:v1.13.2"' in init_playbook and
+            'select(.name=="csi-resizer") | [.args[] | select(. == "--timeout=600s")] | length' in init_playbook,
+            "released chart installation must route its audited system images through the cache and retain all safe CSI RPC timeouts")
     cached_pause = "rancher/mirrored-pause:3.10.2@sha256:412c4a7219cb8a299a37337f3d87810c5340095322e15594a1637785adad0f17"
     require(f"image: {{{{ e2e_state.bootstrapCacheRegistry }}}}/{cached_pause}" in trigger and
             playbook.count(cached_pause) == 2,
@@ -3135,11 +3164,11 @@ def main() -> None:
         "ASN1 OID: prime256v1",
         '-verify_hostname "$cache_host"',
         'cmp -s /etc/inspace-cache/tls/server.crt "$served_certificate"',
-        "/etc/inspace-cache/images.tsv)\" -eq 32",
+        "/etc/inspace-cache/images.tsv)\" -eq 33",
         '$2 == "rancher/kube-webhook-certgen:v1.14.5-hardened2" { count++ } END { print count + 0 }\' /etc/inspace-cache/images.tsv)" -eq 0',
         '$2 == "rancher/nginx-ingress-controller:v1.14.5-hardened2" { count++ } END { print count + 0 }\' /etc/inspace-cache/images.tsv)" -eq 0',
         '$2 == "rancher/hardened-traefik:v3.7.11-build20260819" { count++ } END { print count + 0 }\' /etc/inspace-cache/images.tsv)" -eq 0',
-        'test "$image_count" -eq 32',
+        'test "$image_count" -eq 33',
         '"${resolve[@]}" "$cache_endpoint/healthz"',
         '"${resolve[@]}" "$cache_endpoint/v2/"',
         '"$cache_endpoint/v2/$repository/manifests/$reference"',

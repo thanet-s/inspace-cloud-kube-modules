@@ -5,9 +5,10 @@ CSI v1.12 driver for InSpace block storage. The supported contract is ext4
 
 The production controller uses the shared
 `github.com/thanet-s/inspace-cloud-kube-modules/modules/client` client for disk
-create/get/list/delete and VM disk attach/detach. The production node service
-uses stable virtio by-id links, safe ext4 detection/formatting, mount conflict
-inspection, bind mounts, and idempotent unmounts on Linux.
+create/get/list/delete, VM disk attach/detach, and attached-disk resize. The
+production node service uses stable virtio by-id links, safe ext4
+detection/formatting, mount conflict inspection, bind mounts, online ext4
+resize, and idempotent unmounts on Linux.
 
 ## Supported contract
 
@@ -15,14 +16,41 @@ inspection, bind mounts, and idempotent unmounts on Linux.
 |---|---|---|
 | Access | `SINGLE_NODE_WRITER` / RWO | RWX, ROX, every multi-node mode |
 | Filesystem | ext4 mounted volumes | xfs, raw block |
-| Controller | create, delete, validate, attach, detach | CSI snapshots, cloning, expansion |
-| Node | stage, unstage, publish, unpublish, info, capabilities | stats, expansion |
+| Controller | create, delete, validate, attach, detach, online expansion | CSI snapshots, cloning, offline expansion, shrinking |
+| Node | stage, unstage, publish, unpublish, online ext4 expansion, info, capabilities | stats |
 | Placement | one configured InSpace location | cross-location attachment |
 
 An RWO volume can move between workers only after detach from the old worker
 finishes. A delete is refused while the disk is attached. It is also refused if
 the InSpace disk has snapshots: the native delete API would delete those
 snapshots too, so the driver fails safely instead.
+
+## Volume expansion
+
+The StorageClass sets `allowVolumeExpansion: true`. To grow a volume, raise the
+PVC's `spec.resources.requests.storage`. Kubernetes cannot shrink a PVC, and
+the InSpace API also rejects a smaller disk size.
+
+InSpace resizes a disk only through its VM attachment
+(`PATCH /v1/{location}/user-resource/vm/storage`), so the driver supports
+online expansion only:
+
+1. `csi-resizer` calls `ControllerExpandVolume`. The driver finds the one VM
+   that holds the disk and sends the new absolute size, rounded up to whole
+   GiB. It then waits until the exact disk read reports that size.
+2. kubelet calls `NodeExpandVolume` on that node. The driver waits up to 30
+   seconds for the guest to see the larger virtio device, then runs
+   `resize2fs` on the mounted ext4 filesystem.
+
+If no Pod uses the PVC, the disk is detached. `ControllerExpandVolume` then
+returns `FailedPrecondition`, and `csi-resizer` retries with backoff. The
+resize finishes after a Pod mounts the PVC again.
+
+The resize request carries an absolute size, and the API refuses to shrink a
+disk. A retry after a lost response therefore cannot grow the disk twice, so
+resize uses no durable Lease. It still refuses to run while an attach, detach,
+or delete Lease for the same disk is unresolved. It also refuses a disk that is
+not owned CSI `EMPTY` storage or that is a VM boot disk.
 
 ## VM deletion safety
 
@@ -239,21 +267,21 @@ Files in `deploy/kubernetes` provide:
 
 - a persistent, attach-required `CSIDriver`;
 - a strict-topology RWO `StorageClass`;
-- a controller Deployment with provisioner and attacher sidecars, scheduled on
-  fixed RKE2 control-plane nodes;
+- a controller Deployment with provisioner, attacher, and resizer sidecars,
+  scheduled on fixed RKE2 control-plane nodes;
 - a privileged node DaemonSet with kubelet bidirectional mount propagation;
 - controller RBAC, including read-only Node resolution and durable
   mutation-fence Lease management.
 
-The standalone controller manifest gives both `csi-provisioner` and
-`csi-attacher` a 600-second RPC timeout. This allows up to two minutes for
+The standalone controller manifest gives `csi-provisioner`, `csi-attacher`,
+and `csi-resizer` a 600-second RPC timeout. This allows up to two minutes for
 preflight reads and durable-fence acquisition. Immediately before any
-CreateDisk, DeleteDisk, AttachDisk, or DetachDisk call, the driver requires
-480 seconds to remain: five minutes for the shared client's mutation deadline,
-two minutes for destructive recovery, and one minute for final readback and
-Lease persistence. If less remains, the driver issues no cloud mutation and
-exact-clears only that invocation's undispatched Lease. A shorter sidecar
-deadline can cancel and strand the original no-replay Lease or cause
+CreateDisk, DeleteDisk, AttachDisk, DetachDisk, or disk resize call, the driver
+requires 480 seconds to remain: five minutes for the shared client's mutation
+deadline, two minutes for destructive recovery, and one minute for final
+readback and Lease persistence. If less remains, the driver issues no cloud
+mutation and exact-clears only that invocation's undispatched Lease. A shorter
+sidecar deadline can cancel and strand the original no-replay Lease or cause
 overlapping retries.
 
 Replace the example image tag before deployment. The controller Secret must be

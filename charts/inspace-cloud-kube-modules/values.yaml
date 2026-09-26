@@ -136,6 +136,11 @@ csi:
       # Uses the same 120-second preflight allowance and 480-second mandatory
       # dispatch reserve for attach and detach.
       timeoutSeconds: 600
+    resizer:
+      image: registry.k8s.io/sig-storage/csi-resizer:v1.13.2
+      # Uses the same 120-second preflight allowance and 480-second mandatory
+      # dispatch reserve for the attached-disk resize.
+      timeoutSeconds: 600
     registrar:
       image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.13.0
     livenessProbe:
@@ -147,6 +152,9 @@ csi:
     reclaimPolicy: Delete
     volumeBindingMode: WaitForFirstConsumer
     fsType: ext4
+    # InSpace can resize a disk only while it is attached, so a PVC grows
+    # while a Pod uses it (online expansion).
+    allowVolumeExpansion: true
 
 karpenter:
   enabled: true

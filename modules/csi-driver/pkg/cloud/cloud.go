@@ -19,6 +19,9 @@ var (
 	// ErrSnapshotsPresent protects snapshots from the InSpace delete-disk API,
 	// which otherwise deletes a disk and every snapshot below it.
 	ErrSnapshotsPresent = errors.New("volume has snapshots")
+	// ErrVolumeNotAttached is returned when an online-only operation, such as
+	// expansion, targets a volume that no node currently holds.
+	ErrVolumeNotAttached = errors.New("volume is not attached to a node")
 	// ErrInvalidNode means a CSI node ID could not be resolved to an InSpace VM.
 	ErrInvalidNode = errors.New("invalid or unresolved node ID")
 	// ErrUnavailable marks a temporary provider or dependency failure.
@@ -49,7 +52,9 @@ type Volume struct {
 // (Location, Name), DeleteVolume and DetachVolume may return ErrNotFound, and
 // attaching a volume to its current node must succeed. DetachVolume with an
 // empty nodeID means detach the volume from whichever single node holds it, as
-// required by ControllerUnpublishVolume.
+// required by ControllerUnpublishVolume. ExpandVolume grows an attached volume
+// to at least the requested bytes, returns its resulting capacity, and returns
+// ErrVolumeNotAttached for a detached volume.
 type Interface interface {
 	Probe(context.Context) error
 	EnsureVolume(context.Context, VolumeSpec) (Volume, error)
@@ -57,4 +62,5 @@ type Interface interface {
 	DeleteVolume(ctx context.Context, location, volumeID string) error
 	AttachVolume(ctx context.Context, location, volumeID, nodeID string) error
 	DetachVolume(ctx context.Context, location, volumeID, nodeID string) error
+	ExpandVolume(ctx context.Context, location, volumeID string, capacityBytes int64) (int64, error)
 }

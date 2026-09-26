@@ -59,6 +59,7 @@ type API interface {
 	GetNetwork(context.Context, string, string) (*sdk.Network, error)
 	AttachDisk(context.Context, string, string, string) (*sdk.VMStorage, error)
 	DetachDisk(context.Context, string, string, string) error
+	ResizeAttachedDisk(context.Context, string, string, string, int) (*sdk.VMStorage, error)
 }
 
 // NodeResolver returns the Kubernetes Node's spec.providerID. The adapter

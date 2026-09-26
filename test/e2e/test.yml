@@ -1226,6 +1226,41 @@
         executable: /bin/bash
       changed_when: false
 
+    - name: Expand the live RWO PVC online and require a larger disk and filesystem
+      ansible.builtin.shell: |
+        set -euo pipefail
+        pod=$(kubectl -n default get pod -l app=inspace-e2e-web -o jsonpath='{.items[0].metadata.name}')
+        test -n "$pod"
+        filesystem_bytes() {
+          kubectl -n default exec "$pod" -c nginx -- df -P -B1 /usr/share/nginx/html |
+            awk 'NR == 2 { print $2 }'
+        }
+        before=$(filesystem_bytes)
+        test "$before" -gt 0
+        test "$(kubectl -n default get pvc inspace-e2e-rwo -o jsonpath='{.status.capacity.storage}')" = 1Gi
+        kubectl -n default patch pvc/inspace-e2e-rwo --type=merge \
+          -p '{"spec":{"resources":{"requests":{"storage":"2Gi"}}}}'
+        # kubelet sets status.capacity only after NodeExpandVolume grows ext4.
+        kubectl -n default wait --for=jsonpath='{.status.capacity.storage}'=2Gi \
+          pvc/inspace-e2e-rwo --timeout=15m
+        kubectl -n default get pvc inspace-e2e-rwo -o json | jq -e '
+          [(.status.conditions // [])[] |
+            select(.type == "Resizing" or .type == "FileSystemResizePending" or
+              .type == "ControllerResizeError" or .type == "NodeResizeError")] |
+          length == 0'
+        pv=$(kubectl -n default get pvc inspace-e2e-rwo -o jsonpath='{.spec.volumeName}')
+        test "$(kubectl get pv "$pv" -o jsonpath='{.spec.capacity.storage}')" = 2Gi
+        after=$(filesystem_bytes)
+        test "$after" -ge $((before + 900 * 1024 * 1024))
+        test "$(kubectl -n default exec "$pod" -c nginx -- cat /usr/share/nginx/html/index.html)" = "{{ e2e_marker }}"
+        test "$(kubectl -n default exec "$pod" -c nginx -- \
+          cat /usr/share/nginx/html/e2e-persistence-sentinel)" = \
+          "{{ e2e_marker }}-persistence-sentinel"
+        printf '{"pod":"%s","beforeBytes":%s,"afterBytes":%s}\n' "$pod" "$before" "$after"
+      args:
+        executable: /bin/bash
+      changed_when: true
+
     - name: Require the public NLB to restore exactly the ready local-endpoint worker
       ansible.builtin.command:
         argv:

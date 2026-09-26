@@ -68,6 +68,7 @@ for image in \
   'ghcr.io/thanet-s/karpenter-provider-inspace:0.1.0' \
   'registry.k8s.io/sig-storage/csi-provisioner:v5.2.0' \
   'registry.k8s.io/sig-storage/csi-attacher:v4.8.1' \
+  'registry.k8s.io/sig-storage/csi-resizer:v1.13.2' \
   'registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.13.0' \
   'registry.k8s.io/sig-storage/livenessprobe:v2.15.0'; do
   grep -F "          image: $image" "$tmpdir/direct-system-images.yaml" >/dev/null
@@ -83,6 +84,7 @@ for image in \
   "$cache_registry/thanet-s/karpenter-provider-inspace:0.1.0" \
   "$cache_registry/sig-storage/csi-provisioner:v5.2.0" \
   "$cache_registry/sig-storage/csi-attacher:v4.8.1" \
+  "$cache_registry/sig-storage/csi-resizer:v1.13.2" \
   "$cache_registry/sig-storage/csi-node-driver-registrar:v2.13.0" \
   "$cache_registry/sig-storage/livenessprobe:v2.15.0"; do
   grep -F "          image: $image" "$tmpdir/cached-system-images.yaml" >/dev/null
@@ -124,18 +126,24 @@ test "$(grep -Fc '        fsGroup: 65532' "$tmpdir/csi-controller.yaml")" -eq 1
 test "$(grep -Fc '            runAsGroup: 65532' "$tmpdir/csi-controller.yaml")" -eq 1
 test "$(grep -Fc '            - name: INSPACE_NETWORK_UUID' "$tmpdir/csi-controller.yaml")" -eq 1
 grep -Fx '              value: "11111111-1111-4111-8111-111111111111"' "$tmpdir/csi-controller.yaml" >/dev/null
-test "$(grep -Fc '            - --timeout=600s' "$tmpdir/csi-controller.yaml")" -eq 2
+test "$(grep -Fc '            - --timeout=600s' "$tmpdir/csi-controller.yaml")" -eq 3
+test "$(grep -Fc '            - --handle-volume-inuse-error=false' "$tmpdir/csi-controller.yaml")" -eq 1
 
 helm template bootstrap "$chart" --namespace kube-system --values "$values" \
   --set csi.sidecars.provisioner.timeoutSeconds=720 \
   --show-only templates/csi-controller.yaml >"$tmpdir/csi-controller-long-timeout.yaml"
 test "$(grep -Fc '            - --timeout=720s' "$tmpdir/csi-controller-long-timeout.yaml")" -eq 1
-test "$(grep -Fc '            - --timeout=600s' "$tmpdir/csi-controller-long-timeout.yaml")" -eq 1
+test "$(grep -Fc '            - --timeout=600s' "$tmpdir/csi-controller-long-timeout.yaml")" -eq 2
 helm template bootstrap "$chart" --namespace kube-system --values "$values" \
   --set csi.sidecars.attacher.timeoutSeconds=720 \
   --show-only templates/csi-controller.yaml >"$tmpdir/csi-controller-long-attacher-timeout.yaml"
 test "$(grep -Fc '            - --timeout=720s' "$tmpdir/csi-controller-long-attacher-timeout.yaml")" -eq 1
-test "$(grep -Fc '            - --timeout=600s' "$tmpdir/csi-controller-long-attacher-timeout.yaml")" -eq 1
+test "$(grep -Fc '            - --timeout=600s' "$tmpdir/csi-controller-long-attacher-timeout.yaml")" -eq 2
+helm template bootstrap "$chart" --namespace kube-system --values "$values" \
+  --set csi.sidecars.resizer.timeoutSeconds=720 \
+  --show-only templates/csi-controller.yaml >"$tmpdir/csi-controller-long-resizer-timeout.yaml"
+test "$(grep -Fc '            - --timeout=720s' "$tmpdir/csi-controller-long-resizer-timeout.yaml")" -eq 1
+test "$(grep -Fc '            - --timeout=600s' "$tmpdir/csi-controller-long-resizer-timeout.yaml")" -eq 2
 if helm template invalid "$chart" --namespace kube-system --values "$values" \
   --set csi.sidecars.provisioner.timeoutSeconds=599 >/dev/null 2>&1; then
   echo "unsafe CSI provisioner timeout unexpectedly rendered" >&2
@@ -146,6 +154,19 @@ if helm template invalid "$chart" --namespace kube-system --values "$values" \
   echo "unsafe CSI attacher timeout unexpectedly rendered" >&2
   exit 1
 fi
+if helm template invalid "$chart" --namespace kube-system --values "$values" \
+  --set csi.sidecars.resizer.timeoutSeconds=599 >/dev/null 2>&1; then
+  echo "unsafe CSI resizer timeout unexpectedly rendered" >&2
+  exit 1
+fi
+
+helm template bootstrap "$chart" --namespace kube-system --values "$values" \
+  --show-only templates/csi-storageclass.yaml >"$tmpdir/csi-storageclass.yaml"
+grep -Fx 'allowVolumeExpansion: true' "$tmpdir/csi-storageclass.yaml" >/dev/null
+helm template bootstrap "$chart" --namespace kube-system --values "$values" \
+  --set csi.storageClass.allowVolumeExpansion=false \
+  --show-only templates/csi-storageclass.yaml >"$tmpdir/csi-storageclass-fixed.yaml"
+grep -Fx 'allowVolumeExpansion: false' "$tmpdir/csi-storageclass-fixed.yaml" >/dev/null
 
 helm template bootstrap "$chart" --namespace kube-system --values "$values" \
   --show-only templates/karpenter-deployment.yaml >"$tmpdir/karpenter.yaml"
@@ -236,7 +257,7 @@ grep -Fx '    resources: ["tokenreviews"]' "$standalone_ccm" >/dev/null
 grep -Fx '    resources: ["subjectaccessreviews"]' "$standalone_ccm" >/dev/null
 require_toleration "$standalone_csi"
 require_toleration "$standalone_karpenter"
-test "$(grep -Fc '            - --timeout=600s' "$standalone_csi")" -eq 2
+test "$(grep -Fc '            - --timeout=600s' "$standalone_csi")" -eq 3
 grep -F '            - name: INSPACE_NETWORK_UUID' "$standalone_karpenter" >/dev/null
 grep -F '            - name: INSPACE_CONTROL_PLANE_VIP' "$standalone_karpenter" >/dev/null
 

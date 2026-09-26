@@ -50,6 +50,10 @@ func TestDocumentedResourceContracts(t *testing.T) {
 	if err != nil || attached.UUID != diskUUID || attached.Name != "vdb" {
 		t.Fatalf("AttachDisk() = %#v, %v", attached, err)
 	}
+	resized, err := client.ResizeAttachedDisk(ctx, "bkk01", vmUUID, diskUUID, 60)
+	if err != nil || resized.UUID != diskUUID || resized.SizeGiB != 60 {
+		t.Fatalf("ResizeAttachedDisk() = %#v, %v", resized, err)
+	}
 	if err := client.DetachDisk(ctx, "bkk01", vmUUID, diskUUID); err != nil {
 		t.Fatalf("DetachDisk(): %v", err)
 	}
@@ -276,6 +280,9 @@ func contractHandler(t *testing.T) http.HandlerFunc {
 		case "POST /v1/bkk01/user-resource/vm/storage/attach":
 			assertForm(t, r, url.Values{"uuid": {vmUUID}, "storage_uuid": {diskUUID}})
 			writeLiteral(w, http.StatusOK, `{"uuid":"`+diskUUID+`","name":"vdb","size":50,"primary":false}`)
+		case "PATCH /v1/bkk01/user-resource/vm/storage":
+			assertForm(t, r, url.Values{"uuid": {vmUUID}, "disk_uuid": {diskUUID}, "size_gb": {"60"}})
+			writeLiteral(w, http.StatusOK, `{"uuid":"`+diskUUID+`","name":"vdb","size":60,"primary":false,"type":"block"}`)
 		case "POST /v1/bkk01/user-resource/vm/storage/detach":
 			assertForm(t, r, url.Values{"uuid": {vmUUID}, "storage_uuid": {diskUUID}})
 			writeLiteral(w, http.StatusOK, `{"success":true}`)

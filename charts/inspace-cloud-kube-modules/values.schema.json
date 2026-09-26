@@ -151,7 +151,7 @@
         "sidecars": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["provisioner", "attacher", "registrar", "livenessProbe"],
+          "required": ["provisioner", "attacher", "resizer", "registrar", "livenessProbe"],
           "properties": {
             "provisioner": {
               "type": "object",
@@ -171,6 +171,15 @@
                 "timeoutSeconds": {"type": "integer", "minimum": 600, "maximum": 3600}
               }
             },
+            "resizer": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["image", "timeoutSeconds"],
+              "properties": {
+                "image": {"type": "string", "minLength": 1},
+                "timeoutSeconds": {"type": "integer", "minimum": 600, "maximum": 3600}
+              }
+            },
             "registrar": {"type": "object", "additionalProperties": false, "required": ["image"], "properties": {"image": {"type": "string", "minLength": 1}}},
             "livenessProbe": {"type": "object", "additionalProperties": false, "required": ["image"], "properties": {"image": {"type": "string", "minLength": 1}}}
           }
@@ -178,14 +187,15 @@
         "storageClass": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["create", "name", "annotations", "reclaimPolicy", "volumeBindingMode", "fsType"],
+          "required": ["create", "name", "annotations", "reclaimPolicy", "volumeBindingMode", "fsType", "allowVolumeExpansion"],
           "properties": {
             "create": {"type": "boolean"},
             "name": {"type": "string", "minLength": 1},
             "annotations": {"$ref": "#/definitions/stringMap"},
             "reclaimPolicy": {"type": "string", "enum": ["Delete", "Retain"]},
             "volumeBindingMode": {"type": "string", "enum": ["Immediate", "WaitForFirstConsumer"]},
-            "fsType": {"type": "string", "enum": ["ext4"]}
+            "fsType": {"type": "string", "enum": ["ext4"]},
+            "allowVolumeExpansion": {"type": "boolean"}
           }
         }
       }

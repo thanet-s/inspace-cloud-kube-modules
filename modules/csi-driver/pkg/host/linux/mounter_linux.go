@@ -14,20 +14,27 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/thanet-s/inspace-cloud-kube-modules/modules/csi-driver/pkg/host"
 )
 
-const mountInfoPath = "/proc/self/mountinfo"
+const (
+	mountInfoPath = "/proc/self/mountinfo"
+	// deviceResizeWait bounds how long NodeExpandVolume waits for a provider
+	// resize to reach the guest before it returns a retryable error.
+	deviceResizeWait = 30 * time.Second
+)
 
 type Mounter struct {
 	devicePollInterval time.Duration
+	deviceResizeWait   time.Duration
 }
 
 func New() (host.Mounter, error) {
-	m := &Mounter{devicePollInterval: 250 * time.Millisecond}
+	m := &Mounter{devicePollInterval: 250 * time.Millisecond, deviceResizeWait: deviceResizeWait}
 	if err := m.Probe(context.Background()); err != nil {
 		return nil, err
 	}
@@ -35,7 +42,7 @@ func New() (host.Mounter, error) {
 }
 
 func (m *Mounter) Probe(context.Context) error {
-	for _, command := range []string{"blkid", "lsblk", "mkfs.ext4", "mount", "umount"} {
+	for _, command := range []string{"blkid", "lsblk", "mkfs.ext4", "resize2fs", "mount", "umount"} {
 		if _, err := exec.LookPath(command); err != nil {
 			return fmt.Errorf("required host command %q is unavailable: %w", command, err)
 		}
@@ -338,6 +345,81 @@ func (m *Mounter) Unmount(ctx context.Context, target string) error {
 	}
 	_ = os.Remove(target)
 	return nil
+}
+
+// ExpandFilesystem grows a mounted ext4 filesystem online. virtio-blk reports
+// a provider resize to the guest asynchronously, so the device size is polled
+// before resize2fs; running resize2fs early would succeed without growing.
+func (m *Mounter) ExpandFilesystem(ctx context.Context, devicePath, mountPath string, minimumBytes int64) (int64, error) {
+	if err := validateAbsolutePath(devicePath); err != nil {
+		return 0, err
+	}
+	if err := validateAbsolutePath(mountPath); err != nil {
+		return 0, err
+	}
+	mounted, present, err := m.GetMount(ctx, mountPath)
+	if err != nil {
+		return 0, err
+	}
+	if !present {
+		return 0, fmt.Errorf("filesystem is not mounted: %s", mountPath)
+	}
+	if mounted.FSType != "ext4" {
+		return 0, fmt.Errorf("%w: %s has filesystem %q, expected ext4", host.ErrMountConflict, mountPath, mounted.FSType)
+	}
+	size, err := m.waitForDeviceSize(ctx, devicePath, minimumBytes)
+	if err != nil {
+		return 0, err
+	}
+	if _, err := run(ctx, "resize2fs", devicePath); err != nil {
+		return 0, fmt.Errorf("resize ext4 filesystem: %w", err)
+	}
+	return size, nil
+}
+
+func (m *Mounter) waitForDeviceSize(ctx context.Context, devicePath string, minimumBytes int64) (int64, error) {
+	interval := m.devicePollInterval
+	if interval <= 0 {
+		interval = 250 * time.Millisecond
+	}
+	wait := m.deviceResizeWait
+	if wait <= 0 {
+		wait = deviceResizeWait
+	}
+	deadline := time.NewTimer(wait)
+	defer deadline.Stop()
+	for {
+		output, err := run(ctx, "lsblk", "--bytes", "--nodeps", "--noheadings", "--output", "SIZE", devicePath)
+		if err != nil {
+			return 0, fmt.Errorf("inspect block-device size: %w", err)
+		}
+		size, err := parseBlockDeviceSize(output)
+		if err != nil {
+			return 0, err
+		}
+		if size >= minimumBytes {
+			return size, nil
+		}
+		timer := time.NewTimer(interval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return 0, ctx.Err()
+		case <-deadline.C:
+			timer.Stop()
+			return 0, fmt.Errorf("%w: %s has %d bytes, want %d", host.ErrDeviceNotResized, devicePath, size, minimumBytes)
+		case <-timer.C:
+		}
+	}
+}
+
+func parseBlockDeviceSize(output string) (int64, error) {
+	value := strings.TrimSpace(output)
+	size, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || size <= 0 {
+		return 0, fmt.Errorf("lsblk returned invalid device size %q", value)
+	}
+	return size, nil
 }
 
 func probeFilesystem(ctx context.Context, device string) (string, error) {

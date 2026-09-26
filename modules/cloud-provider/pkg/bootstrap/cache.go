@@ -315,6 +315,7 @@ var fixedCacheImages = []cachedImage{
 	{Source: "docker://ghcr.io/kube-vip/kube-vip@sha256:44035f68040c9eb99103c65f1f9ab9698d93f9f272110825705338ac1926f3d9", Target: "kube-vip/kube-vip:v1.2.1"},
 	{Source: "docker://registry.k8s.io/sig-storage/csi-provisioner@sha256:67ee5137252811fd471b8571efe9e173145ec8af7b520861eeccf7c078a772f2", Target: "sig-storage/csi-provisioner:v5.2.0"},
 	{Source: "docker://registry.k8s.io/sig-storage/csi-attacher@sha256:8eb112854b025cacea3a0d04e9f8fbb46a7152258ada2437d8c80c70a823c3ac", Target: "sig-storage/csi-attacher:v4.8.1"},
+	{Source: "docker://registry.k8s.io/sig-storage/csi-resizer@sha256:9175c28d3db85da73d9d9286c0a2934f73be5b0b985b7d3069bbf1babda95318", Target: "sig-storage/csi-resizer:v1.13.2"},
 	{Source: "docker://registry.k8s.io/sig-storage/csi-node-driver-registrar@sha256:8e66117d3b5e336901fc2ff508b3eb6105f8cf3b70f631e8102441e9562c8875", Target: "sig-storage/csi-node-driver-registrar:v2.13.0"},
 	{Source: "docker://registry.k8s.io/sig-storage/livenessprobe@sha256:7546934830d80d61e598e8e9b2c327b3e2ae14e69b4364120077e4a800736c3c", Target: "sig-storage/livenessprobe:v2.15.0"},
 }

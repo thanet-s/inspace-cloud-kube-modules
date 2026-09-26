@@ -419,18 +419,27 @@ public load balancer.
 
 ## CSI controller timeouts
 
-The chart sets both `csi.sidecars.provisioner.timeoutSeconds` and
-`csi.sidecars.attacher.timeoutSeconds` to `600`. This allows up to two minutes
+The chart sets `csi.sidecars.provisioner.timeoutSeconds`,
+`csi.sidecars.attacher.timeoutSeconds`, and
+`csi.sidecars.resizer.timeoutSeconds` to `600`. This allows up to two minutes
 for preflight reads and durable-fence acquisition. Immediately before any
-CreateDisk, DeleteDisk, AttachDisk, or DetachDisk call, the driver requires
-480 seconds to remain: five minutes for the shared client's HTTP mutation
-deadline, two minutes for destructive recovery, and one minute for final
-readback and Kubernetes Lease persistence. If less remains, no cloud mutation
-is issued and only that invocation's exact undispatched Lease is cleared. The
-chart accepts larger values up to 3600 seconds, but rejects values below 600
-seconds. Shortening either sidecar deadline can cancel and strand the original
-no-replay Lease or cause overlapping retries while the mutation proof is still
-running.
+CreateDisk, DeleteDisk, AttachDisk, DetachDisk, or disk resize call, the driver
+requires 480 seconds to remain: five minutes for the shared client's HTTP
+mutation deadline, two minutes for destructive recovery, and one minute for
+final readback and Kubernetes Lease persistence. If less remains, no cloud
+mutation is issued and only that invocation's exact undispatched Lease is
+cleared. The chart accepts larger values up to 3600 seconds, but rejects values
+below 600 seconds. Shortening any of these sidecar deadlines can cancel and
+strand the original no-replay Lease or cause overlapping retries while the
+mutation proof is still running.
+
+## CSI volume expansion
+
+`csi.storageClass.allowVolumeExpansion` defaults to `true`. Raise a PVC's
+storage request to grow its InSpace disk and ext4 filesystem. InSpace resizes
+a disk only while it is attached to a VM, so expansion is online-only: a PVC
+that no Pod uses stays pending until a Pod mounts it. Set the value to `false`
+to forbid PVC growth for the chart-managed StorageClass.
 
 ## Install
 

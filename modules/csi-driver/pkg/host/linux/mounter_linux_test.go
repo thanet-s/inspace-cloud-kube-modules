@@ -77,3 +77,20 @@ func TestValidateWholeDiskMountSafety(t *testing.T) {
 		})
 	}
 }
+
+func TestParseBlockDeviceSize(t *testing.T) {
+	for input, want := range map[string]int64{
+		"32212254720\n":   32212254720,
+		"  21474836480  ": 21474836480,
+	} {
+		got, err := parseBlockDeviceSize(input)
+		if err != nil || got != want {
+			t.Errorf("parseBlockDeviceSize(%q) = %d, %v; want %d", input, got, err, want)
+		}
+	}
+	for _, input := range []string{"", "0", "-1", "20G", "1\n2\n"} {
+		if _, err := parseBlockDeviceSize(input); err == nil {
+			t.Errorf("parseBlockDeviceSize(%q) accepted invalid output", input)
+		}
+	}
+}

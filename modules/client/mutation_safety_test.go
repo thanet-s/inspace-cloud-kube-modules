@@ -46,6 +46,10 @@ func TestEveryMutationDispatchesOnceOnHTTP500(t *testing.T) {
 		{name: "DetachDisk", method: http.MethodPost, invoke: func(ctx context.Context, client *inspace.Client) error {
 			return client.DetachDisk(ctx, "bkk01", vmUUID, diskUUID)
 		}},
+		{name: "ResizeAttachedDisk", method: http.MethodPatch, invoke: func(ctx context.Context, client *inspace.Client) error {
+			_, err := client.ResizeAttachedDisk(ctx, "bkk01", vmUUID, diskUUID, 60)
+			return err
+		}},
 		{name: "CreateFloatingIP", method: http.MethodPost, invoke: func(ctx context.Context, client *inspace.Client) error {
 			_, err := client.CreateFloatingIP(ctx, "bkk01", inspace.CreateFloatingIPRequest{Name: "owned-ip", BillingAccountID: 42})
 			return err
@@ -111,14 +115,14 @@ func TestEveryMutationDispatchesOnceOnHTTP500(t *testing.T) {
 			return client.RemoveLoadBalancerRule(ctx, "bkk01", lbUUID, ruleUUID)
 		}},
 	}
-	if len(tests) != 22 {
-		t.Fatalf("mutation inventory contains %d methods, want 22", len(tests))
+	if len(tests) != 23 {
+		t.Fatalf("mutation inventory contains %d methods, want 23", len(tests))
 	}
 	covered := make(map[string]struct{}, len(tests))
 	for _, test := range tests {
 		covered[test.name] = struct{}{}
 	}
-	mutationPrefixes := []string{"Create", "Delete", "Attach", "Detach", "Assign", "Unassign", "Update", "Add", "Remove"}
+	mutationPrefixes := []string{"Create", "Delete", "Attach", "Detach", "Assign", "Unassign", "Update", "Add", "Remove", "Resize"}
 	clientType := reflect.TypeOf((*inspace.Client)(nil))
 	discovered := 0
 	for index := 0; index < clientType.NumMethod(); index++ {

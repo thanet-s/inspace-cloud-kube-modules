@@ -112,15 +112,15 @@ func TestCacheTLSContractIsStableP256AndBoundToPersistedInputs(t *testing.T) {
 	}
 }
 
-func TestCacheImageManifestContainsExactlyAuditedThirtyFiveImages(t *testing.T) {
+func TestCacheImageManifestContainsExactlyAuditedThirtySixImages(t *testing.T) {
 	const moduleVersion = "0.3.1-rc.2"
 	manifest, err := renderCacheImageManifest(bootstrapCacheRKE2Version, moduleVersion, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	lines := strings.Split(strings.TrimSuffix(manifest, "\n"), "\n")
-	if len(lines) != 35 || len(rke2CacheImages) != 27 || len(fixedCacheImages) != 5 {
-		t.Fatalf("cache inventory counts: manifest=%d RKE2=%d fixed=%d, want 35/27/5", len(lines), len(rke2CacheImages), len(fixedCacheImages))
+	if len(lines) != 36 || len(rke2CacheImages) != 27 || len(fixedCacheImages) != 6 {
+		t.Fatalf("cache inventory counts: manifest=%d RKE2=%d fixed=%d, want 36/27/6", len(lines), len(rke2CacheImages), len(fixedCacheImages))
 	}
 
 	sources := make(map[string]struct{}, len(lines))
@@ -162,8 +162,8 @@ func TestCacheImageManifestExcludesDisabledRKE2Ingress(t *testing.T) {
 		t.Fatal(err)
 	}
 	lines := strings.Split(strings.TrimSuffix(manifest, "\n"), "\n")
-	if len(lines) != 33 {
-		t.Fatalf("disabled-ingress cache manifest entries=%d, want 33", len(lines))
+	if len(lines) != 34 {
+		t.Fatalf("disabled-ingress cache manifest entries=%d, want 34", len(lines))
 	}
 	for _, forbidden := range []string{"rancher/kube-webhook-certgen:", "rancher/nginx-ingress-controller:"} {
 		if strings.Contains(manifest, forbidden) {

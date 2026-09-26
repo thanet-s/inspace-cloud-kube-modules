@@ -123,6 +123,24 @@ func (c *Cloud) DetachVolume(_ context.Context, location, volumeID, nodeID strin
 	return nil
 }
 
+func (c *Cloud) ExpandVolume(_ context.Context, location, volumeID string, capacityBytes int64) (int64, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	r, ok := c.volumes[key(location, volumeID)]
+	if !ok {
+		return 0, cloud.ErrNotFound
+	}
+	if r.volume.CapacityBytes >= capacityBytes {
+		return r.volume.CapacityBytes, nil
+	}
+	if r.attachedTo == "" {
+		return 0, cloud.ErrVolumeNotAttached
+	}
+	r.volume.CapacityBytes = capacityBytes
+	return capacityBytes, nil
+}
+
 func (c *Cloud) VolumeCount() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
