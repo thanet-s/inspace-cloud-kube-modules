@@ -360,8 +360,8 @@ func TestRenderedShellScriptsHaveValidSyntax(t *testing.T) {
 		}
 		checked++
 	}
-	if checked != 12 {
-		t.Fatalf("syntax-checked %d shell scripts, want twelve; runcmd=%#v", checked, doc.RunCmd)
+	if checked != 13 {
+		t.Fatalf("syntax-checked %d shell scripts, want thirteen; runcmd=%#v", checked, doc.RunCmd)
 	}
 }
 
@@ -734,6 +734,7 @@ func TestBootstrapOrchestratorIsFailFastAndDisablesFirewallAfterAdditionalData(t
 	prepareIndex := strings.Index(orchestrator, "/usr/local/sbin/inspace-prepare-kubernetes-node")
 	waitForInternetIndex := strings.Index(orchestrator, "/usr/local/sbin/inspace-wait-for-internet")
 	prerequisitesIndex := strings.Index(orchestrator, "/usr/local/sbin/inspace-install-prerequisites")
+	registryEgressIndex := strings.Index(orchestrator, "/usr/local/sbin/inspace-verify-registry-egress")
 	disableAPTIndex := strings.Index(orchestrator, "/usr/local/sbin/inspace-disable-automatic-apt-updates")
 	reassertAPTIndex := strings.LastIndex(orchestrator, "/usr/local/sbin/inspace-disable-automatic-apt-updates")
 	installIndex := strings.Index(orchestrator, "/usr/local/sbin/inspace-install-rke2")
@@ -742,7 +743,7 @@ func TestBootstrapOrchestratorIsFailFastAndDisablesFirewallAfterAdditionalData(t
 	disableIndex := strings.Index(orchestrator, "/usr/local/sbin/inspace-disable-host-firewall")
 	verifyIndex := strings.Index(orchestrator, "/usr/local/sbin/inspace-verify-host-firewall")
 	startIndex := strings.Index(orchestrator, "/usr/local/sbin/inspace-start-rke2-agent")
-	if prepareIndex < 0 || waitForInternetIndex <= prepareIndex || prerequisitesIndex <= waitForInternetIndex || disableAPTIndex <= prerequisitesIndex || installIndex <= disableAPTIndex || detectIndex <= installIndex || additionalIndex <= detectIndex || reassertAPTIndex <= additionalIndex || tuningIndex <= reassertAPTIndex || disableIndex <= tuningIndex || verifyIndex <= disableIndex || startIndex <= verifyIndex || strings.Count(orchestrator, "/usr/local/sbin/inspace-disable-automatic-apt-updates") != 2 {
+	if prepareIndex < 0 || waitForInternetIndex <= prepareIndex || prerequisitesIndex <= waitForInternetIndex || registryEgressIndex <= prerequisitesIndex || disableAPTIndex <= registryEgressIndex || installIndex <= disableAPTIndex || detectIndex <= installIndex || additionalIndex <= detectIndex || reassertAPTIndex <= additionalIndex || tuningIndex <= reassertAPTIndex || disableIndex <= tuningIndex || verifyIndex <= disableIndex || startIndex <= verifyIndex || strings.Count(orchestrator, "/usr/local/sbin/inspace-disable-automatic-apt-updates") != 2 {
 		t.Fatalf("unsafe orchestrator order\n%s", orchestrator)
 	}
 
@@ -755,7 +756,7 @@ if [ "$name" = "${FAIL_STEP:-}" ]; then exit 1; fi
 exit 0
 `
 	for _, name := range []string{
-		"inspace-prepare-kubernetes-node", "inspace-wait-for-internet", "inspace-install-prerequisites", "inspace-disable-automatic-apt-updates", "inspace-install-rke2", "inspace-detect-private-ip", "inspace-apply-node-tuning",
+		"inspace-prepare-kubernetes-node", "inspace-wait-for-internet", "inspace-install-prerequisites", "inspace-verify-registry-egress", "inspace-disable-automatic-apt-updates", "inspace-install-rke2", "inspace-detect-private-ip", "inspace-apply-node-tuning",
 		"inspace-additional-user-data", "inspace-disable-host-firewall", "inspace-verify-host-firewall", "inspace-start-rke2-agent", "cloud-init-per",
 	} {
 		writeExecutable(t, filepath.Join(stubDir, name), stub)
@@ -784,7 +785,7 @@ exit 0
 	if strings.Contains(log, "inspace-start-rke2-agent") {
 		t.Fatalf("agent start ran after firewall verification failure\n%s", log)
 	}
-	wantBeforeFailure := "inspace-prepare-kubernetes-node\ninspace-wait-for-internet\ninspace-install-prerequisites\ninspace-disable-automatic-apt-updates\ninspace-install-rke2\ninspace-detect-private-ip\ncloud-init-per\ninspace-disable-automatic-apt-updates\ninspace-apply-node-tuning\ninspace-disable-host-firewall\ninspace-verify-host-firewall\n"
+	wantBeforeFailure := "inspace-prepare-kubernetes-node\ninspace-wait-for-internet\ninspace-install-prerequisites\ninspace-verify-registry-egress\ninspace-disable-automatic-apt-updates\ninspace-install-rke2\ninspace-detect-private-ip\ncloud-init-per\ninspace-disable-automatic-apt-updates\ninspace-apply-node-tuning\ninspace-disable-host-firewall\ninspace-verify-host-firewall\n"
 	if log != wantBeforeFailure {
 		t.Fatalf("failure order differs\ngot:\n%swant:\n%s", log, wantBeforeFailure)
 	}
@@ -797,6 +798,69 @@ exit 0
 	log, err = run("inspace-install-prerequisites")
 	if err == nil || log != "inspace-prepare-kubernetes-node\ninspace-wait-for-internet\ninspace-install-prerequisites\n" {
 		t.Fatalf("prerequisite failure did not stop orchestrator: err=%v log=%q", err, log)
+	}
+
+	// A floating IP that reaches 8.8.8.8 but not the image registries must
+	// never register: the fast-registration timeout then replaces the node
+	// and records the address as bad (seen live in the v1.1.0-rc.7 E2E).
+	log, err = run("inspace-verify-registry-egress")
+	if err == nil || log != "inspace-prepare-kubernetes-node\ninspace-wait-for-internet\ninspace-install-prerequisites\ninspace-verify-registry-egress\n" {
+		t.Fatalf("registry-egress failure did not stop orchestrator: err=%v log=%q", err, log)
+	}
+}
+
+func TestRegistryEgressGateRequiresEveryRegistryWithinFiveMinutes(t *testing.T) {
+	data, err := RenderCloudInit(Config{
+		NodeName: "worker-1", Server: "https://10.0.0.10:9345", Token: "secret-token",
+		RKE2Version: "v1.36.5-rc2+rke2r1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gate := writeFileContent(t, mustDocument(t, data), "/usr/local/sbin/inspace-verify-registry-egress")
+	for _, want := range []string{
+		"https://registry-1.docker.io/v2/",
+		"https://ghcr.io/v2/",
+		"registry_deadline=$(( $(date +%s) + 300 ))",
+	} {
+		if !strings.Contains(gate, want) {
+			t.Fatalf("registry egress gate lacks %q\n%s", want, gate)
+		}
+	}
+	if strings.Contains(gate, "curl -f") || strings.Contains(gate, "--fail") {
+		t.Fatalf("registry egress gate must accept any HTTP answer (registries return 401)\n%s", gate)
+	}
+
+	// Behaviour: a curl that never connects makes the gate fail once the
+	// deadline passes; a curl that answers lets it pass immediately.
+	stubDir := t.TempDir()
+	clock := filepath.Join(stubDir, "clock")
+	if err := os.WriteFile(clock, []byte("1000"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeExecutable(t, filepath.Join(stubDir, "date"), `#!/bin/sh
+now=$(cat "$CLOCK"); echo $((now + 100)) > "$CLOCK"; echo "$now"
+`)
+	writeExecutable(t, filepath.Join(stubDir, "sleep"), "#!/bin/sh\nexit 0\n")
+	for _, tc := range []struct {
+		name     string
+		curlExit string
+		wantFail bool
+	}{
+		{name: "unreachable registry", curlExit: "7", wantFail: true},
+		{name: "reachable registries", curlExit: "0", wantFail: false},
+	} {
+		writeExecutable(t, filepath.Join(stubDir, "curl"), "#!/bin/sh\nexit "+tc.curlExit+"\n")
+		if err := os.WriteFile(clock, []byte("1000"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		command := exec.Command("sh")
+		command.Stdin = strings.NewReader(gate)
+		command.Env = append(os.Environ(), "PATH="+stubDir+":"+os.Getenv("PATH"), "CLOCK="+clock)
+		output, runErr := command.CombinedOutput()
+		if (runErr != nil) != tc.wantFail {
+			t.Fatalf("%s: gate error=%v, want failure=%t\n%s", tc.name, runErr, tc.wantFail, output)
+		}
 	}
 }
 

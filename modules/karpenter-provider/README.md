@@ -419,9 +419,12 @@ Worker network policy relies on the validated InSpace cloud firewall. Generated 
 
 ### Known-bad floating IP cache
 
-Some InSpace floating IPs have no working internet egress; `waitForInternet`
-bootstrap gate (see [RKE2 agent bootstrap](#rke2-agent-bootstrap)) exits
-before RKE2 install on the guest, so the Node never registers and Karpenter's
+Some InSpace floating IPs have no working internet egress, or reach some
+destinations but not the image registries. The `waitForInternet` bootstrap
+gate (see [RKE2 agent bootstrap](#rke2-agent-bootstrap)) and, after `curl` is
+installed, the `inspace-verify-registry-egress` gate (any HTTP answer from
+`registry-1.docker.io` and `ghcr.io` within five minutes) exit before RKE2
+starts on the guest, so the Node never registers and Karpenter's
 own registration-liveness timeout eventually deletes and replaces that
 NodeClaim. `Delete()` treats a NodeClaim whose `Registered` condition stayed
 unsatisfied for at least the 9-minute fast registration timeout as a signal
