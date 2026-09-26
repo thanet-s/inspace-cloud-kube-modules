@@ -2241,7 +2241,7 @@ func TestDurableVMDeleteCommittedHTTP500ConvergesThroughExactDeletedTombstone(t 
 	}
 }
 
-func TestDurableVMDeletePresentAfterHTTP500StaysReadOnlyAcrossRestart(t *testing.T) {
+func TestDurableVMDeletePresentAfterHTTP500ResendsOnlyWithSpacedPresenceAcrossRestart(t *testing.T) {
 	api := &fakeAPI{}
 	adapter, _ := New(api)
 	configureFastNetworkReadback(adapter, 50*time.Millisecond)
@@ -2263,19 +2263,23 @@ func TestDurableVMDeletePresentAfterHTTP500StaysReadOnlyAcrossRestart(t *testing
 
 	restarted, _ := New(api)
 	configureFastNetworkReadback(restarted, 50*time.Millisecond)
-	if err := restarted.DeleteVM(context.Background(), created.Location, created.UUID, created.ClusterName, created.NodeClaimName, identity); err == nil {
-		t.Fatal("restarted ambiguous VM DELETE unexpectedly converged")
-	}
-	if api.deleteVMCalls != 1 {
-		t.Fatalf("issued VM DELETE replayed after restart: calls=%d", api.deleteVMCalls)
-	}
-
+	// Without a canonical presence proof the issued DELETE stays read-only.
 	api.getVMErrorByUUID = map[string]error{created.UUID: errors.New("readback outage")}
 	if err := restarted.DeleteVM(context.Background(), created.Location, created.UUID, created.ClusterName, created.NodeClaimName, identity); err == nil {
 		t.Fatal("readback outage unexpectedly converged")
 	}
 	if api.deleteVMCalls != 1 {
 		t.Fatalf("readback outage replayed issued VM DELETE: calls=%d", api.deleteVMCalls)
+	}
+
+	// Spaced exact reads still show the owned VM, so the earlier DELETE did not
+	// commit and the same exact-UUID DELETE is re-sent once.
+	api.getVMErrorByUUID = nil
+	if err := restarted.DeleteVM(context.Background(), created.Location, created.UUID, created.ClusterName, created.NodeClaimName, identity); err != nil {
+		t.Fatalf("restarted uncommitted VM DELETE stayed wedged: %v", err)
+	}
+	if api.deleteVMCalls != 2 || len(api.vms) != 0 {
+		t.Fatalf("issued VM DELETE re-send calls=%d VMs=%d, want 2/0", api.deleteVMCalls, len(api.vms))
 	}
 }
 

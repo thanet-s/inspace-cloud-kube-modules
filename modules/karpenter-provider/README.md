@@ -250,14 +250,21 @@ persists `karpenter.inspace.cloud/removal-mutation-fence` before dispatching
 the exact ProviderID UUID delete from a fresh owned presence observation. The
 same immutable NodeClaim journal serializes VM delete, Floating-IP unassign,
 and Floating-IP delete. An issued step is read-only across every HTTP/transport
-result, restart, and competing controller; continued presence never grants a
-second dispatch. The issued receipt is durable, and a terminal removal result
+result, restart, and competing controller, with one exception: when the exact
+owned VM of an issued VM DELETE is still present in three canonical reads at
+least 30 seconds apart, each re-verifying its complete ownership record, the
+earlier DELETE did not commit and the same idempotent exact-UUID DELETE is
+re-sent under the same receipt. Otherwise an HTTP 500, 429, or timeout that
+never committed would bill the VM and block its finalizer forever. The issued
+receipt is durable, and a terminal removal result
 is persisted only after three complete authoritative absence observations at
 least 30 seconds apart. A restart before that terminal write starts the
 observation sequence again without replaying the mutation. The provider then
 proves core VM
-absence, cleans the exact named Floating IP, proves VM and assignment absence
-again, and only then detaches firewalls. One VM-detail 404 never authorizes
+absence, cleans the exact named Floating IP, confirms VM and assignment absence
+with one more complete read, and only then detaches firewalls; the firewall
+DELETE itself re-proves core VM absence with spaced reads just before
+dispatch. One VM-detail 404 never authorizes
 dependent cleanup: an already-missing VM must be absent from `GetVM`,
 `ListVMs`, and the configured VPC in repeated bounded observations.
 A later owned detail resumes the normal ownership-checked delete path; any
@@ -305,8 +312,17 @@ simultaneous external attachment.
 The fixed coordinator Lease contains independent non-expiring CAS receipts per
 base firewall. Same-firewall assignments and detachments serialize across
 NodeClaims, processes, and restarts; different firewalls can progress
-independently. A restarted controller is read-only for an already-issued slot,
-and elapsed time never grants mutation authority. Karpenter RBAC may patch or
+independently. A restarted controller is read-only for an already-issued
+assignment slot, and elapsed time never grants mutation authority. An issued
+detachment may re-send its idempotent exact VM/firewall unassign only after
+three reads at least 30 seconds apart still show that relation, and only after
+re-checking that its NodeClaim still owns the VM and the slot. A detachment
+takes the slot only when it sees the relation present (or, briefly, to retire
+an earlier issued receipt once absence is proven), and it holds the
+in-process firewall gate only from its exact pre-DELETE read through the first
+read after that DELETE, so read-only absence confirmations never block
+same-firewall launches. A slot whose owning NodeClaim no longer exists is
+retired for either operation, because only that owner can ever finish it. Karpenter RBAC may patch or
 update only this fixed Lease and its leader-election Lease. Existing issued v2
 create fences are conservatively read-only because the older controller had no
 shared slot and may already have dispatched the assignment.
