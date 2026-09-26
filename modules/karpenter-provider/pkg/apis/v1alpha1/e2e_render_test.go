@@ -200,7 +200,7 @@ func TestClusterE2EProvisionsInOrderAndWaitsForThreeControlPlanesInParallel(t *t
 	cloudInit := exactAnsibleTask(t, controlPlaneWait, "Wait for cloud-init completion on every control plane in parallel")
 	requireParallelTask(t, cloudInit)
 	requireTaskModule(t, cloudInit, "ansible.builtin.raw")
-	mustContain(t, "control-plane cloud-init wait", taskString(t, cloudInit, "ansible.builtin.raw"), "timeout --kill-after=5s 4800s")
+	mustContain(t, "control-plane cloud-init wait", taskString(t, cloudInit, "ansible.builtin.raw"), "timeout --kill-after=5s 2400s")
 	prepared := exactAnsibleTask(t, controlPlaneWait, "Detect completed product node preparation on every control plane")
 	requireParallelTask(t, prepared)
 	preparedConfig := requireTaskMapping(t, prepared, "ansible.builtin.stat")
