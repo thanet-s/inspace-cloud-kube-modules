@@ -26,6 +26,8 @@ import (
 // deliberately kept v13: a noble node renders the same suites as before, and a
 // login shell does not change Kubernetes behavior, so replacing every worker
 // is not worth it. Existing workers keep their shell until replaced.
+// The registry egress gate (v1.1.0-rc.8) also kept v13: it only decides
+// whether a new node registers and never changes a registered node.
 const (
 	SchemaVersion         = "stock-ubuntu-rke2-v13"
 	VPCSubnetPlaceholder  = "__INSPACE_VPC_SUBNET__"
@@ -325,6 +327,26 @@ until ping -c 1 -W 2 8.8.8.8 >/dev/null 2>&1; do
   sleep 5
 done
 `
+	// InSpace can assign a floating IPv4 that reaches 8.8.8.8 yet cannot reach
+	// the image registries. Such a node registers and then fails every image
+	// pull. Refusing to start the agent keeps it unregistered, so Karpenter's
+	// fast-registration timeout replaces it and records the address as bad.
+	// Any HTTP answer proves egress; the registries answer /v2/ with 401.
+	verifyRegistryEgress := `#!/bin/sh
+set -eu
+registry_deadline=$(( $(date +%s) + 300 ))
+attempt=0
+until curl --silent --output /dev/null --connect-timeout 10 --max-time 20 https://registry-1.docker.io/v2/ &&
+  curl --silent --output /dev/null --connect-timeout 10 --max-time 20 https://ghcr.io/v2/; do
+  attempt=$((attempt + 1))
+  if [ "$(date +%s)" -ge "$registry_deadline" ]; then
+    echo "floating IPv4 cannot reach registry-1.docker.io and ghcr.io after $attempt attempts; refusing to register" >&2
+    exit 1
+  fi
+  echo "waiting for floating-IP registry egress (attempt $attempt)" >&2
+  sleep 5
+done
+`
 	aptUpgradeContinuation := ""
 	if !config.SkipOSUpgrade {
 		aptUpgradeContinuation = `     run_package_command env NEEDRESTART_MODE=a DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=30 upgrade -y && \` + "\n"
@@ -476,6 +498,7 @@ tar -xzf "$tmpdir/rke2.linux-amd64.tar.gz" -C /usr/local
 			encodedWriteFile("/var/lib/inspace/static-resolv.conf", "0644", staticResolver),
 			encodedWriteFile("/usr/local/sbin/inspace-prepare-kubernetes-node", "0700", prepareHost),
 			encodedWriteFile("/usr/local/sbin/inspace-wait-for-internet", "0700", waitForInternet),
+			encodedWriteFile("/usr/local/sbin/inspace-verify-registry-egress", "0700", verifyRegistryEgress),
 			encodedWriteFile("/usr/local/sbin/inspace-install-prerequisites", "0700", prerequisites),
 			encodedWriteFile("/usr/local/sbin/inspace-disable-automatic-apt-updates", "0700", disableAutomaticAPTUpdates),
 			encodedWriteFile("/usr/local/sbin/inspace-install-rke2", "0700", install),
@@ -499,6 +522,7 @@ set -eu
 /usr/local/sbin/inspace-prepare-kubernetes-node
 /usr/local/sbin/inspace-wait-for-internet
 /usr/local/sbin/inspace-install-prerequisites
+/usr/local/sbin/inspace-verify-registry-egress
 /usr/local/sbin/inspace-disable-automatic-apt-updates
 /usr/local/sbin/inspace-install-rke2
 /usr/local/sbin/inspace-detect-private-ip
