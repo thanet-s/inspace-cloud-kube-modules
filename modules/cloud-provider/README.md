@@ -208,6 +208,20 @@ rolls back a newly created bastion/control-plane VM that receives an address
 inside it. InSpace exposes no range-reservation API, so operators must exclude
 the entire range from VPC VM/NLB DHCP or IPAM before reconciliation.
 
+Two optional, creation-time Cilium load-balancer fields are rendered into the
+same immutable `rke2-cilium` HelmChartConfig. Omitting both renders no
+`loadBalancer` block, so the default control-plane cloud-init bytes do not
+change. `InSpaceCluster` rejects any later change, and no lifecycle command
+rewrites the on-disk HelmChartConfig, so both are fixed at cluster creation.
+
+- `spec.network.loadBalancerAlgorithm: random | maglev` sets
+  `loadBalancer.algorithm`. Maglev keeps Cilium's default table size (16381)
+  and built-in cluster-wide hash seed; it applies to north-south frontends
+  (Node-LB, NodePort, LoadBalancer), not to socket-level ClusterIP traffic.
+- `spec.network.serviceTopology: true` sets `loadBalancer.serviceTopology`
+  (`enable-service-topology`). Cilium honors `PreferSameNode`,
+  `PreferSameZone`, and `PreferClose` only with it.
+
 Every RKE2 server receives the same deterministic Cilium pool and L2 policy
 AddOn. Cilium API client limits are calculated from the inclusive range size:
 `qps=max(10,ceil(addressCount/5))` and `burst=max(20,2*qps)`. The policy selects
@@ -504,6 +518,19 @@ The generated Service publishes paired private Node InternalIPs with
 `ipMode: VIP`; the user Service publishes the corresponding public FIPs with
 `ipMode: Proxy`. InSpace DNAT rewrites the public destination to the private IP
 before Cilium, so Cilium programs only the private frontend.
+The generated Service copies an explicit parent `spec.trafficDistribution`.
+When the parent leaves it empty, CCM sets `PreferSameNode`, a Kubernetes 1.36
+value that is GA (the `PreferSameTrafficDistribution` gate is locked on since
+1.35). Cilium 1.20 then serves a flow from a ready backend on the receiving LB
+node, for example an ingress DaemonSet that tolerates the Node-LB taint, and
+falls back to every backend when that node has none. Ordinary workloads never
+run on the tainted LB nodes, so for them nothing changes. Cilium honors the
+hint only when the cluster was bootstrapped with
+`spec.network.serviceTopology: true` (Cilium `enable-service-topology`);
+otherwise it is ignored and Cilium keeps its default selection. Child spec
+drift, including this field, is repaired in place, so generated Services
+created by an earlier release converge without withdrawing the published
+Service.
 TCP and UDP are supported; SCTP and
 `externalTrafficPolicy: Local` are rejected. The static NodePool limit permits
 exactly one temporary surge node so Karpenter drift replacement can converge

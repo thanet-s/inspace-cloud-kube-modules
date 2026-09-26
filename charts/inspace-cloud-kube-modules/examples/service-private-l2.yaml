@@ -8,7 +8,8 @@ metadata:
 spec:
   type: LoadBalancer
   loadBalancerClass: io.cilium/l2-announcer
-  # Cilium L2 Announcements does not support externalTrafficPolicy: Local.
+  # Local is also supported with Cilium 1.20.2 or later: only nodes with a
+  # ready local endpoint then compete for the L2 announcement lease.
   externalTrafficPolicy: Cluster
   selector:
     app.kubernetes.io/name: example-private
