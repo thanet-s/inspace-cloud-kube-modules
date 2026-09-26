@@ -557,16 +557,16 @@
         sleep: 5
         timeout: 300
 
+    # cloud-init reports a final result, so a timed-out wait is not retried:
+    # a second attempt would only repeat it. 40 minutes still covers a
+    # cold-cache boot; ansible.cfg retries dropped SSH transports.
     - name: Wait for bounded bastion cloud-init completion
       ansible.builtin.raw: >-
-        timeout --kill-after=5s 4800s sh -c
+        timeout --kill-after=5s 2400s sh -c
         'cloud-init status --wait >/dev/null 2>&1 || test $? -eq 2'
       become: true
       changed_when: false
       register: e2e_bastion_cloud_init
-      retries: 2
-      delay: 10
-      until: e2e_bastion_cloud_init.rc == 0
 
     - name: Prove the bastion private address Ubuntu version and cloud-firewall-only state
       ansible.builtin.shell: |
@@ -771,16 +771,15 @@
         curl -sS -o /dev/null --connect-timeout 10 --max-time 20 https://ghcr.io/v2/; do sleep 5; done'
       changed_when: false
 
+    # One bounded attempt: cloud-init reports a final result, so a timed-out
+    # wait would only repeat. ansible.cfg retries dropped SSH transports.
     - name: Wait for cloud-init completion on every control plane in parallel
       ansible.builtin.raw: >-
-        timeout --kill-after=5s 4800s sh -c
+        timeout --kill-after=5s 2400s sh -c
         'cloud-init status --wait >/dev/null 2>&1 || test $? -eq 2'
       become: true
       changed_when: false
       register: e2e_control_plane_cloud_init
-      retries: 2
-      delay: 10
-      until: e2e_control_plane_cloud_init.rc == 0
 
     - name: Detect completed product node preparation on every control plane
       ansible.builtin.stat:
@@ -1863,12 +1862,26 @@
         test "$(kubectl -n default get deployment/inspace-e2e-trigger -o jsonpath='{.spec.template.spec.containers[0].image}')" = \
           '{{ e2e_state.bootstrapCacheRegistry }}/rancher/mirrored-pause:3.10.2@sha256:412c4a7219cb8a299a37337f3d87810c5340095322e15594a1637785adad0f17'
         kubectl wait --for=condition=Ready node -l "karpenter.sh/nodepool={{ e2e_nodepool_name }}" --timeout=10m
-        kubectl get nodeclaims -l "karpenter.sh/nodepool={{ e2e_nodepool_name }}" -o json | jq -e '
-          .items | length == 1 and
-          all(.[]; any(.status.conditions[]; .type == "Ready" and .status == "True"))'
       args:
         executable: /bin/bash
       changed_when: true
+
+    # A first NodeClaim that missed its registration timeout can still be
+    # terminating after its replacement is Ready. Count only live claims.
+    - name: Require exactly one live Ready Karpenter worker NodeClaim
+      ansible.builtin.shell: |
+        set -euo pipefail
+        kubectl get nodeclaims -l "karpenter.sh/nodepool={{ e2e_nodepool_name }}" -o json | jq -e '
+          [.items[] | select(.metadata.deletionTimestamp == null)] |
+          length == 1 and
+          all(.[]; any(.status.conditions[]?; .type == "Ready" and .status == "True"))'
+      args:
+        executable: /bin/bash
+      register: e2e_live_worker_claim
+      changed_when: false
+      retries: 30
+      delay: 10
+      until: e2e_live_worker_claim.rc == 0
 
     - name: Render the direct public-registry egress probe
       ansible.builtin.template:
@@ -2022,16 +2035,15 @@
         sleep: 5
         timeout: 900
 
+    # The worker Node is already Ready, so cloud-init is at most finishing its
+    # final modules; one 10-minute attempt is ample.
     - name: Wait for worker cloud-init within a hard outer timeout
       ansible.builtin.raw: >-
-        timeout --kill-after=5s 1200s sh -c
+        timeout --kill-after=5s 600s sh -c
         'cloud-init status --wait >/dev/null 2>&1 || test $? -eq 2'
       become: true
       changed_when: false
       register: e2e_worker_cloud_init
-      retries: 2
-      delay: 10
-      until: e2e_worker_cloud_init.rc == 0
 
     - name: Verify cloud-init Ubuntu and the RKE2 agent
       ansible.builtin.shell: |

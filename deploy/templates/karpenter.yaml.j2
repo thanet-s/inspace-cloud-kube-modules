@@ -14,7 +14,7 @@ spec:
   firewallUUID: {{ bootstrap_result.firewallUUID }}
   imageSelector:
     osName: ubuntu
-    osVersion: "26.04"
+    osVersion: "{{ deploy_os_version }}"
   rootDiskGiB: {{ karpenter_root_disk_gib }}
   bootstrapCache:
     directDownload: {{ bootstrap_direct_download | bool | ternary('true', 'false') }}

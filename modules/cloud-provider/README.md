@@ -270,7 +270,11 @@ and returning that first Ready result. Control-plane floating IPv4s are not
 probed: the managed node firewall admits inbound traffic only from the private
 subnet and pod CIDR, so a healthy control plane never answers from outside.
 Their internet egress is proven from inside, through the bastion, by the
-`test/e2e` and `deploy/` init playbooks. This is a detect-and-retry mitigation
+`test/e2e` and `deploy/` init playbooks; a failed proof fails `init` quickly
+but does not retry by itself. Only the E2E `all` phase destroys and retries
+automatically, and `deploy/` does so only when
+`INSPACE_DEPLOY_INIT_AUTO_RECOVER=true` (default `false`). The bastion probe
+above is a detect-and-retry mitigation
 at the one layer that can act automatically without spending an operator's
 time on it, not a fix for the underlying gap; see RELEASING.md's known-issue
 entry. Set it to `0` to disable the probe entirely.

@@ -1535,7 +1535,7 @@ def verify_public_node_local_e2e_contract(
         "Wait for public-node-local static capacity cleanup",
         "Delete the public-node-local NodeClass after capacity is gone",
         "Require complete public-node-local capacity and cloud cleanup",
-        "Require exact pre-public-node-local account inventory",
+        "Require exact pre-Node-LB account inventory after endpoint-local and Node-LB cleanup",
     )
     positions = [exercise.index(f"- name: {name}") for name in ordered_tasks]
     require(
@@ -1598,6 +1598,250 @@ def verify_public_node_local_e2e_contract(
         in readme
         and "InSpace NLB UUID set to remain unchanged" in readme,
         "E2E documentation must describe endpoint-local datapath, ownership, and zero-NLB proof",
+    )
+
+
+def shell_task_script(task: str) -> str:
+    """Return the dedented literal script of one bounded shell task."""
+    lines = task.splitlines()
+    starts = [index for index, line in enumerate(lines) if line == "      ansible.builtin.shell: |"]
+    require(len(starts) == 1, "shell task must contain exactly one literal script")
+    script = []
+    for line in lines[starts[0] + 1:]:
+        if line.strip() and not line.startswith(" " * 8):
+            break
+        script.append(line[8:])
+    return "\n".join(script) + "\n"
+
+
+def verify_private_lb_quiesce_runtime(cleanup: str) -> None:
+    """Run the destroy-time Cilium quiesce script against a fake kubectl."""
+    task = named_yaml_sequence_item(
+        cleanup, "Wait for private Cilium L2 leases and LB IPAM allocations to quiesce", 4
+    )
+    script = shell_task_script(task).replace('"{{ e2e_kubeconfig }}"', '"$FAKE_KUBECONFIG"')
+    require("{{" not in script, "private LB quiesce script has an unexpected template expression")
+    fake_kubectl = r"""#!/bin/bash
+arguments=" $* "
+case "$arguments" in
+  *" api-resources "*)
+    echo leases.coordination.k8s.io
+    [[ $FAKE_SCENARIO == no-crd ]] || echo ciliumloadbalancerippools.cilium.io
+    exit 0 ;;
+  *" get lease "*)
+    exit 0 ;;
+  *" get ciliumloadbalancerippool inspace-private "*)
+    if [[ $FAKE_SCENARIO == no-crd ]]; then
+      echo 'error: the server does not have a resource type "ciliumloadbalancerippool"' >&2
+      exit 1
+    fi
+    if [[ $FAKE_SCENARIO == not-found ]]; then
+      [[ $arguments == *" --ignore-not-found "* ]] && exit 0
+      echo 'Error from server (NotFound): ciliumloadbalancerippools.cilium.io "inspace-private" not found' >&2
+      exit 1
+    fi
+    case $FAKE_SCENARIO in
+      used-0) used=0 ;;
+      used-1) used=1 ;;
+      no-condition) echo '{"status":{"conditions":[]}}'; exit 0 ;;
+      *) exit 98 ;;
+    esac
+    printf '{"status":{"conditions":[{"type":"cilium.io/IPsUsed","message":"%s"}]}}\n' "$used"
+    exit 0 ;;
+esac
+echo "unexpected kubectl $*" >&2
+exit 97
+"""
+    with tempfile.TemporaryDirectory() as directory:
+        root = pathlib.Path(directory)
+        kubectl = root / "kubectl"
+        kubectl.write_text(fake_kubectl, encoding="utf-8")
+        kubectl.chmod(0o755)
+        script_path = root / "quiesce.sh"
+        script_path.write_text(script, encoding="utf-8")
+        for scenario, quiesced in (
+            ("not-found", True),
+            ("no-crd", True),
+            ("used-0", True),
+            ("used-1", False),
+            ("no-condition", False),
+        ):
+            result = subprocess.run(
+                ["bash", str(script_path)],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                env={
+                    **os.environ,
+                    "PATH": f"{root}:{os.environ.get('PATH', '')}",
+                    "FAKE_KUBECONFIG": str(root / "kubeconfig"),
+                    "FAKE_SCENARIO": scenario,
+                },
+            )
+            require(
+                "unexpected kubectl" not in result.stderr,
+                f"private LB quiesce issued an unexpected kubectl call: {result.stderr}",
+            )
+            require(
+                (result.returncode == 0) == quiesced,
+                f"private LB quiesce scenario {scenario} returned {result.returncode}; "
+                f"expected {'success' if quiesced else 'a retryable failure'}",
+            )
+
+
+def verify_teardown_timing_contract(
+    init_playbook: str,
+    test_playbook: str,
+    cleanup: str,
+    nodeclass: str,
+    public_node_local_capacity: str,
+) -> None:
+    """Bound slow waits without dropping any ownership or absence proof."""
+    # Destroy: once workload, storage, and endpoint-local Service gates pass,
+    # both independent NodePools are deleted before any capacity wait so the
+    # Node-LB, edge, and general teardowns overlap instead of running serially.
+    storage_gate = cleanup.index("- name: Wait for E2E pods PVs and VolumeAttachments to disappear")
+    local_service_gate = cleanup.index(
+        "- name: Wait for the public-node-local Service firewall owner to disappear"
+    )
+    cilium_gate = cleanup.index(
+        "- name: Wait for private Cilium L2 leases and LB IPAM allocations to quiesce"
+    )
+    edge_pool_delete = cleanup.index(
+        "- name: Delete the public-node-local static NodePool while Karpenter is running"
+    )
+    worker_pool_delete = cleanup.index("- name: Delete the NodePool while Karpenter is still running")
+    node_lb_wait = cleanup.index("- name: Wait for every managed Node-LB owner to quiesce")
+    node_lb_class = cleanup.index("- name: Delete the generated Node-LB NodeClass after its owners are gone")
+    edge_wait = cleanup.index("- name: Wait for public-node-local NodeClaims and Nodes to disappear")
+    edge_class = cleanup.index("- name: Delete the public-node-local NodeClass after edge capacity is gone")
+    worker_wait = cleanup.index("- name: Wait for owned NodeClaims and worker Nodes to disappear")
+    worker_class = cleanup.index("- name: Delete the NodeClass after all worker ownership is gone")
+    owner_audit = cleanup.index(
+        "- name: Wait until CCM CSI and Karpenter removed all non-control-plane cloud resources"
+    )
+    require(
+        max(storage_gate, local_service_gate, cilium_gate) < min(edge_pool_delete, worker_pool_delete)
+        and max(edge_pool_delete, worker_pool_delete) < min(node_lb_wait, edge_wait, worker_wait)
+        and node_lb_wait < node_lb_class
+        and edge_wait < edge_class
+        and worker_wait < worker_class
+        and max(node_lb_class, edge_class, worker_class) < owner_audit,
+        "destroy must delete both NodePools before any capacity wait and delete each NodeClass only "
+        "after its own capacity is proven absent",
+    )
+
+    # Cloud-init reports a final result; re-running a timed-out wait only
+    # repeats it. SSH transport drops are retried by ansible.cfg.
+    for play, name, register, seconds in (
+        ("Establish the pinned public bastion", "Wait for bounded bastion cloud-init completion",
+         "e2e_bastion_cloud_init", "2400s"),
+        (None, "Wait for cloud-init completion on every control plane in parallel",
+         "e2e_control_plane_cloud_init", "2400s"),
+        (None, "Wait for worker cloud-init within a hard outer timeout", "e2e_worker_cloud_init", "600s"),
+    ):
+        scope = init_playbook if play is None else named_yaml_sequence_item(init_playbook, play, 0)
+        task = named_yaml_sequence_item(scope, name, 4)
+        require(
+            f"timeout --kill-after=5s {seconds} sh -c" in task
+            and re.search(r"(?m)^ {6}(retries|until|delay):", task) is None
+            and f"register: {register}" in task,
+            f"{name} must be one {seconds} attempt without task-level retries",
+        )
+
+    capacity_ready = named_yaml_sequence_item(
+        test_playbook, "Wait for static public-node-local capacity before Service authorization", 8
+    )
+    require_yaml_key(capacity_ready, 10, "retries", "120")
+    require_yaml_key(capacity_ready, 10, "delay", "10")
+
+    live_claim = named_yaml_sequence_item(
+        init_playbook, "Require exactly one live Ready Karpenter worker NodeClaim", 4
+    )
+    require(
+        "select(.metadata.deletionTimestamp == null)" in live_claim
+        and "length == 1" in live_claim
+        and "until: e2e_live_worker_claim.rc == 0" in live_claim,
+        "worker NodeClaim count must ignore terminating claims and retry within a bound",
+    )
+    require_yaml_key(live_claim, 6, "retries", "30")
+    require_yaml_key(live_claim, 6, "delay", "10")
+    trigger = named_yaml_sequence_item(init_playbook, "Force and verify exactly one Karpenter worker", 4)
+    require("get nodeclaims" not in trigger,
+            "the one-shot trigger task must not assert a NodeClaim count without a retry")
+    require(
+        init_playbook.index("- name: Force and verify exactly one Karpenter worker")
+        < init_playbook.index("- name: Require exactly one live Ready Karpenter worker NodeClaim")
+        < init_playbook.index("- name: Render the direct public-registry egress probe"),
+        "the live NodeClaim proof must follow the trigger and precede the egress gate",
+    )
+
+    for label, template in (("general", nodeclass), ("edge", public_node_local_capacity)):
+        nodepool = single_kind_document(template, "NodePool")
+        require(
+            yaml_mapping_scalar(nodepool, "spec", "template", "spec", "terminationGracePeriod") == "5m",
+            f"E2E {label} NodePool must bound node drain with terminationGracePeriod: 5m",
+        )
+
+    # Endpoint-local acceptance does not depend on Node-LB cloud cleanup, so
+    # the Node-LB absence proof runs after endpoint-local cleanup and both
+    # controllers drain in parallel. The Node-LB proof must follow the
+    # endpoint-local Service cleanup because both use inlb-* firewall and
+    # datapath names.
+    node_lb_exercise = named_yaml_sequence_item(
+        test_playbook, "Exercise shared conflict and dedicated public Node-LB modes", 4
+    )
+    node_lb_block, node_lb_always = node_lb_exercise.split("\n      always:\n", 1)
+    defer_task = named_yaml_sequence_item(
+        node_lb_block, "Defer the Node-LB cloud absence proof past endpoint-local acceptance", 8
+    )
+    require("e2e_node_lb_cleanup_deferred: true" in defer_task,
+            "the Node-LB block must defer its absence proof only after every assertion passed")
+    require(
+        node_lb_block.rstrip().endswith(defer_task.rstrip()),
+        "the Node-LB deferral marker must be the block's final task",
+    )
+    for name in (
+        "Require Node-LB Services datapaths NodePools firewalls VMs and FIPs to disappear",
+        "Delete the generated Node-LB NodeClass after its shards are gone",
+        "Require exact pre-Node-LB account inventory after cleanup",
+    ):
+        task = named_yaml_sequence_item(node_lb_always, name, 8)
+        require_yaml_key(task, 10, "when", "not (e2e_node_lb_cleanup_deferred | default(false) | bool)")
+    local_exercise = named_yaml_sequence_item(
+        test_playbook, "Exercise user-owned endpoint-local public capacity", 4
+    )
+    local_block, local_always = local_exercise.split("\n      always:\n", 1)
+    require("/opt/e2e/scripts/account-inventory.py" not in local_block,
+            "endpoint-local block must not compare the account inventory while Node-LB cleanup may still drain")
+    deferred_order = (
+        "Wait for fallback public-node-local capacity cleanup",
+        "Reprove complete public-node-local cleanup after fallback",
+        "Require deferred Node-LB Services datapaths NodePools firewalls VMs and FIPs to disappear",
+        "Delete the deferred generated Node-LB NodeClass after its shards are gone",
+        "Require exact pre-Node-LB account inventory after endpoint-local and Node-LB cleanup",
+    )
+    positions = [local_always.index(f"        - name: {name}") for name in deferred_order]
+    require(positions == sorted(positions),
+            "deferred Node-LB cleanup must follow endpoint-local cleanup and precede the final inventory compare")
+    deferred_absent = named_yaml_sequence_item(local_always, deferred_order[2], 8)
+    require(
+        "/opt/e2e/scripts/verify-node-load-balancer.py" in deferred_absent
+        and "--expect\n              - absent" in deferred_absent
+        and '"{{ e2e_baseline_inventory_file }}"' in deferred_absent
+        and "until: e2e_node_lb_deferred_absent.rc == 0" in deferred_absent,
+        "deferred Node-LB absence proof must use the immutable pre-mutation NLB UUID baseline",
+    )
+    require_yaml_key(deferred_absent, 10, "when", "e2e_node_lb_cleanup_deferred | default(false) | bool")
+    deferred_class = named_yaml_sequence_item(local_always, deferred_order[3], 8)
+    require_yaml_key(deferred_class, 10, "when", "e2e_node_lb_cleanup_deferred | default(false) | bool")
+    final_inventory = named_yaml_sequence_item(local_always, deferred_order[4], 8)
+    require(
+        "/opt/e2e/scripts/account-inventory.py" in final_inventory
+        and '"{{ e2e_node_lb_baseline }}"' in final_inventory
+        and re.search(r"(?m)^ {10}when:", final_inventory) is None,
+        "the final unconditional inventory compare must restore the exact pre-Node-LB account",
     )
 
 
@@ -1686,6 +1930,14 @@ def main() -> None:
         public_node_local_service,
         public_node_local_verifier,
         readme,
+    )
+    verify_private_lb_quiesce_runtime(cleanup)
+    verify_teardown_timing_contract(
+        init_playbook,
+        test_playbook,
+        cleanup,
+        nodeclass,
+        public_node_local_capacity,
     )
     strict_reader_test = subprocess.run(
         [sys.executable, str(ROOT / "scripts/test-strict-inspace-api.py")],
@@ -2057,7 +2309,7 @@ def main() -> None:
     )
     require_unrestricted_parallel_task(cloud_init_wait)
     require("\n      ansible.builtin.raw: >-" in cloud_init_wait and
-            "timeout --kill-after=5s 4800s sh -c" in cloud_init_wait,
+            "timeout --kill-after=5s 2400s sh -c" in cloud_init_wait,
             "control-plane cloud-init wait must cover bounded cold-cache initialization inside the free-strategy play")
     product_preparation = named_yaml_sequence_item(
         control_plane_wait_play, "Detect completed product node preparation on every control plane", 4
@@ -2193,7 +2445,7 @@ def main() -> None:
         "Run the bootstrap reconciler synchronously to readiness",
         "wait_for_connection",
         "systemctl is-active rke2-server",
-        "timeout --kill-after=5s 1200s sh -c",
+        "timeout --kill-after=5s 600s sh -c",
         "KubeProxyReplacement:[[:space:]]+True",
         "Direct Routing",
         "auto-direct-node-routes",
@@ -3149,7 +3401,7 @@ def main() -> None:
     bastion_cloud_init = named_yaml_sequence_item(
         bastion_play, "Wait for bounded bastion cloud-init completion", 4
     )
-    require("timeout --kill-after=5s 4800s sh -c" in bastion_cloud_init,
+    require("timeout --kill-after=5s 2400s sh -c" in bastion_cloud_init,
             "bastion cloud-init wait must cover bounded cold-cache initialization")
     for hostname_proof in (
         'test "$(hostname)" = "{{ e2e_node_name }}"',

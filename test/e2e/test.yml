@@ -1790,6 +1790,16 @@
           delay: 1
           until: e2e_node_lb_background_upgrade.rc == 0
           no_log: true
+
+        # Endpoint-local acceptance uses only its own edge NodePool, VM, FIP,
+        # Service firewall, and datapath, so Node-LB cloud cleanup can drain
+        # while it runs. The Node-LB absence proof, NodeClass deletion, and
+        # inventory compare then run after endpoint-local cleanup: they must,
+        # because the endpoint-local Service firewall and datapath share the
+        # inlb-* names that the Node-LB absence proof forbids.
+        - name: Defer the Node-LB cloud absence proof past endpoint-local acceptance
+          ansible.builtin.set_fact:
+            e2e_node_lb_cleanup_deferred: true
       always:
         - name: Stop any retained Node-LB continuity probe before cleanup
           ansible.builtin.file:
@@ -1812,6 +1822,8 @@
               - --wait=false
           changed_when: true
 
+        # A failed Node-LB assertion never reaches endpoint-local acceptance,
+        # so it proves the complete cleanup here before the play fails.
         - name: Require Node-LB Services datapaths NodePools firewalls VMs and FIPs to disappear
           ansible.builtin.command:
             argv:
@@ -1830,6 +1842,7 @@
           delay: 10
           until: e2e_node_lb_absent.rc == 0
           no_log: true
+          when: not (e2e_node_lb_cleanup_deferred | default(false) | bool)
 
         - name: Delete the generated Node-LB NodeClass after its shards are gone
           ansible.builtin.command:
@@ -1843,6 +1856,7 @@
               - --wait=true
               - --timeout=5m
           changed_when: true
+          when: not (e2e_node_lb_cleanup_deferred | default(false) | bool)
 
         - name: Require exact pre-Node-LB account inventory after cleanup
           ansible.builtin.command:
@@ -1857,6 +1871,7 @@
           delay: 10
           until: e2e_node_lb_inventory_cleanup.rc == 0
           no_log: true
+          when: not (e2e_node_lb_cleanup_deferred | default(false) | bool)
 
     - name: Render the public-node-local static edge capacity
       ansible.builtin.template:
@@ -1897,7 +1912,9 @@
             executable: /bin/bash
           register: e2e_public_local_capacity_ready
           changed_when: false
-          retries: 60
+          # Karpenter's 9-minute registration timeout plus one replacement
+          # boot must fit, so one bad first boot does not fail the run.
+          retries: 120
           delay: 10
           until: e2e_public_local_capacity_ready.rc == 0
 
@@ -2210,20 +2227,6 @@
           delay: 10
           until: e2e_public_local_absent.rc == 0
           no_log: true
-
-        - name: Require exact pre-public-node-local account inventory
-          ansible.builtin.command:
-            argv:
-              - /opt/e2e/scripts/account-inventory.py
-              - compare
-              - --baseline
-              - "{{ e2e_node_lb_baseline }}"
-          register: e2e_public_local_inventory_cleanup
-          changed_when: false
-          retries: 30
-          delay: 10
-          until: e2e_public_local_inventory_cleanup.rc == 0
-          no_log: true
       always:
         - name: Delete the public-node-local Service before fallback capacity cleanup
           ansible.builtin.command:
@@ -2319,7 +2322,44 @@
           no_log: true
           when: e2e_public_local_uid_journal is defined and e2e_public_local_uid_journal.rc == 0
 
-        - name: Restore exact pre-public-node-local account inventory after fallback
+        # The Node-LB cleanup started before endpoint-local acceptance and has
+        # drained in parallel; prove it only now that the endpoint-local
+        # Service firewall and datapath, which share inlb-* names, are gone.
+        - name: Require deferred Node-LB Services datapaths NodePools firewalls VMs and FIPs to disappear
+          ansible.builtin.command:
+            argv:
+              - /opt/e2e/scripts/verify-node-load-balancer.py
+              - --state
+              - "{{ e2e_state_file }}"
+              - --kubeconfig
+              - "{{ e2e_kubeconfig }}"
+              - --expect
+              - absent
+              - --immutable-baseline
+              - "{{ e2e_baseline_inventory_file }}"
+          register: e2e_node_lb_deferred_absent
+          changed_when: false
+          retries: 180
+          delay: 10
+          until: e2e_node_lb_deferred_absent.rc == 0
+          no_log: true
+          when: e2e_node_lb_cleanup_deferred | default(false) | bool
+
+        - name: Delete the deferred generated Node-LB NodeClass after its shards are gone
+          ansible.builtin.command:
+            argv:
+              - kubectl
+              - delete
+              - inspacenodeclass
+              - -l
+              - "inspace.cloud/node-lb-managed=true,inspace.cloud/node-lb-cluster={{ e2e_state.clusterName }}"
+              - --ignore-not-found
+              - --wait=true
+              - --timeout=5m
+          changed_when: true
+          when: e2e_node_lb_cleanup_deferred | default(false) | bool
+
+        - name: Require exact pre-Node-LB account inventory after endpoint-local and Node-LB cleanup
           ansible.builtin.command:
             argv:
               - /opt/e2e/scripts/account-inventory.py
