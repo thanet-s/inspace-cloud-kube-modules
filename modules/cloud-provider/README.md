@@ -286,7 +286,14 @@ New bootstrap FIPs are `<metadata.name>-bastion-ip` and
 `<metadata.name>-cp0-ip`, plus `-cp1-ip` and `-cp2-ip` for HA. The two firewall display names are
 `<metadata.name>-bastion-<owner>` and `<metadata.name>-nodes-<owner>`; keeping
 the namespace/name owner hash in firewall names preserves ownership even
-though InSpace omits firewall descriptions from readback.
+though InSpace omits firewall descriptions from readback. VM and FIP names are
+not namespaced, so two InSpaceClusters with the same `metadata.name` cannot
+share a location; reconciliation fails before any mutation, with an explicit
+error, when a deterministic VM name is held by another owner's record.
+Re-running bootstrap tolerates this cluster's Karpenter and node load-balancer
+workers on the node firewall only when each one's `<metadata.name>-karp-<nodeClaim>`
+name and Karpenter ownership record (cluster, node firewall UUID, billing
+account, VPC) match; any other extra assignment is still rejected as drift.
 
 Reconciliation never migrates the legacy `rke2-<owner>-*` VM, FIP, or firewall
 topology. It fails before mutation when those resources are present. Teardown
@@ -307,8 +314,14 @@ InSpace accepts firewall descriptions on create but omits them from readback,
 so an absent description is tolerated while any returned mismatch is rejected.
 It unassigns and deletes every selected control-plane FIP plus the bastion FIP
 before deleting the bastion and selected control-plane VMs, because InSpace VM deletion only leaves an automatic
-FIP active and unassigned. Both managed firewalls are deleted only after their
-assignments are absent:
+FIP active and unassigned. An owned VM whose auto FIP is not yet visible (for
+example one destroyed while bootstrap still waits for the assignment) is not
+deleted until that FIP is observed and removed; after a bounded 10-minute wait
+per process the FIP is treated as externally released. Both managed firewalls
+are deleted only after their assignments are absent. Teardown refuses to start
+while any other VM, including this cluster's Karpenter or node load-balancer
+workers, is still assigned to a managed firewall; it never detaches or deletes
+a VM it does not own:
 
 Before every FIP unassign/delete, VM delete, and firewall delete, the controller
 records the exact owned address, UUID, related UUID, deterministic slot, and
@@ -319,9 +332,12 @@ The controller releases dependents only after two exact authoritative
 absence/relationship-withdrawal observations separated in time. If the exact
 resource or relationship reappears between those reads, only the absence
 evidence is cleared; the issued no-replay lock remains.
-Malformed VM-create rollback uses the same durable ledger, deletes the exact
-unprotected VM once, proves its absence, then removes its exact auto-FIP before
-atomically resetting the create/assignment/FIP slots for replacement. These
+Malformed VM-create rollback uses the same durable ledger. It first records the
+exact address of the VM's auto-FIP (waiting, durably pending, until that
+address is listed, because once the VM is gone a nameless unassigned FIP can no
+longer be proven to be its own), then deletes the exact VM once, proves its
+absence, and removes that exact auto-FIP before atomically resetting the
+create/assignment/FIP slots for replacement. These
 receipts have no TTL, survive controller reconstruction, and reject an unknown
 UUID, wrong deterministic name, different firewall, or duplicate assignment.
 

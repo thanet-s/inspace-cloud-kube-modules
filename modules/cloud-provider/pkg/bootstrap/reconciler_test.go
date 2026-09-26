@@ -2129,29 +2129,62 @@ func TestFloatingIPCleanupTimeoutDoesNotConsumeVMDeletePhase(t *testing.T) {
 	api.failFirewallAssignmentForName = "bastion"
 	api.blockFloatingIPCleanupAfterCreate = true
 	api.requireLiveSafetyContext = true
+	cluster := testCluster()
 
-	_, err := testReconciler(api).Reconcile(context.Background(), testCluster(), "unit-test-secret-token")
-	if err == nil || !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("blocked floating-IP cleanup did not preserve its timeout: %v", err)
+	_, err := testReconciler(api).Reconcile(context.Background(), cluster, "unit-test-secret-token")
+	if err == nil || !errors.Is(err, context.DeadlineExceeded) || !errors.Is(err, ErrCreateAttemptPending) {
+		t.Fatalf("blocked floating-IP discovery did not preserve its timeout as pending: %v", err)
 	}
-	if len(api.vmDeletes) != 1 || len(api.vms) != 0 {
-		t.Fatalf("cleanup timeout consumed the detached VM-delete phase: deletes=%#v VMs=%#v", api.vmDeletes, api.vms)
+	// A failed discovery read never identifies the auto FIP, so the VM delete
+	// must not be issued: deleting first would strand a nameless address.
+	attempt := cluster.Status.DeleteAttempts[deleteAttemptBastion]
+	if len(api.vmDeletes) != 0 || len(api.vms) != 1 || attempt.Phase != deletePhaseRollbackFIPDiscovery {
+		t.Fatalf("discovery timeout consumed the VM-delete phase: deletes=%#v VMs=%#v attempt=%#v", api.vmDeletes, api.vms, attempt)
+	}
+
+	api.mu.Lock()
+	api.floatingIPCleanupBlocked = false
+	api.blockFloatingIPCleanupAfterCreate = false
+	api.failFirewallAssignmentForName = ""
+	api.mu.Unlock()
+	for pass := 0; pass < 10 && len(cluster.Status.DeleteAttempts) != 0; pass++ {
+		if _, err := testReconciler(api).Reconcile(context.Background(), cluster, "unit-test-secret-token"); err != nil &&
+			!errors.Is(err, ErrCreateAttemptPending) && !errors.Is(err, ErrRetryableAmbiguousVMDelete) {
+			t.Fatalf("rollback pass %d: %v", pass, err)
+		}
+	}
+	if len(api.vmDeletes) != 1 || len(api.floatingIPDeletes) != 1 || api.floatingIPDeletes[0] != "203.0.113.10" {
+		t.Fatalf("rollback did not remove exactly the VM and its auto FIP once unblocked: VM deletes=%#v FIP deletes=%#v", api.vmDeletes, api.floatingIPDeletes)
 	}
 }
 
-func TestMalformedCreateDeletesVMWhenAutoFloatingIPIsNotYetVisible(t *testing.T) {
+func TestMalformedCreateWaitsForBrieflyInvisibleAutoFloatingIPBeforeVMDelete(t *testing.T) {
 	api := newFakeAPI()
 	api.floatingIPReadbackDelay = 1
 	api.mutateStoredVM = func(_ inspace.CreateVMRequest, vm *inspace.VM) { vm.VCPU++ }
-	_, err := testReconciler(api).Reconcile(context.Background(), testCluster(), "unit-test-secret-token")
-	if err == nil || !errors.Is(err, ErrCreateAttemptPending) {
-		t.Fatalf("malformed response did not retain floating-IP cleanup uncertainty: %v", err)
+	cluster := testCluster()
+	_, err := testReconciler(api).Reconcile(context.Background(), cluster, "unit-test-secret-token")
+	if err == nil {
+		t.Fatal("malformed create response was accepted")
 	}
-	if len(api.vmDeletes) != 1 || len(api.vms) != 0 {
-		t.Fatalf("invisible auto FIP prevented fail-closed VM deletion: deletes=%#v VMs=%#v", api.vmDeletes, api.vms)
+	// The initiating call polls past the one stale list, records the exact
+	// address, and only then deletes the VM.
+	attempt, active := cluster.Status.DeleteAttempts[deleteAttemptBastion]
+	if len(api.vmDeletes) != 1 || len(api.vms) != 0 || (active && attempt.FloatingIPAddress != "203.0.113.10") {
+		t.Fatalf("briefly invisible auto FIP was not identified before VM deletion: VM deletes=%#v VMs=%#v attempt=%#v",
+			api.vmDeletes, api.vms, attempt)
 	}
-	if len(api.floatingIPs) != 1 || api.floatingIPs[0].AssignedTo != "" {
-		t.Fatalf("VM deletion contract was not reflected in delayed FIP state: %#v", api.floatingIPs)
+	api.mu.Lock()
+	api.mutateStoredVM = nil
+	api.mu.Unlock()
+	for pass := 0; pass < 5 && active; pass++ {
+		if _, err := testReconciler(api).Reconcile(context.Background(), cluster, "unit-test-secret-token"); err != nil && !errors.Is(err, ErrCreateAttemptPending) {
+			t.Fatalf("rollback pass %d: %v", pass, err)
+		}
+		_, active = cluster.Status.DeleteAttempts[deleteAttemptBastion]
+	}
+	if active || len(api.vmDeletes) != 1 || len(api.floatingIPDeletes) != 1 || api.floatingIPDeletes[0] != "203.0.113.10" {
+		t.Fatalf("rollback did not remove the identified auto FIP: active=%t VM deletes=%#v FIP deletes=%#v", active, api.vmDeletes, api.floatingIPDeletes)
 	}
 }
 
@@ -4749,6 +4782,8 @@ func testReconciler(api *fakeAPI) *Reconciler {
 		createdVMRecoveryTimeout: 100 * time.Millisecond, createdVMFloatingIPCleanupTimeout: 25 * time.Millisecond,
 		createdVMDeleteTimeout: 25 * time.Millisecond, vmAbsenceObservationMinInterval: time.Nanosecond,
 		firewallAssignmentProtectionDeadline: time.Nanosecond,
+		rollbackFloatingIPDiscoveryWait:      20 * time.Millisecond, rollbackFloatingIPDiscoveryInterval: time.Millisecond,
+		destroyFloatingIPObservationWait: time.Nanosecond,
 	}
 }
 

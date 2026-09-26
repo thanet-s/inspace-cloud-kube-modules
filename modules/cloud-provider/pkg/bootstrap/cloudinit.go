@@ -86,7 +86,10 @@ case "$ubuntu_codename" in
 esac
 sed "s/@UBUNTU_CODENAME@/$ubuntu_codename/g" /var/lib/inspace/ubuntu.sources >/etc/apt/sources.list.d/ubuntu.sources
 chmod 0644 /etc/apt/sources.list.d/ubuntu.sources
-! grep -Fq '@UBUNTU_CODENAME@' /etc/apt/sources.list.d/ubuntu.sources
+if grep -Fq '@UBUNTU_CODENAME@' /etc/apt/sources.list.d/ubuntu.sources; then
+  echo "Ubuntu sources kept an @UBUNTU_CODENAME@ placeholder" >&2
+  exit 1
+fi
 `
 }
 
@@ -107,10 +110,16 @@ fi
 if [ -f /etc/adduser.conf ]; then
   sed -Ei 's|^#?[[:space:]]*DSHELL=.*|DSHELL=/bin/bash|' /etc/adduser.conf
 fi
-! awk -F: '($3 == 0 || ($3 >= 1000 && $3 < 65534)) && $7 ~ /^(\/usr)?\/bin\/(sh|dash)$/' /etc/passwd | grep -q .
+if awk -F: '($3 == 0 || ($3 >= 1000 && $3 < 65534)) && $7 ~ /^(\/usr)?\/bin\/(sh|dash)$/' /etc/passwd | grep -q .; then
+  echo "a login account still uses /bin/sh or dash" >&2
+  exit 1
+fi
 `
 }
 
+// renderUbuntuRepositoryAndResolverCommands prepares hostname resolution, the
+// APT mirrors, and the static resolver. Negative assertions use an explicit
+// if/exit: POSIX shells never apply set -e to a command prefixed with "!".
 func renderUbuntuRepositoryAndResolverCommands(nodeName string) string {
 	return `node_name=` + shellSingleQuote(nodeName) + `
 sed -Ei '/^[[:space:]]*127\.0\.1\.1([[:space:]]|$)/d' /etc/hosts
@@ -135,7 +144,10 @@ test ! -L /etc/resolv.conf
 grep -Fqx 'nameserver 8.8.8.8' /etc/resolv.conf
 grep -Fqx 'nameserver 8.8.4.4' /etc/resolv.conf
 test "$(systemctl is-enabled systemd-resolved.service 2>/dev/null || true)" = masked
-! systemctl is-active --quiet systemd-resolved.service
+if systemctl is-active --quiet systemd-resolved.service; then
+  echo "systemd-resolved.service is still active" >&2
+  exit 1
+fi
 grep -Fqx 'http://mirror1.totbb.net/ubuntu/	priority:1' /etc/apt/mirrors/inspace-ubuntu.list
 grep -Fqx 'https://mirror.kku.ac.th/ubuntu/	priority:2' /etc/apt/mirrors/inspace-ubuntu.list
 test "$(grep -Fc 'URIs: mirror+file:/etc/apt/mirrors/inspace-ubuntu.list' /etc/apt/sources.list.d/ubuntu.sources)" -eq 2

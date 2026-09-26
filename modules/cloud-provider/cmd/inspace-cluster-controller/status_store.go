@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -40,7 +42,7 @@ func newFileStatusCompareAndSwap(path string) bootstrap.StatusCompareAndSwapFunc
 			return v1alpha1.InSpaceClusterStatus{}, fmt.Errorf("decode cluster config for status CAS: %w", err)
 		}
 		if current.APIVersion != expectedCluster.APIVersion || current.Kind != expectedCluster.Kind ||
-			!reflect.DeepEqual(current.Metadata, expectedCluster.Metadata) || !reflect.DeepEqual(current.Spec, expectedCluster.Spec) {
+			!sameEncodedValue(current.Metadata, expectedCluster.Metadata) || !sameEncodedValue(current.Spec, expectedCluster.Spec) {
 			return v1alpha1.InSpaceClusterStatus{}, errors.New("cluster config identity or spec changed during status CAS")
 		}
 		if !reflect.DeepEqual(current.Status, expected) {
@@ -109,6 +111,18 @@ func newFileStatusCompareAndSwap(path string) bootstrap.StatusCompareAndSwapFunc
 		}
 		return readback.Status, nil
 	}
+}
+
+// sameEncodedValue compares the persisted meaning of two config values. The
+// file is rewritten with omitempty after every CAS, so an explicit empty list
+// or map ("disable: []", "labels: {}") read at startup and the omitted field
+// read back later are the same configuration; reflect.DeepEqual would treat
+// the empty non-nil and nil forms as a spec change. Every other difference,
+// including element order, still fails the comparison.
+func sameEncodedValue(left, right any) bool {
+	leftData, leftErr := json.Marshal(left)
+	rightData, rightErr := json.Marshal(right)
+	return leftErr == nil && rightErr == nil && bytes.Equal(leftData, rightData)
 }
 
 func acquireStatusFileLock(ctx context.Context, path string) (*os.File, error) {
