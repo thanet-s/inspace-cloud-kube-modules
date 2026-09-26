@@ -144,7 +144,12 @@ def main() -> None:
     private_load_balancers = set(state.get("privateServiceLoadBalancerNames", []))
     private_floating_ips = set(state.get("privateServiceFloatingIPNames", []))
     private_service_vips = set(state.get("privateServiceVIPs", []))
-    for service_name in ("inspace-e2e-web", "inspace-e2e-private-a", "inspace-e2e-private-b"):
+    for service_name in (
+        "inspace-e2e-web",
+        "inspace-e2e-private-a",
+        "inspace-e2e-private-b",
+        "inspace-e2e-private-local",
+    ):
         service = kubectl(args.kubeconfig, "-n", "default", "get", "service", service_name)
         if not service:
             continue

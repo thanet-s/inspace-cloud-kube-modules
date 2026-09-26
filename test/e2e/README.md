@@ -127,8 +127,25 @@ IPAM class or Kubernetes NodePorts.
 The suite exercises private L2 lease-holder failover and requires reachability
 to recover through ARP/gratuitous ARP. L2 Announcements remains a Cilium beta
 feature; a passing run is also the required proof that the target InSpace VPC
-accepts ARP for VIPs not assigned to a VM NIC. `externalTrafficPolicy: Local`
-is deliberately unsupported because it is incompatible with this L2 mode.
+accepts ARP for VIPs not assigned to a VM NIC. The suite then requires Cilium
+1.20.2 or later and adds a third private Service with
+`externalTrafficPolicy: Local` on the existing private-a workload. Its L2 lease
+must be held by the single node with a ready local endpoint, the VIP must
+return the private-a marker from the bastion, and after deletion the Service
+must disappear, its Lease must be absent, unheld, or expired, and the pool must
+return to the two same-port VIPs.
+
+The cluster is bootstrapped with `spec.network.loadBalancerAlgorithm: maglev`
+and `spec.network.serviceTopology: true`. Initialization proves both in the
+Cilium ConfigMap, the rendered HelmChartConfig values, and
+`cilium-dbg status --verbose` (`Backend Selection: Maglev`). The default
+random, topology-disabled path renders no extra bytes and is covered by
+earlier releases. Initialization and every acceptance run also require every
+Cilium agent to report zero `cilium_drift_checker_config_delta` through
+`cilium-dbg metrics list`, proving no `cilium-config` change is waiting for an
+agent restart. The Node-LB verifier requires every generated `inlb-dp-*`
+Service to carry `trafficDistribution: PreferSameNode` when its parent sets
+none.
 
 One separate class-unset Service opts into the explicit paid, TCP-only InSpace
 NLB using the public scope label and annotation with
@@ -303,7 +320,7 @@ later default `all` run from cleaning them implicitly. Owner removal is ordered:
    Services, including controller-owned `inlb-dp-*` datapaths; endpoint-local
    Service finalization must finish before its user-owned edge capacity moves;
 2. pods, PV, and VolumeAttachments must disappear;
-3. both private `cilium-l2announce-*` Leases must be absent, unheld, or
+3. all three private `cilium-l2announce-*` Leases must be absent, unheld, or
    expired, and `CiliumLoadBalancerIPPool/inspace-private` must report zero
    used IPs (a pool that a partial init never created counts as released);
 4. the endpoint-local static and general NodePools are deleted together; the

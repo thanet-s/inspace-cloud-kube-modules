@@ -1690,6 +1690,209 @@ exit 97
             )
 
 
+CILIUM_DRIFT_SCRIPT = "verify-cilium-config-drift.sh"
+
+
+def verify_cilium_config_drift_runtime(init_playbook: str, test_playbook: str, repository: pathlib.Path) -> None:
+    """Run the shared Cilium ConfigMap drift proof against a fake kubectl."""
+    script = ROOT / "scripts" / CILIUM_DRIFT_SCRIPT
+    require(script.is_file(), f"missing E2E {CILIUM_DRIFT_SCRIPT}")
+    deploy_copy = repository / "deploy/scripts" / CILIUM_DRIFT_SCRIPT
+    require(
+        deploy_copy.is_file()
+        and deploy_copy.read_bytes().replace(b"\r\n", b"\n") == script.read_bytes().replace(b"\r\n", b"\n"),
+        "deploy and E2E Cilium drift proofs must be byte-identical",
+    )
+    text = script.read_text(encoding="utf-8")
+    require(
+        "cilium-dbg metrics list -p drift_checker_config_delta -o json" in text
+        and "cilium_drift_checker_config_delta" in text
+        and '"enable-dynamic-config"' in text
+        and '"enable-drift-checker"' in text
+        and "timeout --kill-after=5s 60s kubectl" in text,
+        "Cilium drift proof must read the agent drift metric through cilium-dbg with a bounded exec",
+    )
+    fake_kubectl = r"""#!/bin/bash
+arguments=" $* "
+case "$arguments" in
+  *" get configmap cilium-config "*)
+    if [[ $FAKE_SCENARIO == checker-disabled ]]; then
+      echo '{"data":{"enable-dynamic-config":"true","enable-drift-checker":"false"}}'
+    else
+      echo '{"data":{"enable-dynamic-config":"true","enable-drift-checker":"true"}}'
+    fi
+    exit 0 ;;
+  *" get daemonset cilium "*)
+    echo '{"status":{"desiredNumberScheduled":2,"updatedNumberScheduled":2,"numberReady":2}}'
+    exit 0 ;;
+  *" get pods -l k8s-app=cilium "*)
+    if [[ $FAKE_SCENARIO == rolling ]]; then
+      echo '{"items":[{"metadata":{"name":"cilium-a"},"spec":{"nodeName":"node-a"},"status":{"phase":"Running"}}]}'
+    else
+      echo '{"items":[{"metadata":{"name":"cilium-a"},"spec":{"nodeName":"node-a"},"status":{"phase":"Running"}},{"metadata":{"name":"cilium-b"},"spec":{"nodeName":"node-b"},"status":{"phase":"Running"}}]}'
+    fi
+    exit 0 ;;
+  *" exec cilium-a -c cilium-agent -- cilium-dbg metrics list -p drift_checker_config_delta -o json "*)
+    echo '[{"name":"cilium_drift_checker_config_delta","labels":{},"value":0}]'
+    exit 0 ;;
+  *" exec cilium-b -c cilium-agent -- cilium-dbg metrics list -p drift_checker_config_delta -o json "*)
+    case $FAKE_SCENARIO in
+      drifted) echo '[{"name":"cilium_drift_checker_config_delta","labels":{},"value":3}]' ;;
+      absent) echo '[]' ;;
+      *) echo '[{"name":"cilium_drift_checker_config_delta","labels":{},"value":0}]' ;;
+    esac
+    exit 0 ;;
+esac
+echo "unexpected kubectl $*" >&2
+exit 97
+"""
+    with tempfile.TemporaryDirectory() as directory:
+        root = pathlib.Path(directory)
+        kubectl = root / "kubectl"
+        kubectl.write_text(fake_kubectl, encoding="utf-8")
+        kubectl.chmod(0o755)
+        for scenario, synced, message in (
+            ("synced", True, "runs the current cilium-config"),
+            ("drifted", False, "agent cilium-b on node node-b has 3 cilium-config key(s)"),
+            ("absent", False, "cilium-b on node node-b does not publish cilium_drift_checker_config_delta"),
+            ("checker-disabled", False, "enable-drift-checker"),
+            ("rolling", False, "not fully rolled out"),
+        ):
+            result = subprocess.run(
+                ["bash", str(script)],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=60,
+                env={**os.environ, "PATH": f"{root}:{os.environ.get('PATH', '')}", "FAKE_SCENARIO": scenario},
+            )
+            require(
+                "unexpected kubectl" not in result.stderr,
+                f"Cilium drift proof issued an unexpected kubectl call: {result.stderr}",
+            )
+            require(
+                (result.returncode == 0) == synced and message in result.stdout + result.stderr,
+                f"Cilium drift scenario {scenario} returned {result.returncode} "
+                f"without {message!r}: {result.stdout}{result.stderr}",
+            )
+    for label, playbook, name, indent in (
+        ("init", init_playbook, "Require every Cilium agent to run the current cilium-config", 4),
+        ("test", test_playbook, "Require every Cilium agent to run the current cilium-config", 4),
+    ):
+        task = named_yaml_sequence_item(playbook, name, indent)
+        require(
+            f"/opt/e2e/scripts/{CILIUM_DRIFT_SCRIPT}" in task
+            and re.search(r"(?m)^ {6}retries: [0-9]+$", task) is not None
+            and re.search(r"(?m)^ {6}delay: [0-9]+$", task) is not None
+            and re.search(r"(?m)^ {6}until: [a-z0-9_]+\.rc == 0$", task) is not None,
+            f"{label} playbook must run a bounded Cilium drift proof",
+        )
+    require(
+        init_playbook.index("- name: Verify Cilium native routing and full kube-proxy replacement")
+        < init_playbook.index("- name: Require every Cilium agent to run the current cilium-config"),
+        "init must prove zero Cilium ConfigMap drift after Cilium is configured",
+    )
+
+
+def verify_cilium_load_balancer_e2e_contract(init_playbook: str, cluster: str) -> None:
+    """The E2E cluster opts into Maglev and proves it and service topology live."""
+    require(
+        yaml_mapping_scalar(cluster, "spec", "network", "loadBalancerAlgorithm") == "maglev"
+        and yaml_mapping_scalar(cluster, "spec", "network", "serviceTopology") == "true",
+        "E2E cluster template must exercise Maglev and Cilium service topology",
+    )
+    task = named_yaml_sequence_item(
+        init_playbook,
+        "Verify Cilium native routing and full kube-proxy replacement plus private L2 configuration",
+        4,
+    )
+    for fragment in (
+        '.data["bpf-lb-algorithm"] == "maglev"',
+        '.data["enable-service-topology"] == "true"',
+        'values["loadBalancer"] == {"algorithm": "maglev", "serviceTopology": True}',
+        "grep -E 'Backend Selection:[[:space:]]+Maglev' <<<\"$cilium_status\"",
+    ):
+        require(fragment in task, f"init Cilium verification lacks {fragment}")
+
+
+def verify_node_load_balancer_traffic_distribution(module) -> None:
+    """The live Node-LB verifier mirrors the CCM PreferSameNode child default."""
+    expected = module.expected_datapath_traffic_distribution
+    require(expected({}) == "PreferSameNode", "empty parent must expect a PreferSameNode child")
+    require(expected({"trafficDistribution": ""}) == "PreferSameNode",
+            "explicit empty parent must expect a PreferSameNode child")
+    for value in ("PreferClose", "PreferSameZone", "PreferSameNode"):
+        require(expected({"trafficDistribution": value}) == value,
+                f"explicit parent {value} must be copied to the child")
+    source = (ROOT / "scripts/verify-node-load-balancer.py").read_text(encoding="utf-8")
+    require(
+        'datapath_spec.get("trafficDistribution") == expected_datapath_traffic_distribution(spec)' in source,
+        "live Node-LB verifier must compare each child trafficDistribution",
+    )
+
+
+def verify_private_local_l2_contract(
+    test_playbook: str,
+    cleanup: str,
+    template: str,
+    persist_workload: str,
+) -> None:
+    """A private ETP=Local L2 VIP is proven, then deleted with lease cleanup."""
+    service = manifest_document(template, "Service", "inspace-e2e-private-local")
+    for fragment in (
+        "inspace.cloud/load-balancer-scope: private",
+        "loadBalancerClass: io.cilium/l2-announcer",
+        "externalTrafficPolicy: Local",
+        "selector: {app: inspace-e2e-private-a}",
+    ):
+        require(fragment in service, f"private Local Service lacks {fragment}")
+    require("kind: Deployment" not in template, "private Local proof must reuse the existing private-a workload")
+    block = named_yaml_sequence_item(
+        test_playbook, "Exercise a private externalTrafficPolicy Local L2 VIP", 4
+    )
+    ordered = [
+        "- name: Read the running Cilium agent version",
+        "- name: Apply the private Local L2 Service on the existing private-a workload",
+        "- name: Persist the private Local Service ownership",
+        "- name: Require the private Local VIP lease on the only local-endpoint node",
+        "- name: Reach the private Local VIP from the VPC bastion",
+        "- name: Delete the private Local L2 Service",
+        "- name: Require the private Local Service lease and VIP allocation to disappear",
+    ]
+    offsets = [block.find(value) for value in ordered]
+    require(all(value >= 0 for value in offsets) and offsets == sorted(offsets),
+            "private Local L2 exercise lost an ordered proof step")
+    for fragment in (
+        "1.20.2",
+        "cilium-l2announce-default-inspace-e2e-private-local",
+        '.spec.externalTrafficPolicy == "Local"',
+        "e2e_marker + '-private-a'",
+        "delegate_to: e2e-bastion",
+        "(.spec.holderIdentity // \"\") == \"\" or",
+        "+ 2 * (.spec.leaseDurationSeconds // 15) < $now",
+        '.type == "cilium.io/IPsUsed" and .message == "2"',
+        "--ignore-not-found",
+    ):
+        require(fragment in block, f"private Local L2 exercise lacks {fragment}")
+    require(
+        "service/inspace-e2e-private-local" in named_yaml_sequence_item(
+            test_playbook, "Remove stale paid and Node-LB acceptance owners", 4
+        ),
+        "an interrupted run must not leave a third private VIP before the two-VIP proof",
+    )
+    require(
+        "service/inspace-e2e-private-local" in named_yaml_sequence_item(
+            cleanup, "Delete workload owners before infrastructure owners", 4
+        )
+        and "cilium-l2announce-default-inspace-e2e-private-local" in named_yaml_sequence_item(
+            cleanup, "Wait for private Cilium L2 leases and LB IPAM allocations to quiesce", 4
+        ),
+        "destroy must delete the private Local Service and wait for its lease",
+    )
+    require('"inspace-e2e-private-local"' in persist_workload,
+            "private Local Service must be journaled as a zero-cloud-resource private Service")
+
+
 def verify_teardown_timing_contract(
     init_playbook: str,
     test_playbook: str,
@@ -1932,6 +2135,17 @@ def main() -> None:
         readme,
     )
     verify_private_lb_quiesce_runtime(cleanup)
+    verify_cilium_config_drift_runtime(init_playbook, test_playbook, repository)
+    verify_cilium_load_balancer_e2e_contract(init_playbook, cluster)
+    verify_node_load_balancer_traffic_distribution(
+        load_script_module("verify_node_load_balancer_traffic", ROOT / "scripts/verify-node-load-balancer.py")
+    )
+    verify_private_local_l2_contract(
+        test_playbook,
+        cleanup,
+        (ROOT / "templates/private-local-service.yaml.j2").read_text(encoding="utf-8"),
+        persist_workload,
+    )
     verify_teardown_timing_contract(
         init_playbook,
         test_playbook,
