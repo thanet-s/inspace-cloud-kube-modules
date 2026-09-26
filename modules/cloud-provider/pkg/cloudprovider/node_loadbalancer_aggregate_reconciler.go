@@ -1508,7 +1508,10 @@ func (c *nodeLoadBalancerController) deleteAggregateShardFirewall(ctx context.Co
 		firewall = byPendingUUID
 	}
 	if firewall == nil {
-		if issued := annotations[annotationNodeLoadBalancerShardFWIssuedAt]; issued != "" && appliedUUID == "" && cleanupUUID == "" && deleteTarget == "" {
+		// A definitively rejected create (bound to this exact receipt) instead
+		// falls through to the spaced cleanup absence proof below.
+		if issued := annotations[annotationNodeLoadBalancerShardFWIssuedAt]; issued != "" && appliedUUID == "" && cleanupUUID == "" && deleteTarget == "" &&
+			annotations[annotationNodeLoadBalancerShardFWCreateRejected] != issued {
 			// Empty list responses cannot prove that a paid POST which crossed the
 			// request boundary will never commit later. Retain the exact NodePool
 			// ledger/finalizer until the stable-name firewall becomes observable or
@@ -1596,6 +1599,7 @@ func (c *nodeLoadBalancerController) deleteAggregateShardFirewall(ctx context.Co
 				annotationNodeLoadBalancerShardFWAbsentChecked,
 				annotationNodeLoadBalancerShardFWCreateAbsent,
 				annotationNodeLoadBalancerShardFWCreateChecked,
+				annotationNodeLoadBalancerShardFWCreateRejected,
 				annotationNodeLoadBalancerShardFWCleanupAbsent,
 				annotationNodeLoadBalancerShardFWCleanupCheck,
 				annotationNodeLoadBalancerShardFWCleanupSeen,

@@ -259,14 +259,22 @@ func (c *nodeLoadBalancerController) ensureClusterICMPFirewall(
 
 	if pendingName != "" {
 		if firewall == nil {
-			if createIssued != "" {
+			if createIssued != "" && annotations[annotationNodeLoadBalancerICMPCreateRejected] == createIssued {
+				// The provider definitively rejected this exact create; once spaced
+				// exact-name absence is proven, discard the pending identity below.
+				confirmed, confirmErr := c.confirmRejectedClusterICMPCreateAbsent(ctx, nodeClassName, ownerUID, createIssued)
+				if confirmErr != nil || !confirmed {
+					return nil, false, confirmErr
+				}
+			} else if createIssued != "" {
 				return nil, false, fmt.Errorf(
 					"node load balancer: cluster ICMP firewall create issued at %s remains ambiguous; refusing a second paid create until the original firewall is observable or manually resolved",
 					createIssued,
 				)
 			}
 			// The pending identity was persisted, but POST authority was never
-			// durably issued. It is safe to discard this staged-only intent; a later
+			// durably issued, or the issued POST was definitively rejected and its
+			// name proven absent. It is safe to discard this intent; a later
 			// reconciliation may create a fresh one.
 			_, clearErr := c.clearManagedNodeClassICMPAnnotationsForUID(
 				ctx, nodeClassName, ownerUID,
@@ -279,6 +287,7 @@ func (c *nodeLoadBalancerController) ensureClusterICMPFirewall(
 				},
 				annotationNodeLoadBalancerICMPPendingUUID, annotationNodeLoadBalancerICMPPendingName,
 				annotationNodeLoadBalancerICMPPendingStarted, annotationNodeLoadBalancerICMPCreateIssued,
+				annotationNodeLoadBalancerICMPCreateRejected,
 				annotationNodeLoadBalancerICMPAbsent,
 				annotationNodeLoadBalancerICMPAbsentChecked,
 			)
@@ -425,6 +434,10 @@ func (c *nodeLoadBalancerController) ensureClusterICMPFirewall(
 			}
 			committed, recoveryErr := c.resolveClusterICMPCreateReadback(ctx, nodeClassName, ownerUID, expectedCreate, desired)
 			if recoveryErr != nil {
+				if nodeLoadBalancerCreateRejectionProvable(err, recoveryErr) {
+					return nil, false, errors.Join(createErr, recoveryErr,
+						c.markClusterICMPCreateRejected(ctx, nodeClassName, ownerUID, expectedCreate))
+				}
 				return nil, false, errors.Join(createErr, recoveryErr)
 			}
 			if committed {
@@ -848,7 +861,7 @@ func (c *nodeLoadBalancerController) resolveClusterICMPCreateReadback(
 		}
 		return true, nil
 	}
-	return false, errors.New("node load balancer: cluster ICMP firewall create outcome remains ambiguous after exact name absence readback")
+	return false, fmt.Errorf("node load balancer: cluster ICMP firewall create outcome remains ambiguous after %w", errNodeLoadBalancerCreateAbsentAfterResponse)
 }
 
 // clearManagedNodeClassICMPAnnotations clears a completed transaction only if
@@ -1044,6 +1057,7 @@ func (c *nodeLoadBalancerController) promoteClusterICMPFirewallForUID(
 		for _, key := range []string{
 			annotationNodeLoadBalancerICMPPendingUUID, annotationNodeLoadBalancerICMPPendingName,
 			annotationNodeLoadBalancerICMPPendingStarted, annotationNodeLoadBalancerICMPCreateIssued,
+			annotationNodeLoadBalancerICMPCreateRejected,
 			annotationNodeLoadBalancerICMPAbsent,
 			annotationNodeLoadBalancerICMPAbsentChecked, annotationNodeLoadBalancerICMPCleanupAbsent,
 			annotationNodeLoadBalancerICMPCleanupChecked,
@@ -1471,7 +1485,14 @@ func (c *nodeLoadBalancerController) cleanupClusterICMPFirewall(ctx context.Cont
 			}
 		}
 	}
-	if createIssued != "" {
+	if createIssued != "" && annotations[annotationNodeLoadBalancerICMPCreateRejected] == createIssued {
+		// The provider definitively rejected this exact create; the pending
+		// identity is discarded below only after spaced exact-name absence.
+		confirmed, confirmErr := c.confirmRejectedClusterICMPCreateAbsent(ctx, nodeClassName, nodeClassUID, createIssued)
+		if confirmErr != nil || !confirmed {
+			return false, confirmErr
+		}
+	} else if createIssued != "" {
 		return false, fmt.Errorf(
 			"node load balancer: cluster ICMP firewall create issued at %s remains ambiguous during cleanup; retaining the NodeClass finalizer until the original firewall is observable or manually resolved",
 			createIssued,
@@ -1489,6 +1510,7 @@ func (c *nodeLoadBalancerController) cleanupClusterICMPFirewall(ctx context.Cont
 			},
 			annotationNodeLoadBalancerICMPPendingUUID, annotationNodeLoadBalancerICMPPendingName,
 			annotationNodeLoadBalancerICMPPendingStarted, annotationNodeLoadBalancerICMPCreateIssued,
+			annotationNodeLoadBalancerICMPCreateRejected,
 			annotationNodeLoadBalancerICMPAbsent, annotationNodeLoadBalancerICMPAbsentChecked,
 			annotationNodeLoadBalancerICMPCleanupAbsent, annotationNodeLoadBalancerICMPCleanupChecked,
 			annotationNodeLoadBalancerFirewallRelationIssued,

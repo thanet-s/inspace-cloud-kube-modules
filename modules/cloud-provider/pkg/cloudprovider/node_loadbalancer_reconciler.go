@@ -2116,6 +2116,11 @@ func (c *nodeLoadBalancerController) ensureServiceFirewall(ctx context.Context, 
 		}
 		pendingFirewall := pendingFirewallByName
 		if pendingFirewall == nil {
+			if pendingIssued != "" && service.Annotations[annotationNodeLoadBalancerPendingFWRejected] == pendingIssued {
+				// The provider definitively rejected this exact create and the
+				// deterministic name is absent in this fresh List.
+				return nil, "", false, c.retireRejectedServiceFirewallCreate(ctx, service, pendingIssued, pendingIssuedAt)
+			}
 			if pendingIssued != "" {
 				return nil, "", false, fmt.Errorf(
 					"node load balancer: Service firewall create attempt %s issued at %s remains ambiguous; waiting for deterministic-name adoption or operator resolution",
@@ -2476,6 +2481,9 @@ func (c *nodeLoadBalancerController) createServiceFirewallFromIssuedIntent(
 		}
 		committed, recoveryErr := c.resolveServiceFirewallCreateReadback(ctx, current, desired)
 		if recoveryErr != nil {
+			if nodeLoadBalancerCreateRejectionProvable(err, recoveryErr) {
+				return errors.Join(createErr, recoveryErr, c.markServiceFirewallCreateRejected(ctx, current, token, issuedAt))
+			}
 			return errors.Join(createErr, recoveryErr)
 		}
 		if committed {
@@ -2547,7 +2555,7 @@ func (c *nodeLoadBalancerController) resolveServiceFirewallCreateReadback(
 		}
 		return true, nil
 	}
-	return false, fmt.Errorf("node load balancer: Service firewall create outcome remains ambiguous after exact name absence readback")
+	return false, fmt.Errorf("node load balancer: Service firewall create outcome remains ambiguous after %w", errNodeLoadBalancerCreateAbsentAfterResponse)
 }
 
 func (c *nodeLoadBalancerController) ensurePendingFirewallCreateIntent(ctx context.Context, service *corev1.Service, name string) (*corev1.Service, bool, error) {
@@ -2577,6 +2585,7 @@ func (c *nodeLoadBalancerController) ensurePendingFirewallCreateIntent(ctx conte
 		delete(copy.Annotations, annotationNodeLoadBalancerPendingFirewall)
 		delete(copy.Annotations, annotationNodeLoadBalancerPendingFWIssued)
 		delete(copy.Annotations, annotationNodeLoadBalancerPendingFWIssuedAt)
+		delete(copy.Annotations, annotationNodeLoadBalancerPendingFWRejected)
 		delete(copy.Annotations, annotationNodeLoadBalancerPendingFWDelete)
 		delete(copy.Annotations, annotationNodeLoadBalancerPendingFWAbsent)
 		delete(copy.Annotations, annotationNodeLoadBalancerPendingFWChecked)
@@ -2612,6 +2621,7 @@ func (c *nodeLoadBalancerController) ensurePendingFirewallMetadata(ctx context.C
 		copy.Annotations[annotationNodeLoadBalancerPendingFirewall] = uuid
 		delete(copy.Annotations, annotationNodeLoadBalancerPendingFWIssued)
 		delete(copy.Annotations, annotationNodeLoadBalancerPendingFWIssuedAt)
+		delete(copy.Annotations, annotationNodeLoadBalancerPendingFWRejected)
 		delete(copy.Annotations, annotationNodeLoadBalancerPendingFWAbsent)
 		delete(copy.Annotations, annotationNodeLoadBalancerPendingFWChecked)
 		return true, nil
@@ -2646,6 +2656,7 @@ func (c *nodeLoadBalancerController) clearPendingFirewallMetadata(ctx context.Co
 		delete(copy.Annotations, annotationNodeLoadBalancerPendingFWStarted)
 		delete(copy.Annotations, annotationNodeLoadBalancerPendingFWIssued)
 		delete(copy.Annotations, annotationNodeLoadBalancerPendingFWIssuedAt)
+		delete(copy.Annotations, annotationNodeLoadBalancerPendingFWRejected)
 		delete(copy.Annotations, annotationNodeLoadBalancerPendingFWDelete)
 		delete(copy.Annotations, annotationNodeLoadBalancerPendingFWAbsent)
 		delete(copy.Annotations, annotationNodeLoadBalancerPendingFWChecked)
@@ -2694,6 +2705,7 @@ func (c *nodeLoadBalancerController) resetServiceFirewallCreateAfterProvenNonDis
 		}
 		delete(copy.Annotations, annotationNodeLoadBalancerPendingFWIssued)
 		delete(copy.Annotations, annotationNodeLoadBalancerPendingFWIssuedAt)
+		delete(copy.Annotations, annotationNodeLoadBalancerPendingFWRejected)
 		return true, nil
 	})
 	if err != nil {
@@ -2745,6 +2757,7 @@ func (c *nodeLoadBalancerController) promotePendingFirewallMetadata(
 			annotationNodeLoadBalancerPendingFWStarted,
 			annotationNodeLoadBalancerPendingFWIssued,
 			annotationNodeLoadBalancerPendingFWIssuedAt,
+			annotationNodeLoadBalancerPendingFWRejected,
 			annotationNodeLoadBalancerPendingFWDelete,
 			annotationNodeLoadBalancerPendingFWAbsent,
 			annotationNodeLoadBalancerPendingFWChecked,
@@ -5256,6 +5269,7 @@ func (c *nodeLoadBalancerController) cleanupService(ctx context.Context, service
 			annotationNodeLoadBalancerPendingFWStarted,
 			annotationNodeLoadBalancerPendingFWIssued,
 			annotationNodeLoadBalancerPendingFWIssuedAt,
+			annotationNodeLoadBalancerPendingFWRejected,
 			annotationNodeLoadBalancerPendingFWDelete,
 			annotationNodeLoadBalancerPendingFWAbsent,
 			annotationNodeLoadBalancerPendingFWChecked,
@@ -5972,6 +5986,7 @@ func clearServiceFirewallDeleteState(annotations map[string]string, uuid string)
 			annotationNodeLoadBalancerPendingFWStarted,
 			annotationNodeLoadBalancerPendingFWIssued,
 			annotationNodeLoadBalancerPendingFWIssuedAt,
+			annotationNodeLoadBalancerPendingFWRejected,
 			annotationNodeLoadBalancerPendingFWDelete,
 			annotationNodeLoadBalancerPendingFWAbsent,
 			annotationNodeLoadBalancerPendingFWChecked,
