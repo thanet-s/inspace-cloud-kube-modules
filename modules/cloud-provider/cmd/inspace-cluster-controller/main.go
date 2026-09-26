@@ -6,6 +6,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/hex"
@@ -278,6 +279,17 @@ func parseBootstrapCacheImageDigests(raw string) (map[string]string, error) {
 	return values, nil
 }
 
+// writeGatewayAPICRDs re-proves the pinned digest before printing, so
+// lifecycle tooling can deliver exactly the bytes control planes accept.
+func writeGatewayAPICRDs(w io.Writer, bundle []byte) error {
+	sum := sha256.Sum256(bundle)
+	if got := hex.EncodeToString(sum[:]); got != bootstrap.GatewayAPIStandardInstallSHA256 {
+		return fmt.Errorf("embedded Gateway API bundle sha256=%s, want %s", got, bootstrap.GatewayAPIStandardInstallSHA256)
+	}
+	_, err := w.Write(bundle)
+	return err
+}
+
 func main() {
 	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -300,6 +312,7 @@ func run() error {
 	var issuedVMCreateTimeout time.Duration
 	var operationTimeout time.Duration
 	var floatingIPReachabilityTimeout time.Duration
+	var printGatewayAPICRDs bool
 	flag.StringVar(&configPath, "cluster-config", "", "path to an InSpaceCluster YAML file")
 	flag.BoolVar(&once, "once", false, "perform one reconciliation and exit")
 	flag.DurationVar(&interval, "interval", 20*time.Second, "minimum reconciliation interval")
@@ -330,10 +343,16 @@ func run() error {
 	flag.StringVar(&managementCIDR, "management-cidr", bootstrap.DefaultManagementCIDR, "optional public IPv4 /32 allowed to reach the bastion; defaults to Any")
 	flag.StringVar(&managementTCPPorts, "management-tcp-ports", "", "must be exactly 22 for bastion SSH")
 	flag.BoolVar(&deleteOwned, "delete", false, "delete only this cluster's deterministically owned infrastructure, then exit")
+	flag.BoolVar(&printGatewayAPICRDs, "print-gateway-api-crds", false,
+		"print the embedded, SHA-256 pinned Gateway API "+bootstrap.GatewayAPIBundleVersion+" standard CRD bundle that "+
+			"spec.network.gatewayAPI control planes wait for at "+bootstrap.GatewayAPIStandardInstallNodePath+", then exit")
 	flag.Parse()
 	if version {
 		fmt.Printf("inspace-cluster-controller %s\n", buildversion.Version)
 		return nil
+	}
+	if printGatewayAPICRDs {
+		return writeGatewayAPICRDs(os.Stdout, bootstrap.GatewayAPIStandardInstall())
 	}
 	if configPath == "" {
 		return errors.New("--cluster-config is required")

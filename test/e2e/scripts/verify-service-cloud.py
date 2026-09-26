@@ -103,11 +103,31 @@ def main() -> None:
         default="ready",
         help="expected public NLB target state",
     )
+    parser.add_argument(
+        "--service",
+        choices=("web", "gateway"),
+        default="web",
+        help="paid public Service to prove: the web workload or the Cilium Gateway Service",
+    )
+    parser.add_argument(
+        "--node-port",
+        type=int,
+        help="the Gateway Service's allocated NodePort (required for --service gateway --public present)",
+    )
     args = parser.parse_args()
 
     state = json.loads(pathlib.Path(args.state).read_text(encoding="utf-8"))
-    public_lb_name = state.get("serviceLoadBalancerName", "")
-    public_fip_name = state.get("serviceFloatingIPName", "")
+    journal_keys = {
+        "web": ("serviceLoadBalancerName", "serviceFloatingIPName"),
+        "gateway": ("gatewayServiceLoadBalancerName", "gatewayServiceFloatingIPName"),
+    }
+    public_lb_name = state.get(journal_keys[args.service][0], "")
+    public_fip_name = state.get(journal_keys[args.service][1], "")
+    expected_node_port = 30080
+    if args.service == "gateway" and args.public == "present":
+        if args.node_port is None or not 30000 <= args.node_port <= 32767:
+            raise SystemExit("--service gateway requires the Gateway Service's exact --node-port")
+        expected_node_port = args.node_port
     raw_private_lb_names = state.get("privateServiceLoadBalancerNames", [])
     raw_private_fip_names = state.get("privateServiceFloatingIPNames", [])
     if (
@@ -133,7 +153,13 @@ def main() -> None:
     public_lbs = [lb for lb in active_lbs if public_lb_name and lb.get("display_name") == public_lb_name]
     public_fips = [ip for ip in active_fips if public_fip_name and ip.get("name") == public_fip_name]
     if args.public == "absent":
-        if public_lbs or public_fips:
+        # Absence covers both paid public Services, whichever was selected.
+        paid_lb_names = {state.get(keys[0], "") for keys in journal_keys.values()} - {""}
+        paid_fip_names = {state.get(keys[1], "") for keys in journal_keys.values()} - {""}
+        if (
+            any(lb.get("display_name") in paid_lb_names for lb in active_lbs)
+            or any(ip.get("name") in paid_fip_names for ip in active_fips)
+        ):
             raise SystemExit("public Service NLB/FIP cleanup has not completed")
         require_exact_load_balancer_inventory(
             all_lbs,
@@ -182,8 +208,10 @@ def main() -> None:
         or not isinstance(forwarding_rules[0], dict)
         or forwarding_rules[0].get("protocol") != "TCP"
         or forwarding_rules[0].get("source_port") != 80
-        or forwarding_rules[0].get("target_port") != 30080
+        or forwarding_rules[0].get("target_port") != expected_node_port
     ):
+        if args.service == "gateway":
+            raise SystemExit("Gateway Service NLB must own exactly one TCP 80-to-NodePort forwarding rule")
         raise SystemExit("public Service NLB must own exactly one TCP 80-to-30080 forwarding rule")
     private_address = ipaddress.ip_address(str(load_balancer.get("private_address")))
     control_plane_vip = ipaddress.ip_address(str(state.get("virtualIPv4")))
@@ -212,12 +240,16 @@ def main() -> None:
         "privateIPv4": str(private_address),
         "publicIPv4": str(public_address),
     }
-    record_known_cloud_identities(
-        pathlib.Path(args.state),
-        state,
-        load_balancer_uuids=[result["loadBalancerUUID"]],
-        floating_ip_addresses=[result["publicIPv4"]],
-    )
+    # The final exact-absence audit validates every journaled NLB tombstone
+    # against the web Service's deterministic name, so the Gateway NLB and FIP
+    # are audited by their journaled names instead of by exact identity.
+    if args.service == "web":
+        record_known_cloud_identities(
+            pathlib.Path(args.state),
+            state,
+            load_balancer_uuids=[result["loadBalancerUUID"]],
+            floating_ip_addresses=[result["publicIPv4"]],
+        )
     print(json.dumps(result, sort_keys=True))
 
 

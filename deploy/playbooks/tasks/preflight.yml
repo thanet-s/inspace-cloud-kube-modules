@@ -102,6 +102,38 @@
       service_topology must be a boolean; and either setting requires a
       modules_version newer than 1.1.0-rc.4.
 
+- name: Resolve the RKE2 release numbers for the optional Gateway API
+  ansible.builtin.set_fact:
+    deploy_gateway_api_rke2_release: "{{ rke2_version | regex_replace('^v([0-9]+[.][0-9]+[.][0-9]+).*$', '\\1') }}"
+
+# Cilium 1.19 reads only Gateway API v1.4-era CRD versions; the pinned v1.6.1
+# bundle needs the Cilium 1.20 that these RKE2 patch releases bundle.
+- name: Require a boolean Gateway API choice on an RKE2 release bundling Cilium 1.20
+  ansible.builtin.assert:
+    that:
+      - gateway_api_enabled | default(false) is boolean
+      - not (gateway_api_enabled | default(false)) or modules_version is version('1.1.0-rc.4', '>', version_type='semver')
+      - >-
+        not (gateway_api_enabled | default(false)) or
+        deploy_gateway_api_rke2_release is version('1.37.0', '>=') or
+        (deploy_gateway_api_rke2_release is version('1.36.5', '>=') and deploy_gateway_api_rke2_release is version('1.37.0', '<')) or
+        (deploy_gateway_api_rke2_release is version('1.35.9', '>=') and deploy_gateway_api_rke2_release is version('1.36.0', '<')) or
+        (deploy_gateway_api_rke2_release is version('1.34.12', '>=') and deploy_gateway_api_rke2_release is version('1.35.0', '<'))
+    fail_msg: >-
+      gateway_api_enabled must be true or false, and true requires a
+      modules_version newer than 1.1.0-rc.4 and an rke2_version that bundles
+      Cilium 1.20 or newer (v1.34.12+, v1.35.9+, v1.36.5+, or v1.37.0+).
+
+# From v1.37 RKE2's default rke2-gateway-api-crd chart installs the same
+# Gateway API v1.6.1 standard CRDs; below it bootstrap waits for this bundle.
+- name: Decide whether bootstrap needs the pinned Gateway API CRD bundle
+  ansible.builtin.set_fact:
+    deploy_gateway_api_bundle_delivery: >-
+      {{
+        (gateway_api_enabled | default(false) | bool) and
+        deploy_gateway_api_rke2_release is version('1.37.0', '<')
+      }}
+
 - name: Reject bootstrap-owned RKE2 keys from operator extra configuration
   ansible.builtin.assert:
     that:

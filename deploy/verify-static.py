@@ -21,6 +21,129 @@ def require(value: bool, message: str) -> None:
         raise AssertionError(message)
 
 
+def task_block(playbook: str, name: str) -> str:
+    start = playbook.index(f"- name: {name}\n")
+    end = playbook.find("\n    - name: ", start + 1)
+    return playbook[start:] if end < 0 else playbook[start:end]
+
+
+def verify_gateway_api(inventory: str, cluster_template: str, preflight: str, init: str, destroy: str) -> None:
+    """Optional Gateway API: pinned bundle delivered over SSH before RKE2 starts."""
+    readme = read("deploy/README.md")
+    load_state = read("deploy/playbooks/tasks/load-state.yml")
+    gateway_go = read("modules/cloud-provider/pkg/bootstrap/gateway_api.go")
+    pinned = re.search(r'GatewayAPIStandardInstallSHA256 = "([0-9a-f]{64})"', gateway_go)
+    require(pinned is not None, "bootstrap lacks the pinned Gateway API bundle digest")
+    digest = pinned.group(1)
+    require(
+        re.search(r"(?m)^    gateway_api_enabled: false$", inventory) is not None
+        and "`gateway_api_enabled`" in readme
+        and "--print-gateway-api-crds" in readme,
+        "example inventory and README must document the default-off gateway_api_enabled option",
+    )
+    require(
+        "{% if gateway_api_enabled | default(false) | bool %}\n    gatewayAPI:\n      enabled: true\n{% endif %}\n"
+        in cluster_template,
+        "cluster template must render network.gatewayAPI only when enabled so default specs stay byte-identical",
+    )
+    require(
+        "gateway_api_enabled | default(false) is boolean" in preflight
+        and "not (gateway_api_enabled | default(false)) or modules_version is version('1.1.0-rc.4', '>', version_type='semver')" in preflight
+        and "deploy_gateway_api_rke2_release is version('1.37.0', '>=')" in preflight
+        and "deploy_gateway_api_rke2_release is version('1.36.5', '>=')" in preflight
+        and "deploy_gateway_api_rke2_release is version('1.35.9', '>=')" in preflight
+        and "deploy_gateway_api_rke2_release is version('1.34.12', '>=')" in preflight
+        and "      - rke2-traefik\n" in cluster_template,
+        "preflight must accept gateway_api_enabled only as a boolean on an RKE2 release bundling Cilium 1.20",
+    )
+    require(
+        ".get('gatewayAPI', {}).get('enabled', false) | bool ==" in load_state
+        and "gateway_api_enabled | default(false) | bool" in load_state,
+        "journal binding must keep gateway_api_enabled fixed at cluster creation",
+    )
+    pull_name = "Pull the exact bootstrap controller release"
+    print_name = "Print the pinned Gateway API CRD bundle from the exact bootstrap controller"
+    reconcile_name = "Reconcile bootstrap infrastructure synchronously to readiness"
+    pin_name = "Pin private control-plane host keys"
+    deliver_name = "Deliver the pinned Gateway API CRD bundle to every control plane"
+    egress_name = "Prove every control plane reaches the internet through its floating IP"
+    settle_name = "Settle packaged components without provisioning an elastic worker"
+    accept_name = "Require Cilium Gateway API and an accepted cilium GatewayClass"
+    order = [init.find(name) for name in (pull_name, print_name, reconcile_name, pin_name, deliver_name, egress_name, settle_name, accept_name)]
+    require(all(offset >= 0 for offset in order) and order == sorted(order), "Gateway API init phases are missing or misordered")
+    require(f"deploy_gateway_api_bundle_sha256: {digest}\n" in init, "deploy Gateway API digest differs from the bootstrap pin")
+    print_task = task_block(init, print_name)
+    deliver_task = task_block(init, deliver_name)
+    accept_task = task_block(init, accept_name)
+    # RKE2 v1.37+ installs the same v1.6.1 CRDs through rke2-gateway-api-crd.
+    require(
+        "deploy_gateway_api_bundle_delivery: >-" in preflight
+        and "deploy_gateway_api_rke2_release is version('1.37.0', '<')" in preflight,
+        "preflight must deliver the bootstrap CRD bundle only below RKE2 v1.37",
+    )
+    for task in (print_task, deliver_task):
+        require("when: deploy_gateway_api_bundle_delivery | bool\n" in task,
+                "Gateway API bundle tasks must run only when bootstrap owns the CRDs")
+    require("when: gateway_api_enabled | default(false) | bool\n" in accept_task,
+            "Gateway API acceptance must run whenever Gateway API is enabled")
+    require(
+        "--print-gateway-api-crds" in print_task
+        and "--network=none" in print_task
+        and "ghcr.io/thanet-s/inspace-cloud-controller-manager:{{ bootstrap_controller_version }}" in print_task
+        and 'sha256sum "$bundle.partial"' in print_task
+        and "deploy_gateway_api_bundle_sha256" in print_task,
+        "Gateway API bundle must come offline from the exact controller image and match the pin",
+    )
+    require(
+        "/var/lib/inspace/gateway-api-standard-install.yaml" in deliver_task
+        and "deploy_gateway_api_bundle_sha256" in deliver_task
+        and "register: deploy_gateway_api_delivery\n" in deliver_task
+        and "until: deploy_gateway_api_delivery.rc != 255\n" in deliver_task
+        and "failed_when: deploy_gateway_api_delivery.rc != 0\n" in deliver_task,
+        "Gateway API delivery must verify the node copy and retry only ssh transport failures",
+    )
+    require(
+        "enable-gateway-api" in accept_task and "gatewayclass/cilium" in accept_task and "Accepted" in accept_task,
+        "init must prove Cilium accepted the cilium GatewayClass",
+    )
+    gateway_delete = "Delete every Gateway API Gateway before its generated LoadBalancer Services"
+    require(
+        0 <= destroy.find(gateway_delete) < destroy.find("Delete every LoadBalancer Service while its owning CCM is healthy")
+        and "gateways.gateway.networking.k8s.io" in task_block(destroy, gateway_delete),
+        "destroy must delete Gateways before LoadBalancer Services so Cilium cannot recreate a paid NLB",
+    )
+    upgrade = read("deploy/playbooks/tasks/apply-rke2-upgrade.yml")
+    handover_name = "Hand the Gateway API CRDs to RKE2's own chart before a v1.37 upgrade"
+    require(
+        0 <= upgrade.find(handover_name) < upgrade.find("Upgrade the RKE2 binary one control-plane server at a time"),
+        "an RKE2 v1.37 upgrade must neutralize the bootstrap CRD manifest on every server first",
+    )
+    handover = task_block(upgrade, handover_name)
+    require(
+        "/var/lib/rancher/rke2/server/manifests/inspace-gateway-api-crds.yaml.skip" in handover
+        and "touch" in handover
+        and "rm " not in handover
+        and "loop: \"{{ deployment_state.controlPlanes }}\"" in handover
+        and "gateway_api_enabled | default(false) | bool" in handover
+        and "deploy_gateway_api_rke2_release is version('1.37.0', '>=')" in handover,
+        "the v1.37 handover must only skip, never delete, the manifest so the CRDs and Gateways survive",
+    )
+    # Owner decision: Gateway API is served by Cilium only. Traefik and
+    # ingress-nginx stay disabled, and the v1.37 CRD chart is never disabled.
+    for label, template in (
+        ("deploy", cluster_template),
+        ("E2E", read("test/e2e/templates/cluster.yaml.j2")),
+    ):
+        disabled = re.search(r"(?m)^    disable:\n((?:      - .*\n)+)", template)
+        require(
+            disabled is not None and disabled.group(1) == "      - rke2-ingress-nginx\n      - rke2-traefik\n",
+            f"{label} cluster template must disable exactly rke2-ingress-nginx and rke2-traefik",
+        )
+        require("rke2-gateway-api-crd" not in template,
+                f"{label} cluster template must never disable rke2-gateway-api-crd")
+    require("needs no Traefik" in readme, "README must state that Gateway API needs no Traefik")
+
+
 def main() -> None:
     inventory = read("deploy/inventory.example.yml")
     gitignore = read(".gitignore")
@@ -231,9 +354,10 @@ def main() -> None:
         "single-control-plane tasks are not statically parsed by syntax checks",
     )
     require(
-        init.count("linux/amd64") == 2 and destroy.count("linux/amd64") == 2,
-        "bootstrap controller pull/run does not pin the published x86 platform",
+        init.count("linux/amd64") == 3 and destroy.count("linux/amd64") == 2,
+        "bootstrap controller pull/run/print does not pin the published x86 platform",
     )
+    verify_gateway_api(inventory, cluster_template, preflight, init, destroy)
     load_state = read("deploy/playbooks/tasks/load-state.yml")
     single_cp_settle = read("deploy/playbooks/tasks/settle-single-control-plane.yml")
     for fragment in (

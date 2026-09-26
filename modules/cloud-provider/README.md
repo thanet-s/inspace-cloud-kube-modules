@@ -657,6 +657,149 @@ and SCTP Services are also rejected. The public Node-LB path above accepts
 canonical IPv4 source ranges for the owning Service's TCP/UDP rules in the
 shard aggregate only.
 
+## Gateway API
+
+Gateway API is optional and served by Cilium alone; it needs no Traefik.
+Enable it only when creating a cluster:
+
+```yaml
+spec:
+  rke2:
+    version: v1.36.5-rc2+rke2r1   # must bundle Cilium 1.20+
+    disable: [rke2-ingress-nginx, rke2-traefik]
+  network:
+    gatewayAPI:
+      enabled: true
+```
+
+Validation requires an RKE2 release whose rke2-cilium chart is Cilium 1.20 or
+newer (`v1.34.12+`, `v1.35.9+`, `v1.36.5+`, or `v1.37.0+`); Cilium 1.19 reads
+only Gateway API v1.4-era CRD versions. `rke2-traefik` must stay disabled
+because its CRD chart ships its own Gateway API CRDs, and neither
+`rke2-gateway-api-crd` nor `inspace-gateway-api-crds` may be disabled: RKE2
+deletes the resources of a disabled manifest. The setting is rendered only into
+immutable control-plane bootstrap, so the CRD rejects changing it and a cluster
+that needs it must be recreated. Omitting it keeps control-plane cloud-init
+byte-identical.
+
+When enabled, bootstrap adds `gatewayAPI.enabled: true` and
+`gatewayAPI.gatewayClass.create: "true"` to the rke2-cilium
+`HelmChartConfig`. `kubeProxyReplacement` is already on and Cilium uses the
+Envoy embedded in its agent image (the RKE2 chart default), so no extra image
+is needed. The rke2-cilium 1.20 chart then also forces
+`bpf-lb-algorithm-annotation` and `bpf-lb-sock-hostns-only` to `true` so
+weighted TCPRoute/UDPRoute backends work.
+
+Below RKE2 v1.37 the cluster installs the Gateway API v1.6.1 **standard**
+channel CRDs itself: GatewayClass, Gateway, HTTPRoute, GRPCRoute, TLSRoute,
+ReferenceGrant, BackendTLSPolicy, ListenerSet, TCPRoute, and UDPRoute, plus the
+upstream `safe-upgrades` ValidatingAdmissionPolicy. That is exactly the set
+Cilium 1.20 requires or enables, so no experimental CRD is installed. The
+upstream `standard-install.yaml` is embedded in `inspace-cluster-controller`
+and pinned by SHA-256; nodes never download it, and at about 1.2 MB it is too
+large for cloud-init. Deliver it to every control plane before RKE2 starts:
+
+```sh
+inspace-cluster-controller --print-gateway-api-crds > gateway-api-standard-install.yaml
+# copy to /var/lib/inspace/gateway-api-standard-install.yaml on each server (root, 0600)
+```
+
+Each server waits up to 30 minutes for a file with the pinned digest, then
+stages it as the RKE2 server manifest `inspace-gateway-api-crds.yaml`, so
+Cilium finds the CRDs at its first start. `deploy/` and the E2E suite do this
+over SSH. From v1.37, RKE2's default `rke2-gateway-api-crd` chart installs the
+same v1.6.1 standard CRDs, so bootstrap stages and awaits nothing. Upgrading a
+cluster from below v1.37 first creates `inspace-gateway-api-crds.yaml.skip` on
+every server; RKE2 stops re-applying the manifest without deleting anything,
+and its chart adopts the CRDs with `takeOwnership`.
+
+### Exposing a Gateway
+
+Cilium creates one `LoadBalancer` Service, `cilium-gateway-<gateway>`, per
+Gateway. It copies the Gateway's `spec.infrastructure` labels and annotations
+onto that Service and its CiliumEnvoyConfig, makes the Gateway its controller
+owner, and gives it no selector (Cilium manages a placeholder EndpointSlice).
+The CCM therefore sees an ordinary Service and chooses the mode from those
+markers:
+
+| Mode | Gateway support |
+| --- | --- |
+| Paid public InSpace NLB | Supported: set the two public markers in `spec.infrastructure`. The default `cilium` GatewayClass gives `externalTrafficPolicy: Cluster`, allocated NodePorts, and no `loadBalancerClass`. TCP listeners only. |
+| Private Cilium L2 VIP | Supported: set `inspace.cloud/load-balancer-scope: private` in `spec.infrastructure` and use a GatewayClass whose `CiliumGatewayClassConfig` sets `loadBalancerClass: io.cilium/l2-announcer`. |
+| Node-LB (`inspace.cloud/node`, including `public-node-local`) | Not supported: the CCM requires a Service selector and rejects the selectorless Gateway Service without creating capacity. |
+| No markers | No address: the CCM leaves the Service to another implementation and Cilium's LB-IPAM default is `none`. |
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: web
+  namespace: default
+spec:
+  gatewayClassName: cilium
+  infrastructure:
+    labels:
+      inspace.cloud/load-balancer-scope: public
+    annotations:
+      service.beta.kubernetes.io/inspace-load-balancer-public: "true"
+  listeners:
+    - name: http
+      protocol: HTTP
+      port: 80
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: web
+  namespace: default
+spec:
+  parentRefs:
+    - name: web
+  hostnames:
+    - www.example.com
+  rules:
+    - backendRefs:
+        - name: web
+          port: 80
+```
+
+The Gateway's `status.addresses` becomes the NLB's public FIP. For a private
+VIP, create the class once and reference it from the Gateway:
+
+```yaml
+apiVersion: cilium.io/v2alpha1
+kind: CiliumGatewayClassConfig
+metadata:
+  name: private-l2
+  namespace: kube-system
+spec:
+  service:
+    type: LoadBalancer
+    loadBalancerClass: io.cilium/l2-announcer
+    externalTrafficPolicy: Cluster
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: cilium-private
+spec:
+  controllerName: io.cilium/gateway-controller
+  parametersRef:
+    group: cilium.io
+    kind: CiliumGatewayClassConfig
+    name: private-l2
+    namespace: kube-system
+```
+
+Then use `gatewayClassName: cilium-private` with the private scope label in
+`spec.infrastructure.labels`. Cilium merges infrastructure labels and
+annotations into the Service but never removes one, so removing a marker from
+a Gateway does not change its Service. Delete and recreate the Gateway to
+change or drop its mode. Deleting a Gateway makes Cilium delete its Service,
+and the CCM then removes the NLB and FIP through its normal finalizer. Delete
+Gateways before their Services when tearing a cluster down; Cilium recreates a
+deleted Service while its Gateway exists.
+
 ## Development and verification
 
 Requires Go 1.27.1.

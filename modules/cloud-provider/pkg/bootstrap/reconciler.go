@@ -2932,6 +2932,7 @@ func (r *Reconciler) desiredControlPlaneVMRequest(cluster *v1alpha1.InSpaceClust
 		SkipOSUpgrade:         cluster.Spec.RKE2.SkipOSUpgrade,
 		LoadBalancerAlgorithm: cluster.Spec.Network.LoadBalancerAlgorithm,
 		ServiceTopology:       cluster.Spec.Network.ServiceTopology,
+		GatewayAPI:            cluster.Spec.Network.GatewayAPI.Enabled,
 	})
 	if err != nil {
 		return inspace.CreateVMRequest{}, err

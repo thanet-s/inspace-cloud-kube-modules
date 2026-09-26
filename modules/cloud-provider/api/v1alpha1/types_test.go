@@ -2,6 +2,8 @@ package v1alpha1
 
 import (
 	"bytes"
+	"encoding/json"
+	"fmt"
 	"net/netip"
 	"os"
 	"strings"
@@ -195,7 +197,7 @@ func TestControlPlaneCRDMatchesMachineValidationContract(t *testing.T) {
 		"privateLoadBalancerPool must not overlap podCIDR or serviceCIDR",
 		"privateLoadBalancerPool is immutable",
 		"control-plane virtualIPv4 must not overlap podCIDR or serviceCIDR",
-		"disable:\n                      type: array\n                      x-kubernetes-list-type: set\n                      items:",
+		"disable:\n                      type: array\n                      x-kubernetes-list-type: set\n                      maxItems:",
 		"component != \"rke2-cilium\"",
 		"required: [location, billingAccountID, credentialsSecretRef, controlPlane, bootstrapCache, rke2, network, firewall, publicIPv4, endpoint]",
 		"bootstrapCache:\n                  type: object",
@@ -203,6 +205,15 @@ func TestControlPlaneCRDMatchesMachineValidationContract(t *testing.T) {
 		"skipOSUpgrade:\n                      type: boolean\n                      default: false",
 		"replicas:\n                      type: integer\n                      format: int32\n                      enum:\n                        - 1\n                        - 3",
 		"rule: self == oldSelf\n                          message: control-plane replica count is immutable after cluster creation",
+		"gatewayAPI:\n                      type: object",
+		// No CRD default: an omitted value must never be persisted as a new field.
+		"enabled:\n                          type: boolean\n                firewall:",
+		"rule: '(has(self.gatewayAPI) && self.gatewayAPI.enabled) == (has(oldSelf.gatewayAPI) && oldSelf.gatewayAPI.enabled)'",
+		"message: gatewayAPI.enabled is fixed at cluster creation",
+		`rule: '!has(self.network.gatewayAPI) || !self.network.gatewayAPI.enabled || (has(self.rke2.disable) && self.rke2.disable.exists(component, component == "rke2-traefik"))'`,
+		"message: network.gatewayAPI.enabled requires rke2.disable to include rke2-traefik",
+		`!self.rke2.disable.exists(component, component == "rke2-gateway-api-crd" || component == "inspace-gateway-api-crds")`,
+		"message: network.gatewayAPI.enabled forbids disabling its CRD owner rke2-gateway-api-crd or inspace-gateway-api-crds",
 	} {
 		if !strings.Contains(crd, required) {
 			t.Errorf("CRD does not contain validation contract fragment %q", required)
@@ -265,6 +276,122 @@ func mustAddress(t *testing.T, value string) netip.Addr {
 		t.Fatal(err)
 	}
 	return address
+}
+
+func TestGatewayAPIIsOptionalAndOmittedByDefault(t *testing.T) {
+	spec := validSpec()
+	if spec.Network.GatewayAPI.Enabled {
+		t.Fatal("Gateway API must default to disabled")
+	}
+	data, err := json.Marshal(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "gatewayAPI") {
+		t.Fatalf("a default spec must serialize without gatewayAPI so persisted specs stay byte-stable:\n%s", data)
+	}
+	spec.Network.GatewayAPI.Enabled = true
+	spec.RKE2.Version = "v1.36.5+rke2r1"
+	spec.RKE2.Disable = []string{"rke2-ingress-nginx", "rke2-traefik"}
+	data, err = json.Marshal(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"gatewayAPI":{"enabled":true}`) {
+		t.Fatalf("an enabled spec must serialize network.gatewayAPI.enabled:\n%s", data)
+	}
+}
+
+func TestGatewayAPIRequiresCilium120AndNoTraefikCRDs(t *testing.T) {
+	enabled := func(version string, disable ...string) InSpaceClusterSpec {
+		spec := validSpec()
+		spec.Network.GatewayAPI.Enabled = true
+		spec.RKE2.Version = version
+		spec.RKE2.Disable = disable
+		return spec
+	}
+	for _, version := range []string{
+		"v1.34.12+rke2r1", "v1.35.9+rke2r1", "v1.36.5-rc2+rke2r1", "v1.36.5+rke2r1", "v1.36.12+rke2r2",
+		"v1.37.0+rke2r1", "v1.38.1+rke2r1",
+	} {
+		if errs := enabled(version, "rke2-traefik").Validate(); len(errs) != 0 {
+			t.Errorf("Gateway API on %s rejected: %v", version, errs)
+		}
+	}
+	for _, version := range []string{"v1.33.9+rke2r1", "v1.34.11+rke2r1", "v1.35.8+rke2r1", "v1.36.4+rke2r1"} {
+		errs := enabled(version, "rke2-traefik").Validate()
+		if !validationFieldReported(errs, "spec.network.gatewayAPI.enabled") {
+			t.Errorf("Gateway API on %s (bundled Cilium < 1.20) accepted: %v", version, errs)
+		}
+	}
+	errs := enabled("v1.36.5+rke2r1", "rke2-ingress-nginx").Validate()
+	if !validationFieldReported(errs, "spec.network.gatewayAPI.enabled") {
+		t.Fatalf("Gateway API with the packaged Traefik Gateway API CRDs accepted: %v", errs)
+	}
+	for _, owner := range []string{"rke2-gateway-api-crd", "inspace-gateway-api-crds"} {
+		errs := enabled("v1.37.0+rke2r1", "rke2-traefik", owner).Validate()
+		if !validationFieldReported(errs, "spec.rke2.disable") {
+			t.Errorf("Gateway API with its CRD owner %s disabled accepted: %v", owner, errs)
+		}
+	}
+	disabled := validSpec()
+	disabled.RKE2.Version = "v1.36.4+rke2r1"
+	if errs := disabled.Validate(); len(errs) != 0 {
+		t.Fatalf("disabled Gateway API must not constrain RKE2: %v", errs)
+	}
+}
+
+// The Gateway API CEL rules scan spec.rke2.disable, so the list and its items
+// are bounded for the Kubernetes CEL cost budget; Go enforces the same bounds.
+func TestRKE2DisableListIsBounded(t *testing.T) {
+	spec := validSpec()
+	spec.RKE2.Disable = make([]string, MaxRKE2DisabledComponents)
+	for index := range spec.RKE2.Disable {
+		spec.RKE2.Disable[index] = strings.Repeat("a", MaxRKE2ComponentNameLength-3) + fmt.Sprintf("%03d", index)
+	}
+	if errs := spec.Validate(); len(errs) != 0 {
+		t.Fatalf("maximum disable list rejected: %v", errs)
+	}
+	for name, disable := range map[string][]string{
+		"too many":   append(append([]string(nil), spec.RKE2.Disable...), "rke2-extra"),
+		"too long":   {strings.Repeat("a", MaxRKE2ComponentNameLength+1)},
+		"empty name": {""},
+	} {
+		invalid := validSpec()
+		invalid.RKE2.Disable = disable
+		if !validationFieldReported(invalid.Validate(), "spec.rke2.disable") {
+			t.Errorf("%s disable list accepted", name)
+		}
+	}
+	crd, err := os.ReadFile("../../config/crd/bases/infrastructure.inspace.cloud_inspaceclusters.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := fmt.Sprintf("disable:\n                      type: array\n                      x-kubernetes-list-type: set\n                      maxItems: %d\n                      items:\n                        type: string\n                        minLength: 1\n                        maxLength: %d\n",
+		MaxRKE2DisabledComponents, MaxRKE2ComponentNameLength)
+	if !strings.Contains(string(crd), want) {
+		t.Fatalf("CRD disable schema lacks the Go bounds:\n%s", want)
+	}
+}
+
+func TestRKE2OwnsGatewayAPICRDsFromV137(t *testing.T) {
+	for version, want := range map[string]bool{
+		"v1.34.12+rke2r1": false, "v1.35.9+rke2r1": false, "v1.36.5-rc2+rke2r1": false, "v1.36.9+rke2r1": false,
+		"v1.37.0+rke2r1": true, "v1.37.1+rke2r2": true, "v1.38.0+rke2r1": true, "": false, "latest": false,
+	} {
+		if got := RKE2BundlesGatewayAPICRDs(version); got != want {
+			t.Errorf("RKE2BundlesGatewayAPICRDs(%q) = %t, want %t", version, got, want)
+		}
+	}
+}
+
+func validationFieldReported(errs []error, field string) bool {
+	for _, err := range errs {
+		if strings.HasPrefix(err.Error(), field+":") {
+			return true
+		}
+	}
+	return false
 }
 
 func TestControlPlaneImageAcceptsSupportedUbuntuReleases(t *testing.T) {

@@ -141,6 +141,45 @@ changed `cilium-config` without restarting that agent; `update` stops before
 upgrading the cloud modules and names the affected agents so the operator can
 review the change and restart them.
 
+## Optional Gateway API
+
+`gateway_api_enabled` (default `false`) enables Cilium's Gateway API
+implementation and the `cilium` GatewayClass. Gateway API is served by Cilium
+alone and needs no Traefik: `rke2-traefik` and `rke2-ingress-nginx` stay
+disabled, and `rke2-gateway-api-crd` is never disabled. It requires an `rke2_version`
+that bundles Cilium 1.20 or newer (`v1.34.12+`, `v1.35.9+`, `v1.36.5+`, or
+`v1.37.0+`; the audited `v1.36.5-rc2+rke2r1` qualifies) and preflight rejects
+older releases. It is fixed at cluster creation: it is rendered only into
+immutable control-plane bootstrap, a resumed `init` refuses a changed value,
+and `update`, `status`, and `destroy` refuse an inventory that differs from
+the persisted spec. Enabling it on an existing cluster requires a
+destroy/recreate lifecycle.
+
+Below RKE2 v1.37 the cluster installs the pinned Gateway API v1.6.1 standard
+CRD bundle itself (the same version RKE2 v1.37 ships, including the upstream
+`safe-upgrades` ValidatingAdmissionPolicy). The bundle is about 1.2 MB, too
+large for cloud-init, and is never downloaded by a node. `init` prints it
+offline from the exact bootstrap-controller image with
+`inspace-cluster-controller --print-gateway-api-crds`, checks its SHA-256, and
+copies it over SSH to `/var/lib/inspace/gateway-api-standard-install.yaml` on
+every control plane. Each server waits up to 30 minutes for those exact bytes
+before starting RKE2, then installs them as the RKE2 server manifest
+`inspace-gateway-api-crds.yaml`, so Cilium sees the CRDs at its first start.
+From v1.37 RKE2's default `rke2-gateway-api-crd` chart installs the same CRDs,
+so nothing is printed, copied, or awaited. Before `update` rolls a cluster from
+below v1.37 to v1.37 or later, it creates
+`inspace-gateway-api-crds.yaml.skip` next to that manifest on every server.
+RKE2 then stops re-applying the manifest without deleting anything, and its
+chart adopts the existing CRDs with `takeOwnership`; Gateways and routes are
+untouched. Never delete or disable that manifest: RKE2 deletes the resources
+of a disabled manifest. `init` then requires `enable-gateway-api` in
+`cilium-config` and an `Accepted` `cilium` GatewayClass. Expose a Gateway
+through the paid public NLB with its `spec.infrastructure` labels and
+annotations; see
+[`../modules/cloud-provider/README.md`](../modules/cloud-provider/README.md#gateway-api).
+`destroy` deletes every Gateway before the LoadBalancer Services, so Cilium
+cannot recreate a Service that would receive a new paid NLB.
+
 ## One or three control-plane servers
 
 Set `control_plane_replicas` to:

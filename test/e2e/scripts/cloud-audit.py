@@ -190,15 +190,17 @@ def _select_owned_csi_disks(
 def audit_once(state: dict, owner: str, cluster: str, nodepool: str) -> dict:
     service_lb = state.get("serviceLoadBalancerName", "")
     service_ip = state.get("serviceFloatingIPName", "")
-    if not isinstance(service_lb, str) or not isinstance(service_ip, str):
+    gateway_lb = state.get("gatewayServiceLoadBalancerName", "")
+    gateway_ip = state.get("gatewayServiceFloatingIPName", "")
+    if not all(isinstance(value, str) for value in (service_lb, service_ip, gateway_lb, gateway_ip)):
         raise SystemExit("ownership journal Service cloud names must be strings")
     service_lbs = (
-        {service_lb}
+        {service_lb, gateway_lb}
         | _journal_string_set(state, "privateServiceLoadBalancerNames")
         | _journal_string_set(state, "nodeLoadBalancerForbiddenLoadBalancerNames")
     ) - {""}
     service_ips = (
-        {service_ip}
+        {service_ip, gateway_ip}
         | _journal_string_set(state, "privateServiceFloatingIPNames")
     ) - {""}
     disk_uuid = state.get("diskUUID", "")

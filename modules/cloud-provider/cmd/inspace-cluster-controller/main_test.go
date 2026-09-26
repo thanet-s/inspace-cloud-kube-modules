@@ -177,6 +177,22 @@ func (r *deadlineCrossingReconciler) Destroy(ctx context.Context, _ *v1alpha1.In
 	return bootstrap.DestroyResult{Message: "deadline-crossing delete progress"}, r.err
 }
 
+func TestWriteGatewayAPICRDsPrintsOnlyThePinnedBundle(t *testing.T) {
+	var output bytes.Buffer
+	bundle := bootstrap.GatewayAPIStandardInstall()
+	if err := writeGatewayAPICRDs(&output, bundle); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(output.Bytes(), bundle) {
+		t.Fatal("printed Gateway API bundle differs from the embedded bytes")
+	}
+	tampered := append(bytes.Clone(bundle), '\n')
+	output.Reset()
+	if err := writeGatewayAPICRDs(&output, tampered); err == nil || output.Len() != 0 {
+		t.Fatalf("tampered bundle printed=%d bytes err=%v, want refusal before output", output.Len(), err)
+	}
+}
+
 func TestParseTCPPorts(t *testing.T) {
 	ports, err := parseTCPPorts("22, 6443,30080")
 	if err != nil {
