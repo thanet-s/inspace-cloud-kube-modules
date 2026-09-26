@@ -272,14 +272,25 @@
       until: e2e_cleanup_public_local_service.rc == 0
       when: e2e_cleanup_state.kubernetesOwnersPossible | default(false) | bool
 
+    # Cilium never deletes an L2 announcement Lease, and its release update can
+    # fail with "context canceled" when the Service is deleted, leaving a stale
+    # holder forever. An absent, unheld, or expired (two lease durations past
+    # its last renewal) Lease means no agent still announces the VIP.
     - name: Wait for private Cilium L2 leases and LB IPAM allocations to quiesce
       ansible.builtin.shell: |
         set -euo pipefail
         for lease in \
           cilium-l2announce-default-inspace-e2e-private-a \
           cilium-l2announce-default-inspace-e2e-private-b; do
-          test -z "$(kubectl --kubeconfig "{{ e2e_kubeconfig }}" -n kube-system \
-            get lease "$lease" --ignore-not-found -o name)"
+          lease_json=$(kubectl --kubeconfig "{{ e2e_kubeconfig }}" -n kube-system \
+            get lease "$lease" --ignore-not-found -o json)
+          if [[ -n $lease_json ]]; then
+            jq -e --argjson now "$(date -u +%s)" '
+              (.spec.holderIdentity // "") == "" or
+              (((.spec.renewTime // .spec.acquireTime // "1970-01-01T00:00:00Z")
+                | sub("[.][0-9]+Z$"; "Z") | fromdateiso8601)
+                + 2 * (.spec.leaseDurationSeconds // 15) < $now)' <<<"$lease_json" >/dev/null
+          fi
         done
         kubectl --kubeconfig "{{ e2e_kubeconfig }}" \
           get ciliumloadbalancerippool inspace-private -o json | jq -e '

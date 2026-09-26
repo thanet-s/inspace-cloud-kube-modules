@@ -2039,6 +2039,19 @@ def main() -> None:
     require_yaml_key(connection_wait, 8, "connect_timeout", "10")
     require_yaml_key(connection_wait, 8, "sleep", "5")
     require_yaml_key(connection_wait, 8, "timeout", "300")
+    egress_name = "Prove every control plane reaches the internet through its floating IP"
+    control_plane_egress = named_yaml_sequence_item(control_plane_wait_play, egress_name, 4)
+    require_unrestricted_parallel_task(control_plane_egress)
+    require("\n      ansible.builtin.raw: >-" in control_plane_egress and
+            "https://registry-1.docker.io/v2/" in control_plane_egress and
+            "https://ghcr.io/v2/" in control_plane_egress and
+            "timeout --kill-after=5s 300s sh -c" in control_plane_egress and
+            "'until curl " in control_plane_egress and
+            " -f" not in control_plane_egress,
+            "control-plane egress must be proven from inside within 5 minutes, accepting any HTTP answer")
+    require(control_plane_wait_play.index(egress_name) <
+            control_plane_wait_play.index("Wait for cloud-init completion on every control plane in parallel"),
+            "control-plane egress must be proven before the long cloud-init wait")
     cloud_init_wait = named_yaml_sequence_item(
         control_plane_wait_play, "Wait for cloud-init completion on every control plane in parallel", 4
     )
@@ -2957,6 +2970,19 @@ def main() -> None:
     require("cilium.io/IPsUsed" in cleanup and
             "Wait for private Cilium L2 leases and LB IPAM allocations to quiesce" in cleanup,
             "cleanup must release both private VIPs before Karpenter teardown")
+    # Cilium never deletes an L2 announcement Lease, and its release update can
+    # fail with "context canceled" when the Service is deleted, leaving a
+    # stale holder forever. Cleanup must accept an absent, unheld, or expired
+    # Lease instead of requiring the object to disappear.
+    private_lease_quiesce = named_yaml_sequence_item(
+        cleanup, "Wait for private Cilium L2 leases and LB IPAM allocations to quiesce", 4
+    )
+    require('get lease "$lease" --ignore-not-found -o json' in private_lease_quiesce and
+            '(.spec.holderIdentity // "") == ""' in private_lease_quiesce and
+            ".spec.leaseDurationSeconds" in private_lease_quiesce and
+            "fromdateiso8601" in private_lease_quiesce and
+            '-o name)"' not in private_lease_quiesce,
+            "cleanup must treat an unheld or expired private L2 Lease as released")
 
     require("private Cilium L2 Service unexpectedly owns an InSpace NLB" in service_cloud and
             "private Cilium L2 Service unexpectedly owns an InSpace FIP" in service_cloud and
