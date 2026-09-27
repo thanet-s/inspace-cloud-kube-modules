@@ -614,6 +614,26 @@
         sleep: 5
         timeout: 300
 
+    # A bad floating IPv4 can drop the bastion mid-boot, after which no log can
+    # be read. Keep the last good cloud-init view in the state directory; it
+    # survives the destroy-and-retry and never fails the run.
+    - name: Start background bastion cloud-init snapshots
+      ansible.builtin.command:
+        argv:
+          - /opt/e2e/scripts/capture-cloud-init.sh
+          - --ssh-config
+          - "{{ lookup('env', 'E2E_STATE_DIR') }}/ssh-config"
+          - --host
+          - e2e-bastion
+          - --output
+          - "{{ lookup('env', 'E2E_STATE_DIR') }}/diagnostics/bastion-cloud-init.log"
+          - --stop-file
+          - "{{ lookup('env', 'E2E_STATE_DIR') }}/diagnostics/bastion-cloud-init.stop"
+      delegate_to: localhost
+      async: 3000
+      poll: 0
+      changed_when: false
+
     # cloud-init reports a final result, so a timed-out wait is not retried:
     # a second attempt would only repeat it. 40 minutes still covers a
     # cold-cache boot; ansible.cfg retries dropped SSH transports.
@@ -624,6 +644,14 @@
       become: true
       changed_when: false
       register: e2e_bastion_cloud_init
+
+    - name: Stop background bastion cloud-init snapshots
+      ansible.builtin.file:
+        path: "{{ lookup('env', 'E2E_STATE_DIR') }}/diagnostics/bastion-cloud-init.stop"
+        state: touch
+        mode: "0600"
+      delegate_to: localhost
+      changed_when: false
 
     - name: Prove the bastion private address Ubuntu version and cloud-firewall-only state
       ansible.builtin.shell: |
