@@ -1693,6 +1693,60 @@ exit 97
 CILIUM_DRIFT_SCRIPT = "verify-cilium-config-drift.sh"
 
 
+def verify_bastion_cloud_init_capture(init_playbook: str) -> None:
+    """Keep a live copy of the bastion's first boot so a bad floating IPv4 that
+    drops the bastion mid-boot still leaves evidence (v1.1.0-rc.8 lost it)."""
+    script = ROOT / "scripts/capture-cloud-init.sh"
+    require(script.is_file(), "missing E2E capture-cloud-init.sh")
+    bastion_play = named_yaml_sequence_item(init_playbook, "Establish the pinned public bastion", 0)
+    start_name = "Start background bastion cloud-init snapshots"
+    stop_name = "Stop background bastion cloud-init snapshots"
+    wait_name = "Wait for bounded bastion cloud-init completion"
+    start = named_yaml_sequence_item(bastion_play, start_name, 4)
+    stop = named_yaml_sequence_item(bastion_play, stop_name, 4)
+    require(
+        bastion_play.index(start_name) < bastion_play.index(wait_name) < bastion_play.index(stop_name),
+        "bastion cloud-init snapshots must start before and stop after the bounded wait",
+    )
+    require(
+        "/opt/e2e/scripts/capture-cloud-init.sh" in start and "async:" in start and "poll: 0" in start
+        and "delegate_to: localhost" in start and "diagnostics/bastion-cloud-init.log" in start,
+        "bastion cloud-init snapshots must run in the background from the runner into the state directory",
+    )
+    require("delegate_to: localhost" in stop, "the snapshot stop marker must be written on the runner")
+
+    with tempfile.TemporaryDirectory() as directory:
+        root = pathlib.Path(directory)
+        fake_ssh = root / "ssh"
+        fake_ssh.write_text(
+            "#!/bin/sh\n"
+            "case \"$FAKE_SSH\" in\n"
+            "  error) printf 'status: error\\nextended_status: error\\n---- cloud-init-output.log\\nboom\\n' ;;\n"
+            "  dead) exit 255 ;;\n"
+            "esac\n",
+            encoding="utf-8",
+        )
+        fake_ssh.chmod(0o755)
+        for mode, want_snapshot, want_timeline in (
+            ("error", "boom", "status=error"),
+            ("dead", None, "ssh-failed (2)"),
+        ):
+            output = root / mode / "bastion-cloud-init.log"
+            result = subprocess.run(
+                ["bash", str(script), "--ssh-config", str(root / "ssh-config"), "--host", "e2e-bastion",
+                 "--output", str(output), "--stop-file", str(root / f"{mode}.stop"),
+                 "--interval", "0", "--max-misses", "2", "--deadline", "30"],
+                env={**os.environ, "PATH": f"{root}:{os.environ['PATH']}", "FAKE_SSH": mode},
+                capture_output=True, text=True, timeout=60, check=False,
+            )
+            require(result.returncode == 0, f"cloud-init capture must never fail the run ({mode}): {result.stderr}")
+            timeline = (output.parent / "bastion-cloud-init.log.timeline").read_text(encoding="utf-8")
+            require(want_timeline in timeline, f"cloud-init capture timeline lacks {want_timeline!r} ({mode})")
+            if want_snapshot:
+                require(want_snapshot in output.read_text(encoding="utf-8"),
+                        f"cloud-init capture did not keep the last snapshot ({mode})")
+
+
 def verify_cilium_config_drift_runtime(init_playbook: str, test_playbook: str, repository: pathlib.Path) -> None:
     """Run the shared Cilium ConfigMap drift proof against a fake kubectl."""
     script = ROOT / "scripts" / CILIUM_DRIFT_SCRIPT
@@ -2390,6 +2444,7 @@ def main() -> None:
     )
     verify_private_lb_quiesce_runtime(cleanup)
     verify_cilium_config_drift_runtime(init_playbook, test_playbook, repository)
+    verify_bastion_cloud_init_capture(init_playbook)
     verify_cilium_load_balancer_e2e_contract(init_playbook, cluster)
     verify_node_load_balancer_traffic_distribution(
         load_script_module("verify_node_load_balancer_traffic", ROOT / "scripts/verify-node-load-balancer.py")
