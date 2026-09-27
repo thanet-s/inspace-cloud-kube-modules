@@ -1960,6 +1960,14 @@ def verify_teardown_timing_contract(
     )
     require_yaml_key(capacity_ready, 10, "retries", "120")
     require_yaml_key(capacity_ready, 10, "delay", "10")
+    # A NodeClaim replaced after a bad floating IP (the worker registry egress
+    # gate keeps it unregistered) stays listed while its VM, FIP and firewall
+    # relation are removed; the v1.1.0-rc.8 E2E failed counting it.
+    require(
+        "select(.metadata.deletionTimestamp == null)" in capacity_ready
+        and "'.items | length')\" -eq 1" not in capacity_ready,
+        "edge capacity wait must ignore terminating NodeClaims",
+    )
 
     live_claim = named_yaml_sequence_item(
         init_playbook, "Require exactly one live Ready Karpenter worker NodeClaim", 4

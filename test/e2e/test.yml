@@ -2278,7 +2278,10 @@
             test "$(jq '.items | length' <<<"$nodes")" -eq 1
             jq -e 'all(.items[];
               any(.status.conditions[]?; .type == "Ready" and .status == "True"))' <<<"$nodes"
-            test "$(kubectl get nodeclaims -l "$label" -o json | jq '.items | length')" -eq 1
+            # A claim replaced after a bad floating IP stays listed while its
+            # VM, FIP and firewall relation are removed; count only live claims.
+            kubectl get nodeclaims -l "$label" -o json | jq -e '
+              [.items[] | select(.metadata.deletionTimestamp == null)] | length == 1' >/dev/null
           args:
             executable: /bin/bash
           register: e2e_public_local_capacity_ready
