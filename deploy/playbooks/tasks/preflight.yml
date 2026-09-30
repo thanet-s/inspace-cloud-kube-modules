@@ -138,6 +138,35 @@
       - karpenter_default_node_pool_enabled | default(true) is boolean
     fail_msg: "karpenter_default_node_pool_enabled must be true or false."
 
+# True marks the chart's inspace-rwo StorageClass as the cluster default.
+- name: Require a boolean CSI default StorageClass choice
+  ansible.builtin.assert:
+    that:
+      - csi_storage_class_default | default(false) is boolean
+    fail_msg: "csi_storage_class_default must be true or false."
+
+# A name adds a deploy-owned public-node-local NodeClass for operator edge
+# NodePools. It must not reuse the default or CCM's generated Node-LB NodeClass.
+- name: Require a valid optional public-node-local Karpenter NodeClass
+  ansible.builtin.assert:
+    that:
+      - karpenter_public_node_local_node_class_name | default('', true) is string
+      - >-
+        karpenter_public_node_local_node_class_name | default('', true) == '' or (
+        karpenter_public_node_local_node_class_name | default('', true) is match('^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$') and
+        karpenter_public_node_local_node_class_name | default('', true) != karpenter_node_class_name and
+        karpenter_public_node_local_node_class_name | default('', true) != cluster_name ~ '-node-lb' and
+        not (karpenter_public_node_local_node_class_name | default('', true)).startswith('inlb-'))
+      - (karpenter_public_node_local_root_disk_gib | default(30) | string) is match('^[0-9]+$')
+      - karpenter_public_node_local_root_disk_gib | default(30) | int >= 30
+      - karpenter_public_node_local_root_disk_gib | default(30) | int <= 2000
+    fail_msg: >-
+      karpenter_public_node_local_node_class_name must be empty or a DNS-1123
+      label other than karpenter_node_class_name, "{{ cluster_name }}-node-lb"
+      (CCM's Node-LB NodeClass) or an inlb-* name; and
+      karpenter_public_node_local_root_disk_gib must be a whole number from 30
+      to 2000.
+
 # From v1.37 RKE2's default rke2-gateway-api-crd chart installs the same
 # Gateway API v1.6.1 standard CRDs; below it bootstrap waits for this bundle.
 - name: Decide whether bootstrap needs the pinned Gateway API CRD bundle

@@ -3,7 +3,8 @@
 `deploy/` is the operator-facing cluster lifecycle. It creates the fixed
 bastion and RKE2 control plane, establishes private API access, installs the
 released CCM/CSI/Karpenter charts, creates a default AMD EPYC worker
-`InSpaceNodeClass` and `NodePool`, performs rolling operator configuration, and
+`InSpaceNodeClass` and `NodePool` (plus an optional public edge
+`InSpaceNodeClass`), performs rolling operator configuration, and
 destroys only the journaled cluster.
 
 New v0.8.0 clusters enable Cilium Egress Gateway during immutable control-plane
@@ -103,8 +104,8 @@ choice:
 
 | Inventory value | Default | Applies to |
 | --- | --- | --- |
-| `bootstrap_direct_download` | `false` | Bastion cache setup, control-plane downloads, and the generated Karpenter `InSpaceNodeClass` |
-| `skip_os_upgrade` | `false` | Bastion, every fixed control-plane server, and every worker created from the generated Karpenter `InSpaceNodeClass` |
+| `bootstrap_direct_download` | `false` | Bastion cache setup, control-plane downloads, and every generated Karpenter `InSpaceNodeClass` |
+| `skip_os_upgrade` | `false` | Bastion, every fixed control-plane server, and every worker created from a generated Karpenter `InSpaceNodeClass` |
 
 Cached mode (`bootstrap_direct_download: false`) is the normal path. The
 bastion serves the private RKE2 asset and system-image cache, and both fixed
@@ -120,7 +121,7 @@ Karpenter nodes.
 ## Ubuntu release
 
 `os_version` selects the Ubuntu release for the fixed control-plane servers,
-the bastion (which follows them), and the generated Karpenter
+the bastion (which follows them), and every generated Karpenter
 `InSpaceNodeClass`. It must be exactly `"24.04"` or `"26.04"`; quote it in
 inventory. `"26.04"` requires `modules_version` `1.1.0-rc.3` or later, because
 earlier controllers accept only `24.04`, and preflight rejects the combination.
@@ -128,7 +129,7 @@ When `os_version` is omitted, a cluster that already has a persisted bootstrap
 spec keeps the release it was built with, so `update` never replaces its
 workers with another release and a resumed `init` still matches that spec; a
 new cluster uses `"26.04"`. Setting a different release on an existing cluster
-fails a resumed `init`. On `update` it changes only the NodeClass, so
+fails a resumed `init`. On `update` it changes only the NodeClasses, so
 Karpenter drift replaces the workers while the fixed control planes keep
 their release.
 
@@ -230,6 +231,19 @@ annotations; see
 `destroy` deletes every Gateway before the LoadBalancer Services, so Cilium
 cannot recreate a Service that would receive a new paid NLB.
 
+## Default StorageClass
+
+`csi_storage_class_default` (default `false`) adds the
+`storageclass.kubernetes.io/is-default-class: "true"` annotation to the
+chart's `inspace-rwo` StorageClass, so a PVC without `storageClassName` uses
+it. `update` can flip the option in either direction. Going from `true` to
+`false` makes Helm remove the annotation, except one you added by hand with
+`kubectl annotate`, which Helm leaves in place.
+
+Kubernetes 1.28 and later retroactively assigns the default class to existing
+Pending PVCs that have no class. If several StorageClasses are marked default,
+the newest one wins. `destroy` still refuses to run while PVCs or PVs remain.
+
 ## Karpenter NodePools in GitOps
 
 `init` and `update` apply a default `InSpaceNodeClass`
@@ -252,6 +266,41 @@ NodePool, because `kubectl apply` never prunes. Delete it yourself after your
 GitOps NodePools are Ready. Control planes are tainted, so keep a NodePool that
 can run the GitOps controller, and suspend GitOps before `destroy`, which
 deletes every NodePool and NodeClass.
+
+## Public edge NodeClass for endpoint-local Services
+
+Set `karpenter_public_node_local_node_class_name` (default `""`, disabled) to
+also apply an `InSpaceNodeClass` for CCM `public-node-local` Services. It is
+identical to the default NodeClass except for its name,
+`firewallProfile: public-node-local`, and `rootDiskGiB`
+(`karpenter_public_node_local_root_disk_gib`, default `30`, the minimum). It
+keeps the same trusted private worker firewall as the base, with
+`reservePublicIPv4`; the profile only lets CCM add per-Service TCP/UDP
+firewalls. The name must not equal `karpenter_node_class_name`,
+`<cluster_name>-node-lb`, or start with `inlb-`.
+
+One NodeClass serves any number of edge NodePools. You write the NodePools:
+a template label
+`inspace.cloud.node-restriction.kubernetes.io/public-local-pool: <pool>`, a
+taint, `expireAfter: Never`, and a `nodeClassRef` to this name. Services pick
+the pool with the annotation `service.inspace.cloud/node-lb-pool`. Do not name
+those NodePools `inlb-*`. See
+[Endpoint-local public nodes](../charts/inspace-cloud-kube-modules/README.md#endpoint-local-public-nodes)
+and
+[`../charts/inspace-cloud-kube-modules/examples/service-public-node-local.yaml`](../charts/inspace-cloud-kube-modules/examples/service-public-node-local.yaml).
+
+`update` moves its `spec.rke2.version` and OS like the default NodeClass, so
+edge nodes follow through NodeClass drift only if their disruption budget
+allows it. A `nodes: "0"` budget blocks it; replace the nodes with
+`kubectl delete nodeclaim` in a maintenance window. A replacement changes the
+node's public address, so keep DNS TTLs short.
+
+Clearing or renaming the option leaves the old NodeClass, because
+`kubectl apply` never prunes, and it then stops following RKE2 upgrades.
+Delete the edge NodePools, wait for their NodeClaims, then run
+`kubectl delete inspacenodeclass <name>`. `destroy` removes it anyway.
+Applying over a hand-made NodeClass of the same name adopts it and may drift
+its nodes.
 
 ## One or three control-plane servers
 
@@ -346,10 +395,11 @@ the single command for both kinds of day-2 upgrade:
   `--print-bootstrap-cache-refresh` can update a cached cluster.
 - **Cloud-module upgrade**: it refreshes the in-cluster API Secret, upgrades
   the CRD and workload OCI charts to `modules_version`, and reapplies the
-  default Karpenter NodeClass/NodePool. Because the NodeClass identity changes
-  whenever its rendered RKE2 version or image changes, Karpenter's built-in
-  drift detection automatically replaces existing elastic workers with nodes
-  running the new version, respecting NodePool disruption budgets — no manual
+  generated Karpenter NodeClasses and default NodePool. Because a NodeClass
+  identity changes whenever its rendered RKE2 version or image changes,
+  Karpenter's built-in drift detection automatically replaces existing elastic
+  workers with nodes running the new version, respecting NodePool disruption
+  budgets — no manual
   worker action is required.
 - **Control-plane RKE2 version upgrade**: when `rke2_version` in the inventory
   differs from the RKE2 version recorded in the deployment journal (the

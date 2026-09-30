@@ -172,6 +172,8 @@ def verify_gateway_api(inventory: str, cluster_template: str, preflight: str, in
         "journal binding must keep rke2_traefik_crd_enabled fixed at cluster creation",
     )
     verify_optional_default_node_pool(readme)
+    verify_csi_default_storage_class(readme)
+    verify_public_node_local_node_class(readme)
 
 
 def verify_optional_default_node_pool(readme: str) -> None:
@@ -182,7 +184,7 @@ def verify_optional_default_node_pool(readme: str) -> None:
     )
     require(
         separator != ""
-        and "kind: InSpaceNodeClass" in node_class and "{%" not in node_class.split("kind: InSpaceNodeClass")[0]
+        and "kind: InSpaceNodeClass" in node_class and "karpenter_default_node_pool_enabled" not in node_class
         and "kind: NodePool" in node_pool and node_pool.rstrip().endswith("{% endif %}"),
         "karpenter template must always render the NodeClass and gate only the NodePool",
     )
@@ -194,6 +196,92 @@ def verify_optional_default_node_pool(readme: str) -> None:
         re.search(r"(?m)^    karpenter_default_node_pool_enabled: true$", read("deploy/inventory.example.yml")) is not None
         and "`karpenter_default_node_pool_enabled`" in readme,
         "example inventory and README must document karpenter_default_node_pool_enabled",
+    )
+
+
+def verify_csi_default_storage_class(readme: str) -> None:
+    """The chart's inspace-rwo StorageClass becomes the cluster default only on request."""
+    values = read("deploy/templates/chart-values.yaml.j2").replace("\r\n", "\n")
+    require(
+        "  storageClass:\n"
+        "    name: inspace-rwo\n"
+        "{% if csi_storage_class_default | default(false) | bool %}\n"
+        "    annotations:\n"
+        '      storageclass.kubernetes.io/is-default-class: "true"\n'
+        "{% else %}\n"
+        "    annotations: {}\n"
+        "{% endif %}\n" in values,
+        "chart values must mark inspace-rwo as the default StorageClass only when csi_storage_class_default is true, "
+        "with the annotation value quoted as the chart schema requires a string",
+    )
+    require(
+        "csi_storage_class_default | default(false) is boolean" in read("deploy/playbooks/tasks/preflight.yml"),
+        "preflight must accept csi_storage_class_default only as a boolean",
+    )
+    require(
+        re.search(r"(?m)^    csi_storage_class_default: false$", read("deploy/inventory.example.yml")) is not None
+        and "`csi_storage_class_default`" in readme
+        and "## Default StorageClass" in readme,
+        "example inventory and README must document the default-off csi_storage_class_default option",
+    )
+
+
+def verify_public_node_local_node_class(readme: str) -> None:
+    """An optional deploy-owned public-node-local NodeClass differs from the default only in name, profile, and disk."""
+    template = read("deploy/templates/karpenter.yaml.j2").replace("\r\n", "\n")
+    node_class, _, node_pool = template.partition("{% if karpenter_default_node_pool_enabled | default(true) | bool %}\n---\n")
+    require(
+        "{% for node_class in [" in node_class
+        and "{'name': karpenter_node_class_name, 'profile': '', 'rootDiskGiB': karpenter_root_disk_gib}" in node_class
+        and "'name': karpenter_public_node_local_node_class_name | default('', true)" in node_class
+        and "'profile': 'public-node-local'" in node_class
+        and "karpenter_public_node_local_root_disk_gib | default(30)" in node_class
+        and "] if node_class.name %}" in node_class
+        and "{% if not loop.first %}\n---\n{% endif %}\n" in node_class
+        and node_class.rstrip().endswith("{% endfor %}")
+        and node_class.count("kind: InSpaceNodeClass") == 1,
+        "karpenter template must render every NodeClass from one loop over the default and the optional public-node-local entry",
+    )
+    require(
+        node_class.count("firewallProfile:") == 1
+        and "{% if node_class.profile %}\n  firewallProfile: {{ node_class.profile }}\n{% endif %}\n" in node_class,
+        "only the public-node-local NodeClass may set firewallProfile; the default must render none, "
+        "because the provider hashes the whole spec and any value would drift-replace every worker",
+    )
+    require(
+        "  reservePublicIPv4: true\n  firewallUUID: {{ bootstrap_result.firewallUUID }}\n" in node_class
+        and "  rootDiskGiB: {{ node_class.rootDiskGiB }}\n" in node_class
+        and "  name: {{ node_class.name }}\n" in node_class
+        and "name: {{ karpenter_node_class_name }}" in node_pool,
+        "both NodeClasses must keep the public IPv4 and trusted worker firewall, and the NodePool must use the default NodeClass",
+    )
+    require(
+        "  defaultNodeClass: {{ karpenter_node_class_name }}\n"
+        in read("deploy/templates/chart-values.yaml.j2").replace("\r\n", "\n"),
+        "Karpenter must keep defaulting to the default NodeClass",
+    )
+    preflight = read("deploy/playbooks/tasks/preflight.yml")
+    require(
+        "karpenter_public_node_local_node_class_name | default('', true) != karpenter_node_class_name" in preflight
+        and "cluster_name ~ '-node-lb'" in preflight
+        and "startswith('inlb-')" in preflight
+        and "karpenter_public_node_local_node_class_name | default('', true) is string" in preflight
+        and "is match('^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$')" in preflight
+        and "(karpenter_public_node_local_root_disk_gib | default(30) | string) is match('^[0-9]+$')" in preflight
+        and "karpenter_public_node_local_root_disk_gib | default(30) | int >= 30" in preflight
+        and "karpenter_public_node_local_root_disk_gib | default(30) | int <= 2000" in preflight,
+        "preflight must require a DNS-1123 public-node-local NodeClass name clear of the default and CCM Node-LB "
+        "NodeClasses, and a whole-number root disk of 30-2000 GiB",
+    )
+    inventory = read("deploy/inventory.example.yml")
+    require(
+        re.search(r'(?m)^    karpenter_public_node_local_node_class_name: ""$', inventory) is not None
+        and re.search(r"(?m)^    karpenter_public_node_local_root_disk_gib: 30$", inventory) is not None
+        and "`karpenter_public_node_local_node_class_name`" in readme
+        and "`karpenter_public_node_local_root_disk_gib`" in readme
+        and "## Public edge NodeClass for endpoint-local Services" in readme
+        and "never prunes" in readme,
+        "example inventory and README must document the public-node-local NodeClass options",
     )
 
 

@@ -65,6 +65,10 @@ all:
     # Topology, identity, CNI, CIDR, token, and registry keys are rejected.
     control_plane_extra_config: {}
 
+    # True annotates the chart's inspace-rwo StorageClass as the cluster
+    # default, so PVCs without storageClassName use it. update can flip it.
+    csi_storage_class_default: false
+
     # False makes init and update skip the default NodePool so GitOps can own
     # NodePools. The NodeClass below is always applied: Karpenter defaults to
     # it and CCM Node-LB copies it as the base of its load-balancer NodeClass.
@@ -77,3 +81,9 @@ all:
     karpenter_instance_families: [general, compute, memory, extra-memory]
     karpenter_min_cpu_exclusive: "1"
     karpenter_consolidate_after: 1m
+    # Non-empty also applies an InSpaceNodeClass with firewallProfile
+    # public-node-local for edge NodePools you create (CCM public-node-local
+    # Services). One serves any number of pools. Clearing it later does not
+    # delete it: kubectl apply never prunes.
+    karpenter_public_node_local_node_class_name: ""
+    karpenter_public_node_local_root_disk_gib: 30
