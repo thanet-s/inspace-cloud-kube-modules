@@ -195,9 +195,10 @@ Moving to another release, for example from the candidate to GA
 1. Paste the script's output over the two constants and the
    `rke2CacheImages` entries.
 2. Replace the old version string everywhere it is pinned:
-   `git grep -l 'v1.36.5-rc2+rke2r1' | xargs sed -i 's/v1\.36\.5-rc2+rke2r1/v1.36.5+rke2r1/g'`
+   `git grep -l 'v1.36.5-rc2+rke2r1' -- . ':!release-notes' ':!DEVELOPMENT.md' ':!deploy/scripts/validate_rke2_upgrade.py' ':!deploy/scripts/test_validate_rke2_upgrade.py' | xargs sed -i 's/v1\.36\.5-rc2+rke2r1/v1.36.5+rke2r1/g'`
    (examples, E2E templates and checks, deploy inventory example, and test
-   fixtures).
+   fixtures). Published release notes keep their history, and the upgrade
+   guard keeps the old release as an upgrade source (step 4).
 3. Update `v9DirectHash` in `cache_contract_test.go`: the direct control-plane
    fixture renders `bootstrapCacheRKE2Version`, so only the version moves it.
 4. For a GA release, drop the single release-candidate alternative
@@ -206,7 +207,14 @@ Moving to another release, for example from the candidate to GA
    `AUDITED_PRERELEASES` in `deploy/scripts/validate_rke2_upgrade.py`, and
    drop the candidate-specific validation test cases (step 2 turns them into
    GA cases). The CRD and preflight static checks compare those copies with
-   the Go validators.
+   the Go validators. Never remove a candidate from `RELEASED_PRERELEASES`:
+   clusters a published release installed on it upgrade off it through
+   `deploy update`, which refuses an unknown current version. In
+   `test_validate_rke2_upgrade.py`, drop only the cases that use the
+   candidate as a target. After this step a NodeClass still naming the
+   candidate is NotReady until it moves to the new release; `deploy update`
+   moves the default NodeClass, so release notes must tell users to move
+   their own.
 5. When the bundled Cilium minor changes, render the new rke2-cilium chart
    with the values in `renderRKE2CiliumConfig` and compare the resulting
    `cilium-config` keys the E2E asserts, and read Cilium's upgrade notes.

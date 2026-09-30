@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import unittest
+from unittest import mock
 
+import validate_rke2_upgrade
 from validate_rke2_upgrade import GA, UnsafeRKE2Transition, parse_version, validate_transition
 
 
@@ -71,6 +73,25 @@ class ValidateTransitionTests(unittest.TestCase):
         with self.assertRaises(UnsafeRKE2Transition):
             validate_transition("v1.36.5+rke2r1", "v1.36.5-rc2+rke2r1", forced=False)
         validate_transition("v1.36.5+rke2r1", "v1.36.5-rc2+rke2r1", forced=True)
+
+    def test_released_candidate_stays_an_upgrade_source_after_its_pin_moves(self) -> None:
+        # Moving the cache pin to GA drops the candidate from AUDITED_PRERELEASES;
+        # clusters a published release installed on it must still upgrade.
+        with mock.patch.object(validate_rke2_upgrade, "AUDITED_PRERELEASES", frozenset()):
+            validate_transition("v1.36.5-rc2+rke2r1", "v1.36.5+rke2r1", forced=False)
+            validate_transition("v1.36.5-rc2+rke2r1", "v1.37.0+rke2r1", forced=False)
+            with self.assertRaises(UnsafeRKE2Transition):
+                validate_transition("v1.36.5-rc2+rke2r1", "v1.38.0+rke2r1", forced=False)
+
+    def test_released_candidate_is_no_target_after_its_pin_moves(self) -> None:
+        with mock.patch.object(validate_rke2_upgrade, "AUDITED_PRERELEASES", frozenset()):
+            for forced in (False, True):
+                with self.assertRaises(UnsafeRKE2Transition):
+                    validate_transition("v1.36.4+rke2r1", "v1.36.5-rc2+rke2r1", forced=forced)
+
+    def test_unreleased_candidate_is_no_upgrade_source(self) -> None:
+        with self.assertRaises(UnsafeRKE2Transition):
+            validate_transition("v1.36.5-rc1+rke2r1", "v1.36.5+rke2r1", forced=False)
 
     def test_malformed_current_version_is_refused(self) -> None:
         with self.assertRaises(UnsafeRKE2Transition):

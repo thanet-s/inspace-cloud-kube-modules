@@ -7,10 +7,15 @@ import re
 import sys
 
 VERSION_PATTERN = re.compile(r"^v(\d+)\.(\d+)\.(\d+)(?:-rc(\d+))?\+rke2r(\d+)$")
-# Pre-releases are refused except the single audited release candidate pinned
-# by the bootstrap cache (modules/cloud-provider/pkg/bootstrap/cache.go). Drop
-# it when that pin moves to its GA release.
+# Pre-releases are refused as a target except the single audited release
+# candidate pinned by the bootstrap cache
+# (modules/cloud-provider/pkg/bootstrap/cache.go). Drop it when that pin moves
+# to its GA release.
 AUDITED_PRERELEASES = frozenset({"v1.36.5-rc2+rke2r1"})
+# Every release candidate a published modules release ever pinned. Clusters
+# installed on one must keep upgrading off it after the pin moves, so an entry
+# is never removed; the pin refresh in DEVELOPMENT.md leaves this file alone.
+RELEASED_PRERELEASES = frozenset({"v1.36.5-rc2+rke2r1"})
 # Sorts a GA release after every release candidate of the same patch.
 GA = 1 << 31
 
@@ -19,16 +24,17 @@ class UnsafeRKE2Transition(Exception):
     pass
 
 
-def parse_version(value: str) -> tuple[int, int, int, int, int]:
+def parse_version(value: str, prereleases: frozenset[str] | None = None) -> tuple[int, int, int, int, int]:
     match = VERSION_PATTERN.match(value)
-    if not match or (match.group(4) is not None and value not in AUDITED_PRERELEASES):
+    allowed = AUDITED_PRERELEASES if prereleases is None else prereleases
+    if not match or (match.group(4) is not None and value not in allowed):
         raise UnsafeRKE2Transition(f"malformed or unaudited RKE2 version string {value!r}")
     major, minor, patch, candidate, build = match.groups()
     return int(major), int(minor), int(patch), GA if candidate is None else int(candidate), int(build)
 
 
 def validate_transition(current: str, desired: str, forced: bool) -> None:
-    c_major, c_minor, c_patch, c_candidate, _ = parse_version(current)
+    c_major, c_minor, c_patch, c_candidate, _ = parse_version(current, AUDITED_PRERELEASES | RELEASED_PRERELEASES)
     d_major, d_minor, d_patch, d_candidate, _ = parse_version(desired)
     is_downgrade = (d_major, d_minor, d_patch, d_candidate) < (c_major, c_minor, c_patch, c_candidate)
     skips_minor = d_major != c_major or d_minor - c_minor > 1

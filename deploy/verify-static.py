@@ -737,6 +737,13 @@ def main() -> None:
         "is_downgrade" in rke2_upgrade_validator and "skips_minor" in rke2_upgrade_validator,
         "RKE2 upgrade does not guard against downgrade or multi-minor-version skew",
     )
+    # A regex, so the pin-refresh sed in DEVELOPMENT.md cannot rewrite it.
+    require(
+        re.search(r'RELEASED_PRERELEASES = frozenset\(\{[^}]*"v1\.36\.5-rc2\+rke2r1"', rke2_upgrade_validator)
+        is not None
+        and "parse_version(current, AUDITED_PRERELEASES | RELEASED_PRERELEASES)" in rke2_upgrade_validator,
+        "RKE2 upgrade guard no longer accepts every released candidate as an upgrade source",
+    )
     rke2_upgrade_script = read("deploy/templates/upgrade-rke2-server.sh")
     require(
         "sha256sum" in rke2_upgrade_script and "systemctl stop rke2-server" in rke2_upgrade_script,
