@@ -79,7 +79,7 @@
 
     - name: Persist the upgraded RKE2 version in the deployment journal
       ansible.builtin.copy:
-        content: "{{ deployment_state | to_nice_json }}{{ '\n' }}"
+        content: "{{ deployment_state | to_nice_json }}\n"
         dest: "{{ deploy_state_dir }}/state.json"
         mode: "0600"
 
