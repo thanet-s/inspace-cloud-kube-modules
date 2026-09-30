@@ -457,6 +457,16 @@ a disk only while it is attached to a VM, so expansion is online-only: a PVC
 that no Pod uses stays pending until a Pod mounts it. Set the value to `false`
 to forbid PVC growth for the chart-managed StorageClass.
 
+## CSI fsGroup
+
+The `csi.inspace.cloud` CSIDriver sets `fsGroupPolicy: File`, so kubelet applies
+a Pod's `securityContext.fsGroup` to every `inspace-rwo` volume before the
+containers start. Without it, a new ext4 volume stays owned by root and a
+non-root workload cannot write to it. Kubernetes allows changing
+`fsGroupPolicy` on an existing CSIDriver, so `helm upgrade` updates it in
+place. Pods that are already running keep their current ownership until they
+restart.
+
 ## Install
 
 ```sh

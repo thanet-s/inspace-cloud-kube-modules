@@ -268,11 +268,20 @@ kubectl -n <release-namespace> scale deployment/<csi-controller> --replicas=1
 Never bulk-delete these Leases. An incorrect removal can duplicate a paid disk,
 detach a disk from the wrong state transition, or race disk deletion.
 
+## Volume ownership
+
+The `CSIDriver` declares `fsGroupPolicy: File`, so kubelet applies a Pod's
+`securityContext.fsGroup` to every `inspace-rwo` volume. The volumes are
+single-writer ext4 disks, which would otherwise stay root-owned and unwritable
+for non-root workloads. Kubernetes allows changing `fsGroupPolicy` on an
+existing `CSIDriver`, so `helm upgrade` or `kubectl apply` of the manifest
+updates it in place.
+
 ## Kubernetes manifests
 
 Files in `deploy/kubernetes` provide:
 
-- a persistent, attach-required `CSIDriver`;
+- a persistent, attach-required `CSIDriver` with `fsGroupPolicy: File`;
 - a strict-topology RWO `StorageClass`;
 - a controller Deployment with provisioner, attacher, and resizer sidecars,
   scheduled on fixed RKE2 control-plane nodes;
