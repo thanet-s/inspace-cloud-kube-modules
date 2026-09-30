@@ -1,7 +1,15 @@
+{% for node_class in [
+  {'name': karpenter_node_class_name, 'profile': '', 'rootDiskGiB': karpenter_root_disk_gib},
+  {'name': karpenter_public_node_local_node_class_name | default('', true), 'profile': 'public-node-local',
+   'rootDiskGiB': karpenter_public_node_local_root_disk_gib | default(30)},
+] if node_class.name %}
+{% if not loop.first %}
+---
+{% endif %}
 apiVersion: karpenter.inspace.cloud/v1alpha1
 kind: InSpaceNodeClass
 metadata:
-  name: {{ karpenter_node_class_name }}
+  name: {{ node_class.name }}
 spec:
   clusterName: {{ cluster_name }}
   billingAccountID: {{ inspace_billing_account_id }}
@@ -12,10 +20,13 @@ spec:
     stop: "{{ private_load_balancer_pool_stop }}"
   reservePublicIPv4: true
   firewallUUID: {{ bootstrap_result.firewallUUID }}
+{% if node_class.profile %}
+  firewallProfile: {{ node_class.profile }}
+{% endif %}
   imageSelector:
     osName: ubuntu
     osVersion: "{{ deploy_os_version }}"
-  rootDiskGiB: {{ karpenter_root_disk_gib }}
+  rootDiskGiB: {{ node_class.rootDiskGiB }}
   bootstrapCache:
     directDownload: {{ bootstrap_direct_download | bool | ternary('true', 'false') }}
 {% if not bootstrap_direct_download | bool %}
@@ -31,6 +42,7 @@ spec:
       key: token
   sshUsername: {{ ssh_username }}
   sshPublicKey: {{ ssh_public_key_text | to_json }}
+{% endfor %}
 {% if karpenter_default_node_pool_enabled | default(true) | bool %}
 ---
 apiVersion: karpenter.sh/v1

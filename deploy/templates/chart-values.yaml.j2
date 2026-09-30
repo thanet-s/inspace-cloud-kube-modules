@@ -34,3 +34,9 @@ csi:
     digest: "{{ deploy_modules_release_images['inspace-csi-driver'].platformDigest }}"
   storageClass:
     name: inspace-rwo
+{% if csi_storage_class_default | default(false) | bool %}
+    annotations:
+      storageclass.kubernetes.io/is-default-class: "true"
+{% else %}
+    annotations: {}
+{% endif %}
