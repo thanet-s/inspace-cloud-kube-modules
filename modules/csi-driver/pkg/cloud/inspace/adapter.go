@@ -450,7 +450,7 @@ func (a *Adapter) AttachVolume(ctx context.Context, location, volumeID, nodeID s
 	// InSpace accepts one storage POST per VM at a time, so concurrent attaches
 	// for disks of the same VM would fail and strand their durable fences. Hold
 	// the VM's lock across the whole mutation: fence, POST, and readback.
-	unlockVM, err := a.vmLocks.Lock(ctx, strings.ToLower(vmUUID))
+	unlockVM, err := a.lockVM(ctx, vmUUID)
 	if err != nil {
 		return err
 	}
@@ -601,7 +601,7 @@ func (a *Adapter) DetachVolume(ctx context.Context, location, volumeID, nodeID s
 	// below all run under the lock of the VM that currently holds the disk. The
 	// state is re-read once the fence exists, so a change made while this call
 	// waited for the lock is detected before any POST.
-	unlockVM, err := a.vmLocks.Lock(ctx, strings.ToLower(attachedVM))
+	unlockVM, err := a.lockVM(ctx, attachedVM)
 	if err != nil {
 		return err
 	}

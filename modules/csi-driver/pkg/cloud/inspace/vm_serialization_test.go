@@ -23,14 +23,15 @@ type busyVMAPI struct {
 	inner *fakeAPI
 	hold  time.Duration
 
-	inFlight     map[string]int
-	peakPerVM    map[string]int
-	inFlightAll  int
-	peakAll      int
-	rejected     int
-	attachPosts  int
-	detachPosts  int
-	mutationSeen map[string]int
+	inFlight      map[string]int
+	peakPerVM     map[string]int
+	inFlightAll   int
+	peakAll       int
+	rejected      int
+	attachPosts   int
+	detachPosts   int
+	resizePatches int
+	mutationSeen  map[string]int
 }
 
 func newBusyVMAPI(inner *fakeAPI, hold time.Duration) *busyVMAPI {
@@ -83,8 +84,15 @@ func (b *busyVMAPI) GetNetwork(ctx context.Context, loc, id string) (*sdk.Networ
 }
 
 func (b *busyVMAPI) ResizeAttachedDisk(ctx context.Context, loc, vm, disk string, size int) (*sdk.VMStorage, error) {
+	busy := b.enter(vm)
+	defer b.leave(vm)
+	time.Sleep(b.hold)
+	if busy {
+		return nil, &sdk.APIError{StatusCode: 500, Method: "PATCH", Path: "/storage/resize", Message: "VM is busy", Retryable: true}
+	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	b.resizePatches++
 	return b.inner.ResizeAttachedDisk(ctx, loc, vm, disk, size)
 }
 
@@ -297,5 +305,146 @@ func TestVMLockWaitHonorsContextCancellation(t *testing.T) {
 	// The abandoned waiter must leave no fence and no lock behind.
 	if err := adapter.AttachVolume(context.Background(), testLocation, ids[0], "worker-1"); err != nil {
 		t.Fatalf("attach after canceled waiter: %v", err)
+	}
+}
+
+// countingFenceStore records how many fences a call created.
+type countingFenceStore struct {
+	mutationFenceStore
+	mu      sync.Mutex
+	creates int
+}
+
+func (s *countingFenceStore) Create(ctx context.Context, fence mutationFence) (*mutationFence, bool, error) {
+	s.mu.Lock()
+	s.creates++
+	s.mu.Unlock()
+	return s.mutationFenceStore.Create(ctx, fence)
+}
+
+func (s *countingFenceStore) created() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.creates
+}
+
+// A queued caller may wait only for the part of its deadline that exceeds the
+// dispatch reserve. Past that it must fail retryably, at once, with no fence.
+func TestVMLockWaitIsCappedByDispatchReserve(t *testing.T) {
+	for _, operation := range []string{"attach", "detach"} {
+		t.Run(operation, func(t *testing.T) {
+			api, adapter, ids := newSerializationFixture(t, 1)
+			if operation == "detach" {
+				if err := adapter.AttachVolume(context.Background(), testLocation, ids[0], "worker-1"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			store := &countingFenceStore{mutationFenceStore: adapter.fences}
+			adapter.fences = store
+			attachPosts, detachPosts := api.attachPosts, api.detachPosts
+
+			unlock, err := adapter.vmLocks.Lock(context.Background(), strings.ToLower(testVM1))
+			if err != nil {
+				t.Fatal(err)
+			}
+			// 100ms of waiting budget remain above the reserve.
+			ctx, cancel := context.WithTimeout(context.Background(), minimumMutationDispatchReserve+100*time.Millisecond)
+			defer cancel()
+			started := time.Now()
+			if operation == "attach" {
+				err = adapter.AttachVolume(ctx, testLocation, ids[0], "worker-1")
+			} else {
+				err = adapter.DetachVolume(ctx, testLocation, ids[0], "worker-1")
+			}
+			if elapsed := time.Since(started); elapsed > 5*time.Second {
+				t.Fatalf("queued caller waited %s; wait must stop at the dispatch reserve", elapsed)
+			}
+			if !errors.Is(err, cloud.ErrUnavailable) {
+				t.Fatalf("error = %v, want retryable ErrUnavailable", err)
+			}
+			if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) || ctx.Err() != nil {
+				t.Fatalf("lock wait must not surface the parent context: err=%v ctx=%v", err, ctx.Err())
+			}
+			if store.created() != 0 {
+				t.Fatalf("queued caller created %d fence(s) before holding the VM lock", store.created())
+			}
+			if api.attachPosts != attachPosts || api.detachPosts != detachPosts {
+				t.Fatal("queued caller issued a cloud mutation")
+			}
+			unlock()
+			if n := adapter.vmLocks.size(); n != 0 {
+				t.Fatalf("VM lock entries left behind = %d", n)
+			}
+			if fences, err := adapter.fences.List(context.Background(), ""); err != nil || len(fences) != 0 {
+				t.Fatalf("residual fences: %#v err=%v", fences, err)
+			}
+		})
+	}
+}
+
+// A caller whose deadline already lacks the reserve fails before creating a
+// fence even when the VM lock is free.
+func TestVMLockedMutationChecksReserveBeforeFence(t *testing.T) {
+	for _, operation := range []string{"attach", "detach"} {
+		t.Run(operation, func(t *testing.T) {
+			api, adapter, ids := newSerializationFixture(t, 1)
+			if operation == "detach" {
+				if err := adapter.AttachVolume(context.Background(), testLocation, ids[0], "worker-1"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			store := &countingFenceStore{mutationFenceStore: adapter.fences}
+			adapter.fences = store
+			attachPosts, detachPosts := api.attachPosts, api.detachPosts
+			ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+			defer cancel()
+			var err error
+			if operation == "attach" {
+				err = adapter.AttachVolume(ctx, testLocation, ids[0], "worker-1")
+			} else {
+				err = adapter.DetachVolume(ctx, testLocation, ids[0], "worker-1")
+			}
+			if !errors.Is(err, cloud.ErrUnavailable) {
+				t.Fatalf("error = %v, want ErrUnavailable", err)
+			}
+			if store.created() != 0 {
+				t.Fatalf("created %d fence(s) without the dispatch reserve", store.created())
+			}
+			if api.attachPosts != attachPosts || api.detachPosts != detachPosts {
+				t.Fatal("cloud mutation issued without the dispatch reserve")
+			}
+			if n := adapter.vmLocks.size(); n != 0 {
+				t.Fatalf("VM lock entries left behind = %d", n)
+			}
+		})
+	}
+}
+
+func TestExpandAndAttachToOneVMNeverOverlap(t *testing.T) {
+	api, adapter, ids := newSerializationFixture(t, 2)
+	if err := adapter.AttachVolume(context.Background(), testLocation, ids[0], "worker-1"); err != nil {
+		t.Fatal(err)
+	}
+	errs := runConcurrently(3, func(i int) error {
+		if i == 0 {
+			_, err := adapter.ExpandVolume(context.Background(), testLocation, ids[0], 2*gib)
+			return err
+		}
+		return adapter.AttachVolume(context.Background(), testLocation, ids[i], "worker-1")
+	})
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("operation %d: %v", i, err)
+		}
+	}
+	peak1, _, _, rejected := api.stats()
+	if peak1 != 1 || rejected != 0 {
+		t.Fatalf("mutations in flight for one VM: peak=%d rejected=%d, want 1 and 0", peak1, rejected)
+	}
+	if api.resizePatches != 1 {
+		t.Fatalf("resize PATCHes = %d, want 1", api.resizePatches)
+	}
+	if n := adapter.vmLocks.size(); n != 0 {
+		t.Fatalf("VM lock entries left behind = %d", n)
 	}
 }

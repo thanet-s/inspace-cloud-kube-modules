@@ -1195,6 +1195,13 @@ func TestMutationDispatchReserveBlocksAllFourMutationsAndClearsOnlyExactFence(t 
 				mode = "foreign replacement retained"
 			}
 			t.Run(test.name+"/"+mode, func(t *testing.T) {
+				if replaceFence && (test.name == "attach" || test.name == "detach") {
+					// Attach and detach check the reserve right after taking the
+					// VM lock, before any fence exists, so a short deadline never
+					// leaves a fence to replace. See
+					// TestVMLockedMutationChecksReserveBeforeFence.
+					t.Skip("attach and detach reject a short deadline before creating a fence")
+				}
 				api := test.api()
 				baseStore := newMemoryMutationFenceStore()
 				resolver := &fencedNodeResolver{
