@@ -138,9 +138,12 @@ def verify_gateway_api(inventory: str, cluster_template: str, preflight: str, in
         # Gateway API also needs rke2-traefik-crd disabled: its bundled Gateway
         # API CRDs cannot be imported over ours, so its helm-install job would
         # crash-loop (seen live in the v1.1.0-rc.7 E2E).
+        # An operator installing their own Traefik may also drop it so their
+        # Helm release owns the Traefik CRDs (rke2_traefik_crd_enabled: false).
         expected = {
             "deploy": "      - rke2-ingress-nginx\n      - rke2-traefik\n"
-                      "{% if gateway_api_enabled | default(false) | bool %}\n"
+                      "{% if (gateway_api_enabled | default(false) | bool) or "
+                      "not (rke2_traefik_crd_enabled | default(true) | bool) %}\n"
                       "      - rke2-traefik-crd\n{% endif %}\n",
             "E2E": "      - rke2-ingress-nginx\n      - rke2-traefik\n      - rke2-traefik-crd\n",
         }[label]
@@ -153,6 +156,21 @@ def verify_gateway_api(inventory: str, cluster_template: str, preflight: str, in
         require("rke2-gateway-api-crd" not in template,
                 f"{label} cluster template must never disable rke2-gateway-api-crd")
     require("needs no Traefik" in readme, "README must state that Gateway API needs no Traefik")
+    require(
+        re.search(r"(?m)^    rke2_traefik_crd_enabled: true$", read("deploy/inventory.example.yml")) is not None
+        and "`rke2_traefik_crd_enabled`" in readme,
+        "example inventory and README must document the default-on rke2_traefik_crd_enabled option",
+    )
+    require(
+        "rke2_traefik_crd_enabled | default(true) is boolean" in read("deploy/playbooks/tasks/preflight.yml"),
+        "preflight must accept rke2_traefik_crd_enabled only as a boolean",
+    )
+    load_state = read("deploy/playbooks/tasks/load-state.yml")
+    require(
+        "'rke2-traefik-crd' in persisted_inspace_cluster.spec.rke2.get('disable', [])" in load_state
+        and "not (rke2_traefik_crd_enabled | default(true) | bool)" in load_state,
+        "journal binding must keep rke2_traefik_crd_enabled fixed at cluster creation",
+    )
 
 
 def verify_update_cache_refresh(update: str) -> None:

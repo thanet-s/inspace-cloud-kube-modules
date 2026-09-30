@@ -170,6 +170,26 @@ changed `cilium-config` without restarting that agent; `update` stops before
 upgrading the cloud modules and names the affected agents so the operator can
 review the change and restart them.
 
+## Installing your own Traefik
+
+The template always disables RKE2's `rke2-traefik` and `rke2-ingress-nginx`,
+but by default it keeps `rke2-traefik-crd`, which installs the Traefik CRDs
+(and, below RKE2 v1.37, Gateway API CRDs) for RKE2's bundled Traefik release.
+A Traefik you install yourself with Helm then has to run with `--skip-crds`
+against those RKE2-owned CRDs, and an RKE2 upgrade can change them.
+
+Set `rke2_traefik_crd_enabled` (default `true`) to `false` to disable
+`rke2-traefik-crd` as well, so
+your own `traefik-crds` and `traefik` Helm releases own every Traefik CRD and
+upgrade independently of RKE2. The v1.1.0 bootstrap controller already accepts
+this disable entry. Like `gateway_api_enabled`, it is fixed at cluster
+creation: disabling the chart on a running cluster would make RKE2 delete its
+CRDs and every custom resource, so `init`, `update`, `status`, and `destroy`
+refuse an inventory that differs from the persisted spec.
+`gateway_api_enabled: true` always disables the chart. From RKE2 v1.37 the
+never-disabled `rke2-gateway-api-crd` chart owns the Gateway API standard CRDs,
+so a self-installed Traefik must then leave those CRDs to RKE2.
+
 ## Optional Gateway API
 
 `gateway_api_enabled` (default `false`) enables Cilium's Gateway API

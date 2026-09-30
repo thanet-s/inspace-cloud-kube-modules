@@ -124,6 +124,13 @@
       modules_version newer than 1.1.0-rc.4 and an rke2_version that bundles
       Cilium 1.20 or newer (v1.34.12+, v1.35.9+, v1.36.5+, or v1.37.0+).
 
+# False leaves the Traefik CRDs to an operator-installed Traefik Helm release.
+- name: Require a boolean RKE2 Traefik CRD chart choice
+  ansible.builtin.assert:
+    that:
+      - rke2_traefik_crd_enabled | default(true) is boolean
+    fail_msg: "rke2_traefik_crd_enabled must be true or false."
+
 # From v1.37 RKE2's default rke2-gateway-api-crd chart installs the same
 # Gateway API v1.6.1 standard CRDs; below it bootstrap waits for this bundle.
 - name: Decide whether bootstrap needs the pinned Gateway API CRD bundle
