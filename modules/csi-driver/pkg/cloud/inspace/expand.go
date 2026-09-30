@@ -59,6 +59,14 @@ func (a *Adapter) ExpandVolume(ctx context.Context, location, volumeID string, c
 	if rows := vmDiskRows(targetVM, volumeID); rows != 1 {
 		return 0, fmt.Errorf("InSpace exact VM %s reported %d attachment rows for disk %s", attachedVM, rows, volumeID)
 	}
+	// A resize is one more storage request to the VM, and InSpace accepts one
+	// at a time per VM, so share the attach and detach lock. The reads below
+	// run under it and catch any change made while this call waited.
+	unlockVM, err := a.lockVM(ctx, attachedVM)
+	if err != nil {
+		return 0, err
+	}
+	defer unlockVM()
 	// Exact disk ownership and attachment are the final reads before the
 	// resize mutation.
 	disk, err = a.getOwnedDisk(ctx, location, volumeID)

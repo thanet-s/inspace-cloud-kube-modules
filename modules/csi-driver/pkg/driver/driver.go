@@ -160,7 +160,9 @@ func cloudStatus(operation string, err error) error {
 	case errors.Is(err, cloud.ErrInvalidNode):
 		return status.Error(codes.NotFound, operation+": node does not resolve to an InSpace VM")
 	case errors.Is(err, cloud.ErrUnavailable):
-		return status.Error(codes.Unavailable, operation+": InSpace API is temporarily unavailable")
+		// Keep the stable prefix and append the cloud's reason; the wrapped
+		// error carries method, path, HTTP status, and message only.
+		return status.Errorf(codes.Unavailable, "%s: InSpace API is temporarily unavailable: %v", operation, err)
 	case errors.Is(err, cloud.ErrUnauthenticated):
 		return status.Error(codes.Unauthenticated, operation+": InSpace API authentication failed")
 	case errors.Is(err, cloud.ErrPermissionDenied):
