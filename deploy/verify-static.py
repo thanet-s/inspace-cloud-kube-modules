@@ -171,6 +171,30 @@ def verify_gateway_api(inventory: str, cluster_template: str, preflight: str, in
         and "not (rke2_traefik_crd_enabled | default(true) | bool)" in load_state,
         "journal binding must keep rke2_traefik_crd_enabled fixed at cluster creation",
     )
+    verify_optional_default_node_pool(readme)
+
+
+def verify_optional_default_node_pool(readme: str) -> None:
+    """GitOps-owned NodePools: the default NodeClass (the Node-LB base) always stays deploy-owned."""
+    template = read("deploy/templates/karpenter.yaml.j2").replace("\r\n", "\n")
+    node_class, separator, node_pool = template.partition(
+        "{% if karpenter_default_node_pool_enabled | default(true) | bool %}\n---\n"
+    )
+    require(
+        separator != ""
+        and "kind: InSpaceNodeClass" in node_class and "{%" not in node_class.split("kind: InSpaceNodeClass")[0]
+        and "kind: NodePool" in node_pool and node_pool.rstrip().endswith("{% endif %}"),
+        "karpenter template must always render the NodeClass and gate only the NodePool",
+    )
+    require(
+        "karpenter_default_node_pool_enabled | default(true) is boolean" in read("deploy/playbooks/tasks/preflight.yml"),
+        "preflight must accept karpenter_default_node_pool_enabled only as a boolean",
+    )
+    require(
+        re.search(r"(?m)^    karpenter_default_node_pool_enabled: true$", read("deploy/inventory.example.yml")) is not None
+        and "`karpenter_default_node_pool_enabled`" in readme,
+        "example inventory and README must document karpenter_default_node_pool_enabled",
+    )
 
 
 def verify_update_cache_refresh(update: str) -> None:

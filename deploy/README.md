@@ -230,6 +230,29 @@ annotations; see
 `destroy` deletes every Gateway before the LoadBalancer Services, so Cilium
 cannot recreate a Service that would receive a new paid NLB.
 
+## Karpenter NodePools in GitOps
+
+`init` and `update` apply a default `InSpaceNodeClass`
+(`karpenter_node_class_name`) and `NodePool` (`karpenter_node_pool_name`) from
+the `karpenter_*` inventory values. Set `karpenter_default_node_pool_enabled`
+(default `true`) to `false` to skip the NodePool, so a GitOps tool can own
+every NodePool without `update` re-applying the default over it.
+
+The NodeClass is always applied, and `update` keeps it current: Karpenter
+uses it as its default, CCM Node-LB copies it as the base of the NodeClass it
+generates for load-balancer nodes, and its `spec.rke2.version` follows every
+RKE2 upgrade so workers roll through NodeClass drift. GitOps NodePools
+reference it by name and do not manage it. It carries the controller contract
+(cluster, network, private load-balancer pool, worker firewall, private VIP
+`server`, `inspace-rke2-agent-token` Secret, bootstrap cache), which a
+hand-written copy would have to repeat exactly.
+
+Turning the option off on an existing cluster does not delete the default
+NodePool, because `kubectl apply` never prunes. Delete it yourself after your
+GitOps NodePools are Ready. Control planes are tainted, so keep a NodePool that
+can run the GitOps controller, and suspend GitOps before `destroy`, which
+deletes every NodePool and NodeClass.
+
 ## One or three control-plane servers
 
 Set `control_plane_replicas` to:

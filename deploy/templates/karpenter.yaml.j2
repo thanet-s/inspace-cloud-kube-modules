@@ -31,6 +31,7 @@ spec:
       key: token
   sshUsername: {{ ssh_username }}
   sshPublicKey: {{ ssh_public_key_text | to_json }}
+{% if karpenter_default_node_pool_enabled | default(true) | bool %}
 ---
 apiVersion: karpenter.sh/v1
 kind: NodePool
@@ -68,3 +69,4 @@ spec:
   disruption:
     consolidationPolicy: WhenEmpty
     consolidateAfter: {{ karpenter_consolidate_after }}
+{% endif %}

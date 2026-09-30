@@ -65,6 +65,10 @@ all:
     # Topology, identity, CNI, CIDR, token, and registry keys are rejected.
     control_plane_extra_config: {}
 
+    # False makes init and update skip the default NodePool so GitOps can own
+    # NodePools. The NodeClass below is always applied: Karpenter defaults to
+    # it and CCM Node-LB copies it as the base of its load-balancer NodeClass.
+    karpenter_default_node_pool_enabled: true
     karpenter_node_class_name: ubuntu-workers
     karpenter_node_pool_name: general
     karpenter_root_disk_gib: 100

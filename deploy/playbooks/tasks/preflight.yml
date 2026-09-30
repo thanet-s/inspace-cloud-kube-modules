@@ -131,6 +131,13 @@
       - rke2_traefik_crd_enabled | default(true) is boolean
     fail_msg: "rke2_traefik_crd_enabled must be true or false."
 
+# False leaves the default Karpenter NodePool to GitOps; the NodeClass stays.
+- name: Require a boolean default Karpenter NodePool choice
+  ansible.builtin.assert:
+    that:
+      - karpenter_default_node_pool_enabled | default(true) is boolean
+    fail_msg: "karpenter_default_node_pool_enabled must be true or false."
+
 # From v1.37 RKE2's default rke2-gateway-api-crd chart installs the same
 # Gateway API v1.6.1 standard CRDs; below it bootstrap waits for this bundle.
 - name: Decide whether bootstrap needs the pinned Gateway API CRD bundle
