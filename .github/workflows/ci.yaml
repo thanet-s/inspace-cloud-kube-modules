@@ -247,6 +247,8 @@ jobs:
           sh -n deploy/templates/apply-control-plane-config.sh
           sh -n deploy/templates/refresh-bootstrap-cache.sh
           python3 deploy/scripts/test_refresh_bootstrap_cache.py
+          python3 deploy/scripts/test_resolve_release_images.py
+          python3 deploy/scripts/test_validate_rke2_upgrade.py
 
   e2e-harness:
     name: E2E harness
