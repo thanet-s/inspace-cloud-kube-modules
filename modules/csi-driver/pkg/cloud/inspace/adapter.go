@@ -89,6 +89,9 @@ type Adapter struct {
 	readback    time.Duration
 	absencePoll time.Duration
 	destructive time.Duration
+	// vmLocks serializes attach and detach mutations per target VM: InSpace
+	// accepts only one storage POST for a VM while it is busy.
+	vmLocks *keyedMutex
 }
 
 func New(api API, nodes NodeResolver, cfg Config) (*Adapter, error) {
@@ -131,6 +134,7 @@ func New(api API, nodes NodeResolver, cfg Config) (*Adapter, error) {
 		billing: cfg.BillingAccountID, poll: cfg.PollInterval,
 		readback: cfg.MutationReadbackTimeout, absencePoll: cfg.DestructiveAbsenceInterval,
 		destructive: cfg.DestructiveReadbackTimeout,
+		vmLocks:     newKeyedMutex(),
 	}, nil
 }
 
@@ -443,6 +447,14 @@ func (a *Adapter) AttachVolume(ctx context.Context, location, volumeID, nodeID s
 	if _, err := a.GetVolume(ctx, location, volumeID); err != nil {
 		return err
 	}
+	// InSpace accepts one storage POST per VM at a time, so concurrent attaches
+	// for disks of the same VM would fail and strand their durable fences. Hold
+	// the VM's lock across the whole mutation: fence, POST, and readback.
+	unlockVM, err := a.vmLocks.Lock(ctx, strings.ToLower(vmUUID))
+	if err != nil {
+		return err
+	}
+	defer unlockVM()
 	intent := diskAttachmentIntent{
 		Operation: "disk-attachment", Location: location,
 		DiskUUID: strings.ToLower(volumeID), BillingAccountID: a.billing, DesiredVMUUID: vmUUID,
@@ -585,6 +597,15 @@ func (a *Adapter) DetachVolume(ctx context.Context, location, volumeID, nodeID s
 			return nil
 		}
 	}
+	// Same one-POST-per-VM constraint as attach. The fence, POST, and readback
+	// below all run under the lock of the VM that currently holds the disk. The
+	// state is re-read once the fence exists, so a change made while this call
+	// waited for the lock is detected before any POST.
+	unlockVM, err := a.vmLocks.Lock(ctx, strings.ToLower(attachedVM))
+	if err != nil {
+		return err
+	}
+	defer unlockVM()
 	intent := diskAttachmentIntent{
 		Operation: "disk-attachment", Location: location,
 		DiskUUID: strings.ToLower(volumeID), BillingAccountID: a.billing, PreviousVMUUID: attachedVM,

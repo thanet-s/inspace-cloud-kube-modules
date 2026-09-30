@@ -323,3 +323,20 @@ func TestCloudStatusReportsRejectedResizeAsInvalidArgumentWithCause(t *testing.T
 		t.Fatalf("rejected resize status %q lost the InSpace cause", status.Convert(err).Message())
 	}
 }
+
+// An unavailable cloud must stay retryable and keep the stable prefix, but the
+// cloud's reason must reach the VolumeAttachment status instead of being dropped.
+func TestCloudStatusKeepsUnavailableCause(t *testing.T) {
+	reason := "inspace: POST /v1/bkk01/user-resource/vm/storage/attach returned HTTP 500: VM is busy"
+	err := cloudStatus("attach volume", fmt.Errorf("%w: %s", cloud.ErrUnavailable, reason))
+	if status.Code(err) != codes.Unavailable {
+		t.Fatalf("unavailable code = %v, want Unavailable", status.Code(err))
+	}
+	message := status.Convert(err).Message()
+	if !strings.HasPrefix(message, "attach volume: InSpace API is temporarily unavailable") {
+		t.Fatalf("status %q lost the stable prefix", message)
+	}
+	if !strings.Contains(message, reason) {
+		t.Fatalf("status %q lost the cloud reason %q", message, reason)
+	}
+}
