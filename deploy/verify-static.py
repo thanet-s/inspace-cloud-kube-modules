@@ -171,38 +171,29 @@ def verify_gateway_api(inventory: str, cluster_template: str, preflight: str, in
         and "not (rke2_traefik_crd_enabled | default(true) | bool)" in load_state,
         "journal binding must keep rke2_traefik_crd_enabled fixed at cluster creation",
     )
-    verify_optional_default_karpenter_topology(readme)
+    verify_optional_default_node_pool(readme)
 
 
-def verify_optional_default_karpenter_topology(readme: str) -> None:
-    """GitOps-owned Karpenter topology: init and update may skip the default NodeClass and NodePool."""
-    gate = "      when: karpenter_default_topology_enabled | default(true) | bool\n"
-    for playbook, names in (
-        ("deploy/playbooks/init-cluster.yml", (
-            "Render the default Karpenter worker topology",
-            "Apply the default Karpenter NodeClass and zero-at-rest NodePool",
-        )),
-        ("deploy/playbooks/update-control-plane.yml", (
-            "Render the updated default Karpenter topology",
-            "Apply the updated default NodeClass and NodePool",
-        )),
-    ):
-        text = read(playbook)
-        for name in names:
-            task = re.search(r"(?ms)^    - name: " + re.escape(name) + r"\n(.*?)(?=^    - name: |\Z)", text)
-            require(
-                task is not None and gate in task.group(1),
-                f"{playbook} task {name!r} must be gated on karpenter_default_topology_enabled",
-            )
-    require(
-        "karpenter_default_topology_enabled | default(true) is boolean" in read("deploy/playbooks/tasks/preflight.yml"),
-        "preflight must accept karpenter_default_topology_enabled only as a boolean",
+def verify_optional_default_node_pool(readme: str) -> None:
+    """GitOps-owned NodePools: the default NodeClass (the Node-LB base) always stays deploy-owned."""
+    template = read("deploy/templates/karpenter.yaml.j2").replace("\r\n", "\n")
+    node_class, separator, node_pool = template.partition(
+        "{% if karpenter_default_node_pool_enabled | default(true) | bool %}\n---\n"
     )
     require(
-        re.search(r"(?m)^    karpenter_default_topology_enabled: true$", read("deploy/inventory.example.yml")) is not None
-        and "`karpenter_default_topology_enabled`" in readme
-        and "`karpenter_node_class_name`" in readme,
-        "example inventory and README must document karpenter_default_topology_enabled and the required base NodeClass",
+        separator != ""
+        and "kind: InSpaceNodeClass" in node_class and "{%" not in node_class.split("kind: InSpaceNodeClass")[0]
+        and "kind: NodePool" in node_pool and node_pool.rstrip().endswith("{% endif %}"),
+        "karpenter template must always render the NodeClass and gate only the NodePool",
+    )
+    require(
+        "karpenter_default_node_pool_enabled | default(true) is boolean" in read("deploy/playbooks/tasks/preflight.yml"),
+        "preflight must accept karpenter_default_node_pool_enabled only as a boolean",
+    )
+    require(
+        re.search(r"(?m)^    karpenter_default_node_pool_enabled: true$", read("deploy/inventory.example.yml")) is not None
+        and "`karpenter_default_node_pool_enabled`" in readme,
+        "example inventory and README must document karpenter_default_node_pool_enabled",
     )
 
 

@@ -729,13 +729,11 @@
           - 15m
       changed_when: true
 
-    # False leaves the NodeClass and NodePool to the operator's GitOps.
     - name: Render the default Karpenter worker topology
       ansible.builtin.template:
         src: "{{ deploy_root }}/templates/karpenter.yaml.j2"
         dest: "{{ deploy_state_dir }}/karpenter.yaml"
         mode: "0600"
-      when: karpenter_default_topology_enabled | default(true) | bool
 
     - name: Apply the default Karpenter NodeClass and zero-at-rest NodePool
       ansible.builtin.command:
@@ -747,7 +745,6 @@
           - -f
           - "{{ deploy_state_dir }}/karpenter.yaml"
       changed_when: true
-      when: karpenter_default_topology_enabled | default(true) | bool
 
     - name: Report cluster access
       ansible.builtin.debug:
