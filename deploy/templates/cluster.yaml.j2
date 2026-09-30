@@ -30,7 +30,7 @@ spec:
     disable:
       - rke2-ingress-nginx
       - rke2-traefik
-{% if gateway_api_enabled | default(false) | bool %}
+{% if (gateway_api_enabled | default(false) | bool) or not (rke2_traefik_crd_enabled | default(true) | bool) %}
       - rke2-traefik-crd
 {% endif %}
     tlsSubjectAltNames:
