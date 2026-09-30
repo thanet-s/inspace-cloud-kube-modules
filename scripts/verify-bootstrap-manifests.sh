@@ -6,6 +6,7 @@ chart=$workspace/charts/inspace-cloud-kube-modules
 values=$chart/ci/test-values.yaml
 standalone_ccm=$workspace/modules/cloud-provider/config/ccm/cloud-controller-manager.yaml
 standalone_csi=$workspace/modules/csi-driver/deploy/kubernetes/controller.yaml
+standalone_csi_driver=$workspace/modules/csi-driver/deploy/kubernetes/csidriver.yaml
 standalone_karpenter=$workspace/modules/karpenter-provider/config/controller/controller.yaml
 root_readme=$workspace/README.md
 chart_readme=$chart/README.md
@@ -220,6 +221,12 @@ helm template bootstrap "$chart" --namespace kube-system --values "$values" \
   --set csi.storageClass.allowVolumeExpansion=false \
   --show-only templates/csi-storageclass.yaml >"$tmpdir/csi-storageclass-fixed.yaml"
 grep -Fx 'allowVolumeExpansion: false' "$tmpdir/csi-storageclass-fixed.yaml" >/dev/null
+
+helm template bootstrap "$chart" --namespace kube-system --values "$values" \
+  --show-only templates/csi-driver.yaml >"$tmpdir/csi-driver.yaml"
+grep -Fx 'kind: CSIDriver' "$tmpdir/csi-driver.yaml" >/dev/null
+grep -Fx '  fsGroupPolicy: File' "$tmpdir/csi-driver.yaml" >/dev/null
+grep -Fx '  fsGroupPolicy: File' "$standalone_csi_driver" >/dev/null
 
 helm template bootstrap "$chart" --namespace kube-system --values "$values" \
   --show-only templates/karpenter-deployment.yaml >"$tmpdir/karpenter.yaml"
