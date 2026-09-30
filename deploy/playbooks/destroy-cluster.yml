@@ -263,10 +263,7 @@
 
     - name: Mark the local deployment journal destroyed
       ansible.builtin.copy:
-        content: >-
-          {{ deployment_state |
-             combine({'destroyed': true, 'destroyResult': deploy_destroy_result}, recursive=true) |
-             to_nice_json }}{{ '\n' }}
+        content: "{{ deployment_state | combine({'destroyed': true, 'destroyResult': deploy_destroy_result}, recursive=true) | to_nice_json }}\n"
         dest: "{{ deploy_state_dir }}/state.json"
         mode: "0600"
 

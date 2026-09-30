@@ -589,6 +589,25 @@ def verify_release_image_digests(init: str, update: str, destroy: str) -> None:
     )
 
 
+def verify_journal_writers_end_with_real_newline() -> None:
+    """A Jinja '\n' literal renders as backslash-n, corrupting the JSON journal.
+
+    Only a double-quoted YAML scalar turns \n into a newline, so playbooks must
+    end written JSON with `}}\n"` and never with `{{ '\n' }}`.
+    """
+    literal = "{{ '\\n' }}"
+    offenders = sorted(
+        str(path.relative_to(ROOT))
+        for path in (DEPLOY / "playbooks").rglob("*.yml")
+        if literal in path.read_text(encoding="utf-8")
+    )
+    require(
+        not offenders,
+        "playbooks must end written JSON with a double-quoted \\n, not the Jinja "
+        f"literal {literal} (it renders as backslash-n): {', '.join(offenders)}",
+    )
+
+
 def main() -> None:
     inventory = read("deploy/inventory.example.yml")
     gitignore = read(".gitignore")
@@ -610,6 +629,7 @@ def main() -> None:
         "infrastructure.inspace.cloud_inspaceclusters.yaml"
     )
 
+    verify_journal_writers_end_with_real_newline()
     require(
         re.search(r"(?m)^\s*(?:INSPACE_API_TOKEN|inspace_api_token)\s*:", inventory)
         is None,

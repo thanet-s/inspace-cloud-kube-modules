@@ -173,10 +173,7 @@
 
     - name: Persist active module version without changing bootstrap authority
       ansible.builtin.copy:
-        content: >-
-          {{ deployment_state |
-             combine({'modulesVersion': modules_version}, recursive=true) |
-             to_nice_json }}{{ '\n' }}
+        content: "{{ deployment_state | combine({'modulesVersion': modules_version}, recursive=true) | to_nice_json }}\n"
         dest: "{{ deploy_state_dir }}/state.json"
         mode: "0600"
 
