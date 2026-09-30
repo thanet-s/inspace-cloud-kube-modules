@@ -154,11 +154,14 @@
           - 15m
       changed_when: true
 
+    # False leaves the NodeClass and NodePool to the operator's GitOps, which
+    # must then move spec.rke2.version itself after an RKE2 upgrade.
     - name: Render the updated default Karpenter topology
       ansible.builtin.template:
         src: "{{ deploy_root }}/templates/karpenter.yaml.j2"
         dest: "{{ deploy_state_dir }}/karpenter.yaml"
         mode: "0600"
+      when: karpenter_default_topology_enabled | default(true) | bool
 
     - name: Apply the updated default NodeClass and NodePool
       ansible.builtin.command:
@@ -170,6 +173,7 @@
           - -f
           - "{{ deploy_state_dir }}/karpenter.yaml"
       changed_when: true
+      when: karpenter_default_topology_enabled | default(true) | bool
 
     - name: Persist active module version without changing bootstrap authority
       ansible.builtin.copy:
