@@ -243,6 +243,7 @@ jobs:
           bash -n test/e2e/run.sh
           python3 deploy/verify-static.py
           python3 -m py_compile deploy/scripts/discover_bootstrap.py
+          python3 -m py_compile deploy/scripts/control_plane_resize.py
           bash -n deploy/run.sh deploy/container-entrypoint.sh deploy/scripts/api-tunnel.sh
           sh -n deploy/templates/apply-control-plane-config.sh
           sh -n deploy/templates/refresh-bootstrap-cache.sh
@@ -251,6 +252,7 @@ jobs:
           python3 deploy/scripts/test_post_upgrade_reboot.py
           python3 deploy/scripts/test_resolve_release_images.py
           python3 deploy/scripts/test_validate_rke2_upgrade.py
+          python3 deploy/scripts/test_control_plane_resize.py
 
   e2e-harness:
     name: E2E harness

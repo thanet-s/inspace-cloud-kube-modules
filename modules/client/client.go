@@ -518,6 +518,12 @@ var endpointContracts = []endpointContract{
 	{http.MethodPut, "/v1/{location}/network/firewalls/{uuid}", statusOKOnly, successJSON},
 	{http.MethodPatch, "/v1/{location}/network/ip_addresses/{address}", statusOKOnly, successJSON},
 	{http.MethodPatch, "/v1/{location}/user-resource/vm/storage", statusOKOnly, successJSON},
+	{http.MethodPatch, "/v1/{location}/user-resource/vm", statusOKOnly, successJSON},
+
+	// The power routes' success bodies are not documented. Callers never trust
+	// them: stop and start are proven by reading the VM status back.
+	{http.MethodPost, "/v1/{location}/user-resource/vm/stop", statusOKOrNoContent, successEmptyOrJSON},
+	{http.MethodPost, "/v1/{location}/user-resource/vm/start", statusOKOrNoContent, successEmptyOrJSON},
 
 	// The VM API reference does not state a success response. The live API can
 	// return either an empty 204 or a JSON-bearing 200. The body is never used

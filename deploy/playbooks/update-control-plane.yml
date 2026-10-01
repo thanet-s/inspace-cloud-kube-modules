@@ -7,6 +7,9 @@
     # Only update may move the recorded RKE2 version, through the guarded
     # one-server-at-a-time upgrade in tasks/apply-rke2-upgrade.yml.
     deploy_allow_rke2_version_change: true
+    # Only update may refuse an inventory size that shrinks the control planes
+    # or contradicts a resize in progress; status, tunnel and destroy only report.
+    deploy_enforce_control_plane_size: true
   tasks:
     - name: Validate inventory, topology, tools, and SSH identity
       ansible.builtin.include_tasks: tasks/preflight.yml
@@ -19,6 +22,27 @@
 
     - name: Load and validate the deployment journal
       ansible.builtin.include_tasks: tasks/load-state.yml
+
+    # A resize record that never started a server changed nothing; drop it when
+    # the inventory no longer asks for that resize (a new target replaces it).
+    - name: Drop a control-plane resize record that never started
+      ansible.builtin.command:
+        argv:
+          - python3
+          - "{{ deploy_root }}/scripts/control_plane_resize.py"
+          - clear
+          - --state
+          - "{{ deploy_state_dir }}/state.json"
+      register: deploy_resize_cleared
+      changed_when: true
+      when:
+        - control_plane_resize.staleResize | bool
+        - not control_plane_resize_needed | bool
+
+    - name: Reload the deployment journal after dropping the stale resize record
+      ansible.builtin.set_fact:
+        deployment_state: "{{ deploy_resize_cleared.stdout | from_json }}"
+      when: deploy_resize_cleared is not skipped
 
     - name: Load immutable bootstrap output for chart and NodeClass rendering
       ansible.builtin.set_fact:
@@ -40,6 +64,50 @@
         deploy_modules_release_images: >-
           {{ (deploy_modules_release_images_result.stdout | from_json).images }}
 
+    # A resize left in progress may have stopped the VM, and on a single
+    # control plane that takes the API down, so the tunnel below would wait for
+    # an API that only that server brings back. No quorum check can run yet, so
+    # this only reads the VM and, when it is not running, powers it on without
+    # stopping or resizing anything. A running VM is left to the resize tasks,
+    # which prove quorum before any stop.
+    - name: Bring a control-plane VM left powered off mid-resize back before the API is needed
+      when: control_plane_resize.inProgress | length > 0
+      block:
+        - name: Pull the target controller release that restarts the VM
+          ansible.builtin.command:
+            argv:
+              - docker
+              - pull
+              - --platform
+              - linux/amd64
+              - "{{ deploy_modules_release_images['inspace-cloud-controller-manager'].releaseReference }}"
+          changed_when: false
+
+        - name: Read the VM of the control plane left mid-resize
+          ansible.builtin.include_tasks: tasks/run-resize-controller.yml
+          vars:
+            deploy_resize_check_only: true
+          loop: "{{ deployment_state.controlPlanes }}"
+          loop_control:
+            loop_var: deploy_control_plane
+            index_var: deploy_cp_index
+            label: "{{ deploy_control_plane.name }}"
+          when: deploy_control_plane.name == control_plane_resize.inProgress
+
+        - name: Power on the VM of the control plane left mid-resize when it is not running
+          ansible.builtin.include_tasks: tasks/run-resize-controller.yml
+          vars:
+            deploy_resize_check_only: false
+            deploy_resize_start_only: true
+          loop: "{{ deployment_state.controlPlanes }}"
+          loop_control:
+            loop_var: deploy_control_plane
+            index_var: deploy_cp_index
+            label: "{{ deploy_control_plane.name }}"
+          when:
+            - deploy_control_plane.name == control_plane_resize.inProgress
+            - deploy_resize_result.status | lower != 'running'
+
     - name: Start the private API tunnel and wait for readiness
       ansible.builtin.include_tasks: tasks/start-tunnel.yml
 
@@ -49,8 +117,24 @@
       ansible.builtin.include_tasks: tasks/refresh-bootstrap-cache.yml
       when: not bootstrap_direct_download | bool
 
+    - name: Finish the control-plane resize a previous run left in progress before any RKE2 upgrade
+      ansible.builtin.include_tasks: tasks/apply-control-plane-resize.yml
+      when:
+        - control_plane_resize_needed | bool
+        - control_plane_resize.resuming
+
     - name: Upgrade the RKE2 binary one control-plane server at a time when requested
       ansible.builtin.include_tasks: tasks/apply-rke2-upgrade.yml
+
+    # A larger control_plane_vcpu / control_plane_memory_mib in the inventory
+    # grows the VMs in place, one server at a time, after the RKE2 upgrade has
+    # settled. A resize a previous run left in progress runs first instead, so
+    # an RKE2 restart never overlaps a server that is stopped or half resized.
+    - name: Grow the control-plane VMs one server at a time when the inventory asks for it
+      ansible.builtin.include_tasks: tasks/apply-control-plane-resize.yml
+      when:
+        - control_plane_resize_needed | bool
+        - not control_plane_resize.resuming
 
     - name: Apply operator RKE2 configuration with one-at-a-time restarts
       ansible.builtin.include_tasks: tasks/apply-control-plane-config.yml

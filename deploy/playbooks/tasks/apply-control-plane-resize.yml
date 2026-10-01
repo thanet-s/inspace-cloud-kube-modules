@@ -1,0 +1,78 @@
+---
+# Grow every control-plane VM to control_plane_resize.target, one server at a
+# time. Included by update when the inventory asks for a larger size or a
+# previous run left a resize in progress. The journal records the target
+# before any VM changes and each server before it is touched, so a re-run
+# resumes. cluster.yaml is never rewritten.
+- name: Pull the target controller release that resizes control planes
+  ansible.builtin.command:
+    argv:
+      - docker
+      - pull
+      - --platform
+      - linux/amd64
+      - "{{ deploy_modules_release_images['inspace-cloud-controller-manager'].releaseReference }}"
+  changed_when: false
+
+# Read-only and before the journal is written: a VM above the target, a VM that
+# is not the journaled one, or a controller that predates --resize-check stops
+# update here with nothing changed.
+- name: Check every control-plane VM against the target size before journaling it
+  ansible.builtin.include_tasks: run-resize-controller.yml
+  vars:
+    deploy_resize_check_only: true
+  loop: "{{ deployment_state.controlPlanes }}"
+  loop_control:
+    loop_var: deploy_control_plane
+    index_var: deploy_cp_index
+    label: "{{ deploy_control_plane.name }}"
+
+- name: Journal the target control-plane size before any VM changes
+  ansible.builtin.command:
+    argv:
+      - python3
+      - "{{ deploy_root }}/scripts/control_plane_resize.py"
+      - begin
+      - --state
+      - "{{ deploy_state_dir }}/state.json"
+      - --target-vcpu
+      - "{{ control_plane_resize.target.vcpu }}"
+      - --target-memory-mib
+      - "{{ control_plane_resize.target.memoryMiB }}"
+  register: deploy_resize_journal
+  changed_when: true
+
+- name: Reload the deployment journal
+  ansible.builtin.set_fact:
+    deployment_state: "{{ deploy_resize_journal.stdout | from_json }}"
+
+- name: Resize each pending control-plane server in turn
+  ansible.builtin.include_tasks: resize-one-control-plane.yml
+  loop: "{{ deployment_state.controlPlanes }}"
+  loop_control:
+    loop_var: deploy_control_plane
+    index_var: deploy_cp_index
+    label: "{{ deploy_control_plane.name }}"
+  when: deploy_control_plane.name in control_plane_resize.pending
+
+- name: Record the new control-plane size and clear the resize progress
+  ansible.builtin.command:
+    argv:
+      - python3
+      - "{{ deploy_root }}/scripts/control_plane_resize.py"
+      - finish
+      - --state
+      - "{{ deploy_state_dir }}/state.json"
+  register: deploy_resize_journal
+  changed_when: true
+
+- name: Reload the deployment journal after the resize
+  ansible.builtin.set_fact:
+    deployment_state: "{{ deploy_resize_journal.stdout | from_json }}"
+
+- name: Report the completed control-plane resize
+  ansible.builtin.debug:
+    msg: >-
+      Cluster {{ cluster_name }} control planes now have
+      {{ control_plane_resize.target.vcpu }} vCPU and
+      {{ control_plane_resize.target.memoryMiB }} MiB.

@@ -49,6 +49,8 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		s.listVMs(w)
 	case r.URL.Path == "/v1/bkk01/user-resource/vm":
 		s.vm(w, r)
+	case r.Method == http.MethodPost && (r.URL.Path == "/v1/bkk01/user-resource/vm/stop" || r.URL.Path == "/v1/bkk01/user-resource/vm/start"):
+		s.power(w, r)
 	default:
 		writeError(w, http.StatusNotFound, "route not implemented by fake")
 	}
@@ -120,6 +122,26 @@ func (s *Server) vm(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, http.StatusOK, vm)
+	case http.MethodPatch:
+		// Like the live API, a resize is only accepted while the VM is stopped.
+		vm, ok := s.vms[r.Form.Get("uuid")]
+		if !ok {
+			writeError(w, http.StatusNotFound, "VM not found")
+			return
+		}
+		vcpu, _ := strconv.Atoi(r.Form.Get("vcpu"))
+		memory, _ := strconv.Atoi(r.Form.Get("ram"))
+		if vcpu <= 0 || memory <= 0 {
+			writeError(w, http.StatusUnprocessableEntity, "missing VM fields")
+			return
+		}
+		if vm.Status != "stopped" {
+			writeError(w, http.StatusUnprocessableEntity, "VM must be stopped to change its compute")
+			return
+		}
+		vm.VCPU, vm.MemoryMiB = vcpu, memory
+		s.vms[vm.UUID] = vm
+		writeJSON(w, http.StatusOK, vm)
 	case http.MethodDelete:
 		uuid := r.Form.Get("uuid")
 		if _, ok := s.vms[uuid]; !ok {
@@ -131,6 +153,27 @@ func (s *Server) vm(w http.ResponseWriter, r *http.Request) {
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
+}
+
+func (s *Server) power(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	vm, ok := s.vms[r.Form.Get("uuid")]
+	if !ok {
+		writeError(w, http.StatusNotFound, "VM not found")
+		return
+	}
+	if r.URL.Path == "/v1/bkk01/user-resource/vm/stop" {
+		vm.Status = "stopped"
+	} else {
+		vm.Status = "running"
+	}
+	s.vms[vm.UUID] = vm
+	writeJSON(w, http.StatusOK, vm)
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {

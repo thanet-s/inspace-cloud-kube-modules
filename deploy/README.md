@@ -349,6 +349,52 @@ one replica and disables its proportional autoscaler; otherwise a temporary
 worker would receive a second CoreDNS Pod and could never become empty for
 Karpenter consolidation.
 
+## Resizing control planes
+
+Control planes can grow in place. Raise `control_plane_vcpu` and/or
+`control_plane_memory_mib` in the inventory and run `update`:
+
+```sh
+./deploy/run.sh update
+```
+
+- **Grow only.** Both values must stay within the inventory bounds (2-16 vCPU,
+  4096-65536 MiB), and neither may drop below the size the servers run. A
+  smaller value is refused with a message before anything changes.
+- **One server at a time, in slot order.** For each server `update` first
+  requires every control-plane node Ready and etcd healthy, cordons the node,
+  and journals the resize. The `inspace-cluster-controller --resize-control-plane`
+  subcommand then stops the VM gracefully (ACPI, never forced), changes its
+  vCPU and memory while it is stopped, reads the new size back, and starts it.
+  The server keeps its VM, disks, private address, and floating IP. `update`
+  continues only after the host is on a new boot with a healthy local API and
+  etcd, the node is Ready, and the private API answers; then it uncordons the
+  node and moves on.
+- **About 3 minutes of downtime per server.** With three control planes etcd
+  keeps quorum throughout (at most one server is down) and the API stays
+  available. A single control plane has no quorum to keep, so its API is
+  unavailable for the same period.
+- **Resumable.** `state.json` records `controlPlaneResize` (the target, the
+  server in progress, and the servers done) before each VM change. If a run
+  stops, run `update` again with the same inventory: it finishes the server in
+  progress and continues. A resize in progress finishes before any RKE2
+  upgrade in the same `update`, and a server a stopped run left powered off is
+  started again before `update` waits for the API. An inventory that differs
+  from a resize in progress is refused until it matches again; before the
+  first server starts, the inventory may still change the target. Before
+  anything is journaled, `update` reads every control-plane VM and refuses if
+  one is above the target or is not the journaled VM. When every server is
+  done, `state.json` records `controlPlaneMachine` and drops the progress
+  record.
+- **Already resized servers are left alone.** If a VM already runs at the
+  target size (for example resized in the InSpace console), `update` does not
+  stop it; it only verifies the node and records the size.
+- `cluster.yaml` keeps the size it was created with, because every
+  control-plane ownership record derives from it. Only `update` refuses a
+  smaller inventory size; `status`, `tunnel` and `destroy` keep working and
+  only report a size that differs from the recorded one. Do not re-run `init`
+  after a resize; use `update`.
+
 ## Commands
 
 An explicit inventory path may be absolute or relative:
@@ -466,12 +512,17 @@ the single command for both kinds of day-2 upgrade:
   A **direct-download** cluster (`bootstrap_direct_download: true`) can upgrade
   to any valid RKE2 release independently of `modules_version`.
 
+- **Control-plane resize**: a larger `control_plane_vcpu` or
+  `control_plane_memory_mib` grows the servers one at a time after the RKE2
+  upgrade; see [Resizing control planes](#resizing-control-planes).
+
 `update` still puts `control_plane_extra_config` in RKE2's operator fragment
 after any RKE2 binary upgrade, restarting at most one server at a time.
 Topology, identity, control-plane taints, packaged-component disablement, CNI,
 CIDR, token, data-directory, and registry keys remain blocked because the
-bootstrap controller owns them; replica-count and machine-shape changes still
-require the explicit destroy/recreate lifecycle. On a single-server cluster,
+bootstrap controller owns them; replica-count changes still require the
+explicit destroy/recreate lifecycle. Control-plane vCPU and memory can grow in
+place (see [Resizing control planes](#resizing-control-planes)). On a single-server cluster,
 each RKE2 restart necessarily causes brief API downtime.
 
 `tunnel` starts or reuses the SSH control connection and prints the local
@@ -558,12 +609,12 @@ destroy stops instead of bypassing CSI, CCM, Karpenter, or ownership checks.
 
 ## Limits
 
-Fixed control-plane shape, image, bootstrap cache mode, network, VIP, and
+Fixed control-plane root disk, image, bootstrap cache mode, network, VIP, and
 replica-count updates are not in-place operations; the bootstrap controller
-rejects immutable VM drift for those fields. RKE2 *version* is the one
-exception: `update` performs an in-place, one-at-a-time control-plane binary
-upgrade (see above) and elastic workers converge automatically through
-Karpenter drift-replacement. `update` otherwise covers the allowlisted
-operator RKE2 fragment and released cloud-module upgrades; machine shape and
-replica-count replacement remain a planned, explicit destroy/recreate
-lifecycle.
+rejects immutable VM drift for those fields. RKE2 *version* and control-plane
+vCPU and memory growth are the exceptions: `update` performs an in-place,
+one-at-a-time control-plane binary upgrade or resize (see above) and elastic
+workers converge automatically through Karpenter drift-replacement. `update`
+otherwise covers the allowlisted operator RKE2 fragment and released
+cloud-module upgrades; root disk, image, shrinking, and replica-count
+replacement remain a planned, explicit destroy/recreate lifecycle.

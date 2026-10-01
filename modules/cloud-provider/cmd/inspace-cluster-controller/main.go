@@ -338,6 +338,14 @@ func run() error {
 	var printBootstrapCacheRefresh bool
 	var bootstrapCacheRKE2Version string
 	var bootstrapCacheDisable string
+	var resizeControlPlane bool
+	var resizeCheck bool
+	var resizeStartOnly bool
+	var resizeSlot int
+	var resizeVCPU int
+	var resizeMemoryMiB int
+	var resizeExpectedPrivateIPv4 string
+	var resizeExpectedUUID string
 	flag.StringVar(&configPath, "cluster-config", "", "path to an InSpaceCluster YAML file")
 	flag.BoolVar(&once, "once", false, "perform one reconciliation and exit")
 	flag.DurationVar(&interval, "interval", 20*time.Second, "minimum reconciliation interval")
@@ -380,6 +388,20 @@ func run() error {
 			"audited cache release; empty lists only chart-owned images for a module-only upgrade")
 	flag.StringVar(&bootstrapCacheDisable, "bootstrap-cache-disable", "",
 		"with --print-bootstrap-cache-refresh: comma-separated spec.rke2.disable add-ons whose images are omitted")
+	flag.BoolVar(&resizeControlPlane, "resize-control-plane", false,
+		"grow one control-plane VM to --vcpu and --memory-mib by a graceful stop, resize, and start, then exit; "+
+			"idempotent, so re-running resumes an interrupted resize")
+	flag.BoolVar(&resizeCheck, "resize-check", false,
+		"with --resize-control-plane: only report whether the slot needs a resize or restart; never mutates")
+	flag.BoolVar(&resizeStartOnly, "start-only", false,
+		"with --resize-control-plane: only power on a VM a resize left stopped; never stops it and never changes its size")
+	flag.IntVar(&resizeSlot, "slot", -1, "with --resize-control-plane: the control-plane slot to resize")
+	flag.IntVar(&resizeVCPU, "vcpu", 0, "with --resize-control-plane: the target vCPU count")
+	flag.IntVar(&resizeMemoryMiB, "memory-mib", 0, "with --resize-control-plane: the target memory in MiB")
+	flag.StringVar(&resizeExpectedPrivateIPv4, "expected-private-ipv4", "",
+		"with --resize-control-plane: the private IPv4 journaled for the slot; any other address is refused")
+	flag.StringVar(&resizeExpectedUUID, "expected-uuid", "",
+		"with --resize-control-plane: the VM UUID journaled for the slot; any other VM is refused")
 	flag.Parse()
 	if version {
 		fmt.Printf("inspace-cluster-controller %s\n", buildversion.Version)
@@ -397,6 +419,15 @@ func run() error {
 	}
 	if once && untilReady {
 		return errors.New("--once and --until-ready are mutually exclusive")
+	}
+	if resizeControlPlane && (once || untilReady || deleteOwned) {
+		return errors.New("--resize-control-plane cannot be combined with --once, --until-ready, or --delete")
+	}
+	if (resizeCheck || resizeStartOnly) && !resizeControlPlane {
+		return errors.New("--resize-check and --start-only require --resize-control-plane")
+	}
+	if resizeCheck && resizeStartOnly {
+		return errors.New("--resize-check and --start-only are mutually exclusive")
 	}
 	if issuedVMCreateTimeout <= 0 {
 		return errors.New("--issued-vm-create-timeout must be positive")
@@ -435,14 +466,14 @@ func run() error {
 		return errors.New("INSPACE_API_TOKEN is required")
 	}
 	rke2Token := strings.TrimSpace(os.Getenv("INSPACE_RKE2_TOKEN"))
-	if !deleteOwned && rke2Token == "" {
+	if !deleteOwned && !resizeControlPlane && rke2Token == "" {
 		return errors.New("INSPACE_RKE2_TOKEN is required")
 	}
 	rke2AgentToken, err := loadRKE2AgentToken(rke2Token)
 	if err != nil {
 		return err
 	}
-	cacheKey, cacheNotBefore, err := loadBootstrapCacheSettings(&cluster, deleteOwned)
+	cacheKey, cacheNotBefore, err := loadBootstrapCacheSettings(&cluster, deleteOwned || resizeControlPlane)
 	if err != nil {
 		return err
 	}
@@ -462,6 +493,24 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+	if resizeControlPlane {
+		if operationTimeout <= 0 {
+			return errors.New("--operation-timeout must be positive")
+		}
+		resizeMode := resizeModeResize
+		if resizeCheck {
+			resizeMode = resizeModeCheck
+		} else if resizeStartOnly {
+			resizeMode = resizeModeStartOnly
+		}
+		resizeCtx, cancelResize := context.WithTimeout(ctx, operationTimeout)
+		defer cancelResize()
+		return runControlPlaneResize(resizeCtx, &bootstrap.ControlPlaneResizer{API: api, PollInterval: interval}, &cluster, bootstrap.ControlPlaneResizeRequest{
+			Slot: resizeSlot, VCPU: resizeVCPU, MemoryMiB: resizeMemoryMiB, ExpectedPrivateIPv4: resizeExpectedPrivateIPv4, ExpectedUUID: resizeExpectedUUID,
+		}, resizeMode, os.Stdout)
+	}
 	reconciler := &bootstrap.Reconciler{
 		API: api, SSHUsername: sshUsername, SSHPublicKey: sshPublicKey,
 		StatusCompareAndSwap: newFileStatusCompareAndSwap(configPath),
@@ -469,14 +518,46 @@ func run() error {
 		BootstrapCacheKey: cacheKey, BootstrapCacheNotBefore: cacheNotBefore, ModuleVersion: buildversion.Version,
 		ModuleImageDigests: moduleImageDigests, RKE2AgentToken: rke2AgentToken,
 	}
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer cancel()
 	return runControllerLoop(ctx, reconciler, &cluster, rke2Token, controllerLoopOptions{
 		Once: once, UntilReady: untilReady, DeleteOwned: deleteOwned,
 		Interval: interval, IssuedVMCreateTimeout: issuedVMCreateTimeout, OperationTimeout: operationTimeout, OutputFormat: output,
 		StandardOutput: os.Stdout, StandardError: os.Stderr,
 		FloatingIPReachabilityTimeout: floatingIPReachabilityTimeout,
 	})
+}
+
+// controlPlaneResizer is the resize surface runControlPlaneResize drives.
+type controlPlaneResizer interface {
+	Check(context.Context, *v1alpha1.InSpaceCluster, bootstrap.ControlPlaneResizeRequest) (bootstrap.ControlPlaneResizeResult, error)
+	Resize(context.Context, *v1alpha1.InSpaceCluster, bootstrap.ControlPlaneResizeRequest) (bootstrap.ControlPlaneResizeResult, error)
+	StartOnly(context.Context, *v1alpha1.InSpaceCluster, bootstrap.ControlPlaneResizeRequest) (bootstrap.ControlPlaneResizeResult, error)
+}
+
+const (
+	resizeModeResize    = "resize"
+	resizeModeCheck     = "check"
+	resizeModeStartOnly = "start-only"
+)
+
+// runControlPlaneResize prints one JSON result line. check only reads, and
+// start-only never stops or resizes the VM.
+func runControlPlaneResize(ctx context.Context, resizer controlPlaneResizer, cluster *v1alpha1.InSpaceCluster, request bootstrap.ControlPlaneResizeRequest, mode string, output io.Writer) error {
+	var result bootstrap.ControlPlaneResizeResult
+	var err error
+	switch mode {
+	case resizeModeCheck:
+		result, err = resizer.Check(ctx, cluster, request)
+	case resizeModeStartOnly:
+		result, err = resizer.StartOnly(ctx, cluster, request)
+	default:
+		result, err = resizer.Resize(ctx, cluster, request)
+	}
+	if err != nil {
+		return err
+	}
+	encoder := json.NewEncoder(output)
+	encoder.SetEscapeHTML(false)
+	return encoder.Encode(result)
 }
 
 func runControllerLoop(ctx context.Context, reconciler infrastructureReconciler, cluster *v1alpha1.InSpaceCluster, rke2Token string, options controllerLoopOptions) error {

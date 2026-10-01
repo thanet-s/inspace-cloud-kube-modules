@@ -46,6 +46,16 @@ func TestDocumentedResourceContracts(t *testing.T) {
 	if err != nil || len(disks) != 1 || disks[0].UUID != diskUUID {
 		t.Fatalf("ListDisks() = %#v, %v", disks, err)
 	}
+	if err := client.StopVM(ctx, "bkk01", vmUUID); err != nil {
+		t.Fatalf("StopVM(): %v", err)
+	}
+	resizedVM, err := client.UpdateVMCompute(ctx, "bkk01", vmUUID, 2, 6144)
+	if err != nil || resizedVM.UUID != vmUUID || resizedVM.VCPU != 2 || resizedVM.MemoryMiB != 6144 {
+		t.Fatalf("UpdateVMCompute() = %#v, %v", resizedVM, err)
+	}
+	if err := client.StartVM(ctx, "bkk01", vmUUID); err != nil {
+		t.Fatalf("StartVM(): %v", err)
+	}
 	attached, err := client.AttachDisk(ctx, "bkk01", vmUUID, diskUUID)
 	if err != nil || attached.UUID != diskUUID || attached.Name != "vdb" {
 		t.Fatalf("AttachDisk() = %#v, %v", attached, err)
@@ -277,6 +287,12 @@ func contractHandler(t *testing.T) http.HandlerFunc {
 			writeLiteral(w, http.StatusOK, "["+diskLiteral(false)+"]")
 		case "DELETE /v1/bkk01/storage/disks/" + diskUUID:
 			w.WriteHeader(http.StatusNoContent)
+		case "POST /v1/bkk01/user-resource/vm/stop", "POST /v1/bkk01/user-resource/vm/start":
+			assertForm(t, r, url.Values{"uuid": {vmUUID}})
+			writeLiteral(w, http.StatusOK, `{"uuid":"`+vmUUID+`","status":"stopping"}`)
+		case "PATCH /v1/bkk01/user-resource/vm":
+			assertForm(t, r, url.Values{"uuid": {vmUUID}, "vcpu": {"2"}, "ram": {"6144"}})
+			writeLiteral(w, http.StatusOK, `{"uuid":"`+vmUUID+`","name":"cp","status":"stopped","vcpu":2,"memory":6144}`)
 		case "POST /v1/bkk01/user-resource/vm/storage/attach":
 			assertForm(t, r, url.Values{"uuid": {vmUUID}, "storage_uuid": {diskUUID}})
 			writeLiteral(w, http.StatusOK, `{"uuid":"`+diskUUID+`","name":"vdb","size":50,"primary":false}`)

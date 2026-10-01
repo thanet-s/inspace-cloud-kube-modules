@@ -1,0 +1,173 @@
+---
+# Run the controller's idempotent resize subcommand for one control plane.
+# Required vars: deploy_control_plane (a journaled control plane),
+# deploy_cp_index (its slot) and deploy_resize_check_only; optional
+# deploy_resize_start_only. A check only reads the live VM. With start-only
+# the controller powers on a VM that is not running and never stops it or
+# changes its size. Otherwise it stops the VM gracefully (never forced),
+# resizes it while stopped, and starts it, or finishes whichever of those a
+# previous run left undone. It sets deploy_resize_result to the controller's
+# JSON line (slot, status, action). The expected UUID and private address come
+# from the journal, so a VM that is not the journaled one is refused.
+- name: Check the live VM of {{ deploy_control_plane.name }} against the target size
+  ansible.builtin.command:
+    argv:
+      - docker
+      - run
+      - --platform
+      - linux/amd64
+      - --rm
+      - "--user={{ lookup('pipe', 'id -u') }}:{{ lookup('pipe', 'id -g') }}"
+      - --entrypoint
+      - /usr/local/bin/inspace-cluster-controller
+      - --env
+      - INSPACE_API_URL
+      - --env
+      - INSPACE_API_TOKEN
+      - --mount
+      - "type=bind,src={{ deploy_state_dir }},dst=/state,readonly"
+      - "{{ deploy_modules_release_images['inspace-cloud-controller-manager'].releaseReference }}"
+      - --cluster-config
+      - /state/cluster.yaml
+      - --resize-control-plane
+      - --resize-check
+      - --slot
+      - "{{ deploy_cp_index }}"
+      - --vcpu
+      - "{{ control_plane_resize.target.vcpu }}"
+      - --memory-mib
+      - "{{ control_plane_resize.target.memoryMiB }}"
+      - --expected-uuid
+      - "{{ deploy_control_plane.uuid }}"
+      - --expected-private-ipv4
+      - "{{ deploy_control_plane.privateIPv4 }}"
+      - --output=json
+  environment:
+    INSPACE_API_URL: "{{ inspace_api_url }}"
+    INSPACE_API_TOKEN: "{{ lookup('env', 'INSPACE_API_TOKEN') }}"
+  register: deploy_resize_controller_check
+  changed_when: false
+  failed_when: false
+  no_log: true
+  when: deploy_resize_check_only | bool
+
+- name: Stop, resize, and start the VM of {{ deploy_control_plane.name }}
+  ansible.builtin.command:
+    argv:
+      - docker
+      - run
+      - --platform
+      - linux/amd64
+      - --rm
+      - "--user={{ lookup('pipe', 'id -u') }}:{{ lookup('pipe', 'id -g') }}"
+      - --entrypoint
+      - /usr/local/bin/inspace-cluster-controller
+      - --env
+      - INSPACE_ALLOW_REMOTE_MUTATIONS
+      - --env
+      - INSPACE_API_URL
+      - --env
+      - INSPACE_API_TOKEN
+      - --mount
+      - "type=bind,src={{ deploy_state_dir }},dst=/state,readonly"
+      - "{{ deploy_modules_release_images['inspace-cloud-controller-manager'].releaseReference }}"
+      - --cluster-config
+      - /state/cluster.yaml
+      - --resize-control-plane
+      - --slot
+      - "{{ deploy_cp_index }}"
+      - --vcpu
+      - "{{ control_plane_resize.target.vcpu }}"
+      - --memory-mib
+      - "{{ control_plane_resize.target.memoryMiB }}"
+      - --expected-uuid
+      - "{{ deploy_control_plane.uuid }}"
+      - --expected-private-ipv4
+      - "{{ deploy_control_plane.privateIPv4 }}"
+      - --interval
+      - 10s
+      - --operation-timeout
+      - 45m
+      - --output=json
+  environment:
+    INSPACE_ALLOW_REMOTE_MUTATIONS: "true"
+    INSPACE_API_URL: "{{ inspace_api_url }}"
+    INSPACE_API_TOKEN: "{{ lookup('env', 'INSPACE_API_TOKEN') }}"
+  register: deploy_resize_controller_run
+  changed_when: true
+  failed_when: false
+  no_log: true
+  when: not (deploy_resize_check_only | bool) and not (deploy_resize_start_only | default(false) | bool)
+
+- name: Start the VM of {{ deploy_control_plane.name }} without stopping or resizing it
+  ansible.builtin.command:
+    argv:
+      - docker
+      - run
+      - --platform
+      - linux/amd64
+      - --rm
+      - "--user={{ lookup('pipe', 'id -u') }}:{{ lookup('pipe', 'id -g') }}"
+      - --entrypoint
+      - /usr/local/bin/inspace-cluster-controller
+      - --env
+      - INSPACE_ALLOW_REMOTE_MUTATIONS
+      - --env
+      - INSPACE_API_URL
+      - --env
+      - INSPACE_API_TOKEN
+      - --mount
+      - "type=bind,src={{ deploy_state_dir }},dst=/state,readonly"
+      - "{{ deploy_modules_release_images['inspace-cloud-controller-manager'].releaseReference }}"
+      - --cluster-config
+      - /state/cluster.yaml
+      - --resize-control-plane
+      - --start-only
+      - --slot
+      - "{{ deploy_cp_index }}"
+      - --vcpu
+      - "{{ control_plane_resize.target.vcpu }}"
+      - --memory-mib
+      - "{{ control_plane_resize.target.memoryMiB }}"
+      - --expected-uuid
+      - "{{ deploy_control_plane.uuid }}"
+      - --expected-private-ipv4
+      - "{{ deploy_control_plane.privateIPv4 }}"
+      - --interval
+      - 10s
+      - --operation-timeout
+      - 45m
+      - --output=json
+  environment:
+    INSPACE_ALLOW_REMOTE_MUTATIONS: "true"
+    INSPACE_API_URL: "{{ inspace_api_url }}"
+    INSPACE_API_TOKEN: "{{ lookup('env', 'INSPACE_API_TOKEN') }}"
+  register: deploy_resize_controller_start
+  changed_when: true
+  failed_when: false
+  no_log: true
+  when: not (deploy_resize_check_only | bool) and (deploy_resize_start_only | default(false) | bool)
+
+- name: Select the controller result for {{ deploy_control_plane.name }}
+  ansible.builtin.set_fact:
+    deploy_resize_controller: >-
+      {{
+        deploy_resize_controller_check if (deploy_resize_check_only | bool) else
+        (deploy_resize_controller_start if (deploy_resize_start_only | default(false) | bool) else deploy_resize_controller_run)
+      }}
+  no_log: true
+
+# The controller's last stderr line is the refusal; it never holds a secret.
+- name: Require the resize controller to succeed for {{ deploy_control_plane.name }}
+  ansible.builtin.assert:
+    that: deploy_resize_controller.rc == 0
+    fail_msg: >-
+      The control-plane resize of {{ deploy_control_plane.name }} stopped
+      ({{ 'read-only check, nothing was changed' if (deploy_resize_check_only | bool) else 'a resume is journaled; fix the cause and run update again' }}):
+      {{ deploy_resize_controller.stderr_lines | default([]) | last | default('no error output') }}
+
+- name: Decode the resize controller result for {{ deploy_control_plane.name }}
+  ansible.builtin.set_fact:
+    deploy_resize_result: >-
+      {{ deploy_resize_controller.stdout_lines | select('match', '^\{') | list | last | from_json }}
+  no_log: true

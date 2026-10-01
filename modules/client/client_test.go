@@ -71,6 +71,94 @@ func TestSmoke(t *testing.T) {
 	}
 }
 
+func TestVMPowerAndComputeLifecycleAgainstFake(t *testing.T) {
+	fake := fakeapi.New("test-key")
+	t.Cleanup(fake.Close)
+	client, err := inspace.NewClient(inspace.Options{BaseURL: fake.URL(), APIKey: "test-key"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	created, err := client.CreateVM(ctx, "bkk01", inspace.CreateVMRequest{
+		Name: "cp", OSName: "ubuntu", OSVersion: "24.04", DiskGiB: 40, VCPU: 2, MemoryMiB: 4096,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The live API rejects a resize while the VM runs.
+	if _, err := client.UpdateVMCompute(ctx, "bkk01", created.UUID, 2, 6144); err == nil {
+		t.Fatal("UpdateVMCompute() resized a running VM")
+	}
+	if err := client.StopVM(ctx, "bkk01", created.UUID); err != nil {
+		t.Fatal(err)
+	}
+	resized, err := client.UpdateVMCompute(ctx, "bkk01", created.UUID, 2, 6144)
+	if err != nil || resized.VCPU != 2 || resized.MemoryMiB != 6144 || resized.Status != "stopped" {
+		t.Fatalf("UpdateVMCompute() = %#v, %v", resized, err)
+	}
+	if err := client.StartVM(ctx, "bkk01", created.UUID); err != nil {
+		t.Fatal(err)
+	}
+	got, err := client.GetVM(ctx, "bkk01", created.UUID)
+	if err != nil || got.Status != "running" || got.MemoryMiB != 6144 || got.UUID != created.UUID {
+		t.Fatalf("GetVM() = %#v, %v", got, err)
+	}
+}
+
+func TestVMPowerAndComputeValidateInputsBeforeDispatch(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		http.Error(w, "must not be reached", http.StatusInternalServerError)
+	}))
+	t.Cleanup(server.Close)
+	client, err := inspace.NewClient(inspace.Options{BaseURL: server.URL, APIKey: "test-key"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	for name, err := range map[string]error{
+		"StopVM bad UUID":           client.StopVM(ctx, "bkk01", "not-a-uuid"),
+		"StartVM bad UUID":          client.StartVM(ctx, "bkk01", "not-a-uuid"),
+		"StopVM bad location":       client.StopVM(ctx, "../x", vmUUID),
+		"UpdateVMCompute bad UUID":  discardVM(client.UpdateVMCompute(ctx, "bkk01", "not-a-uuid", 2, 6144)),
+		"UpdateVMCompute zero vCPU": discardVM(client.UpdateVMCompute(ctx, "bkk01", vmUUID, 0, 6144)),
+		"UpdateVMCompute zero RAM":  discardVM(client.UpdateVMCompute(ctx, "bkk01", vmUUID, 2, 0)),
+	} {
+		if err == nil {
+			t.Errorf("%s was accepted", name)
+		}
+	}
+	if got := requests.Load(); got != 0 {
+		t.Fatalf("invalid input dispatched %d requests", got)
+	}
+}
+
+func discardVM(_ *inspace.VM, err error) error { return err }
+
+func TestUpdateVMComputeRejectsAResponseThatIgnoredTheResize(t *testing.T) {
+	for name, body := range map[string]string{
+		"old size": `{"uuid":"` + vmUUID + `","vcpu":2,"memory":4096}`,
+		"other VM": `{"uuid":"bbbbbbbb-1111-4222-8333-bbbbbbbbbbbb","vcpu":2,"memory":6144}`,
+		"no UUID":  `{"vcpu":2,"memory":6144}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, body)
+			}))
+			t.Cleanup(server.Close)
+			client, err := inspace.NewClient(inspace.Options{BaseURL: server.URL, APIKey: "test-key"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := client.UpdateVMCompute(context.Background(), "bkk01", vmUUID, 2, 6144); err == nil {
+				t.Fatal("UpdateVMCompute() accepted a response that does not show the resize")
+			}
+		})
+	}
+}
+
 func TestRemoteBaseURLRequiresHTTPS(t *testing.T) {
 	_, err := inspace.NewClient(inspace.Options{BaseURL: "http://api.example.invalid", APIKey: "test-key"})
 	if err == nil {
@@ -1473,6 +1561,16 @@ func TestEveryMutationEndpointRejectsUndocumentedSuccessStatuses(t *testing.T) {
 		{name: "DetachDisk", body: `{"success":true}`, call: func(ctx context.Context, client *inspace.Client) error {
 			return client.DetachDisk(ctx, "bkk01", vmUUID, diskUUID)
 		}},
+		{name: "StopVM", call: func(ctx context.Context, client *inspace.Client) error {
+			return client.StopVM(ctx, "bkk01", vmUUID)
+		}},
+		{name: "StartVM", call: func(ctx context.Context, client *inspace.Client) error {
+			return client.StartVM(ctx, "bkk01", vmUUID)
+		}},
+		{name: "UpdateVMCompute", body: `{"uuid":"` + vmUUID + `","vcpu":2,"memory":6144}`, call: func(ctx context.Context, client *inspace.Client) error {
+			_, err := client.UpdateVMCompute(ctx, "bkk01", vmUUID, 2, 6144)
+			return err
+		}},
 		{name: "ResizeAttachedDisk", body: `{"uuid":"` + diskUUID + `","size":60}`, call: func(ctx context.Context, client *inspace.Client) error {
 			_, err := client.ResizeAttachedDisk(ctx, "bkk01", vmUUID, diskUUID, 60)
 			return err
@@ -1544,8 +1642,8 @@ func TestEveryMutationEndpointRejectsUndocumentedSuccessStatuses(t *testing.T) {
 			return client.RemoveLoadBalancerRule(ctx, "bkk01", lbUUID, ruleUUID)
 		}},
 	}
-	if len(calls) != 23 {
-		t.Fatalf("mutation route table has %d entries, want all 23 exported mutations", len(calls))
+	if len(calls) != 26 {
+		t.Fatalf("mutation route table has %d entries, want all 26 exported mutations", len(calls))
 	}
 	for _, status := range []int{http.StatusAccepted, http.StatusPartialContent} {
 		for _, call := range calls {

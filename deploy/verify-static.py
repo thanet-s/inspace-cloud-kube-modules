@@ -731,6 +731,152 @@ def verify_journal_writers_end_with_real_newline() -> None:
     )
 
 
+def verify_control_plane_resize(update: str, readme: str) -> None:
+    """Growing control planes is journaled, serial, and never rewrites cluster.yaml."""
+    load_state = read("deploy/playbooks/tasks/load-state.yml")
+    apply = read("deploy/playbooks/tasks/apply-control-plane-resize.yml")
+    one = read("deploy/playbooks/tasks/resize-one-control-plane.yml")
+    controller = read("deploy/playbooks/tasks/run-resize-controller.yml")
+    upgrade_one = read("deploy/playbooks/tasks/upgrade-one-control-plane.yml")
+    helper = read("deploy/scripts/control_plane_resize.py")
+    preflight = read("deploy/playbooks/tasks/preflight.yml")
+    require(
+        "persisted_inspace_cluster.spec.controlPlane.machine.vcpu | int == control_plane_vcpu | int" not in load_state
+        and "persisted_inspace_cluster.spec.controlPlane.machine.memoryMiB | int == control_plane_memory_mib | int" not in load_state
+        and "control_plane_resize.py" in load_state
+        and "control_plane_resize_needed" in load_state
+        and "--spec-vcpu" in load_state
+        and "--inventory-memory-mib" in load_state,
+        "load-state must compare the inventory size with the journaled size through the resize helper, not cluster.yaml",
+    )
+    # status, tunnel and destroy only report a size mismatch; update enforces it.
+    require(
+        "deploy_enforce_control_plane_size | default(false) | bool" in load_state
+        and "'enforce' if" in load_state
+        and "deploy_enforce_control_plane_size: true" in update
+        and all(
+            "deploy_enforce_control_plane_size" not in read(f"deploy/playbooks/{name}.yml")
+            for name in ("status", "tunnel", "destroy-cluster", "init-cluster")
+        ),
+        "only update may enforce the control-plane size check; status, tunnel and destroy must stay report-only",
+    )
+    bounds = (
+        ("control_plane_vcpu | int >= 2", "MIN_VCPU, MAX_VCPU = 2, 16"),
+        ("control_plane_vcpu | int <= 16", "MIN_VCPU, MAX_VCPU = 2, 16"),
+        ("control_plane_memory_mib | int >= 4096", "MIN_MEMORY_MIB, MAX_MEMORY_MIB = 4096, 65536"),
+        ("control_plane_memory_mib | int <= 65536", "MIN_MEMORY_MIB, MAX_MEMORY_MIB = 4096, 65536"),
+    )
+    require(
+        all(inventory_bound in preflight and helper_bound in helper for inventory_bound, helper_bound in bounds),
+        "the resize helper bounds differ from the preflight inventory bounds",
+    )
+    cluster_yaml_write = 'dest: "{{ deploy_state_dir }}/cluster.yaml"'
+    require(
+        cluster_yaml_write not in apply + one + controller + update + load_state,
+        "a control-plane resize must never rewrite cluster.yaml",
+    )
+    # A resize left in progress runs before any RKE2 restart; a fresh one runs
+    # after the RKE2 upgrade and before operator config.
+    resume = update.find("Finish the control-plane resize a previous run left in progress before any RKE2 upgrade")
+    upgrade = update.find("include_tasks: tasks/apply-rke2-upgrade.yml")
+    fresh = update.find("Grow the control-plane VMs one server at a time when the inventory asks for it")
+    config = update.find("tasks/apply-control-plane-config.yml")
+    require(
+        0 <= resume < upgrade < fresh < config
+        and "- control_plane_resize.resuming\n" in update[resume:upgrade]
+        and "- not control_plane_resize.resuming\n" in update[fresh:config]
+        and update[resume:config].count("tasks/apply-control-plane-resize.yml") == 2,
+        "update must resume an in-progress resize before the RKE2 upgrade and start a new one only after it",
+    )
+    # A stopped VM on a single control plane takes the API down, so it is
+    # brought back before the tunnel waits for /readyz.
+    pre_tunnel = update.find("Bring a control-plane VM left powered off mid-resize back before the API is needed")
+    tunnel = update.find("tasks/start-tunnel.yml")
+    require(
+        0 <= pre_tunnel < tunnel
+        and "tasks/run-resize-controller.yml" in update[pre_tunnel:tunnel]
+        and "control_plane_resize.inProgress | length > 0" in update[pre_tunnel:tunnel]
+        and update[pre_tunnel:tunnel].count("deploy_resize_check_only: true") == 1
+        and update[pre_tunnel:tunnel].count("deploy_resize_check_only: false") == 1
+        and update[pre_tunnel:tunnel].count("deploy_resize_start_only: true") == 1
+        and "deploy_resize_result.status | lower != 'running'" in update[pre_tunnel:tunnel],
+        "before the tunnel, update may only read the server a resize left in progress and power it on when it is not running; it must never stop or resize it before the quorum checks",
+    )
+    require(
+        "- --resize-check\n" not in update and "slot-start" not in update,
+        "update must reach VM changes only through the shared resize tasks",
+    )
+    check_loop = apply.find("Check every control-plane VM against the target size before journaling it")
+    begin = apply.find("- begin\n")
+    loop = apply.find("resize-one-control-plane.yml")
+    finish = apply.find("- finish\n")
+    require(
+        0 <= check_loop < begin < loop < finish
+        and "deploy_resize_check_only: true" in apply[check_loop:begin]
+        and "when: deploy_control_plane.name in control_plane_resize.pending" in apply
+        and "loop_var: deploy_control_plane" in apply,
+        "the resize must check every VM read-only, then journal the target, resize each pending server serially, and only then record the size",
+    )
+    order = [
+        one.find(marker)
+        for marker in (
+            "Require every control-plane node other than a resumed one Ready",
+            "Require etcd to be ready on every control plane other than a resumed one",
+            "deploy_resize_check_only: true",
+            "Remember the current boot",
+            "Read whether {{ deploy_control_plane.name }} is already cordoned",
+            "Cordon {{ deploy_control_plane.name }}",
+            "- slot-start\n",
+            "deploy_resize_check_only: false",
+            "Wait for {{ deploy_control_plane.name }} to come back on a new boot",
+            "Wait for the restarted local RKE2 API",
+            "Wait for the restarted local etcd",
+            "Wait for {{ deploy_control_plane.name }} to be Ready at the new size",
+            "Uncordon {{ deploy_control_plane.name }}",
+            "- slot-done\n",
+        )
+    ]
+    require(
+        all(value >= 0 for value in order) and order == sorted(order),
+        "resize-one-control-plane.yml is missing a safety phase or runs them out of order",
+    )
+    require(
+        "when: deploy_resize_result.action != 'unchanged'" in one
+        and "when: deploy_resize_result.action == 'resized'" in one
+        and "when: deploy_resize_cordoned_here | bool or deploy_resize_resuming_slot | bool" in one
+        and "jsonpath={.spec.unschedulable}" in one
+        and "(deploy_resize_unschedulable.stdout | trim) != 'true'" in one,
+        "a VM already at the target size must be skipped, the boot wait must follow only a restart, and only a node this run cordoned is uncordoned",
+    )
+    require(
+        controller.count("- --resize-control-plane\n") == 3
+        and controller.count("- --resize-check\n") == 1
+        and controller.count("- --start-only\n") == 1
+        and controller.count("- --expected-uuid\n") == 3
+        and controller.count("- --expected-private-ipv4\n") == 3
+        and "- --force" not in controller,
+        "the resize controller must verify the journaled UUID and address and never force a stop",
+    )
+    require(
+        len(re.findall(r"- --env\n\s+- INSPACE_API_TOKEN\n", controller)) == 3
+        and controller.count("INSPACE_API_TOKEN: \"{{ lookup('env', 'INSPACE_API_TOKEN') }}\"") == 3
+        and controller.count("no_log: true") >= 4,
+        "the resize controller must receive the API token only through the environment",
+    )
+    require(
+        "Require every other control-plane node Ready before upgrading" in upgrade_one
+        and "Require etcd to be ready on every other control plane before upgrading" in upgrade_one
+        and upgrade_one.find("Require etcd to be ready on every other") < upgrade_one.find("Install RKE2"),
+        "an RKE2 upgrade must prove the other control planes Ready and etcd healthy before restarting a server",
+    )
+    require(
+        "## Resizing control planes" in readme
+        and "control_plane_vcpu" in readme
+        and "**Grow only.**" in readme,
+        "README must document the grow-only rolling control-plane resize",
+    )
+
+
 def main() -> None:
     inventory = read("deploy/inventory.example.yml")
     gitignore = read(".gitignore")
@@ -958,6 +1104,7 @@ def main() -> None:
         for path in sorted((DEPLOY / "playbooks").rglob("*.yml"))
     })
     verify_release_image_digests(init, update, destroy)
+    verify_control_plane_resize(update, read("deploy/README.md"))
     load_state = read("deploy/playbooks/tasks/load-state.yml")
     single_cp_settle = read("deploy/playbooks/tasks/settle-single-control-plane.yml")
     for fragment in (

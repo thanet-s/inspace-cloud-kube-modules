@@ -1,0 +1,262 @@
+---
+# Grow one control-plane VM to control_plane_resize.target. Required vars:
+# deploy_control_plane (a journaled control plane) and deploy_cp_index (its
+# slot and ssh-config alias number). The controller reads the live VM, so a VM
+# that already runs at the target (for example resized out of band) is never
+# stopped: this file only verifies its node and records it done. Any other VM
+# is cordoned, journaled as in progress, then stopped gracefully, resized, and
+# started by the controller; the next server starts only after this one is
+# back with a healthy local API and etcd. Every kubectl or readiness check
+# through the tunnel retries, because a restart of the host that holds the VIP
+# can interrupt it.
+- name: Decide whether {{ deploy_control_plane.name }} is the server a previous run left mid-resize
+  ansible.builtin.set_fact:
+    deploy_resize_resuming_slot: >-
+      {{ deployment_state.get('controlPlaneResize', {}).get('inProgress', '') == deploy_control_plane.name }}
+    deploy_resize_cordoned_here: false
+
+# A server left mid-resize may be down, so only it is excused. Quorum is
+# proven by every other server.
+- name: Require every control-plane node other than a resumed one Ready before resizing {{ deploy_control_plane.name }}
+  ansible.builtin.command:
+    argv:
+      - kubectl
+      - --kubeconfig
+      - "{{ deploy_state_dir }}/kubeconfig.yaml"
+      - wait
+      - --for=condition=Ready
+      - "node/{{ item.name }}"
+      - --timeout=2m
+  loop: "{{ deployment_state.controlPlanes }}"
+  loop_control:
+    label: "{{ item.name }}"
+  register: deploy_resize_nodes_ready
+  changed_when: false
+  retries: 10
+  delay: 15
+  until: deploy_resize_nodes_ready.rc == 0
+  when: not (deploy_resize_resuming_slot | bool and item.name == deploy_control_plane.name)
+
+- name: Require etcd to be ready on every control plane other than a resumed one before resizing {{ deploy_control_plane.name }}
+  ansible.builtin.command:
+    argv:
+      - ssh
+      - -F
+      - "{{ deploy_state_dir }}/ssh-config"
+      - "inspace-cp{{ deploy_etcd_index }}"
+      - >-
+        sudo /var/lib/rancher/rke2/bin/kubectl
+        --kubeconfig /etc/rancher/rke2/rke2.yaml
+        --request-timeout=10s get --raw=/readyz/etcd
+  loop: "{{ deployment_state.controlPlanes }}"
+  loop_control:
+    index_var: deploy_etcd_index
+    label: "{{ item.name }}"
+  register: deploy_resize_etcd_ready
+  changed_when: false
+  retries: 60
+  delay: 5
+  until: deploy_resize_etcd_ready.rc == 0
+  when: not (deploy_resize_resuming_slot | bool and item.name == deploy_control_plane.name)
+
+- name: Check the live VM of {{ deploy_control_plane.name }} against the target size
+  ansible.builtin.include_tasks: run-resize-controller.yml
+  vars:
+    deploy_resize_check_only: true
+
+- name: Resize {{ deploy_control_plane.name }} through a graceful stop and start
+  when: deploy_resize_result.action != 'unchanged'
+  block:
+    # A server left mid-resize may be stopped, so its boot is unreadable; the
+    # controller's own result then decides, and no boot comparison is made.
+    - name: Remember the current boot of {{ deploy_control_plane.name }}
+      ansible.builtin.command:
+        argv:
+          - ssh
+          - -F
+          - "{{ deploy_state_dir }}/ssh-config"
+          - "inspace-cp{{ deploy_cp_index }}"
+          - cat /proc/sys/kernel/random/boot_id
+      register: deploy_resize_boot_before
+      changed_when: false
+      failed_when: false
+
+    # Only a node that was schedulable is cordoned and later uncordoned by this
+    # run; one an operator already cordoned stays as found. A failed read (a
+    # single control plane with its API down) leaves the node unrecorded.
+    - name: Read whether {{ deploy_control_plane.name }} is already cordoned
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - --kubeconfig
+          - "{{ deploy_state_dir }}/kubeconfig.yaml"
+          - get
+          - node
+          - "{{ deploy_control_plane.name }}"
+          - -o
+          - jsonpath={.spec.unschedulable}
+      register: deploy_resize_unschedulable
+      changed_when: false
+      failed_when: false
+
+    # Best effort for a resumed server on a single control plane, whose API
+    # is down while the server is stopped.
+    - name: Cordon {{ deploy_control_plane.name }}
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - --kubeconfig
+          - "{{ deploy_state_dir }}/kubeconfig.yaml"
+          - cordon
+          - "{{ deploy_control_plane.name }}"
+      register: deploy_resize_cordon
+      changed_when: true
+      failed_when: deploy_resize_cordon.rc != 0 and not (deploy_resize_resuming_slot | bool)
+
+    - name: Remember that this run cordoned {{ deploy_control_plane.name }}
+      ansible.builtin.set_fact:
+        deploy_resize_cordoned_here: >-
+          {{ deploy_resize_cordon.rc == 0 and deploy_resize_unschedulable.rc == 0 and (deploy_resize_unschedulable.stdout | trim) != 'true' }}
+
+    - name: Journal the resize of {{ deploy_control_plane.name }} before changing its VM
+      ansible.builtin.command:
+        argv:
+          - python3
+          - "{{ deploy_root }}/scripts/control_plane_resize.py"
+          - slot-start
+          - --state
+          - "{{ deploy_state_dir }}/state.json"
+          - --name
+          - "{{ deploy_control_plane.name }}"
+      register: deploy_resize_journal
+      changed_when: true
+
+    - name: Reload the deployment journal
+      ansible.builtin.set_fact:
+        deployment_state: "{{ deploy_resize_journal.stdout | from_json }}"
+
+    # The controller never forces a stop. It sends each power request once and
+    # polls the VM status, up to 15 minutes per transition.
+    - name: Stop, resize, and start the VM of {{ deploy_control_plane.name }}
+      ansible.builtin.include_tasks: run-resize-controller.yml
+      vars:
+        deploy_resize_check_only: false
+
+    # Only a VM this run restarted has a new boot. An unchanged result (the VM
+    # was already at the target and running) has nothing to wait for.
+    - name: Wait for {{ deploy_control_plane.name }} to come back on a new boot
+      ansible.builtin.command:
+        argv:
+          - ssh
+          - -F
+          - "{{ deploy_state_dir }}/ssh-config"
+          - "inspace-cp{{ deploy_cp_index }}"
+          - cat /proc/sys/kernel/random/boot_id
+      register: deploy_resize_boot_after
+      changed_when: false
+      retries: 60
+      delay: 10
+      until: >-
+        deploy_resize_boot_after.rc == 0 and
+        deploy_resize_boot_after.stdout | trim | length > 0 and
+        (deploy_resize_boot_before.rc != 0 or deploy_resize_boot_after.stdout | trim != deploy_resize_boot_before.stdout | trim)
+      when: deploy_resize_result.action == 'resized'
+
+    - name: Wait for the restarted local RKE2 API on {{ deploy_control_plane.name }}
+      ansible.builtin.command:
+        argv:
+          - ssh
+          - -F
+          - "{{ deploy_state_dir }}/ssh-config"
+          - "inspace-cp{{ deploy_cp_index }}"
+          - >-
+            sudo /var/lib/rancher/rke2/bin/kubectl
+            --kubeconfig /etc/rancher/rke2/rke2.yaml
+            --request-timeout=10s get --raw=/readyz
+      register: deploy_resize_local_ready
+      changed_when: false
+      retries: 120
+      delay: 5
+      until: deploy_resize_local_ready.rc == 0
+
+    - name: Wait for the restarted local etcd on {{ deploy_control_plane.name }}
+      ansible.builtin.command:
+        argv:
+          - ssh
+          - -F
+          - "{{ deploy_state_dir }}/ssh-config"
+          - "inspace-cp{{ deploy_cp_index }}"
+          - >-
+            sudo /var/lib/rancher/rke2/bin/kubectl
+            --kubeconfig /etc/rancher/rke2/rke2.yaml
+            --request-timeout=10s get --raw=/readyz/etcd
+      register: deploy_resize_local_etcd
+      changed_when: false
+      retries: 120
+      delay: 5
+      until: deploy_resize_local_etcd.rc == 0
+
+- name: Wait for {{ deploy_control_plane.name }} to be Ready at the new size
+  ansible.builtin.command:
+    argv:
+      - kubectl
+      - --kubeconfig
+      - "{{ deploy_state_dir }}/kubeconfig.yaml"
+      - wait
+      - --for=condition=Ready
+      - "node/{{ deploy_control_plane.name }}"
+      - --timeout=2m
+  register: deploy_resize_node_ready
+  changed_when: false
+  retries: 15
+  delay: 15
+  until: deploy_resize_node_ready.rc == 0
+
+- name: Require the private API to recover before touching the next server
+  ansible.builtin.command:
+    argv:
+      - kubectl
+      - --kubeconfig
+      - "{{ deploy_state_dir }}/kubeconfig.yaml"
+      - --request-timeout=10s
+      - get
+      - --raw=/readyz
+  register: deploy_resize_api_recovery
+  changed_when: false
+  retries: 60
+  delay: 5
+  until: deploy_resize_api_recovery.rc == 0
+
+# Only a node this run found schedulable and cordoned, or a resumed server whose
+# earlier run may have cordoned it, is uncordoned.
+- name: Uncordon {{ deploy_control_plane.name }}
+  ansible.builtin.command:
+    argv:
+      - kubectl
+      - --kubeconfig
+      - "{{ deploy_state_dir }}/kubeconfig.yaml"
+      - uncordon
+      - "{{ deploy_control_plane.name }}"
+  register: deploy_resize_uncordon
+  changed_when: false
+  retries: 10
+  delay: 15
+  until: deploy_resize_uncordon.rc == 0
+  when: deploy_resize_cordoned_here | bool or deploy_resize_resuming_slot | bool
+
+- name: Journal {{ deploy_control_plane.name }} as resized
+  ansible.builtin.command:
+    argv:
+      - python3
+      - "{{ deploy_root }}/scripts/control_plane_resize.py"
+      - slot-done
+      - --state
+      - "{{ deploy_state_dir }}/state.json"
+      - --name
+      - "{{ deploy_control_plane.name }}"
+  register: deploy_resize_journal
+  changed_when: true
+
+- name: Reload the deployment journal after {{ deploy_control_plane.name }}
+  ansible.builtin.set_fact:
+    deployment_state: "{{ deploy_resize_journal.stdout | from_json }}"
