@@ -46,16 +46,26 @@ func withMatchingTerminalMarker(record *createFenceRecord) {
 type adapterContractCloud struct {
 	*recordingFenceCleanupCloud
 	deleteReplays int
-	auditErr      error
+	// reappeared models a resource covered by the converged marker that is
+	// visible again: the adapter's converged audit then falls back to the full
+	// authorized replay in the same pass.
+	reappeared bool
+	// auditErr is what the pass finally returns (after any replay).
+	auditErr error
 }
 
 func newAdapterContractCloud() *adapterContractCloud {
 	cloud := &adapterContractCloud{recordingFenceCleanupCloud: &recordingFenceCleanupCloud{Cloud: cloudfake.New()}}
 	cloud.cleanup = func(request cloudapi.FencedCreateCleanupRequest) (cloudapi.FencedCreateCleanupResult, error) {
+		allConverged := len(request.Resolutions) != 0
 		for _, resolution := range request.Resolutions {
 			if !resolution.Converged {
 				cloud.deleteReplays++
+				allConverged = false
 			}
+		}
+		if allConverged && cloud.reappeared {
+			cloud.deleteReplays += len(request.Resolutions)
 		}
 		return cloudapi.FencedCreateCleanupResult{}, cloud.auditErr
 	}
@@ -98,22 +108,55 @@ func TestCreateFenceControllerSkipsDeleteReplayForConvergedMarkerAndReleasesAfte
 	}
 }
 
-func TestCreateFenceControllerKeepsFinalizerWhenConvergedAuditSeesReappearance(t *testing.T) {
+func TestCreateFenceControllerReplaysDeleteWhenConvergedAuditSeesReappearance(t *testing.T) {
 	claim := deletingMaterializedClaim(t, withMatchingTerminalMarker)
 	kubeClient := createFenceControllerClient(t, claim)
 	cloud := newAdapterContractCloud()
-	cloud.auditErr = errors.Join(cloudapi.ErrCreateAttemptPending, errors.New("durably resolved VM reappeared in cleanup discovery"))
+	cloud.reappeared = true
+	controller, _ := NewCreateFenceController(kubeClient, kubeClient, cloud)
+
+	if _, err := controller.Reconcile(context.Background(), claim.DeepCopy()); err != nil {
+		t.Fatal(err)
+	}
+	if cloud.calls != 1 || len(cloud.request.Resolutions) != 1 || !cloud.request.Resolutions[0].Converged {
+		t.Fatalf("calls=%d resolutions=%#v, want one pass over the converged receipt", cloud.calls, cloud.request.Resolutions)
+	}
+	if cloud.deleteReplays != 1 {
+		t.Fatalf("destructive replays = %d, want the reappeared resource to be deleted through the full path", cloud.deleteReplays)
+	}
+	if stored := storedClaim(t, kubeClient, claim.Name); containsString(stored.Finalizers, CreateFenceFinalizer) {
+		t.Fatal("finalizer kept although the replay cleaned the reappeared resource and the audit passed")
+	}
+}
+
+func TestCreateFenceControllerKeepsFinalizerWhenTheReplayStillLeavesAResourcePending(t *testing.T) {
+	claim := deletingMaterializedClaim(t, withMatchingTerminalMarker)
+	kubeClient := createFenceControllerClient(t, claim)
+	cloud := newAdapterContractCloud()
+	cloud.reappeared = true
+	cloud.auditErr = errors.Join(cloudapi.ErrCreateAttemptPending, errors.New("floating IP 203.0.113.10 still visible after replay"))
 	controller, _ := NewCreateFenceController(kubeClient, kubeClient, cloud)
 
 	result, err := controller.Reconcile(context.Background(), claim.DeepCopy())
 	if err != nil || result.RequeueAfter != createFenceCleanupRequeue {
-		t.Fatalf("Reconcile() = %#v, %v; want a requeue while the audit is pending", result, err)
+		t.Fatalf("Reconcile() = %#v, %v; want a requeue while a resource is still pending", result, err)
 	}
 	if stored := storedClaim(t, kubeClient, claim.Name); !containsString(stored.Finalizers, CreateFenceFinalizer) {
-		t.Fatal("finalizer released although the converged audit reported a reappearance")
+		t.Fatal("finalizer released while the audit was still pending")
+	}
+}
+
+func TestCreateFenceControllerCleanConvergedAuditDoesNotReplay(t *testing.T) {
+	claim := deletingMaterializedClaim(t, withMatchingTerminalMarker)
+	kubeClient := createFenceControllerClient(t, claim)
+	cloud := newAdapterContractCloud()
+	controller, _ := NewCreateFenceController(kubeClient, kubeClient, cloud)
+
+	if _, err := controller.Reconcile(context.Background(), claim.DeepCopy()); err != nil {
+		t.Fatal(err)
 	}
 	if cloud.deleteReplays != 0 {
-		t.Fatalf("a reappearance triggered %d destructive replays; the converged path must stay read-only", cloud.deleteReplays)
+		t.Fatalf("a clean converged audit replayed the delete %d times", cloud.deleteReplays)
 	}
 }
 

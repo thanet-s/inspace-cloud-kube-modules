@@ -708,9 +708,11 @@ func (a *Adapter) CleanupFencedCreate(ctx context.Context, request cloudapi.Fenc
 	// a materialized claim whose launch UUID is its single exact receipt and
 	// only when every receipt carries it. An issued-but-unobserved attempt or a
 	// dependent-tracking rollback never qualifies: either can still hide a
-	// resource that an earlier delete never saw.
+	// resource that an earlier delete never saw. Dependent tracking is excluded
+	// by anchorReceipt itself (dependentTracking requires !anchorReceipt), so it
+	// is not repeated here.
 	convergedTerminal := len(request.Resolutions) != 0 && request.ObservedVMUUID != "" && anchorReceipt &&
-		!request.RollbackChosen && !issuedUnobserved && !dependentTracking
+		!request.RollbackChosen && !issuedUnobserved
 	for _, resolution := range request.Resolutions {
 		if !resolution.Converged {
 			convergedTerminal = false
@@ -721,8 +723,11 @@ func (a *Adapter) CleanupFencedCreate(ctx context.Context, request cloudapi.Fenc
 	// immediately; the ambiguity window gates only final absence conclusions,
 	// never security-priority deletion of an exact owned target. A converged
 	// receipt skips the destructive replay and is covered by the read-only
-	// receipt audit that every snapshot below still runs, which reports any
-	// reappearance as pending.
+	// receipt audit that every snapshot below still runs. If that audit finds
+	// anything reappeared, the marker no longer describes the cloud: the loop
+	// below drops it for this pass, runs the normal authorized replay, and
+	// repeats the full three-snapshot audit, so a reappeared resource is
+	// removed rather than left pending forever.
 	if convergedTerminal {
 		deleteStageLog(ctx, "skipping DeleteVM replay for converged cleanup receipt", "nodeClaim", request.NodeClaimName, "vmUUID", request.ObservedVMUUID)
 	} else if err := a.reconcileFencedCleanupReceipts(ctx, request); err != nil {
@@ -778,7 +783,22 @@ func (a *Adapter) CleanupFencedCreate(ctx context.Context, request cloudapi.Fenc
 			return empty, fmt.Errorf("capturing fenced VM cleanup discovery inventory: %w", err)
 		}
 		if err := a.auditFencedCleanupReceiptSnapshot(ctx, request, vms, addresses); err != nil {
-			return empty, err
+			if !convergedTerminal || !errors.Is(err, cloudapi.ErrCreateAttemptPending) {
+				return empty, err
+			}
+			// A resource covered by the converged marker is visible again. Fall
+			// back to the unconverged path in this same pass: replay the delete
+			// for every receipt through its normal authorization, then restart
+			// the audit on the full schedule.
+			deleteStageLog(ctx, "converged cleanup receipt reappeared; running the full delete replay",
+				"nodeClaim", request.NodeClaimName, "vmUUID", request.ObservedVMUUID, "reason", err.Error())
+			convergedTerminal = false
+			if replayErr := a.reconcileFencedCleanupReceipts(ctx, request); replayErr != nil {
+				return empty, replayErr
+			}
+			confirmations, confirmationInterval = createAbsenceConfirmations, a.createAbsenceReadInterval
+			confirmation = 0
+			continue
 		}
 		listedVMs := make(map[string]struct{}, len(vms))
 		for i := range vms {
@@ -3408,9 +3428,11 @@ func deleteStageLog(ctx context.Context, stage string, keysAndValues ...any) {
 
 // confirmAuthorizedVMCoreAbsence re-checks the core VM indexes (exact GET,
 // ListVMs, configured VPC) once for a caller that already holds the full
-// spaced proof of absence and dispatched no mutation since. Any contrary
-// observation still waits, bounded, for convergence exactly like the full
-// proof, so a resurrected VM is never mistaken for an absent one.
+// spaced proof of absence and dispatched no mutation since. It is one read
+// only while every observation agrees. The first contrary observation (VM
+// visible, a failed read, a corroborating index disagreeing) escalates the wait
+// to the full requirement of destructiveAbsenceConfirmations spaced clean
+// reads, so a flapping VM (present, then one 404) is never mistaken for absent.
 func (a *Adapter) confirmAuthorizedVMCoreAbsence(
 	ctx context.Context,
 	location, networkUUID, uuid, phase string,
@@ -3422,8 +3444,9 @@ func (a *Adapter) confirmAuthorizedVMCoreAbsence(
 // confirmAuthorizedVMAbsence re-checks, with one complete corroborated read,
 // that a VM whose core absence was already proven with spaced reads is still
 // absent and that no active floating IP remains assigned to it. It is only
-// for a caller that already holds that spaced proof: any contrary observation
-// still waits, bounded, for convergence exactly like the full proof.
+// for a caller that already holds that spaced proof, and only while every
+// observation agrees: the first contrary observation escalates the wait to
+// destructiveAbsenceConfirmations spaced clean reads.
 func (a *Adapter) confirmAuthorizedVMAbsence(
 	ctx context.Context,
 	location, networkUUID, uuid, phase string,
@@ -3448,6 +3471,19 @@ func (a *Adapter) waitForVMAbsenceWithDependents(
 	readbackCtx, cancel := context.WithTimeout(ctx, a.destructiveAbsenceTimeout)
 	defer cancel()
 	absenceConfirmations := 0
+	// A caller may hold a prior full proof and ask for fewer confirmations. That
+	// reduction is only valid while every read agrees: the first contrary
+	// observation (the VM visible in GET, ListVMs or the VPC, a floating IP
+	// still assigned, or a failed read) means the earlier proof can no longer be
+	// taken at face value, so the requirement rises to the full spaced proof and
+	// a single later 404 cannot satisfy it.
+	required := requiredConfirmations
+	contrary := func() {
+		absenceConfirmations = 0
+		if required < destructiveAbsenceConfirmations {
+			required = destructiveAbsenceConfirmations
+		}
+	}
 	var lastObservation error
 	readbackDelay := a.networkAttachmentReadbackMinDelay
 	for {
@@ -3463,7 +3499,7 @@ func (a *Adapter) waitForVMAbsenceWithDependents(
 		exactAbsent := false
 		switch {
 		case getErr == nil && vm == nil:
-			absenceConfirmations = 0
+			contrary()
 			lastObservation = fmt.Errorf("%w: VM %s detail response is empty", errVMAbsenceUncertain, uuid)
 		case getErr == nil && !strings.EqualFold(vm.UUID, uuid):
 			return fmt.Errorf("%w: canonical VM detail UUID %q does not match delete target %q", cloudapi.ErrOwnershipMismatch, vm.UUID, uuid)
@@ -3474,11 +3510,11 @@ func (a *Adapter) waitForVMAbsenceWithDependents(
 				}
 				exactAbsent = true
 			} else {
-				absenceConfirmations = 0
+				contrary()
 				lastObservation = fmt.Errorf("VM %s remains visible %s", uuid, phase)
 			}
 		case !sdk.IsNotFound(getErr):
-			absenceConfirmations = 0
+			contrary()
 			lastObservation = fmt.Errorf("getting VM %s %s: %w", uuid, phase, getErr)
 			if !isRetryableReadback(readbackCtx, getErr) {
 				return lastObservation
@@ -3494,7 +3530,7 @@ func (a *Adapter) waitForVMAbsenceWithDependents(
 				return fmt.Errorf("VM %s absence %s stopped: %w", uuid, phase, errors.Join(errVMAbsenceUncertain, lastObservation, listErr, readbackErr))
 			}
 			if listErr != nil {
-				absenceConfirmations = 0
+				contrary()
 				lastObservation = fmt.Errorf("listing VMs to confirm absence of %s %s: %w", uuid, phase, listErr)
 				if !isRetryableReadback(readbackCtx, listErr) {
 					return lastObservation
@@ -3510,7 +3546,7 @@ func (a *Adapter) waitForVMAbsenceWithDependents(
 					}
 				}
 				if listedPresent {
-					absenceConfirmations = 0
+					contrary()
 					lastObservation = fmt.Errorf("%w: GetVM reports %s absent while ListVMs still contains it", cloudapi.ErrOwnershipMismatch, uuid)
 				} else {
 					networkPresent, networkErr := a.networkContainsVM(readbackCtx, location, networkUUID, uuid)
@@ -3518,7 +3554,7 @@ func (a *Adapter) waitForVMAbsenceWithDependents(
 						return fmt.Errorf("checking VPC membership to confirm absence of %s %s: %w", uuid, phase, networkErr)
 					}
 					if networkPresent {
-						absenceConfirmations = 0
+						contrary()
 						lastObservation = fmt.Errorf("%w: GetVM/ListVMs omit %s while configured VPC still contains it", cloudapi.ErrOwnershipMismatch, uuid)
 						if err := waitForReadback(readbackCtx, readbackDelay); err != nil {
 							return fmt.Errorf("VM %s VPC absence did not converge %s: %w", uuid, phase, errors.Join(lastObservation, err))
@@ -3532,7 +3568,7 @@ func (a *Adapter) waitForVMAbsenceWithDependents(
 							return fmt.Errorf("checking floating-IP assignment to confirm absence of %s %s: %w", uuid, phase, floatingErr)
 						}
 						if floatingAssigned {
-							absenceConfirmations = 0
+							contrary()
 							lastObservation = fmt.Errorf("%w: VM indexes omit %s while an active floating IP remains assigned", cloudapi.ErrOwnershipMismatch, uuid)
 							if err := waitForReadback(readbackCtx, readbackDelay); err != nil {
 								return fmt.Errorf("VM %s floating-IP assignment did not converge absent %s: %w", uuid, phase, errors.Join(lastObservation, err))
@@ -3542,8 +3578,8 @@ func (a *Adapter) waitForVMAbsenceWithDependents(
 						}
 					}
 					absenceConfirmations++
-					lastObservation = fmt.Errorf("VM %s absence confirmation %d of %d %s", uuid, absenceConfirmations, requiredConfirmations, phase)
-					if absenceConfirmations >= requiredConfirmations {
+					lastObservation = fmt.Errorf("VM %s absence confirmation %d of %d %s", uuid, absenceConfirmations, required, phase)
+					if absenceConfirmations >= required {
 						return nil
 					}
 				}
