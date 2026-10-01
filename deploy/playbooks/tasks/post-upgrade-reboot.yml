@@ -1,7 +1,8 @@
 ---
-# Reboot every deploy-created host once so the first-boot apt-get upgrade (new
-# kernel, libc) takes effect. Only init includes this file, and only when the
-# OS upgrade ran and post_upgrade_reboot is true. Control planes go one at a
+# Reboot every deploy-created host that has a pending reboot (the helper checks
+# /run/reboot-required) so the first-boot apt-get upgrade (new kernel, libc)
+# takes effect. Only init includes this file, and only when the OS upgrade ran
+# and post_upgrade_reboot is true. Control planes go one at a
 # time through the bastion; the bastion goes last because every control-plane
 # SSH hop and the API tunnel depend on it.
 - name: Reboot control planes one at a time after the first-boot OS upgrade

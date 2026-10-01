@@ -3,8 +3,10 @@
 # the first-boot apt-get upgrade, so the upgraded kernel and libc take effect.
 # Required vars: deploy_reboot_host (an ssh-config alias), deploy_reboot_is_cp
 # and, for a control plane, deploy_reboot_node_name. The helper's `check`
-# prints "needed" only for a host that has not rebooted since cloud-init ran
-# and has no marker, so a re-run of init never reboots a host twice.
+# prints "needed" only for a host with /run/reboot-required and no marker, so
+# a host without a pending reboot is left alone and a re-run of init never
+# reboots a host twice. Every kubectl or readiness check through the tunnel
+# retries, because rebooting the host that holds the VIP can interrupt it.
 - name: Require every control-plane node Ready before rebooting {{ deploy_reboot_host }}
   ansible.builtin.command:
     argv:
@@ -16,8 +18,14 @@
       - node
       - -l
       - node-role.kubernetes.io/control-plane
-      - --timeout=15m
+      - --timeout=2m
+  register: deploy_reboot_nodes_ready
   changed_when: false
+  # Every call through the tunnel is retried, so an API blip while kube-vip
+  # moves the VIP does not fail init.
+  retries: 10
+  delay: 15
+  until: deploy_reboot_nodes_ready.rc == 0
   when: deploy_reboot_is_cp | bool
 
 - name: Require etcd to be ready on every control plane before rebooting {{ deploy_reboot_host }}
@@ -138,8 +146,12 @@
       - wait
       - --for=condition=Ready
       - "node/{{ deploy_reboot_node_name }}"
-      - --timeout=15m
+      - --timeout=2m
+  register: deploy_rebooted_node_ready
   changed_when: false
+  retries: 15
+  delay: 15
+  until: deploy_rebooted_node_ready.rc == 0
   when: deploy_post_upgrade_reboot_check.stdout == 'needed' and deploy_reboot_is_cp | bool
 
 - name: Require the private API to recover before rebooting the next host

@@ -106,7 +106,7 @@ choice:
 | --- | --- | --- |
 | `bootstrap_direct_download` | `false` | Bastion cache setup, control-plane downloads, and every generated Karpenter `InSpaceNodeClass` |
 | `skip_os_upgrade` | `false` | Bastion, every fixed control-plane server, and every worker created from a generated Karpenter `InSpaceNodeClass` |
-| `post_upgrade_reboot` | `true` | The one-time reboot `init` gives the bastion and every fixed control-plane server after the first-boot OS upgrade |
+| `post_upgrade_reboot` | `true` | The one-time reboot `init` gives the bastion and each fixed control-plane server that has a pending reboot after the first-boot OS upgrade |
 
 Cached mode (`bootstrap_direct_download: false`) is the normal path. The
 bastion serves the private RKE2 asset and system-image cache, and both fixed
@@ -120,20 +120,33 @@ APT upgrades. Keep the production default `false` for both control-plane and
 Karpenter nodes.
 
 When the first-boot OS upgrade runs, a new kernel or libc only takes effect
-after a reboot. Every Karpenter worker therefore reboots itself exactly once,
-after it registers with the cluster (a `skipOSUpgrade: true` NodeClass never
-does). With `skip_os_upgrade: false`, `init` also reboots the bastion and the
-fixed control planes once, at the end of the run: control planes one at a time,
-each only after every control-plane node is Ready and etcd is healthy, and the
-bastion last, with the API tunnel stopped and restarted around it. A reboot
-leaves a marker on the host, and a host that has rebooted since cloud-init ran
-is never rebooted again, so a repeated `init` does not reboot it twice.
-`update` never runs `apt-get upgrade` and never reboots anything. Set
-`post_upgrade_reboot: false` to skip the control-plane and bastion reboots.
+after a reboot, and Ubuntu records a pending one in `/run/reboot-required`.
+Only a host with that file is rebooted; a host without it is left alone.
 
-Warning: re-running `init` with `post_upgrade_reboot: true` on a cluster that an
-older release created reboots, one at a time, every bastion or control-plane
-host that has not rebooted since it was created. Set
+- A Karpenter worker reboots before it joins the cluster. Karpenter binds
+  pending pods the moment a node registers, so a reboot after joining would
+  restart the very workload that triggered the scale-up. The node installs its
+  RKE2 agent, reboots, and starts the agent on the next boot. If the start then
+  fails, the node never registers and Karpenter replaces it, as for any failed
+  start. A `skipOSUpgrade: true` NodeClass never reboots.
+- With `skip_os_upgrade: false`, `init` reboots the fixed control planes and
+  the bastion at the end of the run, when they have a pending reboot. Control
+  planes go one at a time, each only after every control-plane node is Ready
+  and etcd is healthy on every control plane, and each is awaited until its
+  node is Ready and the API answers. The bastion goes last, with the API
+  tunnel stopped and restarted around it, and in cached mode `init` waits for
+  the bootstrap cache to serve again.
+- A reboot leaves a marker on the host, so a host is never rebooted twice for
+  the same upgrade, and a repeated `init` finds nothing to do once the reboot
+  is done.
+
+`update` never runs `apt-get upgrade` and never reboots anything. Set
+`post_upgrade_reboot: false` to skip the control-plane and bastion reboots;
+Karpenter workers are not affected by that option.
+
+Re-running `init` on a cluster that an older release created also reboots,
+one at a time, any bastion or control-plane host that has a pending reboot
+(`/run/reboot-required`), because that reboot is genuinely pending. Set
 `post_upgrade_reboot: false` to avoid that.
 
 ## Ubuntu release

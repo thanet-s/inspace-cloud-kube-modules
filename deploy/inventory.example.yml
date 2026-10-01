@@ -37,12 +37,13 @@ all:
     # Applies to the bastion, fixed control planes, and generated Karpenter
     # NodeClass. True skips only apt-get upgrade and is intended for tests.
     skip_os_upgrade: false
-    # True (the default) reboots the bastion and every control plane once, one
-    # at a time, at the end of init when the first-boot OS upgrade ran, so the
-    # new kernel takes effect. It does not affect Karpenter workers, which
-    # reboot themselves once whenever their NodeClass runs the OS upgrade.
-    # Re-running init on a cluster created by an older release reboots any host
-    # that never rebooted since creation; set false to avoid that.
+    # True (the default) reboots the control planes (one at a time) and then
+    # the bastion at the end of init, only when the first-boot OS upgrade ran
+    # and the host has a pending reboot (/run/reboot-required), so the new
+    # kernel takes effect. It does not affect Karpenter workers, which reboot
+    # before joining whenever their NodeClass runs the OS upgrade and a reboot
+    # is pending. Re-running init on a cluster created by an older release
+    # reboots any host with a pending reboot; set false to avoid that.
     post_upgrade_reboot: true
     # False uses the bastion cache for both fixed and Karpenter nodes.
     bootstrap_direct_download: false

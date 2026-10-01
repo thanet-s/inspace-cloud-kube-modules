@@ -660,8 +660,9 @@
       ansible.builtin.include_tasks: tasks/apply-control-plane-config.yml
 
     # The first boot of the bastion and every control plane ran apt-get upgrade
-    # (skip_os_upgrade: false), so reboot each one once, one at a time, now that
-    # the cluster is healthy. update never runs apt and never reboots.
+    # (skip_os_upgrade: false), so reboot each one that has /run/reboot-required
+    # once, one at a time, now that the cluster is healthy. update never runs
+    # apt and never reboots.
     - name: Reboot the bastion and control planes once after the first-boot OS upgrade
       ansible.builtin.include_tasks: tasks/post-upgrade-reboot.yml
       when:

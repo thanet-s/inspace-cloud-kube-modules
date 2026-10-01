@@ -490,16 +490,21 @@ the stock timeout would.
 - adds exactly one `karpenter.sh/unregistered:NoExecute` taint;
 - runs `additionalUserData` once via `cloud-init-per`, then re-disables and
   verifies UFW before starting RKE2; and
-- unless `spec.rke2.skipOSUpgrade` is true, reboots the node exactly once after
-  it registers, so the kernel and libc from the first-boot upgrade take
-  effect. A transient `inspace-post-upgrade-reboot` unit starts after the
-  agent, waits up to 30 minutes for the node to carry the
-  `karpenter.sh/registered` label, writes
-  `/var/lib/inspace/post-upgrade-reboot.done` and then runs `systemctl reboot`.
-  The marker is written first, so a node never reboots twice, and a node that
-  never registers is not rebooted. Only a new node's first boot carries this
-  step; the bootstrap schema version is unchanged, so running workers are not
-  replaced.
+- unless `spec.rke2.skipOSUpgrade` is true, reboots the node once before it
+  joins the cluster when the upgrade left `/run/reboot-required`, so the kernel
+  and libc from the first-boot upgrade take effect. The reboot comes before the
+  agent starts because Karpenter binds pending pods as soon as a node
+  registers, and a later reboot would restart the scale-up's own workload.
+  After everything else is installed and configured, the last bootstrap step
+  writes `/var/lib/inspace/post-upgrade-reboot.done`, enables the one-shot
+  `inspace-post-reboot-start-rke2-agent.service`, and runs `systemctl reboot`.
+  On the next boot that unit runs the same `inspace-start-rke2-agent` script
+  (bounded wait, fail-fast) and disables itself. The egress gates do not run
+  again, because a reboot does not change the floating IP. If the start fails,
+  the node never registers and Karpenter replaces it. Without a pending
+  reboot the agent starts directly, as before. Only a new node's first boot
+  carries this step; the bootstrap schema version is unchanged, so running
+  workers are not replaced.
 
 Every VM create request includes Warren-compatible non-empty login fields. By
 default the provider sends username `user` with a cryptographically random

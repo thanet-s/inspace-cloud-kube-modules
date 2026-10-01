@@ -450,11 +450,23 @@ def verify_post_upgrade_reboot(init: str, update: str, preflight: str, inventory
         require(f"\n  {subcommand}\n" in helper, f"post-upgrade-reboot.sh lacks the {subcommand} subcommand")
     require(
         "/var/lib/inspace/post-upgrade-reboot.done" in helper
-        and "/var/lib/cloud/instance/sem/config_scripts_user" in helper
-        and "btime" in helper
-        and "systemd-run --on-active=5 /bin/systemctl reboot" in helper,
-        "the helper must reboot only hosts still in the cloud-init boot that have no marker",
+        and "/run/reboot-required" in helper
+        and "config_scripts_user" not in helper
+        and "btime" not in helper
+        and "systemd-run --on-active=5 /bin/systemctl reboot >&2" in helper
+        and "systemd-run --on-active=5 /bin/systemctl reboot >/dev/null" not in helper
+        and helper.index("cloud-init status --wait") < helper.index("systemd-run --on-active=5"),
+        "the helper must reboot only a host with a pending reboot-required and no marker, wait for "
+        "cloud-init first, and report a systemd-run failure",
     )
+    # Every call through the API tunnel (or to an API after a VIP move) retries.
+    for block in one_host.split("\n- name: ")[1:]:
+        if "kubeconfig.yaml" in block or "/readyz" in block:
+            require(
+                "retries:" in block and "until:" in block,
+                "every kubectl or readiness check in post-upgrade-reboot-one-host.yml must retry: "
+                + block.splitlines()[0],
+            )
 
     rolling_updates = [update] + [
         read(f"deploy/playbooks/tasks/{name}").replace("\r\n", "\n")
@@ -472,8 +484,11 @@ def verify_post_upgrade_reboot(init: str, update: str, preflight: str, inventory
         re.search(r"(?m)^    post_upgrade_reboot: true$", inventory) is not None
         and "`post_upgrade_reboot`" in readme
         and "post_upgrade_reboot: false" in readme
-        and "reboots, one at a time" in readme,
-        "example inventory and README must document post_upgrade_reboot and the re-run warning",
+        and "/run/reboot-required" in readme
+        and "reboots before it joins the cluster" in readme
+        and "one at a time, any bastion or control-plane host that has a pending reboot" in readme,
+        "example inventory and README must document post_upgrade_reboot, the reboot-before-join workers, "
+        "and the re-run warning",
     )
     require(
         "python3 deploy/scripts/test_post_upgrade_reboot.py" in ci

@@ -2,41 +2,45 @@
 # One-time reboot of a deploy-created host (control plane or bastion) after the
 # first-boot `apt-get upgrade`, so a new kernel or libc takes effect.
 #
-#   check   print "needed" only when the host never rebooted since cloud-init
-#           ran its scripts and has no marker; otherwise print "done".
-#   reboot  print the current boot_id, then reboot five seconds later (the
-#           delay lets the SSH session that started it exit cleanly).
+#   check   print "needed" only when the OS upgrade left /run/reboot-required
+#           and this host has not already been rebooted for it; else "done".
+#   reboot  wait for cloud-init to finish, print the current boot_id, then
+#           reboot five seconds later (the delay lets the SSH session that
+#           started it exit cleanly). A failure to schedule the reboot is
+#           reported on stderr and fails the command.
 #   mark    record that the post-upgrade reboot is complete.
 #
-# `check` is idempotent: after any reboot, the cloud-init scripts semaphore is
-# older than this boot, so a re-run of init never reboots a host twice.
+# /run is a tmpfs, so /run/reboot-required exists only while a reboot is
+# genuinely pending in the current boot. That alone makes `check` idempotent:
+# after the reboot the file is gone and a re-run of init finds nothing to do,
+# so no extra "still in the cloud-init boot" guard is needed. The marker only
+# stops a second reboot if a later package upgrade raises the flag again.
 set -eu
 
 # INSPACE_POST_UPGRADE_TEST_ROOT relocates the host paths for the offline tests
 # only; sudo never passes it through.
 root=${INSPACE_POST_UPGRADE_TEST_ROOT:-}
 marker="$root/var/lib/inspace/post-upgrade-reboot.done"
-semaphore="$root/var/lib/cloud/instance/sem/config_scripts_user"
-proc_stat="$root/proc/stat"
+reboot_required="$root/run/reboot-required"
 boot_id_file="$root/proc/sys/kernel/random/boot_id"
 
 case "${1:-}" in
   check)
-    if [ -e "$marker" ] || [ ! -e "$semaphore" ]; then
-      printf done
-      exit 0
-    fi
-    boot_time=$(awk '$1 == "btime" { print $2; exit }' "$proc_stat")
-    ran_at=$(stat -c %Y "$semaphore")
-    if [ -n "$boot_time" ] && [ "$ran_at" -ge "$boot_time" ]; then
+    if [ ! -e "$marker" ] && [ -e "$reboot_required" ]; then
       printf needed
     else
       printf done
     fi
     ;;
   reboot)
+    # cloud-init may still be running its final stage on a host that just
+    # finished first boot; a reboot then would cut it off. Its own exit status
+    # (an error result) does not matter here, only that it has stopped.
+    if command -v cloud-init >/dev/null 2>&1; then
+      timeout 1800 cloud-init status --wait >/dev/null 2>&1 || true
+    fi
     cat "$boot_id_file"
-    systemd-run --on-active=5 /bin/systemctl reboot >/dev/null 2>&1
+    systemd-run --on-active=5 /bin/systemctl reboot >&2
     ;;
   mark)
     install -d -m 0755 "$(dirname "$marker")"
