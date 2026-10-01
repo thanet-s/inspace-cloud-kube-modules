@@ -16,6 +16,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/thanet-s/inspace-cloud-kube-modules/modules/csi-driver/pkg/host"
@@ -411,6 +412,34 @@ func (m *Mounter) waitForDeviceSize(ctx context.Context, devicePath string, mini
 		case <-timer.C:
 		}
 	}
+}
+
+// statfs is a variable so tests can feed fixed filesystem numbers.
+var statfs = syscall.Statfs
+
+// VolumeStats reads statfs(2) for path. Used bytes count every block that is
+// not free, including blocks reserved for root, which matches df and the
+// numbers kubelet exports as kubelet_volume_stats_*.
+func (m *Mounter) VolumeStats(ctx context.Context, path string) (host.VolumeStats, error) {
+	if err := ctx.Err(); err != nil {
+		return host.VolumeStats{}, err
+	}
+	if err := validateAbsolutePath(path); err != nil {
+		return host.VolumeStats{}, err
+	}
+	var st syscall.Statfs_t
+	if err := statfs(path, &st); err != nil {
+		return host.VolumeStats{}, fmt.Errorf("statfs %s: %w", path, err)
+	}
+	blockSize := int64(st.Bsize)
+	return host.VolumeStats{
+		TotalBytes:      int64(st.Blocks) * blockSize,
+		AvailableBytes:  int64(st.Bavail) * blockSize,
+		UsedBytes:       (int64(st.Blocks) - int64(st.Bfree)) * blockSize,
+		TotalInodes:     int64(st.Files),
+		AvailableInodes: int64(st.Ffree),
+		UsedInodes:      int64(st.Files) - int64(st.Ffree),
+	}, nil
 }
 
 func parseBlockDeviceSize(output string) (int64, error) {

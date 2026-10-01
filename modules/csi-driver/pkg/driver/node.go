@@ -2,6 +2,8 @@ package driver
 
 import (
 	"context"
+	"errors"
+	"io/fs"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"google.golang.org/grpc/codes"
@@ -188,5 +190,44 @@ func (d *Driver) NodeGetCapabilities(context.Context, *csi.NodeGetCapabilitiesRe
 	return &csi.NodeGetCapabilitiesResponse{Capabilities: []*csi.NodeServiceCapability{
 		{Type: &csi.NodeServiceCapability_Rpc{Rpc: &csi.NodeServiceCapability_RPC{Type: csi.NodeServiceCapability_RPC_STAGE_UNSTAGE_VOLUME}}},
 		{Type: &csi.NodeServiceCapability_Rpc{Rpc: &csi.NodeServiceCapability_RPC{Type: csi.NodeServiceCapability_RPC_EXPAND_VOLUME}}},
+		{Type: &csi.NodeServiceCapability_Rpc{Rpc: &csi.NodeServiceCapability_RPC{Type: csi.NodeServiceCapability_RPC_GET_VOLUME_STATS}}},
+	}}, nil
+}
+
+// NodeGetVolumeStats reports filesystem usage of a published volume so kubelet
+// can export kubelet_volume_stats_*. The driver mounts only filesystem
+// volumes, so there is no raw block case. volume_path must be a mount point:
+// statfs on a plain directory would report the node's own filesystem.
+func (d *Driver) NodeGetVolumeStats(ctx context.Context, req *csi.NodeGetVolumeStatsRequest) (*csi.NodeGetVolumeStatsResponse, error) {
+	if err := d.requireMounter(); err != nil {
+		return nil, err
+	}
+	if req == nil {
+		return nil, status.Error(codes.InvalidArgument, "request is required")
+	}
+	if err := require(req.GetVolumeId(), "volume_id"); err != nil {
+		return nil, err
+	}
+	if err := require(req.GetVolumePath(), "volume_path"); err != nil {
+		return nil, err
+	}
+	if _, err := d.volumeRef(req.GetVolumeId()); err != nil {
+		return nil, err
+	}
+	stats, err := d.mounter.VolumeStats(ctx, req.GetVolumePath())
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, status.Error(codes.NotFound, "volume_path does not exist")
+	}
+	if err != nil {
+		return nil, hostStatus("read volume stats", err)
+	}
+	if _, mounted, err := d.mounter.GetMount(ctx, req.GetVolumePath()); err != nil {
+		return nil, hostStatus("inspect volume path", err)
+	} else if !mounted {
+		return nil, status.Error(codes.NotFound, "volume_path is not mounted")
+	}
+	return &csi.NodeGetVolumeStatsResponse{Usage: []*csi.VolumeUsage{
+		{Unit: csi.VolumeUsage_BYTES, Total: stats.TotalBytes, Available: stats.AvailableBytes, Used: stats.UsedBytes},
+		{Unit: csi.VolumeUsage_INODES, Total: stats.TotalInodes, Available: stats.AvailableInodes, Used: stats.UsedInodes},
 	}}, nil
 }

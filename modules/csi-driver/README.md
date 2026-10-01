@@ -17,7 +17,7 @@ resize, and idempotent unmounts on Linux.
 | Access | `SINGLE_NODE_WRITER` / RWO | RWX, ROX, every multi-node mode |
 | Filesystem | ext4 mounted volumes | xfs, raw block |
 | Controller | create, delete, validate, attach, detach, online expansion | CSI snapshots, cloning, offline expansion, shrinking |
-| Node | stage, unstage, publish, unpublish, online ext4 expansion, info, capabilities | stats |
+| Node | stage, unstage, publish, unpublish, online ext4 expansion, volume usage stats (`kubelet_volume_stats_*`), info, capabilities | volume health conditions |
 | Placement | one configured InSpace location | cross-location attachment |
 
 An RWO volume can move between workers only after detach from the old worker
