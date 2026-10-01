@@ -18,6 +18,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	k8svalidation "k8s.io/apimachinery/pkg/util/validation"
+	ctrllog "sigs.k8s.io/controller-runtime/pkg/log"
 
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
@@ -483,11 +484,13 @@ func (p *CloudProvider) delete(ctx context.Context, nodeClaim *karpv1.NodeClaim,
 		NetworkUUID:    p.opts.NetworkUUID,
 	}
 	deleteClusterName := p.opts.ClusterName
+	var retainedFence *createFenceRecord
 	if encodedFence := nodeClaim.Annotations[AnnotationCreateFence]; encodedFence != "" {
 		record, decodeErr := decodeCreateFence(encodedFence)
 		if decodeErr != nil {
 			return fmt.Errorf("decoding retained launch identity for deletion: %w", decodeErr)
 		}
+		retainedFence = &record
 		if record.Binding.NodeClaimUID != string(nodeClaim.UID) || record.Cleanup.NodeClaimName != nodeClaim.Name ||
 			record.Cleanup.Location != id.Location || record.Phase != createFenceMaterialized ||
 			!strings.EqualFold(record.ObservedVMUUID, id.VMUUID) {
@@ -541,17 +544,48 @@ func (p *CloudProvider) delete(ctx context.Context, nodeClaim *karpv1.NodeClaim,
 		}
 		deleteIdentity.BillingAccountID = billingAccountID
 	}
+	logger := ctrllog.FromContext(ctx).WithValues("nodeClaim", nodeClaim.Name, "vmUUID", id.VMUUID)
+	logger.V(1).Info("deleting VM and proving VM, floating IP and firewall relation absence")
 	if err := p.cloud.DeleteVM(ctx, id.Location, id.VMUUID, deleteClusterName, nodeClaim.Name, deleteIdentity); err != nil {
 		if errors.Is(err, cloudapi.ErrNotFound) {
+			// Only NotFound that carries the converged sentinel finished the
+			// floating-IP and firewall cleanup; a bare NotFound does not say that.
+			if errors.Is(err, cloudapi.ErrDeletionConverged) {
+				p.recordTerminalCleanup(ctx, nodeClaim, retainedFence, id.VMUUID)
+			} else {
+				logger.V(1).Info("VM not found without a dependent-cleanup convergence guarantee; no terminal cleanup marker recorded")
+			}
 			return cloudprovider.NewNodeClaimNotFoundError(fmt.Errorf("VM %s no longer exists", id.VMUUID))
 		}
+		logger.V(1).Info("VM delete has not converged yet", "reason", err.Error())
 		return fmt.Errorf("deleting VM %s: %w", id.VMUUID, err)
 	}
 	// The cloud boundary returns nil only after VM, floating-IP, and firewall
 	// absence have all converged. At that point the instance is already
 	// terminated, so satisfy Karpenter's Delete contract immediately instead
 	// of forcing a second complete deletion audit.
+	p.recordTerminalCleanup(ctx, nodeClaim, retainedFence, id.VMUUID)
 	return cloudprovider.NewNodeClaimNotFoundError(fmt.Errorf("VM %s deletion converged", id.VMUUID))
+}
+
+// recordTerminalCleanup persists the durable marker that this delete drove the
+// VM, its floating IP and its base-firewall relation to proven absence, so the
+// create-protection controller can skip replaying the whole destructive
+// convergence once Karpenter's finalizer clears. It is deliberately best
+// effort: the marker only ever shortens later cleanup, so a failed write is
+// logged and the unmarked claim simply takes the full audit.
+func (p *CloudProvider) recordTerminalCleanup(ctx context.Context, nodeClaim *karpv1.NodeClaim, record *createFenceRecord, vmUUID string) {
+	if record == nil || p.fences == nil {
+		return
+	}
+	logger := ctrllog.FromContext(ctx).WithValues("nodeClaim", nodeClaim.Name, "vmUUID", vmUUID)
+	writeCtx, cancel := detachedCreateFenceContext(ctx)
+	defer cancel()
+	if _, err := p.fences.RecordTerminalCleanup(writeCtx, nodeClaim, record.Binding, record.Token, vmUUID); err != nil {
+		logger.Info("could not record terminal cleanup marker; final cleanup will run its full audit", "error", err.Error())
+		return
+	}
+	logger.V(1).Info("recorded terminal cleanup marker")
 }
 
 func (p *CloudProvider) Get(ctx context.Context, value string) (*karpv1.NodeClaim, error) {

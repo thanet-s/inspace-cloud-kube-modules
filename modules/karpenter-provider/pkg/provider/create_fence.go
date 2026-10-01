@@ -113,11 +113,50 @@ type createFenceRecord struct {
 	CleanupPublicIPv4      string                                   `json:"cleanupPublicIPv4,omitempty"`
 	CleanupResolutions     []cloudapi.FencedCreateCleanupResolution `json:"cleanupResolutions,omitempty"`
 	BaseFirewallAssignment *baseFirewallAssignmentRecord            `json:"baseFirewallAssignment,omitempty"`
+	// TerminalCleanup is written by the provider's own Delete only after the
+	// cloud reported the VM, its floating IP and its base-firewall relation all
+	// proven absent. It is bound to the exact identity it covers, so any later
+	// change to that identity makes it inert (see terminalCleanupConverged).
+	TerminalCleanup *terminalCleanupRecord `json:"terminalCleanup,omitempty"`
 	// LegacyV2 remains persisted after migration so newly added mutation
 	// fences can conservatively treat a pre-upgrade attempt as possibly issued.
 	LegacyV2                        bool `json:"legacyV2MutationFence,omitempty"`
 	LegacyV2BaseFirewallMayBeIssued bool `json:"legacyV2BaseFirewallMayBeIssued,omitempty"`
 	LegacyV2FloatingIPMayBeIssued   bool `json:"legacyV2FloatingIPMayBeIssued,omitempty"`
+}
+
+// terminalCleanupRecord is the durable proof that Delete of a materialized
+// NodeClaim converged. It names every resource the delete covered so the
+// controller can verify the match instead of trusting a bare timestamp.
+type terminalCleanupRecord struct {
+	ObservedAt     time.Time `json:"observedAt"`
+	VMUUID         string    `json:"vmUUID"`
+	FloatingIPName string    `json:"floatingIPName"`
+	PublicIPv4     string    `json:"publicIPv4"`
+	FirewallUUID   string    `json:"firewallUUID"`
+}
+
+func newTerminalCleanupRecord(record createFenceRecord, observedAt time.Time) *terminalCleanupRecord {
+	return &terminalCleanupRecord{
+		ObservedAt:     observedAt.UTC(),
+		VMUUID:         record.ObservedVMUUID,
+		FloatingIPName: record.FloatingIPName,
+		PublicIPv4:     record.PublicIPv4,
+		FirewallUUID:   record.Cleanup.FirewallUUID,
+	}
+}
+
+// terminalCleanupConverged reports whether the record carries a terminal
+// cleanup marker that names exactly the materialized VM, floating IP and base
+// firewall of this record. An absent, unmatched or incomplete marker is simply
+// not converged, which sends cleanup down the full destructive path.
+func (r createFenceRecord) terminalCleanupConverged() bool {
+	marker := r.TerminalCleanup
+	return marker != nil && r.Phase == createFenceMaterialized && !marker.ObservedAt.IsZero() &&
+		r.ObservedVMUUID != "" && marker.VMUUID == r.ObservedVMUUID &&
+		r.FloatingIPName != "" && marker.FloatingIPName == r.FloatingIPName &&
+		r.PublicIPv4 != "" && marker.PublicIPv4 == r.PublicIPv4 &&
+		r.Cleanup.FirewallUUID != "" && marker.FirewallUUID == r.Cleanup.FirewallUUID
 }
 
 type baseFirewallAssignmentRecord struct {
@@ -234,6 +273,10 @@ type CreateFenceStore interface {
 	ChooseRollback(context.Context, *karpv1.NodeClaim, createFenceBinding, string, string, string, *cloudapi.FencedCreateCleanupResolution) (*karpv1.NodeClaim, error)
 	MarkRejected(context.Context, *karpv1.NodeClaim, createFenceBinding, string, string) (*karpv1.NodeClaim, error)
 	MarkMaterialized(context.Context, *karpv1.NodeClaim, createFenceBinding, string, *cloudapi.VM) (*karpv1.NodeClaim, error)
+	// RecordTerminalCleanup persists, on a materialized fence, the marker that
+	// the provider's own delete of exactly this VM converged. The marker is
+	// derived from the stored record, never from caller-supplied resource names.
+	RecordTerminalCleanup(context.Context, *karpv1.NodeClaim, createFenceBinding, string, string) (*karpv1.NodeClaim, error)
 }
 
 type kubernetesCreateFenceStore struct {
@@ -1282,6 +1325,68 @@ func (s *kubernetesCreateFenceStore) MarkMaterialized(ctx context.Context, claim
 	return nil, fmt.Errorf("persisting materialized VM identity for NodeClaim %q did not converge: %w", claim.Name, lastErr)
 }
 
+// RecordTerminalCleanup is a compare-and-swap on the NodeClaim resource
+// version, like every other fence transition. It never changes the phase,
+// receipts or identity of the record, and it is idempotent: an existing
+// matching marker keeps its first observation time.
+func (s *kubernetesCreateFenceStore) RecordTerminalCleanup(ctx context.Context, claim *karpv1.NodeClaim, binding createFenceBinding, token, vmUUID string) (*karpv1.NodeClaim, error) {
+	vmUUID = strings.ToLower(vmUUID)
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		current, readErr := s.getProtectedExact(ctx, claim, "record terminal cleanup")
+		if readErr != nil {
+			return nil, readErr
+		}
+		record, parseErr := parseCreateFence(current.Annotations[AnnotationCreateFence], binding)
+		if parseErr != nil {
+			return nil, parseErr
+		}
+		if err := validateTerminalCleanupTarget(record, token, vmUUID); err != nil {
+			return nil, fmt.Errorf("NodeClaim %q: %w", claim.Name, err)
+		}
+		if record.terminalCleanupConverged() {
+			return current, nil
+		}
+		record.TerminalCleanup = newTerminalCleanupRecord(record, s.now())
+		encoded, err := json.Marshal(record)
+		if err != nil {
+			return nil, fmt.Errorf("encoding terminal cleanup marker: %w", err)
+		}
+		updated := current.DeepCopy()
+		updated.Annotations[AnnotationCreateFence] = string(encoded)
+		lastErr = s.writer.Update(ctx, updated)
+		var readback karpv1.NodeClaim
+		if readErr := s.reader.Get(ctx, types.NamespacedName{Name: claim.Name}, &readback); readErr != nil {
+			lastErr = errors.Join(lastErr, readErr)
+			continue
+		}
+		if readback.UID != current.UID || !controllerutil.ContainsFinalizer(&readback, CreateFenceFinalizer) {
+			return nil, fmt.Errorf("NodeClaim %q changed identity or lost protection while recording terminal cleanup", claim.Name)
+		}
+		stored, parseErr := parseCreateFence(readback.Annotations[AnnotationCreateFence], binding)
+		if parseErr != nil {
+			lastErr = errors.Join(lastErr, parseErr)
+			continue
+		}
+		if stored.terminalCleanupConverged() {
+			return &readback, nil
+		}
+	}
+	return nil, fmt.Errorf("persisting terminal cleanup marker for NodeClaim %q did not converge: %w", claim.Name, lastErr)
+}
+
+// validateTerminalCleanupTarget insists that the marker can only ever describe
+// the one VM this attempt materialized.
+func validateTerminalCleanupTarget(record createFenceRecord, token, vmUUID string) error {
+	if token == "" || record.Token != token {
+		return fmt.Errorf("durable VM create token changed before recording terminal cleanup")
+	}
+	if record.Phase != createFenceMaterialized || vmUUID == "" || record.ObservedVMUUID != vmUUID || record.RollbackAt != nil {
+		return fmt.Errorf("terminal cleanup can only be recorded for the materialized VM")
+	}
+	return nil
+}
+
 func (s *kubernetesCreateFenceStore) getExact(ctx context.Context, claim *karpv1.NodeClaim) (*karpv1.NodeClaim, error) {
 	if claim == nil || claim.Name == "" || claim.UID == "" {
 		return nil, fmt.Errorf("durable VM create fencing requires a named NodeClaim with UID")
@@ -2177,6 +2282,26 @@ func (s *memoryCreateFenceStore) MarkMaterialized(_ context.Context, claim *karp
 		record.FloatingIPName = vm.FloatingIPName
 		publicIP, _ := netip.ParseAddr(vm.PublicIPv4)
 		record.PublicIPv4 = publicIP.String()
+		s.records[claim.UID] = record
+	}
+	return claimWithCreateFence(claim, record), nil
+}
+
+func (s *memoryCreateFenceStore) RecordTerminalCleanup(_ context.Context, claim *karpv1.NodeClaim, binding createFenceBinding, token, vmUUID string) (*karpv1.NodeClaim, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	record, ok := s.records[claim.UID]
+	if !ok {
+		return nil, fmt.Errorf("durable VM create fence is missing")
+	}
+	if _, err := parseCreateFence(mustEncodeCreateFence(record), binding); err != nil {
+		return nil, err
+	}
+	if err := validateTerminalCleanupTarget(record, token, strings.ToLower(vmUUID)); err != nil {
+		return nil, err
+	}
+	if !record.terminalCleanupConverged() {
+		record.TerminalCleanup = newTerminalCleanupRecord(record, s.now())
 		s.records[claim.UID] = record
 	}
 	return claimWithCreateFence(claim, record), nil

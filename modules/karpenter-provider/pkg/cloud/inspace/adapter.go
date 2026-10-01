@@ -21,6 +21,7 @@ import (
 
 	sdk "github.com/thanet-s/inspace-cloud-kube-modules/modules/client"
 	k8svalidation "k8s.io/apimachinery/pkg/util/validation"
+	ctrllog "sigs.k8s.io/controller-runtime/pkg/log"
 
 	inspacev1 "github.com/thanet-s/inspace-cloud-kube-modules/modules/karpenter-provider/pkg/apis/v1alpha1"
 	"github.com/thanet-s/inspace-cloud-kube-modules/modules/karpenter-provider/pkg/bootstrap"
@@ -46,6 +47,14 @@ const (
 	defaultCreateAmbiguityWindow     = 10 * time.Minute
 	defaultCreateAbsenceReadInterval = 30 * time.Second
 	createAbsenceConfirmations       = 3
+	// A materialized claim whose own delete already converged (a durable
+	// terminal-cleanup marker bound to the exact VM, floating IP and firewall)
+	// only needs the final read-only audit to catch a resurrection. Two complete
+	// snapshots ten seconds apart are enough there; every other claim, including
+	// issued-but-unobserved and dependent-tracking attempts, keeps three
+	// snapshots thirty seconds apart.
+	convergedAbsenceConfirmations       = 2
+	defaultConvergedAbsenceReadInterval = 10 * time.Second
 	// Destructive convergence intentionally has a slower, independent clock
 	// than attachment/readiness polling. Three complete observations separated
 	// by 30 seconds prevent a transient omission from authorizing dependent
@@ -128,6 +137,7 @@ type Adapter struct {
 	launchFloatingIPCleanupTimeout    time.Duration
 	createAmbiguityWindow             time.Duration
 	createAbsenceReadInterval         time.Duration
+	convergedAbsenceReadInterval      time.Duration
 	destructiveAbsenceTimeout         time.Duration
 	destructiveAbsenceReadInterval    time.Duration
 	now                               func() time.Time
@@ -233,6 +243,7 @@ func newAdapter(api API, passwordGenerator func() (string, error)) (*Adapter, er
 		launchFloatingIPCleanupTimeout:    defaultLaunchFloatingIPCleanupTimeout,
 		createAmbiguityWindow:             defaultCreateAmbiguityWindow,
 		createAbsenceReadInterval:         defaultCreateAbsenceReadInterval,
+		convergedAbsenceReadInterval:      defaultConvergedAbsenceReadInterval,
 		destructiveAbsenceTimeout:         defaultDestructiveAbsenceTimeout,
 		destructiveAbsenceReadInterval:    destructiveAbsenceInterval,
 		now:                               time.Now,
@@ -688,10 +699,33 @@ func (a *Adapter) CleanupFencedCreate(ctx context.Context, request cloudapi.Fenc
 			break
 		}
 	}
+	issuedUnobserved := request.POSTIssued && !attemptResolved
+	dependentUnresolved := request.DependentUnresolved && !anchorReceipt
+	dependentTracking := (request.DependentUnresolved || request.DependentsResolved) && !anchorReceipt
+	// The controller marks a receipt Converged only when a durable marker bound
+	// to this exact VM, floating IP and firewall records that the provider's own
+	// delete already drove all three to proven absence. That is honored only for
+	// a materialized claim whose launch UUID is its single exact receipt and
+	// only when every receipt carries it. An issued-but-unobserved attempt or a
+	// dependent-tracking rollback never qualifies: either can still hide a
+	// resource that an earlier delete never saw.
+	convergedTerminal := len(request.Resolutions) != 0 && request.ObservedVMUUID != "" && anchorReceipt &&
+		!request.RollbackChosen && !issuedUnobserved && !dependentTracking
+	for _, resolution := range request.Resolutions {
+		if !resolution.Converged {
+			convergedTerminal = false
+			break
+		}
+	}
 	// A durable receipt can identify an unprotected public VM. Reconcile it
 	// immediately; the ambiguity window gates only final absence conclusions,
-	// never security-priority deletion of an exact owned target.
-	if err := a.reconcileFencedCleanupReceipts(ctx, request); err != nil {
+	// never security-priority deletion of an exact owned target. A converged
+	// receipt skips the destructive replay and is covered by the read-only
+	// receipt audit that every snapshot below still runs, which reports any
+	// reappearance as pending.
+	if convergedTerminal {
+		deleteStageLog(ctx, "skipping DeleteVM replay for converged cleanup receipt", "nodeClaim", request.NodeClaimName, "vmUUID", request.ObservedVMUUID)
+	} else if err := a.reconcileFencedCleanupReceipts(ctx, request); err != nil {
 		return empty, err
 	}
 	// A durable receipt was just reconciled through complete VM, FIP, and
@@ -714,12 +748,13 @@ func (a *Adapter) CleanupFencedCreate(ctx context.Context, request cloudapi.Fenc
 	eligibleAt := request.AttemptIssuedAt.Add(a.createAmbiguityWindow)
 	targetVMs := identitySet(request.Baseline.TargetVMs)
 	baselineFloatingIPs := identitySet(request.Baseline.FloatingIPs)
-	issuedUnobserved := request.POSTIssued && !attemptResolved
-	dependentUnresolved := request.DependentUnresolved && !anchorReceipt
-	dependentTracking := (request.DependentUnresolved || request.DependentsResolved) && !anchorReceipt
 	_, anchoredVMExistedBeforeFence := baselineVMs[strings.ToLower(request.CreatedVMUUID)]
 	anchoredBaselineDependents := targetFloatingIPAssignmentsForVM(request.Baseline, request.CreatedVMUUID)
-	for confirmation := 1; confirmation <= createAbsenceConfirmations; confirmation++ {
+	confirmations, confirmationInterval := createAbsenceConfirmations, a.createAbsenceReadInterval
+	if convergedTerminal {
+		confirmations, confirmationInterval = convergedAbsenceConfirmations, a.convergedAbsenceReadInterval
+	}
+	for confirmation := 1; confirmation <= confirmations; confirmation++ {
 		strictUUIDs := make(map[string]struct{}, len(request.Baseline.PotentialVMs)+len(request.Baseline.TargetVMs)+len(request.Resolutions)+2)
 		for _, uuid := range request.Baseline.PotentialVMs {
 			strictUUIDs[strings.ToLower(uuid)] = struct{}{}
@@ -850,8 +885,8 @@ func (a *Adapter) CleanupFencedCreate(ctx context.Context, request cloudapi.Fenc
 		if confirmation == 1 && request.POSTIssued && (!attemptResolved || dependentUnresolved) && now().Before(eligibleAt) {
 			return empty, fmt.Errorf("%w: issued VM create fence %s has no exact visible result or dependent and is inside the cleanup ambiguity window until %s", cloudapi.ErrCreateAttemptPending, request.AttemptToken, eligibleAt.UTC().Format(time.RFC3339Nano))
 		}
-		if confirmation < createAbsenceConfirmations {
-			if err := waitForReadback(ctx, a.createAbsenceReadInterval); err != nil {
+		if confirmation < confirmations {
+			if err := waitForReadback(ctx, confirmationInterval); err != nil {
 				return empty, fmt.Errorf("fenced VM create cleanup absence proof stopped after confirmation %d: %w", confirmation, err)
 			}
 		}
@@ -2927,7 +2962,16 @@ func (a *Adapter) DeleteVM(ctx context.Context, location, uuid, clusterName, nod
 	}
 	// First prove only the core VM indexes absent. A stale expected FIP may still
 	// point at the deleted UUID and is intentionally cleaned in the next stage.
-	if absenceErr := a.waitForAuthorizedVMCoreAbsence(ctx, location, effectiveNetworkUUID, uuid, "after delete", tombstoneVerifier); absenceErr != nil {
+	// When the delete preflight above already produced the full spaced proof
+	// (three exact-GET negatives corroborated by ListVMs and configured-VPC
+	// omission) no DELETE was dispatched here, so there is nothing new to prove:
+	// one confirming read guards only against a resurrection since that proof.
+	coreAbsence := a.waitForAuthorizedVMCoreAbsence
+	if vmMissing {
+		coreAbsence = a.confirmAuthorizedVMCoreAbsence
+	}
+	deleteStageLog(ctx, "waiting for core VM absence", "vmUUID", uuid, "alreadyProvenAbsent", vmMissing)
+	if absenceErr := coreAbsence(ctx, location, effectiveNetworkUUID, uuid, "after delete", tombstoneVerifier); absenceErr != nil {
 		if deleteErr != nil {
 			errs = append(errs, fmt.Errorf("deleting VM %s: %w", uuid, deleteErr))
 		}
@@ -2951,20 +2995,26 @@ func (a *Adapter) DeleteVM(ctx context.Context, location, uuid, clusterName, nod
 	// Before detaching any firewall, require the core indexes and every active
 	// FIP assignment to agree that the exact VM UUID is gone. Core absence was
 	// already proven with spaced reads and persisted above, the exact FIP was
-	// proven absent with its own spaced reads, and a firewall DELETE re-proves
-	// core absence with spaced reads immediately before dispatch. One complete
-	// corroborated read therefore suffices here instead of a second full proof.
+	// proven absent with its own spaced reads (or an observed durable DELETE
+	// receipt plus one confirming read), and a firewall DELETE re-proves core
+	// absence immediately before dispatch. One complete corroborated read
+	// therefore suffices here instead of a second full proof.
+	deleteStageLog(ctx, "confirming VM absence after dependent cleanup", "vmUUID", uuid)
 	if absenceErr := a.confirmAuthorizedVMAbsence(ctx, location, effectiveNetworkUUID, uuid, "after dependent cleanup", tombstoneVerifier); absenceErr != nil {
 		return absenceErr
 	}
-	if err := a.detachFirewallAfterVMDeletion(ctx, location, effectiveNetworkUUID, baseFirewallUUID, uuid, expectedBillingAccountID, deleteBaseFirewallDetachmentAuthority(identity), tombstoneVerifier); err != nil {
+	deleteStageLog(ctx, "waiting for firewall relation absence", "vmUUID", uuid, "firewallUUID", baseFirewallUUID, "reuseVMAbsenceProof", vmMissing)
+	if err := a.detachFirewallAfterVMDeletionWithProof(ctx, location, effectiveNetworkUUID, baseFirewallUUID, uuid, expectedBillingAccountID, deleteBaseFirewallDetachmentAuthority(identity), vmMissing, tombstoneVerifier); err != nil {
 		errs = append(errs, err)
 	}
 	if len(errs) != 0 {
 		return errors.Join(errs...)
 	}
+	deleteStageLog(ctx, "VM, floating IP and firewall relation absence converged", "vmUUID", uuid)
 	if vmMissing {
-		return cloudapi.ErrNotFound
+		// The sentinel tells callers that this NotFound is the end of a fully
+		// converged cleanup, not merely a VM that was never there.
+		return fmt.Errorf("%w: %w", cloudapi.ErrNotFound, cloudapi.ErrDeletionConverged)
 	}
 	return nil
 }
@@ -3343,6 +3393,26 @@ func (a *Adapter) waitForAuthorizedVMCoreAbsence(
 	verifier *deletedVMTombstoneVerifier,
 ) error {
 	return a.waitForVMAbsenceWithDependents(ctx, location, networkUUID, uuid, phase, false, verifier, destructiveAbsenceConfirmations)
+}
+
+// deleteStageLog records, at debug verbosity, which absence proof DeleteVM is
+// about to wait on. Spaced proofs return no output for minutes, so without
+// these lines a slow deletion looks identical to a hung one.
+func deleteStageLog(ctx context.Context, stage string, keysAndValues ...any) {
+	ctrllog.FromContext(ctx).V(1).Info("karpenter delete: "+stage, keysAndValues...)
+}
+
+// confirmAuthorizedVMCoreAbsence re-checks the core VM indexes (exact GET,
+// ListVMs, configured VPC) once for a caller that already holds the full
+// spaced proof of absence and dispatched no mutation since. Any contrary
+// observation still waits, bounded, for convergence exactly like the full
+// proof, so a resurrected VM is never mistaken for an absent one.
+func (a *Adapter) confirmAuthorizedVMCoreAbsence(
+	ctx context.Context,
+	location, networkUUID, uuid, phase string,
+	verifier *deletedVMTombstoneVerifier,
+) error {
+	return a.waitForVMAbsenceWithDependents(ctx, location, networkUUID, uuid, phase, false, verifier, 1)
 }
 
 // confirmAuthorizedVMAbsence re-checks, with one complete corroborated read,
@@ -6073,6 +6143,27 @@ func (a *Adapter) detachFirewallAfterVMDeletion(
 	authority baseFirewallDetachmentAuthority,
 	tombstoneVerifiers ...*deletedVMTombstoneVerifier,
 ) error {
+	var tombstoneVerifier *deletedVMTombstoneVerifier
+	if len(tombstoneVerifiers) != 0 {
+		tombstoneVerifier = tombstoneVerifiers[0]
+	}
+	return a.detachFirewallAfterVMDeletionWithProof(ctx, location, networkUUID, firewallUUID, vmUUID, billingAccountID, authority, false, tombstoneVerifier)
+}
+
+// detachFirewallAfterVMDeletionWithProof is detachFirewallAfterVMDeletion for a
+// caller that already holds a full spaced proof that the VM is absent from
+// every core index and dispatched nothing since. priorAbsenceProven then
+// replaces the spaced re-proof that precedes a firewall DELETE with a single
+// confirming read; the in-gate exact relation read and the spaced relation
+// absence readback are unchanged.
+func (a *Adapter) detachFirewallAfterVMDeletionWithProof(
+	ctx context.Context,
+	location, networkUUID, firewallUUID, vmUUID string,
+	billingAccountID int64,
+	authority baseFirewallDetachmentAuthority,
+	priorAbsenceProven bool,
+	tombstoneVerifier *deletedVMTombstoneVerifier,
+) error {
 	// Karpenter owns only the exact base firewall persisted in its VM ownership
 	// record. CCM owns NodeLB ICMP, shard, and per-Service firewalls, even when
 	// those firewalls still contain this deleted VM UUID.
@@ -6085,11 +6176,7 @@ func (a *Adapter) detachFirewallAfterVMDeletion(
 	if !vmUUIDPattern.MatchString(strings.ToLower(firewallUUID)) {
 		return fmt.Errorf("%w: deleted VM %s has no canonical provider-owned base firewall", cloudapi.ErrOwnershipMismatch, vmUUID)
 	}
-	var tombstoneVerifier *deletedVMTombstoneVerifier
-	if len(tombstoneVerifiers) != 0 {
-		tombstoneVerifier = tombstoneVerifiers[0]
-	}
-	return a.detachExactFirewallRelationAfterVMDeletion(ctx, location, networkUUID, strings.ToLower(firewallUUID), strings.ToLower(vmUUID), billingAccountID, authority, tombstoneVerifier)
+	return a.detachExactFirewallRelationAfterVMDeletion(ctx, location, networkUUID, strings.ToLower(firewallUUID), strings.ToLower(vmUUID), billingAccountID, authority, priorAbsenceProven, tombstoneVerifier)
 }
 
 func (a *Adapter) detachExactFirewallRelationAfterVMDeletion(
@@ -6097,6 +6184,7 @@ func (a *Adapter) detachExactFirewallRelationAfterVMDeletion(
 	location, networkUUID, firewallUUID, vmUUID string,
 	billingAccountID int64,
 	authority baseFirewallDetachmentAuthority,
+	priorAbsenceProven bool,
 	tombstoneVerifier *deletedVMTombstoneVerifier,
 ) error {
 	// POST and DELETE mutate the same firewall relationship collection. Each
@@ -6285,7 +6373,7 @@ func (a *Adapter) detachExactFirewallRelationAfterVMDeletion(
 					// CAS, then re-read the exact firewall relationship in-gate
 					// immediately before DELETE so UUID reuse or relation drift cannot
 					// redirect it.
-					if proofErr := a.proveDeletedVMForFirewallDetachment(readbackCtx, location, networkUUID, vmUUID, tombstoneVerifier); proofErr != nil {
+					if proofErr := a.proveDeletedVMForFirewallDetachment(readbackCtx, location, networkUUID, vmUUID, priorAbsenceProven, tombstoneVerifier); proofErr != nil {
 						return rejectUndispatched(
 							fmt.Errorf("fresh mutation-target proof blocked base-firewall detachment for VM %s: %w", vmUUID, proofErr),
 						)
@@ -6340,14 +6428,20 @@ func (a *Adapter) detachExactFirewallRelationAfterVMDeletion(
 
 // proveDeletedVMForFirewallDetachment re-proves, with spaced reads, that the
 // VM is absent from every canonical core index before its firewall relation
-// may be removed. It is read-only and runs outside the firewall gate.
+// may be removed. It is read-only and runs outside the firewall gate. A caller
+// that already holds the spaced proof (priorAbsenceProven) needs only one
+// confirming read here, which still fails closed on a resurrected VM.
 func (a *Adapter) proveDeletedVMForFirewallDetachment(
 	ctx context.Context,
 	location, networkUUID, vmUUID string,
+	priorAbsenceProven bool,
 	tombstoneVerifier *deletedVMTombstoneVerifier,
 ) error {
 	if strings.TrimSpace(networkUUID) == "" {
 		return fmt.Errorf("%w: configured VPC UUID is required for firewall detachment", cloudapi.ErrOwnershipMismatch)
+	}
+	if priorAbsenceProven {
+		return a.confirmAuthorizedVMCoreAbsence(ctx, location, networkUUID, vmUUID, "during base-firewall detachment authorization", tombstoneVerifier)
 	}
 	return a.waitForAuthorizedVMCoreAbsence(ctx, location, networkUUID, vmUUID, "during base-firewall detachment authorization", tombstoneVerifier)
 }
@@ -6770,6 +6864,18 @@ func (a *Adapter) readOrphanFloatingIPForDelete(
 	readbackCtx, cancel := context.WithTimeout(ctx, a.destructiveAbsenceTimeout)
 	defer cancel()
 	absenceConfirmations := 0
+	// An Observed durable DELETE receipt for exactly this VM, address, name and
+	// billing account already records that this provider deleted the address and
+	// saw it absent. That receipt cannot replace a read: it only removes the
+	// need to re-prove that same absence with spaced reads, so one complete
+	// exact-GET plus inventory read still has to agree before returning.
+	requiredAbsences := destructiveAbsenceConfirmations
+	if a.observedFloatingIPDeleteReceipt(readbackCtx, location, vmUUID, identity, rollbackUpdate, authority) {
+		requiredAbsences = 1
+		deleteStageLog(ctx, "floating IP DELETE already observed; confirming absence once", "vmUUID", vmUUID, "address", identity.PublicIPv4)
+	} else {
+		deleteStageLog(ctx, "proving floating IP absence with spaced reads", "vmUUID", vmUUID, "address", identity.PublicIPv4)
+	}
 	var lastObservation error
 	readbackDelay := a.networkAttachmentReadbackMinDelay
 	for {
@@ -6851,8 +6957,8 @@ func (a *Adapter) readOrphanFloatingIPForDelete(
 			switch len(matches) {
 			case 0:
 				absenceConfirmations++
-				lastObservation = fmt.Errorf("named floating IP absence confirmation %d of %d for missing VM %s", absenceConfirmations, destructiveAbsenceConfirmations, vmUUID)
-				if absenceConfirmations == destructiveAbsenceConfirmations {
+				lastObservation = fmt.Errorf("named floating IP absence confirmation %d of %d for missing VM %s", absenceConfirmations, requiredAbsences, vmUUID)
+				if absenceConfirmations >= requiredAbsences {
 					return nil, nil
 				}
 			case 1:
@@ -6888,6 +6994,50 @@ func (a *Adapter) readOrphanFloatingIPForDelete(
 			return nil, fmt.Errorf("orphan floating IP discovery for missing VM %s did not converge: %w", vmUUID, errors.Join(lastObservation, err))
 		}
 	}
+}
+
+// observedFloatingIPDeleteReceipt reports whether the NodeClaim's durable
+// removal journal, current receipt or bounded Observed-DELETE history, already
+// holds an Observed floating-IP DELETE for exactly this VM, address, name and
+// billing account. It is a read-only query (present=false never issues or
+// rewrites a receipt) and any error or non-exact answer means "no receipt", so
+// the caller falls back to the full spaced proof.
+func (a *Adapter) observedFloatingIPDeleteReceipt(
+	ctx context.Context,
+	location, vmUUID string,
+	identity cloudapi.DeleteVMIdentity,
+	rollbackUpdate bool,
+	authority removalMutationAuthority,
+) bool {
+	if !authority.complete() {
+		return false
+	}
+	candidates := []cloudapi.RemovalMutation{{
+		Operation: cloudapi.RemovalMutationFloatingIPDelete, Location: location, VMUUID: strings.ToLower(vmUUID),
+		Address: identity.PublicIPv4, Name: identity.FloatingIPName, BillingAccountID: identity.BillingAccountID,
+	}}
+	if rollbackUpdate {
+		// Rollback removal records the durable desired metadata, so the receipt
+		// may carry either coherent form.
+		update := identity.FloatingIPUpdate
+		candidates = append(candidates, cloudapi.RemovalMutation{
+			Operation: cloudapi.RemovalMutationFloatingIPDelete, Location: location, VMUUID: strings.ToLower(vmUUID),
+			Address: identity.PublicIPv4, Name: update.Name, BillingAccountID: update.BillingAccountID,
+		})
+	}
+	for _, mutation := range candidates {
+		if mutation.Name == "" || mutation.BillingAccountID <= 0 {
+			continue
+		}
+		authorization, err := a.authorizeRemovalMutation(ctx, authority, mutation, false)
+		if err != nil || !authorization.Active || authorization.AllowMutation {
+			continue
+		}
+		if authorization.Fence.RemovalMutation == mutation && authorization.Fence.Phase == cloudapi.RemovalMutationObserved {
+			return true
+		}
+	}
+	return false
 }
 
 // proveObservedFloatingIPAddressReallocation distinguishes a later InSpace
@@ -7485,7 +7635,12 @@ func nextReadbackDelay(current, maximum time.Duration) time.Duration {
 	return current * 2
 }
 
-func waitForReadback(ctx context.Context, interval time.Duration) error {
+// waitForReadback is a variable only so in-package tests can replace the wall
+// clock with a recording virtual clock and measure how much spaced waiting a
+// cleanup path demands without actually sleeping.
+var waitForReadback = sleepBetweenReadbacks
+
+func sleepBetweenReadbacks(ctx context.Context, interval time.Duration) error {
 	timer := time.NewTimer(interval)
 	defer timer.Stop()
 	select {
