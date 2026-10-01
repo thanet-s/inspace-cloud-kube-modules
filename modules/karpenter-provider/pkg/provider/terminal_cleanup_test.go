@@ -11,6 +11,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	ctrllog "sigs.k8s.io/controller-runtime/pkg/log"
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 
@@ -19,6 +20,12 @@ import (
 	cloudapi "github.com/thanet-s/inspace-cloud-kube-modules/modules/karpenter-provider/pkg/cloud"
 	cloudfake "github.com/thanet-s/inspace-cloud-kube-modules/modules/karpenter-provider/pkg/cloud/fake"
 )
+
+func init() {
+	// Provider and controller log through controller-runtime; without a root
+	// logger it prints a one-time stack trace into the test output.
+	ctrllog.SetLogger(logr.Discard())
+}
 
 // failingTerminalCleanupStore proves a marker write failure never blocks
 // deletion: the marker is only an optimization for later cleanup.

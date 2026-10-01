@@ -2986,7 +2986,11 @@ func (a *Adapter) DeleteVM(ctx context.Context, location, uuid, clusterName, nod
 		if rollbackFloatingIPUpdateMatchesIdentity(identity.FloatingIPUpdate, identity, uuid) {
 			rollbackUpdates = append(rollbackUpdates, identity.FloatingIPUpdate)
 		}
-		if floatingCleanupErr := a.deleteOwnedFloatingIP(ctx, location, effectiveNetworkUUID, *floatingIP, uuid, removalAuthority, tombstoneVerifier, rollbackUpdates...); floatingCleanupErr != nil {
+		// The full spaced core-absence proof above (post-DELETE for a live VM,
+		// preflight for a missing one) already passed and its VM DELETE receipt
+		// is persisted, so the floating-IP removal CAS needs only a confirming
+		// read, not a second spaced proof.
+		if floatingCleanupErr := a.deleteOwnedFloatingIPWithProof(ctx, location, effectiveNetworkUUID, *floatingIP, uuid, removalAuthority, true, tombstoneVerifier, rollbackUpdates...); floatingCleanupErr != nil {
 			// Dependents and firewalls remain intact until every VM index has
 			// converged absent after the canonical VM lifecycle audit.
 			return floatingCleanupErr
@@ -3003,8 +3007,8 @@ func (a *Adapter) DeleteVM(ctx context.Context, location, uuid, clusterName, nod
 	if absenceErr := a.confirmAuthorizedVMAbsence(ctx, location, effectiveNetworkUUID, uuid, "after dependent cleanup", tombstoneVerifier); absenceErr != nil {
 		return absenceErr
 	}
-	deleteStageLog(ctx, "waiting for firewall relation absence", "vmUUID", uuid, "firewallUUID", baseFirewallUUID, "reuseVMAbsenceProof", vmMissing)
-	if err := a.detachFirewallAfterVMDeletionWithProof(ctx, location, effectiveNetworkUUID, baseFirewallUUID, uuid, expectedBillingAccountID, deleteBaseFirewallDetachmentAuthority(identity), vmMissing, tombstoneVerifier); err != nil {
+	deleteStageLog(ctx, "waiting for firewall relation absence", "vmUUID", uuid, "firewallUUID", baseFirewallUUID)
+	if err := a.detachFirewallAfterVMDeletionWithProof(ctx, location, effectiveNetworkUUID, baseFirewallUUID, uuid, expectedBillingAccountID, deleteBaseFirewallDetachmentAuthority(identity), true, tombstoneVerifier); err != nil {
 		errs = append(errs, err)
 	}
 	if len(errs) != 0 {
@@ -6491,6 +6495,25 @@ func (a *Adapter) deleteOwnedFloatingIP(
 	tombstoneVerifier *deletedVMTombstoneVerifier,
 	rollbackUpdates ...cloudapi.FloatingIPUpdateFence,
 ) error {
+	return a.deleteOwnedFloatingIPWithProof(ctx, location, networkUUID, floatingIP, expectedVMUUID, authority, false, tombstoneVerifier, rollbackUpdates...)
+}
+
+// deleteOwnedFloatingIPWithProof is deleteOwnedFloatingIP for a caller that
+// already holds the full spaced proof that the VM is absent from every core
+// index and persisted its VM DELETE receipt. priorAbsenceProven then replaces
+// the spaced VM re-proof that follows each removal CAS with one confirming
+// read; the exact floating-IP reads before and after it, and the spaced
+// floating-IP absence proof, are unchanged.
+func (a *Adapter) deleteOwnedFloatingIPWithProof(
+	ctx context.Context,
+	location, networkUUID string,
+	floatingIP sdk.FloatingIP,
+	expectedVMUUID string,
+	authority removalMutationAuthority,
+	priorAbsenceProven bool,
+	tombstoneVerifier *deletedVMTombstoneVerifier,
+	rollbackUpdates ...cloudapi.FloatingIPUpdateFence,
+) error {
 	expectedVMUUID = strings.ToLower(expectedVMUUID)
 	allowRollbackUpdate := len(rollbackUpdates) != 0
 	if allowRollbackUpdate {
@@ -6577,7 +6600,7 @@ func (a *Adapter) deleteOwnedFloatingIP(
 					}
 					if authorization.AllowMutation {
 						if authority.complete() {
-							if proofErr := a.proveFreshFloatingIPRemovalTarget(readbackCtx, location, networkUUID, floatingIP, expectedVMUUID, true, tombstoneVerifier, allowRollbackUpdate); proofErr != nil {
+							if proofErr := a.proveFreshFloatingIPRemovalTarget(readbackCtx, location, networkUUID, floatingIP, expectedVMUUID, true, priorAbsenceProven, tombstoneVerifier, allowRollbackUpdate); proofErr != nil {
 								rejectErr := a.rejectRemovalMutation(readbackCtx, authority, authorization)
 								return errors.Join(cloudapi.ErrCreateAttemptPending,
 									fmt.Errorf("fresh mutation-target proof blocked floating IP %s unassignment: %w", current.Address, proofErr), rejectErr)
@@ -6617,7 +6640,7 @@ func (a *Adapter) deleteOwnedFloatingIP(
 					}
 					if deleteAuthorization.AllowMutation {
 						if authority.complete() {
-							if proofErr := a.proveFreshFloatingIPRemovalTarget(readbackCtx, location, networkUUID, floatingIP, expectedVMUUID, false, tombstoneVerifier, allowRollbackUpdate); proofErr != nil {
+							if proofErr := a.proveFreshFloatingIPRemovalTarget(readbackCtx, location, networkUUID, floatingIP, expectedVMUUID, false, priorAbsenceProven, tombstoneVerifier, allowRollbackUpdate); proofErr != nil {
 								rejectErr := a.rejectRemovalMutation(readbackCtx, authority, deleteAuthorization)
 								return errors.Join(cloudapi.ErrCreateAttemptPending,
 									fmt.Errorf("fresh mutation-target proof blocked floating IP %s deletion: %w", current.Address, proofErr), rejectErr)
@@ -6770,6 +6793,7 @@ func (a *Adapter) proveFreshFloatingIPRemovalTarget(
 	expected sdk.FloatingIP,
 	expectedVMUUID string,
 	requireAssigned bool,
+	priorAbsenceProven bool,
 	tombstoneVerifier *deletedVMTombstoneVerifier,
 	allowRollbackUpdates ...bool,
 ) error {
@@ -6805,8 +6829,15 @@ func (a *Adapter) proveFreshFloatingIPRemovalTarget(
 	}
 	// A floating IP may legitimately retain its deleted VM UUID while cloud
 	// relation convergence lags. Re-prove the VM absent from Get/List/VPC after
-	// the CAS so UUID reuse cannot redirect the dependent mutation.
-	if err := a.waitForAuthorizedVMCoreAbsence(ctx, location, networkUUID, expectedVMUUID, "during floating-IP removal authorization", tombstoneVerifier); err != nil {
+	// the CAS so UUID reuse cannot redirect the dependent mutation. A caller
+	// that proved the VM absent with the full spaced proof moments earlier only
+	// needs one confirming read here: the exact floating-IP reads on both sides
+	// still bind the mutation, and a VM that has reappeared is still rejected.
+	vmAbsence := a.waitForAuthorizedVMCoreAbsence
+	if priorAbsenceProven {
+		vmAbsence = a.confirmAuthorizedVMCoreAbsence
+	}
+	if err := vmAbsence(ctx, location, networkUUID, expectedVMUUID, "during floating-IP removal authorization", tombstoneVerifier); err != nil {
 		return err
 	}
 	return readExact()

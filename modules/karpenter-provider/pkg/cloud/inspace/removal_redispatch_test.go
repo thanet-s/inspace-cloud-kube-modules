@@ -338,9 +338,10 @@ func TestDeleteConfirmsDependentAbsenceWithOneReadAfterFloatingIPCleanup(t *test
 	}
 	reads := countOperation(api.operations[lastFloatingIPDelete:firstDetach], "get-vm")
 	// Core absence was already proven with spaced reads and persisted before the
-	// floating IP was removed, and the firewall DELETE re-proves core absence
-	// immediately before dispatch. One dependent read closes the gap between.
-	if want := 1 + destructiveAbsenceConfirmations; reads != want {
+	// floating IP was removed, and the firewall DELETE re-confirms core absence
+	// with one read immediately before dispatch (it no longer repeats the spaced
+	// proof). One dependent read closes the gap between.
+	if want := 1 + 1; reads != want {
 		t.Fatalf("canonical VM reads between floating-IP cleanup and firewall DELETE = %d, want %d; operations=%v", reads, want, api.operations)
 	}
 }

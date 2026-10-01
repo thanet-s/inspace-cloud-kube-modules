@@ -8,9 +8,18 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-logr/logr"
+	ctrllog "sigs.k8s.io/controller-runtime/pkg/log"
+
 	sdk "github.com/thanet-s/inspace-cloud-kube-modules/modules/client"
 	cloudapi "github.com/thanet-s/inspace-cloud-kube-modules/modules/karpenter-provider/pkg/cloud"
 )
+
+func init() {
+	// DeleteVM logs its proof stages; without a configured root logger
+	// controller-runtime prints a one-time stack trace into the test output.
+	ctrllog.SetLogger(logr.Discard())
+}
 
 // virtualReadbackClock replaces the spaced-observation sleeps with a recording
 // virtual clock so a test can state how long a cleanup path would have waited

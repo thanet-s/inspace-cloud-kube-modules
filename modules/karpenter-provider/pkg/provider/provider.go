@@ -545,6 +545,23 @@ func (p *CloudProvider) delete(ctx context.Context, nodeClaim *karpv1.NodeClaim,
 		deleteIdentity.BillingAccountID = billingAccountID
 	}
 	logger := ctrllog.FromContext(ctx).WithValues("nodeClaim", nodeClaim.Name, "vmUUID", id.VMUUID)
+	// Karpenter patches the NodeClaim with an optimistic lock after Delete
+	// returns, and the durable fence writes made while deleting change its
+	// resource version, so Karpenter normally calls Delete a second time. If a
+	// previous Delete already converged and recorded a marker bound to this exact
+	// VM, floating IP and firewall, one exact GET by UUID that answers 404 is
+	// enough to say the same thing again. Any other answer (the VM is back, a
+	// server error, a timeout, an ownership error) runs the full delete below.
+	if retainedFence != nil && retainedFence.terminalCleanupConverged() {
+		_, getErr := p.cloud.GetVM(ctx, id.Location, id.VMUUID, deleteClusterName)
+		if errors.Is(getErr, cloudapi.ErrNotFound) {
+			logger.Info("terminal cleanup marker matches and the VM is exactly absent; skipping the repeat delete proof",
+				"terminalCleanupObservedAt", retainedFence.TerminalCleanup.ObservedAt.Format(time.RFC3339))
+			return cloudprovider.NewNodeClaimNotFoundError(fmt.Errorf("VM %s deletion already converged", id.VMUUID))
+		}
+		logger.Info("terminal cleanup marker matches but the exact VM read did not return 404; running the full delete",
+			"result", fmt.Sprint(getErr))
+	}
 	logger.V(1).Info("deleting VM and proving VM, floating IP and firewall relation absence")
 	if err := p.cloud.DeleteVM(ctx, id.Location, id.VMUUID, deleteClusterName, nodeClaim.Name, deleteIdentity); err != nil {
 		if errors.Is(err, cloudapi.ErrNotFound) {
