@@ -11,7 +11,12 @@ import (
 )
 
 var (
-	ErrNotFound                    = errors.New("cloud resource not found")
+	ErrNotFound = errors.New("cloud resource not found")
+	// ErrDeletionConverged accompanies ErrNotFound when DeleteVM found the VM
+	// already absent and then drove its floating IP and base-firewall relation
+	// to proven absence in the same call. A bare ErrNotFound carries no such
+	// guarantee, so only this sentinel may be recorded as a converged cleanup.
+	ErrDeletionConverged           = errors.New("VM deletion and dependent cleanup converged")
 	ErrOwnershipMismatch           = errors.New("cloud resource ownership does not match")
 	ErrAttachedNonPrimaryVolumes   = errors.New("VM has attached non-primary block volumes")
 	ErrVMStorageInventoryUncertain = errors.New("VM storage inventory is not authoritative")
@@ -138,6 +143,14 @@ type FencedCreateCleanupResolution struct {
 	VMUUID         string `json:"vmUUID"`
 	FloatingIPName string `json:"floatingIPName"`
 	PublicIPv4     string `json:"publicIPv4"`
+	// Converged is set by the controller, never persisted with the receipt, when
+	// a durable terminal-cleanup marker bound to exactly this VM UUID, floating
+	// IP name/address and base firewall proves that the provider's own delete
+	// already drove the VM, floating IP and firewall relation to absence. The
+	// adapter then skips the destructive DeleteVM replay for this receipt and
+	// runs only the read-only audit, which still treats any reappearance as
+	// pending.
+	Converged bool `json:"-"`
 }
 
 // FencedCreateCleanupResult is empty when cleanup is complete. Resolution is

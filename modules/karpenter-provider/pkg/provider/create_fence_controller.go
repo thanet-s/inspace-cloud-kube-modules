@@ -16,6 +16,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	ctrllog "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
@@ -82,6 +83,9 @@ func (c *CreateFenceController) Reconcile(ctx context.Context, nodeClaim *karpv1
 	if record.Binding.NodeClaimUID != string(nodeClaim.UID) || record.Cleanup.NodeClaimName != nodeClaim.Name {
 		return reconcile.Result{}, fmt.Errorf("NodeClaim %q create-protection identity does not match its UID/name", nodeClaim.Name)
 	}
+	// Pending results return RequeueAfter with a nil error, so without these
+	// log lines a cleanup that is merely waiting looks identical to a stuck one.
+	logger := ctrllog.FromContext(ctx).WithValues("nodeClaim", nodeClaim.Name, "phase", record.Phase)
 
 	deleting := !nodeClaim.DeletionTimestamp.IsZero()
 	rollbackChosen := record.Phase == createFenceIssued && record.RollbackAt != nil
@@ -105,6 +109,7 @@ func (c *CreateFenceController) Reconcile(ctx context.Context, nodeClaim *karpv1
 	// Avoid racing Karpenter's normal Delete path. Once its finalizer disappears,
 	// independently prove that no VM/FIP escaped before releasing ours.
 	if deleting && nodeClaim.Status.ProviderID != "" && controllerutil.ContainsFinalizer(nodeClaim, karpv1.TerminationFinalizer) {
+		logger.Info("create-protection cleanup is waiting for Karpenter termination to finish deleting the VM", "requeueAfter", createFenceCleanupRequeue.String())
 		return reconcile.Result{RequeueAfter: createFenceCleanupRequeue}, nil
 	}
 	if deleting && record.Phase == createFenceIssued && record.CreatedVMUUID != "" && record.RollbackAt == nil {
@@ -136,6 +141,20 @@ func (c *CreateFenceController) Reconcile(ctx context.Context, nodeClaim *karpv1
 		})
 		if err != nil {
 			return reconcile.Result{}, fmt.Errorf("NodeClaim %q materialized cleanup receipt: %w", nodeClaim.Name, err)
+		}
+	}
+	// A terminal-cleanup marker that names exactly this materialized VM, floating
+	// IP and firewall lets the cloud skip the destructive DeleteVM replay for
+	// that receipt. The marker is matched against the stored identity here, so a
+	// stale or foreign marker never shortens anything.
+	if record.terminalCleanupConverged() {
+		for i := range resolutions {
+			if resolutions[i].VMUUID == record.ObservedVMUUID && resolutions[i].FloatingIPName == record.FloatingIPName &&
+				resolutions[i].PublicIPv4 == record.PublicIPv4 {
+				resolutions[i].Converged = true
+				logger.Info("terminal cleanup marker matches the materialized receipt; cleanup runs only the read-only audit",
+					"vmUUID", resolutions[i].VMUUID, "terminalCleanupObservedAt", record.TerminalCleanup.ObservedAt.Format(time.RFC3339))
+			}
 		}
 	}
 	attemptResolved := record.Phase == createFenceMaterialized || record.Phase == createFenceRejected || record.Intent == cloudapi.CreateAuthorizationAdoption
@@ -307,6 +326,8 @@ func (c *CreateFenceController) Reconcile(ctx context.Context, nodeClaim *karpv1
 				}
 				issuedAt, unresolved := unresolvedProtectionIssuedAt(record, freshUpdate, freshHasUpdate)
 				if unresolved && c.now().UTC().Before(issuedAt.Add(createProtectionIssueDeadline)) {
+					logger.Info("anchored VM protection is still unresolved; waiting before choosing rollback",
+						"reason", protectErr.Error(), "deadline", issuedAt.Add(createProtectionIssueDeadline).UTC().Format(time.RFC3339), "requeueAfter", createFenceCleanupRequeue.String())
 					return reconcile.Result{RequeueAfter: createFenceCleanupRequeue}, nil
 				}
 				if !unresolved && errors.Is(protectErr, cloudapi.ErrCreateAttemptPending) {
@@ -326,6 +347,8 @@ func (c *CreateFenceController) Reconcile(ctx context.Context, nodeClaim *karpv1
 					}
 					nodeClaim = failedClaim
 					if c.now().UTC().Before(failureAt.Add(createProtectionIssueDeadline)) {
+						logger.Info("anchored VM protection failed; waiting for the durable failure deadline before choosing rollback",
+							"reason", protectErr.Error(), "deadline", failureAt.Add(createProtectionIssueDeadline).UTC().Format(time.RFC3339), "requeueAfter", createFenceCleanupRequeue.String())
 						return reconcile.Result{RequeueAfter: createFenceCleanupRequeue}, nil
 					}
 				}
@@ -403,6 +426,8 @@ func (c *CreateFenceController) Reconcile(ctx context.Context, nodeClaim *karpv1
 		return reconcile.Result{}, c.removeProtection(ctx, nodeClaim)
 	}
 	if errors.Is(err, cloudapi.ErrCreateAttemptPending) {
+		logger.Info("create-protection cleanup is pending; the finalizer is kept and the audit repeats",
+			"reason", err.Error(), "requeueAfter", createFenceCleanupRequeue.String())
 		return reconcile.Result{RequeueAfter: createFenceCleanupRequeue}, nil
 	}
 	if errors.Is(err, cloudapi.ErrCreateAttemptUnresolved) {
@@ -411,6 +436,7 @@ func (c *CreateFenceController) Reconcile(ctx context.Context, nodeClaim *karpv1
 	if err != nil {
 		return reconcile.Result{}, err
 	}
+	logger.Info("create-protection cleanup has no result yet; requeueing", "requeueAfter", createFenceCleanupRequeue.String())
 	return reconcile.Result{RequeueAfter: createFenceCleanupRequeue}, nil
 }
 
