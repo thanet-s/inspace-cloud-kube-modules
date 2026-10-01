@@ -145,6 +145,14 @@
       - csi_storage_class_default | default(false) is boolean
     fail_msg: "csi_storage_class_default must be true or false."
 
+# False skips the one-time reboot that init gives the bastion and every control
+# plane after the first-boot apt-get upgrade. skip_os_upgrade: true skips it too.
+- name: Require a boolean post-upgrade reboot choice
+  ansible.builtin.assert:
+    that:
+      - post_upgrade_reboot | default(true) is boolean
+    fail_msg: "post_upgrade_reboot must be true or false."
+
 # A name adds a deploy-owned public-node-local NodeClass for operator edge
 # NodePools. It must not reuse the default or CCM's generated Node-LB NodeClass.
 - name: Require a valid optional public-node-local Karpenter NodeClass

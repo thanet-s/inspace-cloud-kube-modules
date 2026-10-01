@@ -28,6 +28,11 @@ import (
 // is not worth it. Existing workers keep their shell until replaced.
 // The registry egress gate (v1.1.0-rc.8) also kept v13: it only decides
 // whether a new node registers and never changes a registered node.
+// The reboot before joining (v1.1.3) also kept v13: it is rendered only into a
+// new node's first-boot cloud-init when the OS upgrade runs, and it acts only
+// when the upgrade left /run/reboot-required. Neither drift hash covers
+// rendered bytes, so running workers are not replaced just to gain it; they
+// keep their kernel until Karpenter replaces them.
 const (
 	SchemaVersion         = "stock-ubuntu-rke2-v13"
 	VPCSubnetPlaceholder  = "__INSPACE_VPC_SUBNET__"
@@ -541,8 +546,18 @@ set -eu
 /usr/local/sbin/inspace-apply-node-tuning
 /usr/local/sbin/inspace-disable-host-firewall
 /usr/local/sbin/inspace-verify-host-firewall
-/usr/local/sbin/inspace-start-rke2-agent
 `)
+	if config.SkipOSUpgrade {
+		orchestrator.WriteString("/usr/local/sbin/inspace-start-rke2-agent\n")
+	} else {
+		// apt-get upgrade ran during first boot. Reboot before joining when it
+		// left a reboot pending, then start the agent on the next boot.
+		doc.WriteFiles = append(doc.WriteFiles,
+			encodedWriteFile(postRebootUnitPath, "0644", postRebootUnit),
+			encodedWriteFile(startOrRebootPath, "0700", startOrRebootScript),
+		)
+		orchestrator.WriteString(startOrRebootPath + "\n")
+	}
 	doc.WriteFiles = append(doc.WriteFiles, encodedWriteFile("/usr/local/sbin/inspace-bootstrap-rke2-agent", "0700", orchestrator.String()))
 	doc.RunCmd = []string{"/usr/local/sbin/inspace-bootstrap-rke2-agent"}
 
@@ -552,6 +567,61 @@ set -eu
 	}
 	return string(data), nil
 }
+
+const (
+	startOrRebootPath  = "/usr/local/sbin/inspace-start-rke2-agent-or-reboot"
+	postRebootUnitPath = "/etc/systemd/system/inspace-post-reboot-start-rke2-agent.service"
+	postRebootUnitName = "inspace-post-reboot-start-rke2-agent.service"
+	postUpgradeMarker  = "/var/lib/inspace/post-upgrade-reboot.done"
+)
+
+// postRebootUnit starts the RKE2 agent on the boot after the post-upgrade
+// reboot. It runs the whole inspace-start-rke2-agent script, not a bare
+// `systemctl start`, so the bounded wait and the fail-fast on a failed service
+// stay identical. It disables itself after a successful start. On a failure it
+// stays failed, the node never registers, and Karpenter replaces it, exactly
+// as for a failed start without a reboot. The egress gates do not run again:
+// the floating IP does not change across a reboot and the node passed them
+// before it rebooted.
+const postRebootUnit = `[Unit]
+Description=Start the RKE2 agent after the post-upgrade reboot
+Wants=network-online.target
+After=network-online.target cloud-init.service
+ConditionPathExists=` + postUpgradeMarker + `
+
+[Service]
+Type=oneshot
+TimeoutStartSec=20min
+ExecStart=/usr/local/sbin/inspace-start-rke2-agent
+ExecStartPost=/usr/bin/systemctl disable ` + postRebootUnitName + `
+
+[Install]
+WantedBy=multi-user.target
+`
+
+// startOrRebootScript replaces the direct agent start when the first-boot OS
+// upgrade ran. If the upgrade left /run/reboot-required, it reboots the node
+// BEFORE it joins: Karpenter binds pending pods the moment a node registers,
+// so a reboot after joining would restart the scale-up's own workload. The
+// post-reboot unit then starts the agent on the next boot. The marker is
+// written before the reboot, so the reboot happens at most once. cloud-init
+// runs runcmd once per instance, so the orchestrator does not run again.
+const startOrRebootScript = `#!/bin/sh
+set -eu
+marker=` + postUpgradeMarker + `
+if [ ! -e "$marker" ] && [ -e /run/reboot-required ]; then
+  systemctl daemon-reload
+  systemctl enable ` + postRebootUnitName + `
+  install -d -m 0755 /var/lib/inspace
+  date -u +%Y-%m-%dT%H:%M:%SZ >"$marker"
+  sync
+  systemctl reboot --no-block
+  sleep 300
+  echo "reboot did not start; the RKE2 agent was not started" >&2
+  exit 1
+fi
+exec /usr/local/sbin/inspace-start-rke2-agent
+`
 
 func hasNodeRestrictionPrefix(key string) bool {
 	prefix, _, hasPrefix := strings.Cut(key, "/")

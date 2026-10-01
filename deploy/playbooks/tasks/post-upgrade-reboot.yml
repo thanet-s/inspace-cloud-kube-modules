@@ -1,0 +1,35 @@
+---
+# Reboot every deploy-created host that has a pending reboot (the helper checks
+# /run/reboot-required) so the first-boot apt-get upgrade (new kernel, libc)
+# takes effect. Only init includes this file, and only when the OS upgrade ran
+# and post_upgrade_reboot is true. Control planes go one at a
+# time through the bastion; the bastion goes last because every control-plane
+# SSH hop and the API tunnel depend on it.
+- name: Reboot control planes one at a time after the first-boot OS upgrade
+  ansible.builtin.include_tasks: post-upgrade-reboot-one-host.yml
+  vars:
+    deploy_reboot_host: "inspace-cp{{ deploy_cp_index }}"
+    deploy_reboot_node_name: "{{ deploy_control_plane.name }}"
+    deploy_reboot_is_cp: true
+  loop: "{{ deployment_state.controlPlanes }}"
+  loop_control:
+    loop_var: deploy_control_plane
+    index_var: deploy_cp_index
+    label: "{{ deploy_control_plane.name }}"
+
+- name: Stop the private API tunnel before rebooting the bastion
+  ansible.builtin.command:
+    argv:
+      - "{{ deploy_root }}/scripts/api-tunnel.sh"
+      - stop
+      - "{{ deploy_state_dir }}"
+  changed_when: false
+
+- name: Reboot the bastion after the first-boot OS upgrade
+  ansible.builtin.include_tasks: post-upgrade-reboot-one-host.yml
+  vars:
+    deploy_reboot_host: inspace-bastion
+    deploy_reboot_is_cp: false
+
+- name: Start the private API tunnel again and wait for readiness
+  ansible.builtin.include_tasks: start-tunnel.yml

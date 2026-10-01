@@ -1,0 +1,217 @@
+---
+# Reboot one deploy-created host (a control plane or the bastion) once, after
+# the first-boot apt-get upgrade, so the upgraded kernel and libc take effect.
+# Required vars: deploy_reboot_host (an ssh-config alias), deploy_reboot_is_cp
+# and, for a control plane, deploy_reboot_node_name. The helper's `check`
+# prints "needed" only for a host with /run/reboot-required and no marker, so
+# a host without a pending reboot is left alone and a re-run of init never
+# reboots a host twice. Every kubectl or readiness check through the tunnel
+# retries, because rebooting the host that holds the VIP can interrupt it.
+- name: Require every control-plane node Ready before rebooting {{ deploy_reboot_host }}
+  ansible.builtin.command:
+    argv:
+      - kubectl
+      - --kubeconfig
+      - "{{ deploy_state_dir }}/kubeconfig.yaml"
+      - wait
+      - --for=condition=Ready
+      - node
+      - -l
+      - node-role.kubernetes.io/control-plane
+      - --timeout=2m
+  register: deploy_reboot_nodes_ready
+  changed_when: false
+  # Every call through the tunnel is retried, so an API blip while kube-vip
+  # moves the VIP does not fail init.
+  retries: 10
+  delay: 15
+  until: deploy_reboot_nodes_ready.rc == 0
+  when: deploy_reboot_is_cp | bool
+
+- name: Require etcd to be ready on every control plane before rebooting {{ deploy_reboot_host }}
+  ansible.builtin.command:
+    argv:
+      - ssh
+      - -F
+      - "{{ deploy_state_dir }}/ssh-config"
+      - "inspace-cp{{ deploy_etcd_index }}"
+      - >-
+        sudo /var/lib/rancher/rke2/bin/kubectl
+        --kubeconfig /etc/rancher/rke2/rke2.yaml
+        --request-timeout=10s get --raw=/readyz/etcd
+  loop: "{{ deployment_state.controlPlanes }}"
+  loop_control:
+    index_var: deploy_etcd_index
+    label: "{{ item.name }}"
+  register: deploy_reboot_etcd_ready
+  changed_when: false
+  retries: 60
+  delay: 5
+  until: deploy_reboot_etcd_ready.rc == 0
+  when: deploy_reboot_is_cp | bool
+
+- name: Copy the post-upgrade reboot helper to {{ deploy_reboot_host }}
+  ansible.builtin.command:
+    argv:
+      - scp
+      - -F
+      - "{{ deploy_state_dir }}/ssh-config"
+      - "{{ deploy_root }}/templates/post-upgrade-reboot.sh"
+      - "{{ deploy_reboot_host }}:/tmp/inspace-post-upgrade-reboot.sh"
+  changed_when: false
+
+- name: Decide whether {{ deploy_reboot_host }} still needs its post-upgrade reboot
+  ansible.builtin.command:
+    argv:
+      - ssh
+      - -F
+      - "{{ deploy_state_dir }}/ssh-config"
+      - "{{ deploy_reboot_host }}"
+      - sudo sh /tmp/inspace-post-upgrade-reboot.sh check
+  register: deploy_post_upgrade_reboot_check
+  changed_when: false
+
+- name: Reboot {{ deploy_reboot_host }} once and remember its previous boot
+  ansible.builtin.command:
+    argv:
+      - ssh
+      - -F
+      - "{{ deploy_state_dir }}/ssh-config"
+      - "{{ deploy_reboot_host }}"
+      - sudo sh /tmp/inspace-post-upgrade-reboot.sh reboot
+  register: deploy_post_upgrade_reboot_request
+  changed_when: true
+  when: deploy_post_upgrade_reboot_check.stdout == 'needed'
+
+- name: Wait for {{ deploy_reboot_host }} to come back on a new boot
+  ansible.builtin.command:
+    argv:
+      - ssh
+      - -F
+      - "{{ deploy_state_dir }}/ssh-config"
+      - "{{ deploy_reboot_host }}"
+      - cat /proc/sys/kernel/random/boot_id
+  register: deploy_post_upgrade_boot_id
+  changed_when: false
+  retries: 60
+  delay: 10
+  until: >-
+    deploy_post_upgrade_boot_id.rc == 0 and
+    deploy_post_upgrade_boot_id.stdout | trim | length > 0 and
+    deploy_post_upgrade_boot_id.stdout | trim != deploy_post_upgrade_reboot_request.stdout | trim
+  when: deploy_post_upgrade_reboot_check.stdout == 'needed'
+
+- name: Wait for the restarted local RKE2 API on {{ deploy_reboot_host }}
+  ansible.builtin.command:
+    argv:
+      - ssh
+      - -F
+      - "{{ deploy_state_dir }}/ssh-config"
+      - "{{ deploy_reboot_host }}"
+      - >-
+        sudo /var/lib/rancher/rke2/bin/kubectl
+        --kubeconfig /etc/rancher/rke2/rke2.yaml
+        --request-timeout=10s get --raw=/readyz
+  register: deploy_local_rke2_ready
+  changed_when: false
+  retries: 120
+  delay: 5
+  until: deploy_local_rke2_ready.rc == 0
+  when: deploy_post_upgrade_reboot_check.stdout == 'needed' and deploy_reboot_is_cp | bool
+
+- name: Wait for the restarted local etcd on {{ deploy_reboot_host }}
+  ansible.builtin.command:
+    argv:
+      - ssh
+      - -F
+      - "{{ deploy_state_dir }}/ssh-config"
+      - "{{ deploy_reboot_host }}"
+      - >-
+        sudo /var/lib/rancher/rke2/bin/kubectl
+        --kubeconfig /etc/rancher/rke2/rke2.yaml
+        --request-timeout=10s get --raw=/readyz/etcd
+  register: deploy_local_etcd_ready
+  changed_when: false
+  retries: 120
+  delay: 5
+  until: deploy_local_etcd_ready.rc == 0
+  when: deploy_post_upgrade_reboot_check.stdout == 'needed' and deploy_reboot_is_cp | bool
+
+- name: Wait for {{ deploy_reboot_node_name | default(deploy_reboot_host) }} to become Ready after its reboot
+  ansible.builtin.command:
+    argv:
+      - kubectl
+      - --kubeconfig
+      - "{{ deploy_state_dir }}/kubeconfig.yaml"
+      - wait
+      - --for=condition=Ready
+      - "node/{{ deploy_reboot_node_name }}"
+      - --timeout=2m
+  register: deploy_rebooted_node_ready
+  changed_when: false
+  retries: 15
+  delay: 15
+  until: deploy_rebooted_node_ready.rc == 0
+  when: deploy_post_upgrade_reboot_check.stdout == 'needed' and deploy_reboot_is_cp | bool
+
+- name: Require the private API to recover before rebooting the next host
+  ansible.builtin.command:
+    argv:
+      - kubectl
+      - --kubeconfig
+      - "{{ deploy_state_dir }}/kubeconfig.yaml"
+      - --request-timeout=10s
+      - get
+      - --raw=/readyz
+  register: deploy_control_plane_api_recovery
+  changed_when: false
+  retries: 60
+  delay: 5
+  until: deploy_control_plane_api_recovery.rc == 0
+  when: deploy_post_upgrade_reboot_check.stdout == 'needed' and deploy_reboot_is_cp | bool
+
+# A cached bastion serves every RKE2 image and archive to the nodes, so it is
+# only done when its cache service and TLS front answer again.
+- name: Wait for the bootstrap cache on {{ deploy_reboot_host }} to serve again
+  ansible.builtin.command:
+    argv:
+      - ssh
+      - -F
+      - "{{ deploy_state_dir }}/ssh-config"
+      - "{{ deploy_reboot_host }}"
+      - >-
+        systemctl is-active --quiet inspace-cache.service &&
+        sudo curl --fail --silent --show-error --connect-timeout 5 --max-time 15
+        --cacert /etc/inspace-cache/tls/ca.crt
+        --output /dev/null
+        https://{{ bootstrap_result.bootstrapCacheRegistry | quote }}/healthz
+  register: deploy_bastion_cache_ready
+  changed_when: false
+  retries: 90
+  delay: 10
+  until: deploy_bastion_cache_ready.rc == 0
+  when:
+    - deploy_post_upgrade_reboot_check.stdout == 'needed'
+    - not deploy_reboot_is_cp | bool
+    - not bootstrap_direct_download | bool
+
+- name: Record the completed post-upgrade reboot on {{ deploy_reboot_host }}
+  ansible.builtin.command:
+    argv:
+      - ssh
+      - -F
+      - "{{ deploy_state_dir }}/ssh-config"
+      - "{{ deploy_reboot_host }}"
+      - sudo sh /tmp/inspace-post-upgrade-reboot.sh mark
+  changed_when: false
+  when: deploy_post_upgrade_reboot_check.stdout == 'needed'
+
+- name: Remove the post-upgrade reboot helper from {{ deploy_reboot_host }}
+  ansible.builtin.command:
+    argv:
+      - ssh
+      - -F
+      - "{{ deploy_state_dir }}/ssh-config"
+      - "{{ deploy_reboot_host }}"
+      - rm -f /tmp/inspace-post-upgrade-reboot.sh
+  changed_when: false
