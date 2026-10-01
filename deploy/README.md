@@ -106,6 +106,7 @@ choice:
 | --- | --- | --- |
 | `bootstrap_direct_download` | `false` | Bastion cache setup, control-plane downloads, and every generated Karpenter `InSpaceNodeClass` |
 | `skip_os_upgrade` | `false` | Bastion, every fixed control-plane server, and every worker created from a generated Karpenter `InSpaceNodeClass` |
+| `post_upgrade_reboot` | `true` | The one-time reboot `init` gives the bastion and every fixed control-plane server after the first-boot OS upgrade |
 
 Cached mode (`bootstrap_direct_download: false`) is the normal path. The
 bastion serves the private RKE2 asset and system-image cache, and both fixed
@@ -117,6 +118,23 @@ skips the one-time `apt-get upgrade -y`, but still configures mirrors and DNS,
 runs `apt-get update`, installs required packages, and disables later automatic
 APT upgrades. Keep the production default `false` for both control-plane and
 Karpenter nodes.
+
+When the first-boot OS upgrade runs, a new kernel or libc only takes effect
+after a reboot. Every Karpenter worker therefore reboots itself exactly once,
+after it registers with the cluster (a `skipOSUpgrade: true` NodeClass never
+does). With `skip_os_upgrade: false`, `init` also reboots the bastion and the
+fixed control planes once, at the end of the run: control planes one at a time,
+each only after every control-plane node is Ready and etcd is healthy, and the
+bastion last, with the API tunnel stopped and restarted around it. A reboot
+leaves a marker on the host, and a host that has rebooted since cloud-init ran
+is never rebooted again, so a repeated `init` does not reboot it twice.
+`update` never runs `apt-get upgrade` and never reboots anything. Set
+`post_upgrade_reboot: false` to skip the control-plane and bastion reboots.
+
+Warning: re-running `init` with `post_upgrade_reboot: true` on a cluster that an
+older release created reboots, one at a time, every bastion or control-plane
+host that has not rebooted since it was created. Set
+`post_upgrade_reboot: false` to avoid that.
 
 ## Ubuntu release
 

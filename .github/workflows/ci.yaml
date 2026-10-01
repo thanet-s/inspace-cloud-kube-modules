@@ -246,7 +246,9 @@ jobs:
           bash -n deploy/run.sh deploy/container-entrypoint.sh deploy/scripts/api-tunnel.sh
           sh -n deploy/templates/apply-control-plane-config.sh
           sh -n deploy/templates/refresh-bootstrap-cache.sh
+          sh -n deploy/templates/post-upgrade-reboot.sh
           python3 deploy/scripts/test_refresh_bootstrap_cache.py
+          python3 deploy/scripts/test_post_upgrade_reboot.py
           python3 deploy/scripts/test_resolve_release_images.py
           python3 deploy/scripts/test_validate_rke2_upgrade.py
 

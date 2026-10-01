@@ -235,6 +235,180 @@ func TestSkipOSUpgradePreservesWorkerPackageAndMirrorWork(t *testing.T) {
 	}
 }
 
+func TestRenderedPostUpgradeRebootRunsLastAfterAgentStart(t *testing.T) {
+	data, err := RenderCloudInit(Config{
+		NodeName: "worker-1", Server: "https://10.0.0.10:9345", Token: "secret-token",
+		RKE2Version: "v1.36.5-rc2+rke2r1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc := mustDocument(t, data)
+	script := writeFileContent(t, doc, postUpgradeRebootPath)
+	for _, file := range doc.WriteFiles {
+		if file.Path == postUpgradeRebootPath && file.Permissions != "0700" {
+			t.Fatalf("post-upgrade reboot script permissions = %s, want 0700", file.Permissions)
+		}
+	}
+	for _, want := range []string{
+		"node='worker-1'",
+		"/var/lib/inspace/post-upgrade-reboot.done",
+		"/var/lib/rancher/rke2/agent/kubelet.kubeconfig",
+		`karpenter\.sh/registered`,
+		"systemctl reboot",
+	} {
+		if !strings.Contains(script, want) {
+			t.Errorf("post-upgrade reboot script lacks %q\n%s", want, script)
+		}
+	}
+	command := exec.Command("sh", "-n")
+	command.Stdin = strings.NewReader(script)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("post-upgrade reboot script is not valid shell: %v\n%s", err, output)
+	}
+
+	orchestrator := writeFileContent(t, doc, "/usr/local/sbin/inspace-bootstrap-rke2-agent")
+	lines := strings.Split(strings.TrimRight(orchestrator, "\n"), "\n")
+	wantLast := "systemd-run --unit=inspace-post-upgrade-reboot --no-block --collect " + postUpgradeRebootPath
+	if lines[len(lines)-1] != wantLast {
+		t.Fatalf("orchestrator last line = %q, want %q", lines[len(lines)-1], wantLast)
+	}
+	if lines[len(lines)-2] != "/usr/local/sbin/inspace-start-rke2-agent" {
+		t.Fatalf("post-upgrade reboot must directly follow the agent start, got %q", lines[len(lines)-2])
+	}
+	if strings.Count(orchestrator, "inspace-post-upgrade-reboot") != 2 {
+		t.Fatalf("orchestrator must reference the reboot only in its unit name and path\n%s", orchestrator)
+	}
+}
+
+func TestSkipOSUpgradeOmitsPostUpgradeReboot(t *testing.T) {
+	data, err := RenderCloudInit(Config{
+		NodeName: "worker-1", Server: "https://10.0.0.10:9345", Token: "secret-token",
+		RKE2Version: "v1.36.5-rc2+rke2r1", SkipOSUpgrade: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc, contents := decodedDocument(t, data)
+	for _, file := range doc.WriteFiles {
+		if file.Path == postUpgradeRebootPath {
+			t.Fatalf("skipOSUpgrade render still writes %s", file.Path)
+		}
+	}
+	orchestrator := writeFileContent(t, doc, "/usr/local/sbin/inspace-bootstrap-rke2-agent")
+	if strings.Contains(orchestrator, "post-upgrade-reboot") || strings.Contains(orchestrator, "systemd-run") {
+		t.Fatalf("skipOSUpgrade orchestrator schedules a reboot\n%s", orchestrator)
+	}
+	for _, content := range contents {
+		if strings.Contains(content, "post-upgrade-reboot") {
+			t.Fatalf("skipOSUpgrade render references the post-upgrade reboot:\n%s", content)
+		}
+	}
+}
+
+func TestPostUpgradeRebootWaitsForRegistrationAndRebootsOnce(t *testing.T) {
+	data, err := RenderCloudInit(Config{
+		NodeName: "worker-1", Server: "https://10.0.0.10:9345", Token: "secret-token",
+		RKE2Version: "v1.36.5-rc2+rke2r1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := writeFileContent(t, mustDocument(t, data), postUpgradeRebootPath)
+
+	root := t.TempDir()
+	stubDir := filepath.Join(root, "bin")
+	if err := os.MkdirAll(stubDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// Redirect the node-local state paths into the test sandbox.
+	harness := strings.ReplaceAll(script, "/var/lib/", root+"/var/lib/")
+	kubeconfig := filepath.Join(root, "var/lib/rancher/rke2/agent/kubelet.kubeconfig")
+	if err := os.MkdirAll(filepath.Dir(kubeconfig), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(kubeconfig, []byte("apiVersion: v1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(root, "var/lib/inspace/post-upgrade-reboot.done")
+	commandLog := filepath.Join(root, "commands.log")
+	labelFile := filepath.Join(root, "registered")
+	kubectl := filepath.Join(stubDir, "kubectl")
+	writeExecutable(t, kubectl, `#!/bin/sh
+printf 'kubectl %s\n' "$*" >> "$COMMAND_LOG"
+if [ -f "$LABEL_FILE" ]; then printf true; fi
+exit 0
+`)
+	writeExecutable(t, filepath.Join(stubDir, "cloud-init"), `#!/bin/sh
+printf 'cloud-init %s\n' "$*" >> "$COMMAND_LOG"
+exit 0
+`)
+	writeExecutable(t, filepath.Join(stubDir, "systemctl"), `#!/bin/sh
+printf 'systemctl %s\n' "$*" >> "$COMMAND_LOG"
+exit 0
+`)
+	writeExecutable(t, filepath.Join(stubDir, "sleep"), "#!/bin/sh\nexit 0\n")
+	run := func() (string, error) {
+		t.Helper()
+		if err := os.WriteFile(commandLog, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		command := exec.Command("sh")
+		command.Stdin = strings.NewReader(harness)
+		command.Env = append(os.Environ(),
+			"PATH="+stubDir+":"+os.Getenv("PATH"),
+			"INSPACE_KUBECTL="+kubectl,
+			"INSPACE_POST_UPGRADE_REBOOT_DEADLINE=0",
+			"COMMAND_LOG="+commandLog, "LABEL_FILE="+labelFile,
+		)
+		output, runErr := command.CombinedOutput()
+		log, readErr := os.ReadFile(commandLog)
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		return string(log) + string(output), runErr
+	}
+
+	// Not registered yet: never reboot, never write the marker, fail loudly.
+	log, err := run()
+	if err == nil {
+		t.Fatalf("unregistered node did not fail the deadline\n%s", log)
+	}
+	if strings.Contains(log, "systemctl reboot") {
+		t.Fatalf("rebooted before Karpenter registration\n%s", log)
+	}
+	if _, statErr := os.Stat(marker); statErr == nil {
+		t.Fatal("marker written before registration")
+	}
+	if !strings.Contains(log, "kubectl --kubeconfig "+kubeconfig) || !strings.Contains(log, "get node worker-1") {
+		t.Fatalf("registration probe did not use the kubelet kubeconfig for the node\n%s", log)
+	}
+
+	// Registered: reboot exactly once and leave the marker.
+	if err := os.WriteFile(labelFile, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	log, err = run()
+	if err != nil {
+		t.Fatalf("registered node failed: %v\n%s", err, log)
+	}
+	if got := strings.Count(log, "systemctl reboot"); got != 1 {
+		t.Fatalf("reboot count = %d, want 1\n%s", got, log)
+	}
+	if _, statErr := os.Stat(marker); statErr != nil {
+		t.Fatalf("marker missing after reboot request: %v", statErr)
+	}
+
+	// Marker present (the boot after the reboot): no probe and no reboot.
+	log, err = run()
+	if err != nil {
+		t.Fatalf("marker run failed: %v\n%s", err, log)
+	}
+	if strings.Contains(log, "systemctl reboot") || strings.Contains(log, "kubectl") {
+		t.Fatalf("script acted although the marker exists\n%s", log)
+	}
+}
+
 func TestRenderPrivateBootstrapCacheOnlyRewritesSystemInfrastructure(t *testing.T) {
 	caBundle := bootstrapTestCABundle(t)
 	data, err := RenderCloudInit(Config{
@@ -360,8 +534,8 @@ func TestRenderedShellScriptsHaveValidSyntax(t *testing.T) {
 		}
 		checked++
 	}
-	if checked != 13 {
-		t.Fatalf("syntax-checked %d shell scripts, want thirteen; runcmd=%#v", checked, doc.RunCmd)
+	if checked != 14 {
+		t.Fatalf("syntax-checked %d shell scripts, want fourteen; runcmd=%#v", checked, doc.RunCmd)
 	}
 }
 

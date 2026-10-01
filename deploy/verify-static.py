@@ -385,6 +385,114 @@ def verify_update_cache_refresh(update: str) -> None:
     )
 
 
+def verify_post_upgrade_reboot(init: str, update: str, preflight: str, inventory: str, readme: str) -> None:
+    """init reboots the bastion and control planes once after the first-boot OS upgrade; update never does."""
+    init = init.replace("\r\n", "\n")
+    update = update.replace("\r\n", "\n")
+    preflight = preflight.replace("\r\n", "\n")
+    readme = readme.replace("\r\n", "\n")
+    tasks = read("deploy/playbooks/tasks/post-upgrade-reboot.yml").replace("\r\n", "\n")
+    one_host = read("deploy/playbooks/tasks/post-upgrade-reboot-one-host.yml").replace("\r\n", "\n")
+    helper = read("deploy/templates/post-upgrade-reboot.sh").replace("\r\n", "\n")
+    ci = read(".github/workflows/ci.yaml")
+
+    config_name = "Apply optional operator RKE2 configuration with rolling readiness gates"
+    reboot_name = "Reboot the bastion and control planes once after the first-boot OS upgrade"
+    secrets_name = "Create or update cloud and RKE2 agent-token Secrets"
+    require(
+        config_name in init and reboot_name in init and secrets_name in init
+        and init.index(config_name) < init.index(reboot_name) < init.index(secrets_name),
+        "init must reboot after the operator RKE2 configuration and before the cloud Secrets are created",
+    )
+    reboot_task = task_block(init, reboot_name)
+    require(
+        "ansible.builtin.include_tasks: tasks/post-upgrade-reboot.yml" in reboot_task
+        and "- not skip_os_upgrade | bool\n" in reboot_task
+        and "- post_upgrade_reboot | default(true) | bool\n" in reboot_task,
+        "the reboot must run only when the OS upgrade ran and post_upgrade_reboot is true",
+    )
+
+    control_planes = tasks.find("loop: \"{{ deployment_state.controlPlanes }}\"")
+    cp_include = tasks.find("post-upgrade-reboot-one-host.yml")
+    tunnel_stop = tasks.find("- stop\n")
+    bastion_include = tasks.find("deploy_reboot_host: inspace-bastion")
+    tunnel_start = tasks.find("start-tunnel.yml")
+    require(
+        0 <= cp_include < control_planes < tunnel_stop < bastion_include < tunnel_start
+        and "scripts/api-tunnel.sh" in tasks
+        and "deploy_reboot_is_cp: true" in tasks
+        and "deploy_reboot_is_cp: false" in tasks,
+        "control planes must reboot one at a time before the bastion, with the API tunnel stopped "
+        "before the bastion reboots and started again after",
+    )
+    for needle in (
+        "deploy_post_upgrade_reboot_check.stdout == 'needed'",
+        "/readyz/etcd",
+        "retries: 60\n  delay: 10\n",
+        "cat /proc/sys/kernel/random/boot_id",
+        "condition=Ready",
+        "systemctl is-active --quiet inspace-cache.service",
+        "--cacert /etc/inspace-cache/tls/ca.crt",
+        "/healthz",
+        "retries: 90\n  delay: 10\n",
+        "post-upgrade-reboot.sh mark",
+        "- not bootstrap_direct_download | bool",
+    ):
+        require(needle in one_host, f"post-upgrade-reboot-one-host.yml lacks {needle!r}")
+    require(
+        one_host.index("post-upgrade-reboot.sh check")
+        < one_host.index("post-upgrade-reboot.sh reboot")
+        < one_host.index("cat /proc/sys/kernel/random/boot_id")
+        < one_host.index("post-upgrade-reboot.sh mark"),
+        "the helper must check, reboot, wait for a new boot id, then mark",
+    )
+    for subcommand in ("check)", "reboot)", "mark)"):
+        require(f"\n  {subcommand}\n" in helper, f"post-upgrade-reboot.sh lacks the {subcommand} subcommand")
+    require(
+        "/var/lib/inspace/post-upgrade-reboot.done" in helper
+        and "/var/lib/cloud/instance/sem/config_scripts_user" in helper
+        and "btime" in helper
+        and "systemd-run --on-active=5 /bin/systemctl reboot" in helper,
+        "the helper must reboot only hosts still in the cloud-init boot that have no marker",
+    )
+
+    rolling_updates = [update] + [
+        read(f"deploy/playbooks/tasks/{name}").replace("\r\n", "\n")
+        for name in ("update-one-control-plane.yml", "upgrade-one-control-plane.yml", "apply-rke2-upgrade.yml")
+    ]
+    require(
+        all("post-upgrade-reboot" not in text and "post_upgrade_reboot" not in text for text in rolling_updates),
+        "update never runs apt, so it must never reboot a host",
+    )
+    require(
+        "post_upgrade_reboot | default(true) is boolean" in preflight,
+        "preflight must accept post_upgrade_reboot only as a boolean",
+    )
+    require(
+        re.search(r"(?m)^    post_upgrade_reboot: true$", inventory) is not None
+        and "`post_upgrade_reboot`" in readme
+        and "post_upgrade_reboot: false" in readme
+        and "reboots, one at a time" in readme,
+        "example inventory and README must document post_upgrade_reboot and the re-run warning",
+    )
+    require(
+        "python3 deploy/scripts/test_post_upgrade_reboot.py" in ci
+        and "sh -n deploy/templates/post-upgrade-reboot.sh" in ci,
+        "CI must run the offline post-upgrade reboot helper tests",
+    )
+    unit = subprocess.run(
+        [sys.executable, str(DEPLOY / "scripts" / "test_post_upgrade_reboot.py")],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+    require(
+        unit.returncode == 0,
+        "post-upgrade reboot helper tests failed: " + (unit.stderr.strip() or unit.stdout.strip()),
+    )
+
+
 SECRET_FILE_PRELUDE = (
     "umask 077\n"
     "        secret_dir=$(mktemp -d)\n"
@@ -829,6 +937,7 @@ def main() -> None:
     verify_gateway_api(inventory, cluster_template, preflight, init, destroy)
     verify_update_cache_refresh(update)
     verify_rke2_agent_token(init, read("deploy/README.md"))
+    verify_post_upgrade_reboot(init, update, preflight, inventory, read("deploy/README.md"))
     verify_secret_values_stay_off_argv({
         str(path.relative_to(ROOT)): path.read_text(encoding="utf-8")
         for path in sorted((DEPLOY / "playbooks").rglob("*.yml"))

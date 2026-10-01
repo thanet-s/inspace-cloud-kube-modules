@@ -28,6 +28,10 @@ import (
 // is not worth it. Existing workers keep their shell until replaced.
 // The registry egress gate (v1.1.0-rc.8) also kept v13: it only decides
 // whether a new node registers and never changes a registered node.
+// The post-upgrade reboot (v1.1.3) also kept v13: it is rendered only into a
+// new node's first-boot cloud-init when the OS upgrade runs, neither drift
+// hash covers rendered bytes, and a registered node must not be replaced just
+// to gain a reboot it already received or never needed.
 const (
 	SchemaVersion         = "stock-ubuntu-rke2-v13"
 	VPCSubnetPlaceholder  = "__INSPACE_VPC_SUBNET__"
@@ -543,6 +547,13 @@ set -eu
 /usr/local/sbin/inspace-verify-host-firewall
 /usr/local/sbin/inspace-start-rke2-agent
 `)
+	if !config.SkipOSUpgrade {
+		// apt-get upgrade ran during first boot, so a kernel or libc update is
+		// pending. Reboot once after the node registers, from a transient unit
+		// so cloud-init finishes first and the reboot is not part of runcmd.
+		doc.WriteFiles = append(doc.WriteFiles, encodedWriteFile(postUpgradeRebootPath, "0700", postUpgradeRebootScript(config.NodeName)))
+		orchestrator.WriteString("systemd-run --unit=inspace-post-upgrade-reboot --no-block --collect " + postUpgradeRebootPath + "\n")
+	}
 	doc.WriteFiles = append(doc.WriteFiles, encodedWriteFile("/usr/local/sbin/inspace-bootstrap-rke2-agent", "0700", orchestrator.String()))
 	doc.RunCmd = []string{"/usr/local/sbin/inspace-bootstrap-rke2-agent"}
 
@@ -551,6 +562,35 @@ set -eu
 		return "", fmt.Errorf("marshal cloud-init JSON: %w", err)
 	}
 	return string(data), nil
+}
+
+const postUpgradeRebootPath = "/usr/local/sbin/inspace-post-upgrade-reboot"
+
+// postUpgradeRebootScript reboots the node exactly once, after Karpenter has
+// registered it, so packages upgraded on first boot (kernel, libc) take effect.
+// The marker is written before the reboot, so a failed or repeated run can
+// never cause a second reboot. INSPACE_KUBECTL and
+// INSPACE_POST_UPGRADE_REBOOT_DEADLINE (seconds) exist for tests.
+func postUpgradeRebootScript(nodeName string) string {
+	return `#!/bin/sh
+set -eu
+marker=/var/lib/inspace/post-upgrade-reboot.done
+[ ! -e "$marker" ] || exit 0
+node=` + shellQuote(nodeName) + `
+kubectl="${INSPACE_KUBECTL:-/var/lib/rancher/rke2/bin/kubectl}"
+kubeconfig=/var/lib/rancher/rke2/agent/kubelet.kubeconfig
+cloud-init status --wait >/dev/null 2>&1 || true
+deadline=$(( $(date +%s) + ${INSPACE_POST_UPGRADE_REBOOT_DEADLINE:-1800} ))
+until [ -x "$kubectl" ] && [ -s "$kubeconfig" ] &&
+  [ "$("$kubectl" --kubeconfig "$kubeconfig" --request-timeout=10s get node "$node" \
+      -o 'jsonpath={.metadata.labels.karpenter\.sh/registered}' 2>/dev/null)" = true ]; do
+  [ "$(date +%s)" -lt "$deadline" ] || { echo "not registered in 30m; reboot skipped" >&2; exit 1; }
+  sleep 5
+done
+install -d -m 0755 /var/lib/inspace
+date -u +%Y-%m-%dT%H:%M:%SZ >"$marker"; sync
+systemctl reboot
+`
 }
 
 func hasNodeRestrictionPrefix(key string) bool {

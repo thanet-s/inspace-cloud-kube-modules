@@ -487,9 +487,19 @@ the stock timeout would.
 - configures the agent to join the stable TCP/9345 supervisor endpoint;
 - enables the agent, starts it with `--no-block`, and waits at most 180 five-second checks for `active`, failing immediately on a failed service;
 - configures `cloud-provider=external`, NodeClaim labels and taints;
-- adds exactly one `karpenter.sh/unregistered:NoExecute` taint; and
+- adds exactly one `karpenter.sh/unregistered:NoExecute` taint;
 - runs `additionalUserData` once via `cloud-init-per`, then re-disables and
-  verifies UFW before starting RKE2.
+  verifies UFW before starting RKE2; and
+- unless `spec.rke2.skipOSUpgrade` is true, reboots the node exactly once after
+  it registers, so the kernel and libc from the first-boot upgrade take
+  effect. A transient `inspace-post-upgrade-reboot` unit starts after the
+  agent, waits up to 30 minutes for the node to carry the
+  `karpenter.sh/registered` label, writes
+  `/var/lib/inspace/post-upgrade-reboot.done` and then runs `systemctl reboot`.
+  The marker is written first, so a node never reboots twice, and a node that
+  never registers is not rebooted. Only a new node's first boot carries this
+  step; the bootstrap schema version is unchanged, so running workers are not
+  replaced.
 
 Every VM create request includes Warren-compatible non-empty login fields. By
 default the provider sends username `user` with a cryptographically random

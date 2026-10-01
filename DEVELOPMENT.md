@@ -97,9 +97,11 @@ subnet and native-routing pod CIDR, with matching outbound access.
 
 The guarded live E2E templates set `spec.rke2.skipOSUpgrade: true` on both the
 fixed cluster and worker NodeClass to reduce disposable-cluster startup time.
-This bypasses only the one-time full OS upgrade. Mirror selection, package-index
-refresh, required package installation, and automatic-update shutdown are
-still exercised. Production examples omit the field and retain the upgrade.
+This bypasses only the one-time full OS upgrade, and with it the one reboot
+that follows the upgrade, so the E2E clusters never reboot after first boot.
+Mirror selection, package-index refresh, required package installation, and
+automatic-update shutdown are still exercised. Production examples omit the
+field and retain the upgrade.
 
 ### Bastion bootstrap cache
 
