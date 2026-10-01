@@ -1,4 +1,49 @@
 ---
+# Restarting one server is safe only while the others hold quorum, so every
+# other control-plane node must be Ready and etcd healthy first. A single
+# control plane has no others, so both checks skip.
+- name: Require every other control-plane node Ready before upgrading {{ deploy_control_plane.name }}
+  ansible.builtin.command:
+    argv:
+      - kubectl
+      - --kubeconfig
+      - "{{ deploy_state_dir }}/kubeconfig.yaml"
+      - wait
+      - --for=condition=Ready
+      - "node/{{ item.name }}"
+      - --timeout=2m
+  loop: "{{ deployment_state.controlPlanes }}"
+  loop_control:
+    label: "{{ item.name }}"
+  register: deploy_upgrade_nodes_ready
+  changed_when: false
+  retries: 10
+  delay: 15
+  until: deploy_upgrade_nodes_ready.rc == 0
+  when: item.name != deploy_control_plane.name
+
+- name: Require etcd to be ready on every other control plane before upgrading {{ deploy_control_plane.name }}
+  ansible.builtin.command:
+    argv:
+      - ssh
+      - -F
+      - "{{ deploy_state_dir }}/ssh-config"
+      - "inspace-cp{{ deploy_etcd_index }}"
+      - >-
+        sudo /var/lib/rancher/rke2/bin/kubectl
+        --kubeconfig /etc/rancher/rke2/rke2.yaml
+        --request-timeout=10s get --raw=/readyz/etcd
+  loop: "{{ deployment_state.controlPlanes }}"
+  loop_control:
+    index_var: deploy_etcd_index
+    label: "{{ item.name }}"
+  register: deploy_upgrade_etcd_ready
+  changed_when: false
+  retries: 60
+  delay: 5
+  until: deploy_upgrade_etcd_ready.rc == 0
+  when: item.name != deploy_control_plane.name
+
 - name: Copy the fixed RKE2 binary upgrade installer to {{ deploy_control_plane.name }}
   ansible.builtin.command:
     argv:

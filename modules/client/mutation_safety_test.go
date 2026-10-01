@@ -21,14 +21,14 @@ type clientMutationCase struct {
 
 func TestEveryMutationDispatchesOnceOnHTTP500(t *testing.T) {
 	tests := clientMutationInventory()
-	if len(tests) != 23 {
-		t.Fatalf("mutation inventory contains %d methods, want 23", len(tests))
+	if len(tests) != 26 {
+		t.Fatalf("mutation inventory contains %d methods, want 26", len(tests))
 	}
 	covered := make(map[string]struct{}, len(tests))
 	for _, test := range tests {
 		covered[test.name] = struct{}{}
 	}
-	mutationPrefixes := []string{"Create", "Delete", "Attach", "Detach", "Assign", "Unassign", "Update", "Add", "Remove", "Resize"}
+	mutationPrefixes := []string{"Create", "Delete", "Attach", "Detach", "Assign", "Unassign", "Update", "Add", "Remove", "Resize", "Stop", "Start"}
 	clientType := reflect.TypeOf((*inspace.Client)(nil))
 	discovered := 0
 	for index := 0; index < clientType.NumMethod(); index++ {
@@ -185,6 +185,16 @@ func clientMutationInventory() []clientMutationCase {
 		}},
 		{name: "DetachDisk", method: http.MethodPost, invoke: func(ctx context.Context, client *inspace.Client) error {
 			return client.DetachDisk(ctx, "bkk01", vmUUID, diskUUID)
+		}},
+		{name: "StopVM", method: http.MethodPost, invoke: func(ctx context.Context, client *inspace.Client) error {
+			return client.StopVM(ctx, "bkk01", vmUUID)
+		}},
+		{name: "StartVM", method: http.MethodPost, invoke: func(ctx context.Context, client *inspace.Client) error {
+			return client.StartVM(ctx, "bkk01", vmUUID)
+		}},
+		{name: "UpdateVMCompute", method: http.MethodPatch, invoke: func(ctx context.Context, client *inspace.Client) error {
+			_, err := client.UpdateVMCompute(ctx, "bkk01", vmUUID, 2, 6144)
+			return err
 		}},
 		{name: "ResizeAttachedDisk", method: http.MethodPatch, invoke: func(ctx context.Context, client *inspace.Client) error {
 			_, err := client.ResizeAttachedDisk(ctx, "bkk01", vmUUID, diskUUID, 60)

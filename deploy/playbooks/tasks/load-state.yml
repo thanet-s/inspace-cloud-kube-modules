@@ -41,8 +41,6 @@
       - persisted_inspace_cluster.spec.network.privateLoadBalancerPool.start == private_load_balancer_pool_start
       - persisted_inspace_cluster.spec.network.privateLoadBalancerPool.stop == private_load_balancer_pool_stop
       - persisted_inspace_cluster.spec.controlPlane.replicas | int == control_plane_replicas | int
-      - persisted_inspace_cluster.spec.controlPlane.machine.vcpu | int == control_plane_vcpu | int
-      - persisted_inspace_cluster.spec.controlPlane.machine.memoryMiB | int == control_plane_memory_mib | int
       - persisted_inspace_cluster.spec.controlPlane.machine.rootDiskGiB | int == control_plane_root_disk_gib | int
       - persisted_inspace_cluster.spec.controlPlane.machine.hostPoolUUID == inspace_amd_host_pool_uuid
       - deploy_recorded_rke2_version == rke2_version or (deploy_allow_rke2_version_change | default(false) | bool)
@@ -55,6 +53,46 @@
         ('rke2-traefik-crd' in persisted_inspace_cluster.spec.rke2.get('disable', [])) ==
         ((gateway_api_enabled | default(false) | bool) or not (rke2_traefik_crd_enabled | default(true) | bool))
     fail_msg: "The deployment journal belongs to another cluster or topology."
+
+# cluster.yaml keeps the init-time machine size, which every control-plane
+# ownership hash derives from, so it is never rewritten. The journal's
+# controlPlaneMachine records the size `update` last grew the VMs to; older
+# journals omit it and fall back to cluster.yaml. An inventory that equals the
+# recorded size changes nothing, a larger one asks update for a rolling resize,
+# and a smaller one is refused by update. The helper also resumes a journaled
+# resize.
+- name: Compare the inventory control-plane size with the recorded size
+  ansible.builtin.command:
+    argv:
+      - python3
+      - "{{ deploy_root }}/scripts/control_plane_resize.py"
+      - classify
+      - --mode
+      - "{{ 'enforce' if (deploy_enforce_control_plane_size | default(false) | bool) else 'report' }}"
+      - --state
+      - "{{ deploy_state_dir }}/state.json"
+      - --spec-vcpu
+      - "{{ persisted_inspace_cluster.spec.controlPlane.machine.vcpu | int }}"
+      - --spec-memory-mib
+      - "{{ persisted_inspace_cluster.spec.controlPlane.machine.memoryMiB | int }}"
+      - --inventory-vcpu
+      - "{{ control_plane_vcpu | int }}"
+      - --inventory-memory-mib
+      - "{{ control_plane_memory_mib | int }}"
+  register: deploy_control_plane_size
+  changed_when: false
+
+- name: Record whether the control planes must be resized
+  ansible.builtin.set_fact:
+    control_plane_resize: "{{ deploy_control_plane_size.stdout | from_json }}"
+    control_plane_resize_needed: "{{ (deploy_control_plane_size.stdout | from_json).resizeNeeded }}"
+
+# Only update (deploy_enforce_control_plane_size) refuses an inventory size
+# that shrinks the control planes; status, tunnel and destroy just report it.
+- name: Warn that the inventory control-plane size is not the recorded one
+  ansible.builtin.debug:
+    msg: "{{ control_plane_resize.error }}"
+  when: control_plane_resize.error | length > 0
 
 # These settings live in the immutable control-plane cloud-init and the on-disk
 # rke2-cilium HelmChartConfig; update never rewrites either.

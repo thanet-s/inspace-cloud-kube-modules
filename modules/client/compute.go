@@ -135,6 +135,60 @@ func (c *Client) DeleteVM(ctx context.Context, location, uuid string) error {
 	return c.do(ctx, http.MethodDelete, path, nil, url.Values{"uuid": {uuid}}, nil)
 }
 
+// StopVM requests a graceful ACPI shutdown. It never forces: a forced stop can
+// corrupt the guest, so the API's force flag is deliberately not exposed. The
+// call can block past a minute while the guest shuts down, so a transport
+// timeout is ambiguous and callers must read the VM status back instead.
+func (c *Client) StopVM(ctx context.Context, location, uuid string) error {
+	return c.vmPower(ctx, location, uuid, "stop")
+}
+
+// StartVM boots a stopped VM. Its private and floating addresses, UUID, and
+// disks are unchanged. Like StopVM, a transport timeout is ambiguous.
+func (c *Client) StartVM(ctx context.Context, location, uuid string) error {
+	return c.vmPower(ctx, location, uuid, "start")
+}
+
+func (c *Client) vmPower(ctx context.Context, location, uuid, action string) error {
+	if err := validateUUID("VM", uuid); err != nil {
+		return err
+	}
+	path, err := c.locationPath(location, "user-resource/vm/"+action)
+	if err != nil {
+		return err
+	}
+	return c.do(ctx, http.MethodPost, path, nil, url.Values{"uuid": {uuid}}, nil)
+}
+
+// UpdateVMCompute sets the absolute vCPU count and memory of a VM. InSpace only
+// accepts it while the VM is stopped. The response is verified so a silently
+// ignored resize is never reported as applied.
+func (c *Client) UpdateVMCompute(ctx context.Context, location, uuid string, vcpu, memoryMiB int) (*VM, error) {
+	if vcpu <= 0 || memoryMiB <= 0 {
+		return nil, errors.New("inspace: VM vCPU and memory must be positive")
+	}
+	if err := validateUUID("VM", uuid); err != nil {
+		return nil, err
+	}
+	path, err := c.locationPath(location, "user-resource/vm")
+	if err != nil {
+		return nil, err
+	}
+	var result VM
+	err = c.do(ctx, http.MethodPatch, path, nil, url.Values{
+		"uuid": {uuid},
+		"vcpu": {strconv.Itoa(vcpu)},
+		"ram":  {strconv.Itoa(memoryMiB)},
+	}, &result)
+	if err == nil {
+		err = validateExpectedResponseUUID("resized VM", result.UUID, uuid)
+	}
+	if err == nil && (result.VCPU != vcpu || result.MemoryMiB != memoryMiB) {
+		err = fmt.Errorf("inspace: resized VM %s reports %d vCPU and %d MiB, want %d vCPU and %d MiB", uuid, result.VCPU, result.MemoryMiB, vcpu, memoryMiB)
+	}
+	return &result, err
+}
+
 func setOptional(values url.Values, key, value string) {
 	if value != "" {
 		values.Set(key, value)

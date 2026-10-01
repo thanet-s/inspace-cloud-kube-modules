@@ -62,7 +62,9 @@ deploy-verify:
 	python3 deploy/verify-static.py
 	python3 -m py_compile deploy/scripts/discover_bootstrap.py
 	python3 -m py_compile deploy/scripts/validate_rke2_upgrade.py
+	python3 -m py_compile deploy/scripts/control_plane_resize.py
 	python3 deploy/scripts/test_validate_rke2_upgrade.py
+	python3 deploy/scripts/test_control_plane_resize.py
 	@set -eu; for script in deploy/run.sh deploy/scripts/*.sh; do \
 		bash -n "$$script"; \
 	done

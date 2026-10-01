@@ -893,3 +893,52 @@ func TestFloatingIPReachabilityGateProbesOnlyTheBastion(t *testing.T) {
 		t.Fatalf("healthy cluster wrote unexpected stderr: %q", stderr.String())
 	}
 }
+
+type stubControlPlaneResizer struct {
+	calls  []string
+	result bootstrap.ControlPlaneResizeResult
+	err    error
+}
+
+func (s *stubControlPlaneResizer) Check(context.Context, *v1alpha1.InSpaceCluster, bootstrap.ControlPlaneResizeRequest) (bootstrap.ControlPlaneResizeResult, error) {
+	s.calls = append(s.calls, "check")
+	return s.result, s.err
+}
+
+func (s *stubControlPlaneResizer) StartOnly(context.Context, *v1alpha1.InSpaceCluster, bootstrap.ControlPlaneResizeRequest) (bootstrap.ControlPlaneResizeResult, error) {
+	s.calls = append(s.calls, "start-only")
+	return s.result, s.err
+}
+
+func (s *stubControlPlaneResizer) Resize(context.Context, *v1alpha1.InSpaceCluster, bootstrap.ControlPlaneResizeRequest) (bootstrap.ControlPlaneResizeResult, error) {
+	s.calls = append(s.calls, "resize")
+	return s.result, s.err
+}
+
+func TestRunControlPlaneResizeDispatchesAndPrintsOneJSONResult(t *testing.T) {
+	want := bootstrap.ControlPlaneResizeResult{Slot: 1, Name: "unit-cp1", VMUUID: "aaaaaaaa-1111-4222-8333-bbbbbbbbbbbb", VCPU: 2, MemoryMiB: 6144, Status: "running", Action: bootstrap.ResizeActionResized}
+	for _, mode := range []string{resizeModeResize, resizeModeCheck, resizeModeStartOnly} {
+		stub := &stubControlPlaneResizer{result: want}
+		var output bytes.Buffer
+		if err := runControlPlaneResize(context.Background(), stub, &v1alpha1.InSpaceCluster{}, bootstrap.ControlPlaneResizeRequest{Slot: 1}, mode, &output); err != nil {
+			t.Fatal(err)
+		}
+		wantCall := map[string]string{resizeModeResize: "resize", resizeModeCheck: "check", resizeModeStartOnly: "start-only"}[mode]
+		if !reflect.DeepEqual(stub.calls, []string{wantCall}) {
+			t.Fatalf("mode=%s calls = %v, want only %s", mode, stub.calls, wantCall)
+		}
+		var got bootstrap.ControlPlaneResizeResult
+		if err := json.Unmarshal(output.Bytes(), &got); err != nil || got != want || strings.Count(output.String(), "\n") != 1 {
+			t.Fatalf("output = %q (%v), want one JSON line for %#v", output.String(), err, want)
+		}
+	}
+}
+
+func TestRunControlPlaneResizeReturnsErrorsWithoutOutput(t *testing.T) {
+	stub := &stubControlPlaneResizer{err: errors.New("refusing to shrink")}
+	var output bytes.Buffer
+	err := runControlPlaneResize(context.Background(), stub, &v1alpha1.InSpaceCluster{}, bootstrap.ControlPlaneResizeRequest{}, resizeModeResize, &output)
+	if err == nil || !strings.Contains(err.Error(), "refusing to shrink") || output.Len() != 0 {
+		t.Fatalf("err = %v output = %q, want the error and no output", err, output.String())
+	}
+}
