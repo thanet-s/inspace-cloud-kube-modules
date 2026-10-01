@@ -4,6 +4,7 @@ package fake
 import (
 	"context"
 	"fmt"
+	"io/fs"
 	"slices"
 	"sync"
 
@@ -16,6 +17,8 @@ type Mounter struct {
 	devices     map[string]int
 	deviceSizes map[string]int64
 	expansions  map[string]int
+	stats       map[string]host.VolumeStats
+	statsErrors map[string]error
 }
 
 func New() *Mounter {
@@ -24,6 +27,8 @@ func New() *Mounter {
 		devices:     make(map[string]int),
 		deviceSizes: make(map[string]int64),
 		expansions:  make(map[string]int),
+		stats:       make(map[string]host.VolumeStats),
+		statsErrors: make(map[string]error),
 	}
 }
 
@@ -116,6 +121,43 @@ func (m *Mounter) FilesystemExpansions(devicePath string) int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.expansions[devicePath]
+}
+
+// SetMount records a mount without going through FormatAndMount.
+func (m *Mounter) SetMount(mount host.Mount) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.mounts[mount.Target] = mount
+}
+
+// SetVolumeStats makes path exist and report stats.
+func (m *Mounter) SetVolumeStats(path string, stats host.VolumeStats) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.stats[path] = stats
+	delete(m.statsErrors, path)
+}
+
+// SetVolumeStatsError makes VolumeStats fail for path with err.
+func (m *Mounter) SetVolumeStatsError(path string, err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.statsErrors[path] = err
+}
+
+// VolumeStats returns configured stats. A path without configured stats does
+// not exist.
+func (m *Mounter) VolumeStats(_ context.Context, path string) (host.VolumeStats, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err, ok := m.statsErrors[path]; ok {
+		return host.VolumeStats{}, err
+	}
+	stats, ok := m.stats[path]
+	if !ok {
+		return host.VolumeStats{}, fmt.Errorf("stat %s: %w", path, fs.ErrNotExist)
+	}
+	return stats, nil
 }
 
 func (m *Mounter) Mount(target string) (host.Mount, bool) {

@@ -34,6 +34,22 @@ type Mounter interface {
 	// grows the filesystem mounted at mountPath to fill it, and returns the
 	// device size. It returns ErrDeviceNotResized while the device is smaller.
 	ExpandFilesystem(ctx context.Context, devicePath, mountPath string, minimumBytes int64) (int64, error)
+	// VolumeStats reads capacity and inode usage of the filesystem that holds
+	// path. It is read-only. A missing path returns an error that matches
+	// fs.ErrNotExist.
+	VolumeStats(ctx context.Context, path string) (VolumeStats, error)
+}
+
+// VolumeStats reports filesystem capacity and inode usage in bytes and inodes.
+// AvailableBytes excludes blocks reserved for root, so it can be smaller than
+// TotalBytes-UsedBytes.
+type VolumeStats struct {
+	TotalBytes      int64
+	AvailableBytes  int64
+	UsedBytes       int64
+	TotalInodes     int64
+	AvailableInodes int64
+	UsedInodes      int64
 }
 
 // Mount describes fake mounter state and is useful in smoke assertions.
