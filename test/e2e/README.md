@@ -10,7 +10,7 @@ CCM platform digest. A separate non-live target compiles local source for CI.
 The host needs Docker and Git but no Go, Helm, kubectl, Ansible, or cloud
 toolchain.
 
-The test creates exactly three fixed RKE2 `v1.36.5-rc2+rke2r1` control-plane VMs.
+The test creates exactly three fixed RKE2 `v1.36.5+rke2r1` control-plane VMs.
 The product bootstrap reconciler launches missing control-plane VMs in slot
 order with a hard creation concurrency bound of one, and its result must report
 `maxParallelControlPlaneCreates: 1`. Each VM receives authoritative restrictive

@@ -4448,7 +4448,7 @@ func TestDestroyRejectsAssignmentAndPolicyDriftBeforeMutation(t *testing.T) {
 func TestRenderControlPlaneCloudInitUsesVIPStaticPodAndBoundedBoot(t *testing.T) {
 	raw, err := RenderCloudInitJSON(CloudInitInput{
 		NodeName: "cp-1", NodeExternalIPv4: "203.0.113.11", PrivateSubnet: "10.20.30.0/24", VirtualIPv4: "10.20.30.10",
-		RKE2Version: "v1.36.5-rc2+rke2r1", RKE2Token: "token", ServerAddress: "10.20.30.10",
+		RKE2Version: "v1.36.5+rke2r1", RKE2Token: "token", ServerAddress: "10.20.30.10",
 		PodCIDR: "10.42.0.0/16", ServiceCIDR: "10.43.0.0/16",
 		PrivateLoadBalancerPoolStart: "10.20.30.200", PrivateLoadBalancerPoolStop: "10.20.30.239",
 		TLSSubjectAltNames: []string{"10.20.30.10"},
@@ -4462,7 +4462,7 @@ func TestRenderControlPlaneCloudInitUsesVIPStaticPodAndBoundedBoot(t *testing.T)
 func TestRenderSingleControlPlanePinsCoreDNSWithoutChangingThreeControlPlanes(t *testing.T) {
 	input := CloudInitInput{
 		NodeName: "cp-0", NodeExternalIPv4: "203.0.113.10", PrivateSubnet: "10.20.30.0/24", VirtualIPv4: "10.20.30.10",
-		RKE2Version: "v1.36.5-rc2+rke2r1", RKE2Token: "token", Initialize: true,
+		RKE2Version: "v1.36.5+rke2r1", RKE2Token: "token", Initialize: true,
 		PodCIDR: "10.42.0.0/16", ServiceCIDR: "10.43.0.0/16",
 		PrivateLoadBalancerPoolStart: "10.20.30.200", PrivateLoadBalancerPoolStop: "10.20.30.239",
 		TLSSubjectAltNames: []string{"10.20.30.10"},
@@ -4508,7 +4508,7 @@ func TestRenderControlPlaneCloudInitRejectsInvalidGuestHostname(t *testing.T) {
 	for _, nodeName := range []string{"UPPER", "contains.dot", strings.Repeat("a", 64)} {
 		_, err := RenderCloudInitJSON(CloudInitInput{
 			NodeName: nodeName, NodeExternalIPv4: "203.0.113.11", PrivateSubnet: "10.20.30.0/24", VirtualIPv4: "10.20.30.10",
-			RKE2Version: "v1.36.5-rc2+rke2r1", RKE2Token: "token", ServerAddress: "10.20.30.10",
+			RKE2Version: "v1.36.5+rke2r1", RKE2Token: "token", ServerAddress: "10.20.30.10",
 			PodCIDR: "10.42.0.0/16", ServiceCIDR: "10.43.0.0/16",
 			PrivateLoadBalancerPoolStart: "10.20.30.200", PrivateLoadBalancerPoolStop: "10.20.30.239",
 		})
@@ -4799,7 +4799,7 @@ func testCluster() *v1alpha1.InSpaceCluster {
 				VCPU: 4, MemoryMiB: 8192, RootDiskGiB: 60,
 				HostPoolUUID: "aac7dd66-f390-4edd-80c0-dd7cae49bd99", Image: v1alpha1.ImageSpec{OSName: "ubuntu", OSVersion: "26.04"},
 			}},
-			RKE2: v1alpha1.RKE2Spec{Version: "v1.36.5-rc2+rke2r1", TokenSecretRef: v1alpha1.SecretKeyReference{Name: "rke2-token", Key: "token"}, Disable: []string{"rke2-ingress-nginx", "rke2-traefik"}},
+			RKE2: v1alpha1.RKE2Spec{Version: "v1.36.5+rke2r1", TokenSecretRef: v1alpha1.SecretKeyReference{Name: "rke2-token", Key: "token"}, Disable: []string{"rke2-ingress-nginx", "rke2-traefik"}},
 			Network: v1alpha1.NetworkSpec{
 				UUID: "11111111-2222-4333-8444-555555555555", PodCIDR: "10.42.0.0/16", ServiceCIDR: "10.43.0.0/16",
 				PrivateLoadBalancerPool: v1alpha1.PrivateLoadBalancerPoolSpec{Start: "10.20.30.200", Stop: "10.20.30.239"},
@@ -5972,3 +5972,23 @@ func (f *fakeAPI) DeleteFloatingIP(ctx context.Context, _, address string) error
 }
 
 var _ API = (*fakeAPI)(nil)
+
+// Teardown validates the persisted init-time spec, which may name a released
+// release candidate; creating infrastructure with one stays refused.
+func TestDestroyAcceptsAPersistedReleaseCandidateButReconcileRefusesIt(t *testing.T) {
+	api := newFakeAPI()
+	cluster := testCluster()
+	reconciler := testReconciler(api)
+	reconcileUntilReady(t, reconciler, cluster)
+
+	cluster.Spec.RKE2.Version = "v1.36.5-rc2+rke2r1"
+	if result := destroyUntilDone(t, reconciler, cluster); !result.Done || len(api.vms) != 0 {
+		t.Fatalf("destroy of a persisted release-candidate spec = %#v, VMs left %d", result, len(api.vms))
+	}
+
+	fresh := testCluster()
+	fresh.Spec.RKE2.Version = "v1.36.5-rc2+rke2r1"
+	if _, err := testReconciler(newFakeAPI()).Reconcile(context.Background(), fresh, "token"); err == nil || !strings.Contains(err.Error(), "spec.rke2.version") {
+		t.Fatalf("Reconcile of a new release-candidate spec = %v, want a spec.rke2.version refusal", err)
+	}
+}

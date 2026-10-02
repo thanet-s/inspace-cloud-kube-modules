@@ -200,13 +200,13 @@ func TestCacheImageManifestExcludesBothDisabledIngressAddons(t *testing.T) {
 	}
 }
 
-func TestControlPlaneCloudInitAcceptsOnlyTheAuditedRKE2PreRelease(t *testing.T) {
+func TestControlPlaneCloudInitAcceptsOnlyAnExactRKE2Release(t *testing.T) {
 	input := cacheContractControlPlaneInput()
-	input.RKE2Version = "v1.36.5-rc2+rke2r1"
+	input.RKE2Version = "v1.36.5+rke2r1"
 	if _, err := RenderCloudInitJSON(input); err != nil {
-		t.Fatalf("audited release candidate rejected: %v", err)
+		t.Fatalf("audited release rejected: %v", err)
 	}
-	for _, version := range []string{"v1.36.5-rc1+rke2r1", "v1.37.1-rc2+rke2r1", "v1.36.5-rc2", "v1.36.5-rc2+rke2r1 "} {
+	for _, version := range []string{"v1.36.5-rc1+rke2r1", "v1.36.5-rc2+rke2r1", "v1.37.1-rc2+rke2r1", "v1.36.5-rc2", "v1.36.5+rke2r1 "} {
 		input := cacheContractControlPlaneInput()
 		input.RKE2Version = version
 		if _, err := RenderCloudInitJSON(input); err == nil || !strings.Contains(err.Error(), "RKE2 version") {
@@ -508,7 +508,7 @@ func TestControlPlaneCloudInitUsesPrivateCacheOrDirectUpstreamExclusively(t *tes
 	cachedRegistries := cached["/etc/rancher/rke2/registries.yaml"].Content
 	for _, required := range []string{
 		`system-default-registry: "cache.unit.inspace.internal:8443"`,
-		`https://cache.unit.inspace.internal:8443/rke2/v1.36.5-rc2+rke2r1`,
+		`https://cache.unit.inspace.internal:8443/rke2/v1.36.5+rke2r1`,
 		`cache_address='10.20.30.21'`,
 		`cache_hostname='cache.unit.inspace.internal'`,
 		`printf '%s %s # inspace-bootstrap-cache\n' "$cache_address" "$cache_hostname" >>/etc/hosts`,
@@ -547,7 +547,7 @@ func TestControlPlaneCloudInitUsesPrivateCacheOrDirectUpstreamExclusively(t *tes
 	}
 	if strings.Contains(direct["/var/lib/inspace/rke2-config"].Content, "system-default-registry") ||
 		strings.Contains(directScript, ".inspace.internal") ||
-		!strings.Contains(directScript, "https://github.com/rancher/rke2/releases/download/v1.36.5-rc2+rke2r1") ||
+		!strings.Contains(directScript, "https://github.com/rancher/rke2/releases/download/v1.36.5+rke2r1") ||
 		!strings.Contains(direct["/var/lib/inspace/rke2-kube-vip"].Content, kubeVIPImage) {
 		t.Fatalf("direct control-plane mode no longer uses exact upstream artifacts:\n%s", directScript)
 	}
@@ -590,7 +590,7 @@ func TestDirectControlPlaneCloudInitV9OwnershipBytes(t *testing.T) {
 	// load-balancer settings are omitted here and must add no bytes. The
 	// fixture carries a separate agent token, as every new cluster does; the
 	// rendering without one stays frozen at legacyV9DirectHash.
-	const v9DirectHash = "6cc0a7658e68a2ce9064b19ce903627ed81c6e1b4a958412beebd536002a6e11"
+	const v9DirectHash = "45708dc22e3eda956ca6631d47864816d56c74a9856bdca592ce1d35e34b1b12"
 	if got := fmt.Sprintf("%x", sha256.Sum256([]byte(raw))); got != v9DirectHash {
 		t.Fatalf("direct control-plane cloud-init hash=%s, want frozen v9 hash %s", got, v9DirectHash)
 	}

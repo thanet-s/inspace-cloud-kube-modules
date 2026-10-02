@@ -26,7 +26,7 @@ all:
     # supported for acceptance testing.
     # Ubuntu 26.04 needs modules_version 1.1.0-rc.3 or later.
     modules_version: 1.1.0-rc.4
-    rke2_version: v1.36.5-rc2+rke2r1
+    rke2_version: v1.36.5+rke2r1
     # Ubuntu release for control planes and Karpenter workers: "24.04" or
     # "26.04" (quoted). When omitted, an existing cluster keeps the release in
     # its persisted spec and a new cluster uses "26.04".

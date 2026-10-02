@@ -167,7 +167,7 @@ func TestEveryBootstrapScriptSetsUbuntuSourcesAndBashLoginShell(t *testing.T) {
 	scripts := map[string]string{}
 	controlPlane, err := RenderCloudInitJSON(CloudInitInput{
 		NodeName: "cp-1", NodeExternalIPv4: "203.0.113.11", PrivateSubnet: "10.20.30.0/24", VirtualIPv4: "10.20.30.10",
-		RKE2Version: "v1.36.5-rc2+rke2r1", RKE2Token: "token", ServerAddress: "10.20.30.10",
+		RKE2Version: "v1.36.5+rke2r1", RKE2Token: "token", ServerAddress: "10.20.30.10",
 		PodCIDR: "10.42.0.0/16", ServiceCIDR: "10.43.0.0/16",
 		PrivateLoadBalancerPoolStart: "10.20.30.200", PrivateLoadBalancerPoolStop: "10.20.30.239",
 		TLSSubjectAltNames: []string{"10.20.30.10"},

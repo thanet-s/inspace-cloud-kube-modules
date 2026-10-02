@@ -230,7 +230,7 @@ alone and needs no Traefik: `rke2-traefik` and `rke2-ingress-nginx` stay
 disabled, the template also disables `rke2-traefik-crd` (its bundled Gateway
 API CRDs would conflict), and `rke2-gateway-api-crd` is never disabled. It requires an `rke2_version`
 that bundles Cilium 1.20 or newer (`v1.34.12+`, `v1.35.9+`, `v1.36.5+`, or
-`v1.37.0+`; the audited `v1.36.5-rc2+rke2r1` qualifies) and preflight rejects
+`v1.37.0+`; the audited `v1.36.5+rke2r1` qualifies) and preflight rejects
 older releases. It is fixed at cluster creation: it is rendered only into
 immutable control-plane bootstrap, a resumed `init` refuses a changed value,
 and `update`, `status`, and `destroy` refuse an inventory that differs from
@@ -497,6 +497,18 @@ the single command for both kinds of day-2 upgrade:
   `v1.36.5-rc2+rke2r1` ships the GA kubelet, so its nodes report
   `v1.36.5+rke2r1`; the journal is what distinguishes the candidate from its
   GA release, and moving from the candidate to GA is an ordinary upgrade.
+
+  A release candidate is accepted only as the version a cluster already runs.
+  `init` and `update` refuse it as `rke2_version`, because there it is the
+  target of an install or upgrade (and `update` renders the default NodeClass
+  from it, which accepts GA releases only). `status`, `tunnel`, and `destroy`
+  accept it, so a cluster created on `v1.36.5-rc2+rke2r1` stays inspectable and
+  destroyable. They also accept the inventory on that candidate's own GA
+  release (`v1.36.5+rke2r1` while the journal records
+  `v1.36.5-rc2+rke2r1`), so an interrupted or partial `update` never locks them
+  out; any other mismatch with the recorded version still means another
+  cluster. The controller's resize and destroy paths validate the persisted
+  `cluster.yaml` the same way.
 
   A downgrade or a jump of more than one RKE2 minor version is refused unless
   the operator exports `INSPACE_CONFIRM_RKE2_VERSION_SKIP=<cluster-name>`,

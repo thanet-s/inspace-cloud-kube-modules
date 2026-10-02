@@ -89,7 +89,7 @@ def main() -> int:
     parser.add_argument("--check", action="store_true", help="verify cache.go instead of printing")
     args = parser.parse_args()
     if not re.fullmatch(r"v\d+\.\d+\.\d+(?:-rc\d+)?\+rke2r\d+", args.version):
-        parser.error("version must look like v1.36.5+rke2r1 or v1.36.5-rc2+rke2r1")
+        parser.error("version must look like v1.36.5+rke2r1 or v1.37.0-rc1+rke2r1")
     rendered = render(args.version)
     if not args.check:
         sys.stdout.write(rendered)

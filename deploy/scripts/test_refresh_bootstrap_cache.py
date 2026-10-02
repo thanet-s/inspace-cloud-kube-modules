@@ -21,10 +21,10 @@ import unittest
 ROOT = pathlib.Path(__file__).resolve().parent.parent.parent
 SCRIPT = ROOT / "deploy" / "templates" / "refresh-bootstrap-cache.sh"
 FRONT = "cache.unit.inspace.internal:8443"
-RKE2_VERSION = "v1.36.5-rc2+rke2r1"
+RKE2_VERSION = "v1.36.5+rke2r1"
 RKE2_ARCHIVE = b"rke2 release archive bytes\n"
 RKE2_SHA = hashlib.sha256(RKE2_ARCHIVE).hexdigest()
-RKE2_BASE = "https://github.com/rancher/rke2/releases/download/v1.36.5-rc2%2Brke2r1"
+RKE2_BASE = "https://github.com/rancher/rke2/releases/download/v1.36.5%2Brke2r1"
 
 STUB_COMMON = r'''#!/usr/bin/env python3
 import json, os, sys
@@ -172,7 +172,7 @@ class RefreshBootstrapCacheTests(unittest.TestCase):
         self.manifest.write_text(
             f"rke2\t{RKE2_VERSION}\t{RKE2_SHA}\n"
             f"image\t{pause_source}\trancher/mirrored-pause:3.10.2\n"
-            f"image\t{self.runtime_source}\trancher/rke2-runtime:v1.36.5-rc2-rke2r1\n"
+            f"image\t{self.runtime_source}\trancher/rke2-runtime:v1.36.5-rke2r1\n"
             f"image\t{self.ccm_source}\tthanet-s/inspace-cloud-controller-manager:1.2.0\n"
         )
         self.state = {
@@ -218,14 +218,14 @@ class RefreshBootstrapCacheTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip().splitlines()[-1], "changed")
         state = self.load_state()
-        self.assertEqual(state["registry"]["rancher/rke2-runtime:v1.36.5-rc2-rke2r1"], self.runtime_digest)
+        self.assertEqual(state["registry"]["rancher/rke2-runtime:v1.36.5-rke2r1"], self.runtime_digest)
         self.assertEqual(state["registry"]["thanet-s/inspace-cloud-controller-manager:1.2.0"], self.ccm_digest)
         self.assertEqual(state["registry"]["rancher/mirrored-pause:3.10.2"], self.pause_digest)
         # A tag-sourced module image is copied by its resolved linux/amd64
         # digest, so a tag that moves during the refresh cannot be imported.
         self.assertEqual(self.copies(state), [
             f"copy docker://docker.io/rancher/rke2-runtime@{self.runtime_digest} "
-            "docker://127.0.0.1:5000/rancher/rke2-runtime:v1.36.5-rc2-rke2r1",
+            "docker://127.0.0.1:5000/rancher/rke2-runtime:v1.36.5-rke2r1",
             f"copy docker://ghcr.io/thanet-s/inspace-cloud-controller-manager@{self.ccm_digest} "
             "docker://127.0.0.1:5000/thanet-s/inspace-cloud-controller-manager:1.2.0",
         ])
@@ -241,7 +241,7 @@ class RefreshBootstrapCacheTests(unittest.TestCase):
         archive = self.cache_root / "artifacts/rke2" / RKE2_VERSION / "rke2.linux-amd64.tar.gz"
         self.assertEqual(archive.read_bytes(), RKE2_ARCHIVE)
         self.assertEqual(oct(archive.stat().st_mode & 0o777), "0o444")
-        self.assertIn(f"curl HEAD https://{FRONT}/rke2/v1.36.5-rc2%2Brke2r1/rke2.linux-amd64.tar.gz", state["log"])
+        self.assertIn(f"curl HEAD https://{FRONT}/rke2/v1.36.5%2Brke2r1/rke2.linux-amd64.tar.gz", state["log"])
         self.assertNotIn("rm -rf", self.maintain.read_text())
         self.assertNotIn("artifacts/rke2", self.maintain.read_text())
 
@@ -307,7 +307,7 @@ class RefreshBootstrapCacheTests(unittest.TestCase):
         self.assertEqual((directory / "rke2.linux-amd64.tar.gz").read_bytes(), b"other bytes")
 
     def test_failed_readback_still_restores_the_read_only_registry(self) -> None:
-        self.state["copy_digest"]["rancher/rke2-runtime:v1.36.5-rc2-rke2r1"] = "sha256:" + "e" * 64
+        self.state["copy_digest"]["rancher/rke2-runtime:v1.36.5-rke2r1"] = "sha256:" + "e" * 64
         self.save_state()
         result = self.run_refresh()
         self.assertNotEqual(result.returncode, 0)

@@ -235,7 +235,9 @@ func (r *ControlPlaneResizer) inspect(ctx context.Context, cluster *v1alpha1.InS
 	if cluster == nil {
 		return nil, errors.New("bootstrap: cluster is required")
 	}
-	if errs := cluster.Spec.Validate(); len(errs) != 0 {
+	// The spec is the cluster's persisted init-time spec, which may name a
+	// released release candidate.
+	if errs := cluster.Spec.ValidatePersisted(); len(errs) != 0 {
 		return nil, fmt.Errorf("bootstrap: invalid cluster: %v", errs)
 	}
 	replicas := controlPlaneReplicaCount(cluster)

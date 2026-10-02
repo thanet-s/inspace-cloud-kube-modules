@@ -156,7 +156,7 @@ func TestCacheRefreshPlanForRKE2AndModuleUpgradeAddsTheNewImages(t *testing.T) {
 		}
 	}
 	for _, want := range []string{
-		"rancher/rke2-runtime:v1.36.5-rc2-rke2r1",
+		"rancher/rke2-runtime:v1.36.5-rke2r1",
 		"rancher/hardened-kubernetes:v1.36.5-rke2r1-build20260923",
 		"rancher/mirrored-cilium-cilium:v1.20.2",
 		"sig-storage/csi-resizer:v1.13.2",

@@ -41,10 +41,9 @@ const (
 	bootstrapCacheCAPath  = "/etc/rancher/rke2/bootstrap-cache-ca.crt"
 )
 
-// exactRKE2VersionPattern accepts exact GA releases plus the single audited
-// release candidate pinned by the cloud-provider bootstrap cache; other
-// pre-releases stay rejected.
-var exactRKE2VersionPattern = regexp.MustCompile(`^(v[0-9]+\.[0-9]+\.[0-9]+\+rke2r[0-9]+|v1\.36\.5-rc2\+rke2r1)$`)
+// exactRKE2VersionPattern accepts exact GA releases only; every pre-release
+// stays rejected.
+var exactRKE2VersionPattern = regexp.MustCompile(`^(v[0-9]+\.[0-9]+\.[0-9]+\+rke2r[0-9]+)$`)
 
 type Config struct {
 	NodeName         string

@@ -624,8 +624,10 @@ func (r *Reconciler) Destroy(ctx context.Context, cluster *v1alpha1.InSpaceClust
 	// Teardown validates the infrastructure spec but deliberately does not
 	// apply create-time metadata.name constraints. Older clusters may have a
 	// name that cannot form the current guest-hostname convention and must
-	// still remain safely deletable through their owner records.
-	if errs := cluster.Spec.Validate(); len(errs) != 0 {
+	// still remain safely deletable through their owner records. The spec is
+	// the persisted init-time spec, so it may name a released release
+	// candidate.
+	if errs := cluster.Spec.ValidatePersisted(); len(errs) != 0 {
 		return DestroyResult{}, fmt.Errorf("bootstrap: invalid cluster: %v", errs)
 	}
 	replicas := controlPlaneReplicaCount(cluster)

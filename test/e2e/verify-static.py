@@ -3018,7 +3018,7 @@ def main() -> None:
     ):
         require(marker in playbook, f"playbook is missing contract marker: {marker}")
 
-    require("version: v1.36.5-rc2+rke2r1" in cluster, "control plane must pin supported RKE2")
+    require("version: v1.36.5+rke2r1" in cluster, "control plane must pin supported RKE2")
     require("rootDiskGiB: 60" in cluster, "E2E control planes must use 60 GiB root disks")
     require("rke2-ingress-nginx" in cluster, "unused RKE2 ingress must be disabled")
     require("rke2-traefik" in cluster, "unused RKE2 Traefik ingress must be disabled")

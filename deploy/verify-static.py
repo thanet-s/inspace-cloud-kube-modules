@@ -1165,6 +1165,52 @@ def main() -> None:
         and "parse_version(current, AUDITED_PRERELEASES | RELEASED_PRERELEASES)" in rke2_upgrade_validator,
         "RKE2 upgrade guard no longer accepts every released candidate as an upgrade source",
     )
+    # A cluster created on a released release candidate keeps it in cluster.yaml
+    # and the journal for good. Three copies of that list must agree: the
+    # upgrade guard's source set, the Go persisted-spec allowlist that resize and
+    # destroy validate against, and the preflight list status, tunnel and destroy
+    # accept. Init and update refuse a candidate as their target.
+    released_match = re.search(r"RELEASED_PRERELEASES = frozenset\(\{([^}]*)\}\)", rke2_upgrade_validator)
+    released_candidates = set(re.findall(r'"([^"]+)"', released_match.group(1))) if released_match else set()
+    go_released_match = re.search(
+        r"releasedRKE2Prereleases = map\[string\]struct\{\}\{(.*?)\n\}",
+        read("modules/cloud-provider/api/v1alpha1/types.go"),
+        re.S,
+    )
+    go_released_candidates = set(re.findall(r'"([^"]+)"', go_released_match.group(1))) if go_released_match else set()
+    preflight_tasks = read("deploy/playbooks/tasks/preflight.yml")
+    preflight_released_match = re.search(r"deploy_released_rke2_prereleases:\n((?:      - \S+\n)+)", preflight_tasks)
+    preflight_released_candidates = (
+        set(re.findall(r"- (\S+)", preflight_released_match.group(1))) if preflight_released_match else set()
+    )
+    require(
+        released_candidates
+        and released_candidates == go_released_candidates
+        and released_candidates == preflight_released_candidates,
+        "RELEASED_PRERELEASES, the Go releasedRKE2Prereleases set, and preflight's deploy_released_rke2_prereleases differ",
+    )
+    require(
+        "rke2_version in deploy_released_rke2_prereleases" in preflight_tasks
+        and "deploy_rke2_version_is_released_candidate" in preflight_tasks,
+        "preflight must accept every released release candidate as the inventory RKE2 version",
+    )
+    for playbook in ("deploy/playbooks/init-cluster.yml", "deploy/playbooks/update-control-plane.yml"):
+        require(
+            "not (deploy_rke2_version_is_released_candidate | bool)" in read(playbook),
+            f"{playbook} must refuse a release candidate as the RKE2 target",
+        )
+    load_state_tasks = read("deploy/playbooks/tasks/load-state.yml")
+    require(
+        "deploy_inventory_is_ga_of_recorded_candidate" in load_state_tasks
+        and "deploy_recorded_rke2_version in deploy_released_rke2_prereleases" in load_state_tasks
+        and "regex_replace('-rc[0-9]+[+]', '+')" in load_state_tasks,
+        "status, tunnel and destroy must tolerate an inventory on the GA release of the recorded candidate",
+    )
+    require(
+        "cluster.Spec.ValidatePersisted()" in read("modules/cloud-provider/pkg/bootstrap/resize.go")
+        and "cluster.Spec.ValidatePersisted()" in read("modules/cloud-provider/pkg/bootstrap/reconciler.go"),
+        "control-plane resize and destroy must validate the persisted spec with ValidatePersisted",
+    )
     rke2_upgrade_script = read("deploy/templates/upgrade-rke2-server.sh")
     require(
         "sha256sum" in rke2_upgrade_script and "systemctl stop rke2-server" in rke2_upgrade_script,

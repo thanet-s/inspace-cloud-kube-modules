@@ -14,6 +14,17 @@
     - name: Validate inventory, topology, tools, and SSH identity
       ansible.builtin.include_tasks: tasks/preflight.yml
 
+    # update renders the default NodeClass from rke2_version, and NodeClass
+    # validation accepts only GA releases, so the inventory must name a GA
+    # release even when the control plane still runs the recorded candidate.
+    - name: Require a GA RKE2 release as the upgrade target
+      ansible.builtin.assert:
+        that: not (deploy_rke2_version_is_released_candidate | bool)
+        fail_msg: >-
+          rke2_version {{ rke2_version }} is a release candidate. Set rke2_version to the
+          GA release (v1.36.5+rke2r1 or newer) and run update again; a release candidate
+          is accepted only as the version a cluster already runs.
+
     - name: Require the API token for refreshing the in-cluster Secret
       ansible.builtin.assert:
         that: lookup('env', 'INSPACE_API_TOKEN') | length > 0
