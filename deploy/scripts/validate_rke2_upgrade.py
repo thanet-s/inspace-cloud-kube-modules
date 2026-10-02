@@ -9,9 +9,9 @@ import sys
 VERSION_PATTERN = re.compile(r"^v(\d+)\.(\d+)\.(\d+)(?:-rc(\d+))?\+rke2r(\d+)$")
 # Pre-releases are refused as a target except the single audited release
 # candidate pinned by the bootstrap cache
-# (modules/cloud-provider/pkg/bootstrap/cache.go). Drop it when that pin moves
-# to its GA release.
-AUDITED_PRERELEASES = frozenset({"v1.36.5-rc2+rke2r1"})
+# (modules/cloud-provider/pkg/bootstrap/cache.go). The pin is GA, so none is
+# audited; name the candidate here again only while the pin is a candidate.
+AUDITED_PRERELEASES: frozenset[str] = frozenset()
 # Every release candidate a published modules release ever pinned. Clusters
 # installed on one must keep upgrading off it after the pin moves, so an entry
 # is never removed; the pin refresh in DEVELOPMENT.md leaves this file alone.

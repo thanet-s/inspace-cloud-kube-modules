@@ -675,7 +675,7 @@ Enable it only when creating a cluster:
 ```yaml
 spec:
   rke2:
-    version: v1.36.5-rc2+rke2r1   # must bundle Cilium 1.20+
+    version: v1.36.5+rke2r1   # must bundle Cilium 1.20+
     disable: [rke2-ingress-nginx, rke2-traefik, rke2-traefik-crd]
   network:
     gatewayAPI:

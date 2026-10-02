@@ -37,9 +37,9 @@ var (
 	locationPattern   = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
 	clusterNamePrefix = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,53}[a-z0-9])?$`)
 	uuidPattern       = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
-	// Exact GA releases plus the single audited release candidate pinned by
-	// the bootstrap cache; see pkg/bootstrap. Keep in sync with the CRD.
-	rke2VersionPattern = regexp.MustCompile(`^(v[0-9]+\.[0-9]+\.[0-9]+\+rke2r[0-9]+|v1\.36\.5-rc2\+rke2r1)$`)
+	// Exact GA releases only; release candidates are never accepted. See
+	// pkg/bootstrap. Keep in sync with the CRD.
+	rke2VersionPattern = regexp.MustCompile(`^(v[0-9]+\.[0-9]+\.[0-9]+\+rke2r[0-9]+)$`)
 )
 
 type InSpaceCluster struct {

@@ -12,7 +12,7 @@ import (
 func TestWorkerConfigCarriesOnlyTheAgentJoinToken(t *testing.T) {
 	data, err := RenderCloudInit(Config{
 		NodeName: "worker-1", Server: "https://10.0.0.10:9345", Token: "agent-join-token",
-		RKE2Version: "v1.36.5-rc2+rke2r1",
+		RKE2Version: "v1.36.5+rke2r1",
 	})
 	if err != nil {
 		t.Fatal(err)

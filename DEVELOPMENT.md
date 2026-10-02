@@ -171,9 +171,9 @@ cloud-init.
 
 #### Refreshing the audited RKE2 release
 
-The cache serves exactly one RKE2 release, currently the release candidate
-`v1.36.5-rc2+rke2r1` (Kubernetes 1.36.5, rke2-cilium 1.20.200 / Cilium
-1.20.2). `bootstrapCacheRKE2Version` in
+The cache serves exactly one RKE2 release, currently GA `v1.36.5+rke2r1`
+(Kubernetes 1.36.5, rke2-cilium 1.20.200 / Cilium 1.20.2).
+`bootstrapCacheRKE2Version` in
 `modules/cloud-provider/pkg/bootstrap/cache.go` is the source of truth; the
 tarball checksum `bootstrapCacheRKE2SHA256` and the 27-entry
 `rke2CacheImages` inventory are derived from that release's public assets:
@@ -191,8 +191,9 @@ tarball checksum `bootstrapCacheRKE2SHA256` and the 27-entry
 prints the Go values; `--check` verifies `cache.go` against a release instead.
 It needs Docker buildx and public GitHub and Docker Hub access.
 
-Moving to another release, for example from the candidate to GA
-`v1.36.5+rke2r1`, is mechanical:
+Moving to another release, for example from a release candidate to its GA, is
+mechanical. The steps below use the `v1.36.5-rc2+rke2r1` to `v1.36.5+rke2r1`
+move as the worked example:
 
 1. Paste the script's output over the two constants and the
    `rke2CacheImages` entries.
@@ -200,9 +201,14 @@ Moving to another release, for example from the candidate to GA
    `git grep -l 'v1.36.5-rc2+rke2r1' -- . ':!release-notes' ':!DEVELOPMENT.md' ':!deploy/scripts/validate_rke2_upgrade.py' ':!deploy/scripts/test_validate_rke2_upgrade.py' | xargs sed -i 's/v1\.36\.5-rc2+rke2r1/v1.36.5+rke2r1/g'`
    (examples, E2E templates and checks, deploy inventory example, and test
    fixtures). Published release notes keep their history, and the upgrade
-   guard keeps the old release as an upgrade source (step 4).
-3. Update `v9DirectHash` in `cache_contract_test.go`: the direct control-plane
-   fixture renders `bootstrapCacheRKE2Version`, so only the version moves it.
+   guard keeps the old release as an upgrade source (step 4). Afterwards
+   reread the prose that talks about the candidate itself, for example in
+   `deploy/README.md` and `deploy/playbooks/tasks/apply-rke2-upgrade.yml`,
+   and put the candidate name back where the sed rewrote it to the GA name.
+3. Update `v9DirectHash` in `cache_contract_test.go` and `legacyV9DirectHash`
+   in `agent_token_test.go`: the direct control-plane fixture renders
+   `bootstrapCacheRKE2Version`, so only the version moves them. Run the
+   `pkg/bootstrap` tests and take each new hash from its failure message.
 4. For a GA release, drop the single release-candidate alternative
    (`|v1\.36\.5-rc2\+rke2r1`) from the Go RKE2 version patterns, all four CRD
    copies, `deploy/playbooks/tasks/preflight.yml`, and

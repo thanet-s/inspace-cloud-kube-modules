@@ -932,7 +932,7 @@
             fail_msg: >-
               Cilium {{ e2e_cilium_agent_version.stdout }} predates 1.20.2, which
               stops L2 announcements from dropping externalTrafficPolicy Local
-              traffic; the private Local VIP contract needs RKE2 v1.36.5-rc2+rke2r1
+              traffic; the private Local VIP contract needs RKE2 v1.36.5+rke2r1
               or later.
 
         - name: Render the private Local L2 Service

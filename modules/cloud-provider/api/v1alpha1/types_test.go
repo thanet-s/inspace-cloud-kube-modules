@@ -52,7 +52,7 @@ func TestClusterNameFitsFixedNodeHostnames(t *testing.T) {
 }
 
 func TestRKE2VersionValidationRequiresExactRelease(t *testing.T) {
-	for _, version := range []string{"v1.36.4+rke2r1", "v1.36.4+rke2r12", "v1.36.5-rc2+rke2r1"} {
+	for _, version := range []string{"v1.36.4+rke2r1", "v1.36.4+rke2r12", "v1.36.5+rke2r1"} {
 		spec := validSpec()
 		spec.RKE2.Version = version
 		if errs := spec.Validate(); len(errs) != 0 {
@@ -61,8 +61,8 @@ func TestRKE2VersionValidationRequiresExactRelease(t *testing.T) {
 	}
 	for _, version := range []string{
 		"", "latest", "v1.35.6", "v1.35.6+rke2", "1.35.6+rke2r1", "v1.35+rke2r1",
-		// Only the single audited release candidate is accepted.
-		"v1.36.5-rc1+rke2r1", "v1.36.5-rc2+rke2r2", "v1.37.1-rc2+rke2r1", "v1.36.5-rc2", "v1.36.5-rc2+rke2r1x",
+		// Release candidates are never accepted.
+		"v1.36.5-rc1+rke2r1", "v1.36.5-rc2+rke2r1", "v1.36.5-rc2+rke2r2", "v1.37.1-rc2+rke2r1", "v1.36.5-rc2", "v1.36.5+rke2r1x",
 	} {
 		spec := validSpec()
 		spec.RKE2.Version = version
@@ -258,7 +258,7 @@ func validSpec() InSpaceClusterSpec {
 			Image:        ImageSpec{OSName: "ubuntu", OSVersion: "24.04"},
 		}},
 		BootstrapCache: BootstrapCacheSpec{},
-		RKE2:           RKE2Spec{Version: "v1.36.5-rc2+rke2r1", TokenSecretRef: SecretKeyReference{Name: "token", Key: "token"}},
+		RKE2:           RKE2Spec{Version: "v1.36.5+rke2r1", TokenSecretRef: SecretKeyReference{Name: "token", Key: "token"}},
 		Network: NetworkSpec{
 			UUID: "11111111-2222-3333-4444-555555555555", PodCIDR: "10.42.0.0/16", ServiceCIDR: "10.43.0.0/16",
 			PrivateLoadBalancerPool: PrivateLoadBalancerPoolSpec{Start: "10.20.30.200", Stop: "10.20.30.239"},
@@ -311,7 +311,7 @@ func TestGatewayAPIRequiresCilium120AndNoTraefikCRDs(t *testing.T) {
 		return spec
 	}
 	for _, version := range []string{
-		"v1.34.12+rke2r1", "v1.35.9+rke2r1", "v1.36.5-rc2+rke2r1", "v1.36.5+rke2r1", "v1.36.12+rke2r2",
+		"v1.34.12+rke2r1", "v1.35.9+rke2r1", "v1.36.5+rke2r1", "v1.36.12+rke2r2",
 		"v1.37.0+rke2r1", "v1.38.1+rke2r1",
 	} {
 		if errs := enabled(version, "rke2-traefik", "rke2-traefik-crd").Validate(); len(errs) != 0 {
@@ -331,7 +331,7 @@ func TestGatewayAPIRequiresCilium120AndNoTraefikCRDs(t *testing.T) {
 	// Disabling rke2-traefik alone still installs rke2-traefik-crd, whose bundled
 	// Gateway API CRDs collide with ours and crash-loop its helm-install job
 	// (seen live on v1.36.5-rc2 in the v1.1.0-rc.7 E2E).
-	errs = enabled("v1.36.5-rc2+rke2r1", "rke2-traefik").Validate()
+	errs = enabled("v1.36.5+rke2r1", "rke2-traefik").Validate()
 	if !validationFieldReported(errs, "spec.network.gatewayAPI.enabled") {
 		t.Fatalf("Gateway API with rke2-traefik-crd enabled accepted: %v", errs)
 	}
@@ -383,7 +383,7 @@ func TestRKE2DisableListIsBounded(t *testing.T) {
 
 func TestRKE2OwnsGatewayAPICRDsFromV137(t *testing.T) {
 	for version, want := range map[string]bool{
-		"v1.34.12+rke2r1": false, "v1.35.9+rke2r1": false, "v1.36.5-rc2+rke2r1": false, "v1.36.9+rke2r1": false,
+		"v1.34.12+rke2r1": false, "v1.35.9+rke2r1": false, "v1.36.5+rke2r1": false, "v1.36.9+rke2r1": false,
 		"v1.37.0+rke2r1": true, "v1.37.1+rke2r2": true, "v1.38.0+rke2r1": true, "": false, "latest": false,
 	} {
 		if got := RKE2BundlesGatewayAPICRDs(version); got != want {

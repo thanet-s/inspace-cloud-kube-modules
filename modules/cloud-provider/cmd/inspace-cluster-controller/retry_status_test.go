@@ -117,7 +117,7 @@ spec:
   controlPlane: {replicas: 3, machine: {vcpu: 4, memoryMiB: 8192, rootDiskGiB: 60, hostPoolUUID: aac7dd66-f390-4edd-80c0-dd7cae49bd99, image: {osName: ubuntu, osVersion: "26.04"}}}
   bootstrapCache: {}
   rke2:
-    version: v1.36.5-rc2+rke2r1
+    version: v1.36.5+rke2r1
     tokenSecretRef: {name: rke2-token, key: token}
     disable: []
     tlsSubjectAltNames: []

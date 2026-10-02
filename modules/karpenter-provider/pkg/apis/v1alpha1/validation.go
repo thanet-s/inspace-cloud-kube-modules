@@ -20,9 +20,9 @@ import (
 
 var (
 	uuidPattern = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$`)
-	// Exact GA releases plus the single audited release candidate pinned by
-	// the cloud-provider bootstrap cache. Keep in sync with the CRD.
-	rke2VersionPattern = regexp.MustCompile(`^(v[0-9]+\.[0-9]+\.[0-9]+\+rke2r[0-9]+|v1\.36\.5-rc2\+rke2r1)$`)
+	// Exact GA releases only; release candidates are never accepted. Keep in
+	// sync with the CRD.
+	rke2VersionPattern = regexp.MustCompile(`^(v[0-9]+\.[0-9]+\.[0-9]+\+rke2r[0-9]+)$`)
 	sshUsernamePattern = regexp.MustCompile(`^[a-z_][a-z0-9_-]{0,29}$`)
 )
 

@@ -15,11 +15,10 @@ import (
 )
 
 var (
-	// rke2VersionPattern accepts exact GA releases plus exactly one audited
-	// release candidate, the one the bootstrap cache currently pins. It is
-	// deliberately not a general pre-release relaxation; drop the candidate
-	// alternative when the pin moves to its GA release.
-	rke2VersionPattern = regexp.MustCompile(`^(v[0-9]+\.[0-9]+\.[0-9]+\+rke2r[0-9]+|v1\.36\.5-rc2\+rke2r1)$`)
+	// rke2VersionPattern accepts exact GA releases only. While the bootstrap
+	// cache pins a release candidate, add that one candidate as an alternative;
+	// never relax it to pre-releases in general.
+	rke2VersionPattern = regexp.MustCompile(`^(v[0-9]+\.[0-9]+\.[0-9]+\+rke2r[0-9]+)$`)
 	nodeNamePattern    = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
 )
 

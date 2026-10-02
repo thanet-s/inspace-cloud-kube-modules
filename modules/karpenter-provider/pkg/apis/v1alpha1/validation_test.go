@@ -28,8 +28,8 @@ func TestValidate(t *testing.T) {
 	}
 }
 
-func TestValidateAcceptsExactRKE2ReleasesAndOnlyTheAuditedCandidate(t *testing.T) {
-	for _, version := range []string{"v1.36.4+rke2r1", "v1.36.5+rke2r1", "v1.36.4+rke2r12", "v1.36.5-rc2+rke2r1"} {
+func TestValidateAcceptsOnlyExactRKE2Releases(t *testing.T) {
+	for _, version := range []string{"v1.36.4+rke2r1", "v1.36.5+rke2r1", "v1.36.4+rke2r12"} {
 		nodeClass := validNodeClass()
 		nodeClass.Spec.RKE2.Version = version
 		if errs := nodeClass.Validate(); len(errs) != 0 {
@@ -38,7 +38,7 @@ func TestValidateAcceptsExactRKE2ReleasesAndOnlyTheAuditedCandidate(t *testing.T
 	}
 	for _, version := range []string{
 		"", "latest", "v1.36.5", "1.36.5+rke2r1", "v1.36.5-rke2r1",
-		"v1.36.5-rc1+rke2r1", "v1.36.5-rc2+rke2r2", "v1.37.1-rc2+rke2r1", "v1.36.5-rc2",
+		"v1.36.5-rc1+rke2r1", "v1.36.5-rc2+rke2r1", "v1.36.5-rc2+rke2r2", "v1.37.1-rc2+rke2r1", "v1.36.5-rc2",
 	} {
 		nodeClass := validNodeClass()
 		nodeClass.Spec.RKE2.Version = version
@@ -264,7 +264,7 @@ func validNodeClass() *InSpaceNodeClass {
 		ImageSelector:           ImageSelector{OSName: OSNameUbuntu, OSVersion: OSVersionUbuntu},
 		RootDiskGiB:             40,
 		RKE2: RKE2Config{
-			Version:        "v1.36.5-rc2+rke2r1",
+			Version:        "v1.36.5+rke2r1",
 			Server:         "https://10.0.0.10:9345",
 			TokenSecretRef: SecretKeySelector{Name: RKE2AgentTokenSecretName, Key: RKE2AgentTokenSecretKey},
 		},

@@ -90,7 +90,7 @@ L2 Announcements is a beta feature and
 works only if the InSpace VPC accepts ARP and gratuitous ARP for VIPs that are
 not assigned to a VM NIC. Validate this behavior in the target VPC.
 `externalTrafficPolicy: Cluster` is the default private contract. With the
-bundled Cilium 1.20.2 or later (RKE2 v1.36.5-rc2+rke2r1), a private Service may
+bundled Cilium 1.20.2 or later (RKE2 v1.36.5+rke2r1), a private Service may
 also use `externalTrafficPolicy: Local`: only nodes with a ready local endpoint
 compete for its L2 lease, so the VIP is announced from a node that serves it
 and the client source IP is preserved. The VIP moves only after the serving

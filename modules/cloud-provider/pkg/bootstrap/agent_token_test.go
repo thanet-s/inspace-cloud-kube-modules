@@ -13,7 +13,7 @@ import (
 // agent token. Clusters created before the agent token existed keep exactly
 // these bytes, so their spec hashes, adoption, and destroy authority are
 // unchanged.
-const legacyV9DirectHash = "d0e02293426fc7c175413a8ea922c58b2d22b3f9653db444f2a379f3a4dca1f0"
+const legacyV9DirectHash = "41680f3258463a517ae3f9792065cf5d8d20a35382a94052f1b79a109a1236c4"
 
 func agentTokenRKE2Config(t *testing.T, input CloudInitInput) string {
 	t.Helper()
