@@ -72,6 +72,29 @@ func TestRKE2VersionValidationRequiresExactRelease(t *testing.T) {
 	}
 }
 
+func TestPersistedSpecValidationAlsoAcceptsReleasedCandidates(t *testing.T) {
+	for _, version := range []string{"v1.36.4+rke2r1", "v1.36.5+rke2r1", "v1.36.5-rc2+rke2r1"} {
+		spec := validSpec()
+		spec.RKE2.Version = version
+		if errs := spec.ValidatePersisted(); len(errs) != 0 {
+			t.Errorf("persisted version %q: unexpected validation errors: %v", version, errs)
+		}
+	}
+	// A new spec stays GA-only, and only released candidates are tolerated.
+	spec := validSpec()
+	spec.RKE2.Version = "v1.36.5-rc2+rke2r1"
+	if errs := spec.Validate(); !validationFieldReported(errs, "spec.rke2.version") {
+		t.Errorf("new spec naming a release candidate accepted: %v", errs)
+	}
+	for _, version := range []string{"v1.36.5-rc1+rke2r1", "v1.36.5-rc2+rke2r2", "v1.37.1-rc2+rke2r1", "v1.36.5-rc2", "v1.36.5-rc2+rke2r1x", ""} {
+		spec := validSpec()
+		spec.RKE2.Version = version
+		if errs := spec.ValidatePersisted(); !validationFieldReported(errs, "spec.rke2.version") {
+			t.Errorf("persisted version %q accepted: %v", version, errs)
+		}
+	}
+}
+
 func TestBootstrapCacheModesAreValid(t *testing.T) {
 	for _, directDownload := range []bool{false, true} {
 		spec := validSpec()

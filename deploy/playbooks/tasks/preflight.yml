@@ -17,6 +17,17 @@
   ansible.builtin.set_fact:
     deploy_state_dir: "{{ ((deploy_state_root + '/' + cluster_name) | realpath) }}"
 
+# Every release candidate a published modules release ever pinned. It mirrors
+# RELEASED_PRERELEASES in scripts/validate_rke2_upgrade.py, and
+# deploy/verify-static.py keeps the two in sync. A cluster created on one keeps
+# it in its journal and cluster.yaml, so status, tunnel, and destroy must still
+# accept it as the inventory version. Only init and update refuse it, because
+# there it would be the target of an install or an upgrade.
+- name: List the released RKE2 release candidates
+  ansible.builtin.set_fact:
+    deploy_released_rke2_prereleases:
+      - v1.36.5-rc2+rke2r1
+
 - name: Require the complete deployment inventory
   ansible.builtin.assert:
     that:
@@ -36,7 +47,7 @@
       - pod_cidr == '10.42.0.0/16'
       - service_cidr == '10.43.0.0/16'
       - modules_version is match('^[0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z.-]+)?$')
-      - rke2_version is match('^(v[0-9]+\\.[0-9]+\\.[0-9]+\\+rke2r[0-9]+)$')
+      - rke2_version is match('^(v[0-9]+\\.[0-9]+\\.[0-9]+\\+rke2r[0-9]+)$') or rke2_version in deploy_released_rke2_prereleases
       - ssh_username is match('^[a-z_][a-z0-9_-]{0,29}$')
       - ssh_private_key_file_expanded.startswith('/')
       - ssh_public_key_file_expanded.startswith('/')
@@ -48,6 +59,10 @@
       - control_plane_extra_config is mapping
       - karpenter_instance_families | length > 0
     fail_msg: "Deployment inventory is incomplete or violates the supported v0.7 topology."
+
+- name: Record whether the inventory RKE2 version is a released release candidate
+  ansible.builtin.set_fact:
+    deploy_rke2_version_is_released_candidate: "{{ rke2_version in deploy_released_rke2_prereleases }}"
 
 - name: Inspect the persisted bootstrap spec for its Ubuntu release
   ansible.builtin.stat:

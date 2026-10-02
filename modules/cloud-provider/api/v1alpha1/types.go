@@ -42,6 +42,17 @@ var (
 	rke2VersionPattern = regexp.MustCompile(`^(v[0-9]+\.[0-9]+\.[0-9]+\+rke2r[0-9]+)$`)
 )
 
+// releasedRKE2Prereleases lists every release candidate a published modules
+// release ever pinned. A cluster created on one keeps it in its persisted
+// init-time spec (deploy's cluster.yaml is never rewritten), and teardown and
+// control-plane resize validate that spec, so ValidatePersisted accepts these
+// versions. A new spec never does. Entries are never removed; this mirrors
+// RELEASED_PRERELEASES in deploy/scripts/validate_rke2_upgrade.py, and
+// deploy/verify-static.py keeps the two in sync.
+var releasedRKE2Prereleases = map[string]struct{}{
+	"v1.36.5-rc2+rke2r1": {},
+}
+
 type InSpaceCluster struct {
 	APIVersion string               `json:"apiVersion"`
 	Kind       string               `json:"kind"`
@@ -261,7 +272,17 @@ type ValidationError struct {
 
 func (e ValidationError) Error() string { return e.Field + ": " + e.Message }
 
-func (s InSpaceClusterSpec) Validate() []error {
+// Validate checks a spec that is about to create infrastructure. Its RKE2
+// version must be an exact GA release.
+func (s InSpaceClusterSpec) Validate() []error { return s.validate(false) }
+
+// ValidatePersisted checks the init-time spec of an existing cluster before
+// teardown or a control-plane resize. It is Validate, except that a released
+// release candidate is also an acceptable RKE2 version, so clusters created on
+// one stay destroyable and resizable after the audited pin moves to its GA.
+func (s InSpaceClusterSpec) ValidatePersisted() []error { return s.validate(true) }
+
+func (s InSpaceClusterSpec) validate(persisted bool) []error {
 	var errs []error
 	add := func(field, message string) { errs = append(errs, ValidationError{Field: field, Message: message}) }
 	if !locationPattern.MatchString(s.Location) {
@@ -295,7 +316,8 @@ func (s InSpaceClusterSpec) Validate() []error {
 	if machine.Image.OSVersion != "24.04" && machine.Image.OSVersion != "26.04" {
 		add("spec.controlPlane.machine.image.osVersion", "must be 24.04 or 26.04 in v1alpha1")
 	}
-	if !rke2VersionPattern.MatchString(s.RKE2.Version) {
+	_, releasedCandidate := releasedRKE2Prereleases[s.RKE2.Version]
+	if !rke2VersionPattern.MatchString(s.RKE2.Version) && !(persisted && releasedCandidate) {
 		add("spec.rke2.version", "must be an exact vX.Y.Z+rke2rN release")
 	}
 	if s.RKE2.TokenSecretRef.Name == "" || s.RKE2.TokenSecretRef.Key == "" {

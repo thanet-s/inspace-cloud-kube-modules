@@ -222,7 +222,26 @@ move as the worked example:
    candidate as a target. After this step a NodeClass still naming the
    candidate is NotReady until it moves to the new release; `deploy update`
    moves the default NodeClass, so release notes must tell users to move
-   their own.
+   their own. Moving a NodeClass version changes its hash and drifts its
+   workers, so the notes must also say that NodePools with a `nodes: "0"`
+   budget keep the old agent until replaced.
+
+   Clusters created on the candidate keep it in their persisted `cluster.yaml`
+   and journal, so these candidate allowances stay, and a new candidate joins
+   all three the moment a published release pins it:
+   - `releasedRKE2Prereleases` in `modules/cloud-provider/api/v1alpha1/types.go`.
+     `InSpaceClusterSpec.ValidatePersisted` accepts those versions, and control-plane
+     resize (`resize.go`) and `Destroy` use it; `Validate`, which `Reconcile`
+     uses to create a cluster, stays GA-only.
+   - `deploy_released_rke2_prereleases` in
+     `deploy/playbooks/tasks/preflight.yml`. Preflight accepts those versions as
+     the inventory version, `init` and `update` refuse them as the target, and
+     `load-state.yml` lets `status`, `tunnel`, and `destroy` run with the
+     inventory on the candidate's own GA release.
+   - `RELEASED_PRERELEASES` in `deploy/scripts/validate_rke2_upgrade.py`.
+
+   `deploy/verify-static.py` fails when the three lists differ. Leave the CRD
+   patterns, the NodeClass validators, and the controller bootstrap GA-only.
 5. When the bundled Cilium minor changes, render the new rke2-cilium chart
    with the values in `renderRKE2CiliumConfig` and compare the resulting
    `cilium-config` keys the E2E asserts, and read Cilium's upgrade notes.

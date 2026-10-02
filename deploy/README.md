@@ -498,6 +498,18 @@ the single command for both kinds of day-2 upgrade:
   `v1.36.5+rke2r1`; the journal is what distinguishes the candidate from its
   GA release, and moving from the candidate to GA is an ordinary upgrade.
 
+  A release candidate is accepted only as the version a cluster already runs.
+  `init` and `update` refuse it as `rke2_version`, because there it is the
+  target of an install or upgrade (and `update` renders the default NodeClass
+  from it, which accepts GA releases only). `status`, `tunnel`, and `destroy`
+  accept it, so a cluster created on `v1.36.5-rc2+rke2r1` stays inspectable and
+  destroyable. They also accept the inventory on that candidate's own GA
+  release (`v1.36.5+rke2r1` while the journal records
+  `v1.36.5-rc2+rke2r1`), so an interrupted or partial `update` never locks them
+  out; any other mismatch with the recorded version still means another
+  cluster. The controller's resize and destroy paths validate the persisted
+  `cluster.yaml` the same way.
+
   A downgrade or a jump of more than one RKE2 minor version is refused unless
   the operator exports `INSPACE_CONFIRM_RKE2_VERSION_SKIP=<cluster-name>`,
   matching this project's typed-confirmation pattern for other destructive or

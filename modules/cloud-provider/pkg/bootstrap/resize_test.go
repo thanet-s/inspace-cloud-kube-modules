@@ -498,3 +498,40 @@ func TestStartOnlyKeepsEveryOwnershipRefusal(t *testing.T) {
 		t.Fatalf("StartOnly() = %v calls = %q, want an ownership refusal and no mutation", err, api.callList())
 	}
 }
+
+// A cluster created on a released release candidate keeps that version in its
+// persisted cluster.yaml for good, so resize, its check, and the start-only
+// recovery must validate that spec even though the audited pin is GA.
+func TestResizeControlPlaneAcceptsAPersistedReleaseCandidateSpec(t *testing.T) {
+	for _, mode := range []string{"check", "start-only", "resize"} {
+		t.Run(mode, func(t *testing.T) {
+			cluster := testCluster()
+			cluster.Spec.RKE2.Version = "v1.36.5-rc2+rke2r1"
+			api := newResizeAPI(cluster.Metadata.Name, 1, ownerKey(cluster), "stopped", 4, 4096)
+			resizer := testResizer(api)
+			var err error
+			switch mode {
+			case "check":
+				_, err = resizer.Check(context.Background(), cluster, resizeRequest())
+			case "start-only":
+				_, err = resizer.StartOnly(context.Background(), cluster, resizeRequest())
+			default:
+				_, err = resizer.Resize(context.Background(), cluster, resizeRequest())
+			}
+			if err != nil {
+				t.Fatalf("%s on a persisted v1.36.5-rc2+rke2r1 spec: %v", mode, err)
+			}
+		})
+	}
+}
+
+func TestResizeControlPlaneStillRefusesAnUnreleasedCandidateOrMalformedVersion(t *testing.T) {
+	for _, version := range []string{"v1.36.5-rc1+rke2r1", "v1.36.5-rc2+rke2r2", "v1.36.5-rc2", "latest"} {
+		cluster := testCluster()
+		cluster.Spec.RKE2.Version = version
+		api := newResizeAPI(cluster.Metadata.Name, 1, ownerKey(cluster), "running", 4, 4096)
+		if _, err := testResizer(api).Resize(context.Background(), cluster, resizeRequest()); err == nil || !strings.Contains(err.Error(), "spec.rke2.version") || api.callList() != "" {
+			t.Errorf("version %q: err=%v calls=%q, want a version refusal and no mutation", version, err, api.callList())
+		}
+	}
+}

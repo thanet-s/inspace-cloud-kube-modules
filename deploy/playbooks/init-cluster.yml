@@ -12,6 +12,14 @@
     - name: Validate inventory, topology, tools, and SSH identity
       ansible.builtin.include_tasks: tasks/preflight.yml
 
+    - name: Require a GA RKE2 release as the version a new cluster installs
+      ansible.builtin.assert:
+        that: not (deploy_rke2_version_is_released_candidate | bool)
+        fail_msg: >-
+          rke2_version {{ rke2_version }} is a release candidate. Set rke2_version to the
+          GA release (v1.36.5+rke2r1 or newer); a release candidate is accepted only
+          as the version a cluster already runs.
+
     - name: Require the API token only in the process environment
       ansible.builtin.assert:
         that: lookup('env', 'INSPACE_API_TOKEN') | length > 0

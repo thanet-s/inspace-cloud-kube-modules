@@ -5972,3 +5972,23 @@ func (f *fakeAPI) DeleteFloatingIP(ctx context.Context, _, address string) error
 }
 
 var _ API = (*fakeAPI)(nil)
+
+// Teardown validates the persisted init-time spec, which may name a released
+// release candidate; creating infrastructure with one stays refused.
+func TestDestroyAcceptsAPersistedReleaseCandidateButReconcileRefusesIt(t *testing.T) {
+	api := newFakeAPI()
+	cluster := testCluster()
+	reconciler := testReconciler(api)
+	reconcileUntilReady(t, reconciler, cluster)
+
+	cluster.Spec.RKE2.Version = "v1.36.5-rc2+rke2r1"
+	if result := destroyUntilDone(t, reconciler, cluster); !result.Done || len(api.vms) != 0 {
+		t.Fatalf("destroy of a persisted release-candidate spec = %#v, VMs left %d", result, len(api.vms))
+	}
+
+	fresh := testCluster()
+	fresh.Spec.RKE2.Version = "v1.36.5-rc2+rke2r1"
+	if _, err := testReconciler(newFakeAPI()).Reconcile(context.Background(), fresh, "token"); err == nil || !strings.Contains(err.Error(), "spec.rke2.version") {
+		t.Fatalf("Reconcile of a new release-candidate spec = %v, want a spec.rke2.version refusal", err)
+	}
+}

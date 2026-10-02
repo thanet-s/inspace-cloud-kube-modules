@@ -21,6 +21,19 @@
   ansible.builtin.set_fact:
     deploy_recorded_rke2_version: "{{ deployment_state.get('rke2Version', persisted_inspace_cluster.spec.rke2.version) }}"
 
+# status, tunnel, and destroy never change the RKE2 version, so after an
+# interrupted or partial update they must still work with the inventory already
+# on the GA release. That is tolerated only for the exact release the recorded
+# candidate became: a released candidate and its own GA (v1.36.5-rc2+rke2r1 and
+# v1.36.5+rke2r1). Any other mismatch still means another cluster.
+- name: Detect an inventory on the GA release of the recorded release candidate
+  ansible.builtin.set_fact:
+    deploy_inventory_is_ga_of_recorded_candidate: >-
+      {{
+        deploy_recorded_rke2_version in deploy_released_rke2_prereleases and
+        (deploy_recorded_rke2_version | regex_replace('-rc[0-9]+[+]', '+')) == rke2_version
+      }}
+
 - name: Bind local state to the selected inventory
   ansible.builtin.assert:
     that:
@@ -43,7 +56,10 @@
       - persisted_inspace_cluster.spec.controlPlane.replicas | int == control_plane_replicas | int
       - persisted_inspace_cluster.spec.controlPlane.machine.rootDiskGiB | int == control_plane_root_disk_gib | int
       - persisted_inspace_cluster.spec.controlPlane.machine.hostPoolUUID == inspace_amd_host_pool_uuid
-      - deploy_recorded_rke2_version == rke2_version or (deploy_allow_rke2_version_change | default(false) | bool)
+      - >-
+        deploy_recorded_rke2_version == rke2_version or
+        (deploy_allow_rke2_version_change | default(false) | bool) or
+        (deploy_inventory_is_ga_of_recorded_candidate | bool)
       - persisted_inspace_cluster.spec.rke2.get('skipOSUpgrade', false) | bool == skip_os_upgrade | bool
       - persisted_inspace_cluster.spec.bootstrapCache.get('directDownload', false) | bool == bootstrap_direct_download | bool
       - >-
