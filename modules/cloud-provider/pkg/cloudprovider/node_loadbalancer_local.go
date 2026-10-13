@@ -221,10 +221,11 @@ func (c *nodeLoadBalancerController) syncPublicNodeLocal(
 		return c.failPublicNodeLocalClosed(ctx, service, err)
 	}
 	if !assignmentsMatch {
-		service, _, err = c.ensurePublicNodeLocalAssignmentIntent(ctx, service, intent, desiredFirewall, firewall.UUID, addresses)
+		authorized, _, err := c.ensurePublicNodeLocalAssignmentIntent(ctx, service, intent, desiredFirewall, firewall.UUID, addresses)
 		if err != nil {
 			return c.failPublicNodeLocalClosed(ctx, service, err)
 		}
+		service = authorized
 		// A fresh exact fence may have been persisted by a previous process that
 		// crashed before (or midway through) the cloud assignment. Always resume
 		// the idempotent missing assignments after the helper has validated that
@@ -258,10 +259,11 @@ func (c *nodeLoadBalancerController) syncPublicNodeLocal(
 		}
 	}
 
-	service, err = c.validatePublicNodeLocalPublicationState(ctx, service, intent, desiredFirewall, firewall.UUID, addresses, activePool != "", false)
+	validated, err := c.validatePublicNodeLocalPublicationState(ctx, service, intent, desiredFirewall, firewall.UUID, addresses, activePool != "", false)
 	if err != nil {
 		return c.failPublicNodeLocalClosed(ctx, service, err)
 	}
+	service = validated
 	if activePool == "" {
 		patched, err := c.ensurePublicNodeLocalActivation(ctx, service, intent.Pool, desiredFirewall.Hash)
 		if err != nil || patched {
@@ -271,27 +273,27 @@ func (c *nodeLoadBalancerController) syncPublicNodeLocal(
 			return err
 		}
 	}
-	service, err = c.validatePublicNodeLocalPublicationState(ctx, service, intent, desiredFirewall, firewall.UUID, addresses, true, false)
+	validated, err = c.validatePublicNodeLocalPublicationState(ctx, service, intent, desiredFirewall, firewall.UUID, addresses, true, false)
 	if err != nil {
 		return c.failPublicNodeLocalClosed(ctx, service, err)
 	}
-	updated, _, err := c.updatePublicNodeLocalStatusBound(ctx, service, desiredPublicStatus)
+	service = validated
+	published, _, err := c.updatePublicNodeLocalStatusBound(ctx, service, desiredPublicStatus)
 	if err != nil {
 		return c.failPublicNodeLocalClosed(ctx, service, err)
 	}
-	updated, err = c.validatePublicNodeLocalPublicationState(ctx, updated, intent, desiredFirewall, firewall.UUID, addresses, true, true)
+	updated, err := c.validatePublicNodeLocalPublicationState(ctx, published, intent, desiredFirewall, firewall.UUID, addresses, true, true)
 	if err != nil {
-		return c.failPublicNodeLocalClosed(ctx, updated, err)
+		// A failed gate returns no Service; withdraw through the pre-gate one.
+		return c.failPublicNodeLocalClosed(ctx, service, err)
 	}
 	if updated.Annotations[annotationNodeLoadBalancerFirewallAssigning] != "" {
-		var cleared bool
-		updated, cleared, err = c.clearPublicNodeLocalAssignmentIntent(ctx, updated, intent, desiredFirewall, firewall.UUID, addresses)
+		cleared, wasCleared, err := c.clearPublicNodeLocalAssignmentIntent(ctx, updated, intent, desiredFirewall, firewall.UUID, addresses)
 		if err != nil {
 			return c.failPublicNodeLocalClosed(ctx, updated, err)
 		}
-		if cleared {
-			updated, err = c.validatePublicNodeLocalPublicationState(ctx, updated, intent, desiredFirewall, firewall.UUID, addresses, true, true)
-			if err != nil {
+		if wasCleared {
+			if _, err := c.validatePublicNodeLocalPublicationState(ctx, cleared, intent, desiredFirewall, firewall.UUID, addresses, true, true); err != nil {
 				return c.failPublicNodeLocalClosed(ctx, updated, err)
 			}
 		}
@@ -2015,6 +2017,9 @@ func (c *nodeLoadBalancerController) withdrawPublicNodeLocal(ctx context.Context
 }
 
 func (c *nodeLoadBalancerController) failPublicNodeLocalClosed(ctx context.Context, service *corev1.Service, cause error) error {
+	if deferral := deferOnTransientProviderError("public-node-local", cause); deferral != nil {
+		return deferral
+	}
 	return errors.Join(cause, c.withdrawPublicNodeLocal(ctx, service))
 }
 
