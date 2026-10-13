@@ -4,8 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"net/url"
+	"syscall"
 	"testing"
 
 	inspace "github.com/thanet-s/inspace-cloud-kube-modules/modules/client"
@@ -49,7 +52,20 @@ func TestIsTransientClassifiesProviderErrors(t *testing.T) {
 		{name: "url timeout", err: fmt.Errorf("inspace: GET /v1/vm: %w", &url.Error{Op: "Get", URL: "https://x", Err: timeoutNetError{}}), want: true},
 		{name: "wrapped deadline", err: fmt.Errorf("read canonical VM: %w", context.DeadlineExceeded), want: true},
 		{name: "canceled", err: fmt.Errorf("sync: %w", context.Canceled), want: true},
-		{name: "url refused is definite", err: &url.Error{Op: "Get", URL: "https://x", Err: errors.New("connection refused")}, want: false},
+		{name: "url refused", err: &url.Error{Op: "Get", URL: "https://x", Err: errors.New("connection refused")}, want: true},
+		{name: "wrapped url error with syscall refused", err: fmt.Errorf("inspace: GET /v1/vm: %w", &url.Error{Op: "Get", URL: "https://x", Err: syscall.ECONNREFUSED}), want: true},
+		{name: "ECONNREFUSED", err: fmt.Errorf("dial: %w", syscall.ECONNREFUSED), want: true},
+		{name: "ECONNRESET", err: fmt.Errorf("read: %w", syscall.ECONNRESET), want: true},
+		{name: "EPIPE", err: fmt.Errorf("write: %w", syscall.EPIPE), want: true},
+		{name: "ETIMEDOUT", err: fmt.Errorf("dial: %w", syscall.ETIMEDOUT), want: true},
+		{name: "EHOSTUNREACH", err: fmt.Errorf("dial: %w", syscall.EHOSTUNREACH), want: true},
+		{name: "ENETUNREACH", err: fmt.Errorf("dial: %w", syscall.ENETUNREACH), want: true},
+		{name: "EOF", err: fmt.Errorf("read body: %w", io.EOF), want: true},
+		{name: "unexpected EOF", err: fmt.Errorf("read body: %w", io.ErrUnexpectedEOF), want: true},
+		{name: "url EOF", err: &url.Error{Op: "Get", URL: "https://x", Err: io.EOF}, want: true},
+		{name: "DNS failure", err: fmt.Errorf("inspace: GET /v1/vm: %w", &url.Error{Op: "Get", URL: "https://x", Err: &net.DNSError{Err: "no such host", Name: "api.inspace.cloud", IsNotFound: true}}), want: true},
+		{name: "bare DNS failure", err: &net.DNSError{Err: "server misbehaving", Name: "api.inspace.cloud"}, want: true},
+		{name: "refused joined with definite", err: errors.Join(syscall.ECONNREFUSED, errors.New("ownership mismatch")), want: false},
 		{name: "plain error", err: errors.New("VM read error"), want: false},
 		{name: "join transient only", err: errors.Join(status(http.StatusServiceUnavailable, true), context.DeadlineExceeded), want: true},
 		{name: "join transient and definite", err: errors.Join(status(http.StatusServiceUnavailable, true), errors.New("ownership mismatch")), want: false},

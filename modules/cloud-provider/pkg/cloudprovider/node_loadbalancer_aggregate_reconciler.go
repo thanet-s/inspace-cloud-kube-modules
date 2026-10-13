@@ -339,7 +339,7 @@ func (c *nodeLoadBalancerController) sync(ctx context.Context, key string) error
 	}
 	converged, err := c.datapathStatusesMatch(ctx, service, shard.Name, addresses)
 	if err != nil || !converged {
-		return errors.Join(policyErr, err, errors.New("node load balancer: aggregate shard datapath status failed exact readback"))
+		return joinWithExplanation(errors.New("node load balancer: aggregate shard datapath status failed exact readback"), policyErr, err)
 	}
 	if len(addresses) < int(shard.NodesPerShard) {
 		c.queue.AddAfter(key, nodeLoadBalancerRetry)

@@ -311,7 +311,7 @@ func (c *nodeLoadBalancerController) ensurePublicNodeLocalFinalizer(ctx context.
 		}
 		intent, parseErr := parseNodeLoadBalancerService(copy, nodeLoadBalancerDefaults{NodesPerShard: c.provider.config.NodeLoadBalancer.NodesPerShard})
 		if parseErr != nil || intent.Mode != nodeLoadBalancerModeLocal {
-			return false, errors.Join(parseErr, errors.New("public-node-local: invalid Service intent before finalizer persistence"))
+			return false, joinWithExplanation(errors.New("public-node-local: invalid Service intent before finalizer persistence"), parseErr)
 		}
 		if containsString(copy.Finalizers, publicNodeLocalFinalizer) {
 			return false, nil
@@ -898,7 +898,7 @@ func (c *nodeLoadBalancerController) auditPublicNodeLocalVMFirewalls(
 	}
 	metadata, err := c.provider.InstanceMetadata(ctx, node)
 	if err != nil || metadata.ProviderID != node.Spec.ProviderID {
-		return errors.Join(err, errors.New("Node provider identity changed during firewall authorization"))
+		return joinWithExplanation(errors.New("Node provider identity changed during firewall authorization"), err)
 	}
 	authoritativePublicIP, publicOK := exactNodeAddressIPv4(metadata.NodeAddresses, corev1.NodeExternalIP, false)
 	nodePublicIP, nodePublicOK := nodeLoadBalancerNodeExternalIPv4(node)
@@ -1438,7 +1438,7 @@ func (c *nodeLoadBalancerController) ensurePublicNodeLocalAssignmentIntent(
 ) (*corev1.Service, bool, error) {
 	vmSet, err := publicNodeLocalVMSet(addresses)
 	if err != nil || vmSet == "" {
-		return service, false, errors.Join(err, errors.New("public-node-local: non-empty VM set is required before assignment authorization"))
+		return service, false, joinWithExplanation(errors.New("public-node-local: non-empty VM set is required before assignment authorization"), err)
 	}
 	current, err := c.getExactParentService(ctx, service)
 	if err != nil {
@@ -1546,7 +1546,7 @@ func (c *nodeLoadBalancerController) validatePublicNodeLocalAssignmentState(
 	currentIntent, err := parseNodeLoadBalancerService(current, nodeLoadBalancerDefaults{NodesPerShard: c.provider.config.NodeLoadBalancer.NodesPerShard})
 	if err != nil || current.DeletionTimestamp != nil || !containsString(current.Finalizers, publicNodeLocalFinalizer) ||
 		!reflect.DeepEqual(currentIntent, intent) {
-		return errors.Join(err, errors.New("public-node-local: live Service contract changed during firewall assignment authorization"))
+		return joinWithExplanation(errors.New("public-node-local: live Service contract changed during firewall assignment authorization"), err)
 	}
 	currentDesired, err := c.desiredServiceFirewall(current)
 	if err != nil {
@@ -1585,7 +1585,7 @@ func (c *nodeLoadBalancerController) validatePublicNodeLocalAssignmentState(
 	}
 	verified, _, err := c.publicNodeLocalAddresses(ctx, current, currentIntent)
 	if err != nil || !reflect.DeepEqual(publicNodeLocalAddressIdentities(verified), publicNodeLocalAddressIdentities(addresses)) {
-		return errors.Join(err, errors.New("public-node-local: endpoint or Node eligibility changed during firewall assignment authorization"))
+		return joinWithExplanation(errors.New("public-node-local: endpoint or Node eligibility changed during firewall assignment authorization"), err)
 	}
 	if requireFence {
 		vmSet, vmErr := publicNodeLocalVMSet(addresses)
@@ -1741,7 +1741,7 @@ func (c *nodeLoadBalancerController) publicNodeLocalFirewallAssignmentsMatch(
 	currentIntent, err := parseNodeLoadBalancerService(current, nodeLoadBalancerDefaults{NodesPerShard: c.provider.config.NodeLoadBalancer.NodesPerShard})
 	if err != nil || current.DeletionTimestamp != nil || !containsString(current.Finalizers, publicNodeLocalFinalizer) ||
 		!reflect.DeepEqual(currentIntent, intent) {
-		return false, errors.Join(err, errors.New("public-node-local: live Service intent changed before firewall assignment readback"))
+		return false, joinWithExplanation(errors.New("public-node-local: live Service intent changed before firewall assignment readback"), err)
 	}
 	currentDesired, err := c.desiredServiceFirewall(current)
 	if err != nil {
@@ -1805,7 +1805,7 @@ func (c *nodeLoadBalancerController) ensurePublicNodeLocalActivation(
 		intent, parseErr := parseNodeLoadBalancerService(copy, nodeLoadBalancerDefaults{NodesPerShard: c.provider.config.NodeLoadBalancer.NodesPerShard})
 		if parseErr != nil || intent.Mode != nodeLoadBalancerModeLocal || intent.Pool != pool ||
 			copy.Annotations[annotationNodeLoadBalancerFirewallHash] != policy {
-			return false, errors.Join(parseErr, errors.New("public-node-local: Service changed before activation persistence"))
+			return false, joinWithExplanation(errors.New("public-node-local: Service changed before activation persistence"), parseErr)
 		}
 		if copy.Annotations == nil {
 			copy.Annotations = map[string]string{}
@@ -1839,7 +1839,7 @@ func (c *nodeLoadBalancerController) validatePublicNodeLocalPublicationState(
 	currentIntent, err := parseNodeLoadBalancerService(current, nodeLoadBalancerDefaults{NodesPerShard: c.provider.config.NodeLoadBalancer.NodesPerShard})
 	if err != nil || current.DeletionTimestamp != nil || !containsString(current.Finalizers, publicNodeLocalFinalizer) ||
 		!reflect.DeepEqual(currentIntent, intent) {
-		return nil, errors.Join(err, errors.New("public-node-local: live Service intent changed at the publication gate"))
+		return nil, joinWithExplanation(errors.New("public-node-local: live Service intent changed at the publication gate"), err)
 	}
 	currentDesired, err := c.desiredServiceFirewall(current)
 	if err != nil {
@@ -1872,11 +1872,11 @@ func (c *nodeLoadBalancerController) validatePublicNodeLocalPublicationState(
 	}
 	verified, _, err := c.publicNodeLocalAddresses(ctx, current, currentIntent)
 	if err != nil || !reflect.DeepEqual(publicNodeLocalAddressIdentities(verified), publicNodeLocalAddressIdentities(addresses)) {
-		return nil, errors.Join(err, errors.New("public-node-local: endpoint, Node, VM, or FIP proof changed at the publication gate"))
+		return nil, joinWithExplanation(errors.New("public-node-local: endpoint, Node, VM, or FIP proof changed at the publication gate"), err)
 	}
 	loses, winnerWaiting, conflictErr := c.publicNodeLocalPortConflict(ctx, current, currentIntent)
 	if conflictErr != nil || loses || winnerWaiting {
-		return nil, errors.Join(conflictErr, errors.New("public-node-local: protocol/port ownership changed at the publication gate"))
+		return nil, joinWithExplanation(errors.New("public-node-local: protocol/port ownership changed at the publication gate"), conflictErr)
 	}
 	nodes := make([]*corev1.Node, 0, len(addresses))
 	for _, address := range addresses {
@@ -1884,7 +1884,7 @@ func (c *nodeLoadBalancerController) validatePublicNodeLocalPublicationState(
 	}
 	assignmentsMatch, err := c.publicNodeLocalFirewallAssignmentsMatch(ctx, current, currentIntent, currentDesired, firewallUUID, nodes)
 	if err != nil || !assignmentsMatch {
-		return nil, errors.Join(err, errors.New("public-node-local: exact firewall assignment proof changed at the publication gate"))
+		return nil, joinWithExplanation(errors.New("public-node-local: exact firewall assignment proof changed at the publication gate"), err)
 	}
 	desiredPublicStatus := nodeLoadBalancerStatus(addresses, true)
 	if requirePublished {

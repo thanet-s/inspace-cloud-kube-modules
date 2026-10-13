@@ -309,15 +309,35 @@ func TestPublicNodeLocalDefiniteDatapathDriftWithdraws(t *testing.T) {
 				copy.Spec.ExternalTrafficPolicy = corev1.ServiceExternalTrafficPolicyCluster
 				return true, copy, nil
 			})
+			unassignedBefore := len(fixture.api.unassignedFirewalls)
 			err := fixture.controller.syncPublicNodeLocal(fixture.ctx, fixture.key, fixture.current(t))
-			if err == nil {
+			if drifted == 1 {
+				// The first read belongs to the datapath ensure step, which
+				// repairs the drift in place and republishes on later passes.
+				if err != nil {
+					t.Fatalf("ensure step failed on repairable drift: %v", err)
+				}
+				for attempt := 0; attempt < 24 && len(fixture.current(t).Status.LoadBalancer.Ingress) != 1; attempt++ {
+					if err := fixture.controller.syncPublicNodeLocal(fixture.ctx, fixture.key, fixture.current(t)); err != nil {
+						t.Fatalf("repair reconcile %d: %v", attempt, err)
+					}
+				}
+				if got := fixture.current(t).Status.LoadBalancer.Ingress; len(got) != 1 {
+					t.Fatalf("repairable drift never republished: %#v", got)
+				}
 				return
+			}
+			if err == nil {
+				t.Fatal("datapath drift on this read was not detected")
 			}
 			if inspace.IsTransient(err) {
 				t.Fatalf("definite drift reported as transient: %v", err)
 			}
 			if got := fixture.current(t).Status.LoadBalancer.Ingress; len(got) != 0 {
 				t.Fatalf("definite failure %q left the public address published: %#v", err, got)
+			}
+			if len(fixture.api.unassignedFirewalls) == unassignedBefore {
+				t.Fatalf("definite failure %q did not detach the firewall", err)
 			}
 		})
 	}

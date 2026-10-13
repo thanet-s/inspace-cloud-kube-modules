@@ -460,9 +460,16 @@ func (r *ControlPlaneResizer) startTimeout() time.Duration {
 
 // transientResizeError reports a failure whose outcome is unknown or that a
 // later status read can resolve: a client timeout or a retryable HTTP status.
-// A cancellation stays fatal here so a stopped resize does not keep polling.
 func transientResizeError(err error) bool {
-	return inspace.IsTransient(err) && !errors.Is(err, context.Canceled)
+	if errors.Is(err, inspace.ErrMutationNotDispatched) {
+		return false
+	}
+	var apiErr *inspace.APIError
+	if errors.As(err, &apiErr) {
+		return apiErr.Retryable
+	}
+	var networkErr net.Error
+	return errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &networkErr) && networkErr.Timeout())
 }
 
 // resizeConflict reports the 409/422 a power request gets while the VM is

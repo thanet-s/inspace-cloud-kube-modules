@@ -305,6 +305,18 @@ func deferOnTransientProviderError(scope string, cause error) error {
 	return &errTransientProviderDeferral{cause: cause}
 }
 
+// joinWithExplanation returns the causes joined with a definite explanation of
+// the drift they imply. When the causes are only a missing provider answer, the
+// explanation is left out: a plain error is a definite leaf, and joining it
+// would turn a transient failure into a definite one that fails closed.
+func joinWithExplanation(explanation error, causes ...error) error {
+	joined := errors.Join(causes...)
+	if joined != nil && inspace.IsTransient(joined) {
+		return joined
+	}
+	return errors.Join(append(causes, explanation)...)
+}
+
 func (c *nodeLoadBalancerController) processNext(ctx context.Context) bool {
 	key, shutdown := c.queue.Get()
 	if shutdown {

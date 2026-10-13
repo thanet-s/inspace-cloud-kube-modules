@@ -1517,7 +1517,7 @@ func (c *nodeLoadBalancerController) ensureShardFirewallAssignments(
 		current := firewalls[index]
 		stale, err := staleNodeLoadBalancerFirewallAssignments(current, desiredVMs)
 		if err != nil || len(stale) != 0 {
-			return false, &current, errors.Join(err, fmt.Errorf("node load balancer: shard firewall retains stale assignments %v", stale))
+			return false, &current, joinWithExplanation(fmt.Errorf("node load balancer: shard firewall retains stale assignments %v", stale), err)
 		}
 		for vmUUID := range healthyVMs {
 			if !firewallAssignedToVM(current, vmUUID) {
