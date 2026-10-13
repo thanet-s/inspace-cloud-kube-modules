@@ -950,6 +950,56 @@ func IsNotFound(err error) bool {
 	return ok && (messageUUID == "" || strings.EqualFold(messageUUID, apiErr.RequestedUUID))
 }
 
+// IsTransient reports whether err is only a failure to obtain an answer from
+// the provider: a retryable HTTP status, an incomplete error body, or a
+// timeout or cancellation. It is true only when the error tree holds at least
+// one such leaf and no definite leaf, so a definite answer (an exact 404,
+// another 4xx, a malformed body, an undispatched mutation, or a caller-made
+// drift or ownership error) joined with a timeout stays definite. Callers keep
+// their last known good state on a transient error and retry.
+func IsTransient(err error) bool {
+	transient, definite := classifyTransient(err)
+	return transient && !definite
+}
+
+func classifyTransient(err error) (transient, definite bool) {
+	switch typed := err.(type) {
+	case nil:
+		return false, false
+	case *APIError:
+		if IsNotFound(typed) {
+			return false, true
+		}
+		if typed.Retryable || typed.ResponseBodyIncomplete {
+			return true, false
+		}
+		return false, true
+	}
+	if err == ErrMutationNotDispatched {
+		return false, true
+	}
+	if err == context.DeadlineExceeded || err == context.Canceled {
+		return true, false
+	}
+	if networkErr, ok := err.(net.Error); ok && networkErr.Timeout() {
+		return true, false
+	}
+	switch wrapped := err.(type) {
+	case interface{ Unwrap() []error }:
+		for _, child := range wrapped.Unwrap() {
+			childTransient, childDefinite := classifyTransient(child)
+			transient = transient || childTransient
+			definite = definite || childDefinite
+		}
+		return transient, definite
+	case interface{ Unwrap() error }:
+		if child := wrapped.Unwrap(); child != nil {
+			return classifyTransient(child)
+		}
+	}
+	return false, true
+}
+
 func isPublicIPv4(value string) bool {
 	address := net.ParseIP(value)
 	return address != nil &&
