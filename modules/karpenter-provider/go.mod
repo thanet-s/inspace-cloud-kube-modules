@@ -1,6 +1,6 @@
 module github.com/thanet-s/inspace-cloud-kube-modules/modules/karpenter-provider
 
-go 1.27.1
+go 1.27.2
 
 replace github.com/thanet-s/inspace-cloud-kube-modules/modules/client => ../client
 

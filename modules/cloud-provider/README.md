@@ -813,7 +813,7 @@ deleted Service while its Gateway exists.
 
 ## Development and verification
 
-Requires Go 1.27.1.
+Requires Go 1.27.2.
 
 ```sh
 make test
