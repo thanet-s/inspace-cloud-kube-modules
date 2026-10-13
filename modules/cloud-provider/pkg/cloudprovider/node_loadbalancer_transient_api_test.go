@@ -14,8 +14,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	kubefake "k8s.io/client-go/kubernetes/fake"
-	cloud "k8s.io/cloud-provider"
 	k8stesting "k8s.io/client-go/testing"
+	cloud "k8s.io/cloud-provider"
 
 	inspace "github.com/thanet-s/inspace-cloud-kube-modules/modules/client"
 )
