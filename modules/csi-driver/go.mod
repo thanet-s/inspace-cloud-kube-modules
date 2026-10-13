@@ -1,6 +1,6 @@
 module github.com/thanet-s/inspace-cloud-kube-modules/modules/csi-driver
 
-go 1.27.1
+go 1.27.2
 
 replace github.com/thanet-s/inspace-cloud-kube-modules/modules/client => ../client
 
@@ -12,7 +12,7 @@ require (
 )
 
 require (
-	golang.org/x/net v0.59.0 // indirect
+	golang.org/x/net v0.60.0 // indirect
 	golang.org/x/sys v0.48.0 // indirect
 	golang.org/x/text v0.42.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260911204522-f61a6ca850bd // indirect

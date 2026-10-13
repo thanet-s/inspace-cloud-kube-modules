@@ -281,6 +281,42 @@ func (c *nodeLoadBalancerController) enqueueNodeLoadBalancerEndpointSlice(object
 	}
 }
 
+// errTransientProviderDeferral reports that a reconcile pass stopped without
+// changing anything because the InSpace API gave no definite answer. The
+// last published state stays in place and the work item is retried.
+type errTransientProviderDeferral struct {
+	cause error
+}
+
+func (e *errTransientProviderDeferral) Error() string {
+	return "node load balancer: provider answer unavailable, keeping last published state: " + e.cause.Error()
+}
+
+func (e *errTransientProviderDeferral) Unwrap() error { return e.cause }
+
+// deferOnTransientProviderError returns a deferral for a cause that is only a
+// missing provider answer, and nil for a nil or definite cause. Callers must
+// return the deferral before they withdraw, detach, delete or relabel.
+func deferOnTransientProviderError(scope string, cause error) error {
+	if !inspace.IsTransient(cause) {
+		return nil
+	}
+	klog.Warningf("node load balancer %s: keeping last published state after a transient provider error: %v", scope, cause)
+	return &errTransientProviderDeferral{cause: cause}
+}
+
+// joinWithExplanation returns the causes joined with a definite explanation of
+// the drift they imply. When the causes are only a missing provider answer, the
+// explanation is left out: a plain error is a definite leaf, and joining it
+// would turn a transient failure into a definite one that fails closed.
+func joinWithExplanation(explanation error, causes ...error) error {
+	joined := errors.Join(causes...)
+	if joined != nil && inspace.IsTransient(joined) {
+		return joined
+	}
+	return errors.Join(append(causes, explanation)...)
+}
+
 func (c *nodeLoadBalancerController) processNext(ctx context.Context) bool {
 	key, shutdown := c.queue.Get()
 	if shutdown {
@@ -288,7 +324,12 @@ func (c *nodeLoadBalancerController) processNext(ctx context.Context) bool {
 	}
 	defer c.queue.Done(key)
 	if err := c.sync(ctx, key); err != nil {
-		klog.ErrorS(err, "failed to reconcile InSpace node load balancer", "service", key)
+		var deferral *errTransientProviderDeferral
+		if errors.As(err, &deferral) {
+			klog.Warningf("deferring InSpace node load balancer reconcile of %s: %v", key, err)
+		} else {
+			klog.ErrorS(err, "failed to reconcile InSpace node load balancer", "service", key)
+		}
 		c.queue.AddRateLimited(key)
 		return true
 	}
@@ -726,6 +767,9 @@ func (c *nodeLoadBalancerController) auditUncommittedDatapath(ctx context.Contex
 }
 
 func (c *nodeLoadBalancerController) failNodeLoadBalancerShardClosed(ctx context.Context, shard string, cause error) error {
+	if deferral := deferOnTransientProviderError("shard "+shard, cause); deferral != nil {
+		return deferral
+	}
 	if !isManagedNodeLoadBalancerShardName(shard) {
 		return cause
 	}
@@ -742,6 +786,9 @@ func (c *nodeLoadBalancerController) failNodeLoadBalancerShardsClosed(
 	additionalShard string,
 	cause error,
 ) error {
+	if deferral := deferOnTransientProviderError("service shards", cause); deferral != nil {
+		return deferral
+	}
 	shards := map[string]struct{}{}
 	if isManagedNodeLoadBalancerShardName(additionalShard) {
 		shards[additionalShard] = struct{}{}
@@ -772,6 +819,9 @@ func (c *nodeLoadBalancerController) failNodeLoadBalancerShardsClosed(
 }
 
 func (c *nodeLoadBalancerController) failClusterNodeLoadBalancerClosed(ctx context.Context, cause error) error {
+	if deferral := deferOnTransientProviderError("cluster", cause); deferral != nil {
+		return deferral
+	}
 	nodes, err := c.rawNodesForCluster(ctx)
 	result := cause
 	if err != nil {

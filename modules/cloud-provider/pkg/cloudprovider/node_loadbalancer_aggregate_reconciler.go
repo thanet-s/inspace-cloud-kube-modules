@@ -339,7 +339,7 @@ func (c *nodeLoadBalancerController) sync(ctx context.Context, key string) error
 	}
 	converged, err := c.datapathStatusesMatch(ctx, service, shard.Name, addresses)
 	if err != nil || !converged {
-		return errors.Join(policyErr, err, errors.New("node load balancer: aggregate shard datapath status failed exact readback"))
+		return joinWithExplanation(errors.New("node load balancer: aggregate shard datapath status failed exact readback"), policyErr, err)
 	}
 	if len(addresses) < int(shard.NodesPerShard) {
 		c.queue.AddAfter(key, nodeLoadBalancerRetry)
@@ -836,6 +836,9 @@ func (c *nodeLoadBalancerController) failAggregateServiceReferencedShards(
 }
 
 func (c *nodeLoadBalancerController) failAggregateShardClosed(ctx context.Context, shard string, cause error) error {
+	if deferral := deferOnTransientProviderError("shard "+shard, cause); deferral != nil {
+		return deferral
+	}
 	if !isManagedNodeLoadBalancerShardName(shard) {
 		return cause
 	}
@@ -847,6 +850,9 @@ func (c *nodeLoadBalancerController) failAggregateShardClosed(ctx context.Contex
 }
 
 func (c *nodeLoadBalancerController) failAggregateClusterClosed(ctx context.Context, cause error) error {
+	if deferral := deferOnTransientProviderError("cluster", cause); deferral != nil {
+		return deferral
+	}
 	nodes, nodeErr := c.rawNodesForCluster(ctx)
 	if nodeErr == nil {
 		nodeErr = c.setShardNodesReady(ctx, nodes, nil)
@@ -927,6 +933,9 @@ func (c *nodeLoadBalancerController) fenceAggregateShardFirewallAssignmentGap(
 	}
 	authorized, err := c.authorizedNodeLoadBalancerNodes(ctx, raw, shard)
 	if err != nil {
+		if deferral := deferOnTransientProviderError("shard "+shard, err); deferral != nil {
+			return deferral
+		}
 		return errors.Join(err, c.setShardNodesReady(ctx, raw, nil), c.withdrawAggregateShardStatuses(ctx, shard))
 	}
 	authorizedByName := make(map[string]*corev1.Node, len(authorized))
