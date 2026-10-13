@@ -1601,13 +1601,22 @@ func (c *nodeLoadBalancerController) reconcileAggregateShardNodeEligibility(
 	}
 	nodes, err := c.authorizedNodeLoadBalancerNodes(ctx, rawNodes, shard)
 	if err != nil {
+		if deferral := deferOnTransientProviderError("shard "+shard, err); deferral != nil {
+			return deferral
+		}
 		return errors.Join(err, c.setShardNodesReady(ctx, rawNodes, nil))
 	}
 	firewalls, err := c.provider.api.ListFirewalls(ctx, c.provider.config.Location)
 	if err != nil {
+		if deferral := deferOnTransientProviderError("shard "+shard, err); deferral != nil {
+			return deferral
+		}
 		return errors.Join(err, c.setShardNodesReady(ctx, rawNodes, nil))
 	}
 	icmpFirewall, err := c.currentClusterICMPFirewall(ctx, firewalls)
+	if deferral := deferOnTransientProviderError("shard "+shard, err); deferral != nil {
+		return deferral
+	}
 	if err != nil || icmpFirewall == nil {
 		return errors.Join(err, c.setShardNodesReady(ctx, rawNodes, nil))
 	}
