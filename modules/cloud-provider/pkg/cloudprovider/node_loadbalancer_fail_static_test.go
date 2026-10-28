@@ -191,9 +191,6 @@ func TestPublicNodeLocalDefiniteFailureHoldsPublishedState(t *testing.T) {
 		{name: "invalid pool annotation", wantReason: "PublicNodeLocalHolding", prepare: func(t *testing.T, f *publicNodeLocalTransientFixture) {
 			updatePublicNodeLocalFixtureService(t, f, func(s *corev1.Service) { s.Annotations[annotationNodeLoadBalancerPool] = "Bad_Pool" })
 		}},
-		{name: "port change", wantReason: "PublicNodeLocalTransitionPending", prepare: func(t *testing.T, f *publicNodeLocalTransientFixture) {
-			updatePublicNodeLocalFixtureService(t, f, func(s *corev1.Service) { s.Spec.Ports[0].Port = 8443 })
-		}},
 	}
 	for drifted := 2; drifted <= datapathReads; drifted++ {
 		drifted := drifted

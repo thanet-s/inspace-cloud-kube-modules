@@ -634,10 +634,19 @@ func TestPublicNodeLocalPendingTransitionKeepsConvergingUnderActiveIdentity(t *t
 					t.Fatalf("the active identity %s changed: %q -> %q", key, activeBefore[key], current.Annotations[key])
 				}
 			}
-			if !reflect.DeepEqual(trackedPublicNodeLocalDatapath(t, f).Spec.Ports, childPortsBefore) {
-				t.Fatalf("the child ports followed the pending change")
+			// A widening is no longer held: the child serves the union of the old and
+			// the new ports, so every port it served before is still there.
+			after := childPortSet(trackedPublicNodeLocalDatapath(t, f))
+			for _, port := range childPortsBefore {
+				if !after[port.Port] {
+					t.Fatalf("port %d left the child during the pending change: %v", port.Port, after)
+				}
 			}
-			// A settled pass holds, requeues and says why.
+			if test.name != "pool change" {
+				// A widening is a transition in progress, not a hold: it moves on.
+				return
+			}
+			// A pool change into a pool without Nodes holds, requeues and says why.
 			settled := f.controller.syncPublicNodeLocal(f.ctx, f.key, f.current(t))
 			var holding *errPublicNodeLocalHolding
 			if !errors.As(settled, &holding) {
@@ -683,45 +692,6 @@ func shapePublicNodeLocalPorts(ports ...int32) func(*corev1.Service) {
 	}
 }
 
-func firewallRuleOn(protocol string, port int32, sources ...string) inspace.FirewallRule {
-	rule := inspace.FirewallRule{
-		Protocol: protocol, Direction: "inbound", PortStart: &port, PortEnd: &port, EndpointSpecType: "any",
-	}
-	if len(sources) != 0 {
-		rule.EndpointSpecType = "ip_prefixes"
-		rule.EndpointSpec = sources
-	}
-	return rule
-}
-
-func TestPublicNodeLocalRulesNarrow(t *testing.T) {
-	tests := []struct {
-		name     string
-		old, new []inspace.FirewallRule
-		want     bool
-	}{
-		{name: "fewer ports", old: []inspace.FirewallRule{firewallRuleOn("tcp", 443), firewallRuleOn("tcp", 8443)}, new: []inspace.FirewallRule{firewallRuleOn("tcp", 443)}, want: true},
-		{name: "any to a prefix", old: []inspace.FirewallRule{firewallRuleOn("tcp", 443)}, new: []inspace.FirewallRule{firewallRuleOn("tcp", 443, "10.0.0.0/8")}, want: true},
-		{name: "prefix to a subset prefix", old: []inspace.FirewallRule{firewallRuleOn("tcp", 443, "10.0.0.0/8")}, new: []inspace.FirewallRule{firewallRuleOn("tcp", 443, "10.1.0.0/16")}, want: true},
-		{name: "fewer prefixes", old: []inspace.FirewallRule{firewallRuleOn("tcp", 443, "10.0.0.0/8", "192.168.0.0/16")}, new: []inspace.FirewallRule{firewallRuleOn("tcp", 443, "192.168.0.0/16")}, want: true},
-		{name: "extra port", old: []inspace.FirewallRule{firewallRuleOn("tcp", 443)}, new: []inspace.FirewallRule{firewallRuleOn("tcp", 443), firewallRuleOn("tcp", 8443)}},
-		{name: "different port", old: []inspace.FirewallRule{firewallRuleOn("tcp", 443)}, new: []inspace.FirewallRule{firewallRuleOn("tcp", 8443)}},
-		{name: "different protocol", old: []inspace.FirewallRule{firewallRuleOn("tcp", 443)}, new: []inspace.FirewallRule{firewallRuleOn("udp", 443)}},
-		{name: "prefix to any", old: []inspace.FirewallRule{firewallRuleOn("tcp", 443, "10.0.0.0/8")}, new: []inspace.FirewallRule{firewallRuleOn("tcp", 443)}},
-		{name: "superset prefix", old: []inspace.FirewallRule{firewallRuleOn("tcp", 443, "10.1.0.0/16")}, new: []inspace.FirewallRule{firewallRuleOn("tcp", 443, "10.0.0.0/8")}},
-		{name: "mixed: one narrowed one added", old: []inspace.FirewallRule{firewallRuleOn("tcp", 443, "10.0.0.0/8")}, new: []inspace.FirewallRule{firewallRuleOn("tcp", 443, "10.1.0.0/16"), firewallRuleOn("tcp", 9000)}},
-		{name: "identical", old: []inspace.FirewallRule{firewallRuleOn("tcp", 443)}, new: []inspace.FirewallRule{firewallRuleOn("tcp", 443)}},
-		{name: "nothing left", old: []inspace.FirewallRule{firewallRuleOn("tcp", 443)}},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			if got := publicNodeLocalRulesNarrow(test.old, test.new); got != test.want {
-				t.Fatalf("narrow(%v -> %v) = %t, want %t", test.old, test.new, got, test.want)
-			}
-		})
-	}
-}
-
 // reconcileUntilRepublished drives passes until the Service serves the policy
 // of its current spec on every Node.
 func reconcileUntilRepublished(t *testing.T, f *publicNodeLocalTransientFixture, nodes, passes int) {
@@ -735,102 +705,13 @@ func reconcileUntilRepublished(t *testing.T, f *publicNodeLocalTransientFixture,
 	})
 }
 
-// A strict narrowing is verified intent and is applied promptly.
-func TestPublicNodeLocalStrictNarrowingIsApplied(t *testing.T) {
-	tests := []struct {
-		name   string
-		shape  func(*corev1.Service)
-		narrow func(*testing.T, *publicNodeLocalTransientFixture)
-	}{
-		{name: "fewer ports", shape: shapePublicNodeLocalPorts(443, 8443), narrow: func(t *testing.T, f *publicNodeLocalTransientFixture) {
-			setPublicNodeLocalFixturePorts(t, f, 443)
-		}},
-		{name: "any source to a prefix", narrow: func(t *testing.T, f *publicNodeLocalTransientFixture) {
-			updatePublicNodeLocalFixtureService(t, f, func(s *corev1.Service) { s.Spec.LoadBalancerSourceRanges = []string{"10.0.0.0/8"} })
-		}},
-		{name: "prefix to a subset", shape: func(s *corev1.Service) { s.Spec.LoadBalancerSourceRanges = []string{"10.0.0.0/8"} }, narrow: func(t *testing.T, f *publicNodeLocalTransientFixture) {
-			updatePublicNodeLocalFixtureService(t, f, func(s *corev1.Service) { s.Spec.LoadBalancerSourceRanges = []string{"10.1.0.0/16"} })
-		}},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			f := newPublishedPublicNodeLocalFixtureWith(t, 2, test.shape)
-			oldFirewall := f.current(t).Annotations[annotationNodeLoadBalancerFirewallUUID]
-			oldPolicy := f.current(t).Annotations[annotationPublicNodeLocalActivePolicy]
-			test.narrow(t, f)
-			reconcileUntilRepublished(t, f, 2, 80)
-			current := f.current(t)
-			desired, err := f.controller.desiredServiceFirewall(current)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if current.Annotations[annotationPublicNodeLocalActivePolicy] != desired.Hash || desired.Hash == oldPolicy {
-				t.Fatalf("the narrowed policy was not applied: active=%q desired=%q old=%q",
-					current.Annotations[annotationPublicNodeLocalActivePolicy], desired.Hash, oldPolicy)
-			}
-			if len(current.Status.LoadBalancer.Ingress) != 2 {
-				t.Fatalf("the Service did not republish: %#v", current.Status.LoadBalancer)
-			}
-			for _, firewall := range f.api.firewalls {
-				if firewall.UUID == oldFirewall {
-					t.Fatalf("the wider firewall %s still exists", oldFirewall)
-				}
-			}
-			if !publicNodeLocalDatapathMatches(trackedPublicNodeLocalDatapath(t, f), current, "edge") {
-				t.Fatalf("the child does not follow the narrowed spec")
-			}
-		})
-	}
-}
-
-// A widening stays held, and so does a mix of narrowing and widening.
-func TestPublicNodeLocalWideningStaysHeld(t *testing.T) {
-	tests := []struct {
-		name   string
-		shape  func(*corev1.Service)
-		change func(*testing.T, *publicNodeLocalTransientFixture)
-	}{
-		{name: "more ports", change: func(t *testing.T, f *publicNodeLocalTransientFixture) {
-			setPublicNodeLocalFixturePorts(t, f, 443, 8443)
-		}},
-		{name: "prefix to any", shape: func(s *corev1.Service) { s.Spec.LoadBalancerSourceRanges = []string{"10.0.0.0/8"} }, change: func(t *testing.T, f *publicNodeLocalTransientFixture) {
-			updatePublicNodeLocalFixtureService(t, f, func(s *corev1.Service) { s.Spec.LoadBalancerSourceRanges = nil })
-		}},
-		{name: "swapped port", change: func(t *testing.T, f *publicNodeLocalTransientFixture) { setPublicNodeLocalFixturePorts(t, f, 8443) }},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			f := newPublishedPublicNodeLocalFixtureWith(t, 1, test.shape)
-			before := f.current(t)
-			unassigned := len(f.api.unassignedFirewalls)
-			test.change(t, f)
-			for pass := 0; pass < 6; pass++ {
-				err := f.controller.syncPublicNodeLocal(f.ctx, f.key, f.current(t))
-				var holding *errPublicNodeLocalHolding
-				if !errors.As(err, &holding) {
-					t.Fatalf("pass %d: %v, want a hold", pass, err)
-				}
-			}
-			after := f.current(t)
-			if !reflect.DeepEqual(after.Status, before.Status) ||
-				after.Annotations[annotationPublicNodeLocalActivePolicy] != before.Annotations[annotationPublicNodeLocalActivePolicy] ||
-				len(f.api.unassignedFirewalls) != unassigned {
-				t.Fatalf("a widening was applied: %#v", after.Annotations)
-			}
-			requirePublicNodeLocalEvent(t, f, "PublicNodeLocalTransitionPending")
-		})
-	}
-}
-
 // The operator escape hatch permits the old withdraw and rebuild.
 func TestPublicNodeLocalAllowRebuildAnnotationPermitsWithdrawAndRebuild(t *testing.T) {
 	f := newPublishedPublicNodeLocalFixtureN(t, 1)
 	oldPolicy := f.current(t).Annotations[annotationPublicNodeLocalActivePolicy]
 	setPublicNodeLocalFixturePorts(t, f, 443, 8443)
-	// Without the annotation the change stays held.
-	if err := f.controller.syncPublicNodeLocal(f.ctx, f.key, f.current(t)); err == nil {
-		t.Fatal("the widening was not held")
-	}
+	// Without the annotation the change runs in place (see the make-before-break
+	// tests); with it, the operator accepts the old withdraw and rebuild.
 	updatePublicNodeLocalFixtureService(t, f, func(s *corev1.Service) { s.Annotations[annotationNodeLoadBalancerAllowRebuild] = "true" })
 	reconcileUntilRepublished(t, f, 1, 80)
 	current := f.current(t)
@@ -1282,4 +1163,167 @@ func TestPublicNodeLocalPromotionRequiresTargetConverged(t *testing.T) {
 	if current := f.current(t); current.Annotations[annotationPublicNodeLocalTargetPool] != "spe-relay-share" {
 		t.Fatalf("the transition did not stay open: %#v", current.Annotations)
 	}
+}
+
+// policyChangeWatch checks every pass of an in-place policy change against one
+// original firewall.
+type policyChangeWatch struct {
+	oldFirewall string
+	oldPorts    []int32
+	newPorts    []int32
+}
+
+func childPortSet(child *corev1.Service) map[int32]bool {
+	ports := map[int32]bool{}
+	for _, port := range child.Spec.Ports {
+		ports[port.Port] = true
+	}
+	return ports
+}
+
+// firewallHolds says which firewalls (by UUID) are assigned to a VM.
+func firewallsOfVM(f *publicNodeLocalTransientFixture, vmUUID string) map[string]bool {
+	held := map[string]bool{}
+	for _, firewall := range f.api.firewalls {
+		for _, resource := range firewall.ResourcesAssigned {
+			if resource.ResourceUUID == vmUUID && strings.HasPrefix(firewall.EffectiveName(), "inlb-") {
+				held[firewall.UUID] = true
+			}
+		}
+	}
+	return held
+}
+
+// runPolicyChange drives a policy change to the end and checks the edge on
+// every pass: never empty, every published VM keeps a Service firewall, and
+// every published port keeps its child frontend while a firewall guards it.
+func runPolicyChange(t *testing.T, f *publicNodeLocalTransientFixture, nodes int, watch policyChangeWatch, afterPass func(pass int)) {
+	t.Helper()
+	oldHash := f.current(t).Annotations[annotationPublicNodeLocalActivePolicy]
+	sawBoth := false
+	done := false
+	for pass := 0; pass < 200 && !done; pass++ {
+		if current := f.current(t); current.Annotations[annotationNodeLoadBalancerCleanupFWChecked] != "" {
+			ageNodeLoadBalancerAbsenceEvidence(t, f.ctx, f.provider, current, annotationNodeLoadBalancerCleanupFWChecked)
+		}
+		err := f.controller.syncPublicNodeLocal(f.ctx, f.key, f.current(t))
+		var holding *errPublicNodeLocalHolding
+		var pending *nodeLoadBalancerFirewallRelationPendingError
+		waiting := err != nil && strings.Contains(err.Error(), "waiting for")
+		if err != nil && !errors.As(err, &holding) && !errors.As(err, &pending) && !waiting {
+			t.Fatalf("pass %d: %v", pass, err)
+		}
+		indexes := make([]int, nodes)
+		for i := range indexes {
+			indexes[i] = i
+		}
+		requireTransitionEdgeSafe(t, f, pass, indexes...)
+		child := trackedPublicNodeLocalDatapath(t, f)
+		ports := childPortSet(child)
+		for i := 0; i < nodes; i++ {
+			_, vmUUID, _, _ := publicNodeLocalFixtureNode(i)
+			held := firewallsOfVM(f, vmUUID)
+			if len(held) == 0 {
+				t.Fatalf("pass %d: VM %d has no Service firewall: %#v", pass, i, f.current(t).Annotations)
+			}
+			if len(held) > 1 {
+				sawBoth = true
+			}
+			// A port the old firewall allowed keeps its child frontend until that
+			// firewall is detached everywhere.
+			if held[watch.oldFirewall] {
+				for _, port := range watch.oldPorts {
+					if !ports[port] {
+						t.Fatalf("pass %d: port %d left the child while the old firewall is still attached", pass, port)
+					}
+				}
+			}
+		}
+		if afterPass != nil {
+			afterPass(pass)
+		}
+		current := f.current(t)
+		done = current.Annotations[annotationPublicNodeLocalActivePolicy] != oldHash &&
+			current.Annotations[annotationPublicNodeLocalTargetPolicy] == "" &&
+			current.Annotations[annotationNodeLoadBalancerPreviousFirewall] == "" &&
+			!publicNodeLocalAssignmentFencePresent(current) &&
+			publicNodeLocalDatapathMatches(trackedPublicNodeLocalDatapath(t, f), current, current.Annotations[annotationPublicNodeLocalActivePool])
+	}
+	if !done {
+		t.Fatalf("the policy change never completed: %#v", f.current(t).Annotations)
+	}
+	if !sawBoth {
+		t.Fatal("the old and the new firewall were never attached together")
+	}
+	for _, firewall := range f.api.firewalls {
+		if firewall.UUID == watch.oldFirewall {
+			t.Fatalf("the old firewall %s still exists", watch.oldFirewall)
+		}
+	}
+	ports := childPortSet(trackedPublicNodeLocalDatapath(t, f))
+	if len(ports) != len(watch.newPorts) {
+		t.Fatalf("child ports = %v, want %v", ports, watch.newPorts)
+	}
+	for _, port := range watch.newPorts {
+		if !ports[port] {
+			t.Fatalf("child ports = %v, want %v", ports, watch.newPorts)
+		}
+	}
+	if len(f.current(t).Status.LoadBalancer.Ingress) != nodes {
+		t.Fatalf("the Service lost nodes: %#v", f.current(t).Status)
+	}
+}
+
+// 443 becomes 443+8443: 443 stays served, the old firewall stays attached until
+// the new one is on every VM, then it is detached and deleted.
+func TestPublicNodeLocalPortAddMakeBeforeBreak(t *testing.T) {
+	f := newPublishedPublicNodeLocalFixtureN(t, 2)
+	old := f.current(t).Annotations[annotationNodeLoadBalancerFirewallUUID]
+	setPublicNodeLocalFixturePorts(t, f, 443, 8443)
+	newFirewall := ""
+	runPolicyChange(t, f, 2, policyChangeWatch{oldFirewall: old, oldPorts: []int32{443}, newPorts: []int32{443, 8443}}, func(int) {
+		current := f.current(t)
+		if uuid := current.Annotations[annotationNodeLoadBalancerFirewallUUID]; uuid != old {
+			newFirewall = uuid
+		}
+		// The old firewall is detached only after the new one is on every VM.
+		if newFirewall == "" {
+			return
+		}
+		for i := 0; i < 2; i++ {
+			_, vmUUID, _, _ := publicNodeLocalFixtureNode(i)
+			held := firewallsOfVM(f, vmUUID)
+			if !held[old] && !held[newFirewall] {
+				t.Fatalf("VM %d has neither firewall", i)
+			}
+		}
+	})
+}
+
+// 443+80 becomes 443: port 80 stays in the child until the old firewall is
+// detached, so the narrower policy is applied without any outage.
+func TestPublicNodeLocalPortRemovalClosesFirewallBeforeVIP(t *testing.T) {
+	f := newPublishedPublicNodeLocalFixtureWith(t, 2, shapePublicNodeLocalPorts(443, 80))
+	old := f.current(t).Annotations[annotationNodeLoadBalancerFirewallUUID]
+	setPublicNodeLocalFixturePorts(t, f, 443)
+	runPolicyChange(t, f, 2, policyChangeWatch{oldFirewall: old, oldPorts: []int32{443, 80}, newPorts: []int32{443}}, nil)
+	if len(f.api.unassignedFirewalls) == 0 {
+		t.Fatal("the old firewall was never detached")
+	}
+}
+
+func TestPublicNodeLocalSourceRangeChangeKeepsServing(t *testing.T) {
+	f := newPublishedPublicNodeLocalFixtureN(t, 2)
+	old := f.current(t).Annotations[annotationNodeLoadBalancerFirewallUUID]
+	updatePublicNodeLocalFixtureService(t, f, func(s *corev1.Service) { s.Spec.LoadBalancerSourceRanges = []string{"10.0.0.0/8"} })
+	runPolicyChange(t, f, 2, policyChangeWatch{oldFirewall: old, oldPorts: []int32{443}, newPorts: []int32{443}}, nil)
+}
+
+// A mix of narrowing and widening is not held and not rebuilt either.
+func TestPublicNodeLocalMixedPolicyChangeKeepsServing(t *testing.T) {
+	f := newPublishedPublicNodeLocalFixtureWith(t, 2, shapePublicNodeLocalPorts(443, 80))
+	old := f.current(t).Annotations[annotationNodeLoadBalancerFirewallUUID]
+	setPublicNodeLocalFixturePorts(t, f, 443, 8443)
+	updatePublicNodeLocalFixtureService(t, f, func(s *corev1.Service) { s.Spec.LoadBalancerSourceRanges = []string{"10.0.0.0/8"} })
+	runPolicyChange(t, f, 2, policyChangeWatch{oldFirewall: old, oldPorts: []int32{443, 80}, newPorts: []int32{443, 8443}}, nil)
 }
