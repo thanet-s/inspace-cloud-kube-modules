@@ -73,7 +73,7 @@ func initializeCloud(config *cloudconfig.CompletedConfig) cloud.Interface {
 	if err != nil {
 		klog.Fatal(err)
 	}
-	maxFirewallsPerVM, err := parseInt32WithDefault("INSPACE_NODE_LOAD_BALANCER_MAX_FIREWALLS_PER_VM", inspaceprovider.DefaultMaxFirewallsPerVM)
+	maxFirewallsPerVM, err := parseMaxFirewallsPerVM()
 	if err != nil {
 		klog.Fatal(err)
 	}
@@ -108,6 +108,19 @@ func initializeCloud(config *cloudconfig.CompletedConfig) cloud.Interface {
 		klog.Warning("remote mutations are disabled; node metadata works but Service LoadBalancers cannot be changed")
 	}
 	return provider
+}
+
+// parseMaxFirewallsPerVM reads the per-VM firewall limit. An empty value or a
+// value below one means the default; a non-integer is an error.
+func parseMaxFirewallsPerVM() (int32, error) {
+	limit, err := parseInt32WithDefault("INSPACE_NODE_LOAD_BALANCER_MAX_FIREWALLS_PER_VM", inspaceprovider.DefaultMaxFirewallsPerVM)
+	if err != nil {
+		return 0, err
+	}
+	if limit < 1 {
+		return inspaceprovider.DefaultMaxFirewallsPerVM, nil
+	}
+	return limit, nil
 }
 
 func parseInt32WithDefault(name string, fallback int32) (int32, error) {

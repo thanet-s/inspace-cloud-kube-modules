@@ -1242,6 +1242,16 @@ func (c *nodeLoadBalancerController) reconcileNodeLoadBalancerFirewallRelation(
 				result = outcomeCleared
 			}
 		} else {
+			if desired.operation == nodeLoadBalancerFirewallRelationAssign {
+				// Refuse before any receipt is issued. Committing a receipt and
+				// clearing it again would write the owner twice per pass, and a
+				// Service write re-enqueues the Service immediately, which would
+				// defeat the hold backoff. Nothing is persisted on a refusal.
+				if capacityErr := c.firewallVMCapacityFromItems(items, desired.firewallUUID, desired.vmUUID); capacityErr != nil {
+					c.refuseFirewallAttach(ctx, owner, *desired, capacityErr)
+					return false, capacityErr
+				}
+			}
 			if owner.parkRetired && values[annotationNodeLoadBalancerFirewallRelationRetired] != "" {
 				key := nodeLoadBalancerFirewallRelationKey(*desired)
 				now := c.nodeLoadBalancerFirewallRelationTime()
@@ -1438,18 +1448,11 @@ func (c *nodeLoadBalancerController) reconcileNodeLoadBalancerFirewallRelation(
 	}
 
 	if issuedFence.operation == nodeLoadBalancerFirewallRelationAssign {
-		// A VM with too many firewalls loses its outbound connections. Read the
-		// VM's assignments last, right before the POST, and refuse an attachment
-		// that would exceed the limit. The refusal is not a verified intent: the
-		// caller keeps whatever already serves and retries.
+		// Race backstop for the check made before the receipt was issued: read
+		// the VM's assignments again right before the POST. The refusal is not a
+		// verified intent: the caller keeps whatever already serves and retries.
 		if capacityErr := c.requireFirewallVMCapacity(ctx, issuedFence.firewallUUID, issuedFence.vmUUID); capacityErr != nil {
-			var limitErr *FirewallLimitExceededError
-			if errors.As(capacityErr, &limitErr) {
-				c.recordFirewallLimitExceeded(ctx, owner.service, owner.description, capacityErr)
-			} else {
-				klog.Warningf("node load balancer: %s: refuse to attach firewall %s to VM %s: %v",
-					owner.description, issuedFence.firewallUUID, issuedFence.vmUUID, capacityErr)
-			}
+			c.refuseFirewallAttach(ctx, owner, *issuedFence, capacityErr)
 			return rejectUndispatched(capacityErr)
 		}
 	}
@@ -1464,6 +1467,15 @@ func (c *nodeLoadBalancerController) reconcileNodeLoadBalancerFirewallRelation(
 	}
 	klog.Infof("node load balancer: %s: %s firewall %s on VM %s returned: %v",
 		owner.description, issuedFence.operation, issuedFence.firewallUUID, issuedFence.vmUUID, mutationErr)
+	if mutationErr == nil {
+		// The listing may lag a successful call. Count an acknowledged attach
+		// for a while so a second firewall cannot slip past the limit.
+		if issuedFence.operation == nodeLoadBalancerFirewallRelationAssign {
+			c.provider.rememberFirewallAssign(issuedFence.vmUUID, issuedFence.firewallUUID, c.nodeLoadBalancerFirewallRelationTime())
+		} else {
+			c.provider.forgetFirewallAssign(issuedFence.vmUUID, issuedFence.firewallUUID)
+		}
+	}
 	if nodeLoadBalancerMutationKnownPreDispatch(mutationErr) {
 		// The SDK produced this typed error before dispatch. Clear only the exact
 		// UID-pinned receipt using a detached bounded context; a canceled caller
