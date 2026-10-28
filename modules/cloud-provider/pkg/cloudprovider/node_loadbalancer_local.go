@@ -412,10 +412,24 @@ func desiredPublicNodeLocalDatapathFor(service *corev1.Service, pool string, exi
 	if target := service.Annotations[annotationPublicNodeLocalTargetPool]; target != "" {
 		desired.Annotations[annotationPublicNodeLocalDatapathTargetPool] = target
 	}
-	if existing == nil || (service.Annotations[annotationPublicNodeLocalTargetPolicy] == "" &&
-		service.Annotations[annotationNodeLoadBalancerPreviousFirewall] == "") {
+	if existing == nil || !publicNodeLocalUnionWanted(service) {
 		return desired
 	}
+	return mergePublicNodeLocalDatapathUnion(desired, existing)
+}
+
+// publicNodeLocalUnionWanted says whether the child must keep serving what the
+// old firewall still allows: from the start of a policy transition until the
+// old firewall is gone.
+func publicNodeLocalUnionWanted(service *corev1.Service) bool {
+	return service.Annotations[annotationPublicNodeLocalTargetPolicy] != "" ||
+		service.Annotations[annotationNodeLoadBalancerPreviousFirewall] != ""
+}
+
+// mergePublicNodeLocalDatapathUnion adds the ports and source ranges of the
+// existing child to the desired one. For a port both have, the desired one
+// wins; the existing position and name are kept.
+func mergePublicNodeLocalDatapathUnion(desired, existing *corev1.Service) *corev1.Service {
 	type portKey struct {
 		protocol corev1.Protocol
 		port     int32
@@ -548,7 +562,19 @@ func (c *nodeLoadBalancerController) ensurePublicNodeLocalDatapath(
 	if err != nil && !apierrors.IsNotFound(err) {
 		return nil, false, fmt.Errorf("public-node-local: get private datapath Service: %w", err)
 	}
-	desired := desiredPublicNodeLocalDatapathFor(service, pool, existing)
+	base := existing
+	if apierrors.IsNotFound(err) && publicNodeLocalUnionWanted(service) {
+		// A child lost during a transition comes back with the ports the old
+		// firewall still allows, not only the target ones.
+		rebuilt, rebuildErr := c.publicNodeLocalChildFromActiveFirewall(ctx, service)
+		if rebuildErr != nil {
+			return nil, false, rebuildErr
+		}
+		if rebuilt != nil {
+			base = rebuilt
+		}
+	}
+	desired := desiredPublicNodeLocalDatapathFor(service, pool, base)
 	// The child only carries the private VIPs for Cilium; the public gate is the
 	// firewall on the VM. Repairing the child therefore never needs the parent
 	// to be withdrawn, and the status subresource survives a spec update.

@@ -223,6 +223,15 @@ func (c *nodeLoadBalancerController) convergeActivePublicNodeLocal(
 		if datapath, readErr = c.readPublicNodeLocalDatapathHeld(ctx, service); readErr != nil {
 			return c.holdOrFailPublicNodeLocal(ctx, service, readErr)
 		}
+		if datapath == nil {
+			// A lost child is recreated in every mode, before anything else: the
+			// published nodes keep an open firewall and need their VIPs back.
+			if err := c.createPublicNodeLocalDatapathHeld(ctx, service, activePool); err != nil {
+				return c.holdOrFailPublicNodeLocal(ctx, service, err)
+			}
+			c.requeuePublicNodeLocal(key)
+			return nil
+		}
 	} else {
 		var changed bool
 		var err error

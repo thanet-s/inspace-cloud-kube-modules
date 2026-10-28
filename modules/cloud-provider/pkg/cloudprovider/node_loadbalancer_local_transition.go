@@ -4,11 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/klog/v2"
 
 	inspace "github.com/thanet-s/inspace-cloud-kube-modules/modules/client"
@@ -559,5 +561,106 @@ func (c *nodeLoadBalancerController) abortPublicNodeLocalTransition(
 		return c.holdOrFailPublicNodeLocal(ctx, service, err)
 	}
 	c.requeuePublicNodeLocal(key)
+	return nil
+}
+
+// publicNodeLocalChildFromActiveFirewall rebuilds what a lost child served
+// before, from the rules of the firewall that carries the active policy: the
+// ports it allows and the source ranges it allows. The target ports are unknown
+// (the Service spec describes the pending policy), so the port itself is used.
+// It returns nil when no firewall proves the active policy.
+func (c *nodeLoadBalancerController) publicNodeLocalChildFromActiveFirewall(
+	ctx context.Context,
+	service *corev1.Service,
+) (*corev1.Service, error) {
+	activePolicy := service.Annotations[annotationPublicNodeLocalActivePolicy]
+	if activePolicy == "" {
+		return nil, nil
+	}
+	owned, err := c.ownedServiceFirewalls(ctx, service)
+	if err != nil {
+		return nil, err
+	}
+	for index := range owned {
+		hash, hashErr := nodeLoadBalancerFirewallSpecHash(owned[index].Rules)
+		if hashErr != nil || hash != activePolicy {
+			continue
+		}
+		child := &corev1.Service{}
+		anySource := false
+		sources := map[string]struct{}{}
+		for _, rule := range owned[index].Rules {
+			if !strings.EqualFold(rule.Direction, "inbound") || rule.PortStart == nil || rule.PortEnd == nil || *rule.PortStart != *rule.PortEnd {
+				continue
+			}
+			protocol := corev1.ProtocolTCP
+			if strings.EqualFold(rule.Protocol, "udp") {
+				protocol = corev1.ProtocolUDP
+			} else if !strings.EqualFold(rule.Protocol, "tcp") {
+				continue
+			}
+			child.Spec.Ports = append(child.Spec.Ports, corev1.ServicePort{
+				Name: fmt.Sprintf("t-%s-%d", strings.ToLower(string(protocol)), *rule.PortStart), Protocol: protocol,
+				Port: *rule.PortStart, TargetPort: intstr.FromInt32(*rule.PortStart),
+			})
+			if rule.EndpointSpecType != "ip_prefixes" {
+				anySource = true
+			}
+			for _, source := range rule.EndpointSpec {
+				sources[source] = struct{}{}
+			}
+		}
+		if !anySource {
+			for source := range sources {
+				child.Spec.LoadBalancerSourceRanges = append(child.Spec.LoadBalancerSourceRanges, source)
+			}
+			sort.Strings(child.Spec.LoadBalancerSourceRanges)
+		}
+		return child, nil
+	}
+	return nil, nil
+}
+
+// createPublicNodeLocalDatapathHeld recreates a lost child while the Service
+// spec describes a pending policy: the pending ports, plus the ports of the
+// active firewall, so nothing the active firewall allows is blackholed.
+func (c *nodeLoadBalancerController) createPublicNodeLocalDatapathHeld(
+	ctx context.Context,
+	service *corev1.Service,
+	pool string,
+) error {
+	desired := desiredPublicNodeLocalDatapath(service, pool)
+	previous, err := c.publicNodeLocalChildFromActiveFirewall(ctx, service)
+	if err != nil {
+		return err
+	}
+	if previous != nil {
+		// Only what the active firewall allows is served: a pending port that was
+		// refused must not look served (and so claimed) because the child has it.
+		type portKey struct {
+			protocol corev1.Protocol
+			port     int32
+		}
+		served := map[portKey]struct{}{}
+		for _, port := range previous.Spec.Ports {
+			served[portKey{port.Protocol, port.Port}] = struct{}{}
+		}
+		kept := make([]corev1.ServicePort, 0, len(desired.Spec.Ports))
+		for _, port := range desired.Spec.Ports {
+			protocol := port.Protocol
+			if protocol == "" {
+				protocol = corev1.ProtocolTCP
+			}
+			if _, active := served[portKey{protocol, port.Port}]; active {
+				kept = append(kept, port)
+			}
+		}
+		desired.Spec.Ports = kept
+		desired = mergePublicNodeLocalDatapathUnion(desired, previous)
+		desired.Spec.LoadBalancerSourceRanges = append([]string(nil), previous.Spec.LoadBalancerSourceRanges...)
+	}
+	if _, err := c.provider.kubeClient.CoreV1().Services(service.Namespace).Create(ctx, desired, metav1.CreateOptions{}); err != nil {
+		return fmt.Errorf("public-node-local: recreate the private datapath Service: %w", err)
+	}
 	return nil
 }

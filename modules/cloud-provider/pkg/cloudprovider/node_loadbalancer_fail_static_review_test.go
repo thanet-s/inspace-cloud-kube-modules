@@ -1742,3 +1742,72 @@ func TestPublicNodeLocalParkedUnassignDoesNotStarveAdds(t *testing.T) {
 	}
 	t.Fatalf("the add starved behind the parked unassign: %#v", observePublicNodeLocal(t, f))
 }
+
+func deletePublicNodeLocalFixtureChild(t *testing.T, f *publicNodeLocalTransientFixture) {
+	t.Helper()
+	if err := f.provider.kubeClient.CoreV1().Services(f.service.Namespace).Delete(f.ctx, nodeLoadBalancerDatapathName(f.service), metav1.DeleteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// requireChildAndVIPsRestored runs passes until the child exists again with the
+// VIP of every published node and the given ports, never touching the FIPs.
+func requireChildAndVIPsRestored(t *testing.T, f *publicNodeLocalTransientFixture, nodes int, ports ...int32) {
+	t.Helper()
+	statusBefore := f.current(t).Status
+	for pass := 0; pass < 40; pass++ {
+		stepPublicNodeLocal(t, f, pass)
+		if !reflect.DeepEqual(f.current(t).Status, statusBefore) {
+			t.Fatalf("pass %d: the parent FIPs changed: %#v", pass, f.current(t).Status)
+		}
+		child := trackedPublicNodeLocalDatapathOrNil(f)
+		if child == nil || len(child.Status.LoadBalancer.Ingress) != nodes {
+			continue
+		}
+		have := childPortSet(child)
+		complete := true
+		for _, port := range ports {
+			complete = complete && have[port]
+		}
+		if complete {
+			return
+		}
+	}
+	t.Fatalf("the child and its VIPs were not restored with ports %v: %#v", ports, trackedPublicNodeLocalDatapathOrNil(f))
+}
+
+// A held policy change (refused because a peer serves the new port) must still
+// recreate a missing child and restore the VIPs of the published nodes.
+func TestPublicNodeLocalHeldPolicyRecreatesMissingChild(t *testing.T) {
+	f := newPublishedPublicNodeLocalFixtureN(t, 2)
+	addPublicNodeLocalFixturePeer(t, f, "peer", "peer-uid", "edge", 8443)
+	setPublicNodeLocalFixturePorts(t, f, 443, 8443)
+	stepPublicNodeLocal(t, f, 0)
+	requirePublicNodeLocalEvent(t, f, "PublicNodeLocalTransitionRefused")
+	deletePublicNodeLocalFixtureChild(t, f)
+	requireChildAndVIPsRestored(t, f, 2, 443)
+	if len(f.api.unassignedFirewalls) != 0 {
+		t.Fatalf("a firewall was detached: %v", f.api.unassignedFirewalls)
+	}
+}
+
+// A child lost in the middle of a policy transition comes back with the ports
+// of the old firewall too, so a port the old firewall still allows is not
+// blackholed.
+func TestPublicNodeLocalUnionRecreatesMissingChildWithOldPorts(t *testing.T) {
+	f := newPublishedPublicNodeLocalFixtureN(t, 2)
+	old := f.current(t).Annotations[annotationNodeLoadBalancerFirewallUUID]
+	setPublicNodeLocalFixturePorts(t, f, 8443)
+	for pass := 0; pass < 80; pass++ {
+		stepPublicNodeLocal(t, f, pass)
+		current := f.current(t)
+		if current.Annotations[annotationPublicNodeLocalTargetPolicy] != "" && current.Annotations[annotationNodeLoadBalancerFirewallUUID] != old {
+			break
+		}
+	}
+	if f.current(t).Annotations[annotationPublicNodeLocalTargetPolicy] == "" {
+		t.Fatal("the union never started")
+	}
+	deletePublicNodeLocalFixtureChild(t, f)
+	requireChildAndVIPsRestored(t, f, 2, 443, 8443)
+}
