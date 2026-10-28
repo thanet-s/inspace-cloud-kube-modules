@@ -527,62 +527,191 @@ func (c *nodeLoadBalancerController) ensurePublicNodeLocalDatapathStatus(
 	return updated, true, nil
 }
 
+// publicNodeLocalNodeKind is what one pass could prove about one Node. The
+// zero value proves nothing, so a missing verdict can never remove exposure.
+type publicNodeLocalNodeKind int
+
+const (
+	publicNodeLocalNodeUnverified publicNodeLocalNodeKind = iota
+	publicNodeLocalNodeAuthorized
+	// Gone means the Node, its VM or its pool membership is verifiably gone.
+	publicNodeLocalNodeGone
+	// NotEligible means the Node does not qualify now, but nothing proves it gone.
+	publicNodeLocalNodeNotEligible
+)
+
+type publicNodeLocalNodeVerdict struct {
+	kind   publicNodeLocalNodeKind
+	reason string
+}
+
+func publicNodeLocalNodeIs(kind publicNodeLocalNodeKind, reason string) publicNodeLocalNodeVerdict {
+	return publicNodeLocalNodeVerdict{kind: kind, reason: reason}
+}
+
+// publicNodeLocalNodeSet sorts the cluster's Nodes by what is proven about
+// them. Ready Nodes may be published. Gone Nodes (keyed by Node name, or by
+// published IP when the Node object is absent) may be removed. Every other
+// class keeps what is already published and never gains a new publication.
+type publicNodeLocalNodeSet struct {
+	Ready           []nodeLoadBalancerAddress
+	Gone            map[string]string
+	Unverified      map[string]error
+	EndpointMissing map[string]nodeLoadBalancerAddress
+	NotEligible     map[string]string
+}
+
+// publicNodeLocalAddresses returns the Nodes that may be published. It stops
+// at the first Node that cannot be verified, which keeps the bootstrap path
+// and the publication gates strict.
 func (c *nodeLoadBalancerController) publicNodeLocalAddresses(
 	ctx context.Context,
 	service *corev1.Service,
 	intent nodeLoadBalancerIntent,
 ) ([]nodeLoadBalancerAddress, bool, error) {
+	set, patchedNode, unverifiedErr, err := c.classifyPublicNodeLocalNodesMode(ctx, service, intent, true)
+	if err != nil {
+		return nil, patchedNode, err
+	}
+	if unverifiedErr != nil {
+		return nil, patchedNode, unverifiedErr
+	}
+	return set.Ready, patchedNode, nil
+}
+
+// classifyPublicNodeLocalNodes classifies every Node without stopping at the
+// first one that cannot be verified. It returns an error only when the Node
+// list, the EndpointSlice lister, the published child Service or the Node
+// addresses cannot give a consistent answer.
+func (c *nodeLoadBalancerController) classifyPublicNodeLocalNodes(
+	ctx context.Context,
+	service *corev1.Service,
+	intent nodeLoadBalancerIntent,
+) (publicNodeLocalNodeSet, bool, error) {
+	set, patched, _, err := c.classifyPublicNodeLocalNodesMode(ctx, service, intent, false)
+	return set, patched, err
+}
+
+func (c *nodeLoadBalancerController) classifyPublicNodeLocalNodesMode(
+	ctx context.Context,
+	service *corev1.Service,
+	intent nodeLoadBalancerIntent,
+	failFast bool,
+) (publicNodeLocalNodeSet, bool, error, error) {
+	set := publicNodeLocalNodeSet{
+		Gone:            map[string]string{},
+		Unverified:      map[string]error{},
+		EndpointMissing: map[string]nodeLoadBalancerAddress{},
+		NotEligible:     map[string]string{},
+	}
 	readyEndpoints, err := c.publicNodeLocalReadyEndpointNodes(service)
 	if err != nil {
-		return nil, false, err
+		return set, false, nil, err
 	}
 	nodeList, err := c.provider.kubeClient.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
 	if err != nil {
-		return nil, false, fmt.Errorf("public-node-local: list live Nodes: %w", err)
+		return set, false, nil, fmt.Errorf("public-node-local: list live Nodes: %w", err)
 	}
-	addresses := make([]nodeLoadBalancerAddress, 0)
 	seenPrivate := map[string]string{}
 	seenPublic := map[string]string{}
+	knownPrivate := map[string]struct{}{}
+	knownPublic := map[string]struct{}{}
 	patchedNode := false
 	for index := range nodeList.Items {
 		node := &nodeList.Items[index]
-		if !loadBalancerNodeEligible(node) {
+		if ip, ok := nodeLoadBalancerNodeInternalIPv4(node); ok {
+			knownPrivate[ip] = struct{}{}
+		}
+		if ip, ok := nodeLoadBalancerNodeExternalIPv4(node); ok {
+			knownPublic[ip] = struct{}{}
+		}
+		if !node.DeletionTimestamp.IsZero() {
+			set.Gone[node.Name] = "the Node is being deleted"
 			continue
 		}
-		authorized, patched, err := c.authorizePublicNodeLocalNode(ctx, node, intent.Pool)
-		if err != nil {
-			return nil, patchedNode, err
+		if !loadBalancerNodeEligible(node) {
+			set.NotEligible[node.Name] = "the Node is not Ready or is excluded from load balancing"
+			continue
 		}
+		verdict, patched, authErr := c.authorizePublicNodeLocalNodeVerdict(ctx, node, intent.Pool)
 		patchedNode = patchedNode || patched
-		if !authorized {
+		if failFast && authErr != nil {
+			return set, patchedNode, authErr, nil
+		}
+		switch verdict.kind {
+		case publicNodeLocalNodeGone:
+			set.Gone[node.Name] = verdict.reason
+			continue
+		case publicNodeLocalNodeNotEligible:
+			set.NotEligible[node.Name] = verdict.reason
+			continue
+		case publicNodeLocalNodeAuthorized:
+		default:
+			if authErr == nil {
+				authErr = fmt.Errorf("public-node-local: Node %s could not be verified", node.Name)
+			}
+			set.Unverified[node.Name] = authErr
 			continue
 		}
 		if _, serves := readyEndpoints[node.Name]; !serves {
+			// No metadata lookup is needed: this Node is only kept or removed,
+			// never published, so its own addresses are enough to match status.
+			missing := nodeLoadBalancerAddress{Node: node.DeepCopy()}
+			missing.PrivateIPv4, _ = nodeLoadBalancerNodeInternalIPv4(node)
+			missing.PublicIPv4, _ = nodeLoadBalancerNodeExternalIPv4(node)
+			set.EndpointMissing[node.Name] = missing
 			continue
 		}
 		address, err := c.publicNodeLocalAddress(ctx, node)
 		if err != nil {
-			return nil, patchedNode, err
+			if failFast {
+				return set, patchedNode, err, nil
+			}
+			set.Unverified[node.Name] = err
+			continue
 		}
 		if other := seenPrivate[address.PrivateIPv4]; other != "" {
-			return nil, patchedNode, fmt.Errorf("public-node-local: Nodes %s and %s share private IPv4 %s", other, node.Name, address.PrivateIPv4)
+			return set, patchedNode, nil, fmt.Errorf("public-node-local: Nodes %s and %s share private IPv4 %s", other, node.Name, address.PrivateIPv4)
 		}
 		if other := seenPublic[address.PublicIPv4]; other != "" {
-			return nil, patchedNode, fmt.Errorf("public-node-local: Nodes %s and %s share public IPv4 %s", other, node.Name, address.PublicIPv4)
+			return set, patchedNode, nil, fmt.Errorf("public-node-local: Nodes %s and %s share public IPv4 %s", other, node.Name, address.PublicIPv4)
 		}
 		seenPrivate[address.PrivateIPv4] = node.Name
 		seenPublic[address.PublicIPv4] = node.Name
-		addresses = append(addresses, address)
+		set.Ready = append(set.Ready, address)
 	}
-	sort.Slice(addresses, func(i, j int) bool {
-		left := netip.MustParseAddr(addresses[i].PublicIPv4)
-		right := netip.MustParseAddr(addresses[j].PublicIPv4)
+	sort.Slice(set.Ready, func(i, j int) bool {
+		left := netip.MustParseAddr(set.Ready[i].PublicIPv4)
+		right := netip.MustParseAddr(set.Ready[j].PublicIPv4)
 		if comparison := left.Compare(right); comparison != 0 {
 			return comparison < 0
 		}
-		return addresses[i].Node.Name < addresses[j].Node.Name
+		return set.Ready[i].Node.Name < set.Ready[j].Node.Name
 	})
-	return addresses, patchedNode, nil
+	if failFast {
+		return set, patchedNode, nil, nil
+	}
+	// A published entry that matches no Node object at all belongs to a Node
+	// that has been removed from the cluster.
+	datapath, err := c.provider.kubeClient.CoreV1().Services(service.Namespace).Get(
+		ctx, nodeLoadBalancerDatapathName(service), metav1.GetOptions{},
+	)
+	if err != nil && !apierrors.IsNotFound(err) {
+		return set, patchedNode, nil, fmt.Errorf("public-node-local: read published private datapath: %w", err)
+	}
+	if err == nil {
+		for _, ingress := range datapath.Status.LoadBalancer.Ingress {
+			if _, known := knownPrivate[ingress.IP]; !known {
+				set.Gone[ingress.IP] = "the Node object is absent"
+			}
+		}
+	}
+	for _, ingress := range service.Status.LoadBalancer.Ingress {
+		if _, known := knownPublic[ingress.IP]; !known {
+			set.Gone[ingress.IP] = "the Node object is absent"
+		}
+	}
+	return set, patchedNode, nil, nil
 }
 
 func (c *nodeLoadBalancerController) publicNodeLocalReadyEndpointNodes(service *corev1.Service) (map[string]struct{}, error) {
@@ -634,6 +763,25 @@ func (c *nodeLoadBalancerController) authorizePublicNodeLocalNode(
 	node *corev1.Node,
 	pool string,
 ) (bool, bool, error) {
+	verdict, patched, err := c.authorizePublicNodeLocalNodeVerdict(ctx, node, pool)
+	return verdict.kind == publicNodeLocalNodeAuthorized, patched, err
+}
+
+// authorizePublicNodeLocalNodeVerdict says what is proven about one Node. An
+// error means the Node could not be verified (Unverified), except for an exact
+// VM not-found, which is Gone and still reports its error to strict callers.
+func (c *nodeLoadBalancerController) authorizePublicNodeLocalNodeVerdict(
+	ctx context.Context,
+	node *corev1.Node,
+	pool string,
+) (publicNodeLocalNodeVerdict, bool, error) {
+	unverified := publicNodeLocalNodeVerdict{}
+	notEligible := func(reason string) (publicNodeLocalNodeVerdict, bool, error) {
+		return publicNodeLocalNodeIs(publicNodeLocalNodeNotEligible, reason), false, nil
+	}
+	gone := func(reason string) (publicNodeLocalNodeVerdict, bool, error) {
+		return publicNodeLocalNodeIs(publicNodeLocalNodeGone, reason), false, nil
+	}
 	karpenterBacked := node.Labels[karpenterNodePoolLabel] != ""
 	for _, owner := range node.OwnerReferences {
 		if owner.APIVersion == "karpenter.sh/v1" && owner.Kind == "NodeClaim" {
@@ -641,36 +789,49 @@ func (c *nodeLoadBalancerController) authorizePublicNodeLocalNode(
 		}
 	}
 	if !karpenterBacked && node.Labels[publicNodeLocalPoolLabel] != pool {
-		return false, false, nil
+		return gone("the Node left the " + pool + " pool")
 	}
 	providerIdentity, err := providerid.Parse(node.Spec.ProviderID)
 	if err != nil || providerIdentity.Location != c.provider.config.Location || providerIdentity.String() != node.Spec.ProviderID {
-		return false, false, nil
+		return notEligible("the Node has an invalid or foreign providerID")
 	}
 	vm, err := c.provider.api.GetVM(ctx, providerIdentity.Location, providerIdentity.UUID)
 	if err != nil {
-		return false, false, fmt.Errorf("public-node-local: read canonical VM ownership for Node %s: %w", node.Name, err)
+		wrapped := fmt.Errorf("public-node-local: read canonical VM ownership for Node %s: %w", node.Name, err)
+		if inspace.IsNotFound(err) {
+			return publicNodeLocalNodeIs(publicNodeLocalNodeGone, "the VM does not exist"), false, wrapped
+		}
+		return unverified, false, wrapped
 	}
-	if vm == nil || vm.UUID != providerIdentity.UUID ||
-		strings.EqualFold(strings.TrimSpace(vm.Status), "deleted") ||
-		vm.BillingAccountID != c.provider.config.BillingAccountID ||
-		(vm.NetworkUUID != "" && !strings.EqualFold(vm.NetworkUUID, c.provider.config.NetworkUUID)) {
-		return false, false, nil
+	if vm == nil || vm.UUID != providerIdentity.UUID {
+		return notEligible("the VM identity does not match the providerID")
+	}
+	if strings.EqualFold(strings.TrimSpace(vm.Status), "deleted") {
+		return gone("the VM is deleted")
+	}
+	if vm.BillingAccountID != c.provider.config.BillingAccountID {
+		return notEligible("the VM belongs to another billing account")
+	}
+	if vm.NetworkUUID != "" && !strings.EqualFold(vm.NetworkUUID, c.provider.config.NetworkUUID) {
+		return gone("the VM is outside the configured VPC")
 	}
 	network, err := c.provider.api.GetNetwork(ctx, providerIdentity.Location, c.provider.config.NetworkUUID)
 	if err != nil {
-		return false, false, fmt.Errorf("public-node-local: read canonical VPC membership for Node %s: %w", node.Name, err)
+		return unverified, false, fmt.Errorf("public-node-local: read canonical VPC membership for Node %s: %w", node.Name, err)
 	}
 	if network == nil || !strings.EqualFold(network.UUID, c.provider.config.NetworkUUID) {
-		return false, false, nil
+		return notEligible("the VPC identity does not match the configuration")
 	}
 	members, membershipErr := canonicalConfiguredVPCVMUUIDs(providerIdentity.Location, network)
 	if membershipErr != nil {
-		return false, false, fmt.Errorf("public-node-local: canonical VPC membership for Node %s is invalid: %w", node.Name, membershipErr)
+		return unverified, false, fmt.Errorf("public-node-local: canonical VPC membership for Node %s is invalid: %w", node.Name, membershipErr)
 	}
 	member, present := members[providerIdentity.UUID]
-	if !present || member != providerIdentity.UUID {
-		return false, false, nil
+	if !present {
+		return gone("the VM is not a member of the configured VPC")
+	}
+	if member != providerIdentity.UUID {
+		return notEligible("the VPC membership row is not canonical")
 	}
 	var ownership publicNodeLocalVMOwnership
 	ownershipErr := error(nil)
@@ -687,7 +848,7 @@ func (c *nodeLoadBalancerController) authorizePublicNodeLocalNode(
 	if c.provider.dynamicClient != nil {
 		claims, err = c.provider.dynamicClient.Resource(nodeClaimGVR).List(ctx, metav1.ListOptions{})
 		if err != nil {
-			return false, false, fmt.Errorf("public-node-local: list NodeClaims before manual/Karpenter classification: %w", err)
+			return unverified, false, fmt.Errorf("public-node-local: list NodeClaims before manual/Karpenter classification: %w", err)
 		}
 		for index := range claims.Items {
 			claim := &claims.Items[index]
@@ -701,10 +862,13 @@ func (c *nodeLoadBalancerController) authorizePublicNodeLocalNode(
 		}
 	}
 	if !karpenterBacked {
-		return node.Labels[publicNodeLocalPoolLabel] == pool && ownershipErr == nil, false, nil
+		if node.Labels[publicNodeLocalPoolLabel] == pool && ownershipErr == nil {
+			return publicNodeLocalNodeIs(publicNodeLocalNodeAuthorized, ""), false, nil
+		}
+		return notEligible("the VM ownership record is malformed")
 	}
 	if c.provider.dynamicClient == nil {
-		return false, false, errors.New("public-node-local: dynamic client is required to authorize a Karpenter Node")
+		return unverified, false, errors.New("public-node-local: dynamic client is required to authorize a Karpenter Node")
 	}
 	matching := make([]*unstructured.Unstructured, 0, 1)
 	for index := range claims.Items {
@@ -716,61 +880,73 @@ func (c *nodeLoadBalancerController) authorizePublicNodeLocalNode(
 			matching = append(matching, claim.DeepCopy())
 		}
 	}
+	if len(matching) == 0 {
+		return gone("the NodeClaim is absent")
+	}
 	if len(matching) != 1 {
-		return false, false, nil
+		return notEligible("more than one NodeClaim matches the Node")
 	}
 	claim := matching[0]
+	if claim.GetDeletionTimestamp() != nil {
+		return gone("the NodeClaim is being deleted")
+	}
 	claimProviderID, providerFound, _ := unstructured.NestedString(claim.Object, "status", "providerID")
 	claimNodeName, nodeFound, _ := unstructured.NestedString(claim.Object, "status", "nodeName")
 	if !providerFound || !nodeFound || claimProviderID != node.Spec.ProviderID || claimNodeName != node.Name ||
-		claim.GetUID() == "" || claim.GetDeletionTimestamp() != nil ||
+		claim.GetUID() == "" ||
 		!hasExactSingleNodeLoadBalancerOwnerReference(node.OwnerReferences, "karpenter.sh/v1", "NodeClaim", claim.GetName(), claim.GetUID()) {
-		return false, false, nil
+		return notEligible("the NodeClaim identity does not match the Node")
 	}
 	poolName := claim.GetLabels()[karpenterNodePoolLabel]
 	if poolName == "" || node.Labels[karpenterNodePoolLabel] != poolName {
-		return false, false, nil
+		return notEligible("the NodeClaim and Node disagree on the NodePool")
 	}
 	nodePool, err := c.provider.dynamicClient.Resource(nodePoolGVR).Get(ctx, poolName, metav1.GetOptions{})
 	if apierrors.IsNotFound(err) {
-		return false, false, nil
+		return gone("the NodePool is absent")
 	}
 	if err != nil {
-		return false, false, fmt.Errorf("public-node-local: get NodePool %s: %w", poolName, err)
+		return unverified, false, fmt.Errorf("public-node-local: get NodePool %s: %w", poolName, err)
 	}
-	if nodePool.GetUID() == "" || nodePool.GetDeletionTimestamp() != nil ||
+	if nodePool.GetDeletionTimestamp() != nil {
+		return gone("the NodePool is being deleted")
+	}
+	if nodePool.GetUID() == "" ||
 		!hasExactSingleNodeLoadBalancerOwnerReference(claim.GetOwnerReferences(), "karpenter.sh/v1", "NodePool", nodePool.GetName(), nodePool.GetUID()) {
-		return false, false, nil
+		return notEligible("the NodeClaim is not owned by the NodePool")
 	}
 	templateLabels, found, err := unstructured.NestedStringMap(nodePool.Object, "spec", "template", "metadata", "labels")
-	if err != nil || !found || templateLabels[publicNodeLocalPoolLabel] != pool {
-		return false, false, nil
+	if err != nil || !found {
+		return notEligible("the NodePool template labels are unreadable")
+	}
+	if templateLabels[publicNodeLocalPoolLabel] != pool {
+		return gone("the NodePool no longer places Nodes in the " + pool + " pool")
 	}
 	claimClassName, ok := publicNodeLocalNodeClassRefName(claim, []string{"spec", "nodeClassRef"})
 	if !ok {
-		return false, false, nil
+		return notEligible("the NodeClaim has no valid nodeClassRef")
 	}
 	poolClassName, ok := publicNodeLocalNodeClassRefName(nodePool, []string{"spec", "template", "spec", "nodeClassRef"})
 	if !ok || poolClassName != claimClassName {
-		return false, false, nil
+		return notEligible("the NodePool and NodeClaim disagree on the node class")
 	}
 	nodeClass, err := c.provider.dynamicClient.Resource(nodeClassGVR).Get(ctx, claimClassName, metav1.GetOptions{})
 	if apierrors.IsNotFound(err) {
-		return false, false, nil
+		return notEligible("the InSpaceNodeClass is absent")
 	}
 	if err != nil {
-		return false, false, fmt.Errorf("public-node-local: get InSpaceNodeClass %s: %w", claimClassName, err)
+		return unverified, false, fmt.Errorf("public-node-local: get InSpaceNodeClass %s: %w", claimClassName, err)
 	}
 	profile, profileFound, profileErr := unstructured.NestedString(nodeClass.Object, "spec", "firewallProfile")
 	if nodeClass.GetDeletionTimestamp() != nil || profileErr != nil || !profileFound || profile != publicNodeLocalFirewallProfile {
-		return false, false, nil
+		return notEligible("the InSpaceNodeClass is not a public-node-local class")
 	}
 	if err := c.validateBaseNodeClass(nodeClass); err != nil {
-		return false, false, fmt.Errorf("public-node-local: validate InSpaceNodeClass %s: %w", claimClassName, err)
+		return unverified, false, fmt.Errorf("public-node-local: validate InSpaceNodeClass %s: %w", claimClassName, err)
 	}
 	baseFirewallUUID, err := c.publicNodeLocalTrustedBaseFirewall(ctx, nodeClass)
 	if err != nil {
-		return false, false, fmt.Errorf("public-node-local: validate InSpaceNodeClass %s security base: %w", claimClassName, err)
+		return unverified, false, fmt.Errorf("public-node-local: validate InSpaceNodeClass %s security base: %w", claimClassName, err)
 	}
 	if ownershipErr != nil ||
 		ownership.Schema != "karpenter.inspace.cloud/v3" || ownership.Cluster != c.provider.config.ClusterID ||
@@ -778,7 +954,7 @@ func (c *nodeLoadBalancerController) authorizePublicNodeLocalNode(
 		ownership.VMName == "" || ownership.VMName != vm.Name || ownership.VMName != node.Name ||
 		ownership.FirewallProfile != publicNodeLocalFirewallProfile || ownership.FirewallUUID != baseFirewallUUID ||
 		ownership.NetworkUUID != c.provider.config.NetworkUUID || ownership.BillingAccountID != c.provider.config.BillingAccountID {
-		return false, false, nil
+		return notEligible("the VM ownership record does not match the NodeClaim")
 	}
 	if node.Labels[publicNodeLocalPoolLabel] != pool {
 		patch, _ := json.Marshal(map[string]any{"metadata": map[string]any{
@@ -786,17 +962,17 @@ func (c *nodeLoadBalancerController) authorizePublicNodeLocalNode(
 			"labels":          map[string]any{publicNodeLocalPoolLabel: pool},
 		}})
 		if _, err := c.provider.kubeClient.CoreV1().Nodes().Patch(ctx, node.Name, types.MergePatchType, patch, metav1.PatchOptions{}); err != nil {
-			return false, false, fmt.Errorf("public-node-local: mirror protected pool label to Node %s: %w", node.Name, err)
+			return unverified, false, fmt.Errorf("public-node-local: mirror protected pool label to Node %s: %w", node.Name, err)
 		}
 		// Do not authorize from a stale pre-patch Node object. The next
 		// reconciliation must observe the protected label and then complete the
 		// VM firewall audit against the exact live Service state.
-		return false, true, nil
+		return publicNodeLocalNodeIs(publicNodeLocalNodeNotEligible, "the protected pool label was just mirrored"), true, nil
 	}
 	if err := c.auditPublicNodeLocalVMFirewalls(ctx, node, baseFirewallUUID); err != nil {
-		return false, false, fmt.Errorf("public-node-local: audit VM %s firewall assignments: %w", node.Name, err)
+		return unverified, false, fmt.Errorf("public-node-local: audit VM %s firewall assignments: %w", node.Name, err)
 	}
-	return true, false, nil
+	return publicNodeLocalNodeIs(publicNodeLocalNodeAuthorized, ""), false, nil
 }
 
 func (c *nodeLoadBalancerController) publicNodeLocalTrustedBaseFirewall(

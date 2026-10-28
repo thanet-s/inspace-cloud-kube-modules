@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"sort"
 	"testing"
 	"time"
 
@@ -285,5 +286,134 @@ func TestPublicNodeLocalUnpublishedFailureStillFailsClosed(t *testing.T) {
 	}
 	if len(f.api.unassignedFirewalls) == unassignedBefore {
 		t.Fatal("unpublished failure did not close the leftover firewall assignment")
+	}
+}
+
+func TestPublicNodeLocalClassifyNodes(t *testing.T) {
+	ctx := context.Background()
+	const (
+		vmUUID    = "21111111-2222-4333-8444-555555555555"
+		privateIP = "10.0.0.31"
+		publicIP  = "203.0.113.31"
+	)
+	tests := []struct {
+		name        string
+		mutate      func(*fakeAPI, *corev1.Node)
+		getVMErr    error
+		noNode      bool
+		noEndpoint  bool
+		publishedIP string
+		ready       []string
+		gone        []string
+		unverified  []string
+		missing     []string
+		notEligible []string
+	}{
+		{name: "ready node", ready: []string{"edge-classify"}},
+		{name: "no ready endpoint", noEndpoint: true, missing: []string{"edge-classify"}},
+		{name: "node object absent but published", noNode: true, publishedIP: privateIP, gone: []string{privateIP}},
+		{name: "node is deleting", gone: []string{"edge-classify"}, mutate: func(_ *fakeAPI, node *corev1.Node) {
+			now := metav1.Now()
+			node.DeletionTimestamp = &now
+		}},
+		{name: "deleted VM tombstone", gone: []string{"edge-classify"}, mutate: func(api *fakeAPI, _ *corev1.Node) {
+			api.vms[0].Status = "Deleted"
+		}},
+		{name: "VM exact not found", gone: []string{"edge-classify"}, mutate: func(api *fakeAPI, _ *corev1.Node) {
+			api.vms = nil
+		}},
+		{name: "valid empty VPC membership", gone: []string{"edge-classify"}, mutate: func(api *fakeAPI, _ *corev1.Node) {
+			api.network = &inspace.Network{UUID: testNetworkUUID, VMUUIDs: []string{}}
+		}},
+		{name: "pool label changed", gone: []string{"edge-classify"}, mutate: func(_ *fakeAPI, node *corev1.Node) {
+			node.Labels[publicNodeLocalPoolLabel] = "other"
+		}},
+		{name: "GetVM definite error", unverified: []string{"edge-classify"}, getVMErr: errors.New("canonical ownership read failed")},
+		{name: "metadata mismatch", unverified: []string{"edge-classify"}, mutate: func(api *fakeAPI, _ *corev1.Node) {
+			api.floatingIPs[0].Address = "203.0.113.99"
+		}},
+		{name: "foreign billing account", notEligible: []string{"edge-classify"}, mutate: func(api *fakeAPI, _ *corev1.Node) {
+			api.vms[0].BillingAccountID = 99
+		}},
+		{name: "node not ready", notEligible: []string{"edge-classify"}, mutate: func(_ *fakeAPI, node *corev1.Node) {
+			node.Status.Conditions[0].Status = corev1.ConditionFalse
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			service := publicNodeLocalTestService("classify", "classify-service-uid", "edge", corev1.ProtocolTCP, 443)
+			service.Finalizers = []string{publicNodeLocalFinalizer}
+			node := publicNodeLocalTestNode("edge-classify", vmUUID, privateIP, publicIP)
+			api := &fakeAPI{
+				vms: []inspace.VM{{UUID: vmUUID, Name: node.Name, Hostname: node.Name, Status: "running", PrivateIPv4: privateIP, BillingAccountID: 42, NetworkUUID: testNetworkUUID}},
+				floatingIPs: []inspace.FloatingIP{{
+					Address: publicIP, BillingAccountID: 42, Type: "public", Enabled: true,
+					AssignedTo: vmUUID, AssignedToResourceType: "virtual_machine", AssignedToPrivateIP: privateIP,
+				}},
+			}
+			if test.mutate != nil {
+				test.mutate(api, node)
+			}
+			var providerAPI API = &publicNodeLocalFilteringIPAPI{fakeAPI: api}
+			if test.getVMErr != nil {
+				providerAPI = &managedNodeLoadBalancerVMReadErrorAPI{fakeAPI: api, err: test.getVMErr}
+			}
+			provider := newTestProvider(t, providerAPI)
+			objects := []runtime.Object{service.DeepCopy()}
+			if !test.noNode {
+				objects = append(objects, node.DeepCopy())
+			}
+			if test.publishedIP != "" {
+				datapath := desiredPublicNodeLocalDatapath(service, "edge")
+				mode := corev1.LoadBalancerIPModeVIP
+				datapath.Status.LoadBalancer.Ingress = []corev1.LoadBalancerIngress{{IP: test.publishedIP, IPMode: &mode}}
+				objects = append(objects, datapath)
+			}
+			provider.kubeClient = kubefake.NewSimpleClientset(objects...)
+			controller := &nodeLoadBalancerController{provider: provider}
+			if test.noEndpoint {
+				controller.endpointSlices = publicNodeLocalTestEndpointSliceLister(t, service)
+			} else {
+				controller.endpointSlices = publicNodeLocalTestEndpointSliceLister(t, service, node.Name)
+			}
+			intent, err := parseNodeLoadBalancerService(service, nodeLoadBalancerDefaults{})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			set, _, err := controller.classifyPublicNodeLocalNodes(ctx, service, intent)
+			if err != nil {
+				t.Fatalf("classification failed: %v", err)
+			}
+			readyNames := make([]string, 0, len(set.Ready))
+			for _, address := range set.Ready {
+				readyNames = append(readyNames, address.Node.Name)
+			}
+			keys := func(values map[string]string) []string {
+				result := make([]string, 0, len(values))
+				for key := range values {
+					result = append(result, key)
+				}
+				sort.Strings(result)
+				return result
+			}
+			unverified := make([]string, 0, len(set.Unverified))
+			for key := range set.Unverified {
+				unverified = append(unverified, key)
+			}
+			missing := make([]string, 0, len(set.EndpointMissing))
+			for key := range set.EndpointMissing {
+				missing = append(missing, key)
+			}
+			for name, got := range map[string][2][]string{
+				"ready": {readyNames, test.ready}, "gone": {keys(set.Gone), test.gone},
+				"unverified": {unverified, test.unverified}, "endpoint missing": {missing, test.missing},
+				"not eligible": {keys(set.NotEligible), test.notEligible},
+			} {
+				if len(got[0]) != len(got[1]) || (len(got[0]) != 0 && !reflect.DeepEqual(got[0], got[1])) {
+					t.Fatalf("%s = %v, want %v (set=%#v)", name, got[0], got[1], set)
+				}
+			}
+		})
 	}
 }
