@@ -37,10 +37,14 @@ const (
 	// annotationNodeLoadBalancerRebuilding marks a rebuild that has begun and is
 	// not yet withdrawn. It is removed with the activation.
 	annotationNodeLoadBalancerRebuilding = "service.inspace.cloud/node-lb-rebuilding"
-	annotationNodeLoadBalancerNodesPerShard        = "service.inspace.cloud/node-lb-nodes-per-shard"
-	annotationNodeLoadBalancerCPU                  = "service.inspace.cloud/node-lb-cpu"
-	annotationNodeLoadBalancerMemory               = "service.inspace.cloud/node-lb-memory"
-	annotationNodeLoadBalancerShard                = "service.inspace.cloud/node-lb-shard"
+	// annotationNodeLoadBalancerRebuildingAssigned lists the firewall/VM pairs that
+	// were assigned when the rebuild began. A pair that is no longer assigned
+	// means a detach was read back, and the rebuild can not be cancelled any more.
+	annotationNodeLoadBalancerRebuildingAssigned = "service.inspace.cloud/node-lb-rebuilding-assigned"
+	annotationNodeLoadBalancerNodesPerShard      = "service.inspace.cloud/node-lb-nodes-per-shard"
+	annotationNodeLoadBalancerCPU                = "service.inspace.cloud/node-lb-cpu"
+	annotationNodeLoadBalancerMemory             = "service.inspace.cloud/node-lb-memory"
+	annotationNodeLoadBalancerShard              = "service.inspace.cloud/node-lb-shard"
 
 	nodeLoadBalancerModeShared    = "public-node-shared"
 	nodeLoadBalancerModeDedicated = "public-node-dedicated"

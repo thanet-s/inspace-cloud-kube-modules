@@ -134,6 +134,26 @@ func (c *nodeLoadBalancerController) syncPublicNodeLocalPass(
 		// the marker goes away with the activation when the withdrawal is complete.
 		// Starting a transition on top of a half-done withdrawal would leave its
 		// detach journal and unassign receipt behind a half-closed edge.
+		if strings.TrimSpace(service.Annotations[annotationNodeLoadBalancerAllowRebuild]) == "" {
+			// The operator took the escape hatch away. Before any detach has been
+			// read back nothing was taken from the edge, so the rebuild is cancelled.
+			readBack, readErr := c.publicNodeLocalRebuildDetachReadBack(ctx, service)
+			if readErr != nil {
+				return c.holdOrFailPublicNodeLocal(ctx, service, readErr)
+			}
+			if !readBack {
+				if err := c.cancelPublicNodeLocalRebuild(ctx, service); err != nil {
+					return c.holdOrFailPublicNodeLocal(ctx, service, err)
+				}
+				c.requeuePublicNodeLocal(key)
+				return nil
+			}
+			c.recordPublicNodeLocalEvent(ctx, service, publicNodeLocalReasonRebuildStuck, errors.New(
+				"public-node-local: the rebuild cannot be cancelled by removing "+annotationNodeLoadBalancerAllowRebuild+
+					" because a firewall detach was already read back, so the withdrawal goes on. To recover, make the blocked detach possible"+
+					" (a VM of another billing account or VPC, or a parked firewall relation, blocks the readback; see the runbook in the chart README),"+
+					" or delete and recreate the Service"))
+		}
 		return c.withdrawAndRequeuePublicNodeLocal(ctx, key, service)
 	}
 	if activePool != "" && activePool == intent.Pool && activePolicy == desiredFirewall.Hash &&
@@ -2554,6 +2574,7 @@ func (c *nodeLoadBalancerController) clearPublicNodeLocalActivation(ctx context.
 			annotationPublicNodeLocalTargetPool,
 			annotationPublicNodeLocalTargetPolicy,
 			annotationPublicNodeLocalActivePorts,
+			annotationNodeLoadBalancerRebuildingAssigned,
 			annotationPublicNodeLocalTargetSince,
 			annotationPublicNodeLocalPromotedAt,
 			annotationNodeLoadBalancerRebuilding,

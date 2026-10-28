@@ -2545,3 +2545,84 @@ func TestPublicNodeLocalPromotionRefusedWhenLivePolicyMovedOn(t *testing.T) {
 		t.Fatal("the target was promoted")
 	}
 }
+
+// startStuckRebuild begins a rebuild whose detach never reads back. It returns
+// once the rebuild marker and the detach journal are set.
+func startStuckRebuild(t *testing.T, f *publicNodeLocalTransientFixture) {
+	t.Helper()
+	setPublicNodeLocalFixturePorts(t, f, 443, 8443)
+	updatePublicNodeLocalFixtureService(t, f, func(s *corev1.Service) { s.Annotations[annotationNodeLoadBalancerAllowRebuild] = "true" })
+	for pass := 0; pass < 20; pass++ {
+		_ = f.controller.syncPublicNodeLocal(f.ctx, f.key, f.current(t))
+		current := f.current(t)
+		if current.Annotations[annotationNodeLoadBalancerRebuilding] != "" && current.Annotations[annotationNodeLoadBalancerWithdrawFWDetach] != "" {
+			return
+		}
+	}
+	t.Fatalf("the rebuild never started: %#v", f.current(t).Annotations)
+}
+
+// The operator removes the escape hatch before any detach has been read back:
+// the rebuild is cancelled and the Service goes back to normal convergence, which
+// carries the pending change out in place.
+func TestPublicNodeLocalRebuildCancelledWhenAnnotationRemovedBeforeAnyDetachReadBack(t *testing.T) {
+	f := newPublishedPublicNodeLocalFixtureN(t, 1)
+	f.provider.api = &lagUnassignAPI{publicNodeLocalFilteringIPAPI: &publicNodeLocalFilteringIPAPI{fakeAPI: f.api}, skip: 1000}
+	oldHash := f.current(t).Annotations[annotationPublicNodeLocalActivePolicy]
+	startStuckRebuild(t, f)
+	statusBefore := f.current(t).Status
+	updatePublicNodeLocalFixtureService(t, f, func(s *corev1.Service) { delete(s.Annotations, annotationNodeLoadBalancerAllowRebuild) })
+	// The cloud recovers.
+	f.provider.api = &publicNodeLocalFilteringIPAPI{fakeAPI: f.api}
+	clock := time.Now().UTC()
+	f.controller.firewallRelationNow = func() time.Time { return clock }
+	f.controller.firewallRelationAbsentDelay = nodeLoadBalancerAbsenceConfirmationDelay
+	cancelled := false
+	runUntil(t, f, []int{0}, 300, "the pending change in place", func(o publicNodeLocalObservation, s *corev1.Service) bool {
+		clock = clock.Add(nodeLoadBalancerFirewallRelationRetireDelay + time.Second)
+		cancelled = cancelled || s.Annotations[annotationNodeLoadBalancerRebuilding] == ""
+		return s.Annotations[annotationPublicNodeLocalActivePolicy] != oldHash && s.Annotations[annotationPublicNodeLocalTargetPolicy] == "" &&
+			s.Annotations[annotationNodeLoadBalancerPreviousFirewall] == ""
+	})
+	if !cancelled || len(f.current(t).Status.LoadBalancer.Ingress) != len(statusBefore.LoadBalancer.Ingress) {
+		t.Fatalf("the rebuild was not cancelled in place: %#v", f.current(t).Annotations)
+	}
+	if f.current(t).Annotations[annotationNodeLoadBalancerRebuilding] != "" {
+		t.Fatal("the rebuild marker stayed")
+	}
+}
+
+// Once a detach has been read back, the rebuild can no longer be cancelled. It
+// goes on, and an Event says how to recover.
+func TestPublicNodeLocalRebuildCannotBeCancelledAfterADetachReadBack(t *testing.T) {
+	f := newPublishedPublicNodeLocalFixtureN(t, 2)
+	_, vm1, _, _ := publicNodeLocalFixtureNode(0)
+	_, vm2, _, _ := publicNodeLocalFixtureNode(1)
+	// vm2 never detaches (a stuck relation); vm1 does.
+	f.provider.api = &neverUnassignVMAPI{publicNodeLocalFilteringIPAPI: &publicNodeLocalFilteringIPAPI{fakeAPI: f.api}, stuckVM: vm2}
+	setPublicNodeLocalFixturePorts(t, f, 443, 8443)
+	updatePublicNodeLocalFixtureService(t, f, func(s *corev1.Service) { s.Annotations[annotationNodeLoadBalancerAllowRebuild] = "true" })
+	for pass := 0; pass < 40; pass++ {
+		_ = f.controller.syncPublicNodeLocal(f.ctx, f.key, f.current(t))
+		if len(firewallsOfVM(f, vm1)) == 0 {
+			break
+		}
+	}
+	if len(firewallsOfVM(f, vm1)) != 0 || len(firewallsOfVM(f, vm2)) == 0 {
+		t.Fatalf("no partial detach: vm1 %v vm2 %v", firewallsOfVM(f, vm1), firewallsOfVM(f, vm2))
+	}
+	updatePublicNodeLocalFixtureService(t, f, func(s *corev1.Service) { delete(s.Annotations, annotationNodeLoadBalancerAllowRebuild) })
+	for pass := 0; pass < 6; pass++ {
+		_ = f.controller.syncPublicNodeLocal(f.ctx, f.key, f.current(t))
+	}
+	if f.current(t).Annotations[annotationNodeLoadBalancerRebuilding] == "" {
+		t.Fatal("the rebuild was cancelled after a detach had been read back")
+	}
+	found := false
+	for _, message := range publicNodeLocalEventMessages(t, f, "PublicNodeLocalRebuildStuck") {
+		found = found || (strings.Contains(message, "cannot be cancelled") && strings.Contains(message, "recover"))
+	}
+	if !found {
+		t.Fatalf("no Event that says how to recover: %v", publicNodeLocalEventMessages(t, f, "PublicNodeLocalRebuildStuck"))
+	}
+}

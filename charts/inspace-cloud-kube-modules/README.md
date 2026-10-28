@@ -326,6 +326,21 @@ even if the cloud detach readback lags. The same value is not honoured again
 until the annotation is removed or set to another value, so a manifest that
 keeps it cannot replay a rebuild on a later change.
 
+Runbook for a rebuild that does not finish. A rebuild sets
+`service.inspace.cloud/node-lb-rebuilding` and withdraws the edge first; it ends
+when every Service firewall detach has been read back. A VM of another billing
+account or VPC, or a parked firewall relation (`PublicNodeLocalFirewallRelationStuck`),
+can keep a detach from ever reading back. To cancel, remove the
+`node-lb-allow-rebuild` annotation. If no detach has been read back yet, CCM
+clears the marker and the Service goes back to normal in-place convergence,
+carrying the pending change out make-before-break. If a detach has already been
+read back, the rebuild cannot be cancelled: CCM emits `PublicNodeLocalRebuildStuck`
+and keeps withdrawing. Recover by making the blocked detach possible: remove or
+fix the blocking VM (for example drain and delete a node whose VM is in another
+billing account), or wait for the park of the relation to end (CCM retries a
+parked detach of the previous firewall at every pass, and the other parked
+relations after 30 minutes). As a last resort delete and recreate the Service.
+
 The generic public-NLB path remains an explicit, paid, TCP-only InSpace NLB. A
 Service using that path deliberately leaves `loadBalancerClass` unset for
 Kubernetes' cloud service controller and sets both the public scope label and

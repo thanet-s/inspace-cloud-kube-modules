@@ -219,13 +219,21 @@ func (c *nodeLoadBalancerController) consumePublicNodeLocalRebuildAllowance(
 	if consumed == raw {
 		return false, nil
 	}
-	_, _, err := c.updateExactParentService(ctx, service, func(copy *corev1.Service) (bool, error) {
+	// What is assigned now tells, later, whether a detach has been read back.
+	assigned, err := c.publicNodeLocalAssignedPairs(ctx, service)
+	if err != nil {
+		return false, err
+	}
+	_, _, err = c.updateExactParentService(ctx, service, func(copy *corev1.Service) (bool, error) {
 		if copy.Annotations[annotationNodeLoadBalancerAllowRebuild] != raw ||
 			copy.Annotations[annotationNodeLoadBalancerAllowRebuildConsumed] != consumed {
 			return false, errors.New("public-node-local: the escape hatch changed before it was consumed")
 		}
 		copy.Annotations[annotationNodeLoadBalancerAllowRebuildConsumed] = raw
 		copy.Annotations[annotationNodeLoadBalancerRebuilding] = raw
+		if assigned != "" {
+			copy.Annotations[annotationNodeLoadBalancerRebuildingAssigned] = assigned
+		}
 		return true, nil
 	})
 	if err != nil {
@@ -934,4 +942,88 @@ func (c *nodeLoadBalancerController) backfillPublicNodeLocalActivePorts(ctx cont
 		return service, err
 	}
 	return updated, nil
+}
+
+const publicNodeLocalReasonRebuildStuck = "PublicNodeLocalRebuildStuck"
+
+// publicNodeLocalAssignedPairs lists the firewall/VM pairs that are assigned now,
+// bounded to 3000 bytes (an empty string when they do not fit).
+func (c *nodeLoadBalancerController) publicNodeLocalAssignedPairs(ctx context.Context, service *corev1.Service) (string, error) {
+	firewalls, err := c.serviceFirewallsForEmergencyDetach(ctx, service)
+	if err != nil {
+		return "", err
+	}
+	var pairs []string
+	for _, firewall := range firewalls {
+		assignments, assignErr := nodeLoadBalancerFirewallVMAssignments(firewall)
+		if assignErr != nil {
+			return "", assignErr
+		}
+		for vmUUID := range assignments {
+			pairs = append(pairs, firewall.UUID+"/"+vmUUID)
+		}
+	}
+	sort.Strings(pairs)
+	joined := strings.Join(pairs, ",")
+	if len(joined) > 3000 {
+		return "", nil
+	}
+	return joined, nil
+}
+
+// publicNodeLocalRebuildDetachReadBack reports whether a firewall detach of the
+// running rebuild has already been read back: some pair that was assigned when
+// the rebuild began is no longer assigned in the cloud. Until then nothing has
+// been taken from the edge, so the rebuild can still be cancelled.
+func (c *nodeLoadBalancerController) publicNodeLocalRebuildDetachReadBack(ctx context.Context, service *corev1.Service) (bool, error) {
+	journal := strings.TrimSpace(service.Annotations[annotationNodeLoadBalancerRebuildingAssigned])
+	if journal == "" {
+		// The assignments at the start were not recorded (none, or too many to
+		// keep): nothing proves that no detach was read back, so do not cancel.
+		return true, nil
+	}
+	firewalls, err := c.serviceFirewallsForEmergencyDetach(ctx, service)
+	if err != nil {
+		return false, err
+	}
+	byUUID := make(map[string]inspace.Firewall, len(firewalls))
+	for _, firewall := range firewalls {
+		byUUID[firewall.UUID] = firewall
+	}
+	for _, pair := range strings.Split(journal, ",") {
+		firewallUUID, vmUUID, found := strings.Cut(pair, "/")
+		if !found {
+			continue
+		}
+		firewall, exists := byUUID[firewallUUID]
+		if !exists || !firewallAssignedToVM(firewall, vmUUID) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// cancelPublicNodeLocalRebuild ends a rebuild that has not taken anything from
+// the edge: the marker and the detach journal go, and the Service returns to
+// normal convergence. A detach that was dispatched and lands later is an
+// unassigned VM of a published node, which the normal add step assigns again.
+func (c *nodeLoadBalancerController) cancelPublicNodeLocalRebuild(ctx context.Context, service *corev1.Service) error {
+	_, _, err := c.updateExactParentService(ctx, service, func(copy *corev1.Service) (bool, error) {
+		if copy.Annotations[annotationNodeLoadBalancerAllowRebuild] != "" {
+			return false, errors.New("public-node-local: the escape hatch was set again before the rebuild was cancelled")
+		}
+		for _, key := range []string{
+			annotationNodeLoadBalancerRebuilding,
+			annotationNodeLoadBalancerRebuildingAssigned,
+			annotationNodeLoadBalancerWithdrawFWDetach,
+			annotationNodeLoadBalancerWithdrawFWDetachAt,
+			annotationNodeLoadBalancerWithdrawFWAbsent,
+			annotationNodeLoadBalancerWithdrawFWChecked,
+			annotationNodeLoadBalancerWithdrawFWMissing,
+		} {
+			delete(copy.Annotations, key)
+		}
+		return true, nil
+	})
+	return err
 }
