@@ -82,7 +82,7 @@
     "ccm": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["enabled", "nodeLoadBalancer", "replicaCount", "image", "serviceAccount", "priorityClassName", "hostNetwork", "dnsPolicy", "podAnnotations", "podLabels", "nodeSelector", "tolerations", "affinity", "resources", "extraArgs", "extraEnv"],
+      "required": ["enabled", "nodeLoadBalancer", "replicaCount", "image", "serviceAccount", "priorityClassName", "hostNetwork", "dnsPolicy", "podAnnotations", "podLabels", "nodeSelector", "tolerations", "affinity", "antiAffinity", "livenessProbe", "podDisruptionBudget", "resources", "extraArgs", "extraEnv"],
       "properties": {
         "enabled": {"type": "boolean"},
         "nodeLoadBalancer": {
@@ -105,6 +105,28 @@
         "nodeSelector": {"$ref": "#/definitions/stringMap"},
         "tolerations": {"$ref": "#/definitions/objectArray"},
         "affinity": {"type": "object"},
+        "antiAffinity": {"type": "string", "enum": ["required", "preferred", "none"]},
+        "livenessProbe": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["enabled", "initialDelaySeconds", "periodSeconds", "timeoutSeconds", "failureThreshold"],
+          "properties": {
+            "enabled": {"type": "boolean"},
+            "initialDelaySeconds": {"type": "integer", "minimum": 0},
+            "periodSeconds": {"type": "integer", "minimum": 1},
+            "timeoutSeconds": {"type": "integer", "minimum": 1},
+            "failureThreshold": {"type": "integer", "minimum": 1}
+          }
+        },
+        "podDisruptionBudget": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["enabled", "maxUnavailable"],
+          "properties": {
+            "enabled": {"type": "boolean"},
+            "maxUnavailable": {"type": "integer", "minimum": 1}
+          }
+        },
         "resources": {"$ref": "#/definitions/resources"},
         "extraArgs": {"type": "array", "items": {"type": "string"}},
         "extraEnv": {"$ref": "#/definitions/objectArray"}

@@ -64,7 +64,23 @@ ccm:
     - key: node.kubernetes.io/not-ready
       operator: Exists
       effect: NoSchedule
+  # Keeps the two hostNetwork replicas on different nodes (they would collide
+  # on port 10258). required | preferred | none. A non-empty `affinity` below
+  # replaces it.
+  antiAffinity: required
   affinity: {}
+  # /healthz on the secure port 10258 (always allowed without authz). Slow on
+  # purpose: only a wedged process should be restarted, not a busy one.
+  livenessProbe:
+    enabled: true
+    initialDelaySeconds: 30
+    periodSeconds: 20
+    timeoutSeconds: 10
+    failureThreshold: 6
+  # Only rendered with more than one replica.
+  podDisruptionBudget:
+    enabled: true
+    maxUnavailable: 1
   resources:
     requests:
       cpu: 100m

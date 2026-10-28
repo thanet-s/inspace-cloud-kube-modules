@@ -126,6 +126,14 @@ do not conflict. A conflict automatically creates another shard. The optional
 own FIP, so values above one publish multiple addresses rather than one virtual
 IP.
 
+The CCM runs two `hostNetwork` replicas that each bind port 10258. By default
+the chart keeps them on different nodes (`ccm.antiAffinity: required`), replaces
+pods in place (`maxSurge: 0`, `maxUnavailable: 1`), restarts a wedged process
+through a slow `/healthz` liveness probe (`ccm.livenessProbe`), and renders a
+PodDisruptionBudget with `maxUnavailable: 1` when `ccm.replicaCount` is above
+one (`ccm.podDisruptionBudget`). A non-empty `ccm.affinity` replaces the
+generated anti-affinity.
+
 Dedicated mode always creates a separate shard and supports an exact catalog
 shape through Service annotations:
 

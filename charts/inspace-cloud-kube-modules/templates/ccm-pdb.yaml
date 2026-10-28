@@ -1,0 +1,15 @@
+{{- if and .Values.ccm.enabled .Values.ccm.podDisruptionBudget.enabled (gt (int .Values.ccm.replicaCount) 1) }}
+{{- $component := "ccm" }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "inspace.componentName" (dict "root" . "component" $component) }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "inspace.componentLabels" (dict "root" . "component" $component) | nindent 4 }}
+spec:
+  maxUnavailable: {{ .Values.ccm.podDisruptionBudget.maxUnavailable }}
+  selector:
+    matchLabels:
+      {{- include "inspace.selectorLabels" (dict "root" . "component" $component) | nindent 6 }}
+{{- end }}
