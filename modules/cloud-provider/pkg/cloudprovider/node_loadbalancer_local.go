@@ -624,6 +624,9 @@ type publicNodeLocalNodeVerdict struct {
 	// nodeObject marks a Gone verdict that rests on the Node object itself (its
 	// labels), not only on a cloud answer.
 	nodeObject bool
+	// foreign marks a Gone verdict for a VM of another billing account or VPC.
+	// The relation fence never touches such a VM.
+	foreign bool
 }
 
 func publicNodeLocalNodeIs(kind publicNodeLocalNodeKind, reason string) publicNodeLocalNodeVerdict {
@@ -643,6 +646,9 @@ type publicNodeLocalNodeSet struct {
 	// NodeEvidence names the Gone entries that rest on the Node object itself
 	// (deleted, excluded, left the pool, absent), not only on a cloud answer.
 	NodeEvidence map[string]struct{}
+	// Foreign names the Gone Nodes whose VM belongs to another billing account or
+	// VPC. The relation fence refuses to detach a firewall from such a VM.
+	Foreign map[string]struct{}
 	// Nodes holds every listed Node by name, so callers can resolve identities.
 	Nodes map[string]*corev1.Node
 	// PoolOf names the pool that authorized each Ready Node. During a union it
@@ -729,6 +735,7 @@ func (c *nodeLoadBalancerController) classifyPublicNodeLocalNodesPools(
 		EndpointMissing: map[string]nodeLoadBalancerAddress{},
 		NotEligible:     map[string]string{},
 		NodeEvidence:    map[string]struct{}{},
+		Foreign:         map[string]struct{}{},
 		Nodes:           map[string]*corev1.Node{},
 	}
 	readyEndpoints, err := c.publicNodeLocalReadyEndpointNodes(service)
@@ -778,6 +785,9 @@ func (c *nodeLoadBalancerController) classifyPublicNodeLocalNodesPools(
 			set.Gone[node.Name] = verdict.reason
 			if verdict.nodeObject {
 				set.NodeEvidence[node.Name] = struct{}{}
+			}
+			if verdict.foreign {
+				set.Foreign[node.Name] = struct{}{}
 			}
 			continue
 		case publicNodeLocalNodeNotEligible:
@@ -932,10 +942,11 @@ func (c *nodeLoadBalancerController) authorizePublicNodeLocalNodeAcrossPools(
 	var best publicNodeLocalNodeVerdict
 	var bestErr error
 	bestPool := ""
-	anyPatched, allNodeObject := false, true
+	anyPatched, allNodeObject, anyForeign := false, true, false
 	for index, pool := range pools {
 		verdict, patched, err := c.authorizePublicNodeLocalNodeVerdict(ctx, node, pool, subject)
 		anyPatched = anyPatched || patched
+		anyForeign = anyForeign || verdict.foreign
 		if verdict.kind == publicNodeLocalNodeGone && !verdict.nodeObject {
 			allNodeObject = false
 		}
@@ -945,6 +956,7 @@ func (c *nodeLoadBalancerController) authorizePublicNodeLocalNodeAcrossPools(
 	}
 	if best.kind == publicNodeLocalNodeGone {
 		best.nodeObject = allNodeObject
+		best.foreign = anyForeign
 	}
 	return best, bestPool, anyPatched, bestErr
 }
@@ -1004,10 +1016,14 @@ func (c *nodeLoadBalancerController) authorizePublicNodeLocalNodeVerdict(
 		return gone("the VM is deleted")
 	}
 	if vm.BillingAccountID != c.provider.config.BillingAccountID {
-		return gone("the VM belongs to another billing account")
+		verdict, patched, err := gone("the VM belongs to another billing account")
+		verdict.foreign = true
+		return verdict, patched, err
 	}
 	if vm.NetworkUUID != "" && !strings.EqualFold(vm.NetworkUUID, c.provider.config.NetworkUUID) {
-		return gone("the VM is outside the configured VPC")
+		verdict, patched, err := gone("the VM is outside the configured VPC")
+		verdict.foreign = true
+		return verdict, patched, err
 	}
 	network, err := c.provider.api.GetNetwork(ctx, providerIdentity.Location, c.provider.config.NetworkUUID)
 	if err != nil {

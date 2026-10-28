@@ -25,6 +25,8 @@ const (
 	publicNodeLocalReasonNoReadyEndpoints = "PublicNodeLocalNoReadyEndpoints"
 
 	publicNodeLocalReasonAwaitingConfirmation = "PublicNodeLocalAwaitingConfirmation"
+
+	publicNodeLocalReasonForeignAccountFirewall = "PublicNodeLocalForeignAccountFirewall"
 )
 
 // unverifiedCauses joins why Nodes could not be verified, in Node name order, so
@@ -467,6 +469,35 @@ func (c *nodeLoadBalancerController) convergeActivePublicNodeLocal(
 			if member.vmUUID != "" {
 				keepNodes = append(keepNodes, member.node)
 				keepVMSet[member.vmUUID] = struct{}{}
+			}
+		}
+		// The relation fence never touches a VM of another billing account or VPC,
+		// so such a VM can not be detached and must not hold the sequence: it is
+		// left out of the detach plan, and the operator is told.
+		foreignNames := make([]string, 0)
+		for name := range nodes.Foreign {
+			member, known := members[name]
+			if !known || member.vmUUID == "" {
+				continue
+			}
+			if _, kept := keepVMSet[member.vmUUID]; kept {
+				continue
+			}
+			keepNodes = append(keepNodes, member.node)
+			keepVMSet[member.vmUUID] = struct{}{}
+			foreignNames = append(foreignNames, name)
+		}
+		sort.Strings(foreignNames)
+		for _, leaving := range []*inspace.Firewall{firewall, previousFirewall} {
+			if leaving == nil {
+				continue
+			}
+			for _, name := range foreignNames {
+				if firewallAssignedToVM(*leaving, members[name].vmUUID) {
+					c.recordPublicNodeLocalEvent(ctx, service, publicNodeLocalReasonForeignAccountFirewall, fmt.Errorf(
+						"public-node-local: Node %s runs on a VM of another billing account or VPC; Service firewall %s stays assigned to it and needs an operator",
+						name, leaving.UUID))
+				}
 			}
 		}
 		// The current firewall and, while one is left over, the previous one: a

@@ -95,8 +95,9 @@ func TestPublicNodeLocalVerifiedIneligiblePublishedNodeIsRemoved(t *testing.T) {
 	tests := []struct {
 		name   string
 		mutate func(*testing.T, *publicNodeLocalTransientFixture)
-		// foreign leaves only the public FIP to remove: the relation fence never
-		// touches a VM of another billing account.
+		// foreign: the relation fence never touches a VM of another billing account.
+		// Its FIP and child VIP leave, its firewall stays attached, and an Event
+		// tells the operator; the pass is not held by it.
 		foreign bool
 	}{
 		{name: "excluded from load balancers", mutate: func(t *testing.T, f *publicNodeLocalTransientFixture) {
@@ -122,21 +123,27 @@ func TestPublicNodeLocalVerifiedIneligiblePublishedNodeIsRemoved(t *testing.T) {
 			done := false
 			for pass := 0; pass < 40 && !done; pass++ {
 				err := f.controller.syncPublicNodeLocal(f.ctx, f.key, f.current(t))
-				var holding *errPublicNodeLocalHolding
-				if err != nil && !(test.foreign && errors.As(err, &holding)) {
+				if err != nil {
 					t.Fatalf("pass %d: %v", pass, err)
 				}
 				observed := observePublicNodeLocal(t, f)
 				if !observed.fips[pub1] || !observed.vips[priv1] {
 					t.Fatalf("pass %d: the remaining node left the edge: %#v", pass, observed)
 				}
-				done = !observed.fips[pub2]
+				done = !observed.fips[pub2] && !observed.vips[priv2]
 				if !test.foreign {
-					done = done && !observed.vips[priv2] && !observed.assigned[vm2]
+					done = done && !observed.assigned[vm2]
 				}
 			}
 			if !done {
 				t.Fatalf("the ineligible published node stayed on the edge: %#v", observePublicNodeLocal(t, f))
+			}
+			if test.foreign {
+				requirePublicNodeLocalEvent(t, f, "PublicNodeLocalForeignAccountFirewall")
+				// The pass is free again: it ends without a hold.
+				if err := f.controller.syncPublicNodeLocal(f.ctx, f.key, f.current(t)); err != nil {
+					t.Fatalf("a settled pass still holds: %v", err)
+				}
 			}
 		})
 	}
