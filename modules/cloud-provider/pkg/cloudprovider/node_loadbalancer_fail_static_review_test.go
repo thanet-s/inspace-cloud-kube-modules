@@ -394,3 +394,88 @@ func TestPublicNodeLocalFullWithdrawConfirmationResetsWhenNodesReturn(t *testing
 		t.Fatalf("an earlier observation counted after the member list recovered: %d FIPs", got)
 	}
 }
+
+// Publishing a FIP on a serving Service is gated like the bootstrap: after the
+// status write the VIP and the firewall assignment of the added VM are read
+// back. A failed readback must not leave the new FIP published.
+func TestPublicNodeLocalActivePublishReadsBackVIPAndAssignment(t *testing.T) {
+	tests := []struct {
+		name    string
+		onWrite func(*testing.T, *publicNodeLocalTransientFixture, *kubefake.Clientset)
+	}{
+		{name: "child VIP missing after the write", onWrite: func(t *testing.T, f *publicNodeLocalTransientFixture, kube *kubefake.Clientset) {
+			child := trackedPublicNodeLocalDatapath(t, f)
+			_, _, priv2, _ := publicNodeLocalFixtureNode(1)
+			kept := child.Status.LoadBalancer.Ingress[:0:0]
+			for _, ingress := range child.Status.LoadBalancer.Ingress {
+				if ingress.IP != priv2 {
+					kept = append(kept, ingress)
+				}
+			}
+			child.Status.LoadBalancer.Ingress = kept
+			if err := kube.Tracker().Update(corev1.SchemeGroupVersion.WithResource("services"), child, child.Namespace); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "firewall assignment missing after the write", onWrite: func(t *testing.T, f *publicNodeLocalTransientFixture, _ *kubefake.Clientset) {
+			_, vm2, _, _ := publicNodeLocalFixtureNode(1)
+			for index := range f.api.firewalls {
+				resources := f.api.firewalls[index].ResourcesAssigned[:0:0]
+				for _, resource := range f.api.firewalls[index].ResourcesAssigned {
+					if resource.ResourceUUID != vm2 {
+						resources = append(resources, resource)
+					}
+				}
+				f.api.firewalls[index].ResourcesAssigned = resources
+			}
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			f := newPublishedPublicNodeLocalFixtureN(t, 1)
+			kube := f.provider.kubeClient.(*kubefake.Clientset)
+			f.addNode(t, 1)
+			_, _, _, pub1 := publicNodeLocalFixtureNode(0)
+			_, _, _, pub2 := publicNodeLocalFixtureNode(1)
+			armed := false
+			kube.PrependReactor("update", "services", func(action k8stesting.Action) (bool, runtime.Object, error) {
+				update := action.(k8stesting.UpdateAction)
+				if update.GetSubresource() != "status" || update.GetObject().(*corev1.Service).Name != f.service.Name {
+					return false, nil, nil
+				}
+				// Let the write through first, then break the proof it relied on.
+				object := update.GetObject()
+				if err := kube.Tracker().Update(update.GetResource(), object, update.GetNamespace()); err != nil {
+					return true, nil, err
+				}
+				if !armed {
+					armed = true
+					test.onWrite(t, f, kube)
+				}
+				return true, object, nil
+			})
+			sawGateFailure := false
+			for pass := 0; pass < 40; pass++ {
+				err := f.controller.syncPublicNodeLocal(f.ctx, f.key, f.current(t))
+				var holding *errPublicNodeLocalHolding
+				if err != nil && !errors.As(err, &holding) {
+					t.Fatalf("pass %d: %v", pass, err)
+				}
+				if armed {
+					if err == nil {
+						t.Fatalf("pass %d: the failed readback was not reported", pass)
+					}
+					sawGateFailure = true
+					break
+				}
+			}
+			if !sawGateFailure {
+				t.Fatal("the FIP was never published, so the gate never ran")
+			}
+			status := f.current(t).Status.LoadBalancer.Ingress
+			if len(status) != 1 || status[0].IP != pub1 {
+				t.Fatalf("the unproven FIP %s stayed published: %#v", pub2, status)
+			}
+		})
+	}
+}

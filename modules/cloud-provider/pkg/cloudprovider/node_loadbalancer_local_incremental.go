@@ -513,6 +513,15 @@ func (c *nodeLoadBalancerController) convergeActivePublicNodeLocal(
 		if err := c.publishActivePublicNodeLocalStatus(ctx, service, intent, desired, firewall.UUID, publicNodeLocalOrderedStatus(next, nil, true)); err != nil {
 			return c.holdOrFailPublicNodeLocal(ctx, service, err)
 		}
+		if err := c.verifyActivePublicNodeLocalPublication(ctx, service, intent, desired, firewall.UUID, addFIP); err != nil {
+			if inspace.IsTransient(err) {
+				return c.holdOrFailPublicNodeLocal(ctx, service, err)
+			}
+			// The proof behind the new FIPs is gone, so take them back. The
+			// FIPs that were already serving stay.
+			rollbackErr := c.publishActivePublicNodeLocalStatus(ctx, service, intent, desired, firewall.UUID, publicNodeLocalOrderedStatus(fips, nil, true))
+			return c.holdOrFailPublicNodeLocal(ctx, service, errors.Join(err, rollbackErr))
+		}
 		// The adds are complete, so the assignment intent ends with them.
 		if publicNodeLocalAssignmentFencePresent(service) {
 			if err := c.clearActivePublicNodeLocalAssignmentIntent(ctx, service, intent, desired, firewall.UUID); err != nil {
@@ -763,4 +772,84 @@ func (c *nodeLoadBalancerController) clearAllGone(uid string) {
 	c.endpointGoneMu.Lock()
 	defer c.endpointGoneMu.Unlock()
 	delete(c.allGoneSince, uid)
+}
+
+// verifyActivePublicNodeLocalPublication is the post-write gate of an add on a
+// serving Service, in the spirit of validatePublicNodeLocalPublicationState:
+// the parent status carries the new FIPs, and the child VIP, the firewall
+// assignment and the Node proof of every added VM read back exactly.
+func (c *nodeLoadBalancerController) verifyActivePublicNodeLocalPublication(
+	ctx context.Context,
+	service *corev1.Service,
+	intent nodeLoadBalancerIntent,
+	desired desiredNodeLoadBalancerFirewall,
+	firewallUUID string,
+	added []nodeLoadBalancerAddress,
+) error {
+	current, err := c.activePublicNodeLocalContract(ctx, service, intent, desired, firewallUUID)
+	if err != nil {
+		return err
+	}
+	published := publicNodeLocalIngressSet(current.Status.LoadBalancer)
+	datapath, err := c.provider.kubeClient.CoreV1().Services(current.Namespace).Get(
+		ctx, nodeLoadBalancerDatapathName(current), metav1.GetOptions{},
+	)
+	if err != nil {
+		return fmt.Errorf("public-node-local: read private datapath after publication: %w", err)
+	}
+	if !publicNodeLocalDatapathMatches(datapath, current, intent.Pool) {
+		return errors.New("public-node-local: private datapath spec changed after publication")
+	}
+	vips := publicNodeLocalIngressSet(datapath.Status.LoadBalancer)
+	owned, err := c.ownedServiceFirewalls(ctx, current)
+	if err != nil {
+		return err
+	}
+	var assigned map[string]struct{}
+	for index := range owned {
+		if owned[index].UUID == firewallUUID {
+			assignments, assignErr := nodeLoadBalancerFirewallVMAssignments(owned[index])
+			if assignErr != nil {
+				return assignErr
+			}
+			assigned = make(map[string]struct{}, len(assignments))
+			for vmUUID := range assignments {
+				assigned[vmUUID] = struct{}{}
+			}
+		}
+	}
+	if assigned == nil {
+		return fmt.Errorf("public-node-local: Service firewall %s is absent after publication", firewallUUID)
+	}
+	nodes, patched, err := c.classifyPublicNodeLocalNodes(ctx, current, intent)
+	if err != nil {
+		return err
+	}
+	if patched {
+		return errors.New("public-node-local Node authority changed after publication")
+	}
+	ready := map[string]nodeLoadBalancerAddress{}
+	for _, address := range nodes.Ready {
+		ready[address.Node.Name] = address
+	}
+	for _, address := range added {
+		vmUUID, _ := nodeLoadBalancerVMUUID(address.Node)
+		if _, ok := published[address.PublicIPv4]; !ok {
+			return fmt.Errorf("public-node-local: FIP %s did not read back in the parent status", address.PublicIPv4)
+		}
+		if _, ok := vips[address.PrivateIPv4]; !ok {
+			return fmt.Errorf("public-node-local: VIP %s of VM %s is absent after publication", address.PrivateIPv4, vmUUID)
+		}
+		if _, ok := assigned[vmUUID]; !ok {
+			return fmt.Errorf("public-node-local: VM %s has no Service firewall after publication", vmUUID)
+		}
+		verified, ok := ready[address.Node.Name]
+		if !ok || !reflect.DeepEqual(
+			publicNodeLocalAddressIdentities([]nodeLoadBalancerAddress{verified}),
+			publicNodeLocalAddressIdentities([]nodeLoadBalancerAddress{address}),
+		) {
+			return fmt.Errorf("public-node-local: Node %s is no longer a verified endpoint after publication", address.Node.Name)
+		}
+	}
+	return nil
 }
