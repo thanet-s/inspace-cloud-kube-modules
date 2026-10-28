@@ -316,6 +316,34 @@ func (c *nodeLoadBalancerController) convergeActivePublicNodeLocal(
 		c.queue.AddAfter(key, nextCheck)
 	}
 
+	// A recreated or class-repaired child lost its VIPs. Every kept and published
+	// Node gets its VIP back first, Ready or not, so the FIP, the firewall and
+	// the VIP of each published Node stay consistent before anything else moves.
+	restoreVIPs := map[string]struct{}{}
+	for name := range keep {
+		member := members[name]
+		if member.private == "" || !published(name) {
+			continue
+		}
+		if _, has := vips[member.private]; !has {
+			restoreVIPs[member.private] = struct{}{}
+		}
+	}
+	if len(restoreVIPs) != 0 {
+		next := map[string]struct{}{}
+		for ip := range vips {
+			next[ip] = struct{}{}
+		}
+		for ip := range restoreVIPs {
+			next[ip] = struct{}{}
+		}
+		if _, _, err := c.ensurePublicNodeLocalDatapathStatus(ctx, service, datapath, intent.Pool, publicNodeLocalOrderedStatus(next, publicOfPrivate, false)); err != nil {
+			return c.holdOrFailPublicNodeLocal(ctx, service, err)
+		}
+		c.requeuePublicNodeLocal(key)
+		return nil
+	}
+
 	// Adds first: child VIP, then the firewall, then the FIP.
 	var addVIP, addAssign, addFIP []nodeLoadBalancerAddress
 	for _, address := range nodes.Ready {

@@ -3,6 +3,7 @@ package cloudprovider
 import (
 	"context"
 	"errors"
+	"reflect"
 	"testing"
 	"time"
 
@@ -208,5 +209,73 @@ func TestPublicNodeLocalGraceRestartsWhenAnEndpointReturns(t *testing.T) {
 	run(20)
 	if observed := observePublicNodeLocal(t, f); observed.fips[pub2] || observed.fips[pub3] || !observed.fips[pub1] {
 		t.Fatalf("the Nodes without an endpoint stayed after the grace: %#v", observed)
+	}
+}
+
+// After the child is recreated or its class is repaired, every kept and
+// published Node gets its VIP back, whether or not it is Ready right now.
+func TestPublicNodeLocalChildRepairRestoresVIPsOfEveryKeptNode(t *testing.T) {
+	_, vm2, _, _ := publicNodeLocalFixtureNode(1)
+	tests := []struct {
+		name  string
+		setup func(*testing.T, *publicNodeLocalTransientFixture)
+	}{
+		{name: "zero Ready endpoints", setup: func(t *testing.T, f *publicNodeLocalTransientFixture) { f.setEndpoints(t) }},
+		{name: "one endpoint missing", setup: func(t *testing.T, f *publicNodeLocalTransientFixture) { f.setEndpoints(t, "edge-0") }},
+		{name: "one Node unverified", setup: func(_ *testing.T, f *publicNodeLocalTransientFixture) {
+			f.provider.api = &vmGetErrorAPI{
+				publicNodeLocalFilteringIPAPI: &publicNodeLocalFilteringIPAPI{fakeAPI: f.api},
+				badVM:                         vm2, err: errors.New("canonical ownership read failed"),
+			}
+		}},
+	}
+	for _, repair := range []string{"child deleted", "child class drift"} {
+		for _, test := range tests {
+			t.Run(repair+"/"+test.name, func(t *testing.T) {
+				f := newPublishedPublicNodeLocalFixtureN(t, 2)
+				_, _, priv1, _ := publicNodeLocalFixtureNode(0)
+				_, _, priv2, _ := publicNodeLocalFixtureNode(1)
+				test.setup(t, f)
+				childName := nodeLoadBalancerDatapathName(f.service)
+				if repair == "child deleted" {
+					if err := f.provider.kubeClient.CoreV1().Services(f.service.Namespace).Delete(f.ctx, childName, metav1.DeleteOptions{}); err != nil {
+						t.Fatal(err)
+					}
+				} else {
+					drifted := trackedPublicNodeLocalDatapath(t, f)
+					// A real apiserver assigns the UID that the replacement is fenced on.
+					drifted.UID = "child-datapath-uid"
+					other := "example.com/other"
+					drifted.Spec.LoadBalancerClass = &other
+					if _, err := f.provider.kubeClient.CoreV1().Services(drifted.Namespace).Update(f.ctx, drifted, metav1.UpdateOptions{}); err != nil {
+						t.Fatal(err)
+					}
+				}
+				parentBefore := f.current(t)
+				restored := false
+				for pass := 0; pass < 20 && !restored; pass++ {
+					err := f.controller.syncPublicNodeLocal(f.ctx, f.key, f.current(t))
+					var holding *errPublicNodeLocalHolding
+					if err != nil && !errors.As(err, &holding) {
+						t.Fatalf("pass %d: %v", pass, err)
+					}
+					if !reflect.DeepEqual(f.current(t).Status, parentBefore.Status) {
+						t.Fatalf("pass %d: the parent FIPs changed: %#v", pass, f.current(t).Status)
+					}
+					if len(f.api.unassignedFirewalls) != 0 {
+						t.Fatalf("pass %d: a firewall was detached: %v", pass, f.api.unassignedFirewalls)
+					}
+					if child := trackedPublicNodeLocalDatapathOrNil(f); child != nil {
+						restored = len(child.Status.LoadBalancer.Ingress) == 2
+						if restored && (!observePublicNodeLocal(t, f).vips[priv1] || !observePublicNodeLocal(t, f).vips[priv2]) {
+							t.Fatalf("pass %d: the wrong VIPs were restored: %#v", pass, child.Status.LoadBalancer)
+						}
+					}
+				}
+				if !restored {
+					t.Fatalf("the VIPs of the kept nodes were not restored: %#v", observePublicNodeLocal(t, f))
+				}
+			})
+		}
 	}
 }
