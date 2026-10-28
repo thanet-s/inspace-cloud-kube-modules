@@ -2073,3 +2073,96 @@ func TestPublicNodeLocalUnionStillRemovesNodeWithoutEndpointAfterGrace(t *testin
 		t.Fatal("the union ended")
 	}
 }
+
+// shapePublicNodeLocalNamedPorts is the shape of a real edge Service: container
+// ports that differ from the Service ports, a named one, and a UDP twin.
+func shapePublicNodeLocalNamedPorts(s *corev1.Service) {
+	s.Spec.Ports = []corev1.ServicePort{
+		{Name: "web", Protocol: corev1.ProtocolTCP, Port: 80, TargetPort: intstr.FromInt32(8000)},
+		{Name: "websecure", Protocol: corev1.ProtocolTCP, Port: 443, TargetPort: intstr.FromString("https")},
+		{Name: "http3", Protocol: corev1.ProtocolUDP, Port: 443, TargetPort: intstr.FromInt32(8443)},
+	}
+}
+
+func requireNamedTargetPortsKept(t *testing.T, child *corev1.Service) {
+	t.Helper()
+	want := map[string]intstr.IntOrString{
+		"TCP/80": intstr.FromInt32(8000), "TCP/443": intstr.FromString("https"), "UDP/443": intstr.FromInt32(8443),
+	}
+	for _, port := range child.Spec.Ports {
+		key := fmt.Sprintf("%s/%d", port.Protocol, port.Port)
+		expected, tracked := want[key]
+		if !tracked {
+			continue
+		}
+		if port.TargetPort != expected {
+			t.Fatalf("port %s has target port %v, want %v", key, port.TargetPort, expected)
+		}
+		delete(want, key)
+	}
+	if len(want) != 0 {
+		t.Fatalf("ports missing from the rebuilt child: %v (child ports %v)", want, child.Spec.Ports)
+	}
+}
+
+// A child rebuilt while a new port is held back keeps the real target ports of
+// the Service, named or numbered, not the Service port numbers.
+func TestPublicNodeLocalHeldRebuildKeepsNamedTargetPorts(t *testing.T) {
+	f := newPublishedPublicNodeLocalFixtureWith(t, 1, shapePublicNodeLocalNamedPorts)
+	addPublicNodeLocalFixturePeer(t, f, "peer", "peer-uid", "edge", 9000)
+	updatePublicNodeLocalFixtureService(t, f, func(s *corev1.Service) {
+		s.Spec.Ports = append(s.Spec.Ports, corev1.ServicePort{Name: "extra", Protocol: corev1.ProtocolTCP, Port: 9000, TargetPort: intstr.FromInt32(9000)})
+	})
+	stepPublicNodeLocal(t, f, 0)
+	requirePublicNodeLocalEvent(t, f, "PublicNodeLocalTransitionRefused")
+	deletePublicNodeLocalFixtureChild(t, f)
+	requireChildAndVIPsRestored(t, f, 1, 80, 443)
+	requireNamedTargetPortsKept(t, trackedPublicNodeLocalDatapath(t, f))
+}
+
+// A port that the change drops stays in the child until its firewall is gone;
+// a child lost meanwhile comes back with that port's real target port.
+func TestPublicNodeLocalUnionRebuildKeepsNamedTargetPortsOfDroppedPort(t *testing.T) {
+	f := newPublishedPublicNodeLocalFixtureWith(t, 1, shapePublicNodeLocalNamedPorts)
+	old := f.current(t).Annotations[annotationNodeLoadBalancerFirewallUUID]
+	updatePublicNodeLocalFixtureService(t, f, func(s *corev1.Service) {
+		s.Spec.Ports = []corev1.ServicePort{
+			{Name: "websecure", Protocol: corev1.ProtocolTCP, Port: 443, TargetPort: intstr.FromString("https")},
+			{Name: "http3", Protocol: corev1.ProtocolUDP, Port: 443, TargetPort: intstr.FromInt32(8443)},
+		}
+	})
+	for pass := 0; pass < 80; pass++ {
+		stepPublicNodeLocal(t, f, pass)
+		current := f.current(t)
+		if current.Annotations[annotationPublicNodeLocalTargetPolicy] != "" && current.Annotations[annotationNodeLoadBalancerFirewallUUID] != old {
+			break
+		}
+	}
+	if f.current(t).Annotations[annotationPublicNodeLocalTargetPolicy] == "" {
+		t.Fatal("the union never started")
+	}
+	deletePublicNodeLocalFixtureChild(t, f)
+	requireChildAndVIPsRestored(t, f, 1, 80, 443)
+	requireNamedTargetPortsKept(t, trackedPublicNodeLocalDatapath(t, f))
+}
+
+func TestPublicNodeLocalActivePortsRoundTripAndBound(t *testing.T) {
+	ports := []corev1.ServicePort{
+		{Name: "web", Protocol: corev1.ProtocolTCP, Port: 80, TargetPort: intstr.FromInt32(8000)},
+		{Name: "websecure", Protocol: corev1.ProtocolTCP, Port: 443, TargetPort: intstr.FromString("https")},
+		{Name: "http3", Port: 443, Protocol: corev1.ProtocolUDP, TargetPort: intstr.FromInt32(8443)},
+	}
+	service := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{
+		annotationPublicNodeLocalActivePorts: encodePublicNodeLocalActivePorts(ports),
+	}}}
+	if got := publicNodeLocalActivePorts(service); !reflect.DeepEqual(got, ports) {
+		t.Fatalf("round trip = %#v", got)
+	}
+	var many []corev1.ServicePort
+	for port := int32(1); port <= 400; port++ {
+		many = append(many, corev1.ServicePort{Name: fmt.Sprintf("port-%d", port), Protocol: corev1.ProtocolTCP, Port: port, TargetPort: intstr.FromInt32(port)})
+	}
+	if encoded := encodePublicNodeLocalActivePorts(many); encoded != "" {
+		t.Fatalf("an oversized record was kept: %d bytes", len(encoded))
+	}
+}

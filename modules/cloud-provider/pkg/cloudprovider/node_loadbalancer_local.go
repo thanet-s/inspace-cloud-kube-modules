@@ -136,6 +136,16 @@ func (c *nodeLoadBalancerController) syncPublicNodeLocalPass(
 		// detach journal and unassign receipt behind a half-closed edge.
 		return c.withdrawAndRequeuePublicNodeLocal(ctx, key, service)
 	}
+	if activePool != "" && activePool == intent.Pool && activePolicy == desiredFirewall.Hash &&
+		service.Annotations[annotationPublicNodeLocalTargetPool] == "" {
+		// The pass goes on with the updated Service: recording the ports is not a
+		// change of the edge.
+		recorded, backfillErr := c.backfillPublicNodeLocalActivePorts(ctx, service)
+		if backfillErr != nil {
+			return c.holdOrFailPublicNodeLocal(ctx, service, backfillErr)
+		}
+		service = recorded
+	}
 	if activePool != "" {
 		state, stateErr := publicNodeLocalTransition(service)
 		if stateErr != nil {
@@ -2413,6 +2423,7 @@ func (c *nodeLoadBalancerController) ensurePublicNodeLocalActivation(
 		}
 		copy.Annotations[annotationPublicNodeLocalActivePool] = pool
 		copy.Annotations[annotationPublicNodeLocalActivePolicy] = policy
+		setPublicNodeLocalActivePorts(copy)
 		return true, nil
 	})
 	return changed, err
@@ -2534,6 +2545,7 @@ func (c *nodeLoadBalancerController) clearPublicNodeLocalActivation(ctx context.
 			annotationPublicNodeLocalActivePolicy,
 			annotationPublicNodeLocalTargetPool,
 			annotationPublicNodeLocalTargetPolicy,
+			annotationPublicNodeLocalActivePorts,
 			annotationNodeLoadBalancerRebuilding,
 			annotationNodeLoadBalancerFirewallAssigning,
 			annotationNodeLoadBalancerFirewallAssignAt,

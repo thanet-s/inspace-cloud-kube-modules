@@ -2,6 +2,7 @@ package cloudprovider
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
@@ -529,6 +530,7 @@ func (c *nodeLoadBalancerController) promotePublicNodeLocalTransition(
 		}
 		copy.Annotations[annotationPublicNodeLocalActivePool] = targetPool
 		copy.Annotations[annotationPublicNodeLocalActivePolicy] = targetPolicy
+		setPublicNodeLocalActivePorts(copy)
 		delete(copy.Annotations, annotationPublicNodeLocalTargetPool)
 		delete(copy.Annotations, annotationPublicNodeLocalTargetPolicy)
 		return true, nil
@@ -643,6 +645,7 @@ func (c *nodeLoadBalancerController) publicNodeLocalChildFromActiveFirewall(
 			continue
 		}
 		child := &corev1.Service{}
+		recordedPorts := publicNodeLocalActivePorts(service)
 		anySource := false
 		sources := map[string]struct{}{}
 		for _, rule := range owned[index].Rules {
@@ -655,10 +658,17 @@ func (c *nodeLoadBalancerController) publicNodeLocalChildFromActiveFirewall(
 			} else if !strings.EqualFold(rule.Protocol, "tcp") {
 				continue
 			}
-			child.Spec.Ports = append(child.Spec.Ports, corev1.ServicePort{
+			port := corev1.ServicePort{
 				Name: fmt.Sprintf("t-%s-%d", strings.ToLower(string(protocol)), *rule.PortStart), Protocol: protocol,
 				Port: *rule.PortStart, TargetPort: intstr.FromInt32(*rule.PortStart),
-			})
+			}
+			// The recorded active ports know the real name and target port.
+			for _, recorded := range recordedPorts {
+				if recorded.Port == port.Port && recorded.Protocol == protocol {
+					port = recorded
+				}
+			}
+			child.Spec.Ports = append(child.Spec.Ports, port)
 			if rule.EndpointSpecType != "ip_prefixes" {
 				anySource = true
 			}
@@ -719,4 +729,110 @@ func (c *nodeLoadBalancerController) createPublicNodeLocalDatapathHeld(
 		return fmt.Errorf("public-node-local: recreate the private datapath Service: %w", err)
 	}
 	return nil
+}
+
+const (
+	// annotationPublicNodeLocalActivePorts records the Service ports that the
+	// active exposure serves: name, protocol, port and target port. A child that
+	// is lost during a transition is rebuilt from it, because the Service spec
+	// already describes the target and the real target ports of a port that the
+	// change drops are not recoverable from anywhere else.
+	annotationPublicNodeLocalActivePorts = "service.inspace.cloud/public-node-local-active-ports"
+
+	// publicNodeLocalActivePortsMaxBytes bounds the annotation. A Service whose
+	// ports do not fit is rebuilt from the firewall alone, with the port number as
+	// target port.
+	publicNodeLocalActivePortsMaxBytes = 4096
+)
+
+type publicNodeLocalActivePort struct {
+	Name       string `json:"n,omitempty"`
+	Protocol   string `json:"pr"`
+	Port       int32  `json:"p"`
+	TargetInt  int32  `json:"ti,omitempty"`
+	TargetName string `json:"ts,omitempty"`
+}
+
+// encodePublicNodeLocalActivePorts returns the annotation value, or "" when the
+// ports do not fit the bound.
+func encodePublicNodeLocalActivePorts(ports []corev1.ServicePort) string {
+	records := make([]publicNodeLocalActivePort, 0, len(ports))
+	for _, port := range ports {
+		record := publicNodeLocalActivePort{Name: port.Name, Protocol: string(port.Protocol), Port: port.Port}
+		if record.Protocol == "" {
+			record.Protocol = string(corev1.ProtocolTCP)
+		}
+		if port.TargetPort.Type == intstr.String {
+			record.TargetName = port.TargetPort.StrVal
+		} else {
+			record.TargetInt = port.TargetPort.IntVal
+		}
+		records = append(records, record)
+	}
+	encoded, err := json.Marshal(records)
+	if err != nil || len(encoded) > publicNodeLocalActivePortsMaxBytes {
+		return ""
+	}
+	return string(encoded)
+}
+
+// publicNodeLocalActivePorts reads the recorded ports. A malformed value counts
+// as no record.
+func publicNodeLocalActivePorts(service *corev1.Service) []corev1.ServicePort {
+	raw := service.Annotations[annotationPublicNodeLocalActivePorts]
+	if raw == "" {
+		return nil
+	}
+	var records []publicNodeLocalActivePort
+	if err := json.Unmarshal([]byte(raw), &records); err != nil {
+		return nil
+	}
+	ports := make([]corev1.ServicePort, 0, len(records))
+	for _, record := range records {
+		port := corev1.ServicePort{Name: record.Name, Protocol: corev1.Protocol(record.Protocol), Port: record.Port}
+		if record.TargetName != "" {
+			port.TargetPort = intstr.FromString(record.TargetName)
+		} else {
+			port.TargetPort = intstr.FromInt32(record.TargetInt)
+		}
+		ports = append(ports, port)
+	}
+	return ports
+}
+
+// setPublicNodeLocalActivePorts records the ports of the spec as the active
+// ones, or drops a stale record that no longer fits.
+func setPublicNodeLocalActivePorts(copy *corev1.Service) bool {
+	encoded := encodePublicNodeLocalActivePorts(copy.Spec.Ports)
+	if copy.Annotations[annotationPublicNodeLocalActivePorts] == encoded {
+		return false
+	}
+	if copy.Annotations == nil {
+		copy.Annotations = map[string]string{}
+	}
+	if encoded == "" {
+		delete(copy.Annotations, annotationPublicNodeLocalActivePorts)
+	} else {
+		copy.Annotations[annotationPublicNodeLocalActivePorts] = encoded
+	}
+	return true
+}
+
+// backfillPublicNodeLocalActivePorts records the ports of a Service that was
+// activated before they were recorded. It only runs when the intent is the
+// active identity, so the spec is the active ports.
+func (c *nodeLoadBalancerController) backfillPublicNodeLocalActivePorts(ctx context.Context, service *corev1.Service) (*corev1.Service, error) {
+	if service.Annotations[annotationPublicNodeLocalActivePorts] != "" || encodePublicNodeLocalActivePorts(service.Spec.Ports) == "" {
+		return service, nil
+	}
+	updated, _, err := c.updateExactParentService(ctx, service, func(copy *corev1.Service) (bool, error) {
+		if copy.Annotations[annotationPublicNodeLocalActivePorts] != "" {
+			return false, nil
+		}
+		return setPublicNodeLocalActivePorts(copy), nil
+	})
+	if err != nil {
+		return service, err
+	}
+	return updated, nil
 }
