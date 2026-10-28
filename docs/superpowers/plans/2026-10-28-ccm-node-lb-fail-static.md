@@ -567,3 +567,20 @@ Left out on purpose:
   for the create); the old firewall of a policy change stays assigned from the promotion until the
   fence detaches it (two absence readbacks); the union classifies Nodes against both pools, so a
   Karpenter node in the other pool costs extra provider reads per pass.
+
+### 6.1 Review follow-ups
+
+- Exposure attribution is node-scoped: a Service's exposure pools include the pool label of every
+  Node that still carries one of its child VIPs, so a pool drained by a promotion or an abort, or a
+  Node relabelled to another pool, keeps blocking peers until its last VIP is gone.
+- `node-lb-allow-rebuild` records the raw value in `node-lb-allow-rebuild-consumed`; any value is
+  honoured once. A rebuild sets `node-lb-rebuilding`, which lives until the withdrawal has completed
+  and makes every pass continue the withdrawal instead of starting a union.
+- Grace and not-eligible removals run during a union before the promotion gate, while a published
+  node is left.
+- The active Service ports (name, protocol, port, target port) are recorded in
+  `public-node-local-active-ports` (at most 4 KiB) at activation, promotion and as a backfill, and a
+  lost child is rebuilt from it.
+- `public-node-local-target-since` and `public-node-local-promoted-at` give the union age and the
+  age of an attached narrowed old firewall for the Events. A parked detach of the previous firewall
+  is un-parked at each pass, since detaching is the safe direction.

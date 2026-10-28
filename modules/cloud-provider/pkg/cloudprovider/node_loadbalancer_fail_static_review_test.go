@@ -1468,6 +1468,15 @@ func TestPublicNodeLocalPoolAndPolicyChangeTogether(t *testing.T) {
 				t.Fatalf("the old firewall went to the target pool VM")
 			}
 		}
+		if s.Annotations[annotationPublicNodeLocalActivePool] == "edge" {
+			// Until the promotion the new firewall goes to the target pool only; the
+			// old pool's VM keeps the old firewall and nothing else.
+			for uuid := range firewallsOfVM(f, vmA) {
+				if uuid != old {
+					t.Fatalf("the new firewall %s was attached to the old pool VM before the promotion", uuid)
+				}
+			}
+		}
 		return s.Annotations[annotationPublicNodeLocalActivePool] == "spe-relay-share" && s.Annotations[annotationPublicNodeLocalTargetPool] == "" &&
 			s.Annotations[annotationNodeLoadBalancerPreviousFirewall] == "" && !o.fips[pubA] && !o.vips[privA] && !o.assigned[vmA] &&
 			publicNodeLocalDatapathMatches(trackedPublicNodeLocalDatapath(t, f), s, "spe-relay-share")
@@ -2296,5 +2305,197 @@ func TestPublicNodeLocalParkedOldFirewallDetachIsRetried(t *testing.T) {
 	}
 	if api.calls <= before {
 		t.Fatalf("the parked detach of the old firewall was not retried (calls %d)", api.calls)
+	}
+}
+
+// Reverting between the creation of the target firewall and the move of the
+// ledger leaves the active firewall as the only one.
+func TestPublicNodeLocalAbortBetweenFirewallCreateAndLedgerKeepsActiveFirewall(t *testing.T) {
+	f := newPublishedPublicNodeLocalFixtureN(t, 2)
+	old := f.current(t).Annotations[annotationNodeLoadBalancerFirewallUUID]
+	setPublicNodeLocalFixturePorts(t, f, 443, 8443)
+	hit := false
+	for pass := 0; pass < 40 && !hit; pass++ {
+		_ = f.controller.syncPublicNodeLocal(f.ctx, f.key, f.current(t))
+		current := f.current(t)
+		hit = len(f.api.firewalls) >= 2 && current.Annotations[annotationNodeLoadBalancerFirewallUUID] == old &&
+			current.Annotations[annotationPublicNodeLocalTargetPolicy] != ""
+	}
+	if !hit {
+		t.Fatal("the window between the firewall create and the ledger move was not reached")
+	}
+	setPublicNodeLocalFixturePorts(t, f, 443)
+	runUntil(t, f, []int{0, 1}, 300, "the active firewall is the only one", func(o publicNodeLocalObservation, s *corev1.Service) bool {
+		return s.Annotations[annotationPublicNodeLocalTargetPolicy] == "" && s.Annotations[annotationNodeLoadBalancerPreviousFirewall] == "" &&
+			len(f.api.firewalls) == 1
+	})
+	if got := f.current(t).Annotations[annotationNodeLoadBalancerFirewallUUID]; got != old {
+		t.Fatalf("ledger = %s, want the active firewall %s", got, old)
+	}
+}
+
+// promotionPass returns the index of the pass of a fresh scenario in which the
+// target is promoted.
+func promotionPass(t *testing.T, scenario publicNodeLocalTransitionScenario) int {
+	t.Helper()
+	probe := scenario.setup(t)
+	before := probe.current(t).Annotations[annotationPublicNodeLocalActivePool] + "/" + probe.current(t).Annotations[annotationPublicNodeLocalActivePolicy]
+	for pass := 0; pass < 400; pass++ {
+		stepPublicNodeLocal(t, probe, pass)
+		now := probe.current(t).Annotations[annotationPublicNodeLocalActivePool] + "/" + probe.current(t).Annotations[annotationPublicNodeLocalActivePolicy]
+		if now != before {
+			return pass
+		}
+	}
+	t.Fatal("the scenario never promoted")
+	return -1
+}
+
+// The promotion needs the proof after publication. In the promotion pass the
+// child loses the VIP of the target node for every read after the first one: the
+// passes earlier checks work from what they read first, and only the proof reads
+// the child again.
+func TestPublicNodeLocalPromotionNeedsPostPublicationProof(t *testing.T) {
+	scenario := publicNodeLocalTransitionScenarios()[0]
+	k := promotionPass(t, scenario)
+	f := scenario.setup(t)
+	for pass := 0; pass < k; pass++ {
+		stepPublicNodeLocal(t, f, pass)
+	}
+	_, _, privB, _ := publicNodeLocalFixtureNode(1)
+	kube := f.provider.kubeClient.(*kubefake.Clientset)
+	name := nodeLoadBalancerDatapathName(f.service)
+	reads := 0
+	kube.PrependReactor("get", "services", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		get := action.(k8stesting.GetAction)
+		if get.GetName() != name {
+			return false, nil, nil
+		}
+		reads++
+		if reads < 2 {
+			return false, nil, nil
+		}
+		object, err := kube.Tracker().Get(get.GetResource(), get.GetNamespace(), get.GetName())
+		if err != nil {
+			return true, nil, err
+		}
+		child := object.(*corev1.Service).DeepCopy()
+		kept := child.Status.LoadBalancer.Ingress[:0]
+		for _, ingress := range child.Status.LoadBalancer.Ingress {
+			if ingress.IP != privB {
+				kept = append(kept, ingress)
+			}
+		}
+		child.Status.LoadBalancer.Ingress = kept
+		return true, child, nil
+	})
+	_ = f.controller.syncPublicNodeLocal(f.ctx, f.key, f.current(t))
+	if got := f.current(t).Annotations[annotationPublicNodeLocalActivePool]; got != "edge" {
+		t.Fatalf("promoted to %q although the proof after publication fails", got)
+	}
+}
+
+// A new change does not start a union while the previous firewall of the last
+// one is still being retired: the ledger has one slot for it.
+func TestPublicNodeLocalUnionDoesNotStartWhilePreviousFirewallExists(t *testing.T) {
+	f := newPublishedPublicNodeLocalFixtureN(t, 1)
+	clock := time.Now().UTC()
+	f.controller.firewallRelationNow = func() time.Time { return clock }
+	f.controller.firewallRelationAbsentDelay = nodeLoadBalancerAbsenceConfirmationDelay
+	f.provider.api = &lagUnassignAPI{publicNodeLocalFilteringIPAPI: &publicNodeLocalFilteringIPAPI{fakeAPI: f.api}, skip: 1000}
+	setPublicNodeLocalFixturePorts(t, f, 443, 8443)
+	for pass := 0; pass < 60; pass++ {
+		stepPublicNodeLocal(t, f, pass)
+		current := f.current(t)
+		if current.Annotations[annotationNodeLoadBalancerPreviousFirewall] != "" && current.Annotations[annotationPublicNodeLocalTargetPolicy] == "" {
+			break
+		}
+	}
+	if f.current(t).Annotations[annotationNodeLoadBalancerPreviousFirewall] == "" {
+		t.Fatal("the first change never promoted")
+	}
+	setPublicNodeLocalFixturePorts(t, f, 443, 8443, 9443)
+	for pass := 0; pass < 20; pass++ {
+		stepPublicNodeLocal(t, f, pass)
+		current := f.current(t)
+		if current.Annotations[annotationNodeLoadBalancerPreviousFirewall] == "" {
+			break
+		}
+		if current.Annotations[annotationPublicNodeLocalTargetPolicy] != "" || current.Annotations[annotationPublicNodeLocalTargetPool] != "" {
+			t.Fatalf("pass %d: a union started while the previous firewall %s exists: %#v", pass, current.Annotations[annotationNodeLoadBalancerPreviousFirewall], current.Annotations)
+		}
+	}
+	// The cloud catches up: the old firewall goes, and then the second change is
+	// carried out. Refusing to start must not stop the old firewall from going.
+	f.provider.api = &publicNodeLocalFilteringIPAPI{fakeAPI: f.api}
+	runUntil(t, f, []int{0}, 300, "the second change", func(o publicNodeLocalObservation, s *corev1.Service) bool {
+		clock = clock.Add(nodeLoadBalancerFirewallRelationRetireDelay + time.Second)
+		return s.Annotations[annotationNodeLoadBalancerPreviousFirewall] == "" && s.Annotations[annotationPublicNodeLocalTargetPolicy] == "" &&
+			len(childPortSet(trackedPublicNodeLocalDatapath(t, f))) == 3 && len(f.api.firewalls) == 1
+	})
+}
+
+// The promotion is compare-and-swap on the ledger too: a ledger that does not
+// carry the target policy is not promoted.
+func TestPublicNodeLocalPromotionRefusedWhenLedgerPolicyDiffers(t *testing.T) {
+	f := newPublishedPublicNodeLocalFixtureN(t, 1)
+	setPublicNodeLocalFixturePorts(t, f, 443, 8443)
+	for pass := 0; pass < 60; pass++ {
+		stepPublicNodeLocal(t, f, pass)
+		current := f.current(t)
+		if current.Annotations[annotationPublicNodeLocalTargetPolicy] != "" &&
+			current.Annotations[annotationNodeLoadBalancerFirewallHash] == current.Annotations[annotationPublicNodeLocalTargetPolicy] {
+			break
+		}
+	}
+	current := f.current(t)
+	target := current.Annotations[annotationPublicNodeLocalTargetPolicy]
+	if target == "" || current.Annotations[annotationNodeLoadBalancerFirewallHash] != target {
+		t.Fatalf("no ledger on the target policy: %#v", current.Annotations)
+	}
+	updatePublicNodeLocalFixtureService(t, f, func(s *corev1.Service) { s.Annotations[annotationNodeLoadBalancerFirewallHash] = "00000000" })
+	stale := f.current(t)
+	if err := f.controller.promotePublicNodeLocalTransition(f.ctx, stale, "edge", target, stale.Annotations[annotationNodeLoadBalancerFirewallUUID]); err == nil {
+		t.Fatal("the promotion went through with a ledger that does not carry the target policy")
+	}
+	if f.current(t).Annotations[annotationPublicNodeLocalTargetPolicy] == "" {
+		t.Fatal("the target was promoted")
+	}
+}
+
+// The old firewall stays on a kept node that does not hold the new one yet: a
+// published node whose endpoint is gone but still inside the grace is kept, never
+// gets the new firewall, and keeps its gate until it does.
+func TestPublicNodeLocalOldFirewallStaysOnKeptNodeWithoutTheNewOne(t *testing.T) {
+	f := newPublishedPublicNodeLocalFixtureN(t, 2)
+	now := time.Date(2026, 10, 28, 12, 0, 0, 0, time.UTC)
+	f.controller.publicNodeLocalNow = func() time.Time { return now }
+	old := f.current(t).Annotations[annotationNodeLoadBalancerFirewallUUID]
+	_, vm2, _, _ := publicNodeLocalFixtureNode(1)
+	f.setEndpoints(t, "edge-0")
+	setPublicNodeLocalFixturePorts(t, f, 443, 8443)
+	for pass := 0; pass < 120; pass++ {
+		stepPublicNodeLocal(t, f, pass)
+		if held := firewallsOfVM(f, vm2); len(held) == 0 {
+			t.Fatalf("pass %d: the kept node lost its only firewall: %#v", pass, f.current(t).Annotations)
+		}
+	}
+	current := f.current(t)
+	if current.Annotations[annotationPublicNodeLocalTargetPolicy] != "" || current.Annotations[annotationNodeLoadBalancerPreviousFirewall] != old {
+		t.Fatalf("the change did not reach the promotion with the old firewall kept: %#v", current.Annotations)
+	}
+	if held := firewallsOfVM(f, vm2); !held[old] || len(held) != 1 {
+		t.Fatalf("the kept node does not hold only the old firewall: %v", held)
+	}
+	// The endpoint returns, the node takes the new firewall, and the old one goes.
+	f.setEndpoints(t, "edge-0", "edge-1")
+	for pass := 0; pass < 200; pass++ {
+		stepPublicNodeLocal(t, f, pass)
+		if len(firewallsOfVM(f, vm2)) == 0 {
+			t.Fatalf("pass %d: the node had no firewall while it was handed over", pass)
+		}
+	}
+	if current := f.current(t); current.Annotations[annotationNodeLoadBalancerPreviousFirewall] != "" {
+		t.Fatalf("the old firewall was never retired: %#v", current.Annotations)
 	}
 }
