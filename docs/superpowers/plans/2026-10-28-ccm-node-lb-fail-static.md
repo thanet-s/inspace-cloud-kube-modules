@@ -536,3 +536,34 @@ Left out on purpose:
 - Service status conditions. Events only, so that hold never writes status.
 - The `AssignFirewallToVM` body check (client/firewall.go:94-128). The bounded fence now absorbs it.
 - DNS TTL tuning and metrics.
+
+## 6. Phase B as built: deviations from the plan above
+
+- Phases are Inactive, Steady, Union, Promoted (Steady with a previous firewall) and Invalid.
+  `Union` is entered from `syncPendingPublicNodeLocalTransition` by a CAS that writes
+  `target-pool` and `target-policy`. It needs an empty previous firewall and no assignment fence;
+  otherwise the pass keeps the Phase A held convergence and retries.
+- The target is promoted when every target-pool Ready node has its child VIP, firewall and FIP and
+  the post-publication proof passes. For a policy change the old firewall is detached after the
+  promotion (not before): the promotion only needs the new firewall on every VM, the old one is then
+  retired by `finishPreviousPublicNodeLocalFirewall`, and it stays only on a kept node that does not
+  hold the new one yet. The child keeps the union of ports and source ranges until the previous
+  firewall annotation is gone.
+- During a union with the same policy (pool switch), Nodes that join the active pool can still be
+  added, so a replacement is not blocked for the length of the switch. With a different policy only
+  the target pool gains nodes.
+- An empty target pool holds the union (`PublicNodeLocalTransitionPending`); it is never promoted.
+- A union that loses a port claim in the target pool, or whose intent goes back or moves on, is
+  abandoned (`PublicNodeLocalTransitionAborted`). When the ledger had moved to the target firewall,
+  it is handed back to the active one (the previous firewall must prove the active policy), and the
+  target firewall becomes the previous one to detach and delete.
+- A child lost during a transition is rebuilt with the ports of the firewall that carries the active
+  policy (target port = port number, since the old spec is gone), in every mode.
+- The strict-narrowing rebuild and its rule-subset helpers are removed. `node-lb-allow-rebuild` is
+  single use (`node-lb-allow-rebuild-consumed` records `<pool>/<policy hash>`); a value equal to the
+  target policy hash permits exactly that target.
+- B8 reuses the rejected-create retire path with `issuedAt + RetireDelay` as the earliest absence read.
+- Known limits: while the new firewall is being created the union pass holds (gone-node removals wait
+  for the create); the old firewall of a policy change stays assigned from the promotion until the
+  fence detaches it (two absence readbacks); the union classifies Nodes against both pools, so a
+  Karpenter node in the other pool costs extra provider reads per pass.
