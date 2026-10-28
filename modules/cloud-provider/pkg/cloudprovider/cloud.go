@@ -27,8 +27,11 @@ import (
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/kubernetes/scheme"
+	typedcorev1 "k8s.io/client-go/kubernetes/typed/core/v1"
 	discoverylisters "k8s.io/client-go/listers/discovery/v1"
 	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/tools/record"
 	cloud "k8s.io/cloud-provider"
 	cloudproviderapi "k8s.io/cloud-provider/api"
 	"k8s.io/klog/v2"
@@ -47,6 +50,10 @@ const (
 	LabelLoadBalancerScope          = "inspace.cloud/load-balancer-scope"
 	LoadBalancerScopePublic         = "public"
 	LoadBalancerScopePrivate        = "private"
+
+	// annotationStandardNLBEmptyTargetsSince records when the desired target
+	// set first came up empty, so the grace period survives restarts.
+	annotationStandardNLBEmptyTargetsSince = "service.inspace.cloud/public-nlb-empty-targets-since"
 
 	// AnnotationReleasePublicLoadBalancer is the explicit opt-in that lets an
 	// unpublished Service delete its public NLB and floating IP. Without it the
@@ -79,6 +86,9 @@ const (
 	standardNLBDeleteLoadBalancer = "delete-load-balancer"
 
 	standardNLBRemovalAbsenceDelay = 30 * time.Second
+	// emptyTargetSetGrace is how long an empty desired set keeps the last known
+	// good targets before targets whose VM is provably gone may be removed.
+	emptyTargetSetGrace = 15 * time.Minute
 	// standardNLBAdditiveRetireDelay is how long an issued additive receipt
 	// stays authoritative: the slowest deadline plus the spaced-read delay.
 	// Only after it, and two exact absent reads, may the receipt be retired.
@@ -198,6 +208,8 @@ type Provider struct {
 	standardNLBNow               func() time.Time
 	standardNLBAbsentDelay       time.Duration
 	standardNLBMutationTimeout   time.Duration
+	// standardNLBEvents is optional; unit tests leave it nil.
+	standardNLBEvents record.EventRecorder
 }
 
 // exactVMReadAbsenceError distinguishes absence returned by the one canonical
@@ -346,6 +358,13 @@ func (p *Provider) Initialize(clientBuilder cloud.ControllerClientBuilder, stopC
 	}
 	p.kubeClient = client
 	p.standardNLBServiceStore = kubernetesStandardNLBServiceStore{client: client}
+	broadcaster := record.NewBroadcaster()
+	broadcaster.StartRecordingToSink(&typedcorev1.EventSinkImpl{Interface: client.CoreV1().Events("")})
+	p.standardNLBEvents = broadcaster.NewRecorder(scheme.Scheme, corev1.EventSource{Component: "inspace-cloud-controller-manager"})
+	go func() {
+		<-stopCh
+		broadcaster.Shutdown()
+	}()
 	if p.config.NodeLoadBalancer.Enabled {
 		restConfig, err := clientBuilder.Config("inspace-node-load-balancer-controller")
 		if err != nil {
@@ -3976,6 +3995,91 @@ func (p *Provider) removeStandardNLBRule(
 	return nil, errors.Join(mutationErr, observeErr, standardNLBRemovalPending(fence))
 }
 
+// noteEmptyTargetSet records, once, when the desired target set first came up
+// empty and raises one Warning Event for that state change. The start time is
+// kept on the Service so the grace period survives controller restarts.
+func (p *Provider) noteEmptyTargetSet(ctx context.Context, service *corev1.Service, lb *inspace.LoadBalancer) (time.Time, error) {
+	if p.standardNLBServiceStore == nil {
+		return time.Time{}, nil
+	}
+	current, err := p.standardNLBServiceStore.GetExact(ctx, service)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("cloudprovider: read empty target set mark: %w", err)
+	}
+	if err := validateExactStandardNLBService(service, current); err != nil {
+		return time.Time{}, err
+	}
+	if value := current.Annotations[annotationStandardNLBEmptyTargetsSince]; value != "" {
+		since, parseErr := time.Parse(time.RFC3339Nano, value)
+		if parseErr != nil {
+			return time.Time{}, fmt.Errorf("cloudprovider: invalid empty target set mark %q: %w", value, parseErr)
+		}
+		return since, nil
+	}
+	now := p.standardNLBTime()
+	marked := current.DeepCopy()
+	if marked.Annotations == nil {
+		marked.Annotations = map[string]string{}
+	}
+	marked.Annotations[annotationStandardNLBEmptyTargetsSince] = now.Format(time.RFC3339Nano)
+	if _, err := p.standardNLBServiceStore.UpdateExact(ctx, marked); err != nil {
+		return time.Time{}, fmt.Errorf("cloudprovider: record empty target set mark: %w", err)
+	}
+	klog.Warningf("public NLB %s of Service %s/%s: desired target set is empty; keeping the %d last known good targets for %s",
+		lb.UUID, service.Namespace, service.Name, len(lb.Targets), emptyTargetSetGrace)
+	if p.standardNLBEvents != nil {
+		p.standardNLBEvents.Eventf(service, corev1.EventTypeWarning, "EmptyTargetSetHeld",
+			"No eligible node is available for public NLB %s; keeping its %d current targets for %s before dropping targets whose VM is gone",
+			lb.UUID, len(lb.Targets), emptyTargetSetGrace)
+	}
+	return now, nil
+}
+
+func (p *Provider) clearEmptyTargetSet(ctx context.Context, service *corev1.Service) error {
+	if p.standardNLBServiceStore == nil {
+		return nil
+	}
+	current, err := p.standardNLBServiceStore.GetExact(ctx, service)
+	if err != nil {
+		return err
+	}
+	if err := validateExactStandardNLBService(service, current); err != nil {
+		return err
+	}
+	if _, marked := current.Annotations[annotationStandardNLBEmptyTargetsSince]; !marked {
+		return nil
+	}
+	cleared := current.DeepCopy()
+	delete(cleared.Annotations, annotationStandardNLBEmptyTargetsSince)
+	_, err = p.standardNLBServiceStore.UpdateExact(ctx, cleared)
+	return err
+}
+
+// emptyTargetSetMayRemove reports whether one target may go while the desired
+// set is empty: only after the grace period, and only when an exact VM read
+// proves the VM is gone.
+func (p *Provider) emptyTargetSetMayRemove(
+	ctx context.Context,
+	service *corev1.Service,
+	lb *inspace.LoadBalancer,
+	targetUUID string,
+	since time.Time,
+) (bool, error) {
+	if since.IsZero() || p.standardNLBTime().Before(since.Add(emptyTargetSetGrace)) {
+		return false, nil
+	}
+	_, err := p.api.GetVM(ctx, p.config.Location, targetUUID)
+	if err == nil {
+		return false, nil
+	}
+	if !inspace.IsNotFound(err) {
+		return false, fmt.Errorf("cloudprovider: read VM %s of NLB %s before dropping it: %w", targetUUID, lb.UUID, err)
+	}
+	klog.Warningf("public NLB %s of Service %s/%s: dropping target %s because its VM no longer exists",
+		lb.UUID, service.Namespace, service.Name, targetUUID)
+	return true, nil
+}
+
 func (p *Provider) reconcileLoadBalancer(ctx context.Context, service *corev1.Service, lb *inspace.LoadBalancer, targetUUIDs []string, rules []inspace.LoadBalancerRule) error {
 	if err := p.resolvePendingStandardNLBAdd(ctx, service, lb, targetUUIDs, rules); err != nil {
 		return err
@@ -4003,6 +4107,20 @@ func (p *Provider) reconcileLoadBalancer(ctx context.Context, service *corev1.Se
 			currentTargets[uuid] = struct{}{}
 		}
 	}
+	var emptySince time.Time
+	if len(desiredTargets) == 0 && len(lb.Targets) > 0 {
+		since, noteErr := p.noteEmptyTargetSet(ctx, service, lb)
+		if noteErr != nil {
+			return errors.Join(addErr, noteErr)
+		}
+		emptySince = since
+	} else if len(desiredTargets) > 0 {
+		if _, marked := service.Annotations[annotationStandardNLBEmptyTargetsSince]; marked {
+			if clearErr := p.clearEmptyTargetSet(ctx, service); clearErr != nil {
+				klog.Warningf("clear the empty target set mark of Service %s/%s: %v", service.Namespace, service.Name, clearErr)
+			}
+		}
+	}
 	servingDesired := 0
 	for _, target := range lb.Targets {
 		if _, wanted := desiredTargets[target.TargetUUID]; wanted {
@@ -4022,10 +4140,16 @@ func (p *Provider) reconcileLoadBalancer(ctx context.Context, service *corev1.Se
 			// An empty desired set usually means NotReady nodes, an API
 			// brownout or a pod restart, not "serve nothing". Like upstream
 			// (KEP-3458) keep the last known good targets instead of
-			// turning a transient fault into an outage.
-			klog.Warningf("public NLB %s of Service %s/%s: desired target set is empty; keeping the %d last known good targets",
-				lb.UUID, service.Namespace, service.Name, len(lb.Targets))
-			break
+			// turning a transient fault into an outage. The hold is bounded:
+			// after the grace period only targets whose VM is provably gone
+			// are removed.
+			removable, holdErr := p.emptyTargetSetMayRemove(ctx, service, lb, target.TargetUUID, emptySince)
+			if holdErr != nil {
+				return errors.Join(addErr, holdErr)
+			}
+			if !removable {
+				continue
+			}
 		}
 		_, err := p.removeStandardNLBTarget(ctx, service, lb, target.TargetUUID)
 		return errors.Join(addErr, err)
