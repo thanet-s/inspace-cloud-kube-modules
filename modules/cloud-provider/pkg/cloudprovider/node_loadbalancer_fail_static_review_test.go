@@ -2499,3 +2499,49 @@ func TestPublicNodeLocalOldFirewallStaysOnKeptNodeWithoutTheNewOne(t *testing.T)
 		t.Fatalf("the old firewall was never retired: %#v", current.Annotations)
 	}
 }
+
+// A spec change that keeps the policy hash (a new target port, a renamed port)
+// still updates the recorded active ports of a Service in the steady state.
+func TestPublicNodeLocalActivePortsFollowSpecChangeThatKeepsPolicy(t *testing.T) {
+	f := newPublishedPublicNodeLocalFixtureWith(t, 1, shapePublicNodeLocalNamedPorts)
+	hash := f.current(t).Annotations[annotationPublicNodeLocalActivePolicy]
+	updatePublicNodeLocalFixtureService(t, f, func(s *corev1.Service) {
+		s.Spec.Ports[1].TargetPort = intstr.FromString("https-new")
+		s.Spec.Ports[0].Name = "web-renamed"
+	})
+	for pass := 0; pass < 6; pass++ {
+		stepPublicNodeLocal(t, f, pass)
+	}
+	current := f.current(t)
+	if current.Annotations[annotationPublicNodeLocalActivePolicy] != hash {
+		t.Fatalf("the policy changed: %#v", current.Annotations)
+	}
+	recorded := publicNodeLocalActivePorts(current)
+	if len(recorded) != 3 || recorded[1].TargetPort != intstr.FromString("https-new") || recorded[0].Name != "web-renamed" {
+		t.Fatalf("the recorded active ports are stale: %#v", recorded)
+	}
+}
+
+// The promotion re-checks the live Service: a spec that moved on since the pass
+// began is not promoted, and its ports are not recorded.
+func TestPublicNodeLocalPromotionRefusedWhenLivePolicyMovedOn(t *testing.T) {
+	f := newPublishedPublicNodeLocalFixtureN(t, 1)
+	setPublicNodeLocalFixturePorts(t, f, 443, 8443)
+	for pass := 0; pass < 60; pass++ {
+		stepPublicNodeLocal(t, f, pass)
+		current := f.current(t)
+		if current.Annotations[annotationPublicNodeLocalTargetPolicy] != "" &&
+			current.Annotations[annotationNodeLoadBalancerFirewallHash] == current.Annotations[annotationPublicNodeLocalTargetPolicy] {
+			break
+		}
+	}
+	target := f.current(t).Annotations[annotationPublicNodeLocalTargetPolicy]
+	ledger := f.current(t).Annotations[annotationNodeLoadBalancerFirewallUUID]
+	setPublicNodeLocalFixturePorts(t, f, 443, 9443)
+	if err := f.controller.promotePublicNodeLocalTransition(f.ctx, f.current(t), "edge", target, ledger); err == nil {
+		t.Fatal("the promotion went through although the live policy is not the target")
+	}
+	if f.current(t).Annotations[annotationPublicNodeLocalTargetPolicy] == "" {
+		t.Fatal("the target was promoted")
+	}
+}

@@ -612,6 +612,13 @@ func (c *nodeLoadBalancerController) promotePublicNodeLocalTransition(
 			publicNodeLocalAssignmentFencePresent(copy) {
 			return false, errors.New("public-node-local: the transition changed before promotion")
 		}
+		// The ports recorded below are the spec of this write, so the live spec
+		// must still be the target the pass converged to.
+		liveIntent, parseErr := parseNodeLoadBalancerService(copy, nodeLoadBalancerDefaults{NodesPerShard: c.provider.config.NodeLoadBalancer.NodesPerShard})
+		liveDesired, desiredErr := c.desiredServiceFirewall(copy)
+		if parseErr != nil || desiredErr != nil || liveIntent.Pool != targetPool || liveDesired.Hash != targetPolicy {
+			return false, errors.Join(errors.New("public-node-local: the live Service is no longer the target at promotion"), parseErr, desiredErr)
+		}
 		copy.Annotations[annotationPublicNodeLocalActivePool] = targetPool
 		copy.Annotations[annotationPublicNodeLocalActivePolicy] = targetPolicy
 		setPublicNodeLocalActivePorts(copy)
@@ -907,15 +914,18 @@ func setPublicNodeLocalActivePorts(copy *corev1.Service) bool {
 	return true
 }
 
-// backfillPublicNodeLocalActivePorts records the ports of a Service that was
-// activated before they were recorded. It only runs when the intent is the
-// active identity, so the spec is the active ports.
+// backfillPublicNodeLocalActivePorts keeps the recorded ports equal to the spec
+// of a Service in the steady state: it records a Service that was activated
+// before the ports were recorded, and rewrites a record that a spec change
+// (a new target port, a renamed port) left stale while the policy hash stayed.
+// It only runs when the intent is the active identity, so the spec is the
+// active ports.
 func (c *nodeLoadBalancerController) backfillPublicNodeLocalActivePorts(ctx context.Context, service *corev1.Service) (*corev1.Service, error) {
-	if service.Annotations[annotationPublicNodeLocalActivePorts] != "" || encodePublicNodeLocalActivePorts(service.Spec.Ports) == "" {
+	if service.Annotations[annotationPublicNodeLocalActivePorts] == encodePublicNodeLocalActivePorts(service.Spec.Ports) {
 		return service, nil
 	}
 	updated, _, err := c.updateExactParentService(ctx, service, func(copy *corev1.Service) (bool, error) {
-		if copy.Annotations[annotationPublicNodeLocalActivePorts] != "" {
+		if copy.Annotations[annotationPublicNodeLocalTargetPool] != "" {
 			return false, nil
 		}
 		return setPublicNodeLocalActivePorts(copy), nil
