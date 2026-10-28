@@ -1387,7 +1387,7 @@ func (p *Provider) ensureStandardNLBLoadBalancer(
 		rejection := fmt.Errorf("cloudprovider: reject public NLB create at final Service authority: %w", err)
 		return nil, false, p.clearStandardNLBFenceAfterProvenNonDispatch(ctx, service, raw, rejection)
 	}
-	mutationCtx, cancelMutation := p.standardNLBMutationContext(ctx)
+	mutationCtx, cancelMutation := p.standardNLBMutationContext(ctx, standardNLBCreateLoadBalancerTimeout)
 	created, createErr := p.api.CreateLoadBalancer(mutationCtx, p.config.Location, request)
 	cancelMutation()
 	observed, listErr := p.findOwnedLoadBalancer(ctx, service)
@@ -1502,7 +1502,7 @@ func (p *Provider) ensureStandardNLBPublicFloatingIP(
 		rejection := fmt.Errorf("cloudprovider: reject public floating-IP create at final Service authority: %w", err)
 		return nil, p.clearStandardNLBFenceAfterProvenNonDispatch(ctx, service, raw, rejection)
 	}
-	mutationCtx, cancelMutation := p.standardNLBMutationContext(ctx)
+	mutationCtx, cancelMutation := p.standardNLBMutationContext(ctx, standardNLBCreateFloatingIPTimeout)
 	created, createErr := p.api.CreateFloatingIP(mutationCtx, p.config.Location, request)
 	cancelMutation()
 	observed, listErr := p.findOwnedFloatingIP(ctx, service)
@@ -1617,7 +1617,7 @@ func (p *Provider) ensureStandardNLBFloatingIPAssignment(
 		rejection := fmt.Errorf("cloudprovider: reject floating-IP assignment at final Service authority: %w", err)
 		return nil, p.clearStandardNLBFenceAfterProvenNonDispatch(ctx, service, raw, rejection)
 	}
-	mutationCtx, cancelMutation := p.standardNLBMutationContext(ctx)
+	mutationCtx, cancelMutation := p.standardNLBMutationContext(ctx, standardNLBAssignTimeout)
 	_, mutationErr := p.api.AssignFloatingIP(mutationCtx, p.config.Location, floatingIP.Address, loadBalancer.UUID, "load_balancer")
 	cancelMutation()
 	observed, listErr := p.findOwnedFloatingIP(ctx, service)
@@ -1919,7 +1919,7 @@ func (p *Provider) cleanupOwnedLoadBalancer(ctx context.Context, service *corev1
 		rejection := fmt.Errorf("cloudprovider: reject public NLB delete at final Service authority: %w", authorityErr)
 		return p.clearStandardNLBFenceAfterProvenNonDispatch(ctx, service, raw, rejection)
 	}
-	mutationCtx, cancelMutation := p.standardNLBMutationContext(ctx)
+	mutationCtx, cancelMutation := p.standardNLBMutationContext(ctx, standardNLBDeleteTimeout)
 	deleteErr := p.api.DeleteLoadBalancer(mutationCtx, p.config.Location, lb.UUID)
 	cancelMutation()
 	if standardNLBMutationKnownPreDispatch(deleteErr) {
@@ -2191,7 +2191,7 @@ func (p *Provider) cleanupOwnedFloatingIP(
 			rejection := fmt.Errorf("cloudprovider: reject floating-IP unassign at final Service authority: %w", err)
 			return p.clearStandardNLBFenceAfterProvenNonDispatch(ctx, service, raw, rejection)
 		}
-		mutationCtx, cancelMutation := p.standardNLBMutationContext(ctx)
+		mutationCtx, cancelMutation := p.standardNLBMutationContext(ctx, standardNLBDeleteTimeout)
 		_, unassignErr := p.api.UnassignFloatingIP(mutationCtx, p.config.Location, address)
 		cancelMutation()
 		if standardNLBMutationKnownPreDispatch(unassignErr) {
@@ -2263,7 +2263,7 @@ func (p *Provider) cleanupOwnedFloatingIP(
 		rejection := fmt.Errorf("cloudprovider: reject floating-IP delete at final Service authority: %w", err)
 		return p.clearStandardNLBFenceAfterProvenNonDispatch(ctx, service, raw, rejection)
 	}
-	mutationCtx, cancelMutation := p.standardNLBMutationContext(ctx)
+	mutationCtx, cancelMutation := p.standardNLBMutationContext(ctx, standardNLBDeleteTimeout)
 	deleteErr := p.api.DeleteFloatingIP(mutationCtx, p.config.Location, address)
 	cancelMutation()
 	if standardNLBMutationKnownPreDispatch(deleteErr) {
@@ -3568,7 +3568,7 @@ func (p *Provider) addStandardNLBTarget(
 		rejection := fmt.Errorf("cloudprovider: reject add-target at final Service authority: %w", err)
 		return nil, p.clearStandardNLBFenceAfterProvenNonDispatch(ctx, service, raw, rejection)
 	}
-	mutationCtx, cancelMutation := p.standardNLBMutationContext(ctx)
+	mutationCtx, cancelMutation := p.standardNLBMutationContext(ctx, standardNLBRelationTimeout)
 	response, mutationErr := p.api.AddLoadBalancerTarget(mutationCtx, p.config.Location, lb.UUID, targetUUID)
 	cancelMutation()
 	observed, exactAbsent, readErr := p.readExactOwnedStandardNLB(ctx, service, lb.UUID)
@@ -3641,7 +3641,7 @@ func (p *Provider) addStandardNLBRule(
 		rejection := fmt.Errorf("cloudprovider: reject add-rule at final Service authority: %w", err)
 		return nil, p.clearStandardNLBFenceAfterProvenNonDispatch(ctx, service, raw, rejection)
 	}
-	mutationCtx, cancelMutation := p.standardNLBMutationContext(ctx)
+	mutationCtx, cancelMutation := p.standardNLBMutationContext(ctx, standardNLBRelationTimeout)
 	response, mutationErr := p.api.AddLoadBalancerRule(mutationCtx, p.config.Location, lb.UUID, rule)
 	cancelMutation()
 	observed, exactAbsent, readErr := p.readExactOwnedStandardNLB(ctx, service, lb.UUID)
@@ -3712,7 +3712,7 @@ func (p *Provider) removeStandardNLBTarget(
 		rejection := fmt.Errorf("cloudprovider: reject remove-target at final Service authority: %w", authorityErr)
 		return nil, p.clearStandardNLBFenceAfterProvenNonDispatch(ctx, service, raw, rejection)
 	}
-	mutationCtx, cancelMutation := p.standardNLBMutationContext(ctx)
+	mutationCtx, cancelMutation := p.standardNLBMutationContext(ctx, standardNLBRelationTimeout)
 	mutationErr := p.api.RemoveLoadBalancerTarget(mutationCtx, p.config.Location, lb.UUID, targetUUID)
 	cancelMutation()
 	if standardNLBMutationKnownPreDispatch(mutationErr) {
@@ -3782,7 +3782,7 @@ func (p *Provider) removeStandardNLBRule(
 		rejection := fmt.Errorf("cloudprovider: reject remove-rule at final Service authority: %w", authorityErr)
 		return nil, p.clearStandardNLBFenceAfterProvenNonDispatch(ctx, service, raw, rejection)
 	}
-	mutationCtx, cancelMutation := p.standardNLBMutationContext(ctx)
+	mutationCtx, cancelMutation := p.standardNLBMutationContext(ctx, standardNLBRelationTimeout)
 	mutationErr := p.api.RemoveLoadBalancerRule(mutationCtx, p.config.Location, lb.UUID, ruleUUID)
 	cancelMutation()
 	if standardNLBMutationKnownPreDispatch(mutationErr) {
@@ -4109,17 +4109,22 @@ var (
 	_ cloud.InstancesV2  = (*Provider)(nil)
 	_ cloud.LoadBalancer = (*Provider)(nil)
 )
+// Each NLB or floating-IP mutation gets its own deadline so a hung InSpace POST
+// cannot hold the single worker and the global mutex for the client's 5-minute
+// timeout, yet slow-but-healthy calls are not cut off. Create NLB is the
+// slowest; a cut-off call is ambiguous like any timeout and is resolved by the
+// durable receipt, the readbacks and the retire rule.
+const (
+	standardNLBCreateLoadBalancerTimeout = 5 * time.Minute
+	standardNLBCreateFloatingIPTimeout   = 90 * time.Second
+	standardNLBAssignTimeout             = 3 * time.Minute
+	standardNLBDeleteTimeout             = 3 * time.Minute
+	standardNLBRelationTimeout           = 2 * time.Minute
+)
 
-// defaultStandardNLBMutationTimeout bounds one NLB or floating-IP mutation so a
-// hung InSpace POST cannot hold the single worker and the global mutex for the
-// client's 5-minute timeout. A cut-off call is ambiguous like any other
-// timeout: the durable receipt and the readbacks resolve it.
-const defaultStandardNLBMutationTimeout = 60 * time.Second
-
-func (p *Provider) standardNLBMutationContext(ctx context.Context) (context.Context, context.CancelFunc) {
-	timeout := p.standardNLBMutationTimeout
-	if timeout <= 0 {
-		timeout = defaultStandardNLBMutationTimeout
+func (p *Provider) standardNLBMutationContext(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	if p.standardNLBMutationTimeout > 0 {
+		timeout = p.standardNLBMutationTimeout
 	}
 	return context.WithTimeout(ctx, timeout)
 }
