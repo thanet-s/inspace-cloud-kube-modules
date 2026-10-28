@@ -204,8 +204,14 @@ func (c *nodeLoadBalancerController) finishPreviousPublicNodeLocalFirewall(
 			return true, c.holdOrFailPublicNodeLocal(ctx, service, err)
 		}
 		if len(stale) != 0 {
-			if err := c.detachServiceFirewallFromOtherNodes(ctx, service, previous, stayNodes); err != nil {
+			parked, err := c.detachServiceFirewallFromOtherNodesParked(ctx, service, previous, stayNodes)
+			if err != nil {
 				return true, c.holdOrFailPublicNodeLocal(ctx, service, err)
+			}
+			if len(publicNodeLocalWithout(stale, parked)) == 0 {
+				// Only parked relations are left: they are retried when the park
+				// ends, and must not stop the pass meanwhile.
+				return false, nil
 			}
 			c.requeuePublicNodeLocal(key)
 			return true, nil

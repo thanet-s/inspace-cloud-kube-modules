@@ -1673,3 +1673,72 @@ func TestPublicNodeLocalTransitionSurvivesNthProviderFailure(t *testing.T) {
 		}
 	}
 }
+
+// neverUnassignVMAPI accepts the unassign of one VM and never applies it.
+type neverUnassignVMAPI struct {
+	*publicNodeLocalFilteringIPAPI
+	stuckVM string
+}
+
+func (a *neverUnassignVMAPI) UnassignFirewallFromVM(ctx context.Context, location, firewallUUID, vmUUID string) error {
+	if vmUUID == a.stuckVM {
+		return nil
+	}
+	return a.publicNodeLocalFilteringIPAPI.UnassignFirewallFromVM(ctx, location, firewallUUID, vmUUID)
+}
+
+// A parked unassign must not starve the adds of the Service. The VIP of the
+// node whose firewall is still attached stays, as the safety order requires.
+func TestPublicNodeLocalParkedUnassignDoesNotStarveAdds(t *testing.T) {
+	f := newPublishedPublicNodeLocalFixtureN(t, 2)
+	name2, vm2, priv2, _ := publicNodeLocalFixtureNode(1)
+	_, _, _, pub1 := publicNodeLocalFixtureNode(0)
+	f.provider.api = &neverUnassignVMAPI{
+		publicNodeLocalFilteringIPAPI: &publicNodeLocalFilteringIPAPI{fakeAPI: f.api}, stuckVM: vm2,
+	}
+	clock := time.Now().UTC()
+	f.controller.firewallRelationNow = func() time.Time { return clock }
+	f.controller.firewallRelationAbsentDelay = nodeLoadBalancerAbsenceConfirmationDelay
+	if err := f.provider.kubeClient.CoreV1().Nodes().Delete(f.ctx, name2, metav1.DeleteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	f.setEndpoints(t, "edge-0")
+	parked := false
+	for pass := 0; pass < 60 && !parked; pass++ {
+		_ = f.controller.syncPublicNodeLocal(f.ctx, f.key, f.current(t))
+		events, err := f.provider.kubeClient.CoreV1().Events(f.service.Namespace).List(f.ctx, metav1.ListOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, event := range events.Items {
+			parked = parked || event.Reason == "PublicNodeLocalFirewallRelationStuck"
+		}
+		clock = clock.Add(nodeLoadBalancerFirewallRelationRetireDelay + time.Second)
+	}
+	if !parked {
+		t.Fatalf("the unassign never parked: %#v", observePublicNodeLocal(t, f))
+	}
+	// A replacement node arrives while the old unassign is parked.
+	f.addNode(t, 2)
+	_, vm3, priv3, pub3 := publicNodeLocalFixtureNode(2)
+	for pass := 0; pass < 40; pass++ {
+		if err := f.controller.syncPublicNodeLocal(f.ctx, f.key, f.current(t)); err != nil {
+			var holding *errPublicNodeLocalHolding
+			var pending *nodeLoadBalancerFirewallRelationPendingError
+			if !errors.As(err, &holding) && !errors.As(err, &pending) {
+				t.Fatalf("pass %d: %v", pass, err)
+			}
+		}
+		observed := observePublicNodeLocal(t, f)
+		if !observed.fips[pub1] {
+			t.Fatalf("pass %d: the serving node left: %#v", pass, observed)
+		}
+		if observed.assigned[vm2] && !observed.vips[priv2] {
+			t.Fatalf("pass %d: the VIP left while the firewall is still attached: %#v", pass, observed)
+		}
+		if observed.fips[pub3] && observed.vips[priv3] && observed.assigned[vm3] {
+			return
+		}
+	}
+	t.Fatalf("the add starved behind the parked unassign: %#v", observePublicNodeLocal(t, f))
+}

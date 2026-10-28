@@ -29,6 +29,21 @@ const (
 	publicNodeLocalReasonForeignAccountFirewall = "PublicNodeLocalForeignAccountFirewall"
 )
 
+// publicNodeLocalWithout returns the entries of list that are not in skip.
+func publicNodeLocalWithout(list, skip []string) []string {
+	skipped := make(map[string]struct{}, len(skip))
+	for _, value := range skip {
+		skipped[value] = struct{}{}
+	}
+	var result []string
+	for _, value := range list {
+		if _, found := skipped[value]; !found {
+			result = append(result, value)
+		}
+	}
+	return result
+}
+
 // unverifiedCauses joins why Nodes could not be verified, in Node name order, so
 // a hold keeps a transient cause visible and is deferred like any transient error.
 func (s publicNodeLocalNodeSet) unverifiedCauses() error {
@@ -463,6 +478,8 @@ func (c *nodeLoadBalancerController) convergeActivePublicNodeLocal(
 		keepNodes := make([]*corev1.Node, 0, len(kept))
 		keepVMSet := map[string]struct{}{}
 		keepPrivate := map[string]struct{}{}
+		parkedPrivate := map[string]struct{}{}
+		retainUnknownVIPs := false
 		for name := range kept {
 			member := members[name]
 			keepPrivate[member.private] = struct{}{}
@@ -511,16 +528,39 @@ func (c *nodeLoadBalancerController) convergeActivePublicNodeLocal(
 				return true, c.holdOrFailPublicNodeLocal(ctx, service, err)
 			}
 			if len(stale) != 0 {
-				if err := c.detachServiceFirewallFromOtherNodes(ctx, service, leaving, keepNodes); err != nil {
+				parked, err := c.detachServiceFirewallFromOtherNodesParked(ctx, service, leaving, keepNodes)
+				if err != nil {
 					return true, c.holdOrFailPublicNodeLocal(ctx, service, err)
 				}
-				c.requeuePublicNodeLocal(key)
-				return true, nil
+				if remaining := publicNodeLocalWithout(stale, parked); len(remaining) != 0 {
+					c.requeuePublicNodeLocal(key)
+					return true, nil
+				}
+				// Every VM left is parked: it is skipped so the pass goes on, but its
+				// firewall is still attached, so its child VIP stays.
+				for _, vmUUID := range parked {
+					mapped := false
+					for _, member := range members {
+						if member.vmUUID == vmUUID && member.private != "" {
+							parkedPrivate[member.private] = struct{}{}
+							mapped = true
+						}
+					}
+					if !mapped {
+						// The Node object is gone, so the VIP of this VM is unknown:
+						// every VIP that matches no Node stays until the firewall goes.
+						retainUnknownVIPs = true
+					}
+				}
 			}
 		}
 		next := map[string]struct{}{}
 		for ip := range vips {
 			if _, keptVIP := keepPrivate[ip]; keptVIP {
+				next[ip] = struct{}{}
+			} else if _, attached := parkedPrivate[ip]; attached {
+				next[ip] = struct{}{}
+			} else if _, known := knownPrivate[ip]; !known && retainUnknownVIPs {
 				next[ip] = struct{}{}
 			}
 		}

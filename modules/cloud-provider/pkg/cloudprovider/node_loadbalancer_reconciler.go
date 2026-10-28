@@ -4798,8 +4798,21 @@ func (c *nodeLoadBalancerController) detachServiceFirewallFromOtherNodes(
 	firewall *inspace.Firewall,
 	nodes []*corev1.Node,
 ) error {
+	_, err := c.detachServiceFirewallFromOtherNodesParked(ctx, service, firewall, nodes)
+	return err
+}
+
+// detachServiceFirewallFromOtherNodesParked detaches the firewall from the VMs
+// that are not in nodes, and names the VMs whose relation is parked. A parked
+// relation is skipped without a dispatch, so it does not stop the VMs after it.
+func (c *nodeLoadBalancerController) detachServiceFirewallFromOtherNodesParked(
+	ctx context.Context,
+	service *corev1.Service,
+	firewall *inspace.Firewall,
+	nodes []*corev1.Node,
+) ([]string, error) {
 	if firewall == nil {
-		return errors.New("node load balancer: Service firewall is required for assignment cleanup")
+		return nil, errors.New("node load balancer: Service firewall is required for assignment cleanup")
 	}
 	converged, err := c.reconcileNodeLoadBalancerFirewallRelation(
 		ctx,
@@ -4807,23 +4820,24 @@ func (c *nodeLoadBalancerController) detachServiceFirewallFromOtherNodes(
 		nil,
 	)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if !converged {
-		return errors.New("node load balancer: waiting for durable Service firewall relation readback")
+		return nil, errors.New("node load balancer: waiting for durable Service firewall relation readback")
 	}
 	desiredVMs := make(map[string]struct{}, len(nodes))
 	for _, node := range nodes {
 		vmUUID, ok := nodeLoadBalancerVMUUID(node)
 		if !ok {
-			return fmt.Errorf("node load balancer: selected shard Node %s has no valid InSpace provider identity", node.Name)
+			return nil, fmt.Errorf("node load balancer: selected shard Node %s has no valid InSpace provider identity", node.Name)
 		}
 		desiredVMs[vmUUID] = struct{}{}
 	}
 	staleVMs, err := staleNodeLoadBalancerFirewallAssignments(*firewall, desiredVMs)
 	if err != nil || len(staleVMs) == 0 {
-		return err
+		return nil, err
 	}
+	var parked []string
 	for _, vmUUID := range staleVMs {
 		converged, relationErr := c.reconcileNodeLoadBalancerFirewallRelation(
 			ctx,
@@ -4835,18 +4849,19 @@ func (c *nodeLoadBalancerController) detachServiceFirewallFromOtherNodes(
 		if errors.Is(relationErr, errNodeLoadBalancerFirewallRelationParked) {
 			// A relation that never converges must not block the other VMs.
 			c.recordPublicNodeLocalStuckRelation(ctx, service, relationErr)
+			parked = append(parked, vmUUID)
 			continue
 		}
 		if relationErr != nil {
-			return fmt.Errorf("node load balancer: unassign firewall %s from stale VM %s: %w", firewall.UUID, vmUUID, relationErr)
+			return parked, fmt.Errorf("node load balancer: unassign firewall %s from stale VM %s: %w", firewall.UUID, vmUUID, relationErr)
 		}
 		if !converged {
 			// The exact relation was removed and authoritatively read back, but a
 			// later pass must consume a fresh firewall snapshot before publication.
-			return nil
+			return parked, nil
 		}
 	}
-	return nil
+	return parked, nil
 }
 
 func staleNodeLoadBalancerFirewallAssignments(firewall inspace.Firewall, desiredVMs map[string]struct{}) ([]string, error) {
