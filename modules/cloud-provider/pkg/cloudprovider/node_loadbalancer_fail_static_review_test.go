@@ -16,6 +16,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 	kubefake "k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
+	"k8s.io/client-go/util/workqueue"
 
 	inspace "github.com/thanet-s/inspace-cloud-kube-modules/modules/client"
 )
@@ -1326,4 +1327,342 @@ func TestPublicNodeLocalMixedPolicyChangeKeepsServing(t *testing.T) {
 	setPublicNodeLocalFixturePorts(t, f, 443, 8443)
 	updatePublicNodeLocalFixtureService(t, f, func(s *corev1.Service) { s.Spec.LoadBalancerSourceRanges = []string{"10.0.0.0/8"} })
 	runPolicyChange(t, f, 2, policyChangeWatch{oldFirewall: old, oldPorts: []int32{443, 80}, newPorts: []int32{443, 8443}}, nil)
+}
+
+// stepPublicNodeLocal runs one pass and tolerates only holds and waits.
+func stepPublicNodeLocal(t *testing.T, f *publicNodeLocalTransientFixture, pass int) {
+	t.Helper()
+	if current := f.current(t); current.Annotations[annotationNodeLoadBalancerCleanupFWChecked] != "" {
+		ageNodeLoadBalancerAbsenceEvidence(t, f.ctx, f.provider, current, annotationNodeLoadBalancerCleanupFWChecked)
+	}
+	err := f.controller.syncPublicNodeLocal(f.ctx, f.key, f.current(t))
+	var holding *errPublicNodeLocalHolding
+	var pending *nodeLoadBalancerFirewallRelationPendingError
+	waiting := err != nil && strings.Contains(err.Error(), "waiting for")
+	if err != nil && !errors.As(err, &holding) && !errors.As(err, &pending) && !waiting {
+		t.Fatalf("pass %d: %v", pass, err)
+	}
+}
+
+// runUntil steps until the condition holds, checking the edge each pass.
+func runUntil(t *testing.T, f *publicNodeLocalTransientFixture, nodes []int, limit int, what string, cond func(publicNodeLocalObservation, *corev1.Service) bool) {
+	t.Helper()
+	for pass := 0; pass < limit; pass++ {
+		stepPublicNodeLocal(t, f, pass)
+		observed := requireTransitionEdgeSafe(t, f, pass, nodes...)
+		if cond(observed, f.current(t)) {
+			return
+		}
+	}
+	t.Fatalf("%s: never reached: %#v %#v", what, observePublicNodeLocal(t, f), f.current(t).Annotations)
+}
+
+// Going back to the active pool in the middle of a switch drops the target only.
+func TestPublicNodeLocalTransitionRevertPrunesTargetOnly(t *testing.T) {
+	f := newPublishedPublicNodeLocalFixtureN(t, 1)
+	f.addNode(t, 1)
+	moveFixtureNodeToPool(t, f, 1, "spe-relay-share")
+	_, vmA, privA, pubA := publicNodeLocalFixtureNode(0)
+	_, vmB, privB, pubB := publicNodeLocalFixtureNode(1)
+	updatePublicNodeLocalFixtureService(t, f, func(s *corev1.Service) { s.Annotations[annotationNodeLoadBalancerPool] = "spe-relay-share" })
+	runUntil(t, f, []int{0, 1}, 80, "both pools published", func(o publicNodeLocalObservation, s *corev1.Service) bool {
+		return o.fips[pubA] && o.fips[pubB] && s.Annotations[annotationPublicNodeLocalTargetPool] != ""
+	})
+	updatePublicNodeLocalFixtureService(t, f, func(s *corev1.Service) { s.Annotations[annotationNodeLoadBalancerPool] = "edge" })
+	runUntil(t, f, []int{0, 1}, 120, "the target is pruned", func(o publicNodeLocalObservation, s *corev1.Service) bool {
+		return s.Annotations[annotationPublicNodeLocalTargetPool] == "" && !o.fips[pubB] && !o.vips[privB] && !o.assigned[vmB]
+	})
+	observed := observePublicNodeLocal(t, f)
+	if !observed.fips[pubA] || !observed.vips[privA] || !observed.assigned[vmA] {
+		t.Fatalf("the active pool node was touched: %#v", observed)
+	}
+	for _, entry := range f.api.unassignedFirewalls {
+		if strings.HasSuffix(entry, "/"+vmA) {
+			t.Fatalf("the active pool node was unassigned: %v", f.api.unassignedFirewalls)
+		}
+	}
+	if got := f.current(t).Annotations[annotationPublicNodeLocalActivePool]; got != "edge" {
+		t.Fatalf("active pool = %q", got)
+	}
+}
+
+// Reverting a policy change in the middle hands the ledger back to the active
+// firewall and retires the target firewall.
+func TestPublicNodeLocalPolicyChangeRevertRestoresActiveFirewall(t *testing.T) {
+	f := newPublishedPublicNodeLocalFixtureN(t, 2)
+	old := f.current(t).Annotations[annotationNodeLoadBalancerFirewallUUID]
+	oldHash := f.current(t).Annotations[annotationPublicNodeLocalActivePolicy]
+	vm1 := "11111111-2222-4333-8444-555555555555"
+	setPublicNodeLocalFixturePorts(t, f, 443, 8443)
+	runUntil(t, f, []int{0, 1}, 80, "the target firewall is attached", func(o publicNodeLocalObservation, s *corev1.Service) bool {
+		return s.Annotations[annotationPublicNodeLocalTargetPolicy] != "" && s.Annotations[annotationNodeLoadBalancerFirewallUUID] != old &&
+			len(firewallsOfVM(f, vm1)) == 2
+	})
+	setPublicNodeLocalFixturePorts(t, f, 443)
+	runUntil(t, f, []int{0, 1}, 200, "the old policy is restored", func(o publicNodeLocalObservation, s *corev1.Service) bool {
+		return s.Annotations[annotationPublicNodeLocalTargetPolicy] == "" && s.Annotations[annotationNodeLoadBalancerFirewallUUID] == old &&
+			s.Annotations[annotationNodeLoadBalancerPreviousFirewall] == "" &&
+			publicNodeLocalDatapathMatches(trackedPublicNodeLocalDatapath(t, f), s, s.Annotations[annotationPublicNodeLocalActivePool])
+	})
+	current := f.current(t)
+	if current.Annotations[annotationPublicNodeLocalActivePolicy] != oldHash || len(firewallsOfVM(f, vm1)) != 1 {
+		t.Fatalf("the active policy did not come back: %#v", current.Annotations)
+	}
+}
+
+// A third pool in the middle of a switch first ends the union, then starts a
+// new one, and the active pool is never withdrawn.
+func TestPublicNodeLocalTransitionRetargetAbortsThenStartsAgain(t *testing.T) {
+	f := newPublishedPublicNodeLocalFixtureN(t, 1)
+	f.addNode(t, 1)
+	f.addNode(t, 2)
+	moveFixtureNodeToPool(t, f, 1, "pool-b")
+	moveFixtureNodeToPool(t, f, 2, "pool-c")
+	_, vmA, _, pubA := publicNodeLocalFixtureNode(0)
+	_, _, _, pubB := publicNodeLocalFixtureNode(1)
+	_, _, _, pubC := publicNodeLocalFixtureNode(2)
+	updatePublicNodeLocalFixtureService(t, f, func(s *corev1.Service) { s.Annotations[annotationNodeLoadBalancerPool] = "pool-b" })
+	runUntil(t, f, []int{0, 1, 2}, 80, "the first union", func(o publicNodeLocalObservation, s *corev1.Service) bool {
+		return o.fips[pubB] && s.Annotations[annotationPublicNodeLocalTargetPool] == "pool-b"
+	})
+	updatePublicNodeLocalFixtureService(t, f, func(s *corev1.Service) { s.Annotations[annotationNodeLoadBalancerPool] = "pool-c" })
+	sawAbort, sawC := false, false
+	runUntil(t, f, []int{0, 1, 2}, 400, "the switch to pool C", func(o publicNodeLocalObservation, s *corev1.Service) bool {
+		if s.Annotations[annotationPublicNodeLocalTargetPool] == "" && s.Annotations[annotationPublicNodeLocalActivePool] == "edge" {
+			sawAbort = true
+		}
+		if o.fips[pubC] && o.fips[pubA] {
+			sawC = true
+		}
+		return s.Annotations[annotationPublicNodeLocalActivePool] == "pool-c" && s.Annotations[annotationPublicNodeLocalTargetPool] == "" &&
+			!o.fips[pubA] && !o.assigned[vmA] && !o.fips[pubB]
+	})
+	if !sawAbort || !sawC {
+		t.Fatalf("abort seen %t, union with C seen %t", sawAbort, sawC)
+	}
+}
+
+// A pool and a policy changing together use the same tuple: the new firewall
+// goes to the target pool only, and the old one stays on the old pool.
+func TestPublicNodeLocalPoolAndPolicyChangeTogether(t *testing.T) {
+	f := newPublishedPublicNodeLocalFixtureN(t, 1)
+	f.addNode(t, 1)
+	moveFixtureNodeToPool(t, f, 1, "spe-relay-share")
+	old := f.current(t).Annotations[annotationNodeLoadBalancerFirewallUUID]
+	_, vmA, privA, pubA := publicNodeLocalFixtureNode(0)
+	_, vmB, _, pubB := publicNodeLocalFixtureNode(1)
+	setPublicNodeLocalFixturePorts(t, f, 443, 8443)
+	updatePublicNodeLocalFixtureService(t, f, func(s *corev1.Service) { s.Annotations[annotationNodeLoadBalancerPool] = "spe-relay-share" })
+	sawUnion := false
+	runUntil(t, f, []int{0, 1}, 300, "the combined change", func(o publicNodeLocalObservation, s *corev1.Service) bool {
+		if o.fips[pubA] && o.fips[pubB] {
+			sawUnion = true
+			if firewallsOfVM(f, vmB)[old] {
+				t.Fatalf("the old firewall went to the target pool VM")
+			}
+		}
+		return s.Annotations[annotationPublicNodeLocalActivePool] == "spe-relay-share" && s.Annotations[annotationPublicNodeLocalTargetPool] == "" &&
+			s.Annotations[annotationNodeLoadBalancerPreviousFirewall] == "" && !o.fips[pubA] && !o.vips[privA] && !o.assigned[vmA] &&
+			publicNodeLocalDatapathMatches(trackedPublicNodeLocalDatapath(t, f), s, "spe-relay-share")
+	})
+	if !sawUnion {
+		t.Fatal("both pools were never published together")
+	}
+	for _, firewall := range f.api.firewalls {
+		if firewall.UUID == old {
+			t.Fatal("the old firewall was not deleted")
+		}
+	}
+}
+
+// listFirewallsFailingAPI fails every firewall list and passes the rest on.
+type listFirewallsFailingAPI struct {
+	API
+	err error
+}
+
+func (a *listFirewallsFailingAPI) ListFirewalls(context.Context, string) ([]inspace.Firewall, error) {
+	return nil, a.err
+}
+
+// restartPublicNodeLocalController replaces the controller by a fresh one over
+// the same cluster and cloud, as a crash and restart would.
+func restartPublicNodeLocalController(f *publicNodeLocalTransientFixture) {
+	controller := &nodeLoadBalancerController{
+		provider:       f.provider,
+		queue:          workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]()),
+		endpointSlices: f.controller.endpointSlices,
+	}
+	f.controller = controller
+}
+
+type publicNodeLocalTransitionScenario struct {
+	name  string
+	nodes []int
+	setup func(*testing.T) *publicNodeLocalTransientFixture
+	done  func(*testing.T, *publicNodeLocalTransientFixture) bool
+}
+
+func publicNodeLocalTransitionScenarios() []publicNodeLocalTransitionScenario {
+	twoPools := func(t *testing.T, shape func(*corev1.Service)) *publicNodeLocalTransientFixture {
+		f := newPublishedPublicNodeLocalFixtureWith(t, 1, shape)
+		f.addNode(t, 1)
+		moveFixtureNodeToPool(t, f, 1, "spe-relay-share")
+		return f
+	}
+	poolDone := func(t *testing.T, f *publicNodeLocalTransientFixture) bool {
+		_, vmA, privA, pubA := publicNodeLocalFixtureNode(0)
+		o := observePublicNodeLocal(t, f)
+		s := f.current(t)
+		return s.Annotations[annotationPublicNodeLocalActivePool] == "spe-relay-share" && s.Annotations[annotationPublicNodeLocalTargetPool] == "" &&
+			s.Annotations[annotationNodeLoadBalancerPreviousFirewall] == "" && !o.fips[pubA] && !o.vips[privA] && !o.assigned[vmA] &&
+			publicNodeLocalDatapathMatches(trackedPublicNodeLocalDatapath(t, f), s, "spe-relay-share")
+	}
+	policyDone := func(oldHash string) func(*testing.T, *publicNodeLocalTransientFixture) bool {
+		return func(t *testing.T, f *publicNodeLocalTransientFixture) bool {
+			s := f.current(t)
+			return s.Annotations[annotationPublicNodeLocalActivePolicy] != oldHash && s.Annotations[annotationPublicNodeLocalTargetPolicy] == "" &&
+				s.Annotations[annotationNodeLoadBalancerPreviousFirewall] == "" && !publicNodeLocalAssignmentFencePresent(s) &&
+				publicNodeLocalDatapathMatches(trackedPublicNodeLocalDatapath(t, f), s, s.Annotations[annotationPublicNodeLocalActivePool])
+		}
+	}
+	return []publicNodeLocalTransitionScenario{
+		{name: "pool switch", nodes: []int{0, 1}, setup: func(t *testing.T) *publicNodeLocalTransientFixture {
+			f := twoPools(t, nil)
+			updatePublicNodeLocalFixtureService(t, f, func(s *corev1.Service) { s.Annotations[annotationNodeLoadBalancerPool] = "spe-relay-share" })
+			return f
+		}, done: poolDone},
+		{name: "widening", nodes: []int{0, 1}, setup: func(t *testing.T) *publicNodeLocalTransientFixture {
+			f := newPublishedPublicNodeLocalFixtureN(t, 2)
+			setPublicNodeLocalFixturePorts(t, f, 443, 8443)
+			return f
+		}, done: func(t *testing.T, f *publicNodeLocalTransientFixture) bool { return policyDone("886b49b4")(t, f) }},
+		{name: "narrowing", nodes: []int{0, 1}, setup: func(t *testing.T) *publicNodeLocalTransientFixture {
+			f := newPublishedPublicNodeLocalFixtureWith(t, 2, shapePublicNodeLocalPorts(443, 80))
+			setPublicNodeLocalFixturePorts(t, f, 443)
+			return f
+		}, done: func(t *testing.T, f *publicNodeLocalTransientFixture) bool {
+			return policyDone("")(t, f) && len(childPortSet(trackedPublicNodeLocalDatapath(t, f))) == 1
+		}},
+		{name: "pool and policy", nodes: []int{0, 1}, setup: func(t *testing.T) *publicNodeLocalTransientFixture {
+			f := twoPools(t, nil)
+			setPublicNodeLocalFixturePorts(t, f, 443, 8443)
+			updatePublicNodeLocalFixtureService(t, f, func(s *corev1.Service) { s.Annotations[annotationNodeLoadBalancerPool] = "spe-relay-share" })
+			return f
+		}, done: poolDone},
+	}
+}
+
+// A restart at any step of a transition resumes or rolls back safely: the edge
+// is never empty and the transition still completes. The same holds when the
+// first pass after the restart meets one definite firewall list error.
+func TestPublicNodeLocalTransitionResumesAfterRestartAtEveryStep(t *testing.T) {
+	for _, scenario := range publicNodeLocalTransitionScenarios() {
+		t.Run(scenario.name, func(t *testing.T) {
+			probe := scenario.setup(t)
+			steps := 0
+			for ; steps < 400; steps++ {
+				stepPublicNodeLocal(t, probe, steps)
+				requireTransitionEdgeSafe(t, probe, steps, scenario.nodes...)
+				if scenario.done(t, probe) {
+					break
+				}
+			}
+			if steps >= 400 {
+				t.Fatalf("the scenario never completed without a restart: %#v", probe.current(t).Annotations)
+			}
+			for restartAt := 0; restartAt <= steps; restartAt++ {
+				for _, injectError := range []bool{false, true} {
+					f := scenario.setup(t)
+					for pass := 0; pass < restartAt; pass++ {
+						stepPublicNodeLocal(t, f, pass)
+					}
+					restartPublicNodeLocalController(f)
+					completed := false
+					for pass := 0; pass < 400 && !completed; pass++ {
+						if injectError && pass == 0 {
+							real := f.provider.api
+							f.provider.api = &listFirewallsFailingAPI{API: real, err: errors.New("definite list failure")}
+							stepPublicNodeLocal(t, f, pass)
+							f.provider.api = real
+						} else {
+							stepPublicNodeLocal(t, f, pass)
+						}
+						requireTransitionEdgeSafe(t, f, restartAt*1000+pass, scenario.nodes...)
+						completed = scenario.done(t, f)
+					}
+					if !completed {
+						t.Fatalf("restart at %d (error %t): never completed: %#v", restartAt, injectError, f.current(t).Annotations)
+					}
+				}
+			}
+		})
+	}
+}
+
+// A single provider call that fails in any pass of a transition must leave the
+// edge safe and never empty, and the transition must finish once the provider
+// recovers. The calls of every pass are counted first, so none is skipped.
+func TestPublicNodeLocalTransitionSurvivesNthProviderFailure(t *testing.T) {
+	definite := errors.New("canonical ownership mismatch")
+	for _, scenario := range publicNodeLocalTransitionScenarios() {
+		probe := scenario.setup(t)
+		steps := 0
+		for ; steps < 400; steps++ {
+			stepPublicNodeLocal(t, probe, steps)
+			if scenario.done(t, probe) {
+				break
+			}
+		}
+		for pass := 0; pass < steps; pass++ {
+			for _, kind := range []string{"GetVM", "ListFirewalls"} {
+				counted := scenario.setup(t)
+				for i := 0; i < pass; i++ {
+					stepPublicNodeLocal(t, counted, i)
+				}
+				base := counted.provider.api
+				counter := &nthCallAPI{API: base, calls: map[string]int{}}
+				counted.provider.api = counter
+				_ = counted.controller.syncPublicNodeLocal(counted.ctx, counted.key, counted.current(t))
+				total := counter.calls[kind]
+				for n := 1; n <= total; n++ {
+					for _, transient := range []bool{true, false} {
+						name := fmt.Sprintf("%s/pass %d/%s call %d/transient=%t", scenario.name, pass, kind, n, transient)
+						t.Run(name, func(t *testing.T) {
+							f := scenario.setup(t)
+							for i := 0; i < pass; i++ {
+								stepPublicNodeLocal(t, f, i)
+							}
+							failure := definite
+							if transient {
+								failure = transientProviderError()
+							}
+							base := f.provider.api
+							failing := &nthCallAPI{API: base, failKind: kind, failOn: n, err: failure, calls: map[string]int{}}
+							f.provider.api = failing
+							err := f.controller.syncPublicNodeLocal(f.ctx, f.key, f.current(t))
+							f.provider.api = base
+							var holding *errPublicNodeLocalHolding
+							var pending *nodeLoadBalancerFirewallRelationPendingError
+							if err != nil && transient && !inspace.IsTransient(err) {
+								t.Fatalf("a transient failure became definite: %v", err)
+							}
+							if err != nil && !transient && !errors.As(err, &holding) && !errors.As(err, &pending) &&
+								!strings.Contains(err.Error(), "waiting for") {
+								t.Fatalf("a definite failure was not held: %v", err)
+							}
+							requireTransitionEdgeSafe(t, f, pass, scenario.nodes...)
+							for i := 0; i < 400 && !scenario.done(t, f); i++ {
+								stepPublicNodeLocal(t, f, i)
+								requireTransitionEdgeSafe(t, f, i, scenario.nodes...)
+							}
+							if !scenario.done(t, f) {
+								t.Fatalf("the transition never finished after the failure: %#v", f.current(t).Annotations)
+							}
+						})
+					}
+				}
+			}
+		}
+	}
 }

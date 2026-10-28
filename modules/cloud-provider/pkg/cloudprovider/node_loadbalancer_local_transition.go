@@ -534,6 +534,19 @@ func (c *nodeLoadBalancerController) abortPublicNodeLocalTransition(
 		}
 		delete(copy.Annotations, annotationPublicNodeLocalTargetPool)
 		delete(copy.Annotations, annotationPublicNodeLocalTargetPolicy)
+		if restore != nil {
+			// The assignment intent named the target firewall, which is retired now.
+			// Nothing is assigned under it any more; a stale receipt is resolved by
+			// the relation fence as usual.
+			for _, fenceKey := range []string{
+				annotationNodeLoadBalancerFirewallAssigning,
+				annotationNodeLoadBalancerFirewallAssignAt,
+				annotationPublicNodeLocalAssignPolicy,
+				annotationPublicNodeLocalAssignVMs,
+			} {
+				delete(copy.Annotations, fenceKey)
+			}
+		}
 		return true, nil
 	})
 	if err != nil {

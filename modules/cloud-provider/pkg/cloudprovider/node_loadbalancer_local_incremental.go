@@ -27,6 +27,31 @@ const (
 	publicNodeLocalReasonAwaitingConfirmation = "PublicNodeLocalAwaitingConfirmation"
 )
 
+// unverifiedCauses joins why Nodes could not be verified, in Node name order, so
+// a hold keeps a transient cause visible and is deferred like any transient error.
+func (s publicNodeLocalNodeSet) unverifiedCauses() error {
+	names := make([]string, 0, len(s.Unverified))
+	for name := range s.Unverified {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	causes := make([]error, 0, len(names))
+	for _, name := range names {
+		causes = append(causes, s.Unverified[name])
+	}
+	return errors.Join(causes...)
+}
+
+// holdCause is why a pass holds. A Node that could not be verified is the
+// better reason: a transient cause behind it stays visible and the pass is
+// deferred, where a plain waiting message would turn it into a definite hold.
+func (s publicNodeLocalNodeSet) holdCause(waiting error) error {
+	if len(s.Unverified) != 0 {
+		return s.unverifiedCauses()
+	}
+	return waiting
+}
+
 func (c *nodeLoadBalancerController) publicNodeLocalClock() time.Time {
 	if c.publicNodeLocalNow != nil {
 		return c.publicNodeLocalNow().UTC()
@@ -224,7 +249,8 @@ func (c *nodeLoadBalancerController) convergeActivePublicNodeLocal(
 			return c.holdOrFailPublicNodeLocal(ctx, service, err)
 		}
 		if waiting {
-			return c.holdOrFailPublicNodeLocal(ctx, service, errors.New("public-node-local: active Service firewall is not authoritatively ready"))
+			return c.holdOrFailPublicNodeLocal(ctx, service, nodes.holdCause(
+				errors.New("public-node-local: active Service firewall is not authoritatively ready")))
 		}
 	}
 	if service.Annotations[annotationNodeLoadBalancerFirewallRelationIssued] != "" ||
@@ -629,8 +655,8 @@ func (c *nodeLoadBalancerController) convergeActivePublicNodeLocal(
 		// Every Node of the target pool is on the edge now. It must be a pool
 		// that serves at all: promoting an empty one would take the edge away.
 		if len(targetReady) == 0 {
-			return c.holdPendingPublicNodeLocalTransition(ctx, service, errors.New(
-				"public-node-local: the target pool has no Ready Node with a local endpoint yet; the active exposure stays"))
+			return c.holdPendingPublicNodeLocalTransition(ctx, service, nodes.holdCause(errors.New(
+				"public-node-local: the target pool has no Ready Node with a local endpoint yet; the active exposure stays")))
 		}
 		if err := c.verifyActivePublicNodeLocalPublication(ctx, service, intent, desired, firewall.UUID, targetReady); err != nil {
 			return c.holdOrFailPublicNodeLocal(ctx, service, err)
@@ -658,16 +684,7 @@ func (c *nodeLoadBalancerController) convergeActivePublicNodeLocal(
 	}
 
 	if len(nodes.Unverified) != 0 {
-		names := make([]string, 0, len(nodes.Unverified))
-		for name := range nodes.Unverified {
-			names = append(names, name)
-		}
-		sort.Strings(names)
-		causes := make([]error, 0, len(names))
-		for _, name := range names {
-			causes = append(causes, nodes.Unverified[name])
-		}
-		return c.holdOrFailPublicNodeLocal(ctx, service, errors.Join(causes...))
+		return c.holdOrFailPublicNodeLocal(ctx, service, nodes.unverifiedCauses())
 	}
 	return nil
 }
