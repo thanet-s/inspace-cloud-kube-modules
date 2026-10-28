@@ -305,6 +305,7 @@ func TestPublicNodeLocalClassifyNodes(t *testing.T) {
 		name        string
 		mutate      func(*fakeAPI, *corev1.Node)
 		getVMErr    error
+		wrapAPI     func(*fakeAPI) API
 		noNode      bool
 		noEndpoint  bool
 		publishedIP string
@@ -337,8 +338,17 @@ func TestPublicNodeLocalClassifyNodes(t *testing.T) {
 		{name: "metadata mismatch", unverified: []string{"edge-classify"}, mutate: func(api *fakeAPI, _ *corev1.Node) {
 			api.floatingIPs[0].Address = "203.0.113.99"
 		}},
-		{name: "foreign billing account", notEligible: []string{"edge-classify"}, mutate: func(api *fakeAPI, _ *corev1.Node) {
+		{name: "foreign billing account", gone: []string{"edge-classify"}, mutate: func(api *fakeAPI, _ *corev1.Node) {
 			api.vms[0].BillingAccountID = 99
+		}},
+		{name: "node excluded from load balancers", gone: []string{"edge-classify"}, mutate: func(_ *fakeAPI, node *corev1.Node) {
+			node.Labels[corev1.LabelNodeExcludeBalancers] = "true"
+		}},
+		{name: "control-plane node", gone: []string{"edge-classify"}, mutate: func(_ *fakeAPI, node *corev1.Node) {
+			node.Labels[nodeRoleControlPlaneLabel] = ""
+		}},
+		{name: "VM identity differs from the providerID", gone: []string{"edge-classify"}, wrapAPI: func(api *fakeAPI) API {
+			return &vmUUIDMismatchAPI{publicNodeLocalFilteringIPAPI: &publicNodeLocalFilteringIPAPI{fakeAPI: api}}
 		}},
 		{name: "node not ready", notEligible: []string{"edge-classify"}, mutate: func(_ *fakeAPI, node *corev1.Node) {
 			node.Status.Conditions[0].Status = corev1.ConditionFalse
@@ -362,6 +372,9 @@ func TestPublicNodeLocalClassifyNodes(t *testing.T) {
 			var providerAPI API = &publicNodeLocalFilteringIPAPI{fakeAPI: api}
 			if test.getVMErr != nil {
 				providerAPI = &managedNodeLoadBalancerVMReadErrorAPI{fakeAPI: api, err: test.getVMErr}
+			}
+			if test.wrapAPI != nil {
+				providerAPI = test.wrapAPI(api)
 			}
 			provider := newTestProvider(t, providerAPI)
 			objects := []runtime.Object{service.DeepCopy()}
@@ -965,4 +978,19 @@ func TestPublicNodeLocalIncumbentKeepsPortAgainstLowerUIDNewcomer(t *testing.T) 
 	if !loses || err == nil || !strings.Contains(err.Error(), "z-service-uid") {
 		t.Fatalf("newcomer conflict = loses:%t err:%v", loses, err)
 	}
+}
+
+// vmUUIDMismatchAPI answers every GetVM with another VM's identity.
+type vmUUIDMismatchAPI struct {
+	*publicNodeLocalFilteringIPAPI
+}
+
+func (a *vmUUIDMismatchAPI) GetVM(ctx context.Context, location, uuid string) (*inspace.VM, error) {
+	vm, err := a.publicNodeLocalFilteringIPAPI.GetVM(ctx, location, uuid)
+	if err != nil || vm == nil {
+		return vm, err
+	}
+	other := *vm
+	other.UUID = "99999999-2222-4333-8444-555555555555"
+	return &other, nil
 }

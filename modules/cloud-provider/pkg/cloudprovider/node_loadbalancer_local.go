@@ -605,8 +605,13 @@ func (c *nodeLoadBalancerController) classifyPublicNodeLocalNodesMode(
 			set.Gone[node.Name] = "the Node is being deleted"
 			continue
 		}
+		if nodeExcludedFromLoadBalancers(node) || nodeHasControlPlaneRole(node) {
+			// Both are explicit operator intent, so the Node leaves the edge.
+			set.Gone[node.Name] = "the Node is excluded from external load balancers or is a control-plane Node"
+			continue
+		}
 		if !loadBalancerNodeEligible(node) {
-			set.NotEligible[node.Name] = "the Node is not Ready or is excluded from load balancing"
+			set.NotEligible[node.Name] = "the Node is not Ready or is being disrupted"
 			continue
 		}
 		verdict, patched, authErr := c.authorizePublicNodeLocalNodeVerdict(ctx, node, intent.Pool, service)
@@ -784,13 +789,13 @@ func (c *nodeLoadBalancerController) authorizePublicNodeLocalNodeVerdict(
 		return unverified, false, wrapped
 	}
 	if vm == nil || vm.UUID != providerIdentity.UUID {
-		return notEligible("the VM identity does not match the providerID")
+		return gone("the VM identity does not match the providerID")
 	}
 	if strings.EqualFold(strings.TrimSpace(vm.Status), "deleted") {
 		return gone("the VM is deleted")
 	}
 	if vm.BillingAccountID != c.provider.config.BillingAccountID {
-		return notEligible("the VM belongs to another billing account")
+		return gone("the VM belongs to another billing account")
 	}
 	if vm.NetworkUUID != "" && !strings.EqualFold(vm.NetworkUUID, c.provider.config.NetworkUUID) {
 		return gone("the VM is outside the configured VPC")
@@ -919,7 +924,7 @@ func (c *nodeLoadBalancerController) authorizePublicNodeLocalNodeVerdict(
 	}
 	profile, profileFound, profileErr := unstructured.NestedString(nodeClass.Object, "spec", "firewallProfile")
 	if nodeClass.GetDeletionTimestamp() != nil || profileErr != nil || !profileFound || profile != publicNodeLocalFirewallProfile {
-		return notEligible("the InSpaceNodeClass is not a public-node-local class")
+		return gone("the InSpaceNodeClass is not a public-node-local class")
 	}
 	if err := c.validateBaseNodeClass(nodeClass); err != nil {
 		return unverified, false, fmt.Errorf("public-node-local: validate InSpaceNodeClass %s: %w", claimClassName, err)
