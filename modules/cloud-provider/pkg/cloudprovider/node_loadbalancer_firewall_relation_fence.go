@@ -247,6 +247,56 @@ func nodeLoadBalancerFirewallRelationRetireDue(fence nodeLoadBalancerFirewallRel
 	return !now.Before(issuedAt.Add(nodeLoadBalancerFirewallRelationRetireDelay)), nil
 }
 
+// nodeLoadBalancerFirewallRelationPendingError reports that a relation fence is
+// still waiting for cloud readback. It is a wait with a known end, not a
+// fault: the work item is requeued after retryAfter instead of backing off.
+type nodeLoadBalancerFirewallRelationPendingError struct {
+	message    string
+	retryAfter time.Duration
+}
+
+func (err *nodeLoadBalancerFirewallRelationPendingError) Error() string { return err.message }
+
+// nodeLoadBalancerRequeueDelay returns the fixed requeue delay of an error that
+// is a bounded wait. Other errors, including transient deferrals, keep the
+// rate-limited backoff.
+func nodeLoadBalancerRequeueDelay(err error) (time.Duration, bool) {
+	var pending *nodeLoadBalancerFirewallRelationPendingError
+	if errors.As(err, &pending) {
+		return pending.retryAfter, true
+	}
+	return 0, false
+}
+
+// nodeLoadBalancerFirewallRelationPendingRetry returns how long to wait before
+// the next readback of an unresolved receipt. It never exceeds the time that is
+// left before the receipt may be retired.
+func nodeLoadBalancerFirewallRelationPendingRetry(
+	existing nodeLoadBalancerFirewallRelationFence,
+	converged bool,
+	now time.Time,
+	absenceDelay time.Duration,
+) time.Duration {
+	wait := nodeLoadBalancerRetry
+	if issuedAt, err := time.Parse(time.RFC3339Nano, existing.issuedAt); err == nil {
+		if untilRetire := issuedAt.Add(nodeLoadBalancerFirewallRelationRetireDelay).Sub(now); untilRetire < wait {
+			wait = untilRetire
+		}
+	}
+	if existing.operation == nodeLoadBalancerFirewallRelationUnassign && converged {
+		// The second absence read is due once the first one is old enough.
+		observedAt := now
+		if parsed, err := time.Parse(time.RFC3339Nano, existing.absenceObservedAt); err == nil {
+			observedAt = parsed
+		}
+		wait = observedAt.Add(absenceDelay).Sub(now)
+	}
+	if wait <= 0 {
+		return time.Second
+	}
+	return wait
+}
+
 func sameNodeLoadBalancerFirewallRelationIssue(left, right nodeLoadBalancerFirewallRelationFence) bool {
 	return left.operation == right.operation &&
 		strings.EqualFold(left.firewallUUID, right.firewallUUID) &&
@@ -1066,6 +1116,7 @@ func (c *nodeLoadBalancerController) reconcileNodeLoadBalancerFirewallRelation(
 	var issuedFence *nodeLoadBalancerFirewallRelationFence
 	confirmRemovalImmediately := false
 	retryPreDispatchProofImmediately := false
+	pendingRetry := nodeLoadBalancerRetry
 	values := copyNodeLoadBalancerAnnotations(snapshot.annotations)
 	changed := false
 	existingValue := values[annotationNodeLoadBalancerFirewallRelationIssued]
@@ -1122,6 +1173,9 @@ func (c *nodeLoadBalancerController) reconcileNodeLoadBalancerFirewallRelation(
 			result = outcomeCleared
 		} else {
 			result = outcomePending
+			pendingRetry = nodeLoadBalancerFirewallRelationPendingRetry(
+				existing, converged, c.nodeLoadBalancerFirewallRelationTime(), c.nodeLoadBalancerFirewallRelationAbsenceDelay(),
+			)
 			confirmRemovalImmediately = existing.operation == nodeLoadBalancerFirewallRelationUnassign &&
 				converged && existing.absenceObservedAt == "" &&
 				c.nodeLoadBalancerFirewallRelationAbsenceDelay() == 0
@@ -1170,10 +1224,12 @@ func (c *nodeLoadBalancerController) reconcileNodeLoadBalancerFirewallRelation(
 						changed = true
 						readyToIssue = false
 						result = outcomePreDispatchProof
+						pendingRetry = max(c.nodeLoadBalancerFirewallRelationAbsenceDelay(), time.Second)
 						retryPreDispatchProofImmediately = c.nodeLoadBalancerFirewallRelationAbsenceDelay() == 0
 					} else if now.Before(observedAt.Add(c.nodeLoadBalancerFirewallRelationAbsenceDelay())) {
 						readyToIssue = false
 						result = outcomePreDispatchProof
+						pendingRetry = max(observedAt.Add(c.nodeLoadBalancerFirewallRelationAbsenceDelay()).Sub(now), time.Second)
 					} else {
 						issued.targetAbsentAt = observedAt.Format(time.RFC3339Nano)
 						delete(values, annotationNodeLoadBalancerFirewallRelationVMAbsent)
@@ -1239,13 +1295,19 @@ func (c *nodeLoadBalancerController) reconcileNodeLoadBalancerFirewallRelation(
 		}
 		return true, nil
 	case outcomePending:
-		return false, fmt.Errorf(
-			"node load balancer: %s firewall relation mutation %s remains ambiguous; waiting for authoritative cloud readback",
-			owner.description,
-			mustNodeLoadBalancerFirewallRelationFenceValue(owner, desired),
-		)
+		return false, &nodeLoadBalancerFirewallRelationPendingError{
+			message: fmt.Sprintf(
+				"node load balancer: %s firewall relation mutation %s remains ambiguous; waiting for authoritative cloud readback",
+				owner.description,
+				mustNodeLoadBalancerFirewallRelationFenceValue(owner, desired),
+			),
+			retryAfter: pendingRetry,
+		}
 	case outcomePreDispatchProof:
-		return false, errors.New("node load balancer: waiting for spaced exact VM-absence authority before firewall detach")
+		return false, &nodeLoadBalancerFirewallRelationPendingError{
+			message:    "node load balancer: waiting for spaced exact VM-absence authority before firewall detach",
+			retryAfter: pendingRetry,
+		}
 	case outcomeCleared:
 		// The cloud relationship was authoritatively re-read before this exact
 		// Kubernetes fence was cleared. Stop this pass: when desired is non-nil,

@@ -341,6 +341,12 @@ func (c *nodeLoadBalancerController) processNext(ctx context.Context) bool {
 		} else {
 			klog.ErrorS(err, "failed to reconcile InSpace node load balancer", "service", key)
 		}
+		if delay, fixed := nodeLoadBalancerRequeueDelay(err); fixed {
+			// A bounded wait has a known end, so it must not grow the backoff.
+			c.queue.Forget(key)
+			c.queue.AddAfter(key, delay)
+			return true
+		}
 		c.queue.AddRateLimited(key)
 		return true
 	}

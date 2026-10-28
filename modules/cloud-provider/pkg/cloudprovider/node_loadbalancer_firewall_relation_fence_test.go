@@ -574,6 +574,8 @@ func TestNodeLoadBalancerFirewallRelationTransientRemovalOmissionNeverReissues(t
 		ctx, withoutFirewallRelationCloudAuthorityForFenceTest(restarted.serviceFirewallRelationOwner(stored)), desired,
 	); err == nil || converged {
 		t.Fatalf("restarted unresolved relation did not stay read-only: converged=%t err=%v", converged, err)
+	} else if _, fixed := nodeLoadBalancerRequeueDelay(err); !fixed {
+		t.Fatalf("unresolved relation is not a bounded pending wait: %v", err)
 	}
 	if api.unassignCalls != 1 {
 		t.Fatalf("transient omission/reappearance reissued DELETE: calls=%d", api.unassignCalls)
@@ -613,6 +615,8 @@ func TestNodeLoadBalancerFirewallRelationUncommittedUnassignIsResentAfterRetireI
 	now = now.Add(nodeLoadBalancerAbsenceConfirmationDelay + time.Second)
 	if converged, err := controller.reconcileNodeLoadBalancerFirewallRelation(ctx, owner, desired); err == nil || converged {
 		t.Fatalf("early retry crossed the fence: converged=%t err=%v", converged, err)
+	} else if _, fixed := nodeLoadBalancerRequeueDelay(err); !fixed {
+		t.Fatalf("early retry is not a bounded pending wait: %v", err)
 	}
 	if api.unassignCalls != 1 {
 		t.Fatalf("early retry re-sent unassign: calls=%d", api.unassignCalls)
@@ -667,6 +671,9 @@ func TestNodeLoadBalancerFirewallDetachRequiresSpacedExactDeletedVMProof(t *test
 		)
 		if err == nil || converged || !strings.Contains(err.Error(), "spaced exact VM-absence") {
 			t.Fatalf("pre-delay deleted-VM proof %d = converged %t, err %v", attempt, converged, err)
+		}
+		if _, fixed := nodeLoadBalancerRequeueDelay(err); !fixed {
+			t.Fatalf("pre-delay deleted-VM proof %d is not a bounded pending wait: %v", attempt, err)
 		}
 		if len(api.unassignedFirewalls) != 0 {
 			t.Fatalf("pre-delay deleted-VM proof issued detach: %#v", api.unassignedFirewalls)
