@@ -35,10 +35,10 @@ const (
 	// annotationNodeLoadBalancerAllowRebuildConsumed is "<pool>/<policy hash>" of
 	// the target that the escape hatch was used for.
 	annotationNodeLoadBalancerAllowRebuildConsumed = "service.inspace.cloud/node-lb-allow-rebuild-consumed"
-	annotationNodeLoadBalancerNodesPerShard = "service.inspace.cloud/node-lb-nodes-per-shard"
-	annotationNodeLoadBalancerCPU           = "service.inspace.cloud/node-lb-cpu"
-	annotationNodeLoadBalancerMemory        = "service.inspace.cloud/node-lb-memory"
-	annotationNodeLoadBalancerShard         = "service.inspace.cloud/node-lb-shard"
+	annotationNodeLoadBalancerNodesPerShard        = "service.inspace.cloud/node-lb-nodes-per-shard"
+	annotationNodeLoadBalancerCPU                  = "service.inspace.cloud/node-lb-cpu"
+	annotationNodeLoadBalancerMemory               = "service.inspace.cloud/node-lb-memory"
+	annotationNodeLoadBalancerShard                = "service.inspace.cloud/node-lb-shard"
 
 	nodeLoadBalancerModeShared    = "public-node-shared"
 	nodeLoadBalancerModeDedicated = "public-node-dedicated"
