@@ -841,3 +841,243 @@ func TestPublicNodeLocalAllowRebuildAnnotationPermitsWithdrawAndRebuild(t *testi
 		t.Fatal("the old exposure was not withdrawn")
 	}
 }
+
+// nthCallAPI counts GetVM and ListFirewalls calls and fails the Nth call of
+// one kind. A zero failOn only counts.
+type nthCallAPI struct {
+	API
+	failKind string
+	failOn   int
+	err      error
+	calls    map[string]int
+}
+
+func (a *nthCallAPI) hit(kind string) error {
+	a.calls[kind]++
+	if kind == a.failKind && a.calls[kind] == a.failOn {
+		return a.err
+	}
+	return nil
+}
+
+func (a *nthCallAPI) GetVM(ctx context.Context, location, uuid string) (*inspace.VM, error) {
+	if err := a.hit("GetVM"); err != nil {
+		return nil, err
+	}
+	return a.API.GetVM(ctx, location, uuid)
+}
+
+func (a *nthCallAPI) ListFirewalls(ctx context.Context, location string) ([]inspace.Firewall, error) {
+	if err := a.hit("ListFirewalls"); err != nil {
+		return nil, err
+	}
+	return a.API.ListFirewalls(ctx, location)
+}
+
+// nthSweepScenario is one pass of an add or a remove sequence.
+type nthSweepScenario struct {
+	name string
+	// setup builds the fixture and moves it to the start of the sequence.
+	setup func(*testing.T) *publicNodeLocalTransientFixture
+	// done reports that the sequence is complete.
+	done func(*testing.T, *publicNodeLocalTransientFixture) bool
+	// safe checks the invariants that must hold after every pass.
+	safe func(*testing.T, *publicNodeLocalTransientFixture)
+}
+
+func newNthAddScenario() nthSweepScenario {
+	_, vm2, priv2, pub2 := publicNodeLocalFixtureNode(1)
+	_, _, priv1, pub1 := publicNodeLocalFixtureNode(0)
+	return nthSweepScenario{
+		name: "add",
+		setup: func(t *testing.T) *publicNodeLocalTransientFixture {
+			f := newPublishedPublicNodeLocalFixtureN(t, 1)
+			f.addNode(t, 1)
+			return f
+		},
+		done: func(t *testing.T, f *publicNodeLocalTransientFixture) bool {
+			o := observePublicNodeLocal(t, f)
+			return o.fips[pub2] && o.vips[priv2] && o.assigned[vm2] && !publicNodeLocalAssignmentFencePresent(f.current(t))
+		},
+		safe: func(t *testing.T, f *publicNodeLocalTransientFixture) {
+			o := observePublicNodeLocal(t, f)
+			if !o.fips[pub1] || !o.vips[priv1] {
+				t.Fatalf("the serving node left the edge: %#v", o)
+			}
+			if len(f.api.unassignedFirewalls) != 0 {
+				t.Fatalf("a firewall was detached: %v", f.api.unassignedFirewalls)
+			}
+			o.requireMakeBeforeBreak(t, -1, 1)
+		},
+	}
+}
+
+func newNthRemoveScenario() nthSweepScenario {
+	name2, vm2, priv2, pub2 := publicNodeLocalFixtureNode(1)
+	_, vm1, priv1, pub1 := publicNodeLocalFixtureNode(0)
+	return nthSweepScenario{
+		name: "remove",
+		setup: func(t *testing.T) *publicNodeLocalTransientFixture {
+			f := newPublishedPublicNodeLocalFixtureN(t, 2)
+			if err := f.provider.kubeClient.CoreV1().Nodes().Delete(f.ctx, name2, metav1.DeleteOptions{}); err != nil {
+				t.Fatal(err)
+			}
+			f.setEndpoints(t, "edge-0")
+			return f
+		},
+		done: func(t *testing.T, f *publicNodeLocalTransientFixture) bool {
+			o := observePublicNodeLocal(t, f)
+			return !o.fips[pub2] && !o.vips[priv2] && !o.assigned[vm2]
+		},
+		safe: func(t *testing.T, f *publicNodeLocalTransientFixture) {
+			o := observePublicNodeLocal(t, f)
+			if !o.fips[pub1] || !o.vips[priv1] || !o.assigned[vm1] {
+				t.Fatalf("the remaining node left the edge: %#v", o)
+			}
+			if len(f.api.unassignedFirewalls) != 0 && o.fips[pub2] {
+				t.Fatalf("the firewall was detached while the FIP was still published: %#v", o)
+			}
+			if !o.vips[priv2] && o.assigned[vm2] {
+				t.Fatalf("the child VIP left before the firewall was detached: %#v", o)
+			}
+		},
+	}
+}
+
+// A single provider call that fails in any pass of an add or a remove must leave
+// the edge safe, and the sequence must finish once the provider recovers. The
+// number of calls is measured first, so every call of every pass is covered and
+// nothing is skipped.
+func TestPublicNodeLocalIncrementalSequencesSurviveNthProviderFailure(t *testing.T) {
+	definite := errors.New("canonical ownership mismatch")
+	for _, scenario := range []nthSweepScenario{newNthAddScenario(), newNthRemoveScenario()} {
+		for pass := 0; pass < 5; pass++ {
+			for _, kind := range []string{"GetVM", "ListFirewalls"} {
+				// Measure the calls of this pass on a clean run.
+				probe := scenario.setup(t)
+				runPublicNodeLocalPasses(t, probe, pass, nil)
+				base := probe.provider.api
+				counter := &nthCallAPI{API: base, calls: map[string]int{}}
+				probe.provider.api = counter
+				_ = probe.controller.syncPublicNodeLocal(probe.ctx, probe.key, probe.current(t))
+				total := counter.calls[kind]
+				for n := 1; n <= total; n++ {
+					for _, transient := range []bool{true, false} {
+						name := fmt.Sprintf("%s/pass %d/%s call %d/transient=%t", scenario.name, pass, kind, n, transient)
+						t.Run(name, func(t *testing.T) {
+							f := scenario.setup(t)
+							runPublicNodeLocalPasses(t, f, pass, nil)
+							failure := definite
+							if transient {
+								failure = transientProviderError()
+							}
+							base := f.provider.api
+							failing := &nthCallAPI{API: base, failKind: kind, failOn: n, err: failure, calls: map[string]int{}}
+							f.provider.api = failing
+							err := f.controller.syncPublicNodeLocal(f.ctx, f.key, f.current(t))
+							f.provider.api = base
+							if failing.calls[kind] < n {
+								t.Fatalf("the pass made only %d %s calls, the probe saw %d", failing.calls[kind], kind, total)
+							}
+							var holding *errPublicNodeLocalHolding
+							var pending *nodeLoadBalancerFirewallRelationPendingError
+							if err != nil && transient && !inspace.IsTransient(err) {
+								t.Fatalf("a transient failure became definite: %v", err)
+							}
+							if err != nil && !transient && !errors.As(err, &holding) && !errors.As(err, &pending) {
+								t.Fatalf("a definite failure was not held: %v", err)
+							}
+							scenario.safe(t, f)
+							// The provider recovers and the sequence finishes.
+							runPublicNodeLocalPasses(t, f, 60, func() bool {
+								scenario.safe(t, f)
+								return scenario.done(t, f)
+							})
+							if !scenario.done(t, f) {
+								t.Fatalf("the sequence never finished after the failure: %#v", observePublicNodeLocal(t, f))
+							}
+						})
+					}
+				}
+			}
+		}
+	}
+}
+
+func setPublicNodeLocalFixtureAssignFence(t *testing.T, f *publicNodeLocalTransientFixture, assignAt time.Time) {
+	t.Helper()
+	current := f.current(t)
+	_, vm1, _, _ := publicNodeLocalFixtureNode(0)
+	updatePublicNodeLocalFixtureService(t, f, func(s *corev1.Service) {
+		s.Annotations[annotationNodeLoadBalancerFirewallAssigning] = current.Annotations[annotationNodeLoadBalancerFirewallUUID]
+		s.Annotations[annotationNodeLoadBalancerFirewallAssignAt] = assignAt.UTC().Format(time.RFC3339Nano)
+		s.Annotations[annotationPublicNodeLocalAssignPolicy] = current.Annotations[annotationPublicNodeLocalActivePolicy]
+		s.Annotations[annotationPublicNodeLocalAssignVMs] = vm1
+	})
+}
+
+// A Service that is already published with its assignment fence still present
+// (the process stopped between the publication and the fence clearance) clears
+// the fence and keeps serving.
+func TestPublicNodeLocalPublishedServiceWithFencePresentClearsFenceWithoutWithdraw(t *testing.T) {
+	for _, age := range []time.Duration{time.Second, 7 * time.Minute} {
+		t.Run(age.String(), func(t *testing.T) {
+			f := newPublishedPublicNodeLocalFixtureN(t, 1)
+			before := f.current(t)
+			setPublicNodeLocalFixtureAssignFence(t, f, time.Now().Add(-age))
+			if !publicNodeLocalAssignmentFencePresent(f.current(t)) {
+				t.Fatal("the fence was not installed")
+			}
+			runPublicNodeLocalPasses(t, f, 10, func() bool { return !publicNodeLocalAssignmentFencePresent(f.current(t)) })
+			after := f.current(t)
+			if publicNodeLocalAssignmentFencePresent(after) {
+				t.Fatalf("the fence stayed: %#v", after.Annotations)
+			}
+			if !reflect.DeepEqual(after.Status, before.Status) || len(f.api.unassignedFirewalls) != 0 {
+				t.Fatalf("the exposure changed: status=%#v unassigned=%v", after.Status, f.api.unassignedFirewalls)
+			}
+			if after.Annotations[annotationPublicNodeLocalActivePool] != "edge" {
+				t.Fatalf("the activation was lost: %#v", after.Annotations)
+			}
+		})
+	}
+}
+
+// Child repair must work while an assignment fence is unresolved: the fence
+// belongs to an add in flight, and the repair neither waits for it nor drops it.
+func TestPublicNodeLocalChildRepairProceedsWhileAssignmentFenceIsUnresolved(t *testing.T) {
+	f := newPublishedPublicNodeLocalFixtureN(t, 1)
+	f.addNode(t, 1)
+	_, vm2, priv2, pub2 := publicNodeLocalFixtureNode(1)
+	_, _, priv1, pub1 := publicNodeLocalFixtureNode(0)
+	// Run until the add holds its assignment fence but has not published yet.
+	fenced := false
+	for pass := 0; pass < 20 && !fenced; pass++ {
+		if err := f.controller.syncPublicNodeLocal(f.ctx, f.key, f.current(t)); err != nil {
+			t.Fatalf("pass %d: %v", pass, err)
+		}
+		fenced = publicNodeLocalAssignmentFencePresent(f.current(t)) && !observePublicNodeLocal(t, f).fips[pub2]
+	}
+	if !fenced {
+		t.Fatal("the add never reached an unresolved assignment fence")
+	}
+	if err := f.provider.kubeClient.CoreV1().Services(f.service.Namespace).Delete(f.ctx, nodeLoadBalancerDatapathName(f.service), metav1.DeleteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	for pass := 0; pass < 60; pass++ {
+		if err := f.controller.syncPublicNodeLocal(f.ctx, f.key, f.current(t)); err != nil {
+			t.Fatalf("repair pass %d: %v", pass, err)
+		}
+		o := observePublicNodeLocal(t, f)
+		if !o.fips[pub1] {
+			t.Fatalf("pass %d: the serving FIP left: %#v", pass, o)
+		}
+		if len(f.api.unassignedFirewalls) != 0 {
+			t.Fatalf("pass %d: a firewall was detached: %v", pass, f.api.unassignedFirewalls)
+		}
+		if o.fips[pub2] && o.vips[priv1] && o.vips[priv2] && o.assigned[vm2] && !publicNodeLocalAssignmentFencePresent(f.current(t)) {
+			return
+		}
+	}
+	t.Fatalf("the repair and the add never converged: %#v", observePublicNodeLocal(t, f))
+}

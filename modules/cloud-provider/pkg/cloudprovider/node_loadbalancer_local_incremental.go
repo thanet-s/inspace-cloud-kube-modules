@@ -309,8 +309,14 @@ func (c *nodeLoadBalancerController) convergeActivePublicNodeLocal(
 			removeGone[name] = struct{}{}
 		}
 	}
+	// An unverified Node stays wherever it already is: published, or part of the way
+	// through an add (firewall assigned or VIP present). Detaching a half-added Node
+	// on one odd answer would only undo the add and flap it.
 	for name := range nodes.Unverified {
-		if published(name) {
+		member := members[name]
+		_, assignedVM := assigned[member.vmUUID]
+		_, hasVIP := vips[member.private]
+		if published(name) || (member.vmUUID != "" && assignedVM) || (member.private != "" && hasVIP) {
 			keep[name] = struct{}{}
 		}
 	}
@@ -789,6 +795,12 @@ func (c *nodeLoadBalancerController) validateActivePublicNodeLocalAssignState(
 		}
 	}
 	if target == nil {
+		for name, cause := range nodes.Unverified {
+			if id, ok := nodeLoadBalancerVMUUID(nodes.Nodes[name]); ok && id == vmUUID {
+				// A cause that is only a missing cloud answer stays transient.
+				return cause
+			}
+		}
 		return fmt.Errorf("VM %s is not a current authorized local endpoint", vmUUID)
 	}
 	vips := publicNodeLocalIngressSet(datapath.Status.LoadBalancer)
@@ -899,6 +911,10 @@ func (c *nodeLoadBalancerController) verifyActivePublicNodeLocalPublication(
 		}
 		if _, ok := assigned[vmUUID]; !ok {
 			return fmt.Errorf("public-node-local: VM %s has no Service firewall after publication", vmUUID)
+		}
+		if cause, unverified := nodes.Unverified[address.Node.Name]; unverified {
+			// A cause that is only a missing cloud answer stays transient.
+			return cause
 		}
 		verified, ok := ready[address.Node.Name]
 		if !ok || !reflect.DeepEqual(
