@@ -246,6 +246,34 @@ func (c *nodeLoadBalancerController) retireRejectedServiceFirewallCreate(
 	if err != nil {
 		return err
 	}
+	return c.retireIssuedServiceFirewallCreate(ctx, service, token, issuedAt, notBefore, true)
+}
+
+// retireLateServiceFirewallCreate bounds a create receipt that nothing resolved:
+// no marker, no visible firewall. After the relation retire delay (the longest a
+// committed create can stay invisible) and the spaced absence readbacks, the
+// receipt is released and a later pass may issue the create again. A create
+// that commits even later leaves two firewalls with the deterministic name,
+// which ensureServiceFirewall reports as multiple firewalls and holds.
+func (c *nodeLoadBalancerController) retireLateServiceFirewallCreate(
+	ctx context.Context,
+	service *corev1.Service,
+	token, issuedAt string,
+) error {
+	issued, err := time.Parse(time.RFC3339Nano, issuedAt)
+	if err != nil {
+		return fmt.Errorf("node load balancer: invalid firewall create-issued timestamp: %w", err)
+	}
+	return c.retireIssuedServiceFirewallCreate(ctx, service, token, issuedAt, issued.Add(nodeLoadBalancerFirewallRelationRetireDelay), false)
+}
+
+func (c *nodeLoadBalancerController) retireIssuedServiceFirewallCreate(
+	ctx context.Context,
+	service *corev1.Service,
+	token, issuedAt string,
+	notBefore time.Time,
+	rejected bool,
+) error {
 	confirmed, _, err := c.recordFirewallAbsence(
 		ctx,
 		service,
@@ -258,6 +286,12 @@ func (c *nodeLoadBalancerController) retireRejectedServiceFirewallCreate(
 		return err
 	}
 	if !confirmed {
+		if !rejected {
+			return fmt.Errorf(
+				"node load balancer: Service firewall create attempt %s issued at %s remains ambiguous; waiting for deterministic-name adoption or the retire delay and spaced absence readbacks",
+				token, issuedAt,
+			)
+		}
 		return fmt.Errorf(
 			"node load balancer: Service firewall create attempt %s issued at %s was definitively rejected but remains ambiguous until spaced exact-name absence is proven; refusing a second paid create until then",
 			token, issuedAt,
@@ -266,7 +300,7 @@ func (c *nodeLoadBalancerController) retireRejectedServiceFirewallCreate(
 	_, _, err = c.updateExactParentService(ctx, service, func(copy *corev1.Service) (bool, error) {
 		if copy.Annotations[annotationNodeLoadBalancerPendingFWIssued] != token ||
 			copy.Annotations[annotationNodeLoadBalancerPendingFWIssuedAt] != issuedAt ||
-			copy.Annotations[annotationNodeLoadBalancerPendingFWRejected] != token ||
+			(rejected && copy.Annotations[annotationNodeLoadBalancerPendingFWRejected] != token) ||
 			copy.Annotations[annotationNodeLoadBalancerPendingFirewall] != "" {
 			return false, errors.New("node load balancer: Service firewall create receipt changed during rejection absence proof")
 		}

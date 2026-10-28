@@ -2209,11 +2209,9 @@ func (c *nodeLoadBalancerController) ensureServiceFirewall(ctx context.Context, 
 				return nil, "", false, c.retireRejectedServiceFirewallCreate(ctx, service, pendingIssued, pendingIssuedAt)
 			}
 			if pendingIssued != "" {
-				return nil, "", false, fmt.Errorf(
-					"node load balancer: Service firewall create attempt %s issued at %s remains ambiguous; waiting for deterministic-name adoption or operator resolution",
-					pendingIssued,
-					pendingIssuedAt,
-				)
+				// Kept inside the retire delay; released after it and two spaced
+				// absence readbacks, so a lost create cannot hold the Service forever.
+				return nil, "", false, c.retireLateServiceFirewallCreate(ctx, service, pendingIssued, pendingIssuedAt)
 			}
 			startedAt, parseErr := time.Parse(time.RFC3339Nano, pendingStarted)
 			if parseErr != nil {

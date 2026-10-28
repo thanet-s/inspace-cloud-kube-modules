@@ -1,6 +1,8 @@
 package cloudprovider
 
 import (
+	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -191,5 +193,70 @@ func TestServiceFirewallDefinitiveCreateRejectionRetriesAfterSpacedAbsence(t *te
 	}
 	if len(base.createdFirewalls) != 2 {
 		t.Fatalf("staged Service intent did not retry create: creates=%d annotations=%#v", len(base.createdFirewalls), stored.Annotations)
+	}
+}
+
+func ageServiceFirewallIssuedCreate(t *testing.T, ctx context.Context, provider *Provider, service *corev1.Service, age time.Duration) *corev1.Service {
+	t.Helper()
+	copy := service.DeepCopy()
+	copy.Annotations[annotationNodeLoadBalancerPendingFWIssuedAt] = time.Now().Add(-age).UTC().Format(time.RFC3339Nano)
+	updated, err := provider.kubeClient.CoreV1().Services(copy.Namespace).Update(ctx, copy, metav1.UpdateOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return updated
+}
+
+// An issued Service firewall create that never becomes visible is released
+// after the relation retire delay and two spaced absence readbacks. Before that
+// the receipt is kept, so no second paid create can be issued.
+func TestServiceFirewallIssuedCreateRetiresAfterRetireDelay(t *testing.T) {
+	ctx := context.Background()
+	service := nodeLoadBalancerTestService("service-late-create", "service-late-create-uid", corev1.ProtocolTCP, 443)
+	base := &fakeAPI{}
+	api := &nodeLoadBalancerPostErrorAPI{fakeAPI: base, createErr: errors.New("connection reset by peer")}
+	provider := newTestProvider(t, api)
+	provider.kubeClient = kubefake.NewSimpleClientset(service.DeepCopy())
+	controller := &nodeLoadBalancerController{provider: provider}
+
+	if _, _, _, err := controller.ensureServiceFirewall(ctx, service, nil); err == nil {
+		t.Fatal("the lost create returned no error")
+	}
+	stored := getNodeLoadBalancerTestService(t, ctx, provider, service.Namespace, service.Name)
+	if stored.Annotations[annotationNodeLoadBalancerPendingFWIssued] == "" || len(base.createdFirewalls) != 1 {
+		t.Fatalf("no issued receipt after the lost create: %#v creates=%d", stored.Annotations, len(base.createdFirewalls))
+	}
+	for attempt := 0; attempt < 3; attempt++ {
+		_, _, _, err := controller.ensureServiceFirewall(ctx, stored, nil)
+		if err == nil || !strings.Contains(err.Error(), "remains ambiguous") || len(base.createdFirewalls) != 1 {
+			t.Fatalf("early retry %d: err=%v creates=%d", attempt, err, len(base.createdFirewalls))
+		}
+		stored = getNodeLoadBalancerTestService(t, ctx, provider, service.Namespace, service.Name)
+	}
+
+	stored = ageServiceFirewallIssuedCreate(t, ctx, provider, stored, nodeLoadBalancerFirewallRelationRetireDelay+time.Second)
+	retired := false
+	for attempt := 0; attempt < 6 && !retired; attempt++ {
+		if stored.Annotations[annotationNodeLoadBalancerPendingFWChecked] != "" {
+			stored = ageNodeLoadBalancerAbsenceEvidence(t, ctx, provider, stored, annotationNodeLoadBalancerPendingFWChecked)
+		}
+		_, _, _, _ = controller.ensureServiceFirewall(ctx, stored, nil)
+		stored = getNodeLoadBalancerTestService(t, ctx, provider, service.Namespace, service.Name)
+		retired = stored.Annotations[annotationNodeLoadBalancerPendingFWIssued] == ""
+		if !retired && len(base.createdFirewalls) != 1 {
+			t.Fatalf("a second create was issued before the receipt retired: %d", len(base.createdFirewalls))
+		}
+	}
+	if !retired {
+		t.Fatalf("the receipt never retired: %#v", stored.Annotations)
+	}
+	// The create is issued again, once.
+	api.createErr = nil
+	for attempt := 0; attempt < 4; attempt++ {
+		_, _, _, _ = controller.ensureServiceFirewall(ctx, stored, nil)
+		stored = getNodeLoadBalancerTestService(t, ctx, provider, service.Namespace, service.Name)
+	}
+	if len(base.createdFirewalls) != 2 {
+		t.Fatalf("creates = %d, want exactly one more", len(base.createdFirewalls))
 	}
 }
