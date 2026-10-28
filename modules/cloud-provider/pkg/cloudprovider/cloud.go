@@ -3744,11 +3744,9 @@ func (p *Provider) reconcileLoadBalancer(ctx context.Context, service *corev1.Se
 	currentTargets := make(map[string]struct{}, len(lb.Targets))
 	for _, target := range lb.Targets {
 		currentTargets[target.TargetUUID] = struct{}{}
-		if _, wanted := desiredTargets[target.TargetUUID]; !wanted {
-			_, err := p.removeStandardNLBTarget(ctx, service, lb, target.TargetUUID)
-			return err
-		}
 	}
+	// Add before remove: a rollout must never leave the NLB without a target
+	// while each removal waits for its negative readbacks.
 	for _, uuid := range targetUUIDs {
 		if _, exists := currentTargets[uuid]; !exists {
 			refreshed, err := p.addStandardNLBTarget(ctx, service, lb, uuid)
@@ -3757,6 +3755,12 @@ func (p *Provider) reconcileLoadBalancer(ctx context.Context, service *corev1.Se
 			}
 			lb = refreshed
 			currentTargets[uuid] = struct{}{}
+		}
+	}
+	for _, target := range lb.Targets {
+		if _, wanted := desiredTargets[target.TargetUUID]; !wanted {
+			_, err := p.removeStandardNLBTarget(ctx, service, lb, target.TargetUUID)
+			return err
 		}
 	}
 
