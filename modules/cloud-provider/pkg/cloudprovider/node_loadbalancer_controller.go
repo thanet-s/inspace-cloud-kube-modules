@@ -730,8 +730,11 @@ func renderNodeLoadBalancerNodePoolManifest(name, nodeClassName string, shard no
 			"disruption": map[string]any{
 				"consolidateAfter":    "0s",
 				"consolidationPolicy": "WhenEmptyOrUnderutilized",
+				// Budget 0 stops voluntary disruption (drift, consolidation) of
+				// a load balancer node. Forced paths (deletion, interruption)
+				// are not budgeted and still work; operators roll a node by hand.
 				"budgets": []any{map[string]any{
-					"nodes": "10%",
+					"nodes": "0",
 				}},
 			},
 			"template": map[string]any{
@@ -742,7 +745,12 @@ func renderNodeLoadBalancerNodePoolManifest(name, nodeClassName string, shard no
 					nodeLoadBalancerModeLabel:      shard.Mode,
 				}},
 				"spec": map[string]any{
-					"expireAfter": "720h",
+					// A load balancer node owns a public IP, so replacing it
+					// changes the published address and drops customer traffic
+					// (NATS). Never expire it; roll nodes by hand. The CRD
+					// accepts "Never" and the API server stores it unchanged,
+					// so the exact spec readback stays stable.
+					"expireAfter": "Never",
 					"nodeClassRef": map[string]any{
 						"group": "karpenter.inspace.cloud", "kind": "InSpaceNodeClass", "name": nodeClassName,
 					},

@@ -697,10 +697,10 @@ func TestRenderNodeLoadBalancerManifests(t *testing.T) {
 		t.Fatalf("NodePool disruption.consolidationPolicy = %q", policy)
 	}
 	budgets, _, _ := unstructured.NestedSlice(nodePool.Object, "spec", "disruption", "budgets")
-	if len(budgets) != 1 || budgets[0].(map[string]any)["nodes"] != "10%" {
+	if len(budgets) != 1 || budgets[0].(map[string]any)["nodes"] != "0" {
 		t.Fatalf("NodePool disruption.budgets = %#v", budgets)
 	}
-	if expireAfter, _, _ := unstructured.NestedString(nodePool.Object, "spec", "template", "spec", "expireAfter"); expireAfter != "720h" {
+	if expireAfter, _, _ := unstructured.NestedString(nodePool.Object, "spec", "template", "spec", "expireAfter"); expireAfter != "Never" {
 		t.Fatalf("NodePool template.spec.expireAfter = %q", expireAfter)
 	}
 	labels, _, _ := unstructured.NestedStringMap(nodePool.Object, "spec", "template", "metadata", "labels")
