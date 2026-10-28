@@ -118,6 +118,11 @@ func (c *nodeLoadBalancerController) syncPublicNodeLocal(
 		))
 	}
 
+	if activePool != "" {
+		return c.convergeActivePublicNodeLocal(ctx, key, service, intent, desiredFirewall)
+	}
+	// Everything below is the bootstrap of a Service that is not serving yet.
+
 	addresses, patchedNode, err := c.publicNodeLocalAddresses(ctx, service, intent)
 	if err != nil {
 		return c.holdOrFailPublicNodeLocal(ctx, service, err)
@@ -559,6 +564,8 @@ type publicNodeLocalNodeSet struct {
 	Unverified      map[string]error
 	EndpointMissing map[string]nodeLoadBalancerAddress
 	NotEligible     map[string]string
+	// Nodes holds every listed Node by name, so callers can resolve identities.
+	Nodes map[string]*corev1.Node
 }
 
 // publicNodeLocalAddresses returns the Nodes that may be published. It stops
@@ -603,6 +610,7 @@ func (c *nodeLoadBalancerController) classifyPublicNodeLocalNodesMode(
 		Unverified:      map[string]error{},
 		EndpointMissing: map[string]nodeLoadBalancerAddress{},
 		NotEligible:     map[string]string{},
+		Nodes:           map[string]*corev1.Node{},
 	}
 	readyEndpoints, err := c.publicNodeLocalReadyEndpointNodes(service)
 	if err != nil {
@@ -619,6 +627,7 @@ func (c *nodeLoadBalancerController) classifyPublicNodeLocalNodesMode(
 	patchedNode := false
 	for index := range nodeList.Items {
 		node := &nodeList.Items[index]
+		set.Nodes[node.Name] = node
 		if ip, ok := nodeLoadBalancerNodeInternalIPv4(node); ok {
 			knownPrivate[ip] = struct{}{}
 		}
@@ -700,6 +709,9 @@ func (c *nodeLoadBalancerController) classifyPublicNodeLocalNodesMode(
 		return set, patchedNode, nil, fmt.Errorf("public-node-local: read published private datapath: %w", err)
 	}
 	if err == nil {
+		if !publicNodeLocalDatapathMatches(datapath, service, intent.Pool) {
+			return set, patchedNode, nil, errors.New("public-node-local: private datapath spec drifted; its published VIPs cannot be trusted")
+		}
 		for _, ingress := range datapath.Status.LoadBalancer.Ingress {
 			if _, known := knownPrivate[ingress.IP]; !known {
 				set.Gone[ingress.IP] = "the Node object is absent"
@@ -1227,8 +1239,7 @@ func (c *nodeLoadBalancerController) validateLivePublicNodeLocalServiceFirewall(
 			service.Annotations[annotationPublicNodeLocalActivePool] == intent.Pool &&
 			service.Annotations[annotationPublicNodeLocalActivePolicy] == desired.Hash
 		staged := false
-		if len(service.Status.LoadBalancer.Ingress) == 0 &&
-			service.Annotations[annotationNodeLoadBalancerFirewallAssigning] == firewall.UUID &&
+		if service.Annotations[annotationNodeLoadBalancerFirewallAssigning] == firewall.UUID &&
 			service.Annotations[annotationPublicNodeLocalAssignPolicy] == desired.Hash {
 			vmSet := strings.Split(service.Annotations[annotationPublicNodeLocalAssignVMs], ",")
 			sortedVMs := append([]string(nil), vmSet...)
@@ -1706,8 +1717,14 @@ func (c *nodeLoadBalancerController) assignPublicNodeLocalFirewallWithFence(
 		if _, assigned := assignments[strings.ToLower(vmUUID)]; assigned {
 			continue
 		}
-		if err := c.validatePublicNodeLocalAssignmentState(ctx, service, intent, desired, firewall.UUID, addresses, true, false); err != nil {
-			return err
+		var validateErr error
+		if service.Annotations[annotationPublicNodeLocalActivePool] != "" {
+			validateErr = c.validateActivePublicNodeLocalAssignState(ctx, service, intent, desired, firewall.UUID, vmUUID)
+		} else {
+			validateErr = c.validatePublicNodeLocalAssignmentState(ctx, service, intent, desired, firewall.UUID, addresses, true, false)
+		}
+		if validateErr != nil {
+			return validateErr
 		}
 		converged, relationErr := c.reconcileNodeLoadBalancerFirewallRelation(
 			ctx,

@@ -417,3 +417,256 @@ func TestPublicNodeLocalClassifyNodes(t *testing.T) {
 		})
 	}
 }
+
+// publicNodeLocalObservation is one look at the three places that carry the
+// exposure of a Service: the parent FIPs, the child VIPs and the firewall.
+type publicNodeLocalObservation struct {
+	fips     map[string]bool
+	vips     map[string]bool
+	assigned map[string]bool
+}
+
+func observePublicNodeLocal(t *testing.T, f *publicNodeLocalTransientFixture) publicNodeLocalObservation {
+	t.Helper()
+	observed := publicNodeLocalObservation{fips: map[string]bool{}, vips: map[string]bool{}, assigned: map[string]bool{}}
+	for _, ingress := range f.current(t).Status.LoadBalancer.Ingress {
+		observed.fips[ingress.IP] = true
+	}
+	for _, ingress := range trackedPublicNodeLocalDatapath(t, f).Status.LoadBalancer.Ingress {
+		observed.vips[ingress.IP] = true
+	}
+	for _, firewall := range f.api.firewalls {
+		for _, resource := range firewall.ResourcesAssigned {
+			observed.assigned[resource.ResourceUUID] = true
+		}
+	}
+	return observed
+}
+
+// requireMakeBeforeBreak checks the order of the edge: a FIP only points at a
+// node whose firewall is assigned, and a firewall is only assigned to a node
+// whose child VIP exists.
+func (o publicNodeLocalObservation) requireMakeBeforeBreak(t *testing.T, pass int, index int) {
+	t.Helper()
+	_, vmUUID, privateIP, publicIP := publicNodeLocalFixtureNode(index)
+	if o.fips[publicIP] && (!o.assigned[vmUUID] || !o.vips[privateIP]) {
+		t.Fatalf("pass %d: FIP %s is published before its firewall and VIP: %#v", pass, publicIP, o)
+	}
+	if o.assigned[vmUUID] && !o.vips[privateIP] {
+		t.Fatalf("pass %d: VM %s is assigned before its child VIP exists: %#v", pass, vmUUID, o)
+	}
+}
+
+func (f *publicNodeLocalTransientFixture) setEndpoints(t *testing.T, names ...string) {
+	t.Helper()
+	f.endpointNodes = names
+	f.controller.endpointSlices = publicNodeLocalTestEndpointSliceLister(t, f.service, names...)
+}
+
+// addNode creates the i-th fixture Node with its VM and FIP, and gives it a
+// Ready endpoint.
+func (f *publicNodeLocalTransientFixture) addNode(t *testing.T, index int) {
+	t.Helper()
+	if f.provider.api == API(f.api) {
+		// With several Nodes the FIP lookup has to filter by VM.
+		f.provider.api = &publicNodeLocalFilteringIPAPI{fakeAPI: f.api}
+	}
+	name, vmUUID, privateIP, publicIP := publicNodeLocalFixtureNode(index)
+	node := publicNodeLocalTestNode(name, vmUUID, privateIP, publicIP)
+	f.api.vms = append(f.api.vms, inspace.VM{UUID: vmUUID, Name: name, Hostname: name, Status: "running", PrivateIPv4: privateIP, BillingAccountID: 42, NetworkUUID: testNetworkUUID})
+	f.api.floatingIPs = append(f.api.floatingIPs, inspace.FloatingIP{
+		Address: publicIP, BillingAccountID: 42, Type: "public", Enabled: true,
+		AssignedTo: vmUUID, AssignedToResourceType: "virtual_machine", AssignedToPrivateIP: privateIP,
+	})
+	if _, err := f.provider.kubeClient.CoreV1().Nodes().Create(f.ctx, node, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	f.setEndpoints(t, append(append([]string(nil), f.endpointNodes...), name)...)
+}
+
+func TestPublicNodeLocalAddNodeKeepsExistingIPsPublished(t *testing.T) {
+	f := newPublishedPublicNodeLocalFixtureN(t, 1)
+	f.addNode(t, 1)
+	_, vm2, priv2, pub2 := publicNodeLocalFixtureNode(1)
+	_, _, priv1, pub1 := publicNodeLocalFixtureNode(0)
+	converged := false
+	for pass := 0; pass < 40 && !converged; pass++ {
+		if err := f.controller.syncPublicNodeLocal(f.ctx, f.key, f.current(t)); err != nil {
+			t.Fatalf("pass %d: %v", pass, err)
+		}
+		observed := observePublicNodeLocal(t, f)
+		if !observed.fips[pub1] || !observed.vips[priv1] {
+			t.Fatalf("pass %d: the existing node left the edge: %#v", pass, observed)
+		}
+		if len(f.api.unassignedFirewalls) != 0 {
+			t.Fatalf("pass %d: a firewall was detached: %v", pass, f.api.unassignedFirewalls)
+		}
+		observed.requireMakeBeforeBreak(t, pass, 1)
+		converged = observed.fips[pub2] && observed.vips[priv2] && observed.assigned[vm2] &&
+			!publicNodeLocalAssignmentFencePresent(f.current(t))
+	}
+	if !converged {
+		t.Fatalf("the added node never converged: %#v", observePublicNodeLocal(t, f))
+	}
+}
+
+func TestPublicNodeLocalRemoveNodeDetachesOnlyThatVM(t *testing.T) {
+	f := newPublishedPublicNodeLocalFixtureN(t, 2)
+	_, vm1, priv1, pub1 := publicNodeLocalFixtureNode(0)
+	name2, vm2, priv2, pub2 := publicNodeLocalFixtureNode(1)
+	if err := f.provider.kubeClient.CoreV1().Nodes().Delete(f.ctx, name2, metav1.DeleteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	f.setEndpoints(t, "edge-0")
+	firewallUUID := f.api.firewalls[0].UUID
+	done := false
+	for pass := 0; pass < 40 && !done; pass++ {
+		if err := f.controller.syncPublicNodeLocal(f.ctx, f.key, f.current(t)); err != nil {
+			t.Fatalf("pass %d: %v", pass, err)
+		}
+		observed := observePublicNodeLocal(t, f)
+		if !observed.fips[pub1] || !observed.vips[priv1] || !observed.assigned[vm1] {
+			t.Fatalf("pass %d: the remaining node left the edge: %#v", pass, observed)
+		}
+		if len(f.api.unassignedFirewalls) != 0 && observed.fips[pub2] {
+			t.Fatalf("pass %d: the firewall was detached while the FIP was still published", pass)
+		}
+		if !observed.vips[priv2] && observed.assigned[vm2] {
+			t.Fatalf("pass %d: the child VIP left before the firewall was detached: %#v", pass, observed)
+		}
+		done = !observed.fips[pub2] && !observed.vips[priv2] && !observed.assigned[vm2]
+	}
+	if !done {
+		t.Fatalf("the removed node never left the edge: %#v", observePublicNodeLocal(t, f))
+	}
+	if want := []string{firewallUUID + "/" + vm2}; !reflect.DeepEqual(f.api.unassignedFirewalls, want) {
+		t.Fatalf("unassigned = %v, want %v", f.api.unassignedFirewalls, want)
+	}
+}
+
+func TestPublicNodeLocalEndpointGoneRemovesAfterGrace(t *testing.T) {
+	f := newPublishedPublicNodeLocalFixtureN(t, 2)
+	now := time.Date(2026, 10, 28, 12, 0, 0, 0, time.UTC)
+	f.controller.publicNodeLocalNow = func() time.Time { return now }
+	_, _, _, pub1 := publicNodeLocalFixtureNode(0)
+	_, _, _, pub2 := publicNodeLocalFixtureNode(1)
+	f.setEndpoints(t, "edge-0")
+	run := func(passes int) {
+		for pass := 0; pass < passes; pass++ {
+			if err := f.controller.syncPublicNodeLocal(f.ctx, f.key, f.current(t)); err != nil {
+				t.Fatalf("pass %d: %v", pass, err)
+			}
+		}
+	}
+	run(1)
+	now = now.Add(30 * time.Second)
+	run(3)
+	if observed := observePublicNodeLocal(t, f); !observed.fips[pub2] || len(f.api.unassignedFirewalls) != 0 {
+		t.Fatalf("the node was removed inside the grace: %#v", observed)
+	}
+	now = now.Add(31 * time.Second)
+	run(12)
+	observed := observePublicNodeLocal(t, f)
+	if observed.fips[pub2] || !observed.fips[pub1] {
+		t.Fatalf("the node was not removed after the grace: %#v", observed)
+	}
+}
+
+func TestPublicNodeLocalZeroReadyEndpointsHoldsPublication(t *testing.T) {
+	f := newPublishedPublicNodeLocalFixtureN(t, 2)
+	now := time.Date(2026, 10, 28, 12, 0, 0, 0, time.UTC)
+	f.controller.publicNodeLocalNow = func() time.Time { return now }
+	f.setEndpoints(t)
+	before := f.current(t)
+	childBefore := trackedPublicNodeLocalDatapath(t, f)
+	mutations := managedNodeLoadBalancerMutationSnapshot(f.api)
+	for pass := 0; pass < 10; pass++ {
+		if pass == 5 {
+			now = now.Add(time.Hour)
+		}
+		err := f.controller.syncPublicNodeLocal(f.ctx, f.key, f.current(t))
+		var holding *errPublicNodeLocalHolding
+		if err != nil && !errors.As(err, &holding) {
+			t.Fatalf("pass %d: %v", pass, err)
+		}
+		after := f.current(t)
+		if !reflect.DeepEqual(after.Status, before.Status) || !reflect.DeepEqual(after.Annotations, before.Annotations) {
+			t.Fatalf("pass %d: the parent changed: %#v", pass, after.Status)
+		}
+		if child := trackedPublicNodeLocalDatapath(t, f); !reflect.DeepEqual(child.Status, childBefore.Status) {
+			t.Fatalf("pass %d: the child changed: %#v", pass, child.Status)
+		}
+		if got := managedNodeLoadBalancerMutationSnapshot(f.api); got != mutations || len(f.api.unassignedFirewalls) != 0 {
+			t.Fatalf("pass %d: the firewall changed", pass)
+		}
+	}
+	requirePublicNodeLocalEvent(t, f, "PublicNodeLocalNoReadyEndpoints")
+}
+
+// vmGetErrorAPI fails GetVM for one VM only.
+type vmGetErrorAPI struct {
+	*publicNodeLocalFilteringIPAPI
+	badVM string
+	err   error
+}
+
+func (a *vmGetErrorAPI) GetVM(ctx context.Context, location, uuid string) (*inspace.VM, error) {
+	if uuid == a.badVM {
+		return nil, a.err
+	}
+	return a.publicNodeLocalFilteringIPAPI.GetVM(ctx, location, uuid)
+}
+
+func TestPublicNodeLocalUnverifiedPublishedNodeIsHeld(t *testing.T) {
+	f := newPublishedPublicNodeLocalFixtureN(t, 2)
+	_, vm2, _, pub2 := publicNodeLocalFixtureNode(1)
+	_, _, _, pub3 := publicNodeLocalFixtureNode(2)
+	f.provider.api = &vmGetErrorAPI{
+		publicNodeLocalFilteringIPAPI: &publicNodeLocalFilteringIPAPI{fakeAPI: f.api},
+		badVM:                         vm2, err: errors.New("canonical ownership read failed"),
+	}
+	f.addNode(t, 2)
+	for pass := 0; pass < 50; pass++ {
+		err := f.controller.syncPublicNodeLocal(f.ctx, f.key, f.current(t))
+		var holding *errPublicNodeLocalHolding
+		if err != nil && !errors.As(err, &holding) {
+			t.Fatalf("pass %d: %v", pass, err)
+		}
+		observed := observePublicNodeLocal(t, f)
+		if !observed.fips[pub2] {
+			t.Fatalf("pass %d: the unverified published node was removed: %#v", pass, observed)
+		}
+		if len(f.api.unassignedFirewalls) != 0 {
+			t.Fatalf("pass %d: a firewall was detached: %v", pass, f.api.unassignedFirewalls)
+		}
+		observed.requireMakeBeforeBreak(t, pass, 2)
+		if observed.fips[pub3] {
+			return
+		}
+	}
+	t.Fatalf("the third node was never added: %#v", observePublicNodeLocal(t, f))
+}
+
+func TestPublicNodeLocalAllPublishedNodesGoneWithdraws(t *testing.T) {
+	f := newPublishedPublicNodeLocalFixtureN(t, 2)
+	for _, name := range []string{"edge-0", "edge-1"} {
+		if err := f.provider.kubeClient.CoreV1().Nodes().Delete(f.ctx, name, metav1.DeleteOptions{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	f.setEndpoints(t)
+	for pass := 0; pass < 60; pass++ {
+		_ = f.controller.syncPublicNodeLocal(f.ctx, f.key, f.current(t))
+		if current := f.current(t); len(current.Status.LoadBalancer.Ingress) == 0 &&
+			current.Annotations[annotationPublicNodeLocalActivePool] == "" {
+			break
+		}
+	}
+	current := f.current(t)
+	if len(current.Status.LoadBalancer.Ingress) != 0 || current.Annotations[annotationPublicNodeLocalActivePool] != "" {
+		t.Fatalf("the Service was not withdrawn: %#v %#v", current.Status, current.Annotations)
+	}
+	if len(f.api.unassignedFirewalls) != 2 {
+		t.Fatalf("unassigned = %v, want both VMs", f.api.unassignedFirewalls)
+	}
+}

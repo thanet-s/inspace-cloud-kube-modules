@@ -838,7 +838,12 @@ func (c *nodeLoadBalancerController) authorizeServiceFirewallRelationPreDispatch
 	if err != nil {
 		return err
 	}
-	if intent.Mode == nodeLoadBalancerModeLocal {
+	if intent.Mode == nodeLoadBalancerModeLocal && current.Annotations[annotationPublicNodeLocalActivePool] != "" {
+		// A serving Service adds one node at a time; only that VM must be proven.
+		if err := c.validateActivePublicNodeLocalAssignState(ctx, current, intent, desired, fence.firewallUUID, fence.vmUUID); err != nil {
+			return err
+		}
+	} else if intent.Mode == nodeLoadBalancerModeLocal {
 		addresses, patched, addressErr := c.publicNodeLocalAddresses(ctx, current, intent)
 		if addressErr != nil {
 			return addressErr

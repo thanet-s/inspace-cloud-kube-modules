@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -157,43 +158,63 @@ func TestAggregateStillWithdrawsOnDefiniteProviderErrors(t *testing.T) {
 }
 
 type publicNodeLocalTransientFixture struct {
-	ctx        context.Context
-	api        *fakeAPI
-	provider   *Provider
-	controller *nodeLoadBalancerController
-	service    *corev1.Service
-	key        string
+	ctx           context.Context
+	api           *fakeAPI
+	provider      *Provider
+	controller    *nodeLoadBalancerController
+	service       *corev1.Service
+	key           string
+	endpointNodes []string
 }
 
 func newPublishedPublicNodeLocalFixture(t *testing.T) *publicNodeLocalTransientFixture {
+	return newPublishedPublicNodeLocalFixtureN(t, 1)
+}
+
+// publicNodeLocalFixtureNode names the i-th fixture Node and its VM and IPs.
+func publicNodeLocalFixtureNode(i int) (name, vmUUID, privateIP, publicIP string) {
+	digit := strconv.Itoa(i + 1)
+	return fmt.Sprintf("edge-%d", i), strings.Repeat(digit, 8) + "-2222-4333-8444-555555555555",
+		fmt.Sprintf("10.0.0.%d", 21+i), fmt.Sprintf("203.0.113.%d", 21+i)
+}
+
+func newPublishedPublicNodeLocalFixtureN(t *testing.T, n int) *publicNodeLocalTransientFixture {
 	t.Helper()
-	const (
-		vmUUID    = "11111111-2222-4333-8444-555555555555"
-		privateIP = "10.0.0.21"
-		publicIP  = "203.0.113.21"
-	)
 	service := publicNodeLocalTestService("edge", "edge-service-uid", "edge", corev1.ProtocolTCP, 443)
-	node := publicNodeLocalTestNode("edge-0", vmUUID, privateIP, publicIP)
-	api := &fakeAPI{
-		vms: []inspace.VM{{UUID: vmUUID, Name: node.Name, Hostname: node.Name, Status: "running", PrivateIPv4: privateIP, BillingAccountID: 42, NetworkUUID: testNetworkUUID}},
-		floatingIPs: []inspace.FloatingIP{{
+	api := &fakeAPI{}
+	objects := []runtime.Object{service.DeepCopy()}
+	nodeNames := make([]string, 0, n)
+	for i := 0; i < n; i++ {
+		name, vmUUID, privateIP, publicIP := publicNodeLocalFixtureNode(i)
+		node := publicNodeLocalTestNode(name, vmUUID, privateIP, publicIP)
+		api.vms = append(api.vms, inspace.VM{UUID: vmUUID, Name: node.Name, Hostname: node.Name, Status: "running", PrivateIPv4: privateIP, BillingAccountID: 42, NetworkUUID: testNetworkUUID})
+		api.floatingIPs = append(api.floatingIPs, inspace.FloatingIP{
 			Address: publicIP, BillingAccountID: 42, Type: "public", Enabled: true,
 			AssignedTo: vmUUID, AssignedToResourceType: "virtual_machine", AssignedToPrivateIP: privateIP,
-		}},
+		})
+		objects = append(objects, node.DeepCopy())
+		nodeNames = append(nodeNames, name)
 	}
-	provider := newTestProvider(t, api)
-	provider.kubeClient = kubefake.NewSimpleClientset(service.DeepCopy(), node.DeepCopy())
+	var provider *Provider
+	if n > 1 {
+		// With several Nodes the FIP lookup has to filter by VM.
+		provider = newTestProvider(t, &publicNodeLocalFilteringIPAPI{fakeAPI: api})
+	} else {
+		provider = newTestProvider(t, api)
+	}
+	provider.kubeClient = kubefake.NewSimpleClientset(objects...)
 	controller := &nodeLoadBalancerController{provider: provider}
-	controller.endpointSlices = publicNodeLocalTestEndpointSliceLister(t, service, node.Name)
+	controller.endpointSlices = publicNodeLocalTestEndpointSliceLister(t, service, nodeNames...)
 	fixture := &publicNodeLocalTransientFixture{
 		ctx: context.Background(), api: api, provider: provider, controller: controller,
-		service: service, key: service.Namespace + "/" + service.Name,
+		service: service, key: service.Namespace + "/" + service.Name, endpointNodes: nodeNames,
 	}
-	for attempt := 0; attempt < 24; attempt++ {
+	for attempt := 0; attempt < 40; attempt++ {
 		if err := controller.syncPublicNodeLocal(fixture.ctx, fixture.key, fixture.current(t)); err != nil {
 			t.Fatalf("publish reconcile %d: %v", attempt, err)
 		}
-		if len(fixture.current(t).Status.LoadBalancer.Ingress) == 1 {
+		current := fixture.current(t)
+		if len(current.Status.LoadBalancer.Ingress) == n && !publicNodeLocalAssignmentFencePresent(current) {
 			return fixture
 		}
 	}

@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/time/rate"
@@ -124,6 +125,14 @@ type nodeLoadBalancerController struct {
 	// production constructor always installs the real clock and convergence delay.
 	firewallRelationNow         func() time.Time
 	firewallRelationAbsentDelay time.Duration
+	// publicNodeLocalNow is the clock of the endpoint-gone grace. It is nil in
+	// production, where the wall clock is used.
+	publicNodeLocalNow func() time.Time
+	// endpointGoneSince records, in memory only, when a published Node was first
+	// seen without a Ready local endpoint. A CCM restart can only delay a
+	// removal, never speed it up.
+	endpointGoneMu    sync.Mutex
+	endpointGoneSince map[string]time.Time
 
 	nodesSynced          cache.InformerSynced
 	servicesSynced       cache.InformerSynced
