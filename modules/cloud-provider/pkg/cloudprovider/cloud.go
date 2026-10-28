@@ -3758,10 +3758,20 @@ func (p *Provider) reconcileLoadBalancer(ctx context.Context, service *corev1.Se
 		}
 	}
 	for _, target := range lb.Targets {
-		if _, wanted := desiredTargets[target.TargetUUID]; !wanted {
-			_, err := p.removeStandardNLBTarget(ctx, service, lb, target.TargetUUID)
-			return err
+		if _, wanted := desiredTargets[target.TargetUUID]; wanted {
+			continue
 		}
+		if len(desiredTargets) == 0 {
+			// An empty desired set usually means NotReady nodes, an API
+			// brownout or a pod restart, not "serve nothing". Like upstream
+			// (KEP-3458) keep the last known good targets instead of
+			// turning a transient fault into an outage.
+			klog.Warningf("public NLB %s of Service %s/%s: desired target set is empty; keeping the %d last known good targets",
+				lb.UUID, service.Namespace, service.Name, len(lb.Targets))
+			break
+		}
+		_, err := p.removeStandardNLBTarget(ctx, service, lb, target.TargetUUID)
+		return err
 	}
 
 	desiredRules := make(map[int32]inspace.LoadBalancerRule, len(rules))

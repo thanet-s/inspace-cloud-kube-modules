@@ -448,12 +448,11 @@ func TestTargetControllerReconcilesEndpointMovementReadinessAndTermination(t *te
 			wantAdd: []string{testVMUUIDB}, wantDrop: []string{testVMUUID},
 		},
 		{
+			// The only target loses its ready endpoint: the last-target guard keeps it.
 			name: "endpoint becomes unready", endpoint: endpointForNode("worker-a", false, false),
-			wantDrop: []string{testVMUUID},
 		},
 		{
 			name: "endpoint starts terminating", endpoint: endpointForNode("worker-a", true, true),
-			wantDrop: []string{testVMUUID},
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
