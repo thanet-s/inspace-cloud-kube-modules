@@ -70,7 +70,8 @@ ccm:
   antiAffinity: required
   affinity: {}
   # /healthz on the secure port 10258 (always allowed without authz). Slow on
-  # purpose: only a wedged process should be restarted, not a busy one.
+  # purpose: it restarts a hung HTTP server or a lease-renew failure, not a
+  # busy process.
   livenessProbe:
     enabled: true
     initialDelaySeconds: 30
