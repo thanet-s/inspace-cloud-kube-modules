@@ -2,8 +2,10 @@ package cloudprovider
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	inspace "github.com/thanet-s/inspace-cloud-kube-modules/modules/client"
 	corev1 "k8s.io/api/core/v1"
@@ -179,5 +181,41 @@ func TestServiceDeletionStillReleasesFloatingIPWithoutOptIn(t *testing.T) {
 	})
 	if len(api.floatingIPs) != 0 || len(api.lbs) != 0 {
 		t.Fatalf("deletion left resources: LBs=%d FIPs=%d", len(api.lbs), len(api.floatingIPs))
+	}
+}
+
+// hangingAddTargetAPI blocks AddLoadBalancerTarget until its context ends, like
+// a brownout where POSTs hang instead of failing.
+type hangingAddTargetAPI struct {
+	*fakeAPI
+	sawDeadline bool
+}
+
+func (a *hangingAddTargetAPI) AddLoadBalancerTarget(ctx context.Context, _, _, _ string) (*inspace.LoadBalancerTarget, error) {
+	_, a.sawDeadline = ctx.Deadline()
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-time.After(10 * time.Second):
+		return nil, errors.New("test: mutation was never cancelled")
+	}
+}
+
+func TestStandardNLBMutationIsBoundedByItsOwnDeadline(t *testing.T) {
+	service := testService()
+	base := &fakeAPI{}
+	api := &hangingAddTargetAPI{fakeAPI: base}
+	provider := newTestProvider(t, api)
+	provider.standardNLBMutationTimeout = 50 * time.Millisecond
+	setStandardNLBKubeNodes(provider, readyNode("worker-a", "inspace://bkk01/"+testVMUUID))
+	setOwnedLoadBalancer(base, provider, service, nil)
+
+	started := time.Now()
+	err := provider.reconcileLoadBalancer(context.Background(), service, &base.lbs[0], []string{testVMUUID}, serviceRules(service))
+	if err == nil || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("reconcileLoadBalancer() error = %v, want the mutation deadline", err)
+	}
+	if !api.sawDeadline || time.Since(started) > 5*time.Second {
+		t.Fatalf("mutation was not bounded: deadline set=%t, took %s", api.sawDeadline, time.Since(started))
 	}
 }
