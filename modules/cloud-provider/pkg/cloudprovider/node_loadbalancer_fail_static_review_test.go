@@ -1825,12 +1825,8 @@ func TestPublicNodeLocalAllowRebuildIsSingleUse(t *testing.T) {
 	if current.Annotations[annotationPublicNodeLocalActivePolicy] == oldHash || len(f.api.unassignedFirewalls) == 0 {
 		t.Fatalf("the first change was not rebuilt: %#v", current.Annotations)
 	}
-	desired, err := f.controller.desiredServiceFirewall(current)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if want := f.current(t).Annotations[annotationPublicNodeLocalActivePool] + "/" + desired.Hash; current.Annotations[annotationNodeLoadBalancerAllowRebuildConsumed] != want {
-		t.Fatalf("consumed marker = %q, want %q", current.Annotations[annotationNodeLoadBalancerAllowRebuildConsumed], want)
+	if current.Annotations[annotationNodeLoadBalancerAllowRebuildConsumed] != "true" {
+		t.Fatalf("consumed marker = %q, want the raw annotation value", current.Annotations[annotationNodeLoadBalancerAllowRebuildConsumed])
 	}
 	// The manifest still says "true". The next change runs in place.
 	unassigned := len(f.api.unassignedFirewalls)
@@ -1848,38 +1844,6 @@ func TestPublicNodeLocalAllowRebuildIsSingleUse(t *testing.T) {
 	}
 }
 
-// A value equal to the target policy hash permits that one target only.
-func TestPublicNodeLocalAllowRebuildByTargetHashIsKeyedToTheTarget(t *testing.T) {
-	f := newPublishedPublicNodeLocalFixtureN(t, 1)
-	setPublicNodeLocalFixturePorts(t, f, 443, 8443)
-	desiredOther, err := f.controller.desiredServiceFirewall(f.current(t))
-	if err != nil {
-		t.Fatal(err)
-	}
-	// The annotation names a different target: it is not honoured.
-	updatePublicNodeLocalFixtureService(t, f, func(s *corev1.Service) { s.Annotations[annotationNodeLoadBalancerAllowRebuild] = "deadbeef" })
-	old := f.current(t).Annotations[annotationNodeLoadBalancerFirewallUUID]
-	runPolicyChange(t, f, 1, policyChangeWatch{oldFirewall: old, oldPorts: []int32{443}, newPorts: []int32{443, 8443}}, nil)
-	if f.current(t).Annotations[annotationNodeLoadBalancerAllowRebuildConsumed] != "" {
-		t.Fatal("a value for another target was consumed")
-	}
-	// Now the annotation names the next target.
-	oldHash := f.current(t).Annotations[annotationPublicNodeLocalActivePolicy]
-	if oldHash != desiredOther.Hash {
-		t.Fatalf("unexpected policy %q", oldHash)
-	}
-	setPublicNodeLocalFixturePorts(t, f, 443)
-	next, err := f.controller.desiredServiceFirewall(f.current(t))
-	if err != nil {
-		t.Fatal(err)
-	}
-	updatePublicNodeLocalFixtureService(t, f, func(s *corev1.Service) { s.Annotations[annotationNodeLoadBalancerAllowRebuild] = next.Hash })
-	unassigned := len(f.api.unassignedFirewalls)
-	reconcileUntilRepublished(t, f, 1, 80)
-	if len(f.api.unassignedFirewalls) == unassigned {
-		t.Fatal("the named target was not rebuilt")
-	}
-}
 
 // addPublicNodeLocalWaitingPeer creates a Service that wants a port in a pool
 // and exposes nothing yet.
@@ -1974,4 +1938,99 @@ func TestPublicNodeLocalRelabelledNodeVIPBlocksPeerInNewPool(t *testing.T) {
 	requirePeerBlockedWhileVIPOn(t, f, peer, intent, priv2, 120, func(o publicNodeLocalObservation, s *corev1.Service) bool {
 		return !o.vips[priv2]
 	})
+}
+
+// lagUnassignAPI accepts the first skip unassigns without applying them, as a
+// cloud whose detach readback lags.
+type lagUnassignAPI struct {
+	*publicNodeLocalFilteringIPAPI
+	skip int
+}
+
+func (a *lagUnassignAPI) UnassignFirewallFromVM(ctx context.Context, location, firewallUUID, vmUUID string) error {
+	if a.skip > 0 {
+		a.skip--
+		return nil
+	}
+	return a.publicNodeLocalFilteringIPAPI.UnassignFirewallFromVM(ctx, location, firewallUUID, vmUUID)
+}
+
+// A rebuild the operator asked for is finished as a rebuild. When the detach
+// readback lags, the withdrawal goes on until it is complete; it never falls into
+// a union half way, with the withdraw journal and the unassign receipt live.
+func TestPublicNodeLocalAllowRebuildFinishesWithdrawWhenDetachLags(t *testing.T) {
+	f := newPublishedPublicNodeLocalFixtureN(t, 1)
+	f.provider.api = &lagUnassignAPI{publicNodeLocalFilteringIPAPI: &publicNodeLocalFilteringIPAPI{fakeAPI: f.api}, skip: 1}
+	oldHash := f.current(t).Annotations[annotationPublicNodeLocalActivePolicy]
+	clock := time.Now().UTC()
+	f.controller.firewallRelationNow = func() time.Time { return clock }
+	f.controller.firewallRelationAbsentDelay = nodeLoadBalancerAbsenceConfirmationDelay
+	setPublicNodeLocalFixturePorts(t, f, 443, 8443)
+	updatePublicNodeLocalFixtureService(t, f, func(s *corev1.Service) { s.Annotations[annotationNodeLoadBalancerAllowRebuild] = "true" })
+	sawEmpty := false
+	for pass := 0; pass < 200; pass++ {
+		// The lagging unassign is retired after the relation retire delay.
+		clock = clock.Add(nodeLoadBalancerFirewallRelationRetireDelay + time.Second)
+		if current := f.current(t); current.Annotations[annotationNodeLoadBalancerCleanupFWChecked] != "" {
+			ageNodeLoadBalancerAbsenceEvidence(t, f.ctx, f.provider, current, annotationNodeLoadBalancerCleanupFWChecked)
+		}
+		_ = f.controller.syncPublicNodeLocal(f.ctx, f.key, f.current(t))
+		current := f.current(t)
+		if current.Annotations[annotationPublicNodeLocalTargetPolicy] != "" || current.Annotations[annotationPublicNodeLocalTargetPool] != "" {
+			t.Fatalf("pass %d: a union started in the middle of the rebuild: %#v", pass, current.Annotations)
+		}
+		sawEmpty = sawEmpty || len(current.Status.LoadBalancer.Ingress) == 0
+		if current.Annotations[annotationPublicNodeLocalActivePolicy] != "" && current.Annotations[annotationPublicNodeLocalActivePolicy] != oldHash &&
+			len(current.Status.LoadBalancer.Ingress) == 1 && !publicNodeLocalAssignmentFencePresent(current) {
+			if !sawEmpty {
+				t.Fatal("the rebuild never withdrew the edge")
+			}
+			return
+		}
+	}
+	t.Fatalf("the rebuild never finished: %#v", f.current(t).Annotations)
+}
+
+// A rebuild value is honoured once, whatever it is, until the annotation is
+// changed or removed. A manifest that keeps it cannot replay it on a later
+// change of another kind, such as a pool switch.
+func TestPublicNodeLocalAllowRebuildValueDoesNotReplayOnPoolSwitch(t *testing.T) {
+	f := newPublishedPublicNodeLocalFixtureN(t, 1)
+	setPublicNodeLocalFixturePorts(t, f, 443, 8443)
+	desired, err := f.controller.desiredServiceFirewall(f.current(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	updatePublicNodeLocalFixtureService(t, f, func(s *corev1.Service) { s.Annotations[annotationNodeLoadBalancerAllowRebuild] = desired.Hash })
+	reconcileUntilRepublished(t, f, 1, 80)
+	if got := f.current(t).Annotations[annotationNodeLoadBalancerAllowRebuildConsumed]; got != desired.Hash {
+		t.Fatalf("consumed marker = %q, want the raw annotation value %q", got, desired.Hash)
+	}
+	// The manifest still carries the value. A pool switch runs in place.
+	f.addNode(t, 1)
+	moveFixtureNodeToPool(t, f, 1, "spe-relay-share")
+	updatePublicNodeLocalFixtureService(t, f, func(s *corev1.Service) { s.Annotations[annotationNodeLoadBalancerPool] = "spe-relay-share" })
+	runUntil(t, f, []int{0, 1}, 200, "the pool switch", func(o publicNodeLocalObservation, s *corev1.Service) bool {
+		_, vmA, _, pubA := publicNodeLocalFixtureNode(0)
+		return s.Annotations[annotationPublicNodeLocalActivePool] == "spe-relay-share" && s.Annotations[annotationPublicNodeLocalTargetPool] == "" &&
+			!o.fips[pubA] && !o.assigned[vmA]
+	})
+}
+
+// A new value is honoured again, once.
+func TestPublicNodeLocalAllowRebuildNewValueIsHonouredAgain(t *testing.T) {
+	f := newPublishedPublicNodeLocalFixtureN(t, 1)
+	setPublicNodeLocalFixturePorts(t, f, 443, 8443)
+	updatePublicNodeLocalFixtureService(t, f, func(s *corev1.Service) { s.Annotations[annotationNodeLoadBalancerAllowRebuild] = "first" })
+	reconcileUntilRepublished(t, f, 1, 80)
+	unassigned := len(f.api.unassignedFirewalls)
+	setPublicNodeLocalFixturePorts(t, f, 443)
+	updatePublicNodeLocalFixtureService(t, f, func(s *corev1.Service) { s.Annotations[annotationNodeLoadBalancerAllowRebuild] = "second" })
+	reconcileUntilRepublished(t, f, 1, 80)
+	if len(f.api.unassignedFirewalls) == unassigned {
+		t.Fatal("the second value was not honoured")
+	}
+	if got := f.current(t).Annotations[annotationNodeLoadBalancerAllowRebuildConsumed]; got != "second" {
+		t.Fatalf("consumed marker = %q", got)
+	}
 }

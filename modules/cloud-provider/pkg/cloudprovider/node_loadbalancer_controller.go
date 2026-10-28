@@ -25,16 +25,18 @@ const (
 	// public-node-local Service. It lets the controller withdraw the serving
 	// exposure and rebuild it when the pool or the firewall policy changes, which
 	// is a short outage. Without it every change runs in place (make-before-break).
-	// It is single use. The value "true" is honoured for one target only: the
-	// controller records the consumed target in annotationNodeLoadBalancerAllowRebuildConsumed,
-	// and "true" is not honoured again until the annotation is removed. A value
-	// that equals the target firewall policy hash permits exactly that target.
-	// A manifest that keeps the annotation therefore cannot replay a rebuild on a
+	// It is single use: whatever its value, the controller honours it once and
+	// records the raw value in annotationNodeLoadBalancerAllowRebuildConsumed. The
+	// value is honoured again only after the annotation is removed or set to
+	// another value, so a manifest that keeps it cannot replay a rebuild on a
 	// later change.
 	annotationNodeLoadBalancerAllowRebuild = "service.inspace.cloud/node-lb-allow-rebuild"
-	// annotationNodeLoadBalancerAllowRebuildConsumed is "<pool>/<policy hash>" of
-	// the target that the escape hatch was used for.
+	// annotationNodeLoadBalancerAllowRebuildConsumed is the raw value of the
+	// escape hatch that was used last.
 	annotationNodeLoadBalancerAllowRebuildConsumed = "service.inspace.cloud/node-lb-allow-rebuild-consumed"
+	// annotationNodeLoadBalancerRebuilding marks a rebuild that has begun and is
+	// not yet withdrawn. It is removed with the activation.
+	annotationNodeLoadBalancerRebuilding = "service.inspace.cloud/node-lb-rebuilding"
 	annotationNodeLoadBalancerNodesPerShard        = "service.inspace.cloud/node-lb-nodes-per-shard"
 	annotationNodeLoadBalancerCPU                  = "service.inspace.cloud/node-lb-cpu"
 	annotationNodeLoadBalancerMemory               = "service.inspace.cloud/node-lb-memory"

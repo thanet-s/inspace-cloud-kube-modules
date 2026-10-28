@@ -318,12 +318,13 @@ serves, the change is refused with `PublicNodeLocalTransitionRefused` and the
 active exposure stays. While the target pool has no node that is Ready and has a
 local endpoint, the change waits with `PublicNodeLocalTransitionPending`.
 To apply a change by the old withdraw-and-rebuild instead, accepting the short
-outage, annotate the Service with `service.inspace.cloud/node-lb-allow-rebuild`.
-The value `true` is honoured once: CCM records the target it was used for in
-`service.inspace.cloud/node-lb-allow-rebuild-consumed` and emits
-`PublicNodeLocalRebuildAllowed`; a later change needs the annotation removed and
-set again. A value equal to the target firewall policy hash permits exactly that
-target. A manifest that keeps the annotation therefore cannot replay a rebuild.
+outage, annotate the Service with `service.inspace.cloud/node-lb-allow-rebuild`
+and any value. CCM honours a value once: it records the raw value in
+`service.inspace.cloud/node-lb-allow-rebuild-consumed`, emits
+`PublicNodeLocalRebuildAllowed`, and finishes the withdrawal before it rebuilds,
+even if the cloud detach readback lags. The same value is not honoured again
+until the annotation is removed or set to another value, so a manifest that
+keeps it cannot replay a rebuild on a later change.
 
 The generic public-NLB path remains an explicit, paid, TCP-only InSpace NLB. A
 Service using that path deliberately leaves `loadBalancerClass` unset for

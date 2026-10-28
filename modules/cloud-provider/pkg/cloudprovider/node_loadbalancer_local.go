@@ -129,6 +129,13 @@ func (c *nodeLoadBalancerController) syncPublicNodeLocalPass(
 		}
 		return clearErr
 	}
+	if activePool != "" && service.Annotations[annotationNodeLoadBalancerRebuilding] != "" {
+		// A rebuild the operator asked for has begun. It is finished as a rebuild:
+		// the marker goes away with the activation when the withdrawal is complete.
+		// Starting a transition on top of a half-done withdrawal would leave its
+		// detach journal and unassign receipt behind a half-closed edge.
+		return c.withdrawAndRequeuePublicNodeLocal(ctx, key, service)
+	}
 	if activePool != "" {
 		state, stateErr := publicNodeLocalTransition(service)
 		if stateErr != nil {
@@ -2527,6 +2534,7 @@ func (c *nodeLoadBalancerController) clearPublicNodeLocalActivation(ctx context.
 			annotationPublicNodeLocalActivePolicy,
 			annotationPublicNodeLocalTargetPool,
 			annotationPublicNodeLocalTargetPolicy,
+			annotationNodeLoadBalancerRebuilding,
 			annotationNodeLoadBalancerFirewallAssigning,
 			annotationNodeLoadBalancerFirewallAssignAt,
 			annotationPublicNodeLocalAssignPolicy,

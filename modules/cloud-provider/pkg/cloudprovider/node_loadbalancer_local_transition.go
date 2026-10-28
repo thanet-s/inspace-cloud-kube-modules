@@ -124,10 +124,10 @@ func (c *nodeLoadBalancerController) holdPendingPublicNodeLocalTransition(ctx co
 }
 
 // consumePublicNodeLocalRebuildAllowance decides whether the operator escape
-// hatch applies to this target, and records the use before anything is
-// withdrawn. "true" is honoured while nothing was consumed; a value equal to the
-// target policy hash is honoured for that target only. Either way one target
-// is never rebuilt twice, and a later change needs a new, deliberate value.
+// hatch applies, and records the use before anything is withdrawn. The raw
+// annotation value is the key: any value is honoured exactly once, until the
+// annotation is changed (a new value counts again) or removed. A manifest that
+// keeps a value therefore cannot replay a rebuild on a later change, of any kind.
 func (c *nodeLoadBalancerController) consumePublicNodeLocalRebuildAllowance(
 	ctx context.Context,
 	service *corev1.Service,
@@ -138,12 +138,8 @@ func (c *nodeLoadBalancerController) consumePublicNodeLocalRebuildAllowance(
 	if raw == "" {
 		return false, nil
 	}
-	target := intent.Pool + "/" + desired.Hash
 	consumed := service.Annotations[annotationNodeLoadBalancerAllowRebuildConsumed]
-	switch {
-	case raw == desired.Hash && consumed != target:
-	case raw == "true" && consumed == "":
-	default:
+	if consumed == raw {
 		return false, nil
 	}
 	_, _, err := c.updateExactParentService(ctx, service, func(copy *corev1.Service) (bool, error) {
@@ -151,7 +147,8 @@ func (c *nodeLoadBalancerController) consumePublicNodeLocalRebuildAllowance(
 			copy.Annotations[annotationNodeLoadBalancerAllowRebuildConsumed] != consumed {
 			return false, errors.New("public-node-local: the escape hatch changed before it was consumed")
 		}
-		copy.Annotations[annotationNodeLoadBalancerAllowRebuildConsumed] = target
+		copy.Annotations[annotationNodeLoadBalancerAllowRebuildConsumed] = raw
+		copy.Annotations[annotationNodeLoadBalancerRebuilding] = raw
 		return true, nil
 	})
 	if err != nil {
