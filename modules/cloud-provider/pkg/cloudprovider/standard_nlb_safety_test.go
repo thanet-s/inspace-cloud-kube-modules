@@ -9,6 +9,7 @@ import (
 
 	inspace "github.com/thanet-s/inspace-cloud-kube-modules/modules/client"
 	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -158,8 +159,7 @@ func TestDroppingPublicMarkerHoldsFloatingIPUntilExplicitRelease(t *testing.T) {
 					api.unassignedIPs, api.deletedIPs, api.deletedLBs, len(api.lbs), len(api.floatingIPs))
 			}
 
-			service.Annotations[AnnotationReleasePublicLoadBalancer] = "true"
-			syncMemoryStandardNLBServiceIntent(t, provider.standardNLBServiceStore, service)
+			releaseHeldStandardNLB(t, provider, service, nodes)
 			requireStandardNLBConvergence(t, func() error {
 				_, err := provider.EnsureLoadBalancer(context.Background(), "ignored", service, nodes)
 				return err
@@ -185,13 +185,17 @@ func TestServiceDeletionStillReleasesFloatingIPWithoutOptIn(t *testing.T) {
 }
 
 // hangingAddTargetAPI blocks AddLoadBalancerTarget until its context ends, like
-// a brownout where POSTs hang instead of failing.
+// a brownout where POSTs hang instead of failing. Once recovered it forwards.
 type hangingAddTargetAPI struct {
 	*fakeAPI
+	recovered   bool
 	sawDeadline bool
 }
 
-func (a *hangingAddTargetAPI) AddLoadBalancerTarget(ctx context.Context, _, _, _ string) (*inspace.LoadBalancerTarget, error) {
+func (a *hangingAddTargetAPI) AddLoadBalancerTarget(ctx context.Context, l, lb, uuid string) (*inspace.LoadBalancerTarget, error) {
+	if a.recovered {
+		return a.fakeAPI.AddLoadBalancerTarget(ctx, l, lb, uuid)
+	}
 	_, a.sawDeadline = ctx.Deadline()
 	select {
 	case <-ctx.Done():
@@ -201,21 +205,78 @@ func (a *hangingAddTargetAPI) AddLoadBalancerTarget(ctx context.Context, _, _, _
 	}
 }
 
-func TestStandardNLBMutationIsBoundedByItsOwnDeadline(t *testing.T) {
+func TestStandardNLBMutationIsBoundedAndTheNextReconcileMakesProgress(t *testing.T) {
 	service := testService()
 	base := &fakeAPI{}
 	api := &hangingAddTargetAPI{fakeAPI: base}
 	provider := newTestProvider(t, api)
 	provider.standardNLBMutationTimeout = 50 * time.Millisecond
+	now := time.Date(2026, 10, 28, 12, 0, 0, 0, time.UTC)
+	provider.standardNLBNow = func() time.Time { return now }
+	provider.standardNLBAbsentDelay = standardNLBRemovalAbsenceDelay
 	setStandardNLBKubeNodes(provider, readyNode("worker-a", "inspace://bkk01/"+testVMUUID))
 	setOwnedLoadBalancer(base, provider, service, nil)
+	run := func() error {
+		lb, err := provider.findOwnedLoadBalancer(context.Background(), service)
+		if err != nil {
+			return err
+		}
+		return provider.reconcileLoadBalancer(context.Background(), service, lb, []string{testVMUUID}, serviceRules(service))
+	}
 
 	started := time.Now()
-	err := provider.reconcileLoadBalancer(context.Background(), service, &base.lbs[0], []string{testVMUUID}, serviceRules(service))
+	err := run()
 	if err == nil || !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("reconcileLoadBalancer() error = %v, want the mutation deadline", err)
 	}
 	if !api.sawDeadline || time.Since(started) > 5*time.Second {
 		t.Fatalf("mutation was not bounded: deadline set=%t, took %s", api.sawDeadline, time.Since(started))
+	}
+
+	// The API recovers. The next pass must not hang again, and once the receipt
+	// is retired the add goes through.
+	api.recovered = true
+	started = time.Now()
+	if err := run(); err == nil || time.Since(started) > 5*time.Second {
+		t.Fatalf("reconcile within the retire window: err=%v took %s, want a prompt pending error", err, time.Since(started))
+	}
+	now = now.Add(standardNLBAdditiveRetireDelay + time.Second)
+	_ = run()
+	now = now.Add(standardNLBRemovalAbsenceDelay + time.Second)
+	if err := run(); err != nil {
+		t.Fatalf("reconcile after the retire window: %v", err)
+	}
+	if len(base.lbs[0].Targets) != 1 {
+		t.Fatalf("target was never added after recovery: %v", base.lbs[0].Targets)
+	}
+}
+
+func TestTargetControllerDropsOneOfTwoLocalTargetsWhenItsEndpointGoesUnready(t *testing.T) {
+	for name, endpoint := range map[string]discoveryv1.Endpoint{
+		"endpoint becomes unready":    endpointForNode("worker-b", false, false),
+		"endpoint starts terminating": endpointForNode("worker-b", true, true),
+	} {
+		t.Run(name, func(t *testing.T) {
+			api := &fakeAPI{}
+			provider := newTestProvider(t, api)
+			fixture := newTargetControllerFixture(t, provider)
+			service := testService()
+			service.Spec.Type = corev1.ServiceTypeLoadBalancer
+			service.Spec.ExternalTrafficPolicy = corev1.ServiceExternalTrafficPolicyLocal
+			markPublicIntentMirrored(service)
+			fixture.addService(t, service)
+			fixture.addNode(t, readyNode("worker-a", "inspace://bkk01/"+testVMUUID))
+			fixture.addNode(t, readyNode("worker-b", "inspace://bkk01/"+testVMUUIDB))
+			fixture.addEndpointSlice(t, testEndpointSlice("default", "web", "web-a",
+				endpointForNode("worker-a", true, false), endpoint))
+			setOwnedLoadBalancer(api, provider, service, []string{testVMUUID, testVMUUIDB})
+
+			requireStandardNLBConvergence(t, func() error {
+				return fixture.controller.sync(context.Background(), "default/web")
+			})
+			if len(api.addedTargets) != 0 || !reflectStrings(api.removedTargets, []string{testVMUUIDB}) {
+				t.Fatalf("target changes add=%v drop=%v, want only worker-b dropped", api.addedTargets, api.removedTargets)
+			}
+		})
 	}
 }

@@ -106,9 +106,9 @@ func TestStandardNLBMutationsUsePerOperationDeadlines(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	service.Annotations[AnnotationReleasePublicLoadBalancer] = "true"
 	delete(service.Labels, LabelLoadBalancerScope)
 	syncMemoryStandardNLBServiceIntent(t, provider.standardNLBServiceStore, service)
+	releaseHeldStandardNLB(t, provider, service, nodes)
 	requireStandardNLBConvergence(t, func() error {
 		_, err := provider.EnsureLoadBalancer(context.Background(), "ignored", service, nodes)
 		return err

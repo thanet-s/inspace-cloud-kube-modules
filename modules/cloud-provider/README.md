@@ -466,10 +466,13 @@ Services may still use `Cluster`; unhealthy, deleting, excluded, or disrupting
 nodes are filtered there as well. Nodes carrying either
 `node-role.kubernetes.io/control-plane` or the legacy
 `node-role.kubernetes.io/master` label are never public NLB targets in either
-mode; adding or removing either role reconciles targets immediately. New targets are added before stale ones are removed, and the last known good
-targets are kept when the desired set is empty (for example every node NotReady
-or a Local Service with no Ready endpoint), so a transient fault never empties
-the NLB. Kubernetes
+mode; adding or removing either role reconciles targets immediately. New targets
+are added before stale ones are removed, and a failed add never blocks removals
+or rule updates (the last serving target is never removed). When the desired set
+is empty (for example every node NotReady or a Local Service with no Ready
+endpoint) the last known good targets are kept, with one Warning Event, so a
+transient fault never empties the NLB. After 15 minutes only targets whose VM an
+exact read shows gone are dropped. Kubernetes
 defaults an omitted `externalTrafficPolicy` to `Cluster` before CCM observes the
 Service, so set `Local` explicitly when local-endpoint targeting is required.
 Private Cilium L2 Services must remain `externalTrafficPolicy: Cluster`.
@@ -654,9 +657,15 @@ assignment, only its affected shard is withdrawn before repair.
 
 For the paid NLB path, removing either public marker holds the owned FIP/NLB and
 reports an error on the Service, because a freed public IP cannot be recovered.
-Set `inspace.cloud/release-public-load-balancer: "true"` on the Service to let
-CCM delete every deterministically owned FIP/NLB before handing it to another
-implementation; deleting the Service always releases them. Discovery and
+The first pass records the drop time in
+`service.inspace.cloud/public-nlb-unpublished-at` and raises one Event; targets
+and rules keep following the Service. To delete the FIP/NLB without deleting the
+Service, set `inspace.cloud/release-public-load-balancer` to an RFC3339 time
+later than that recorded drop; a plain `true` or an older time is ignored, so a
+stale opt-in cannot release an IP later. Republishing clears the mark. Deleting
+the Service always releases the FIP/NLB, and so does changing its type (for
+example to `ClusterIP`), because the stock controller then treats the load
+balancer as no longer wanted and runs the same deletion. Discovery and
 deletion remain ownership-based even after markers change, preventing legacy
 resources from leaking. Public FIP list/create/assignment responses must match
 the deterministic name, billing account, active enabled non-virtual `public`

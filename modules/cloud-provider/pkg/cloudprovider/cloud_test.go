@@ -1116,9 +1116,9 @@ func TestMarkerRemovalNeverLeaksOwnedResourcesOrReturnsImplementedElsewhereEarly
 		t.Fatal(err)
 	}
 	delete(service.Labels, LabelLoadBalancerScope)
-	// Unpublishing only deletes the public IP when the owner opts in.
-	service.Annotations[AnnotationReleasePublicLoadBalancer] = "true"
 	syncMemoryStandardNLBServiceIntent(t, provider.standardNLBServiceStore, service)
+	// Unpublishing only deletes the public IP when the owner opts in after the drop.
+	releaseHeldStandardNLB(t, provider, service, nodes)
 	var status *corev1.LoadBalancerStatus
 	requireStandardNLBConvergence(t, func() error {
 		var err error
@@ -1324,9 +1324,9 @@ func TestPublicToPrivateTransitionRemovesFloatingIP(t *testing.T) {
 		t.Fatal(err)
 	}
 	service.Annotations[AnnotationPublicLoadBalancer] = "false"
-	// Unpublishing only deletes the public IP when the owner opts in.
-	service.Annotations[AnnotationReleasePublicLoadBalancer] = "true"
 	syncMemoryStandardNLBServiceIntent(t, provider.standardNLBServiceStore, service)
+	// Unpublishing only deletes the public IP when the owner opts in after the drop.
+	releaseHeldStandardNLB(t, provider, service, nodes)
 	var status *corev1.LoadBalancerStatus
 	requireStandardNLBConvergence(t, func() error {
 		var err error

@@ -51,6 +51,9 @@ const (
 	LoadBalancerScopePublic         = "public"
 	LoadBalancerScopePrivate        = "private"
 
+	// annotationStandardNLBUnpublishedAt records when the public markers were
+	// first seen dropped from a Service that still owns an NLB or floating IP.
+	annotationStandardNLBUnpublishedAt = "service.inspace.cloud/public-nlb-unpublished-at"
 	// annotationStandardNLBEmptyTargetsSince records when the desired target
 	// set first came up empty, so the grace period survives restarts.
 	annotationStandardNLBEmptyTargetsSince = "service.inspace.cloud/public-nlb-empty-targets-since"
@@ -1851,17 +1854,18 @@ func (p *Provider) EnsureLoadBalancer(ctx context.Context, _ string, service *co
 				return nil, cloud.ImplementedElsewhere
 			}
 		}
-		if held, err := p.holdUnpublishedStandardNLB(ctx, service, lb, floatingIP); err != nil || held != nil {
-			if err == nil {
-				err = held
-			}
+		if held, err := p.holdUnpublishedStandardNLB(ctx, service, lb, floatingIP); err != nil {
 			return nil, err
+		} else if held != nil {
+			// The NLB keeps following the Service while it is held.
+			return nil, errors.Join(held, p.reconcileHeldStandardNLB(ctx, service, lb, nodes))
 		}
 		if err := p.cleanupOwnedLoadBalancer(ctx, service, lb); err != nil {
 			return nil, err
 		}
 		return &corev1.LoadBalancerStatus{}, nil
 	}
+	p.clearUnpublishedMark(ctx, service)
 	if err := validateServiceFloatingIPState(floatingIP, lb); err != nil {
 		return nil, err
 	}
@@ -1946,12 +1950,12 @@ func (p *Provider) updateLoadBalancer(ctx context.Context, service *corev1.Servi
 			return err
 		} else if held != nil {
 			// UpdateLoadBalancer runs on every node event; the Ensure path
-			// already reports the hold as an error event.
-			klog.Warning(held)
-			return nil
+			// already reports the hold, so stay quiet here.
+			return p.reconcileHeldStandardNLB(ctx, service, lb, nodes)
 		}
 		return p.cleanupOwnedLoadBalancer(ctx, service, lb)
 	}
+	p.clearUnpublishedMark(ctx, service)
 	if err := validateServiceFloatingIPState(floatingIP, lb); err != nil {
 		return err
 	}
@@ -1998,12 +2002,42 @@ func (p *Provider) EnsureLoadBalancerDeleted(ctx context.Context, _ string, serv
 	return p.cleanupOwnedLoadBalancer(ctx, service, lb)
 }
 
+// standardNLBReleaseAuthorized reports whether the owner has asked, after the
+// public markers were dropped, to delete the public NLB and floating IP. The
+// release annotation carries an RFC3339 time that must be later than the
+// recorded drop, so a value left from an earlier edit (or a plain "true")
+// cannot release an IP the owner has since forgotten about.
+func standardNLBReleaseAuthorized(service *corev1.Service) bool {
+	droppedAt, err := time.Parse(time.RFC3339Nano, service.Annotations[annotationStandardNLBUnpublishedAt])
+	if err != nil {
+		return false
+	}
+	releaseAt, err := time.Parse(time.RFC3339Nano, service.Annotations[AnnotationReleasePublicLoadBalancer])
+	return err == nil && releaseAt.After(droppedAt)
+}
+
+// standardNLBUnpublishHeld is true for a live LoadBalancer Service that lost its
+// public markers and has not been authorized to release. A Service that is
+// deleting or no longer a LoadBalancer is handled by the stock deletion path.
+func standardNLBUnpublishHeld(service *corev1.Service) bool {
+	if service.DeletionTimestamp != nil || service.Spec.Type != corev1.ServiceTypeLoadBalancer ||
+		service.Spec.LoadBalancerClass != nil {
+		return false
+	}
+	if explicitPublic, err := explicitPublicRequested(service); err != nil || explicitPublic {
+		return false
+	}
+	return !standardNLBReleaseAuthorized(service)
+}
+
 // holdUnpublishedStandardNLB returns a non-nil hold when a live Service lost its
 // public markers but still owns an NLB or floating IP. A dropped label or
 // annotation is usually a Helm/GitOps slip, and freeing the public IP cannot be
-// undone (DNS and customer allow-lists break), so deletion needs either Service
-// deletion or the explicit release annotation. A cleanup already in flight is
-// allowed to finish so its receipt cannot be stranded.
+// undone (DNS and customer allow-lists break), so deletion needs the Service to
+// be deleted (or changed to another type, which the stock controller handles
+// as a deletion) or a release time later than the drop. A cleanup already in
+// flight is allowed to finish so its receipt cannot be stranded. The first pass
+// records the drop time and raises one Event; later passes stay silent.
 func (p *Provider) holdUnpublishedStandardNLB(
 	ctx context.Context,
 	service *corev1.Service,
@@ -2013,10 +2047,20 @@ func (p *Provider) holdUnpublishedStandardNLB(
 	if lb == nil && floatingIP == nil {
 		return nil, nil
 	}
-	if service.DeletionTimestamp != nil || service.Annotations[AnnotationReleasePublicLoadBalancer] == "true" {
+	if p.standardNLBServiceStore == nil {
+		return nil, errors.New("cloudprovider: Initialize must install the Service metadata store before public NLB mutation")
+	}
+	current, err := p.standardNLBServiceStore.GetExact(ctx, service)
+	if err != nil {
+		return nil, fmt.Errorf("cloudprovider: read Service before holding an unpublished NLB: %w", err)
+	}
+	if err := validateExactStandardNLBService(service, current); err != nil {
+		return nil, err
+	}
+	if standardNLBReleaseAuthorized(current) {
 		return nil, nil
 	}
-	fence, _, err := p.readStandardNLBFence(ctx, service)
+	fence, err := parseStandardNLBFence(current.Annotations[annotationStandardNLBMutation])
 	if err != nil {
 		return nil, err
 	}
@@ -2026,11 +2070,79 @@ func (p *Provider) holdUnpublishedStandardNLB(
 			return nil, nil
 		}
 	}
+	if current.Annotations[annotationStandardNLBUnpublishedAt] == "" {
+		marked := current.DeepCopy()
+		if marked.Annotations == nil {
+			marked.Annotations = map[string]string{}
+		}
+		marked.Annotations[annotationStandardNLBUnpublishedAt] = p.standardNLBTime().Format(time.RFC3339Nano)
+		if _, err := p.standardNLBServiceStore.UpdateExact(ctx, marked); err != nil {
+			return nil, fmt.Errorf("cloudprovider: record when the public markers were dropped: %w", err)
+		}
+		klog.Warningf("Service %s/%s lost its public markers; keeping its public NLB and floating IP", service.Namespace, service.Name)
+		if p.standardNLBEvents != nil {
+			p.standardNLBEvents.Eventf(service, corev1.EventTypeWarning, "PublicLoadBalancerHeld",
+				"The public markers were removed; the public NLB and floating IP are kept. Set %s to an RFC3339 time later than %s to delete them",
+				AnnotationReleasePublicLoadBalancer, marked.Annotations[annotationStandardNLBUnpublishedAt])
+		}
+	}
 	return fmt.Errorf(
 		"cloudprovider: Service %s/%s is no longer marked public but still owns a public NLB or floating IP; "+
-			"keeping them. Set annotation %s=true to delete them, or restore the public markers",
-		service.Namespace, service.Name, AnnotationReleasePublicLoadBalancer,
+			"keeping them. Set annotation %s to an RFC3339 time later than the recorded drop (%s) to delete them, "+
+			"restore the public markers, or delete the Service",
+		service.Namespace, service.Name, AnnotationReleasePublicLoadBalancer, annotationStandardNLBUnpublishedAt,
 	), nil
+}
+
+// clearUnpublishedMark forgets the drop time once the Service is public again,
+// so a later unpublish starts a fresh hold.
+func (p *Provider) clearUnpublishedMark(ctx context.Context, service *corev1.Service) {
+	if _, marked := service.Annotations[annotationStandardNLBUnpublishedAt]; !marked || p.standardNLBServiceStore == nil {
+		return
+	}
+	current, err := p.standardNLBServiceStore.GetExact(ctx, service)
+	if err == nil {
+		err = validateExactStandardNLBService(service, current)
+	}
+	if err == nil {
+		if _, stored := current.Annotations[annotationStandardNLBUnpublishedAt]; stored {
+			cleared := current.DeepCopy()
+			delete(cleared.Annotations, annotationStandardNLBUnpublishedAt)
+			_, err = p.standardNLBServiceStore.UpdateExact(ctx, cleared)
+		}
+	}
+	if err != nil {
+		klog.Warningf("clear the unpublished mark of Service %s/%s: %v", service.Namespace, service.Name, err)
+	}
+}
+
+// heldReconcileKey marks a context whose mutations belong to a held-NLB
+// reconcile. Only then does the final Service authority accept forwarding
+// changes for a Service without public markers; every other path (deletion,
+// withdrawal) still treats such a Service as cleanup-only.
+type heldReconcileKey struct{}
+
+func heldReconcile(ctx context.Context) bool {
+	held, _ := ctx.Value(heldReconcileKey{}).(bool)
+	return held
+}
+
+// reconcileHeldStandardNLB keeps targets and rules of a held NLB following the
+// Service so a node rollout cannot strand the public IP on dead targets. It
+// never creates, assigns or deletes anything.
+func (p *Provider) reconcileHeldStandardNLB(ctx context.Context, service *corev1.Service, lb *inspace.LoadBalancer, nodes []*corev1.Node) error {
+	if lb == nil {
+		return nil
+	}
+	ctx = context.WithValue(ctx, heldReconcileKey{}, true)
+	if err := validateServiceShape(service); err != nil {
+		return err
+	}
+	targets, err := p.targetUUIDs(ctx, service, nodes)
+	if err != nil {
+		return err
+	}
+	return p.reconcileLoadBalancer(ctx, service, lb, targets, serviceRules(service))
 }
 
 func (p *Provider) cleanupOwnedLoadBalancer(ctx context.Context, service *corev1.Service, lb *inspace.LoadBalancer) error {
@@ -2889,6 +3001,7 @@ type standardNLBLiveDesiredState struct {
 	service          *corev1.Service
 	public           bool
 	lifecycleCleanup bool
+	held             bool
 	targets          []string
 	rules            []inspace.LoadBalancerRule
 }
@@ -2933,6 +3046,14 @@ func (p *Provider) readStandardNLBLiveDesiredState(
 		}
 		state.lifecycleCleanup = !explicitPublic
 		state.public = explicitPublic
+		if !explicitPublic && heldReconcile(ctx) && standardNLBUnpublishHeld(current) {
+			// Held: not public, but not released either. Forwarding state may
+			// still follow the Service; creates, assignments and deletions
+			// stay unauthorized.
+			state.lifecycleCleanup = false
+			state.public = true
+			state.held = true
+		}
 	}
 	needsLivePolicy := true
 	switch fence.Operation {
@@ -2944,7 +3065,11 @@ func (p *Provider) readStandardNLBLiveDesiredState(
 		needsLivePolicy = false
 	}
 	if state.public && needsLivePolicy {
-		if err := validateService(current); err != nil {
+		policy := validateService
+		if state.held {
+			policy = validateServiceShape
+		}
+		if err := policy(current); err != nil {
 			return standardNLBLiveDesiredState{}, fmt.Errorf("cloudprovider: final public NLB Service policy: %w", err)
 		}
 		state.targets, err = p.freshStandardNLBTargetUUIDs(ctx, current)
@@ -3051,6 +3176,15 @@ func (p *Provider) authorizeStandardNLBMutationPreDispatch(
 		}
 		return nil
 	}
+	requireNotHeld := func() error {
+		if err := requirePublic(); err != nil {
+			return err
+		}
+		if state.held {
+			return errors.New("cloudprovider: creating or assigning public NLB resources is not authorized while the Service is held")
+		}
+		return nil
+	}
 	requestHashMatches := func(value any) error {
 		hash, hashErr := standardNLBRequestHash(value)
 		if hashErr != nil {
@@ -3064,7 +3198,7 @@ func (p *Provider) authorizeStandardNLBMutationPreDispatch(
 
 	switch fence.Operation {
 	case standardNLBCreateLoadBalancer:
-		if err := requirePublic(); err != nil {
+		if err := requireNotHeld(); err != nil {
 			return err
 		}
 		request := standardNLBDesiredRequest(p, state.service, state.targets, state.rules)
@@ -3081,7 +3215,7 @@ func (p *Provider) authorizeStandardNLBMutationPreDispatch(
 		}
 		return nil
 	case standardNLBCreateFloatingIP:
-		if err := requirePublic(); err != nil {
+		if err := requireNotHeld(); err != nil {
 			return err
 		}
 		request := inspace.CreateFloatingIPRequest{
@@ -3096,7 +3230,7 @@ func (p *Provider) authorizeStandardNLBMutationPreDispatch(
 		_, err := p.authorizeStandardNLBTopology(ctx, state)
 		return err
 	case standardNLBAssignFloatingIP:
-		if err := requirePublic(); err != nil {
+		if err := requireNotHeld(); err != nil {
 			return err
 		}
 		if err := requestHashMatches(struct {
@@ -4198,6 +4332,18 @@ func validateService(service *corev1.Service) error {
 	}
 	if !explicitPublic {
 		return errors.New("cloudprovider: InSpace NLB requires the public scope label and public=true annotation")
+	}
+	return validateServiceShape(service)
+}
+
+// validateServiceShape checks the parts of a Service the NLB can express,
+// without requiring the public markers.
+func validateServiceShape(service *corev1.Service) error {
+	if service == nil {
+		return errors.New("cloudprovider: service is required")
+	}
+	if len(service.Spec.LoadBalancerSourceRanges) != 0 {
+		return errors.New("cloudprovider: loadBalancerSourceRanges is unsupported; InSpace NLB exposes TCP forwarding only")
 	}
 	for _, port := range service.Spec.Ports {
 		if port.Protocol != "" && port.Protocol != corev1.ProtocolTCP {
