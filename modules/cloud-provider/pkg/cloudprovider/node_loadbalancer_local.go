@@ -1312,6 +1312,36 @@ func publicNodeLocalAddressIdentities(addresses []nodeLoadBalancerAddress) []str
 	return result
 }
 
+// publicNodeLocalIncumbentInPool reports whether the Service is already
+// serving the pool with a child datapath whose ports overlap the claim.
+func (c *nodeLoadBalancerController) publicNodeLocalIncumbentInPool(
+	ctx context.Context,
+	service *corev1.Service,
+	pool string,
+	ports []nodeLoadBalancerPortClaim,
+) (bool, error) {
+	if strings.TrimSpace(service.Annotations[annotationPublicNodeLocalActivePool]) != pool {
+		return false, nil
+	}
+	datapath, err := c.provider.kubeClient.CoreV1().Services(service.Namespace).Get(
+		ctx, nodeLoadBalancerDatapathName(service), metav1.GetOptions{},
+	)
+	if apierrors.IsNotFound(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("public-node-local: inspect incumbent datapath: %w", err)
+	}
+	if !nodeLoadBalancerDatapathOwnedByService(datapath, service) {
+		return false, fmt.Errorf("public-node-local: conflict peer %s/%s has a foreign datapath identity", service.Namespace, service.Name)
+	}
+	childPorts, err := nodeLoadBalancerPortClaims(datapath)
+	if err != nil {
+		return false, nil
+	}
+	return publicNodeLocalPortsOverlap(ports, childPorts), nil
+}
+
 func (c *nodeLoadBalancerController) publicNodeLocalPortConflict(
 	ctx context.Context,
 	service *corev1.Service,
@@ -1333,7 +1363,21 @@ func (c *nodeLoadBalancerController) publicNodeLocalPortConflict(
 			if parseErr == nil && otherIntent.Mode == nodeLoadBalancerModeLocal && otherIntent.Pool == intent.Pool &&
 				publicNodeLocalPortsOverlap(intent.Ports, otherIntent.Ports) {
 				validDesiredConflict = true
-				if string(other.UID) < string(service.UID) {
+				// A Service that already serves the claim keeps it against a newcomer,
+				// whatever the UID order. Within the same class the lowest UID wins.
+				selfIncumbent, incumbentErr := c.publicNodeLocalIncumbentInPool(ctx, service, intent.Pool, otherIntent.Ports)
+				if incumbentErr != nil {
+					return false, false, incumbentErr
+				}
+				otherIncumbent, incumbentErr := c.publicNodeLocalIncumbentInPool(ctx, other, intent.Pool, intent.Ports)
+				if incumbentErr != nil {
+					return false, false, incumbentErr
+				}
+				otherWins := string(other.UID) < string(service.UID)
+				if selfIncumbent != otherIncumbent {
+					otherWins = otherIncumbent
+				}
+				if otherWins {
 					return true, false, fmt.Errorf(
 						"public-node-local: pool %s protocol/port claim belongs to lexicographic winner %s/%s (UID %s); Service %s/%s (UID %s) must remain closed",
 						intent.Pool, other.Namespace, other.Name, other.UID, service.Namespace, service.Name, service.UID,

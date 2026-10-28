@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"reflect"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -935,4 +936,33 @@ func trackedPublicNodeLocalDatapathOrNil(f *publicNodeLocalTransientFixture) *co
 		return nil
 	}
 	return object.(*corev1.Service).DeepCopy()
+}
+
+func TestPublicNodeLocalIncumbentKeepsPortAgainstLowerUIDNewcomer(t *testing.T) {
+	incumbent := publicNodeLocalTestService("incumbent", "z-service-uid", "edge", corev1.ProtocolTCP, 443)
+	incumbent.Annotations[annotationPublicNodeLocalActivePool] = "edge"
+	incumbent.Annotations[annotationPublicNodeLocalActivePolicy] = "policy"
+	child := desiredPublicNodeLocalDatapath(incumbent, "edge")
+	newcomer := publicNodeLocalTestService("newcomer", "a-service-uid", "edge", corev1.ProtocolTCP, 443)
+	provider := newTestProvider(t, &fakeAPI{})
+	provider.kubeClient = kubefake.NewSimpleClientset(incumbent.DeepCopy(), newcomer.DeepCopy(), child)
+	controller := &nodeLoadBalancerController{provider: provider}
+	ctx := context.Background()
+
+	incumbentIntent, err := parseNodeLoadBalancerService(incumbent, nodeLoadBalancerDefaults{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	loses, waiting, err := controller.publicNodeLocalPortConflict(ctx, incumbent, incumbentIntent)
+	if err != nil || loses || waiting {
+		t.Fatalf("incumbent conflict = loses:%t waiting:%t err:%v", loses, waiting, err)
+	}
+	newcomerIntent, err := parseNodeLoadBalancerService(newcomer, nodeLoadBalancerDefaults{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	loses, _, err = controller.publicNodeLocalPortConflict(ctx, newcomer, newcomerIntent)
+	if !loses || err == nil || !strings.Contains(err.Error(), "z-service-uid") {
+		t.Fatalf("newcomer conflict = loses:%t err:%v", loses, err)
+	}
 }
