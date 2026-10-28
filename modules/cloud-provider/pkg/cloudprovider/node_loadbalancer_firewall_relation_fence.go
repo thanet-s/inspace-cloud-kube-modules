@@ -2,11 +2,11 @@ package cloudprovider
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"reflect"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
@@ -1182,8 +1182,10 @@ func (c *nodeLoadBalancerController) reconcileNodeLoadBalancerFirewallRelation(
 				c.nodeLoadBalancerFirewallRelationAbsenceDelay(),
 			)
 			if cleared {
-				// The relation converged, which ends any retirement streak.
-				delete(values, annotationNodeLoadBalancerFirewallRelationRetired)
+				// The relation converged, which ends the retirement streak of this
+				// relation only.
+				clearNodeLoadBalancerFirewallRelationRetirement(
+					values, nodeLoadBalancerFirewallRelationKey(existing), c.nodeLoadBalancerFirewallRelationTime())
 			}
 		}
 		if observationErr != nil {
@@ -1218,32 +1220,26 @@ func (c *nodeLoadBalancerController) reconcileNodeLoadBalancerFirewallRelation(
 				changed = true
 				result = outcomeCleared
 			}
-			if retiredKey, _, _, found := parseNodeLoadBalancerFirewallRelationRetired(
-				values[annotationNodeLoadBalancerFirewallRelationRetired],
-			); found && retiredKey == nodeLoadBalancerFirewallRelationKey(*desired) {
-				delete(values, annotationNodeLoadBalancerFirewallRelationRetired)
+			if clearNodeLoadBalancerFirewallRelationRetirement(
+				values, nodeLoadBalancerFirewallRelationKey(*desired), c.nodeLoadBalancerFirewallRelationTime(),
+			) {
 				changed = true
 				result = outcomeCleared
 			}
 		} else {
 			if owner.parkRetired && values[annotationNodeLoadBalancerFirewallRelationRetired] != "" {
-				retiredKey, retiredCount, retiredAt, found := parseNodeLoadBalancerFirewallRelationRetired(
+				key := nodeLoadBalancerFirewallRelationKey(*desired)
+				now := c.nodeLoadBalancerFirewallRelationTime()
+				if record, found := parseNodeLoadBalancerFirewallRelationRetirements(
 					values[annotationNodeLoadBalancerFirewallRelationRetired],
-				)
-				switch {
-				case found && retiredKey == nodeLoadBalancerFirewallRelationKey(*desired) &&
-					retiredCount >= nodeLoadBalancerFirewallRelationParkRetirements &&
-					c.nodeLoadBalancerFirewallRelationTime().Before(retiredAt.Add(nodeLoadBalancerFirewallRelationParkDuration)):
-					// Nothing is dispatched or persisted: the relation just waits out
-					// its park so the owner's other relations can proceed.
-					return false, fmt.Errorf("%w: %s on %s", errNodeLoadBalancerFirewallRelationParked, retiredKey, owner.description)
-				case found && retiredKey == nodeLoadBalancerFirewallRelationKey(*desired) &&
-					retiredCount < nodeLoadBalancerFirewallRelationParkRetirements:
-					// The streak of the same relation goes on.
-				default:
-					// A different relation, a finished park or a malformed record all
-					// start a new streak.
-					delete(values, annotationNodeLoadBalancerFirewallRelationRetired)
+				)[key]; found && record.Count >= nodeLoadBalancerFirewallRelationParkRetirements {
+					if now.Before(record.At.Add(nodeLoadBalancerFirewallRelationParkDuration)) {
+						// Nothing is dispatched or persisted: the relation just waits out
+						// its park so the owner's other relations can proceed.
+						return false, fmt.Errorf("%w: %s on %s", errNodeLoadBalancerFirewallRelationParked, key, owner.description)
+					}
+					// A finished park starts a new streak. Other relations keep theirs.
+					clearNodeLoadBalancerFirewallRelationRetirement(values, key, now)
 					changed = true
 				}
 			}
@@ -1600,35 +1596,94 @@ func nodeLoadBalancerFirewallRelationKey(fence nodeLoadBalancerFirewallRelationF
 	return string(fence.operation) + "/" + strings.ToLower(fence.firewallUUID) + "/" + strings.ToLower(fence.vmUUID)
 }
 
-// parseNodeLoadBalancerFirewallRelationRetired reads "<key>|<count>|<at>". A
-// malformed record counts as no record: it can only shorten a park, never
-// dispatch a relation that the fence would refuse.
-func parseNodeLoadBalancerFirewallRelationRetired(value string) (key string, count int, at time.Time, ok bool) {
-	parts := strings.Split(value, "|")
-	if len(parts) != 3 {
-		return "", 0, time.Time{}, false
+// nodeLoadBalancerFirewallRelationRetirementRecords bounds how many relations
+// the retirement annotation tracks.
+const nodeLoadBalancerFirewallRelationRetirementRecords = 16
+
+// nodeLoadBalancerFirewallRelationRetirement is the retirement streak of one
+// logical relation.
+type nodeLoadBalancerFirewallRelationRetirement struct {
+	Count int       `json:"n"`
+	At    time.Time `json:"at"`
+}
+
+// parseNodeLoadBalancerFirewallRelationRetirements reads the per relation
+// retirement records. A malformed value counts as no record: it can only
+// shorten a park, never dispatch a relation that the fence would refuse.
+func parseNodeLoadBalancerFirewallRelationRetirements(value string) map[string]nodeLoadBalancerFirewallRelationRetirement {
+	records := map[string]nodeLoadBalancerFirewallRelationRetirement{}
+	if value == "" {
+		return records
 	}
-	parsedCount, err := strconv.Atoi(parts[1])
-	parsedAt, timeErr := time.Parse(time.RFC3339Nano, parts[2])
-	if err != nil || timeErr != nil || parsedCount < 1 {
-		return "", 0, time.Time{}, false
+	if err := json.Unmarshal([]byte(value), &records); err != nil {
+		return map[string]nodeLoadBalancerFirewallRelationRetirement{}
 	}
-	return parts[0], parsedCount, parsedAt, true
+	for key, record := range records {
+		if record.Count < 1 || record.At.IsZero() {
+			delete(records, key)
+		}
+	}
+	return records
+}
+
+// storeNodeLoadBalancerFirewallRelationRetirements writes the records back. A
+// finished park and a streak older than a park are dropped, and the oldest
+// records go first when the bound is exceeded. An empty map removes the key.
+func storeNodeLoadBalancerFirewallRelationRetirements(
+	values map[string]string,
+	records map[string]nodeLoadBalancerFirewallRelationRetirement,
+	now time.Time,
+) {
+	for key, record := range records {
+		if !now.Before(record.At.Add(nodeLoadBalancerFirewallRelationParkDuration)) {
+			delete(records, key)
+		}
+	}
+	for len(records) > nodeLoadBalancerFirewallRelationRetirementRecords {
+		oldestKey, oldest := "", time.Time{}
+		for key, record := range records {
+			if oldestKey == "" || record.At.Before(oldest) || (record.At.Equal(oldest) && key < oldestKey) {
+				oldestKey, oldest = key, record.At
+			}
+		}
+		delete(records, oldestKey)
+	}
+	if len(records) == 0 {
+		delete(values, annotationNodeLoadBalancerFirewallRelationRetired)
+		return
+	}
+	encoded, err := json.Marshal(records)
+	if err != nil {
+		delete(values, annotationNodeLoadBalancerFirewallRelationRetired)
+		return
+	}
+	values[annotationNodeLoadBalancerFirewallRelationRetired] = string(encoded)
 }
 
 // recordNodeLoadBalancerFirewallRelationRetirement counts one more retirement
-// of the same logical relation, or starts at one for a different relation.
+// of this logical relation and leaves every other relation's record alone.
 func recordNodeLoadBalancerFirewallRelationRetirement(
 	values map[string]string,
 	retired nodeLoadBalancerFirewallRelationFence,
 	now time.Time,
 ) {
 	key := nodeLoadBalancerFirewallRelationKey(retired)
-	count := 1
-	if previousKey, previousCount, _, ok := parseNodeLoadBalancerFirewallRelationRetired(
-		values[annotationNodeLoadBalancerFirewallRelationRetired],
-	); ok && previousKey == key {
-		count = previousCount + 1
+	records := parseNodeLoadBalancerFirewallRelationRetirements(values[annotationNodeLoadBalancerFirewallRelationRetired])
+	record := records[key]
+	record.Count++
+	record.At = now.UTC()
+	records[key] = record
+	storeNodeLoadBalancerFirewallRelationRetirements(values, records, now)
+}
+
+// clearNodeLoadBalancerFirewallRelationRetirement ends the streak of one
+// relation, and reports whether a record was removed.
+func clearNodeLoadBalancerFirewallRelationRetirement(values map[string]string, key string, now time.Time) bool {
+	records := parseNodeLoadBalancerFirewallRelationRetirements(values[annotationNodeLoadBalancerFirewallRelationRetired])
+	if _, found := records[key]; !found {
+		return false
 	}
-	values[annotationNodeLoadBalancerFirewallRelationRetired] = fmt.Sprintf("%s|%d|%s", key, count, now.UTC().Format(time.RFC3339Nano))
+	delete(records, key)
+	storeNodeLoadBalancerFirewallRelationRetirements(values, records, now)
+	return true
 }

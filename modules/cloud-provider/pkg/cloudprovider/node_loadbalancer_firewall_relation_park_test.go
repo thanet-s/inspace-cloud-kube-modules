@@ -3,6 +3,7 @@ package cloudprovider
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -120,5 +121,51 @@ func TestNodeLoadBalancerFirewallRelationParkExpiresAfterThirtyMinutes(t *testin
 	}
 	if f.api.unassignCalls != 4 {
 		t.Fatalf("the relation was not issued again after the park: calls = %d", f.api.unassignCalls)
+	}
+}
+
+// A retirement of another relation must not erase the park of this one.
+func TestNodeLoadBalancerFirewallRelationParkSurvivesOtherRelationRetirement(t *testing.T) {
+	f := newRelationParkFixture(t)
+	f.retireThrice(t)
+	if err := f.unassign(testFirewallRelationVMUUID); !errors.Is(err, errNodeLoadBalancerFirewallRelationParked) {
+		t.Fatalf("VM A is not parked: %v", err)
+	}
+	// Issue a different relation (VM B), then let its receipt retire.
+	if err := f.unassign(testFirewallRelationSecondVMUUID); errors.Is(err, errNodeLoadBalancerFirewallRelationParked) {
+		t.Fatalf("a different relation was parked: %v", err)
+	}
+	if f.api.unassignCalls != 4 {
+		t.Fatalf("VM B was not issued: calls = %d", f.api.unassignCalls)
+	}
+	*f.now = f.now.Add(nodeLoadBalancerFirewallRelationRetireDelay + time.Second)
+	if err := f.unassign(testFirewallRelationSecondVMUUID); err != nil {
+		t.Fatalf("VM B receipt did not retire: %v", err)
+	}
+	// VM A is still inside its 30 minute park.
+	if err := f.unassign(testFirewallRelationVMUUID); !errors.Is(err, errNodeLoadBalancerFirewallRelationParked) {
+		t.Fatalf("the park on VM A was lost after VM B was issued: %v", err)
+	}
+	if f.api.unassignCalls != 4 {
+		t.Fatalf("parked VM A was dispatched again: calls = %d", f.api.unassignCalls)
+	}
+}
+
+// The retirement record is kept per relation and stays small.
+func TestNodeLoadBalancerFirewallRelationRetirementRecordIsBounded(t *testing.T) {
+	now := time.Date(2026, 10, 28, 2, 0, 0, 0, time.UTC)
+	values := map[string]string{}
+	for index := 0; index < 4*nodeLoadBalancerFirewallRelationRetirementRecords; index++ {
+		recordNodeLoadBalancerFirewallRelationRetirement(values, nodeLoadBalancerFirewallRelationFence{
+			operation: nodeLoadBalancerFirewallRelationUnassign, firewallUUID: testFirewallRelationFirewallUUID,
+			vmUUID: fmt.Sprintf("%08d-2222-4333-8444-555555555555", index),
+		}, now.Add(time.Duration(index)*time.Second))
+	}
+	records := parseNodeLoadBalancerFirewallRelationRetirements(values[annotationNodeLoadBalancerFirewallRelationRetired])
+	if len(records) > nodeLoadBalancerFirewallRelationRetirementRecords {
+		t.Fatalf("retirement record holds %d relations, want at most %d", len(records), nodeLoadBalancerFirewallRelationRetirementRecords)
+	}
+	if len(values[annotationNodeLoadBalancerFirewallRelationRetired]) > 4096 {
+		t.Fatalf("retirement annotation is %d bytes", len(values[annotationNodeLoadBalancerFirewallRelationRetired]))
 	}
 }
