@@ -35,6 +35,9 @@ const (
 	// they are. Adds and child spec repair wait for a make-before-break
 	// transition.
 	publicNodeLocalPassPolicyHeld
+	// publicNodeLocalPassUnion: the Service converges to a target pool or policy
+	// while the active exposure keeps serving. The intent is the target.
+	publicNodeLocalPassUnion
 )
 
 // syncPendingPublicNodeLocalTransition handles a serving Service whose pool or
@@ -90,6 +93,18 @@ func (c *nodeLoadBalancerController) syncPendingPublicNodeLocalTransition(
 	if refusal != nil {
 		reason, cause = publicNodeLocalReasonTransitionRefused, refusal
 	}
+	if refusal == nil && activePolicy == desired.Hash && service.Annotations[annotationNodeLoadBalancerPreviousFirewall] == "" &&
+		!publicNodeLocalAssignmentFencePresent(service) {
+		// A pool switch keeps the policy, so it keeps the firewall too.
+		started, startErr := c.startPublicNodeLocalTransition(ctx, service, intent, desired)
+		if startErr != nil {
+			return c.holdOrFailPublicNodeLocal(ctx, service, startErr)
+		}
+		if started {
+			c.requeuePublicNodeLocal(key)
+			return nil
+		}
+	}
 	c.recordPublicNodeLocalEvent(ctx, service, reason, cause)
 	mode := publicNodeLocalPassPoolHeld
 	activeIntent := intent
@@ -104,6 +119,14 @@ func (c *nodeLoadBalancerController) syncPendingPublicNodeLocalTransition(
 	}
 	// Nothing else to do under the active identity: hold, and look again later.
 	// The delay grows while the same change stays pending.
+	retryAfter, _ := c.nextPublicNodeLocalHoldDelay(string(service.UID), cause)
+	return &errPublicNodeLocalHolding{cause: cause, retryAfter: retryAfter}
+}
+
+// holdPendingPublicNodeLocalTransition holds a transition that cannot move on
+// yet, with the Pending Event and the backoff of an unchanged hold.
+func (c *nodeLoadBalancerController) holdPendingPublicNodeLocalTransition(ctx context.Context, service *corev1.Service, cause error) error {
+	c.recordPublicNodeLocalEvent(ctx, service, publicNodeLocalReasonTransitionPending, cause)
 	retryAfter, _ := c.nextPublicNodeLocalHoldDelay(string(service.UID), cause)
 	return &errPublicNodeLocalHolding{cause: cause, retryAfter: retryAfter}
 }
@@ -138,7 +161,7 @@ func (c *nodeLoadBalancerController) publicNodeLocalPolicyNarrows(
 	if firewallUUID == "" || service.Annotations[annotationNodeLoadBalancerFirewallHash] != activePolicy {
 		return false, nil
 	}
-	firewall, err := c.activePublicNodeLocalFirewall(ctx, service, activePolicy)
+	firewall, _, err := c.activePublicNodeLocalFirewall(ctx, service, activePolicy)
 	if err != nil {
 		if inspace.IsTransient(err) {
 			return false, err
@@ -155,26 +178,87 @@ func (c *nodeLoadBalancerController) activePublicNodeLocalFirewall(
 	ctx context.Context,
 	service *corev1.Service,
 	activePolicy string,
-) (*inspace.Firewall, error) {
+) (*inspace.Firewall, *inspace.Firewall, error) {
 	firewallUUID := service.Annotations[annotationNodeLoadBalancerFirewallUUID]
 	if firewallUUID == "" || service.Annotations[annotationNodeLoadBalancerFirewallHash] != activePolicy {
-		return nil, errors.New("public-node-local: the firewall ledger does not match the active policy")
+		return nil, nil, errors.New("public-node-local: the firewall ledger does not match the active policy")
 	}
 	owned, err := c.ownedServiceFirewalls(ctx, service)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
+	var current, previous *inspace.Firewall
 	for index := range owned {
-		if owned[index].UUID != firewallUUID {
-			continue
+		switch owned[index].UUID {
+		case firewallUUID:
+			hash, hashErr := nodeLoadBalancerFirewallSpecHash(owned[index].Rules)
+			if hashErr != nil || hash != activePolicy {
+				return nil, nil, errors.New("public-node-local: the ledger firewall rules are not the active policy")
+			}
+			current = &owned[index]
+		case service.Annotations[annotationNodeLoadBalancerPreviousFirewall]:
+			previous = &owned[index]
 		}
-		hash, hashErr := nodeLoadBalancerFirewallSpecHash(owned[index].Rules)
-		if hashErr != nil || hash != activePolicy {
-			return nil, errors.New("public-node-local: the ledger firewall rules are not the active policy")
-		}
-		return &owned[index], nil
 	}
-	return nil, fmt.Errorf("public-node-local: ledger firewall %s is not owned by the Service", firewallUUID)
+	if current == nil {
+		return nil, nil, fmt.Errorf("public-node-local: ledger firewall %s is not owned by the Service", firewallUUID)
+	}
+	return current, previous, nil
+}
+
+// finishPreviousPublicNodeLocalFirewall retires the firewall of the old policy
+// after a promotion: it is detached from every VM that holds the current
+// firewall, and deleted once nothing is assigned. A VM that does not hold the
+// current firewall yet keeps the old one, so a kept node is never left without
+// a gate. The old firewall is therefore attached only as long as it is needed:
+// from the promotion until the current firewall is attached to every VM and
+// read back. The child ports stay at the union until the old firewall is gone.
+func (c *nodeLoadBalancerController) finishPreviousPublicNodeLocalFirewall(
+	ctx context.Context,
+	key string,
+	service *corev1.Service,
+	current, previous *inspace.Firewall,
+	currentAssigned map[string]struct{},
+	keep map[string]struct{},
+	members map[string]publicNodeLocalMember,
+) (bool, error) {
+	if service.Annotations[annotationNodeLoadBalancerPreviousFirewall] == "" {
+		return false, nil
+	}
+	if previous != nil {
+		stay := map[string]struct{}{}
+		var stayNodes []*corev1.Node
+		for name := range keep {
+			member := members[name]
+			if member.vmUUID == "" {
+				continue
+			}
+			if _, covered := currentAssigned[member.vmUUID]; !covered {
+				stay[member.vmUUID] = struct{}{}
+				stayNodes = append(stayNodes, member.node)
+			}
+		}
+		stale, err := staleNodeLoadBalancerFirewallAssignments(*previous, stay)
+		if err != nil {
+			return true, c.holdOrFailPublicNodeLocal(ctx, service, err)
+		}
+		if len(stale) != 0 {
+			if err := c.detachServiceFirewallFromOtherNodes(ctx, service, previous, stayNodes); err != nil {
+				return true, c.holdOrFailPublicNodeLocal(ctx, service, err)
+			}
+			c.requeuePublicNodeLocal(key)
+			return true, nil
+		}
+		if len(stay) != 0 {
+			// Kept nodes without the current firewall: the old one stays on them.
+			return false, nil
+		}
+	}
+	if err := c.cleanupPreviousFirewall(ctx, service); err != nil {
+		return true, c.holdOrFailPublicNodeLocal(ctx, service, err)
+	}
+	c.requeuePublicNodeLocal(key)
+	return true, nil
 }
 
 // publicNodeLocalRulesNarrow reports whether the new rules are a strict
@@ -437,4 +521,132 @@ func (c *nodeLoadBalancerController) publicNodeLocalTransitionAdmissible(
 		}
 	}
 	return nil, nil
+}
+
+// startPublicNodeLocalTransition records the target of a pool or policy change
+// next to the active identity. From then on the Service serves the union of
+// both until the target is converged and promoted. Nothing is changed in the
+// cloud. The write is a compare-and-swap on the exact parent: it only applies if
+// the live Service still wants this target and still serves this activation.
+func (c *nodeLoadBalancerController) startPublicNodeLocalTransition(
+	ctx context.Context,
+	service *corev1.Service,
+	intent nodeLoadBalancerIntent,
+	desired desiredNodeLoadBalancerFirewall,
+) (bool, error) {
+	activePool := service.Annotations[annotationPublicNodeLocalActivePool]
+	activePolicy := service.Annotations[annotationPublicNodeLocalActivePolicy]
+	_, changed, err := c.updateExactParentService(ctx, service, func(copy *corev1.Service) (bool, error) {
+		liveIntent, parseErr := parseNodeLoadBalancerService(copy, nodeLoadBalancerDefaults{NodesPerShard: c.provider.config.NodeLoadBalancer.NodesPerShard})
+		liveDesired, desiredErr := c.desiredServiceFirewall(copy)
+		if parseErr != nil || desiredErr != nil || liveIntent.Pool != intent.Pool || liveDesired.Hash != desired.Hash ||
+			copy.Annotations[annotationPublicNodeLocalActivePool] != activePool ||
+			copy.Annotations[annotationPublicNodeLocalActivePolicy] != activePolicy ||
+			copy.Annotations[annotationPublicNodeLocalTargetPool] != "" ||
+			copy.Annotations[annotationPublicNodeLocalTargetPolicy] != "" ||
+			copy.Annotations[annotationNodeLoadBalancerPreviousFirewall] != "" ||
+			publicNodeLocalAssignmentFencePresent(copy) {
+			return false, errors.Join(errors.New("public-node-local: the Service changed before the transition could start"), parseErr, desiredErr)
+		}
+		copy.Annotations[annotationPublicNodeLocalTargetPool] = intent.Pool
+		copy.Annotations[annotationPublicNodeLocalTargetPolicy] = desired.Hash
+		return true, nil
+	})
+	return changed, err
+}
+
+// promotePublicNodeLocalTransition makes the converged target the active
+// identity. Old-pool Nodes are then Gone, and the normal removal order takes
+// them off the edge one by one.
+func (c *nodeLoadBalancerController) promotePublicNodeLocalTransition(
+	ctx context.Context,
+	service *corev1.Service,
+	targetPool, targetPolicy, firewallUUID string,
+) error {
+	_, _, err := c.updateExactParentService(ctx, service, func(copy *corev1.Service) (bool, error) {
+		if copy.Annotations[annotationPublicNodeLocalTargetPool] != targetPool ||
+			copy.Annotations[annotationPublicNodeLocalTargetPolicy] != targetPolicy ||
+			copy.Annotations[annotationNodeLoadBalancerFirewallUUID] != firewallUUID ||
+			copy.Annotations[annotationNodeLoadBalancerFirewallHash] != targetPolicy ||
+			publicNodeLocalAssignmentFencePresent(copy) {
+			return false, errors.New("public-node-local: the transition changed before promotion")
+		}
+		copy.Annotations[annotationPublicNodeLocalActivePool] = targetPool
+		copy.Annotations[annotationPublicNodeLocalActivePolicy] = targetPolicy
+		delete(copy.Annotations, annotationPublicNodeLocalTargetPool)
+		delete(copy.Annotations, annotationPublicNodeLocalTargetPolicy)
+		return true, nil
+	})
+	return err
+}
+
+const publicNodeLocalReasonTransitionAborted = "PublicNodeLocalTransitionAborted"
+
+// abortPublicNodeLocalTransition ends a union that the intent no longer wants:
+// the pool or policy went back to the active one, moved on to a third, or the
+// target lost a claim. The target annotations are cleared and the active
+// exposure keeps serving. Nodes that joined for the target only are then Gone
+// under the active identity, and the normal removal order takes them off. When
+// the policy had moved the firewall ledger to the target firewall, the ledger is
+// handed back to the active firewall, and the target one becomes the previous
+// firewall that the normal cleanup detaches and deletes.
+func (c *nodeLoadBalancerController) abortPublicNodeLocalTransition(
+	ctx context.Context,
+	key string,
+	service *corev1.Service,
+	cause error,
+) error {
+	state, err := publicNodeLocalTransition(service)
+	if err != nil || state.Phase != publicNodeLocalPhaseUnion {
+		return c.holdOrFailPublicNodeLocal(ctx, service, errors.Join(err, errors.New("public-node-local: no transition to abort")))
+	}
+	var restore *inspace.Firewall
+	ledgerPolicy := service.Annotations[annotationNodeLoadBalancerFirewallHash]
+	previousUUID := service.Annotations[annotationNodeLoadBalancerPreviousFirewall]
+	if ledgerPolicy != state.ActivePolicy {
+		// The ledger already moved to the target firewall. Only the exact previous
+		// firewall, proven to carry the active policy, may take it back.
+		if previousUUID == "" {
+			return c.holdOrFailPublicNodeLocal(ctx, service, errors.New("public-node-local: cannot abort a transition whose active firewall is unknown"))
+		}
+		owned, ownedErr := c.ownedServiceFirewalls(ctx, service)
+		if ownedErr != nil {
+			return c.holdOrFailPublicNodeLocal(ctx, service, ownedErr)
+		}
+		for index := range owned {
+			if owned[index].UUID != previousUUID {
+				continue
+			}
+			if hash, hashErr := nodeLoadBalancerFirewallSpecHash(owned[index].Rules); hashErr == nil && hash == state.ActivePolicy {
+				restore = &owned[index]
+			}
+		}
+		if restore == nil {
+			return c.holdOrFailPublicNodeLocal(ctx, service, errors.New("public-node-local: the previous firewall does not prove the active policy"))
+		}
+	}
+	c.recordPublicNodeLocalEvent(ctx, service, publicNodeLocalReasonTransitionAborted, fmt.Errorf(
+		"public-node-local: the transition to pool %q (policy %q) is abandoned and the active exposure stays: %w",
+		state.TargetPool, state.TargetPolicy, cause))
+	_, _, err = c.updateExactParentService(ctx, service, func(copy *corev1.Service) (bool, error) {
+		if copy.Annotations[annotationPublicNodeLocalTargetPool] != state.TargetPool ||
+			copy.Annotations[annotationPublicNodeLocalTargetPolicy] != state.TargetPolicy ||
+			copy.Annotations[annotationPublicNodeLocalActivePool] != state.ActivePool ||
+			copy.Annotations[annotationPublicNodeLocalActivePolicy] != state.ActivePolicy {
+			return false, errors.New("public-node-local: the transition changed before it could be abandoned")
+		}
+		if restore != nil {
+			copy.Annotations[annotationNodeLoadBalancerPreviousFirewall] = copy.Annotations[annotationNodeLoadBalancerFirewallUUID]
+			copy.Annotations[annotationNodeLoadBalancerFirewallUUID] = restore.UUID
+			copy.Annotations[annotationNodeLoadBalancerFirewallHash] = state.ActivePolicy
+		}
+		delete(copy.Annotations, annotationPublicNodeLocalTargetPool)
+		delete(copy.Annotations, annotationPublicNodeLocalTargetPolicy)
+		return true, nil
+	})
+	if err != nil {
+		return c.holdOrFailPublicNodeLocal(ctx, service, err)
+	}
+	c.requeuePublicNodeLocal(key)
+	return nil
 }

@@ -5073,9 +5073,22 @@ func (c *nodeLoadBalancerController) cleanupPreviousFirewall(ctx context.Context
 	if err != nil {
 		return err
 	}
+	retainedPrevious := false
 	for _, firewall := range owned {
 		if firewall.UUID == currentUUID {
 			continue
+		}
+		if previousUUID != "" && firewall.UUID == previousUUID {
+			// The previous firewall guards VMs until the current one has taken
+			// over: while a policy transition runs, or while it is still assigned.
+			assignments, assignmentErr := nodeLoadBalancerFirewallVMAssignments(firewall)
+			if assignmentErr != nil {
+				return assignmentErr
+			}
+			if current.Annotations[annotationPublicNodeLocalTargetPolicy] != "" || len(assignments) != 0 {
+				retainedPrevious = true
+				continue
+			}
 		}
 		latest, latestErr := c.getExactParentService(ctx, current)
 		if latestErr != nil {
@@ -5094,7 +5107,7 @@ func (c *nodeLoadBalancerController) cleanupPreviousFirewall(ctx context.Context
 			return nil
 		}
 	}
-	if previousUUID == "" {
+	if previousUUID == "" || retainedPrevious {
 		return nil
 	}
 	_, _, err = c.updateExactParentService(ctx, current, func(copy *corev1.Service) (bool, error) {

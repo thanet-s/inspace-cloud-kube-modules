@@ -1157,3 +1157,129 @@ func TestPublicNodeLocalPeerInTransitionBlocksBothPools(t *testing.T) {
 		t.Fatalf("an unrelated pool is blocked: blocks=%t err=%v", blocks, err)
 	}
 }
+
+// moveFixtureNodeToPool relabels the i-th fixture Node.
+func moveFixtureNodeToPool(t *testing.T, f *publicNodeLocalTransientFixture, index int, pool string) {
+	t.Helper()
+	name, _, _, _ := publicNodeLocalFixtureNode(index)
+	updatePublicNodeLocalFixtureNode(t, f, name, func(n *corev1.Node) { n.Labels[publicNodeLocalPoolLabel] = pool })
+}
+
+// requireNeverEmptyAndMakeBeforeBreak checks the edge after one pass of a
+// transition: it is never empty, and every published FIP points at a VM with
+// a firewall and a child VIP.
+func requireTransitionEdgeSafe(t *testing.T, f *publicNodeLocalTransientFixture, pass int, nodes ...int) publicNodeLocalObservation {
+	t.Helper()
+	observed := observePublicNodeLocal(t, f)
+	if len(f.current(t).Status.LoadBalancer.Ingress) == 0 {
+		t.Fatalf("pass %d: the parent status is empty", pass)
+	}
+	for _, index := range nodes {
+		observed.requireMakeBeforeBreak(t, pass, index)
+	}
+	return observed
+}
+
+// A pool switch publishes the union of both pools, promotes the target and only
+// then removes the old pool, and the edge is never empty.
+func TestPublicNodeLocalPoolSwitchMakeBeforeBreak(t *testing.T) {
+	f := newPublishedPublicNodeLocalFixtureN(t, 1)
+	f.addNode(t, 1)
+	moveFixtureNodeToPool(t, f, 1, "spe-relay-share")
+	_, vmA, privA, pubA := publicNodeLocalFixtureNode(0)
+	_, vmB, privB, pubB := publicNodeLocalFixtureNode(1)
+	updatePublicNodeLocalFixtureService(t, f, func(s *corev1.Service) { s.Annotations[annotationNodeLoadBalancerPool] = "spe-relay-share" })
+	sawUnion, done := false, false
+	for pass := 0; pass < 120 && !done; pass++ {
+		if current := f.current(t); current.Annotations[annotationNodeLoadBalancerCleanupFWChecked] != "" {
+			ageNodeLoadBalancerAbsenceEvidence(t, f.ctx, f.provider, current, annotationNodeLoadBalancerCleanupFWChecked)
+		}
+		err := f.controller.syncPublicNodeLocal(f.ctx, f.key, f.current(t))
+		var holding *errPublicNodeLocalHolding
+		var pending *nodeLoadBalancerFirewallRelationPendingError
+		if err != nil && !errors.As(err, &holding) && !errors.As(err, &pending) {
+			t.Fatalf("pass %d: %v", pass, err)
+		}
+		observed := requireTransitionEdgeSafe(t, f, pass, 0, 1)
+		if observed.fips[pubA] && observed.fips[pubB] {
+			sawUnion = true
+		}
+		current := f.current(t)
+		done = current.Annotations[annotationPublicNodeLocalActivePool] == "spe-relay-share" &&
+			current.Annotations[annotationPublicNodeLocalTargetPool] == "" &&
+			!observed.fips[pubA] && !observed.vips[privA] && !observed.assigned[vmA]
+	}
+	if !done {
+		t.Fatalf("the switch never completed: %#v %#v", observePublicNodeLocal(t, f), f.current(t).Annotations)
+	}
+	if !sawUnion {
+		t.Fatal("both pools were never published together")
+	}
+	observed := observePublicNodeLocal(t, f)
+	if !observed.fips[pubB] || !observed.vips[privB] || !observed.assigned[vmB] || len(f.current(t).Status.LoadBalancer.Ingress) != 1 {
+		t.Fatalf("the target pool does not serve alone: %#v", observed)
+	}
+	if got := trackedPublicNodeLocalDatapath(t, f).Annotations[annotationPublicNodeLocalDatapathPool]; got != "spe-relay-share" {
+		t.Fatalf("child pool = %q", got)
+	}
+	if got := trackedPublicNodeLocalDatapath(t, f).Annotations[annotationPublicNodeLocalDatapathTargetPool]; got != "" {
+		t.Fatalf("child target pool = %q", got)
+	}
+}
+
+// A pool change no longer holds: the first pass records the target next to the
+// active identity and touches nothing else. (It replaces the "pool annotation
+// change" row of the definite-failure table, which expected a pending hold.)
+func TestPublicNodeLocalPoolChangeStartsTransitionWithoutTouchingTheEdge(t *testing.T) {
+	f := newPublishedPublicNodeLocalFixtureN(t, 1)
+	before := f.current(t)
+	childBefore := trackedPublicNodeLocalDatapath(t, f)
+	updatePublicNodeLocalFixtureService(t, f, func(s *corev1.Service) { s.Annotations[annotationNodeLoadBalancerPool] = "other" })
+	if err := f.controller.syncPublicNodeLocal(f.ctx, f.key, f.current(t)); err != nil {
+		t.Fatalf("start pass: %v", err)
+	}
+	after := f.current(t)
+	if after.Annotations[annotationPublicNodeLocalTargetPool] != "other" ||
+		after.Annotations[annotationPublicNodeLocalTargetPolicy] != before.Annotations[annotationPublicNodeLocalActivePolicy] {
+		t.Fatalf("target not recorded: %#v", after.Annotations)
+	}
+	if after.Annotations[annotationPublicNodeLocalActivePool] != "edge" || !reflect.DeepEqual(after.Status, before.Status) ||
+		len(f.api.unassignedFirewalls) != 0 {
+		t.Fatalf("the start pass changed the edge: %#v", after)
+	}
+	if !reflect.DeepEqual(trackedPublicNodeLocalDatapath(t, f).Status, childBefore.Status) {
+		t.Fatal("the start pass changed the child status")
+	}
+}
+
+// The target is promoted only when its Nodes are on the edge. A target Node
+// whose firewall assignment is not applied keeps the old pool as the active one.
+func TestPublicNodeLocalPromotionRequiresTargetConverged(t *testing.T) {
+	f := newPublishedPublicNodeLocalFixtureN(t, 1)
+	_, vmB, _, _ := publicNodeLocalFixtureNode(1)
+	f.addNode(t, 1)
+	moveFixtureNodeToPool(t, f, 1, "spe-relay-share")
+	f.provider.api = &neverAppliesAssignAPI{
+		publicNodeLocalFilteringIPAPI: &publicNodeLocalFilteringIPAPI{fakeAPI: f.api}, stuckVM: vmB,
+	}
+	_, vmA, privA, pubA := publicNodeLocalFixtureNode(0)
+	updatePublicNodeLocalFixtureService(t, f, func(s *corev1.Service) { s.Annotations[annotationNodeLoadBalancerPool] = "spe-relay-share" })
+	for pass := 0; pass < 40; pass++ {
+		err := f.controller.syncPublicNodeLocal(f.ctx, f.key, f.current(t))
+		var holding *errPublicNodeLocalHolding
+		var pending *nodeLoadBalancerFirewallRelationPendingError
+		if err != nil && !errors.As(err, &holding) && !errors.As(err, &pending) {
+			t.Fatalf("pass %d: %v", pass, err)
+		}
+		current := f.current(t)
+		if current.Annotations[annotationPublicNodeLocalActivePool] != "edge" {
+			t.Fatalf("pass %d: promoted with a target Node that has no firewall", pass)
+		}
+		if observed := observePublicNodeLocal(t, f); !observed.fips[pubA] || !observed.vips[privA] || !observed.assigned[vmA] {
+			t.Fatalf("pass %d: the old node left the edge: %#v", pass, observed)
+		}
+	}
+	if current := f.current(t); current.Annotations[annotationPublicNodeLocalTargetPool] != "spe-relay-share" {
+		t.Fatalf("the transition did not stay open: %#v", current.Annotations)
+	}
+}

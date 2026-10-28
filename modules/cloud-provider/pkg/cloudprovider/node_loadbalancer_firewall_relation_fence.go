@@ -850,6 +850,10 @@ func (c *nodeLoadBalancerController) authorizeServiceFirewallRelationPreDispatch
 		// A serving Service adds one node at a time; only that VM must be proven.
 		// While a pool change is pending, the active pool governs the add.
 		intent.Pool = current.Annotations[annotationPublicNodeLocalActivePool]
+		if target := current.Annotations[annotationPublicNodeLocalTargetPool]; target != "" {
+			// During a union the add converges to the target.
+			intent.Pool = target
+		}
 		if err := c.validateActivePublicNodeLocalAssignState(ctx, current, intent, desired, fence.firewallUUID, fence.vmUUID); err != nil {
 			return err
 		}

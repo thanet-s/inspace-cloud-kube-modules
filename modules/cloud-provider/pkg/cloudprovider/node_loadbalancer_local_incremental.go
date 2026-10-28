@@ -140,12 +140,21 @@ func (c *nodeLoadBalancerController) convergeActivePublicNodeLocal(
 	mode publicNodeLocalPassMode,
 ) error {
 	policyHeld := mode == publicNodeLocalPassPolicyHeld
+	union := mode == publicNodeLocalPassUnion
+	// The child follows the persisted activation. During a union the intent is
+	// the target, and the child keeps the active pool until promotion.
+	activePool := service.Annotations[annotationPublicNodeLocalActivePool]
 	if !policyHeld {
 		loses, winnerWaiting, conflictErr := c.publicNodeLocalPortConflict(ctx, service, intent)
 		if loses {
 			cause := conflictErr
 			if cause == nil {
 				cause = fmt.Errorf("public-node-local: Service %s/%s lost a deterministic protocol/port claim in pool %s", service.Namespace, service.Name, intent.Pool)
+			}
+			if union {
+				// The active exposure still holds its own claim. Only the target
+				// is given up.
+				return errors.Join(c.recordPublicNodeLocalConflictEvent(ctx, service, cause), c.abortPublicNodeLocalTransition(ctx, key, service, cause))
 			}
 			return errors.Join(c.recordPublicNodeLocalConflictEvent(ctx, service, cause), c.failPublicNodeLocalClosed(ctx, service, cause))
 		}
@@ -175,7 +184,7 @@ func (c *nodeLoadBalancerController) convergeActivePublicNodeLocal(
 	} else {
 		var changed bool
 		var err error
-		datapath, changed, err = c.ensurePublicNodeLocalDatapath(ctx, service, intent.Pool)
+		datapath, changed, err = c.ensurePublicNodeLocalDatapath(ctx, service, activePool)
 		if err != nil {
 			return c.holdOrFailPublicNodeLocal(ctx, service, err)
 		}
@@ -184,7 +193,11 @@ func (c *nodeLoadBalancerController) convergeActivePublicNodeLocal(
 			return nil
 		}
 	}
-	nodes, patchedNode, err := c.classifyPublicNodeLocalNodesChild(ctx, service, intent, !policyHeld)
+	pools := []string{activePool}
+	if union && intent.Pool != activePool {
+		pools = append(pools, intent.Pool)
+	}
+	nodes, patchedNode, _, err := c.classifyPublicNodeLocalNodesPools(ctx, service, pools, activePool, false, !policyHeld)
 	if err != nil {
 		return c.holdOrFailPublicNodeLocal(ctx, service, err)
 	}
@@ -196,17 +209,17 @@ func (c *nodeLoadBalancerController) convergeActivePublicNodeLocal(
 	if err != nil {
 		return c.holdOrFailPublicNodeLocal(ctx, service, err)
 	}
-	var firewall *inspace.Firewall
+	var firewall, previousFirewall *inspace.Firewall
 	if policyHeld {
 		if service, err = c.getExactParentService(ctx, service); err != nil {
 			return c.holdOrFailPublicNodeLocal(ctx, service, err)
 		}
-		if firewall, err = c.activePublicNodeLocalFirewall(ctx, service, desired.Hash); err != nil {
+		if firewall, previousFirewall, err = c.activePublicNodeLocalFirewall(ctx, service, desired.Hash); err != nil {
 			return c.holdOrFailPublicNodeLocal(ctx, service, err)
 		}
 	} else {
 		var waiting bool
-		service, firewall, waiting, err = c.preparePublicNodeLocalFirewall(ctx, service)
+		service, firewall, previousFirewall, waiting, err = c.preparePublicNodeLocalFirewall(ctx, service)
 		if err != nil {
 			return c.holdOrFailPublicNodeLocal(ctx, service, err)
 		}
@@ -238,7 +251,7 @@ func (c *nodeLoadBalancerController) convergeActivePublicNodeLocal(
 		if policyHeld {
 			return c.setPublicNodeLocalDatapathStatusHeld(ctx, service, datapath, status)
 		}
-		_, _, err := c.ensurePublicNodeLocalDatapathStatus(ctx, service, datapath, intent.Pool, status)
+		_, _, err := c.ensurePublicNodeLocalDatapathStatus(ctx, service, datapath, activePool, status)
 		return err
 	}
 
@@ -430,16 +443,23 @@ func (c *nodeLoadBalancerController) convergeActivePublicNodeLocal(
 				keepVMSet[member.vmUUID] = struct{}{}
 			}
 		}
-		stale, err := staleNodeLoadBalancerFirewallAssignments(*firewall, keepVMSet)
-		if err != nil {
-			return true, c.holdOrFailPublicNodeLocal(ctx, service, err)
-		}
-		if len(stale) != 0 {
-			if err := c.detachServiceFirewallFromOtherNodes(ctx, service, firewall, keepNodes); err != nil {
+		// The current firewall and, while one is left over, the previous one: a
+		// node that leaves loses both before its child VIP goes.
+		for _, leaving := range []*inspace.Firewall{firewall, previousFirewall} {
+			if leaving == nil {
+				continue
+			}
+			stale, err := staleNodeLoadBalancerFirewallAssignments(*leaving, keepVMSet)
+			if err != nil {
 				return true, c.holdOrFailPublicNodeLocal(ctx, service, err)
 			}
-			c.requeuePublicNodeLocal(key)
-			return true, nil
+			if len(stale) != 0 {
+				if err := c.detachServiceFirewallFromOtherNodes(ctx, service, leaving, keepNodes); err != nil {
+					return true, c.holdOrFailPublicNodeLocal(ctx, service, err)
+				}
+				c.requeuePublicNodeLocal(key)
+				return true, nil
+			}
 		}
 		next := map[string]struct{}{}
 		for ip := range vips {
@@ -507,6 +527,22 @@ func (c *nodeLoadBalancerController) convergeActivePublicNodeLocal(
 		// Adds wait for a make-before-break transition: a new node would need the
 		// pending policy, and the active one is the only one this pass may use.
 		addCandidates = nil
+	}
+	var targetReady []nodeLoadBalancerAddress
+	if union {
+		for _, address := range nodes.Ready {
+			if nodes.PoolOf[address.Node.Name] == intent.Pool {
+				targetReady = append(targetReady, address)
+			}
+		}
+		if desired.Hash != service.Annotations[annotationPublicNodeLocalActivePolicy] {
+			// The active pool's Nodes hold the old firewall and the ledger names the
+			// new one, so only the target pool gains Nodes. The active pool keeps
+			// what it has and loses it through the removal order after promotion.
+			addCandidates = targetReady
+		}
+		// With the same policy the firewall is shared, so a Node that joins the
+		// active pool meanwhile (a replacement, say) can still join.
 	}
 	for _, address := range addCandidates {
 		vmUUID, _ := nodeLoadBalancerVMUUID(address.Node)
@@ -589,6 +625,23 @@ func (c *nodeLoadBalancerController) convergeActivePublicNodeLocal(
 		return nil
 	}
 
+	if union {
+		// Every Node of the target pool is on the edge now. It must be a pool
+		// that serves at all: promoting an empty one would take the edge away.
+		if len(targetReady) == 0 {
+			return c.holdPendingPublicNodeLocalTransition(ctx, service, errors.New(
+				"public-node-local: the target pool has no Ready Node with a local endpoint yet; the active exposure stays"))
+		}
+		if err := c.verifyActivePublicNodeLocalPublication(ctx, service, intent, desired, firewall.UUID, targetReady); err != nil {
+			return c.holdOrFailPublicNodeLocal(ctx, service, err)
+		}
+		if err := c.promotePublicNodeLocalTransition(ctx, service, intent.Pool, desired.Hash, firewall.UUID); err != nil {
+			return c.holdOrFailPublicNodeLocal(ctx, service, err)
+		}
+		c.requeuePublicNodeLocal(key)
+		return nil
+	}
+
 	// The rest of the removals, after every add is done.
 	allDropped := map[string]struct{}{}
 	for name := range removeGone {
@@ -598,6 +651,9 @@ func (c *nodeLoadBalancerController) convergeActivePublicNodeLocal(
 		allDropped[name] = struct{}{}
 	}
 	if acted, err := removeNodes(allDropped, keep); acted || err != nil {
+		return err
+	}
+	if acted, err := c.finishPreviousPublicNodeLocalFirewall(ctx, key, service, firewall, previousFirewall, assigned, keep, members); acted || err != nil {
 		return err
 	}
 
@@ -637,16 +693,24 @@ func (c *nodeLoadBalancerController) activePublicNodeLocalContract(
 	if err != nil || current.DeletionTimestamp != nil || !containsString(current.Finalizers, publicNodeLocalFinalizer) {
 		return nil, joinWithExplanation(errors.New("public-node-local: live Service contract changed during an incremental change"), err)
 	}
-	activePool := current.Annotations[annotationPublicNodeLocalActivePool]
-	activePolicy := current.Annotations[annotationPublicNodeLocalActivePolicy]
-	if activePool != "" {
-		currentIntent.Pool = activePool
+	state, err := publicNodeLocalTransition(current)
+	if err != nil {
+		return nil, err
+	}
+	// Adds converge to the target while a union runs and to the active identity
+	// otherwise. A held pass reads the live pool annotation as the active pool.
+	workPool, workPolicy := state.Work()
+	if state.Phase != publicNodeLocalPhaseUnion && workPool != "" {
+		currentIntent.Pool = workPool
 	}
 	currentDesired, err := c.desiredServiceFirewall(current)
 	if err != nil {
 		return nil, err
 	}
-	if currentDesired.Hash == activePolicy {
+	if state.Phase == publicNodeLocalPhaseUnion && currentDesired.Hash != workPolicy {
+		return nil, errors.New("public-node-local: live target policy changed during a transition")
+	}
+	if currentDesired.Hash == workPolicy {
 		if !reflect.DeepEqual(currentIntent, intent) {
 			return nil, errors.New("public-node-local: live Service contract changed during an incremental change")
 		}
@@ -658,7 +722,7 @@ func (c *nodeLoadBalancerController) activePublicNodeLocalContract(
 		current.Annotations[annotationNodeLoadBalancerFirewallHash] != desired.Hash {
 		return nil, errors.New("public-node-local: live firewall ledger or policy changed during an incremental change")
 	}
-	if activePool != intent.Pool || activePolicy != desired.Hash {
+	if workPool != intent.Pool || workPolicy != desired.Hash {
 		return nil, errors.New("public-node-local: persisted activation identity changed during an incremental change")
 	}
 	return current, nil
@@ -777,10 +841,10 @@ func (c *nodeLoadBalancerController) validateActivePublicNodeLocalAssignState(
 	if err != nil {
 		return fmt.Errorf("public-node-local: read private datapath during assignment authorization: %w", err)
 	}
-	if !publicNodeLocalDatapathMatches(datapath, current, intent.Pool) {
+	if !publicNodeLocalDatapathMatches(datapath, current, publicNodeLocalChildPool(current, intent.Pool)) {
 		return errors.New("public-node-local: private datapath spec changed during firewall assignment authorization")
 	}
-	nodes, patched, err := c.classifyPublicNodeLocalNodes(ctx, current, intent)
+	nodes, patched, err := c.classifyPublicNodeLocalNodesInTransition(ctx, current)
 	if err != nil {
 		return err
 	}
@@ -818,6 +882,21 @@ func (c *nodeLoadBalancerController) validateActivePublicNodeLocalAssignState(
 		return errors.New("public-node-local: durable firewall assignment fence does not cover the VM")
 	}
 	return nil
+}
+
+// classifyPublicNodeLocalNodesInTransition classifies the Nodes of a serving
+// Service against the active pool and, during a union, the target pool too.
+func (c *nodeLoadBalancerController) classifyPublicNodeLocalNodesInTransition(
+	ctx context.Context,
+	service *corev1.Service,
+) (publicNodeLocalNodeSet, bool, error) {
+	active := service.Annotations[annotationPublicNodeLocalActivePool]
+	pools := []string{active}
+	if target := service.Annotations[annotationPublicNodeLocalTargetPool]; target != "" && target != active {
+		pools = append(pools, target)
+	}
+	set, patched, _, err := c.classifyPublicNodeLocalNodesPools(ctx, service, pools, active, false, true)
+	return set, patched, err
 }
 
 // noteAllGone returns when the Service was first seen with every published Node
@@ -866,7 +945,7 @@ func (c *nodeLoadBalancerController) verifyActivePublicNodeLocalPublication(
 	if err != nil {
 		return fmt.Errorf("public-node-local: read private datapath after publication: %w", err)
 	}
-	if !publicNodeLocalDatapathMatches(datapath, current, intent.Pool) {
+	if !publicNodeLocalDatapathMatches(datapath, current, publicNodeLocalChildPool(current, intent.Pool)) {
 		return errors.New("public-node-local: private datapath spec changed after publication")
 	}
 	vips := publicNodeLocalIngressSet(datapath.Status.LoadBalancer)
@@ -890,7 +969,7 @@ func (c *nodeLoadBalancerController) verifyActivePublicNodeLocalPublication(
 	if assigned == nil {
 		return fmt.Errorf("public-node-local: Service firewall %s is absent after publication", firewallUUID)
 	}
-	nodes, patched, err := c.classifyPublicNodeLocalNodes(ctx, current, intent)
+	nodes, patched, err := c.classifyPublicNodeLocalNodesInTransition(ctx, current)
 	if err != nil {
 		return err
 	}

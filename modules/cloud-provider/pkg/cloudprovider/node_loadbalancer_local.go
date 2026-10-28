@@ -123,6 +123,21 @@ func (c *nodeLoadBalancerController) syncPublicNodeLocalPass(
 	if activePool == "" && len(service.Status.LoadBalancer.Ingress) != 0 {
 		return c.holdOrFailPublicNodeLocal(ctx, service, errors.New("public-node-local: public status exists without persisted activation authorization"))
 	}
+	if activePool != "" {
+		state, stateErr := publicNodeLocalTransition(service)
+		if stateErr != nil {
+			return c.holdOrFailPublicNodeLocal(ctx, service, stateErr)
+		}
+		if state.Phase == publicNodeLocalPhaseUnion {
+			if intent.Pool == state.TargetPool && desiredFirewall.Hash == state.TargetPolicy {
+				return c.convergeActivePublicNodeLocal(ctx, key, service, intent, desiredFirewall, publicNodeLocalPassUnion)
+			}
+			// The intent moved away from the target: back to the active identity,
+			// or on to a third one. Either way the union ends first.
+			return c.abortPublicNodeLocalTransition(ctx, key, service, fmt.Errorf(
+				"the Service intent (pool %q, firewall policy %q) is no longer the target", intent.Pool, desiredFirewall.Hash))
+		}
+	}
 	if activePool != "" && (activePool != intent.Pool || activePolicy != desiredFirewall.Hash) {
 		return c.syncPendingPublicNodeLocalTransition(ctx, key, service, intent, desiredFirewall)
 	}
@@ -199,7 +214,7 @@ func (c *nodeLoadBalancerController) syncPublicNodeLocalPass(
 	}
 	var firewall *inspace.Firewall
 	var waiting bool
-	service, firewall, waiting, err = c.preparePublicNodeLocalFirewall(ctx, service)
+	service, firewall, _, waiting, err = c.preparePublicNodeLocalFirewall(ctx, service)
 	if err != nil {
 		return c.holdOrFailPublicNodeLocal(ctx, service, err)
 	}
@@ -337,35 +352,124 @@ func (c *nodeLoadBalancerController) ensurePublicNodeLocalFinalizer(ctx context.
 	return changed, err
 }
 
+// preparePublicNodeLocalFirewall returns the firewall of the current policy
+// and, while a policy change is in flight, the previous one. Two owned
+// firewalls are expected exactly when the ledger names a previous one.
 func (c *nodeLoadBalancerController) preparePublicNodeLocalFirewall(
 	ctx context.Context,
 	service *corev1.Service,
-) (*corev1.Service, *inspace.Firewall, bool, error) {
+) (*corev1.Service, *inspace.Firewall, *inspace.Firewall, bool, error) {
 	firewall, previousUUID, _, err := c.ensureServiceFirewall(ctx, service, nil)
 	if err != nil {
-		return service, nil, false, err
+		return service, nil, nil, false, err
 	}
 	if firewall == nil {
-		return service, nil, true, nil
+		return service, nil, nil, true, nil
 	}
 	if patched, err := c.ensureFirewallMetadata(ctx, service, firewall, previousUUID); err != nil || patched {
-		return service, nil, patched, err
+		return service, nil, nil, patched, err
 	}
 	service, err = c.getExactParentService(ctx, service)
 	if err != nil {
-		return service, nil, false, err
+		return service, nil, nil, false, err
 	}
 	if err := c.cleanupPreviousFirewall(ctx, service); err != nil {
-		return service, nil, false, err
+		return service, nil, nil, false, err
+	}
+	service, err = c.getExactParentService(ctx, service)
+	if err != nil {
+		return service, nil, nil, false, err
 	}
 	owned, err := c.ownedServiceFirewalls(ctx, service)
 	if err != nil {
-		return service, nil, false, err
+		return service, nil, nil, false, err
 	}
-	if len(owned) != 1 || owned[0].UUID != firewall.UUID {
-		return service, nil, true, nil
+	var current, previous *inspace.Firewall
+	previousAnnotation := service.Annotations[annotationNodeLoadBalancerPreviousFirewall]
+	for index := range owned {
+		switch {
+		case owned[index].UUID == firewall.UUID:
+			current = &owned[index]
+		case previousAnnotation != "" && owned[index].UUID == previousAnnotation:
+			previous = &owned[index]
+		default:
+			return service, nil, nil, true, nil
+		}
 	}
-	return service, &owned[0], false, nil
+	if current == nil {
+		return service, nil, nil, true, nil
+	}
+	return service, current, previous, false, nil
+}
+
+// desiredPublicNodeLocalDatapathFor is the child a Service wants, given the
+// child that exists. While a policy transition runs, or its old firewall is
+// still being detached, the child keeps the ports and source ranges it already
+// serves next to the new ones, so no port closes before the firewall that
+// guards it is gone.
+func desiredPublicNodeLocalDatapathFor(service *corev1.Service, pool string, existing *corev1.Service) *corev1.Service {
+	desired := desiredPublicNodeLocalDatapath(service, pool)
+	if target := service.Annotations[annotationPublicNodeLocalTargetPool]; target != "" {
+		desired.Annotations[annotationPublicNodeLocalDatapathTargetPool] = target
+	}
+	if existing == nil || (service.Annotations[annotationPublicNodeLocalTargetPolicy] == "" &&
+		service.Annotations[annotationNodeLoadBalancerPreviousFirewall] == "") {
+		return desired
+	}
+	type portKey struct {
+		protocol corev1.Protocol
+		port     int32
+	}
+	keyOf := func(port corev1.ServicePort) portKey {
+		protocol := port.Protocol
+		if protocol == "" {
+			protocol = corev1.ProtocolTCP
+		}
+		return portKey{protocol: protocol, port: port.Port}
+	}
+	wanted := make(map[portKey]corev1.ServicePort, len(desired.Spec.Ports))
+	for _, port := range desired.Spec.Ports {
+		wanted[keyOf(port)] = port
+	}
+	names := map[string]struct{}{}
+	merged := make([]corev1.ServicePort, 0, len(existing.Spec.Ports)+len(desired.Spec.Ports))
+	for _, port := range existing.Spec.Ports {
+		if replacement, found := wanted[keyOf(port)]; found {
+			port = replacement
+			delete(wanted, keyOf(port))
+		}
+		names[port.Name] = struct{}{}
+		merged = append(merged, port)
+	}
+	for _, port := range desired.Spec.Ports {
+		if _, pending := wanted[keyOf(port)]; !pending {
+			continue
+		}
+		if _, taken := names[port.Name]; taken {
+			port.Name = fmt.Sprintf("t-%s-%d", strings.ToLower(string(keyOf(port).protocol)), port.Port)
+		}
+		names[port.Name] = struct{}{}
+		merged = append(merged, port)
+	}
+	desired.Spec.Ports = merged
+	// An empty list means any source, which is the widest.
+	if len(existing.Spec.LoadBalancerSourceRanges) == 0 || len(desired.Spec.LoadBalancerSourceRanges) == 0 {
+		desired.Spec.LoadBalancerSourceRanges = nil
+	} else {
+		seen := map[string]struct{}{}
+		union := make([]string, 0)
+		for _, list := range [][]string{existing.Spec.LoadBalancerSourceRanges, desired.Spec.LoadBalancerSourceRanges} {
+			for _, value := range list {
+				if _, dup := seen[value]; !dup {
+					seen[value] = struct{}{}
+					union = append(union, value)
+				}
+			}
+		}
+		sort.Strings(union)
+		desired.Spec.LoadBalancerSourceRanges = union
+	}
+	return desired
 }
 
 func desiredPublicNodeLocalDatapath(service *corev1.Service, pool string) *corev1.Service {
@@ -416,7 +520,7 @@ func publicNodeLocalDatapathMatches(datapath, service *corev1.Service, pool stri
 		!nodeLoadBalancerDatapathOwnedByService(datapath, service) {
 		return false
 	}
-	desired := normalizedDesiredPublicNodeLocalDatapath(desiredPublicNodeLocalDatapath(service, pool), datapath)
+	desired := normalizedDesiredPublicNodeLocalDatapath(desiredPublicNodeLocalDatapathFor(service, pool, datapath), datapath)
 	return reflect.DeepEqual(datapath.Labels, desired.Labels) &&
 		reflect.DeepEqual(datapath.Annotations, desired.Annotations) &&
 		reflect.DeepEqual(datapath.OwnerReferences, desired.OwnerReferences) &&
@@ -444,7 +548,7 @@ func (c *nodeLoadBalancerController) ensurePublicNodeLocalDatapath(
 	if err != nil && !apierrors.IsNotFound(err) {
 		return nil, false, fmt.Errorf("public-node-local: get private datapath Service: %w", err)
 	}
-	desired := desiredPublicNodeLocalDatapath(service, pool)
+	desired := desiredPublicNodeLocalDatapathFor(service, pool, existing)
 	// The child only carries the private VIPs for Cilium; the public gate is the
 	// firewall on the VM. Repairing the child therefore never needs the parent
 	// to be withdrawn, and the status subresource survives a spec update.
@@ -541,6 +645,9 @@ type publicNodeLocalNodeSet struct {
 	NodeEvidence map[string]struct{}
 	// Nodes holds every listed Node by name, so callers can resolve identities.
 	Nodes map[string]*corev1.Node
+	// PoolOf names the pool that authorized each Ready Node. During a union it
+	// tells the active pool's Nodes from the target pool's.
+	PoolOf map[string]string
 }
 
 // publicNodeLocalAddresses returns the Nodes that may be published. It stops
@@ -587,13 +694,36 @@ func (c *nodeLoadBalancerController) classifyPublicNodeLocalNodesChild(
 	return set, patched, err
 }
 
+// publicNodeLocalChildPool is the pool the child datapath is recorded under.
+// It follows the persisted activation, not the pool of the pending intent.
+func publicNodeLocalChildPool(service *corev1.Service, fallback string) string {
+	if active := service.Annotations[annotationPublicNodeLocalActivePool]; active != "" {
+		return active
+	}
+	return fallback
+}
+
 func (c *nodeLoadBalancerController) classifyPublicNodeLocalNodesMode(
 	ctx context.Context,
 	service *corev1.Service,
 	intent nodeLoadBalancerIntent,
 	failFast, childStrict bool,
 ) (publicNodeLocalNodeSet, bool, error, error) {
+	return c.classifyPublicNodeLocalNodesPools(ctx, service, []string{intent.Pool}, publicNodeLocalChildPool(service, intent.Pool), failFast, childStrict)
+}
+
+// classifyPublicNodeLocalNodesPools classifies every Node against a set of
+// pools. A Node that one of the pools authorizes is Ready for that pool; it is
+// Gone only when every pool says so.
+func (c *nodeLoadBalancerController) classifyPublicNodeLocalNodesPools(
+	ctx context.Context,
+	service *corev1.Service,
+	pools []string,
+	childPool string,
+	failFast, childStrict bool,
+) (publicNodeLocalNodeSet, bool, error, error) {
 	set := publicNodeLocalNodeSet{
+		PoolOf:          map[string]string{},
 		Gone:            map[string]string{},
 		Unverified:      map[string]error{},
 		EndpointMissing: map[string]nodeLoadBalancerAddress{},
@@ -638,7 +768,7 @@ func (c *nodeLoadBalancerController) classifyPublicNodeLocalNodesMode(
 			set.NotEligible[node.Name] = "the Node is not Ready or is being disrupted"
 			continue
 		}
-		verdict, patched, authErr := c.authorizePublicNodeLocalNodeVerdict(ctx, node, intent.Pool, service)
+		verdict, authorizedPool, patched, authErr := c.authorizePublicNodeLocalNodeAcrossPools(ctx, node, pools, service)
 		patchedNode = patchedNode || patched
 		if failFast && authErr != nil {
 			return set, patchedNode, authErr, nil
@@ -686,6 +816,7 @@ func (c *nodeLoadBalancerController) classifyPublicNodeLocalNodesMode(
 		}
 		seenPrivate[address.PrivateIPv4] = node.Name
 		seenPublic[address.PublicIPv4] = node.Name
+		set.PoolOf[node.Name] = authorizedPool
 		set.Ready = append(set.Ready, address)
 	}
 	sort.Slice(set.Ready, func(i, j int) bool {
@@ -708,7 +839,7 @@ func (c *nodeLoadBalancerController) classifyPublicNodeLocalNodesMode(
 		return set, patchedNode, nil, fmt.Errorf("public-node-local: read published private datapath: %w", err)
 	}
 	if err == nil {
-		if childStrict && !publicNodeLocalDatapathMatches(datapath, service, intent.Pool) {
+		if childStrict && !publicNodeLocalDatapathMatches(datapath, service, childPool) {
 			return set, patchedNode, nil, errors.New("public-node-local: private datapath spec drifted; its published VIPs cannot be trusted")
 		}
 		if !childStrict && !nodeLoadBalancerDatapathOwnedByService(datapath, service) {
@@ -772,6 +903,50 @@ func publicNodeLocalEndpointSliceOwnedByService(endpointSlice *discoveryv1.Endpo
 		}
 	}
 	return matches == 1
+}
+
+// authorizePublicNodeLocalNodeAcrossPools asks each pool in turn. The best
+// answer wins: authorized, then unverified, then not eligible, then gone. A
+// Gone answer rests on the Node object only when every pool's answer does.
+func (c *nodeLoadBalancerController) authorizePublicNodeLocalNodeAcrossPools(
+	ctx context.Context,
+	node *corev1.Node,
+	pools []string,
+	subject *corev1.Service,
+) (publicNodeLocalNodeVerdict, string, bool, error) {
+	if len(pools) == 1 {
+		verdict, patched, err := c.authorizePublicNodeLocalNodeVerdict(ctx, node, pools[0], subject)
+		return verdict, pools[0], patched, err
+	}
+	rank := func(kind publicNodeLocalNodeKind) int {
+		switch kind {
+		case publicNodeLocalNodeAuthorized:
+			return 3
+		case publicNodeLocalNodeUnverified:
+			return 2
+		case publicNodeLocalNodeNotEligible:
+			return 1
+		}
+		return 0
+	}
+	var best publicNodeLocalNodeVerdict
+	var bestErr error
+	bestPool := ""
+	anyPatched, allNodeObject := false, true
+	for index, pool := range pools {
+		verdict, patched, err := c.authorizePublicNodeLocalNodeVerdict(ctx, node, pool, subject)
+		anyPatched = anyPatched || patched
+		if verdict.kind == publicNodeLocalNodeGone && !verdict.nodeObject {
+			allNodeObject = false
+		}
+		if index == 0 || rank(verdict.kind) > rank(best.kind) {
+			best, bestErr, bestPool = verdict, err, pool
+		}
+	}
+	if best.kind == publicNodeLocalNodeGone {
+		best.nodeObject = allNodeObject
+	}
+	return best, bestPool, anyPatched, bestErr
 }
 
 func (c *nodeLoadBalancerController) authorizePublicNodeLocalNode(
@@ -2244,6 +2419,8 @@ func (c *nodeLoadBalancerController) clearPublicNodeLocalActivation(ctx context.
 		for _, key := range []string{
 			annotationPublicNodeLocalActivePool,
 			annotationPublicNodeLocalActivePolicy,
+			annotationPublicNodeLocalTargetPool,
+			annotationPublicNodeLocalTargetPolicy,
 			annotationNodeLoadBalancerFirewallAssigning,
 			annotationNodeLoadBalancerFirewallAssignAt,
 			annotationPublicNodeLocalAssignPolicy,
