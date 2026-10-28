@@ -175,7 +175,6 @@ func TestPublicNodeLocalDefiniteFailureHoldsPublishedState(t *testing.T) {
 		name       string
 		prepare    func(*testing.T, *publicNodeLocalTransientFixture)
 		wantReason string
-		wantNil    bool
 	}
 	cases := []holdCase{
 		{name: "GetVM definite error", wantReason: "PublicNodeLocalHolding", prepare: func(_ *testing.T, f *publicNodeLocalTransientFixture) {
@@ -192,10 +191,10 @@ func TestPublicNodeLocalDefiniteFailureHoldsPublishedState(t *testing.T) {
 		{name: "invalid pool annotation", wantReason: "PublicNodeLocalHolding", prepare: func(t *testing.T, f *publicNodeLocalTransientFixture) {
 			updatePublicNodeLocalFixtureService(t, f, func(s *corev1.Service) { s.Annotations[annotationNodeLoadBalancerPool] = "Bad_Pool" })
 		}},
-		{name: "pool annotation change", wantReason: "PublicNodeLocalTransitionPending", wantNil: true, prepare: func(t *testing.T, f *publicNodeLocalTransientFixture) {
+		{name: "pool annotation change", wantReason: "PublicNodeLocalTransitionPending", prepare: func(t *testing.T, f *publicNodeLocalTransientFixture) {
 			updatePublicNodeLocalFixtureService(t, f, func(s *corev1.Service) { s.Annotations[annotationNodeLoadBalancerPool] = "other" })
 		}},
-		{name: "port change", wantReason: "PublicNodeLocalTransitionPending", wantNil: true, prepare: func(t *testing.T, f *publicNodeLocalTransientFixture) {
+		{name: "port change", wantReason: "PublicNodeLocalTransitionPending", prepare: func(t *testing.T, f *publicNodeLocalTransientFixture) {
 			updatePublicNodeLocalFixtureService(t, f, func(s *corev1.Service) { s.Spec.Ports[0].Port = 8443 })
 		}},
 	}
@@ -240,12 +239,13 @@ func TestPublicNodeLocalDefiniteFailureHoldsPublishedState(t *testing.T) {
 
 			var holding *errPublicNodeLocalHolding
 			switch {
-			case test.wantNil && syncErr != nil:
-				t.Fatalf("pending transition returned an error: %v", syncErr)
-			case !test.wantNil && !errors.As(syncErr, &holding):
+			case !errors.As(syncErr, &holding):
 				t.Fatalf("error = %v, want a holding error", syncErr)
-			case syncErr != nil && inspace.IsTransient(syncErr):
+			case inspace.IsTransient(syncErr):
 				t.Fatalf("holding error is transient: %v", syncErr)
+			}
+			if delay, fixed := nodeLoadBalancerRequeueDelay(syncErr); !fixed || delay <= 0 {
+				t.Fatalf("hold %v has no requeue delay", syncErr)
 			}
 			after := f.current(t)
 			if !reflect.DeepEqual(after.Status, before.Status) || !reflect.DeepEqual(after.Annotations, before.Annotations) {

@@ -19,8 +19,14 @@ import (
 const (
 	nodeLoadBalancerClass = "inspace.cloud/node"
 
-	annotationNodeLoadBalancerMode          = "service.inspace.cloud/node-lb-mode"
-	annotationNodeLoadBalancerPool          = "service.inspace.cloud/node-lb-pool"
+	annotationNodeLoadBalancerMode = "service.inspace.cloud/node-lb-mode"
+	annotationNodeLoadBalancerPool = "service.inspace.cloud/node-lb-pool"
+	// annotationNodeLoadBalancerAllowRebuild is an operator escape hatch for a
+	// public-node-local Service. "true" lets the controller withdraw the serving
+	// exposure and rebuild it when the pool or the firewall policy changes, which
+	// is a short outage. Without it a pool change and a policy widening keep
+	// serving the active exposure until a make-before-break transition exists.
+	annotationNodeLoadBalancerAllowRebuild  = "service.inspace.cloud/node-lb-allow-rebuild"
 	annotationNodeLoadBalancerNodesPerShard = "service.inspace.cloud/node-lb-nodes-per-shard"
 	annotationNodeLoadBalancerCPU           = "service.inspace.cloud/node-lb-cpu"
 	annotationNodeLoadBalancerMemory        = "service.inspace.cloud/node-lb-memory"

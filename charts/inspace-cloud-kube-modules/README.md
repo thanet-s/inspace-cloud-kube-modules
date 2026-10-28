@@ -298,6 +298,22 @@ not overlap. The lowest lexicographic Service UID wins deterministically. CCM
 withdraws the losing Service and emits `PublicNodeLocalPortConflict`; it does
 not let two Cilium Services program the same node frontend.
 
+A serving `public-node-local` Service keeps serving while its spec changes, and
+nodes that are verifiably gone, excluded or without an endpoint still leave the
+edge one at a time. A change of `service.inspace.cloud/node-lb-pool`, or of the
+ports or `loadBalancerSourceRanges` that widens the exposed set, is held:
+CCM keeps the active exposure, emits `PublicNodeLocalTransitionPending`, and
+retries with a growing delay. While the change is held, no node is added when
+the policy differs (a pool-only change still adds nodes under the active pool).
+A strict narrowing (fewer ports, or source ranges that are a subset of the
+active ones) only removes exposure, so CCM applies it promptly by rebuilding
+the edge under the narrower policy and emits `PublicNodeLocalPolicyNarrowed`.
+To apply a held change anyway, accepting the short outage of the old
+withdraw-and-rebuild behavior, annotate the Service with
+`service.inspace.cloud/node-lb-allow-rebuild: "true"`. CCM then emits
+`PublicNodeLocalRebuildAllowed` and rebuilds. Remove the annotation afterwards,
+because it applies to every later pool or policy change as well.
+
 The generic public-NLB path remains an explicit, paid, TCP-only InSpace NLB. A
 Service using that path deliberately leaves `loadBalancerClass` unset for
 Kubernetes' cloud service controller and sets both the public scope label and

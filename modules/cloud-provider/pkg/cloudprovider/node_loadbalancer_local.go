@@ -124,16 +124,11 @@ func (c *nodeLoadBalancerController) syncPublicNodeLocalPass(
 		return c.holdOrFailPublicNodeLocal(ctx, service, errors.New("public-node-local: public status exists without persisted activation authorization"))
 	}
 	if activePool != "" && (activePool != intent.Pool || activePolicy != desiredFirewall.Hash) {
-		// A changed pool or policy is not an emergency. The active exposure keeps
-		// serving untouched until a make-before-break transition can replace it.
-		return c.recordPublicNodeLocalHoldEvent(ctx, service, publicNodeLocalReasonTransitionPending, fmt.Errorf(
-			"public-node-local: the Service intent (pool %q, firewall policy %q) differs from the active exposure (pool %q, firewall policy %q); keeping the active exposure",
-			intent.Pool, desiredFirewall.Hash, activePool, activePolicy,
-		))
+		return c.syncPendingPublicNodeLocalTransition(ctx, key, service, intent, desiredFirewall)
 	}
 
 	if activePool != "" {
-		return c.convergeActivePublicNodeLocal(ctx, key, service, intent, desiredFirewall)
+		return c.convergeActivePublicNodeLocal(ctx, key, service, intent, desiredFirewall, publicNodeLocalPassNormal)
 	}
 	// Everything below is the bootstrap of a Service that is not serving yet.
 
@@ -563,7 +558,7 @@ func (c *nodeLoadBalancerController) publicNodeLocalAddresses(
 	service *corev1.Service,
 	intent nodeLoadBalancerIntent,
 ) ([]nodeLoadBalancerAddress, bool, error) {
-	set, patchedNode, unverifiedErr, err := c.classifyPublicNodeLocalNodesMode(ctx, service, intent, true)
+	set, patchedNode, unverifiedErr, err := c.classifyPublicNodeLocalNodesMode(ctx, service, intent, true, true)
 	if err != nil {
 		return nil, patchedNode, err
 	}
@@ -582,7 +577,20 @@ func (c *nodeLoadBalancerController) classifyPublicNodeLocalNodes(
 	service *corev1.Service,
 	intent nodeLoadBalancerIntent,
 ) (publicNodeLocalNodeSet, bool, error) {
-	set, patched, _, err := c.classifyPublicNodeLocalNodesMode(ctx, service, intent, false)
+	return c.classifyPublicNodeLocalNodesChild(ctx, service, intent, true)
+}
+
+// classifyPublicNodeLocalNodesChild is classifyPublicNodeLocalNodes for a pass
+// that may run while the Service spec describes a pending policy. With childStrict
+// false, the child must be exact-owned but its spec is not compared with the
+// Service spec, since the spec no longer describes it.
+func (c *nodeLoadBalancerController) classifyPublicNodeLocalNodesChild(
+	ctx context.Context,
+	service *corev1.Service,
+	intent nodeLoadBalancerIntent,
+	childStrict bool,
+) (publicNodeLocalNodeSet, bool, error) {
+	set, patched, _, err := c.classifyPublicNodeLocalNodesMode(ctx, service, intent, false, childStrict)
 	return set, patched, err
 }
 
@@ -590,7 +598,7 @@ func (c *nodeLoadBalancerController) classifyPublicNodeLocalNodesMode(
 	ctx context.Context,
 	service *corev1.Service,
 	intent nodeLoadBalancerIntent,
-	failFast bool,
+	failFast, childStrict bool,
 ) (publicNodeLocalNodeSet, bool, error, error) {
 	set := publicNodeLocalNodeSet{
 		Gone:            map[string]string{},
@@ -707,8 +715,11 @@ func (c *nodeLoadBalancerController) classifyPublicNodeLocalNodesMode(
 		return set, patchedNode, nil, fmt.Errorf("public-node-local: read published private datapath: %w", err)
 	}
 	if err == nil {
-		if !publicNodeLocalDatapathMatches(datapath, service, intent.Pool) {
+		if childStrict && !publicNodeLocalDatapathMatches(datapath, service, intent.Pool) {
 			return set, patchedNode, nil, errors.New("public-node-local: private datapath spec drifted; its published VIPs cannot be trusted")
+		}
+		if !childStrict && !nodeLoadBalancerDatapathOwnedByService(datapath, service) {
+			return set, patchedNode, nil, errors.New("public-node-local: private datapath has foreign ownership; its published VIPs cannot be trusted")
 		}
 		for _, ingress := range datapath.Status.LoadBalancer.Ingress {
 			if _, known := knownPrivate[ingress.IP]; !known {

@@ -3,6 +3,7 @@ package cloudprovider
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -12,6 +13,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	kubefake "k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 
@@ -549,5 +551,293 @@ func TestPublicNodeLocalHoldEventNameIgnoresCauseText(t *testing.T) {
 	}
 	if events.Items[0].Count != 3 {
 		t.Fatalf("Event count = %d, want 3", events.Items[0].Count)
+	}
+}
+
+func setPublicNodeLocalFixturePorts(t *testing.T, f *publicNodeLocalTransientFixture, ports ...int32) {
+	t.Helper()
+	updatePublicNodeLocalFixtureService(t, f, func(s *corev1.Service) {
+		base := s.Spec.Ports[0]
+		s.Spec.Ports = nil
+		for index, port := range ports {
+			next := base
+			next.Name = fmt.Sprintf("p%d", index)
+			next.Port = port
+			next.TargetPort = intstr.FromInt32(port)
+			s.Spec.Ports = append(s.Spec.Ports, next)
+		}
+	})
+}
+
+// runPublicNodeLocalPasses drives passes and tolerates only holds and waits.
+func runPublicNodeLocalPasses(t *testing.T, f *publicNodeLocalTransientFixture, passes int, stop func() bool) {
+	t.Helper()
+	for pass := 0; pass < passes; pass++ {
+		if current := f.current(t); current.Annotations[annotationNodeLoadBalancerCleanupFWChecked] != "" {
+			// Deleting the superseded firewall needs spaced absence reads.
+			ageNodeLoadBalancerAbsenceEvidence(t, f.ctx, f.provider, current, annotationNodeLoadBalancerCleanupFWChecked)
+		}
+		err := f.controller.syncPublicNodeLocal(f.ctx, f.key, f.current(t))
+		var holding *errPublicNodeLocalHolding
+		var pending *nodeLoadBalancerFirewallRelationPendingError
+		// A withdrawal reports its wait for the detachment readback as an error.
+		waiting := err != nil && strings.Contains(err.Error(), "waiting for exact Service firewall detachment readback")
+		if err != nil && !errors.As(err, &holding) && !errors.As(err, &pending) && !waiting {
+			t.Fatalf("pass %d: %v", pass, err)
+		}
+		if stop != nil && stop() {
+			return
+		}
+	}
+}
+
+// While a pool or policy change is pending, the active exposure keeps
+// converging under the active pool and policy, and the pass requeues.
+func TestPublicNodeLocalPendingTransitionKeepsConvergingUnderActiveIdentity(t *testing.T) {
+	tests := []struct {
+		name   string
+		change func(*testing.T, *publicNodeLocalTransientFixture)
+	}{
+		{name: "pool change", change: func(t *testing.T, f *publicNodeLocalTransientFixture) {
+			updatePublicNodeLocalFixtureService(t, f, func(s *corev1.Service) { s.Annotations[annotationNodeLoadBalancerPool] = "other" })
+		}},
+		{name: "port widening", change: func(t *testing.T, f *publicNodeLocalTransientFixture) {
+			setPublicNodeLocalFixturePorts(t, f, 443, 8443)
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			f := newPublishedPublicNodeLocalFixtureN(t, 2)
+			childPortsBefore := trackedPublicNodeLocalDatapath(t, f).Spec.Ports
+			activeBefore := f.current(t).Annotations
+			test.change(t, f)
+			name2, vm2, priv2, pub2 := publicNodeLocalFixtureNode(1)
+			_, vm1, priv1, pub1 := publicNodeLocalFixtureNode(0)
+			if err := f.provider.kubeClient.CoreV1().Nodes().Delete(f.ctx, name2, metav1.DeleteOptions{}); err != nil {
+				t.Fatal(err)
+			}
+			f.setEndpoints(t, "edge-0")
+			runPublicNodeLocalPasses(t, f, 40, func() bool {
+				observed := observePublicNodeLocal(t, f)
+				return !observed.fips[pub2] && !observed.vips[priv2] && !observed.assigned[vm2]
+			})
+			observed := observePublicNodeLocal(t, f)
+			if observed.fips[pub2] || observed.vips[priv2] || observed.assigned[vm2] {
+				t.Fatalf("the gone node stayed on the edge while the change was pending: %#v", observed)
+			}
+			if !observed.fips[pub1] || !observed.vips[priv1] || !observed.assigned[vm1] {
+				t.Fatalf("the remaining node left the edge: %#v", observed)
+			}
+			current := f.current(t)
+			for _, key := range []string{annotationPublicNodeLocalActivePool, annotationPublicNodeLocalActivePolicy} {
+				if current.Annotations[key] != activeBefore[key] {
+					t.Fatalf("the active identity %s changed: %q -> %q", key, activeBefore[key], current.Annotations[key])
+				}
+			}
+			if !reflect.DeepEqual(trackedPublicNodeLocalDatapath(t, f).Spec.Ports, childPortsBefore) {
+				t.Fatalf("the child ports followed the pending change")
+			}
+			// A settled pass holds, requeues and says why.
+			settled := f.controller.syncPublicNodeLocal(f.ctx, f.key, f.current(t))
+			var holding *errPublicNodeLocalHolding
+			if !errors.As(settled, &holding) {
+				t.Fatalf("a pending change returned %v, want a hold that requeues", settled)
+			}
+			if delay, fixed := nodeLoadBalancerRequeueDelay(settled); !fixed || delay <= 0 {
+				t.Fatalf("no requeue delay for %v", settled)
+			}
+			requirePublicNodeLocalEvent(t, f, "PublicNodeLocalTransitionPending")
+		})
+	}
+}
+
+// A pool change keeps the full incremental convergence, adds included.
+func TestPublicNodeLocalPendingPoolChangeStillAddsNodesUnderActivePool(t *testing.T) {
+	f := newPublishedPublicNodeLocalFixtureN(t, 1)
+	updatePublicNodeLocalFixtureService(t, f, func(s *corev1.Service) { s.Annotations[annotationNodeLoadBalancerPool] = "other" })
+	f.addNode(t, 1)
+	_, vm2, priv2, pub2 := publicNodeLocalFixtureNode(1)
+	runPublicNodeLocalPasses(t, f, 60, func() bool {
+		observed := observePublicNodeLocal(t, f)
+		return observed.fips[pub2] && observed.vips[priv2] && observed.assigned[vm2] && !publicNodeLocalAssignmentFencePresent(f.current(t))
+	})
+	if observed := observePublicNodeLocal(t, f); !observed.fips[pub2] || !observed.vips[priv2] || !observed.assigned[vm2] {
+		t.Fatalf("the added node never joined under the active pool: %#v", observed)
+	}
+	if got := f.current(t).Annotations[annotationPublicNodeLocalActivePool]; got != "edge" {
+		t.Fatalf("active pool = %q", got)
+	}
+}
+
+func shapePublicNodeLocalPorts(ports ...int32) func(*corev1.Service) {
+	return func(s *corev1.Service) {
+		base := s.Spec.Ports[0]
+		s.Spec.Ports = nil
+		for index, port := range ports {
+			next := base
+			next.Name = fmt.Sprintf("p%d", index)
+			next.Port = port
+			next.TargetPort = intstr.FromInt32(port)
+			s.Spec.Ports = append(s.Spec.Ports, next)
+		}
+	}
+}
+
+func firewallRuleOn(protocol string, port int32, sources ...string) inspace.FirewallRule {
+	rule := inspace.FirewallRule{
+		Protocol: protocol, Direction: "inbound", PortStart: &port, PortEnd: &port, EndpointSpecType: "any",
+	}
+	if len(sources) != 0 {
+		rule.EndpointSpecType = "ip_prefixes"
+		rule.EndpointSpec = sources
+	}
+	return rule
+}
+
+func TestPublicNodeLocalRulesNarrow(t *testing.T) {
+	tests := []struct {
+		name     string
+		old, new []inspace.FirewallRule
+		want     bool
+	}{
+		{name: "fewer ports", old: []inspace.FirewallRule{firewallRuleOn("tcp", 443), firewallRuleOn("tcp", 8443)}, new: []inspace.FirewallRule{firewallRuleOn("tcp", 443)}, want: true},
+		{name: "any to a prefix", old: []inspace.FirewallRule{firewallRuleOn("tcp", 443)}, new: []inspace.FirewallRule{firewallRuleOn("tcp", 443, "10.0.0.0/8")}, want: true},
+		{name: "prefix to a subset prefix", old: []inspace.FirewallRule{firewallRuleOn("tcp", 443, "10.0.0.0/8")}, new: []inspace.FirewallRule{firewallRuleOn("tcp", 443, "10.1.0.0/16")}, want: true},
+		{name: "fewer prefixes", old: []inspace.FirewallRule{firewallRuleOn("tcp", 443, "10.0.0.0/8", "192.168.0.0/16")}, new: []inspace.FirewallRule{firewallRuleOn("tcp", 443, "192.168.0.0/16")}, want: true},
+		{name: "extra port", old: []inspace.FirewallRule{firewallRuleOn("tcp", 443)}, new: []inspace.FirewallRule{firewallRuleOn("tcp", 443), firewallRuleOn("tcp", 8443)}},
+		{name: "different port", old: []inspace.FirewallRule{firewallRuleOn("tcp", 443)}, new: []inspace.FirewallRule{firewallRuleOn("tcp", 8443)}},
+		{name: "different protocol", old: []inspace.FirewallRule{firewallRuleOn("tcp", 443)}, new: []inspace.FirewallRule{firewallRuleOn("udp", 443)}},
+		{name: "prefix to any", old: []inspace.FirewallRule{firewallRuleOn("tcp", 443, "10.0.0.0/8")}, new: []inspace.FirewallRule{firewallRuleOn("tcp", 443)}},
+		{name: "superset prefix", old: []inspace.FirewallRule{firewallRuleOn("tcp", 443, "10.1.0.0/16")}, new: []inspace.FirewallRule{firewallRuleOn("tcp", 443, "10.0.0.0/8")}},
+		{name: "mixed: one narrowed one added", old: []inspace.FirewallRule{firewallRuleOn("tcp", 443, "10.0.0.0/8")}, new: []inspace.FirewallRule{firewallRuleOn("tcp", 443, "10.1.0.0/16"), firewallRuleOn("tcp", 9000)}},
+		{name: "identical", old: []inspace.FirewallRule{firewallRuleOn("tcp", 443)}, new: []inspace.FirewallRule{firewallRuleOn("tcp", 443)}},
+		{name: "nothing left", old: []inspace.FirewallRule{firewallRuleOn("tcp", 443)}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := publicNodeLocalRulesNarrow(test.old, test.new); got != test.want {
+				t.Fatalf("narrow(%v -> %v) = %t, want %t", test.old, test.new, got, test.want)
+			}
+		})
+	}
+}
+
+// reconcileUntilRepublished drives passes until the Service serves the policy
+// of its current spec on every Node.
+func reconcileUntilRepublished(t *testing.T, f *publicNodeLocalTransientFixture, nodes, passes int) {
+	t.Helper()
+	runPublicNodeLocalPasses(t, f, passes, func() bool {
+		current := f.current(t)
+		desired, err := f.controller.desiredServiceFirewall(current)
+		return err == nil && len(current.Status.LoadBalancer.Ingress) == nodes &&
+			current.Annotations[annotationPublicNodeLocalActivePolicy] == desired.Hash &&
+			!publicNodeLocalAssignmentFencePresent(current)
+	})
+}
+
+// A strict narrowing is verified intent and is applied promptly.
+func TestPublicNodeLocalStrictNarrowingIsApplied(t *testing.T) {
+	tests := []struct {
+		name   string
+		shape  func(*corev1.Service)
+		narrow func(*testing.T, *publicNodeLocalTransientFixture)
+	}{
+		{name: "fewer ports", shape: shapePublicNodeLocalPorts(443, 8443), narrow: func(t *testing.T, f *publicNodeLocalTransientFixture) {
+			setPublicNodeLocalFixturePorts(t, f, 443)
+		}},
+		{name: "any source to a prefix", narrow: func(t *testing.T, f *publicNodeLocalTransientFixture) {
+			updatePublicNodeLocalFixtureService(t, f, func(s *corev1.Service) { s.Spec.LoadBalancerSourceRanges = []string{"10.0.0.0/8"} })
+		}},
+		{name: "prefix to a subset", shape: func(s *corev1.Service) { s.Spec.LoadBalancerSourceRanges = []string{"10.0.0.0/8"} }, narrow: func(t *testing.T, f *publicNodeLocalTransientFixture) {
+			updatePublicNodeLocalFixtureService(t, f, func(s *corev1.Service) { s.Spec.LoadBalancerSourceRanges = []string{"10.1.0.0/16"} })
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			f := newPublishedPublicNodeLocalFixtureWith(t, 2, test.shape)
+			oldFirewall := f.current(t).Annotations[annotationNodeLoadBalancerFirewallUUID]
+			oldPolicy := f.current(t).Annotations[annotationPublicNodeLocalActivePolicy]
+			test.narrow(t, f)
+			reconcileUntilRepublished(t, f, 2, 80)
+			current := f.current(t)
+			desired, err := f.controller.desiredServiceFirewall(current)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if current.Annotations[annotationPublicNodeLocalActivePolicy] != desired.Hash || desired.Hash == oldPolicy {
+				t.Fatalf("the narrowed policy was not applied: active=%q desired=%q old=%q",
+					current.Annotations[annotationPublicNodeLocalActivePolicy], desired.Hash, oldPolicy)
+			}
+			if len(current.Status.LoadBalancer.Ingress) != 2 {
+				t.Fatalf("the Service did not republish: %#v", current.Status.LoadBalancer)
+			}
+			for _, firewall := range f.api.firewalls {
+				if firewall.UUID == oldFirewall {
+					t.Fatalf("the wider firewall %s still exists", oldFirewall)
+				}
+			}
+			if !publicNodeLocalDatapathMatches(trackedPublicNodeLocalDatapath(t, f), current, "edge") {
+				t.Fatalf("the child does not follow the narrowed spec")
+			}
+		})
+	}
+}
+
+// A widening stays held, and so does a mix of narrowing and widening.
+func TestPublicNodeLocalWideningStaysHeld(t *testing.T) {
+	tests := []struct {
+		name   string
+		shape  func(*corev1.Service)
+		change func(*testing.T, *publicNodeLocalTransientFixture)
+	}{
+		{name: "more ports", change: func(t *testing.T, f *publicNodeLocalTransientFixture) {
+			setPublicNodeLocalFixturePorts(t, f, 443, 8443)
+		}},
+		{name: "prefix to any", shape: func(s *corev1.Service) { s.Spec.LoadBalancerSourceRanges = []string{"10.0.0.0/8"} }, change: func(t *testing.T, f *publicNodeLocalTransientFixture) {
+			updatePublicNodeLocalFixtureService(t, f, func(s *corev1.Service) { s.Spec.LoadBalancerSourceRanges = nil })
+		}},
+		{name: "swapped port", change: func(t *testing.T, f *publicNodeLocalTransientFixture) { setPublicNodeLocalFixturePorts(t, f, 8443) }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			f := newPublishedPublicNodeLocalFixtureWith(t, 1, test.shape)
+			before := f.current(t)
+			unassigned := len(f.api.unassignedFirewalls)
+			test.change(t, f)
+			for pass := 0; pass < 6; pass++ {
+				err := f.controller.syncPublicNodeLocal(f.ctx, f.key, f.current(t))
+				var holding *errPublicNodeLocalHolding
+				if !errors.As(err, &holding) {
+					t.Fatalf("pass %d: %v, want a hold", pass, err)
+				}
+			}
+			after := f.current(t)
+			if !reflect.DeepEqual(after.Status, before.Status) ||
+				after.Annotations[annotationPublicNodeLocalActivePolicy] != before.Annotations[annotationPublicNodeLocalActivePolicy] ||
+				len(f.api.unassignedFirewalls) != unassigned {
+				t.Fatalf("a widening was applied: %#v", after.Annotations)
+			}
+			requirePublicNodeLocalEvent(t, f, "PublicNodeLocalTransitionPending")
+		})
+	}
+}
+
+// The operator escape hatch permits the old withdraw and rebuild.
+func TestPublicNodeLocalAllowRebuildAnnotationPermitsWithdrawAndRebuild(t *testing.T) {
+	f := newPublishedPublicNodeLocalFixtureN(t, 1)
+	oldPolicy := f.current(t).Annotations[annotationPublicNodeLocalActivePolicy]
+	setPublicNodeLocalFixturePorts(t, f, 443, 8443)
+	// Without the annotation the change stays held.
+	if err := f.controller.syncPublicNodeLocal(f.ctx, f.key, f.current(t)); err == nil {
+		t.Fatal("the widening was not held")
+	}
+	updatePublicNodeLocalFixtureService(t, f, func(s *corev1.Service) { s.Annotations[annotationNodeLoadBalancerAllowRebuild] = "true" })
+	reconcileUntilRepublished(t, f, 1, 80)
+	current := f.current(t)
+	if current.Annotations[annotationPublicNodeLocalActivePolicy] == oldPolicy {
+		t.Fatalf("the rebuild never happened: %#v", current.Annotations)
+	}
+	if len(f.api.unassignedFirewalls) == 0 {
+		t.Fatal("the old exposure was not withdrawn")
 	}
 }

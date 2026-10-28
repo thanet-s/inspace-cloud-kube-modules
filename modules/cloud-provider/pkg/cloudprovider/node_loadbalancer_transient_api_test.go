@@ -16,6 +16,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	kubefake "k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
+	"k8s.io/client-go/util/workqueue"
 	cloud "k8s.io/cloud-provider"
 
 	inspace "github.com/thanet-s/inspace-cloud-kube-modules/modules/client"
@@ -179,8 +180,17 @@ func publicNodeLocalFixtureNode(i int) (name, vmUUID, privateIP, publicIP string
 }
 
 func newPublishedPublicNodeLocalFixtureN(t *testing.T, n int) *publicNodeLocalTransientFixture {
+	return newPublishedPublicNodeLocalFixtureWith(t, n, nil)
+}
+
+// newPublishedPublicNodeLocalFixtureWith builds the fixture from a Service that
+// the caller may shape before the first reconcile.
+func newPublishedPublicNodeLocalFixtureWith(t *testing.T, n int, shape func(*corev1.Service)) *publicNodeLocalTransientFixture {
 	t.Helper()
 	service := publicNodeLocalTestService("edge", "edge-service-uid", "edge", corev1.ProtocolTCP, 443)
+	if shape != nil {
+		shape(service)
+	}
 	api := &fakeAPI{}
 	objects := []runtime.Object{service.DeepCopy()}
 	nodeNames := make([]string, 0, n)
@@ -203,7 +213,11 @@ func newPublishedPublicNodeLocalFixtureN(t *testing.T, n int) *publicNodeLocalTr
 		provider = newTestProvider(t, api)
 	}
 	provider.kubeClient = kubefake.NewSimpleClientset(objects...)
-	controller := &nodeLoadBalancerController{provider: provider}
+	controller := &nodeLoadBalancerController{
+		provider: provider,
+		queue:    workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]()),
+	}
+	t.Cleanup(controller.queue.ShutDown)
 	controller.endpointSlices = publicNodeLocalTestEndpointSliceLister(t, service, nodeNames...)
 	fixture := &publicNodeLocalTransientFixture{
 		ctx: context.Background(), api: api, provider: provider, controller: controller,
