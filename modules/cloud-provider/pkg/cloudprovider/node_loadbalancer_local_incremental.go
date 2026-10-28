@@ -731,7 +731,28 @@ func (c *nodeLoadBalancerController) convergeActivePublicNodeLocal(
 		return nil
 	}
 
+	// The rest of the removals (grace and not-eligible Nodes), after every add is
+	// done. During a union they run before the promotion gate, because pods move
+	// while a pool is switched and the gate can wait for a long time.
+	allDropped := map[string]struct{}{}
+	for name := range removeGone {
+		allDropped[name] = struct{}{}
+	}
+	for name := range removeGrace {
+		allDropped[name] = struct{}{}
+	}
 	if union {
+		// Something must keep serving across the active and the target pool: the
+		// Nodes left after the removal include a published one.
+		serving := false
+		for name := range keep {
+			serving = serving || published(name)
+		}
+		if serving {
+			if acted, err := removeNodes(allDropped, keep); acted || err != nil {
+				return err
+			}
+		}
 		// Every Node of the target pool is on the edge now. It must be a pool
 		// that serves at all: promoting an empty one would take the edge away.
 		if len(targetReady) == 0 {
@@ -748,14 +769,6 @@ func (c *nodeLoadBalancerController) convergeActivePublicNodeLocal(
 		return nil
 	}
 
-	// The rest of the removals, after every add is done.
-	allDropped := map[string]struct{}{}
-	for name := range removeGone {
-		allDropped[name] = struct{}{}
-	}
-	for name := range removeGrace {
-		allDropped[name] = struct{}{}
-	}
 	if acted, err := removeNodes(allDropped, keep); acted || err != nil {
 		return err
 	}

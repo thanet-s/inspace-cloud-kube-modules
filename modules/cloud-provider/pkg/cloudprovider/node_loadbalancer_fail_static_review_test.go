@@ -1844,7 +1844,6 @@ func TestPublicNodeLocalAllowRebuildIsSingleUse(t *testing.T) {
 	}
 }
 
-
 // addPublicNodeLocalWaitingPeer creates a Service that wants a port in a pool
 // and exposes nothing yet.
 func addPublicNodeLocalWaitingPeer(t *testing.T, f *publicNodeLocalTransientFixture, name, uid, pool string, port int32) (*corev1.Service, nodeLoadBalancerIntent) {
@@ -2032,5 +2031,45 @@ func TestPublicNodeLocalAllowRebuildNewValueIsHonouredAgain(t *testing.T) {
 	}
 	if got := f.current(t).Annotations[annotationNodeLoadBalancerAllowRebuildConsumed]; got != "second" {
 		t.Fatalf("consumed marker = %q", got)
+	}
+}
+
+// The endpoint grace and the not-eligible removals run during a union too. Pods
+// move while a pool is switched, so waiting for the promotion would keep a node
+// that serves nothing on the edge for as long as the target pool is empty.
+func TestPublicNodeLocalUnionStillRemovesNodeWithoutEndpointAfterGrace(t *testing.T) {
+	f := newPublishedPublicNodeLocalFixtureN(t, 2)
+	now := time.Date(2026, 10, 28, 12, 0, 0, 0, time.UTC)
+	f.controller.publicNodeLocalNow = func() time.Time { return now }
+	_, _, privA, pubA := publicNodeLocalFixtureNode(0)
+	_, vmB, privB, pubB := publicNodeLocalFixtureNode(1)
+	updatePublicNodeLocalFixtureService(t, f, func(s *corev1.Service) { s.Annotations[annotationNodeLoadBalancerPool] = "empty-pool" })
+	for pass := 0; pass < 4; pass++ {
+		stepPublicNodeLocal(t, f, pass)
+	}
+	if f.current(t).Annotations[annotationPublicNodeLocalTargetPool] != "empty-pool" {
+		t.Fatalf("the union did not start: %#v", f.current(t).Annotations)
+	}
+	f.setEndpoints(t, "edge-0")
+	for pass := 0; pass < 4; pass++ {
+		stepPublicNodeLocal(t, f, pass)
+	}
+	if !observePublicNodeLocal(t, f).fips[pubB] {
+		t.Fatal("the node left inside the grace")
+	}
+	now = now.Add(publicNodeLocalEndpointGoneGrace + time.Minute)
+	for pass := 0; pass < 40; pass++ {
+		stepPublicNodeLocal(t, f, pass)
+		observed := observePublicNodeLocal(t, f)
+		if !observed.fips[pubA] || !observed.vips[privA] {
+			t.Fatalf("pass %d: the last serving node left: %#v", pass, observed)
+		}
+	}
+	observed := observePublicNodeLocal(t, f)
+	if observed.fips[pubB] || observed.vips[privB] || observed.assigned[vmB] {
+		t.Fatalf("the node without an endpoint stayed on the edge during the union: %#v", observed)
+	}
+	if f.current(t).Annotations[annotationPublicNodeLocalTargetPool] != "empty-pool" {
+		t.Fatal("the union ended")
 	}
 }
