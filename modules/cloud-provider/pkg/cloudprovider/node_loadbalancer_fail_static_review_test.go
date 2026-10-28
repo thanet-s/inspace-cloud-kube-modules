@@ -1125,3 +1125,35 @@ func TestPublicNodeLocalPoolSwitchRefusedWhenTargetPoolPortTaken(t *testing.T) {
 	}
 	requirePublicNodeLocalEvent(t, f, "PublicNodeLocalTransitionRefused")
 }
+
+// A peer in a transition exposes in both pools, so a newcomer waits in either.
+func TestPublicNodeLocalPeerInTransitionBlocksBothPools(t *testing.T) {
+	peer := publicNodeLocalTestService("peer", "peer-uid", "pool-y", corev1.ProtocolTCP, 443)
+	peer.Annotations[annotationPublicNodeLocalActivePool] = "pool-x"
+	peer.Annotations[annotationPublicNodeLocalActivePolicy] = "policy"
+	peer.Annotations[annotationPublicNodeLocalTargetPool] = "pool-y"
+	peer.Annotations[annotationPublicNodeLocalTargetPolicy] = "policy"
+	child := desiredPublicNodeLocalDatapath(peer, "pool-x")
+	child.Annotations[annotationPublicNodeLocalDatapathTargetPool] = "pool-y"
+	provider := newTestProvider(t, &fakeAPI{})
+	provider.kubeClient = kubefake.NewSimpleClientset(peer.DeepCopy(), child)
+	controller := &nodeLoadBalancerController{provider: provider}
+	ctx := context.Background()
+	claim := nodeLoadBalancerIntent{Ports: []nodeLoadBalancerPortClaim{{IPFamily: corev1.IPv4Protocol, Protocol: corev1.ProtocolTCP, Port: 443}}}
+	other := nodeLoadBalancerIntent{Ports: []nodeLoadBalancerPortClaim{{IPFamily: corev1.IPv4Protocol, Protocol: corev1.ProtocolTCP, Port: 9999}}}
+	for _, pool := range []string{"pool-x", "pool-y"} {
+		claim.Pool, other.Pool = pool, pool
+		blocks, err := controller.publicNodeLocalStaleExposureBlocks(ctx, peer, claim)
+		if err != nil || !blocks {
+			t.Fatalf("a newcomer in %s is not blocked by the peer in transition: blocks=%t err=%v", pool, blocks, err)
+		}
+		blocks, err = controller.publicNodeLocalStaleExposureBlocks(ctx, peer, other)
+		if err != nil || blocks {
+			t.Fatalf("a disjoint port in %s is blocked: blocks=%t err=%v", pool, blocks, err)
+		}
+	}
+	claim.Pool = "pool-z"
+	if blocks, err := controller.publicNodeLocalStaleExposureBlocks(ctx, peer, claim); err != nil || blocks {
+		t.Fatalf("an unrelated pool is blocked: blocks=%t err=%v", blocks, err)
+	}
+}

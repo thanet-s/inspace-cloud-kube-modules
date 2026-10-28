@@ -1363,7 +1363,8 @@ func (c *nodeLoadBalancerController) publicNodeLocalIncumbentInPool(
 	pool string,
 	ownPorts, ports []nodeLoadBalancerPortClaim,
 ) (bool, error) {
-	if strings.TrimSpace(service.Annotations[annotationPublicNodeLocalActivePool]) != pool {
+	if strings.TrimSpace(service.Annotations[annotationPublicNodeLocalActivePool]) != pool &&
+		strings.TrimSpace(service.Annotations[annotationPublicNodeLocalTargetPool]) != pool {
 		return false, nil
 	}
 	if publicNodeLocalPortsOverlap(ports, ownPorts) {
@@ -1481,7 +1482,8 @@ func (c *nodeLoadBalancerController) publicNodeLocalStaleExposureBlocks(
 	intent nodeLoadBalancerIntent,
 ) (bool, error) {
 	activePool := strings.TrimSpace(service.Annotations[annotationPublicNodeLocalActivePool])
-	childPool := ""
+	targetPool := strings.TrimSpace(service.Annotations[annotationPublicNodeLocalTargetPool])
+	childPool, childTargetPool := "", ""
 	var childPorts []nodeLoadBalancerPortClaim
 	childPortsProven := false
 	datapath, err := c.provider.kubeClient.CoreV1().Services(service.Namespace).Get(
@@ -1492,33 +1494,43 @@ func (c *nodeLoadBalancerController) publicNodeLocalStaleExposureBlocks(
 			return false, fmt.Errorf("public-node-local: conflict peer %s/%s has a foreign datapath identity", service.Namespace, service.Name)
 		}
 		childPool = strings.TrimSpace(datapath.Annotations[annotationPublicNodeLocalDatapathPool])
+		childTargetPool = strings.TrimSpace(datapath.Annotations[annotationPublicNodeLocalDatapathTargetPool])
 		childPorts, err = nodeLoadBalancerPortClaims(datapath)
 		childPortsProven = err == nil && len(childPorts) != 0
 	} else if !apierrors.IsNotFound(err) {
 		return false, fmt.Errorf("public-node-local: inspect conflict peer persisted datapath: %w", err)
 	}
 
-	// Disagreement between the two persisted identities means the exact old
-	// port set cannot be attributed safely. Block either named pool until the
-	// peer's withdrawal removes the exposure.
-	if activePool != "" && childPool != "" && activePool != childPool {
-		return activePool == intent.Pool || childPool == intent.Pool, nil
+	// A Service in a transition exposes in every pool it names: the active one,
+	// the target one, and the pools its child records.
+	exposurePools := map[string]struct{}{}
+	for _, pool := range []string{activePool, targetPool, childPool, childTargetPool} {
+		if pool != "" {
+			exposurePools[pool] = struct{}{}
+		}
 	}
-	exposurePool := activePool
-	if exposurePool == "" {
-		exposurePool = childPool
-	}
-	if exposurePool == "" {
+	if len(exposurePools) == 0 {
 		// A privileged status/firewall proves exposure, but no persisted pool
 		// proves where it belongs. The only safe temporary choice is to block.
 		return true, nil
 	}
-	if exposurePool != intent.Pool {
+	if _, named := exposurePools[intent.Pool]; !named {
 		return false, nil
 	}
-	if !childPortsProven || childPool != exposurePool {
+	// Disagreement between the two persisted identities means the exact old
+	// port set cannot be attributed safely. Block either named pool until the
+	// peer's withdrawal removes the exposure.
+	if activePool != "" && childPool != "" && activePool != childPool {
+		return true, nil
+	}
+	if targetPool != "" && intent.Pool == targetPool && childTargetPool != targetPool {
+		// The child does not record the transition yet, so its ports do not
+		// prove the claim the peer is taking in the target pool.
+		return true, nil
+	}
+	if !childPortsProven || childPool == "" {
 		// activePool is authoritative for the pool, but only the exact-owned
-		// child proves the old frontend ports. Missing/drifted evidence blocks
+		// child proves the frontend ports. Missing/drifted evidence blocks
 		// that pool until cleanup completes.
 		return true, nil
 	}
