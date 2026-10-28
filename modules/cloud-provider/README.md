@@ -466,7 +466,13 @@ Services may still use `Cluster`; unhealthy, deleting, excluded, or disrupting
 nodes are filtered there as well. Nodes carrying either
 `node-role.kubernetes.io/control-plane` or the legacy
 `node-role.kubernetes.io/master` label are never public NLB targets in either
-mode; adding or removing either role reconciles targets immediately. Kubernetes
+mode; adding or removing either role reconciles targets immediately. New targets
+are added before stale ones are removed, and a failed add never blocks removals
+or rule updates (the last serving target is never removed). When the desired set
+is empty (for example every node NotReady or a Local Service with no Ready
+endpoint) the last known good targets are kept, with one Warning Event, so a
+transient fault never empties the NLB. After 15 minutes only targets whose VM an
+exact read shows gone are dropped. Kubernetes
 defaults an omitted `externalTrafficPolicy` to `Cluster` before CCM observes the
 Service, so set `Local` explicitly when local-endpoint targeting is required.
 Private Cilium L2 Services must remain `externalTrafficPolicy: Cluster`.
@@ -649,8 +655,20 @@ already protected nodes and sibling Services published; the new VM remains
 ineligible until a later authoritative readback. If an advertised VM loses an
 assignment, only its affected shard is withdrawn before repair.
 
-For the paid NLB path, if either public marker is removed, CCM deletes every deterministically owned
-FIP/NLB before handing the Service to another implementation. Discovery and
+For the paid NLB path, removing either public marker holds the owned FIP/NLB and
+reports an error on the Service, because a freed public IP cannot be recovered.
+The first pass records the drop time in
+`service.inspace.cloud/public-nlb-unpublished-at` and raises one Event; targets
+and rules keep following the Service. To delete the FIP/NLB without deleting the
+Service, set `inspace.cloud/release-public-load-balancer` to an RFC3339 time
+later than that recorded drop; a plain `true` or an older time is ignored, so a
+stale opt-in cannot release an IP later. The comparison is between the time you
+write and the controller's clock; if the two clocks disagree, the failure
+direction is safe, because a release time that is not clearly later leaves the
+hold in place. Republishing clears the mark. Deleting
+the Service always releases the FIP/NLB, and so does changing its type (for
+example to `ClusterIP`), because the stock controller then treats the load
+balancer as no longer wanted and runs the same deletion. Discovery and
 deletion remain ownership-based even after markers change, preventing legacy
 resources from leaking. Public FIP list/create/assignment responses must match
 the deterministic name, billing account, active enabled non-virtual `public`
@@ -659,6 +677,25 @@ Service status. Before creating a public FIP, CCM also verifies that the owned
 NLB's private address is neither the control-plane VIP nor an address in the
 reserved Cilium pool. A collision triggers deterministic owned FIP/NLB cleanup
 and fails the reconciliation.
+
+Runbook: while a Service's public NLB (or floating IP) create is still
+ambiguous, that is, its mutation receipt shows `create-load-balancer` or
+`create-floating-ip` issued and the resource is not yet visible, do not toggle
+the Service's public markers off and on. The receipt carries the one-re-create
+budget, and a drop-and-restore cycle can end with a fresh create while the
+original still lands: more than one paid resource and an ownership-name
+collision. Wait until the resource appears, or the retire window passes and the
+CCM re-creates once, or the receipt is resolved by hand.
+
+Node lifecycle safety: a Node is declared gone only on an exact VM 404 (or a
+deleted tombstone) plus a populated VM inventory and VPC membership. If either
+list is empty, the same VM must be seen absent again at least 30 seconds later.
+If more than half of the nodes would be declared gone within five minutes, the
+CCM refuses, logs, and raises a `MassNodeAbsenceRefused` Event on the Node;
+delete such Nodes by hand once you have checked the InSpace view. A VM answer
+with no private IPv4 is an error, so the node keeps its last addresses, and an
+empty floating-IP list does not drop an existing ExternalIP until it has stayed
+empty for five minutes.
 
 For that paid NLB path, `Service.spec.loadBalancerSourceRanges` is rejected
 because the InSpace NLB API exposes TCP port forwarding, not source-range

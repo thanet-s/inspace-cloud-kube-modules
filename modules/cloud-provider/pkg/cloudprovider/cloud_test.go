@@ -181,11 +181,11 @@ func TestInstanceExistsOnlyNormalizesExactVMAbsence(t *testing.T) {
 			name: "corroborated exact GetVM 404 is absence",
 			api: &resolvedVMReadErrorAPI{
 				fakeAPI: &fakeAPI{network: &inspace.Network{
-					UUID: testNetworkUUID, VMUUIDs: []string{},
+					UUID: testNetworkUUID, VMUUIDs: []string{"99999999-1111-4222-8333-444444444444"},
 				}},
 				getErr:       notFound("/v1/bkk01/user-resource/vm"),
 				overrideList: true,
-				listResponse: []inspace.VM{},
+				listResponse: []inspace.VM{{UUID: "99999999-1111-4222-8333-444444444444"}},
 			},
 			node: &corev1.Node{Spec: corev1.NodeSpec{ProviderID: "inspace://bkk01/" + testVMUUID}},
 		},
@@ -261,8 +261,8 @@ func TestInstanceExistsCorroboratesProviderIDExactVMAbsence(t *testing.T) {
 		},
 		{
 			name:   "bound HTTP 400 with independent omissions",
-			getErr: boundMissingVM, listResponse: []inspace.VM{},
-			network:    &inspace.Network{UUID: testNetworkUUID, VMUUIDs: []string{}},
+			getErr: boundMissingVM, listResponse: []inspace.VM{otherVM},
+			network:    &inspace.Network{UUID: testNetworkUUID, VMUUIDs: []string{otherVM.UUID}},
 			wantAbsent: true,
 		},
 		{
@@ -1117,6 +1117,8 @@ func TestMarkerRemovalNeverLeaksOwnedResourcesOrReturnsImplementedElsewhereEarly
 	}
 	delete(service.Labels, LabelLoadBalancerScope)
 	syncMemoryStandardNLBServiceIntent(t, provider.standardNLBServiceStore, service)
+	// Unpublishing only deletes the public IP when the owner opts in after the drop.
+	releaseHeldStandardNLB(t, provider, service, nodes)
 	var status *corev1.LoadBalancerStatus
 	requireStandardNLBConvergence(t, func() error {
 		var err error
@@ -1323,6 +1325,8 @@ func TestPublicToPrivateTransitionRemovesFloatingIP(t *testing.T) {
 	}
 	service.Annotations[AnnotationPublicLoadBalancer] = "false"
 	syncMemoryStandardNLBServiceIntent(t, provider.standardNLBServiceStore, service)
+	// Unpublishing only deletes the public IP when the owner opts in after the drop.
+	releaseHeldStandardNLB(t, provider, service, nodes)
 	var status *corev1.LoadBalancerStatus
 	requireStandardNLBConvergence(t, func() error {
 		var err error

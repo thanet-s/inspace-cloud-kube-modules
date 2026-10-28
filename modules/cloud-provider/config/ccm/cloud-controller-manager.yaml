@@ -100,6 +100,13 @@ metadata:
     app.kubernetes.io/name: inspace-cloud-controller-manager
 spec:
   replicas: 2
+  # Each replica binds hostNetwork port 10258, so a surge pod can never be
+  # scheduled next to the old one. Replace in place, one pod at a time.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
   selector:
     matchLabels:
       app.kubernetes.io/name: inspace-cloud-controller-manager
@@ -114,6 +121,13 @@ spec:
       dnsPolicy: Default
       nodeSelector:
         node-role.kubernetes.io/control-plane: "true"
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels:
+                  app.kubernetes.io/name: inspace-cloud-controller-manager
       tolerations:
         - key: node-role.kubernetes.io/control-plane
           operator: Exists
@@ -133,6 +147,24 @@ spec:
             - --leader-elect=true
             - --configure-cloud-routes=false
             - --controllers=cloud-node-controller,cloud-node-lifecycle-controller,service-lb-controller
+          # The secure port is fixed at 10258; do not override --secure-port or
+          # the probe below stops matching.
+          ports:
+            - name: https
+              containerPort: 10258
+              protocol: TCP
+          # /healthz is served on the secure port and allowed without authz. The
+          # slow thresholds restart only a hung HTTP server or a lease-renew
+          # failure, not a busy process.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: https
+              scheme: HTTPS
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            timeoutSeconds: 10
+            failureThreshold: 6
           env:
             - name: INSPACE_API_TOKEN
               valueFrom:
@@ -205,3 +237,16 @@ spec:
             runAsNonRoot: true
             capabilities:
               drop: ["ALL"]
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: inspace-cloud-controller-manager
+  namespace: kube-system
+  labels:
+    app.kubernetes.io/name: inspace-cloud-controller-manager
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: inspace-cloud-controller-manager

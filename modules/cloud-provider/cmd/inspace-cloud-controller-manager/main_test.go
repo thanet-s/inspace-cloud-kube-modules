@@ -58,3 +58,27 @@ func TestParseRequiredPositiveInt64(t *testing.T) {
 		})
 	}
 }
+
+func TestManifestKeepsTheTwoReplicasApartAndHealthChecked(t *testing.T) {
+	data, err := os.ReadFile("../../config/ccm/cloud-controller-manager.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := string(data)
+	for _, required := range []string{
+		"podAntiAffinity:",
+		"requiredDuringSchedulingIgnoredDuringExecution:",
+		"topologyKey: kubernetes.io/hostname",
+		"containerPort: 10258",
+		"livenessProbe:",
+		"path: /healthz",
+		"scheme: HTTPS",
+		"maxSurge: 0",
+		"kind: PodDisruptionBudget",
+		"  maxUnavailable: 1",
+	} {
+		if !strings.Contains(manifest, required) {
+			t.Errorf("CCM manifest lacks %q", required)
+		}
+	}
+}
