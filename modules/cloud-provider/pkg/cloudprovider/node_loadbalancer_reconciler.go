@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"golang.org/x/time/rate"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -196,7 +197,7 @@ func newNodeLoadBalancerController(provider *Provider, factory informers.SharedI
 		nodesSynced: nodes.Informer().HasSynced, servicesSynced: services.Informer().HasSynced,
 		endpointSlicesSynced: endpointSlices.Informer().HasSynced,
 		queue: workqueue.NewTypedRateLimitingQueueWithConfig(
-			workqueue.DefaultTypedControllerRateLimiter[string](),
+			newNodeLoadBalancerRateLimiter(),
 			workqueue.TypedRateLimitingQueueConfig[string]{Name: "inspace-node-load-balancers"},
 		),
 	}
@@ -232,6 +233,16 @@ func newNodeLoadBalancerController(provider *Provider, factory informers.SharedI
 		return nil, fmt.Errorf("node load balancer: register EndpointSlice handler: %w", err)
 	}
 	return controller, nil
+}
+
+// newNodeLoadBalancerRateLimiter is the default controller limiter with the
+// per-item backoff capped at one minute. The default cap of 1000s left a
+// Service unreconciled for a quarter of an hour after a long error streak.
+func newNodeLoadBalancerRateLimiter() workqueue.TypedRateLimiter[string] {
+	return workqueue.NewTypedMaxOfRateLimiter(
+		workqueue.NewTypedItemExponentialFailureRateLimiter[string](5*time.Millisecond, 60*time.Second),
+		&workqueue.TypedBucketRateLimiter[string]{Limiter: rate.NewLimiter(rate.Limit(10), 100)},
+	)
 }
 
 func (c *nodeLoadBalancerController) Run(stopCh <-chan struct{}) {
