@@ -1749,6 +1749,19 @@ func (c *nodeLoadBalancerController) publicNodeLocalStaleExposureBlocks(
 			exposurePools[pool] = struct{}{}
 		}
 	}
+	// Port claims are per pool, but VIPs are on Nodes: Cilium programs a claim on
+	// every Node that carries a VIP of this Service, whatever pool that Node is
+	// in now. A pool that was drained by a promotion or an abort, or a Node that
+	// was relabelled, stays attributed until its last VIP is gone.
+	if datapath != nil {
+		vipPools, vipErr := c.publicNodeLocalVIPNodePools(ctx, datapath)
+		if vipErr != nil {
+			return false, vipErr
+		}
+		for pool := range vipPools {
+			exposurePools[pool] = struct{}{}
+		}
+	}
 	if len(exposurePools) == 0 {
 		// A privileged status/firewall proves exposure, but no persisted pool
 		// proves where it belongs. The only safe temporary choice is to block.
@@ -1775,6 +1788,34 @@ func (c *nodeLoadBalancerController) publicNodeLocalStaleExposureBlocks(
 		return true, nil
 	}
 	return publicNodeLocalPortsOverlap(intent.Ports, childPorts), nil
+}
+
+// publicNodeLocalVIPNodePools names the pools of the Nodes that carry a VIP of
+// the child. A VIP that matches no Node has nothing to program and names none.
+func (c *nodeLoadBalancerController) publicNodeLocalVIPNodePools(ctx context.Context, datapath *corev1.Service) (map[string]struct{}, error) {
+	pools := map[string]struct{}{}
+	if len(datapath.Status.LoadBalancer.Ingress) == 0 {
+		return pools, nil
+	}
+	nodes, err := c.provider.kubeClient.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("public-node-local: list Nodes to attribute conflict peer VIPs: %w", err)
+	}
+	vips := publicNodeLocalIngressSet(datapath.Status.LoadBalancer)
+	for index := range nodes.Items {
+		node := &nodes.Items[index]
+		private, ok := nodeLoadBalancerNodeInternalIPv4(node)
+		if !ok {
+			continue
+		}
+		if _, carries := vips[private]; !carries {
+			continue
+		}
+		if pool := node.Labels[publicNodeLocalPoolLabel]; pool != "" {
+			pools[pool] = struct{}{}
+		}
+	}
+	return pools, nil
 }
 
 func (c *nodeLoadBalancerController) publicNodeLocalServiceStillExposed(

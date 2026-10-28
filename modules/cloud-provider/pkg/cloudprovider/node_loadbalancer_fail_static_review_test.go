@@ -1880,3 +1880,98 @@ func TestPublicNodeLocalAllowRebuildByTargetHashIsKeyedToTheTarget(t *testing.T)
 		t.Fatal("the named target was not rebuilt")
 	}
 }
+
+// addPublicNodeLocalWaitingPeer creates a Service that wants a port in a pool
+// and exposes nothing yet.
+func addPublicNodeLocalWaitingPeer(t *testing.T, f *publicNodeLocalTransientFixture, name, uid, pool string, port int32) (*corev1.Service, nodeLoadBalancerIntent) {
+	t.Helper()
+	peer := publicNodeLocalTestService(name, uid, pool, corev1.ProtocolTCP, port)
+	peer.Finalizers = append(peer.Finalizers, publicNodeLocalFinalizer)
+	created, err := f.provider.kubeClient.CoreV1().Services(peer.Namespace).Create(f.ctx, peer, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	intent, err := parseNodeLoadBalancerService(created, nodeLoadBalancerDefaults{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return created, intent
+}
+
+// requirePeerBlockedWhileVIPOn checks, after every pass, that a peer wanting the
+// port in a pool is blocked for as long as the Service still has a child VIP on
+// a Node of that pool: Cilium would program the same node IP and port twice.
+func requirePeerBlockedWhileVIPOn(
+	t *testing.T, f *publicNodeLocalTransientFixture, peer *corev1.Service, intent nodeLoadBalancerIntent,
+	privateIP string, limit int, done func(publicNodeLocalObservation, *corev1.Service) bool,
+) {
+	t.Helper()
+	sawVIP, sawFree := false, false
+	for pass := 0; pass < limit; pass++ {
+		stepPublicNodeLocal(t, f, pass)
+		observed := observePublicNodeLocal(t, f)
+		loses, waiting, err := f.controller.publicNodeLocalPortConflict(f.ctx, peer, intent)
+		if err != nil {
+			t.Fatalf("pass %d: %v", pass, err)
+		}
+		blocked := loses || waiting
+		if observed.vips[privateIP] {
+			sawVIP = true
+			if !blocked {
+				t.Fatalf("pass %d: the peer is free while the child still has a VIP on node %s: %#v %v", pass, privateIP, observed, f.current(t).Annotations)
+			}
+		} else if sawVIP && !blocked {
+			sawFree = true
+		}
+		if done(observed, f.current(t)) && sawFree {
+			return
+		}
+	}
+	t.Fatalf("the peer was never freed after the VIP drained (sawVIP %t, sawFree %t): %#v", sawVIP, sawFree, observePublicNodeLocal(t, f))
+}
+
+// After a promotion the old pool is still drained for a while. A peer that
+// waits for the port in the old pool must stay blocked until the last VIP of
+// the old pool's nodes is gone.
+func TestPublicNodeLocalPromotionKeepsDrainingPoolAttributed(t *testing.T) {
+	f := newPublishedPublicNodeLocalFixtureN(t, 1)
+	f.addNode(t, 1)
+	moveFixtureNodeToPool(t, f, 1, "spe-relay-share")
+	_, _, privA, _ := publicNodeLocalFixtureNode(0)
+	peer, intent := addPublicNodeLocalWaitingPeer(t, f, "waiter", "waiter-uid", "edge", 443)
+	updatePublicNodeLocalFixtureService(t, f, func(s *corev1.Service) { s.Annotations[annotationNodeLoadBalancerPool] = "spe-relay-share" })
+	requirePeerBlockedWhileVIPOn(t, f, peer, intent, privA, 200, func(o publicNodeLocalObservation, s *corev1.Service) bool {
+		return s.Annotations[annotationPublicNodeLocalActivePool] == "spe-relay-share" && !o.vips[privA]
+	})
+}
+
+// An abandoned transition leaves the target pool's Nodes draining. A peer that
+// waits for the port in the target pool stays blocked until they are gone.
+func TestPublicNodeLocalAbortKeepsDrainingTargetPoolAttributed(t *testing.T) {
+	f := newPublishedPublicNodeLocalFixtureN(t, 1)
+	f.addNode(t, 1)
+	moveFixtureNodeToPool(t, f, 1, "spe-relay-share")
+	_, _, privB, pubB := publicNodeLocalFixtureNode(1)
+	peer, intent := addPublicNodeLocalWaitingPeer(t, f, "waiter", "waiter-uid", "spe-relay-share", 443)
+	updatePublicNodeLocalFixtureService(t, f, func(s *corev1.Service) { s.Annotations[annotationNodeLoadBalancerPool] = "spe-relay-share" })
+	runUntil(t, f, []int{0, 1}, 80, "the target Node is on the edge", func(o publicNodeLocalObservation, s *corev1.Service) bool {
+		return o.fips[pubB] && s.Annotations[annotationPublicNodeLocalTargetPool] != ""
+	})
+	updatePublicNodeLocalFixtureService(t, f, func(s *corev1.Service) { s.Annotations[annotationNodeLoadBalancerPool] = "edge" })
+	requirePeerBlockedWhileVIPOn(t, f, peer, intent, privB, 200, func(o publicNodeLocalObservation, s *corev1.Service) bool {
+		return s.Annotations[annotationPublicNodeLocalTargetPool] == "" && !o.vips[privB]
+	})
+}
+
+// A Node that is relabelled to another pool is Gone for its Service, but its VIP
+// stays until the removal order has run. A peer in the new pool is blocked
+// meanwhile, because the VIP is on that Node.
+func TestPublicNodeLocalRelabelledNodeVIPBlocksPeerInNewPool(t *testing.T) {
+	f := newPublishedPublicNodeLocalFixtureN(t, 2)
+	_, _, priv2, _ := publicNodeLocalFixtureNode(1)
+	peer, intent := addPublicNodeLocalWaitingPeer(t, f, "waiter", "waiter-uid", "other-pool", 443)
+	moveFixtureNodeToPool(t, f, 1, "other-pool")
+	requirePeerBlockedWhileVIPOn(t, f, peer, intent, priv2, 120, func(o publicNodeLocalObservation, s *corev1.Service) bool {
+		return !o.vips[priv2]
+	})
+}
