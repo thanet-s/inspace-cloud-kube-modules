@@ -638,6 +638,10 @@ func (p *Provider) resolveVM(ctx context.Context, node *corev1.Node) (*inspace.V
 		if err := p.validateResolvedVM(ctx, vm, id.UUID); err != nil {
 			return nil, err
 		}
+		if !strings.EqualFold(strings.TrimSpace(vm.Status), "deleted") {
+			// Seen alive: any earlier empty-evidence absence no longer counts.
+			p.clearSpacedAbsence(id.UUID)
+		}
 		if strings.EqualFold(strings.TrimSpace(vm.Status), "deleted") {
 			return nil, &exactVMReadAbsenceError{
 				location:  id.Location,
@@ -742,10 +746,21 @@ func (p *Provider) guardMassAbsence(ctx context.Context, node *corev1.Node, vmUU
 			delete(p.absenceVerdicts, uuid)
 		}
 	}
-	p.absenceVerdicts[vmUUID] = now
+	// Only allowed verdicts count, and a refusal records nothing, so a refused
+	// VM cannot keep itself (or its neighbours) inside the window: the guard is
+	// a rate limit of at most half the cluster per window, not a permanent block.
 	gone := len(p.absenceVerdicts)
+	if _, counted := p.absenceVerdicts[vmUUID]; !counted {
+		gone++
+	}
+	refuse := total >= 2 && gone*2 > total
+	if !refuse {
+		if _, counted := p.absenceVerdicts[vmUUID]; !counted {
+			p.absenceVerdicts[vmUUID] = now
+		}
+	}
 	p.lifecycleMu.Unlock()
-	if total >= 2 && gone*2 > total {
+	if refuse {
 		klog.Warningf("refusing to declare VM %s gone: %d of %d nodes would be gone within %s", vmUUID, gone, total, absenceVerdictWindow)
 		if p.standardNLBEvents != nil && node != nil {
 			p.standardNLBEvents.Eventf(node, corev1.EventTypeWarning, "MassNodeAbsenceRefused",

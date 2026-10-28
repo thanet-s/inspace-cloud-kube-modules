@@ -169,3 +169,71 @@ func TestInstanceMetadataWithoutAnExistingExternalAddressNeedsNoHold(t *testing.
 		t.Fatal(err)
 	}
 }
+
+// A real loss of every node must not stay refused forever: refused
+// checks do not refresh their verdict, only allowed ones count, so the guard is
+// a rate limit of at most half the cluster per window.
+func TestMassAbsenceGuardIsARateLimitNotAPermanentRefusal(t *testing.T) {
+	other := inspace.VM{UUID: "99999999-1111-4222-8333-444444444444"}
+	api := &resolvedVMReadErrorAPI{
+		fakeAPI:      &fakeAPI{network: &inspace.Network{UUID: testNetworkUUID, VMUUIDs: []string{other.UUID}}},
+		getErr:       lifecycleNotFound(),
+		overrideList: true,
+		listResponse: []inspace.VM{other},
+	}
+	provider, clock := newLifecycleProvider(t, api)
+	nodes := []*corev1.Node{nodeFor("w-a", goneVMA), nodeFor("w-b", goneVMB), nodeFor("w-c", goneVMC)}
+	setStandardNLBKubeNodes(provider, nodes...)
+	ctx := context.Background()
+
+	// All three VMs are really gone. One is allowed at once, the others are
+	// refused no matter how often they are asked.
+	if exists, err := provider.InstanceExists(ctx, nodes[0]); err != nil || exists {
+		t.Fatalf("first absence = %t, %v; want allowed", exists, err)
+	}
+	for range 4 {
+		clock.advance(time.Minute)
+		for _, node := range nodes[1:] {
+			if _, err := provider.InstanceExists(ctx, node); err == nil {
+				t.Fatalf("%s: a second absence inside the window must be refused", node.Name)
+			}
+		}
+	}
+	// Refused checks left no verdict behind, so the window ends and the loss
+	// drains at a rate of at most half the cluster per window.
+	clock.advance(absenceVerdictWindow)
+	if exists, err := provider.InstanceExists(ctx, nodes[1]); err != nil || exists {
+		t.Fatalf("second absence after the window = %t, %v; want allowed", exists, err)
+	}
+	if _, err := provider.InstanceExists(ctx, nodes[2]); err == nil {
+		t.Fatal("the third absence right after the second must wait for another window")
+	}
+	clock.advance(absenceVerdictWindow + time.Second)
+	if exists, err := provider.InstanceExists(ctx, nodes[2]); err != nil || exists {
+		t.Fatalf("third absence after another window = %t, %v; want allowed", exists, err)
+	}
+}
+
+func TestSuccessfulVMReadClearsPendingEmptyEvidence(t *testing.T) {
+	api := emptyInventoryAPI()
+	provider, clock := newLifecycleProvider(t, api)
+	node := nodeFor("worker-0", testVMUUID)
+	ctx := context.Background()
+
+	if _, err := provider.InstanceExists(ctx, node); err == nil {
+		t.Fatal("first empty read must be uncertain")
+	}
+	// The VM is seen alive in between.
+	api.getErr = nil
+	api.fakeAPI.network = &inspace.Network{UUID: testNetworkUUID, VMUUIDs: []string{testVMUUID}}
+	if exists, err := provider.InstanceExists(ctx, node); err != nil || !exists {
+		t.Fatalf("live read = %t, %v; want true", exists, err)
+	}
+	// A later lone empty read, long after the first, must start over.
+	clock.advance(10 * time.Minute)
+	api.getErr = lifecycleNotFound()
+	api.fakeAPI.network = &inspace.Network{UUID: testNetworkUUID, VMUUIDs: []string{}}
+	if exists, err := provider.InstanceExists(ctx, node); err == nil || exists {
+		t.Fatalf("lone empty read after a live read = %t, %v; want an uncertainty error", exists, err)
+	}
+}
