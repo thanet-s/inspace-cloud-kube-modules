@@ -642,7 +642,7 @@ func (c *nodeLoadBalancerController) classifyPublicNodeLocalNodesMode(
 			set.NotEligible[node.Name] = "the Node is not Ready or is excluded from load balancing"
 			continue
 		}
-		verdict, patched, authErr := c.authorizePublicNodeLocalNodeVerdict(ctx, node, intent.Pool)
+		verdict, patched, authErr := c.authorizePublicNodeLocalNodeVerdict(ctx, node, intent.Pool, service)
 		patchedNode = patchedNode || patched
 		if failFast && authErr != nil {
 			return set, patchedNode, authErr, nil
@@ -775,7 +775,7 @@ func (c *nodeLoadBalancerController) authorizePublicNodeLocalNode(
 	node *corev1.Node,
 	pool string,
 ) (bool, bool, error) {
-	verdict, patched, err := c.authorizePublicNodeLocalNodeVerdict(ctx, node, pool)
+	verdict, patched, err := c.authorizePublicNodeLocalNodeVerdict(ctx, node, pool, nil)
 	return verdict.kind == publicNodeLocalNodeAuthorized, patched, err
 }
 
@@ -786,6 +786,7 @@ func (c *nodeLoadBalancerController) authorizePublicNodeLocalNodeVerdict(
 	ctx context.Context,
 	node *corev1.Node,
 	pool string,
+	subject *corev1.Service,
 ) (publicNodeLocalNodeVerdict, bool, error) {
 	unverified := publicNodeLocalNodeVerdict{}
 	notEligible := func(reason string) (publicNodeLocalNodeVerdict, bool, error) {
@@ -981,7 +982,7 @@ func (c *nodeLoadBalancerController) authorizePublicNodeLocalNodeVerdict(
 		// VM firewall audit against the exact live Service state.
 		return publicNodeLocalNodeIs(publicNodeLocalNodeNotEligible, "the protected pool label was just mirrored"), true, nil
 	}
-	if err := c.auditPublicNodeLocalVMFirewalls(ctx, node, baseFirewallUUID); err != nil {
+	if err := c.auditPublicNodeLocalVMFirewalls(ctx, node, baseFirewallUUID, subject); err != nil {
 		return unverified, false, fmt.Errorf("public-node-local: audit VM %s firewall assignments: %w", node.Name, err)
 	}
 	return publicNodeLocalNodeIs(publicNodeLocalNodeAuthorized, ""), false, nil
@@ -1087,6 +1088,7 @@ func (c *nodeLoadBalancerController) auditPublicNodeLocalVMFirewalls(
 	ctx context.Context,
 	node *corev1.Node,
 	baseFirewallUUID string,
+	subject *corev1.Service,
 ) error {
 	vmUUID, ok := nodeLoadBalancerVMUUID(node)
 	if !ok {
@@ -1149,8 +1151,23 @@ func (c *nodeLoadBalancerController) auditPublicNodeLocalVMFirewalls(
 		); err != nil {
 			return fmt.Errorf("VM %s has unauthorized additional firewall %s: %w", vmUUID, firewall.UUID, err)
 		}
+		if subject != nil && nodeLoadBalancerFirewallIdentityOwnedByService(
+			firewall, c.provider.config.ClusterID, string(subject.UID), c.provider.config.BillingAccountID,
+		) {
+			// The subject's own reconcile repairs its own firewall.
+			continue
+		}
 		if err := c.validateLivePublicNodeLocalServiceFirewall(ctx, node, authoritativePublicIP, firewall); err != nil {
-			return err
+			var sibling *publicNodeLocalSiblingError
+			if !errors.As(err, &sibling) {
+				return err
+			}
+			// One Service's imperfect firewall must not fail the node for every
+			// other Service. Its own reconcile handles it.
+			klog.Warningf("public-node-local: ignoring imperfect sibling firewall %s on VM %s: %v", firewall.UUID, vmUUID, err)
+			if c.queue != nil {
+				c.queue.Add(sibling.key)
+			}
 		}
 	}
 	if baseFirewall == nil {
@@ -1192,29 +1209,32 @@ func (c *nodeLoadBalancerController) validateLivePublicNodeLocalServiceFirewall(
 			continue
 		}
 		matches++
+		siblingErr := func(cause error) error {
+			return &publicNodeLocalSiblingError{key: service.Namespace + "/" + service.Name, cause: cause}
+		}
 		intent, parseErr := parseNodeLoadBalancerService(service, nodeLoadBalancerDefaults{NodesPerShard: c.provider.config.NodeLoadBalancer.NodesPerShard})
 		if parseErr != nil || service.DeletionTimestamp != nil || intent.Mode != nodeLoadBalancerModeLocal ||
 			!containsString(service.Finalizers, publicNodeLocalFinalizer) || node.Labels[publicNodeLocalPoolLabel] != intent.Pool {
-			return errors.Join(parseErr, fmt.Errorf("public-node-local: firewall %s is not bound to a live valid local Service", firewall.UUID))
+			return siblingErr(errors.Join(parseErr, fmt.Errorf("public-node-local: firewall %s is not bound to a live valid local Service", firewall.UUID)))
 		}
 		desired, desiredErr := c.desiredServiceFirewall(service)
 		if desiredErr != nil || service.Annotations[annotationNodeLoadBalancerFirewallUUID] != firewall.UUID ||
 			service.Annotations[annotationNodeLoadBalancerFirewallHash] != desired.Hash ||
 			!nodeLoadBalancerFirewallMatches(firewall, desired) {
-			return errors.Join(desiredErr, fmt.Errorf("public-node-local: firewall %s lost its exact live Service ledger", firewall.UUID))
+			return siblingErr(errors.Join(desiredErr, fmt.Errorf("public-node-local: firewall %s lost its exact live Service ledger", firewall.UUID)))
 		}
 		readyNodes, endpointErr := c.publicNodeLocalReadyEndpointNodes(service)
 		if endpointErr != nil {
 			return endpointErr
 		}
 		if _, ready := readyNodes[node.Name]; !ready {
-			return fmt.Errorf("public-node-local: firewall %s is assigned to VM %s without a Ready local endpoint", firewall.UUID, vmUUID)
+			return siblingErr(fmt.Errorf("public-node-local: firewall %s is assigned to VM %s without a Ready local endpoint", firewall.UUID, vmUUID))
 		}
 		datapath, datapathErr := c.provider.kubeClient.CoreV1().Services(service.Namespace).Get(
 			ctx, nodeLoadBalancerDatapathName(service), metav1.GetOptions{},
 		)
 		if datapathErr != nil || !publicNodeLocalDatapathMatches(datapath, service, intent.Pool) {
-			return errors.Join(datapathErr, fmt.Errorf("public-node-local: firewall %s has no exact live child datapath", firewall.UUID))
+			return siblingErr(errors.Join(datapathErr, fmt.Errorf("public-node-local: firewall %s has no exact live child datapath", firewall.UUID)))
 		}
 		privateAdvertised := false
 		for _, ingress := range datapath.Status.LoadBalancer.Ingress {
@@ -1224,13 +1244,13 @@ func (c *nodeLoadBalancerController) validateLivePublicNodeLocalServiceFirewall(
 			}
 		}
 		if !privateAdvertised {
-			return fmt.Errorf("public-node-local: firewall %s VM %s is absent from the exact child VIP status", firewall.UUID, vmUUID)
+			return siblingErr(fmt.Errorf("public-node-local: firewall %s VM %s is absent from the exact child VIP status", firewall.UUID, vmUUID))
 		}
 		publicAdvertised := false
 		for _, ingress := range service.Status.LoadBalancer.Ingress {
 			if ingress.IP == authoritativePublicIP && ingress.IPMode != nil && *ingress.IPMode == corev1.LoadBalancerIPModeProxy {
 				if publicAdvertised {
-					return fmt.Errorf("public-node-local: firewall %s VM %s has a duplicate public status entry", firewall.UUID, vmUUID)
+					return siblingErr(fmt.Errorf("public-node-local: firewall %s VM %s has a duplicate public status entry", firewall.UUID, vmUUID))
 				}
 				publicAdvertised = true
 			}
@@ -1262,7 +1282,7 @@ func (c *nodeLoadBalancerController) validateLivePublicNodeLocalServiceFirewall(
 			staged = canonical && seenVM && timeErr == nil && !startedAt.After(now) && now.Before(startedAt.Add(nodeLoadBalancerPublicNodeLocalAssignTimeout))
 		}
 		if !active && !staged {
-			return fmt.Errorf("public-node-local: firewall %s VM assignment has no active or durable staged authorization", firewall.UUID)
+			return siblingErr(fmt.Errorf("public-node-local: firewall %s VM assignment has no active or durable staged authorization", firewall.UUID))
 		}
 	}
 	if matches != 1 {
@@ -2475,3 +2495,14 @@ func (e *errPublicNodeLocalHolding) Error() string {
 }
 
 func (e *errPublicNodeLocalHolding) Unwrap() error { return e.cause }
+
+// publicNodeLocalSiblingError marks a ledger or readiness fault of another
+// Service's firewall found while auditing a shared VM.
+type publicNodeLocalSiblingError struct {
+	key   string
+	cause error
+}
+
+func (e *publicNodeLocalSiblingError) Error() string { return e.cause.Error() }
+
+func (e *publicNodeLocalSiblingError) Unwrap() error { return e.cause }
