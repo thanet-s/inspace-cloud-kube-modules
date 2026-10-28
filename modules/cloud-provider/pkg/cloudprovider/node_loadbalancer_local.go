@@ -1312,16 +1312,23 @@ func publicNodeLocalAddressIdentities(addresses []nodeLoadBalancerAddress) []str
 	return result
 }
 
-// publicNodeLocalIncumbentInPool reports whether the Service is already
-// serving the pool with a child datapath whose ports overlap the claim.
+// publicNodeLocalIncumbentInPool reports whether the Service already serves
+// the pool with a claim that overlaps ports. The parent decides: a persisted
+// activation in the pool plus its own intent ports (ownPorts) prove the claim.
+// The child datapath only adds the ports that are actually served after an
+// intent change. A child that is absent, unparsable or unreadable can never
+// make a serving Service lose its claim: it holds instead.
 func (c *nodeLoadBalancerController) publicNodeLocalIncumbentInPool(
 	ctx context.Context,
 	service *corev1.Service,
 	pool string,
-	ports []nodeLoadBalancerPortClaim,
+	ownPorts, ports []nodeLoadBalancerPortClaim,
 ) (bool, error) {
 	if strings.TrimSpace(service.Annotations[annotationPublicNodeLocalActivePool]) != pool {
 		return false, nil
+	}
+	if publicNodeLocalPortsOverlap(ports, ownPorts) {
+		return true, nil
 	}
 	datapath, err := c.provider.kubeClient.CoreV1().Services(service.Namespace).Get(
 		ctx, nodeLoadBalancerDatapathName(service), metav1.GetOptions{},
@@ -1337,7 +1344,8 @@ func (c *nodeLoadBalancerController) publicNodeLocalIncumbentInPool(
 	}
 	childPorts, err := nodeLoadBalancerPortClaims(datapath)
 	if err != nil {
-		return false, nil
+		// The activation is proven and the served ports are not: keep the claim.
+		return true, nil
 	}
 	return publicNodeLocalPortsOverlap(ports, childPorts), nil
 }
@@ -1365,11 +1373,11 @@ func (c *nodeLoadBalancerController) publicNodeLocalPortConflict(
 				validDesiredConflict = true
 				// A Service that already serves the claim keeps it against a newcomer,
 				// whatever the UID order. Within the same class the lowest UID wins.
-				selfIncumbent, incumbentErr := c.publicNodeLocalIncumbentInPool(ctx, service, intent.Pool, otherIntent.Ports)
+				selfIncumbent, incumbentErr := c.publicNodeLocalIncumbentInPool(ctx, service, intent.Pool, intent.Ports, otherIntent.Ports)
 				if incumbentErr != nil {
 					return false, false, incumbentErr
 				}
-				otherIncumbent, incumbentErr := c.publicNodeLocalIncumbentInPool(ctx, other, intent.Pool, intent.Ports)
+				otherIncumbent, incumbentErr := c.publicNodeLocalIncumbentInPool(ctx, other, intent.Pool, otherIntent.Ports, intent.Ports)
 				if incumbentErr != nil {
 					return false, false, incumbentErr
 				}
