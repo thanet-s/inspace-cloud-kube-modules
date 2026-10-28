@@ -79,6 +79,10 @@ const (
 	standardNLBDeleteLoadBalancer = "delete-load-balancer"
 
 	standardNLBRemovalAbsenceDelay = 30 * time.Second
+	// standardNLBAdditiveRetireDelay is how long an issued additive receipt
+	// stays authoritative: the slowest deadline plus the spaced-read delay.
+	// Only after it, and two exact absent reads, may the receipt be retired.
+	standardNLBAdditiveRetireDelay = standardNLBCreateLoadBalancerTimeout + standardNLBRemovalAbsenceDelay
 	// standardNLBRemovalRetryDelay is the fixed requeue for a durably pending
 	// removal. Resolution needs spaced readbacks, not exponential backoff that
 	// could stretch a Service deletion to the controller's five-minute ceiling.
@@ -123,6 +127,9 @@ type standardNLBMutationFence struct {
 	TargetPort        int32  `json:"targetPort,omitempty"`
 	IssuedAt          string `json:"issuedAt,omitempty"`
 	AbsenceObservedAt string `json:"absenceObservedAt,omitempty"`
+	// Attempt counts retired create receipts. One re-create is allowed after a
+	// create stayed absent through the retire window; a second needs a human.
+	Attempt int `json:"attempt,omitempty"`
 }
 
 // API is the exact SDK surface used by the CCM and permits loopback-only
@@ -805,25 +812,24 @@ func (f standardNLBMutationFence) validate() error {
 	switch f.Operation {
 	case standardNLBCreateLoadBalancer, standardNLBCreateFloatingIP:
 		if strings.TrimSpace(f.ResourceName) == "" || f.LoadBalancerUUID != "" || f.TargetUUID != "" ||
-			f.RuleUUID != "" || f.Protocol != "" || f.SourcePort != 0 || f.TargetPort != 0 || f.AbsenceObservedAt != "" {
+			f.RuleUUID != "" || f.Protocol != "" || f.SourcePort != 0 || f.TargetPort != 0 {
 			return fmt.Errorf("cloudprovider: %s fence has inconsistent resource identity", f.Operation)
 		}
 	case standardNLBAssignFloatingIP:
 		address, err := netip.ParseAddr(f.ResourceName)
 		if err != nil || !address.Is4() || !address.IsGlobalUnicast() || address.IsPrivate() || address.String() != f.ResourceName ||
 			!validNodeLoadBalancerCloudUUID(f.LoadBalancerUUID) || f.TargetUUID != "" || f.RuleUUID != "" ||
-			f.Protocol != "" || f.SourcePort != 0 || f.TargetPort != 0 || f.AbsenceObservedAt != "" {
+			f.Protocol != "" || f.SourcePort != 0 || f.TargetPort != 0 {
 			return errors.New("cloudprovider: assign-floating-ip fence has inconsistent resource identity")
 		}
 	case standardNLBAddTarget:
 		if !validNodeLoadBalancerCloudUUID(f.LoadBalancerUUID) || !validNodeLoadBalancerCloudUUID(f.TargetUUID) ||
-			f.ResourceName != "" || f.RuleUUID != "" || f.Protocol != "" || f.SourcePort != 0 || f.TargetPort != 0 || f.AbsenceObservedAt != "" {
+			f.ResourceName != "" || f.RuleUUID != "" || f.Protocol != "" || f.SourcePort != 0 || f.TargetPort != 0 {
 			return errors.New("cloudprovider: add-target fence has inconsistent resource identity")
 		}
 	case standardNLBAddRule:
 		if !validNodeLoadBalancerCloudUUID(f.LoadBalancerUUID) || f.ResourceName != "" || f.TargetUUID != "" ||
-			f.RuleUUID != "" || f.Protocol != "TCP" || f.SourcePort < 1 || f.SourcePort > 65535 || f.TargetPort < 1 || f.TargetPort > 65535 ||
-			f.AbsenceObservedAt != "" {
+			f.RuleUUID != "" || f.Protocol != "TCP" || f.SourcePort < 1 || f.SourcePort > 65535 || f.TargetPort < 1 || f.TargetPort > 65535 {
 			return errors.New("cloudprovider: add-rule fence has inconsistent resource identity")
 		}
 	case standardNLBUnassignFloatingIP:
@@ -856,6 +862,10 @@ func (f standardNLBMutationFence) validate() error {
 		}
 	default:
 		return fmt.Errorf("cloudprovider: public NLB mutation fence has unknown operation %q", f.Operation)
+	}
+	createOperation := f.Operation == standardNLBCreateLoadBalancer || f.Operation == standardNLBCreateFloatingIP
+	if f.Attempt < 0 || f.Attempt > 1 || (f.Attempt != 0 && !createOperation) {
+		return fmt.Errorf("cloudprovider: %s fence has an invalid attempt count %d", f.Operation, f.Attempt)
 	}
 	if f.Version == standardNLBLegacyMutationVersion && standardNLBRemovalOperation(f.Operation) {
 		return fmt.Errorf("cloudprovider: legacy public NLB mutation fence version %d cannot describe removal %q", f.Version, f.Operation)
@@ -1042,6 +1052,11 @@ func (p *Provider) stageStandardNLBMutation(
 		return standardNLBMutationFence{}, "", err
 	}
 	if existing != nil {
+		if existing.Operation == desired.Operation && existing.ResourceName == desired.ResourceName {
+			// A retired create keeps its count so a re-staged intent cannot
+			// reset the one-re-create budget.
+			desired.Attempt = existing.Attempt
+		}
 		if existing.Phase == standardNLBPhaseIssued && !sameStandardNLBMutationIntent(*existing, desired) {
 			return standardNLBMutationFence{}, "", fmt.Errorf("cloudprovider: issued %s mutation must resolve before staging %s", existing.Operation, desired.Operation)
 		}
@@ -1101,6 +1116,72 @@ func (p *Provider) clearStandardNLBFenceAfterProvenNonDispatch(
 		clearErr = fmt.Errorf("cloudprovider: clear proven non-dispatched public NLB receipt: %w", clearErr)
 	}
 	return errors.Join(rejection, clearErr)
+}
+
+// retireAbsentStandardNLBAdditive decides whether an issued additive receipt
+// whose resource is still absent can be dropped. A timed-out call may land
+// late, so nothing is retired before the slowest deadline plus a spacing delay
+// has passed since issue, and then only after two exact absent reads at least
+// the convergence delay apart. Adds and assignments are idempotent, so the
+// caller then replays them. A create is retired into a fresh intent that
+// carries Attempt+1: one re-create is allowed, a second one is refused so a
+// slow paid resource can never be duplicated more than once.
+func (p *Provider) retireAbsentStandardNLBAdditive(
+	ctx context.Context,
+	service *corev1.Service,
+	issued standardNLBMutationFence,
+) (bool, error) {
+	fence, raw, err := p.readStandardNLBFence(ctx, service)
+	if err != nil {
+		return false, err
+	}
+	if fence == nil {
+		return true, nil
+	}
+	if fence.Phase != standardNLBPhaseIssued || !sameStandardNLBMutationIntent(*fence, issued) {
+		return false, fmt.Errorf("cloudprovider: public NLB %s receipt changed while checking its absence", issued.Operation)
+	}
+	issuedAt, err := time.Parse(time.RFC3339Nano, fence.IssuedAt)
+	if err != nil {
+		return false, fmt.Errorf("cloudprovider: public NLB %s receipt has an invalid timestamp: %w", fence.Operation, err)
+	}
+	now := p.standardNLBTime()
+	if now.Before(issuedAt.Add(standardNLBAdditiveRetireDelay)) {
+		return false, nil
+	}
+	if fence.AbsenceObservedAt == "" {
+		updated := *fence
+		updated.AbsenceObservedAt = now.Format(time.RFC3339Nano)
+		_, err := p.replaceStandardNLBFence(ctx, service, raw, &updated)
+		return false, err
+	}
+	observedAt, err := time.Parse(time.RFC3339Nano, fence.AbsenceObservedAt)
+	if err != nil {
+		return false, fmt.Errorf("cloudprovider: public NLB %s receipt has invalid absence evidence: %w", fence.Operation, err)
+	}
+	if now.Before(observedAt.Add(p.standardNLBRemovalDelay())) {
+		return false, nil
+	}
+	var next *standardNLBMutationFence
+	if fence.Operation == standardNLBCreateLoadBalancer || fence.Operation == standardNLBCreateFloatingIP {
+		if fence.Attempt >= 1 {
+			return false, fmt.Errorf(
+				"cloudprovider: public %s was already re-created once and is still absent after the retire window; "+
+					"refusing another paid create until the Service receipt is resolved manually",
+				fence.Operation,
+			)
+		}
+		next = &standardNLBMutationFence{
+			Version: standardNLBMutationVersion, Operation: fence.Operation, Phase: standardNLBPhaseIntent,
+			RequestHash: fence.RequestHash, ResourceName: fence.ResourceName, Attempt: fence.Attempt + 1,
+		}
+	}
+	klog.Warningf("retiring public NLB %s receipt for Service %s/%s: issued at %s and absent on two spaced reads",
+		fence.Operation, service.Namespace, service.Name, fence.IssuedAt)
+	if _, err := p.replaceStandardNLBFence(ctx, service, raw, next); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func standardNLBRemovalOperation(operation string) bool {
@@ -1340,7 +1421,25 @@ func (p *Provider) ensureStandardNLBLoadBalancer(
 			return nil, false, fmt.Errorf("cloudprovider: visible NLB %s does not match fenced create name %q", discovered.UUID, fence.ResourceName)
 		}
 		if fence.RequestHash != requestHash {
-			return nil, false, errors.New("cloudprovider: visible NLB cannot resolve its create fence because the exact requested rules or targets changed")
+			// A slow create can land after the node set moved. When only the
+			// targets differ, adopt the NLB and let the normal reconcile move
+			// its targets; a rules change still fails closed.
+			adopted := request
+			adopted.Targets = standardNLBVisibleCreateTargets(discovered)
+			adoptedHash, hashErr := standardNLBRequestHash(adopted)
+			if hashErr != nil {
+				return nil, false, hashErr
+			}
+			if adoptedHash != fence.RequestHash {
+				return nil, false, errors.New("cloudprovider: visible NLB cannot resolve its create fence because the exact requested rules or targets changed")
+			}
+			if err := validateStandardNLBInitialPolicy(discovered, adopted); err != nil {
+				return nil, false, err
+			}
+			if _, err := p.replaceStandardNLBFence(ctx, service, raw, nil); err != nil {
+				return nil, false, fmt.Errorf("cloudprovider: promote visible fenced NLB %s: %w", discovered.UUID, err)
+			}
+			return discovered, false, nil
 		}
 		if err := validateStandardNLBInitialPolicy(discovered, request); err != nil {
 			return nil, false, err
@@ -1352,6 +1451,18 @@ func (p *Provider) ensureStandardNLBLoadBalancer(
 	}
 	if fence != nil && fence.Operation != standardNLBCreateLoadBalancer {
 		return nil, false, fmt.Errorf("cloudprovider: %s mutation must resolve before creating the public NLB", fence.Operation)
+	}
+	if fence != nil && fence.Phase == standardNLBPhaseIssued && fence.ResourceName == request.DisplayName {
+		retired, retireErr := p.retireAbsentStandardNLBAdditive(ctx, service, *fence)
+		if retireErr != nil {
+			return nil, false, retireErr
+		}
+		if !retired {
+			return nil, false, fmt.Errorf(
+				"cloudprovider: public NLB create issued at %s remains ambiguous; refusing a second paid create until %q is observable or the retire window passes",
+				fence.IssuedAt, fence.ResourceName,
+			)
+		}
 	}
 
 	fenceValue, raw, err := p.stageStandardNLBMutation(ctx, service, desired)
@@ -1468,6 +1579,18 @@ func (p *Provider) ensureStandardNLBPublicFloatingIP(
 	if fence != nil && fence.Operation != standardNLBCreateFloatingIP {
 		return nil, fmt.Errorf("cloudprovider: %s mutation must resolve before creating the public floating IP", fence.Operation)
 	}
+	if fence != nil && fence.Phase == standardNLBPhaseIssued && fence.ResourceName == request.Name {
+		retired, retireErr := p.retireAbsentStandardNLBAdditive(ctx, service, *fence)
+		if retireErr != nil {
+			return nil, retireErr
+		}
+		if !retired {
+			return nil, fmt.Errorf(
+				"cloudprovider: public floating IP create issued at %s remains ambiguous; refusing a second create until %q is observable or the retire window passes",
+				fence.IssuedAt, fence.ResourceName,
+			)
+		}
+	}
 
 	fenceValue, raw, err := p.stageStandardNLBMutation(ctx, service, desired)
 	if err != nil {
@@ -1580,6 +1703,18 @@ func (p *Provider) ensureStandardNLBFloatingIPAssignment(
 	}
 	if err := validateServiceFloatingIPUnassigned(floatingIP); err != nil {
 		return nil, err
+	}
+	if fence != nil && fence.Phase == standardNLBPhaseIssued {
+		retired, retireErr := p.retireAbsentStandardNLBAdditive(ctx, service, *fence)
+		if retireErr != nil {
+			return nil, retireErr
+		}
+		if !retired {
+			return nil, fmt.Errorf(
+				"cloudprovider: floating IP %s assignment to NLB %s issued at %s remains ambiguous; refusing a blind replay until the retire window passes",
+				floatingIP.Address, loadBalancer.UUID, fence.IssuedAt,
+			)
+		}
 	}
 	fenceValue, raw, err := p.stageStandardNLBMutation(ctx, service, desired)
 	if err != nil {
@@ -3476,15 +3611,24 @@ func (p *Provider) resolvePendingStandardNLBAdd(
 			_, err := p.replaceStandardNLBFence(ctx, service, raw, nil)
 			return err
 		}
-		if fence.Phase == standardNLBPhaseIssued {
-			return fmt.Errorf(
-				"cloudprovider: add target %s to NLB %s issued at %s remains ambiguous; refusing a blind replay",
-				fence.TargetUUID, fence.LoadBalancerUUID, fence.IssuedAt,
-			)
-		}
 		if !desiredStandardNLBTarget(targetUUIDs, fence.TargetUUID) {
+			// The exact read above shows the target absent and the Service no
+			// longer wants it: a stuck add must not block the rest of the
+			// reconcile. If it lands late, the normal removal path handles it.
 			_, err := p.replaceStandardNLBFence(ctx, service, raw, nil)
 			return err
+		}
+		if fence.Phase == standardNLBPhaseIssued {
+			retired, retireErr := p.retireAbsentStandardNLBAdditive(ctx, service, *fence)
+			if retireErr != nil {
+				return retireErr
+			}
+			if !retired {
+				return fmt.Errorf(
+					"cloudprovider: add target %s to NLB %s issued at %s remains ambiguous; refusing a blind replay until the retire window passes",
+					fence.TargetUUID, fence.LoadBalancerUUID, fence.IssuedAt,
+				)
+			}
 		}
 		return nil
 	case standardNLBAddRule:
@@ -3504,15 +3648,21 @@ func (p *Provider) resolvePendingStandardNLBAdd(
 			_, err := p.replaceStandardNLBFence(ctx, service, raw, nil)
 			return err
 		}
-		if fence.Phase == standardNLBPhaseIssued {
-			return fmt.Errorf(
-				"cloudprovider: add rule %d->%d to NLB %s issued at %s remains ambiguous; refusing a blind replay",
-				fence.SourcePort, fence.TargetPort, fence.LoadBalancerUUID, fence.IssuedAt,
-			)
-		}
 		if !desiredStandardNLBRule(rules, *fence) {
 			_, err := p.replaceStandardNLBFence(ctx, service, raw, nil)
 			return err
+		}
+		if fence.Phase == standardNLBPhaseIssued {
+			retired, retireErr := p.retireAbsentStandardNLBAdditive(ctx, service, *fence)
+			if retireErr != nil {
+				return retireErr
+			}
+			if !retired {
+				return fmt.Errorf(
+					"cloudprovider: add rule %d->%d to NLB %s issued at %s remains ambiguous; refusing a blind replay until the retire window passes",
+					fence.SourcePort, fence.TargetPort, fence.LoadBalancerUUID, fence.IssuedAt,
+				)
+			}
 		}
 		return nil
 	default:
@@ -4127,4 +4277,15 @@ func (p *Provider) standardNLBMutationContext(ctx context.Context, timeout time.
 		timeout = p.standardNLBMutationTimeout
 	}
 	return context.WithTimeout(ctx, timeout)
+}
+
+// standardNLBVisibleCreateTargets rebuilds the target list of a create request
+// from what the visible NLB carries, in the sorted order requests use.
+func standardNLBVisibleCreateTargets(lb *inspace.LoadBalancer) []inspace.LoadBalancerTarget {
+	targets := make([]inspace.LoadBalancerTarget, 0, len(lb.Targets))
+	for _, target := range lb.Targets {
+		targets = append(targets, inspace.LoadBalancerTarget{TargetUUID: target.TargetUUID, TargetType: "vm"})
+	}
+	sort.Slice(targets, func(i, j int) bool { return targets[i].TargetUUID < targets[j].TargetUUID })
+	return targets
 }
