@@ -279,3 +279,48 @@ func TestPublicNodeLocalChildRepairRestoresVIPsOfEveryKeptNode(t *testing.T) {
 		}
 	}
 }
+
+// neverAppliesAssignAPI accepts a firewall assignment for one VM and never
+// applies it, which leaves an add stuck for as long as the test runs.
+type neverAppliesAssignAPI struct {
+	*publicNodeLocalFilteringIPAPI
+	stuckVM string
+}
+
+func (a *neverAppliesAssignAPI) AssignFirewallToVM(ctx context.Context, location, firewallUUID, vmUUID string) error {
+	if vmUUID == a.stuckVM {
+		return nil
+	}
+	return a.publicNodeLocalFilteringIPAPI.AssignFirewallToVM(ctx, location, firewallUUID, vmUUID)
+}
+
+// A stuck add must not starve the removal of a Node that is proven gone.
+func TestPublicNodeLocalStuckAddDoesNotStarveGoneRemoval(t *testing.T) {
+	f := newPublishedPublicNodeLocalFixtureN(t, 2)
+	_, vm3, _, _ := publicNodeLocalFixtureNode(2)
+	f.provider.api = &neverAppliesAssignAPI{
+		publicNodeLocalFilteringIPAPI: &publicNodeLocalFilteringIPAPI{fakeAPI: f.api}, stuckVM: vm3,
+	}
+	f.addNode(t, 2)
+	f.provider.api = &neverAppliesAssignAPI{
+		publicNodeLocalFilteringIPAPI: &publicNodeLocalFilteringIPAPI{fakeAPI: f.api}, stuckVM: vm3,
+	}
+	name2, vm2, priv2, pub2 := publicNodeLocalFixtureNode(1)
+	if err := f.provider.kubeClient.CoreV1().Nodes().Delete(f.ctx, name2, metav1.DeleteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	f.setEndpoints(t, "edge-0", "edge-2")
+	for pass := 0; pass < 30; pass++ {
+		err := f.controller.syncPublicNodeLocal(f.ctx, f.key, f.current(t))
+		var holding *errPublicNodeLocalHolding
+		var pending *nodeLoadBalancerFirewallRelationPendingError
+		if err != nil && !errors.As(err, &holding) && !errors.As(err, &pending) {
+			t.Fatalf("pass %d: %v", pass, err)
+		}
+		observed := observePublicNodeLocal(t, f)
+		if !observed.fips[pub2] && !observed.vips[priv2] && !observed.assigned[vm2] {
+			return
+		}
+	}
+	t.Fatalf("the gone node stayed on the edge behind the stuck add: %#v", observePublicNodeLocal(t, f))
+}

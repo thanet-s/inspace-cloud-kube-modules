@@ -232,7 +232,10 @@ func (c *nodeLoadBalancerController) convergeActivePublicNodeLocal(
 	now := c.publicNodeLocalClock()
 	readyEmpty := len(nodes.Ready) == 0
 	keep := map[string]struct{}{}
-	remove := map[string]struct{}{}
+	// removeGone holds Nodes whose absence is verified; removeGrace holds Nodes
+	// that only lost their endpoint for longer than the grace.
+	removeGone := map[string]struct{}{}
+	removeGrace := map[string]struct{}{}
 	goneKeys := map[string]struct{}{}
 	var nextCheck time.Duration
 	for name := range readyByName {
@@ -254,7 +257,7 @@ func (c *nodeLoadBalancerController) convergeActivePublicNodeLocal(
 		goneKeys[string(service.UID)+"/"+name] = struct{}{}
 		since := c.noteEndpointGone(string(service.UID)+"/"+name, now)
 		if elapsed := now.Sub(since); elapsed >= publicNodeLocalEndpointGoneGrace {
-			remove[name] = struct{}{}
+			removeGrace[name] = struct{}{}
 			return
 		} else if remaining := publicNodeLocalEndpointGoneGrace - elapsed; nextCheck == 0 || remaining < nextCheck {
 			nextCheck = remaining
@@ -263,7 +266,7 @@ func (c *nodeLoadBalancerController) convergeActivePublicNodeLocal(
 	}
 	for name := range nodes.Gone {
 		if _, known := members[name]; known {
-			remove[name] = struct{}{}
+			removeGone[name] = struct{}{}
 		}
 	}
 	for name := range nodes.Unverified {
@@ -287,8 +290,10 @@ func (c *nodeLoadBalancerController) convergeActivePublicNodeLocal(
 		noteGone(name)
 	}
 	c.pruneEndpointGone(string(service.UID), goneKeys)
-	for name := range remove {
-		delete(keep, name)
+	for _, set := range []map[string]struct{}{removeGone, removeGrace} {
+		for name := range set {
+			delete(keep, name)
+		}
 	}
 
 	staleFIPs := map[string]struct{}{}
@@ -314,6 +319,71 @@ func (c *nodeLoadBalancerController) convergeActivePublicNodeLocal(
 
 	if nextCheck > 0 && c.queue != nil {
 		c.queue.AddAfter(key, nextCheck)
+	}
+
+	// removeNodes runs one removal step for the dropped Nodes while the kept
+	// Nodes stay on the edge. It reports whether it changed anything.
+	removeNodes := func(drop, kept map[string]struct{}) (bool, error) {
+		removeFIPs := map[string]struct{}{}
+		for ip := range staleFIPs {
+			removeFIPs[ip] = struct{}{}
+		}
+		for name := range drop {
+			if member := members[name]; member.public != "" {
+				if _, has := fips[member.public]; has {
+					removeFIPs[member.public] = struct{}{}
+				}
+			}
+		}
+		if len(removeFIPs) != 0 {
+			next := map[string]struct{}{}
+			for ip := range fips {
+				if _, drop := removeFIPs[ip]; !drop {
+					next[ip] = struct{}{}
+				}
+			}
+			if err := c.publishActivePublicNodeLocalStatus(ctx, service, intent, desired, firewall.UUID, publicNodeLocalOrderedStatus(next, nil, true)); err != nil {
+				return true, c.holdOrFailPublicNodeLocal(ctx, service, err)
+			}
+			c.requeuePublicNodeLocal(key)
+			return true, nil
+		}
+		keepNodes := make([]*corev1.Node, 0, len(kept))
+		keepVMSet := map[string]struct{}{}
+		keepPrivate := map[string]struct{}{}
+		for name := range kept {
+			member := members[name]
+			keepPrivate[member.private] = struct{}{}
+			if member.vmUUID != "" {
+				keepNodes = append(keepNodes, member.node)
+				keepVMSet[member.vmUUID] = struct{}{}
+			}
+		}
+		stale, err := staleNodeLoadBalancerFirewallAssignments(*firewall, keepVMSet)
+		if err != nil {
+			return true, c.holdOrFailPublicNodeLocal(ctx, service, err)
+		}
+		if len(stale) != 0 {
+			if err := c.detachServiceFirewallFromOtherNodes(ctx, service, firewall, keepNodes); err != nil {
+				return true, c.holdOrFailPublicNodeLocal(ctx, service, err)
+			}
+			c.requeuePublicNodeLocal(key)
+			return true, nil
+		}
+		next := map[string]struct{}{}
+		for ip := range vips {
+			if _, keptVIP := keepPrivate[ip]; keptVIP {
+				next[ip] = struct{}{}
+			}
+		}
+		if len(next) != len(vips) {
+			if _, _, err := c.ensurePublicNodeLocalDatapathStatus(ctx, service, datapath, intent.Pool, publicNodeLocalOrderedStatus(next, publicOfPrivate, false)); err != nil {
+				return true, c.holdOrFailPublicNodeLocal(ctx, service, err)
+			}
+			c.requeuePublicNodeLocal(key)
+			return true, nil
+		}
+		return false, nil
 	}
 
 	// A recreated or class-repaired child lost its VIPs. Every kept and published
@@ -342,6 +412,21 @@ func (c *nodeLoadBalancerController) convergeActivePublicNodeLocal(
 		}
 		c.requeuePublicNodeLocal(key)
 		return nil
+	}
+
+	// Removals: FIP, then the firewall, then the child VIP. Nodes that are
+	// verifiably gone leave first and never wait behind a stuck or parked add,
+	// since a gone Node can not serve and removing it takes no capacity away.
+	// The grace removals run after the adds so a replacement is up first.
+	keepWithGrace := map[string]struct{}{}
+	for name := range keep {
+		keepWithGrace[name] = struct{}{}
+	}
+	for name := range removeGrace {
+		keepWithGrace[name] = struct{}{}
+	}
+	if acted, err := removeNodes(removeGone, keepWithGrace); acted || err != nil {
+		return err
 	}
 
 	// Adds first: child VIP, then the firewall, then the FIP.
@@ -418,65 +503,16 @@ func (c *nodeLoadBalancerController) convergeActivePublicNodeLocal(
 		return nil
 	}
 
-	// Removals: FIP, then the firewall, then the child VIP.
-	removeFIPs := map[string]struct{}{}
-	for ip := range staleFIPs {
-		removeFIPs[ip] = struct{}{}
+	// The rest of the removals, after every add is done.
+	allDropped := map[string]struct{}{}
+	for name := range removeGone {
+		allDropped[name] = struct{}{}
 	}
-	for name := range remove {
-		if member := members[name]; member.public != "" {
-			if _, has := fips[member.public]; has {
-				removeFIPs[member.public] = struct{}{}
-			}
-		}
+	for name := range removeGrace {
+		allDropped[name] = struct{}{}
 	}
-	if len(removeFIPs) != 0 {
-		next := map[string]struct{}{}
-		for ip := range fips {
-			if _, drop := removeFIPs[ip]; !drop {
-				next[ip] = struct{}{}
-			}
-		}
-		if err := c.publishActivePublicNodeLocalStatus(ctx, service, intent, desired, firewall.UUID, publicNodeLocalOrderedStatus(next, nil, true)); err != nil {
-			return c.holdOrFailPublicNodeLocal(ctx, service, err)
-		}
-		c.requeuePublicNodeLocal(key)
-		return nil
-	}
-	keepNodes := make([]*corev1.Node, 0, len(keep))
-	keepVMSet := map[string]struct{}{}
-	keepPrivate := map[string]struct{}{}
-	for name := range keep {
-		member := members[name]
-		keepPrivate[member.private] = struct{}{}
-		if member.vmUUID != "" {
-			keepNodes = append(keepNodes, member.node)
-			keepVMSet[member.vmUUID] = struct{}{}
-		}
-	}
-	stale, err := staleNodeLoadBalancerFirewallAssignments(*firewall, keepVMSet)
-	if err != nil {
-		return c.holdOrFailPublicNodeLocal(ctx, service, err)
-	}
-	if len(stale) != 0 {
-		if err := c.detachServiceFirewallFromOtherNodes(ctx, service, firewall, keepNodes); err != nil {
-			return c.holdOrFailPublicNodeLocal(ctx, service, err)
-		}
-		c.requeuePublicNodeLocal(key)
-		return nil
-	}
-	next := map[string]struct{}{}
-	for ip := range vips {
-		if _, kept := keepPrivate[ip]; kept {
-			next[ip] = struct{}{}
-		}
-	}
-	if len(next) != len(vips) {
-		if _, _, err := c.ensurePublicNodeLocalDatapathStatus(ctx, service, datapath, intent.Pool, publicNodeLocalOrderedStatus(next, publicOfPrivate, false)); err != nil {
-			return c.holdOrFailPublicNodeLocal(ctx, service, err)
-		}
-		c.requeuePublicNodeLocal(key)
-		return nil
+	if acted, err := removeNodes(allDropped, keep); acted || err != nil {
+		return err
 	}
 
 	if len(nodes.Unverified) != 0 {
