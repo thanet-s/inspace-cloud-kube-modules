@@ -29,6 +29,25 @@ const (
 	publicNodeLocalReasonForeignAccountFirewall = "PublicNodeLocalForeignAccountFirewall"
 )
 
+// noteForeignAccountState reports whether the foreign-account state of a Service
+// changed since it was last announced, and remembers it. An empty state resets.
+func (c *nodeLoadBalancerController) noteForeignAccountState(uid, state string) bool {
+	c.endpointGoneMu.Lock()
+	defer c.endpointGoneMu.Unlock()
+	if c.foreignEventKey == nil {
+		c.foreignEventKey = map[string]string{}
+	}
+	if state == "" {
+		delete(c.foreignEventKey, uid)
+		return false
+	}
+	if c.foreignEventKey[uid] == state {
+		return false
+	}
+	c.foreignEventKey[uid] = state
+	return true
+}
+
 // publicNodeLocalWithout returns the entries of list that are not in skip.
 func publicNodeLocalWithout(list, skip []string) []string {
 	skipped := make(map[string]struct{}, len(skip))
@@ -279,6 +298,9 @@ func (c *nodeLoadBalancerController) convergeActivePublicNodeLocal(
 				errors.New("public-node-local: active Service firewall is not authoritatively ready")))
 		}
 	}
+	if !union {
+		c.noteOldFirewallAttached(ctx, service, firewall, previousFirewall)
+	}
 	if service.Annotations[annotationNodeLoadBalancerFirewallRelationIssued] != "" ||
 		service.Annotations[annotationNodeLoadBalancerFirewallRelationOwnerUID] != "" {
 		// Resolve the unresolved relation receipt before planning on top of it.
@@ -514,17 +536,23 @@ func (c *nodeLoadBalancerController) convergeActivePublicNodeLocal(
 			foreignNames = append(foreignNames, name)
 		}
 		sort.Strings(foreignNames)
+		var foreignNotes []string
 		for _, leaving := range []*inspace.Firewall{firewall, previousFirewall} {
 			if leaving == nil {
 				continue
 			}
 			for _, name := range foreignNames {
 				if firewallAssignedToVM(*leaving, members[name].vmUUID) {
-					c.recordPublicNodeLocalEvent(ctx, service, publicNodeLocalReasonForeignAccountFirewall, fmt.Errorf(
-						"public-node-local: Node %s runs on a VM of another billing account or VPC; Service firewall %s stays assigned to it and needs an operator",
+					foreignNotes = append(foreignNotes, fmt.Sprintf(
+						"Node %s runs on a VM of another billing account or VPC; Service firewall %s stays assigned to it and needs an operator",
 						name, leaving.UUID))
 				}
 			}
+		}
+		// Announced once per state change: the same set is not announced again.
+		if c.noteForeignAccountState(string(service.UID), strings.Join(foreignNotes, "; ")) {
+			c.recordPublicNodeLocalEvent(ctx, service, publicNodeLocalReasonForeignAccountFirewall, errors.New(
+				"public-node-local: "+strings.Join(foreignNotes, "; ")))
 		}
 		// The current firewall and, while one is left over, the previous one: a
 		// node that leaves loses both before its child VIP goes.

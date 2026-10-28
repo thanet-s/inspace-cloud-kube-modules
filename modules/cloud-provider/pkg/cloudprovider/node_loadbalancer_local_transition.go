@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -116,9 +117,84 @@ func (c *nodeLoadBalancerController) syncPendingPublicNodeLocalTransition(
 	return &errPublicNodeLocalHolding{cause: cause, retryAfter: retryAfter}
 }
 
+// publicNodeLocalAgeSince is the time since a recorded instant, rounded to the
+// minute so an Event that carries it changes once a minute, not once a pass.
+func publicNodeLocalAgeSince(now time.Time, recorded string) (time.Duration, bool) {
+	since, err := time.Parse(time.RFC3339, recorded)
+	if err != nil {
+		return 0, false
+	}
+	age := now.Sub(since)
+	if age < 0 {
+		age = 0
+	}
+	return age.Round(time.Minute), true
+}
+
+const publicNodeLocalReasonOldFirewallAttached = "PublicNodeLocalOldFirewallAttached"
+
+// noteOldFirewallAttached tells the operator how long a narrowed old firewall has
+// stayed attached after the promotion. The narrowing is applied by the new
+// firewall only once the old one is detached, so the age is the length of the
+// window in which a port or source range that the Service dropped is still open.
+func (c *nodeLoadBalancerController) noteOldFirewallAttached(ctx context.Context, service *corev1.Service, current, previous *inspace.Firewall) {
+	if current == nil || previous == nil || service.Annotations[annotationPublicNodeLocalTargetPolicy] != "" {
+		return
+	}
+	assignments, err := nodeLoadBalancerFirewallVMAssignments(*previous)
+	if err != nil || len(assignments) == 0 {
+		return
+	}
+	kept := make(map[string]struct{}, len(current.Rules))
+	for _, rule := range current.Rules {
+		kept[nodeLoadBalancerFirewallRuleKey(rule)] = struct{}{}
+	}
+	narrowed := false
+	for _, rule := range previous.Rules {
+		if _, found := kept[nodeLoadBalancerFirewallRuleKey(rule)]; !found {
+			narrowed = true
+		}
+	}
+	if !narrowed {
+		return
+	}
+	age, found := publicNodeLocalAgeSince(c.publicNodeLocalClock(), service.Annotations[annotationPublicNodeLocalPromotedAt])
+	if !found {
+		return
+	}
+	c.recordPublicNodeLocalEvent(ctx, service, publicNodeLocalReasonOldFirewallAttached, fmt.Errorf(
+		"public-node-local: the narrowed previous firewall %s is still attached to %d VM(s), %s after the promotion; what the Service dropped stays open until it is detached",
+		previous.UUID, len(assignments), age))
+}
+
+// unparkPublicNodeLocalUnassign ends the park of a detach of the previous
+// firewall. Detaching is the safe direction, so it is retried at the normal
+// cadence instead of waiting out the park.
+func (c *nodeLoadBalancerController) unparkPublicNodeLocalUnassign(ctx context.Context, service *corev1.Service, firewallUUID string, vmUUIDs []string) error {
+	if len(vmUUIDs) == 0 {
+		return nil
+	}
+	_, _, err := c.updateExactParentService(ctx, service, func(copy *corev1.Service) (bool, error) {
+		changed := false
+		for _, vmUUID := range vmUUIDs {
+			key := nodeLoadBalancerFirewallRelationKey(nodeLoadBalancerFirewallRelationFence{
+				operation: nodeLoadBalancerFirewallRelationUnassign, firewallUUID: firewallUUID, vmUUID: vmUUID,
+			})
+			if clearNodeLoadBalancerFirewallRelationRetirement(copy.Annotations, key, c.nodeLoadBalancerFirewallRelationTime()) {
+				changed = true
+			}
+		}
+		return changed, nil
+	})
+	return err
+}
+
 // holdPendingPublicNodeLocalTransition holds a transition that cannot move on
 // yet, with the Pending Event and the backoff of an unchanged hold.
 func (c *nodeLoadBalancerController) holdPendingPublicNodeLocalTransition(ctx context.Context, service *corev1.Service, cause error) error {
+	if age, found := publicNodeLocalAgeSince(c.publicNodeLocalClock(), service.Annotations[annotationPublicNodeLocalTargetSince]); found {
+		cause = fmt.Errorf("%w (union age %s)", cause, age)
+	}
 	c.recordPublicNodeLocalEvent(ctx, service, publicNodeLocalReasonTransitionPending, cause)
 	retryAfter, _ := c.nextPublicNodeLocalHoldDelay(string(service.UID), cause)
 	return &errPublicNodeLocalHolding{cause: cause, retryAfter: retryAfter}
@@ -267,10 +343,12 @@ func (c *nodeLoadBalancerController) finishPreviousPublicNodeLocalFirewall(
 			if err != nil {
 				return true, c.holdOrFailPublicNodeLocal(ctx, service, err)
 			}
-			if len(publicNodeLocalWithout(stale, parked)) == 0 {
-				// Only parked relations are left: they are retried when the park
-				// ends, and must not stop the pass meanwhile.
-				return false, nil
+			if len(parked) != 0 {
+				if err := c.unparkPublicNodeLocalUnassign(ctx, service, previous.UUID, parked); err != nil {
+					return true, c.holdOrFailPublicNodeLocal(ctx, service, err)
+				}
+				c.requeuePublicNodeLocal(key)
+				return true, nil
 			}
 			c.requeuePublicNodeLocal(key)
 			return true, nil
@@ -330,6 +408,11 @@ func (c *nodeLoadBalancerController) setPublicNodeLocalDatapathStatusHeld(
 const (
 	annotationPublicNodeLocalTargetPool   = "service.inspace.cloud/public-node-local-target-pool"
 	annotationPublicNodeLocalTargetPolicy = "service.inspace.cloud/public-node-local-target-policy"
+	// annotationPublicNodeLocalTargetSince is when the union started, and
+	// annotationPublicNodeLocalPromotedAt when the target was promoted. They give
+	// the age that the Events report.
+	annotationPublicNodeLocalTargetSince = "service.inspace.cloud/public-node-local-target-since"
+	annotationPublicNodeLocalPromotedAt  = "service.inspace.cloud/public-node-local-promoted-at"
 	// annotationPublicNodeLocalDatapathTargetPool is set on the child while a
 	// transition is in progress, so peers can attribute its exposure to both pools.
 	annotationPublicNodeLocalDatapathTargetPool = "service.inspace.cloud/public-node-local-target-pool"
@@ -507,6 +590,7 @@ func (c *nodeLoadBalancerController) startPublicNodeLocalTransition(
 		}
 		copy.Annotations[annotationPublicNodeLocalTargetPool] = intent.Pool
 		copy.Annotations[annotationPublicNodeLocalTargetPolicy] = desired.Hash
+		copy.Annotations[annotationPublicNodeLocalTargetSince] = c.publicNodeLocalClock().Format(time.RFC3339)
 		return true, nil
 	})
 	return changed, err
@@ -533,6 +617,10 @@ func (c *nodeLoadBalancerController) promotePublicNodeLocalTransition(
 		setPublicNodeLocalActivePorts(copy)
 		delete(copy.Annotations, annotationPublicNodeLocalTargetPool)
 		delete(copy.Annotations, annotationPublicNodeLocalTargetPolicy)
+		delete(copy.Annotations, annotationPublicNodeLocalTargetSince)
+		if copy.Annotations[annotationNodeLoadBalancerPreviousFirewall] != "" {
+			copy.Annotations[annotationPublicNodeLocalPromotedAt] = c.publicNodeLocalClock().Format(time.RFC3339)
+		}
 		return true, nil
 	})
 	return err
@@ -600,6 +688,7 @@ func (c *nodeLoadBalancerController) abortPublicNodeLocalTransition(
 		}
 		delete(copy.Annotations, annotationPublicNodeLocalTargetPool)
 		delete(copy.Annotations, annotationPublicNodeLocalTargetPolicy)
+		delete(copy.Annotations, annotationPublicNodeLocalTargetSince)
 		if restore != nil {
 			// The assignment intent named the target firewall, which is retired now.
 			// Nothing is assigned under it any more; a stale receipt is resolved by

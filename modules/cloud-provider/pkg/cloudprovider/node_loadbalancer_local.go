@@ -489,7 +489,15 @@ func mergePublicNodeLocalDatapathUnion(desired, existing *corev1.Service) *corev
 		merged = append(merged, port)
 	}
 	desired.Spec.Ports = merged
-	// An empty list means any source, which is the widest.
+	// An empty list means any source, which is the widest. During the union the
+	// child therefore admits the widest of the old and the new source ranges. The
+	// per-Service VM firewall is the gate for traffic from outside the VPC, but
+	// sources inside the VPC are admitted by the base node firewall and only
+	// Cilium filters them by these ranges, so for the length of the union an
+	// in-VPC source that the new policy excludes (a narrowing) can still reach the
+	// frontends, and one that the new policy admits (a widening) is already
+	// admitted by the child while the VM firewall still blocks it from outside.
+	// The window ends when the old firewall is gone and the child is trimmed.
 	if len(existing.Spec.LoadBalancerSourceRanges) == 0 || len(desired.Spec.LoadBalancerSourceRanges) == 0 {
 		desired.Spec.LoadBalancerSourceRanges = nil
 	} else {
@@ -2546,6 +2554,8 @@ func (c *nodeLoadBalancerController) clearPublicNodeLocalActivation(ctx context.
 			annotationPublicNodeLocalTargetPool,
 			annotationPublicNodeLocalTargetPolicy,
 			annotationPublicNodeLocalActivePorts,
+			annotationPublicNodeLocalTargetSince,
+			annotationPublicNodeLocalPromotedAt,
 			annotationNodeLoadBalancerRebuilding,
 			annotationNodeLoadBalancerFirewallAssigning,
 			annotationNodeLoadBalancerFirewallAssignAt,

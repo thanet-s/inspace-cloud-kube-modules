@@ -2166,3 +2166,135 @@ func TestPublicNodeLocalActivePortsRoundTripAndBound(t *testing.T) {
 		t.Fatalf("an oversized record was kept: %d bytes", len(encoded))
 	}
 }
+
+func publicNodeLocalEventMessages(t *testing.T, f *publicNodeLocalTransientFixture, reason string) []string {
+	t.Helper()
+	events, err := f.provider.kubeClient.CoreV1().Events(f.service.Namespace).List(f.ctx, metav1.ListOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var messages []string
+	for _, event := range events.Items {
+		if event.Reason == reason && event.InvolvedObject.UID == f.service.UID {
+			messages = append(messages, event.Message)
+		}
+	}
+	return messages
+}
+
+// The TransitionPending Event of a union says how long the union has been open.
+func TestPublicNodeLocalPendingEventCarriesUnionAge(t *testing.T) {
+	f := newPublishedPublicNodeLocalFixtureN(t, 1)
+	now := time.Date(2026, 10, 28, 12, 0, 0, 0, time.UTC)
+	f.controller.publicNodeLocalNow = func() time.Time { return now }
+	updatePublicNodeLocalFixtureService(t, f, func(s *corev1.Service) { s.Annotations[annotationNodeLoadBalancerPool] = "empty-pool" })
+	for pass := 0; pass < 4; pass++ {
+		stepPublicNodeLocal(t, f, pass)
+	}
+	now = now.Add(3*time.Minute + 20*time.Second)
+	for pass := 0; pass < 3; pass++ {
+		stepPublicNodeLocal(t, f, pass)
+	}
+	found := false
+	for _, message := range publicNodeLocalEventMessages(t, f, "PublicNodeLocalTransitionPending") {
+		found = found || strings.Contains(message, "union age 3m")
+	}
+	if !found {
+		t.Fatalf("no TransitionPending Event with the union age: %v", publicNodeLocalEventMessages(t, f, "PublicNodeLocalTransitionPending"))
+	}
+}
+
+// The foreign-account Event is emitted once per state change, not every pass.
+func TestPublicNodeLocalForeignAccountEventIsEmittedOncePerStateChange(t *testing.T) {
+	f := newPublishedPublicNodeLocalFixtureN(t, 2)
+	f.api.vms[1].BillingAccountID = 99
+	kube := f.provider.kubeClient.(*kubefake.Clientset)
+	creates := 0
+	kube.PrependReactor("create", "events", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		if event, ok := action.(k8stesting.CreateAction).GetObject().(*corev1.Event); ok && event.Reason == publicNodeLocalReasonForeignAccountFirewall {
+			creates++
+		}
+		return false, nil, nil
+	})
+	for pass := 0; pass < 20; pass++ {
+		stepPublicNodeLocal(t, f, pass)
+	}
+	if creates != 1 {
+		t.Fatalf("the foreign-account Event was emitted %d times in 20 passes, want once", creates)
+	}
+}
+
+// While the narrowed old firewall is still attached after a promotion, an Event
+// says how long that has been going on.
+func TestPublicNodeLocalNarrowedOldFirewallEventCarriesAge(t *testing.T) {
+	f := newPublishedPublicNodeLocalFixtureWith(t, 1, shapePublicNodeLocalPorts(443, 80))
+	f.provider.api = &lagUnassignAPI{publicNodeLocalFilteringIPAPI: &publicNodeLocalFilteringIPAPI{fakeAPI: f.api}, skip: 1000}
+	now := time.Date(2026, 10, 28, 12, 0, 0, 0, time.UTC)
+	f.controller.publicNodeLocalNow = func() time.Time { return now }
+	setPublicNodeLocalFixturePorts(t, f, 443)
+	for pass := 0; pass < 60; pass++ {
+		stepPublicNodeLocal(t, f, pass)
+		current := f.current(t)
+		if current.Annotations[annotationNodeLoadBalancerPreviousFirewall] != "" && current.Annotations[annotationPublicNodeLocalTargetPolicy] == "" {
+			break
+		}
+	}
+	if f.current(t).Annotations[annotationNodeLoadBalancerPreviousFirewall] == "" {
+		t.Fatal("the change never promoted")
+	}
+	now = now.Add(7*time.Minute + 5*time.Second)
+	for pass := 0; pass < 4; pass++ {
+		stepPublicNodeLocal(t, f, pass)
+	}
+	found := false
+	for _, message := range publicNodeLocalEventMessages(t, f, "PublicNodeLocalOldFirewallAttached") {
+		found = found || strings.Contains(message, "7m")
+	}
+	if !found {
+		t.Fatalf("no Event with the age of the attached narrowed firewall: %v", publicNodeLocalEventMessages(t, f, "PublicNodeLocalOldFirewallAttached"))
+	}
+}
+
+// countingUnassignAPI never applies an unassign and counts the dispatches.
+type countingUnassignAPI struct {
+	*publicNodeLocalFilteringIPAPI
+	calls int
+}
+
+func (a *countingUnassignAPI) UnassignFirewallFromVM(context.Context, string, string, string) error {
+	a.calls++
+	return nil
+}
+
+// A parked detach of the narrowed old firewall is retried at the normal cadence:
+// detaching is the safe direction, so the 30 minute park does not apply to it.
+func TestPublicNodeLocalParkedOldFirewallDetachIsRetried(t *testing.T) {
+	f := newPublishedPublicNodeLocalFixtureWith(t, 1, shapePublicNodeLocalPorts(443, 80))
+	api := &countingUnassignAPI{publicNodeLocalFilteringIPAPI: &publicNodeLocalFilteringIPAPI{fakeAPI: f.api}}
+	f.provider.api = api
+	clock := time.Now().UTC()
+	f.controller.firewallRelationNow = func() time.Time { return clock }
+	f.controller.firewallRelationAbsentDelay = nodeLoadBalancerAbsenceConfirmationDelay
+	setPublicNodeLocalFixturePorts(t, f, 443)
+	parkedAt := -1
+	for pass := 0; pass < 120 && parkedAt < 0; pass++ {
+		stepPublicNodeLocal(t, f, pass)
+		for _, message := range publicNodeLocalEventMessages(t, f, "PublicNodeLocalFirewallRelationStuck") {
+			if message != "" {
+				parkedAt = pass
+			}
+		}
+		clock = clock.Add(nodeLoadBalancerFirewallRelationRetireDelay + time.Second)
+	}
+	if parkedAt < 0 {
+		t.Fatal("the detach never parked")
+	}
+	before := api.calls
+	// Less than the park time later (one retire interval), the detach is issued again.
+	for pass := 0; pass < 4; pass++ {
+		stepPublicNodeLocal(t, f, pass)
+	}
+	if api.calls <= before {
+		t.Fatalf("the parked detach of the old firewall was not retried (calls %d)", api.calls)
+	}
+}

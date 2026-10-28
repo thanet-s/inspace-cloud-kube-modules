@@ -136,6 +136,9 @@ type nodeLoadBalancerController struct {
 	// allGoneSince records, in memory only, when every published Node of a Service
 	// was first seen gone on cloud evidence alone. Guarded by endpointGoneMu.
 	allGoneSince map[string]time.Time
+	// foreignEventKey records, in memory only, the last foreign-account state
+	// that was announced per Service, so an unchanged state is announced once.
+	foreignEventKey map[string]string
 	// holds records, in memory only, the hold each Service is repeating.
 	holdMu sync.Mutex
 	holds  map[string]publicNodeLocalHold
@@ -5128,6 +5131,7 @@ func (c *nodeLoadBalancerController) cleanupPreviousFirewall(ctx context.Context
 			return false, errors.New("node load balancer: previous firewall identity changed during cleanup")
 		}
 		delete(copy.Annotations, annotationNodeLoadBalancerPreviousFirewall)
+		delete(copy.Annotations, annotationPublicNodeLocalPromotedAt)
 		return true, nil
 	})
 	return err
