@@ -82,7 +82,15 @@ func (c *nodeLoadBalancerController) syncPendingPublicNodeLocalTransition(
 		}
 	}
 
-	c.recordPublicNodeLocalEvent(ctx, service, publicNodeLocalReasonTransitionPending, cause)
+	reason := publicNodeLocalReasonTransitionPending
+	refusal, admitErr := c.publicNodeLocalTransitionAdmissible(ctx, service, intent)
+	if admitErr != nil {
+		return c.holdOrFailPublicNodeLocal(ctx, service, admitErr)
+	}
+	if refusal != nil {
+		reason, cause = publicNodeLocalReasonTransitionRefused, refusal
+	}
+	c.recordPublicNodeLocalEvent(ctx, service, reason, cause)
 	mode := publicNodeLocalPassPoolHeld
 	activeIntent := intent
 	activeDesired := desired
@@ -358,4 +366,75 @@ func publicNodeLocalTransition(service *corev1.Service) (publicNodeLocalTransiti
 		state.Phase = publicNodeLocalPhaseSteady
 	}
 	return state, nil
+}
+
+const publicNodeLocalReasonTransitionRefused = "PublicNodeLocalTransitionRefused"
+
+// publicNodeLocalTransitionAdmissible says whether a serving Service may start
+// a transition to the target intent. The target pool must not take a protocol
+// and port that a peer already serves there. Ports this Service already serves
+// in the same pool are not new claims. A refusal is returned as the first
+// value; an error means the answer could not be established.
+func (c *nodeLoadBalancerController) publicNodeLocalTransitionAdmissible(
+	ctx context.Context,
+	service *corev1.Service,
+	target nodeLoadBalancerIntent,
+) (refusal error, err error) {
+	claims := target.Ports
+	if service.Annotations[annotationPublicNodeLocalActivePool] == target.Pool {
+		child, readErr := c.readPublicNodeLocalDatapathHeld(ctx, service)
+		if readErr != nil {
+			return nil, readErr
+		}
+		if child != nil {
+			if served, claimErr := nodeLoadBalancerPortClaims(child); claimErr == nil {
+				servedSet := make(map[nodeLoadBalancerPortClaim]struct{}, len(served))
+				for _, claim := range served {
+					servedSet[claim] = struct{}{}
+				}
+				fresh := make([]nodeLoadBalancerPortClaim, 0, len(claims))
+				for _, claim := range claims {
+					if _, already := servedSet[claim]; !already {
+						fresh = append(fresh, claim)
+					}
+				}
+				claims = fresh
+			}
+		}
+	}
+	if len(claims) == 0 {
+		return nil, nil
+	}
+	newClaims := target
+	newClaims.Ports = claims
+	services, listErr := c.provider.kubeClient.CoreV1().Services("").List(ctx, metav1.ListOptions{})
+	if listErr != nil {
+		return nil, fmt.Errorf("public-node-local: list Services for transition admission: %w", listErr)
+	}
+	for index := range services.Items {
+		other := &services.Items[index]
+		if other.UID == service.UID || other.Spec.LoadBalancerClass == nil ||
+			*other.Spec.LoadBalancerClass != nodeLoadBalancerClass {
+			// Child datapath Services use their own class and are not peers.
+			continue
+		}
+		exposed, exposureErr := c.publicNodeLocalServiceStillExposed(ctx, other)
+		if exposureErr != nil {
+			return nil, exposureErr
+		}
+		if !exposed {
+			continue
+		}
+		blocks, blockErr := c.publicNodeLocalStaleExposureBlocks(ctx, other, newClaims)
+		if blockErr != nil {
+			return nil, blockErr
+		}
+		if blocks {
+			return fmt.Errorf(
+				"public-node-local: pool %s already serves a protocol/port claim of Service %s/%s that this Service would take; the transition is refused and the active exposure stays",
+				target.Pool, other.Namespace, other.Name,
+			), nil
+		}
+	}
+	return nil, nil
 }

@@ -1081,3 +1081,47 @@ func TestPublicNodeLocalChildRepairProceedsWhileAssignmentFenceIsUnresolved(t *t
 	}
 	t.Fatalf("the repair and the add never converged: %#v", observePublicNodeLocal(t, f))
 }
+
+// addPublicNodeLocalFixturePeer creates a serving peer Service in a pool.
+func addPublicNodeLocalFixturePeer(t *testing.T, f *publicNodeLocalTransientFixture, name, uid, pool string, port int32) *corev1.Service {
+	t.Helper()
+	peer := publicNodeLocalTestService(name, uid, pool, corev1.ProtocolTCP, port)
+	peer.Annotations[annotationPublicNodeLocalActivePool] = pool
+	peer.Annotations[annotationPublicNodeLocalActivePolicy] = "peer-policy"
+	peer.Finalizers = append(peer.Finalizers, publicNodeLocalFinalizer)
+	created, err := f.provider.kubeClient.CoreV1().Services(peer.Namespace).Create(f.ctx, peer, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	child := desiredPublicNodeLocalDatapath(created, pool)
+	if _, err := f.provider.kubeClient.CoreV1().Services(peer.Namespace).Create(f.ctx, child, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	return created
+}
+
+// A pool switch whose target pool would lose a port claim is refused before
+// anything is written.
+func TestPublicNodeLocalPoolSwitchRefusedWhenTargetPoolPortTaken(t *testing.T) {
+	f := newPublishedPublicNodeLocalFixtureN(t, 1)
+	addPublicNodeLocalFixturePeer(t, f, "peer", "peer-uid", "spe-relay-share", 443)
+	updatePublicNodeLocalFixtureService(t, f, func(s *corev1.Service) { s.Annotations[annotationNodeLoadBalancerPool] = "spe-relay-share" })
+	before := f.current(t)
+	for pass := 0; pass < 5; pass++ {
+		err := f.controller.syncPublicNodeLocal(f.ctx, f.key, f.current(t))
+		var holding *errPublicNodeLocalHolding
+		if !errors.As(err, &holding) {
+			t.Fatalf("pass %d: %v, want a hold", pass, err)
+		}
+	}
+	after := f.current(t)
+	for _, key := range []string{annotationPublicNodeLocalTargetPool, annotationPublicNodeLocalTargetPolicy} {
+		if after.Annotations[key] != "" {
+			t.Fatalf("the transition started despite the refusal: %s=%q", key, after.Annotations[key])
+		}
+	}
+	if !reflect.DeepEqual(after.Status, before.Status) || len(f.api.unassignedFirewalls) != 0 {
+		t.Fatalf("a refused switch changed the exposure: %#v", after.Status)
+	}
+	requirePublicNodeLocalEvent(t, f, "PublicNodeLocalTransitionRefused")
+}
