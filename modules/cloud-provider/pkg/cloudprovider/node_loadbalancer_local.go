@@ -123,6 +123,12 @@ func (c *nodeLoadBalancerController) syncPublicNodeLocalPass(
 	if activePool == "" && len(service.Status.LoadBalancer.Ingress) != 0 {
 		return c.holdOrFailPublicNodeLocal(ctx, service, errors.New("public-node-local: public status exists without persisted activation authorization"))
 	}
+	if cleared, clearErr := c.clearPublicNodeLocalRebuildConsumed(ctx, service); clearErr != nil || cleared {
+		if cleared {
+			c.requeuePublicNodeLocal(key)
+		}
+		return clearErr
+	}
 	if activePool != "" {
 		state, stateErr := publicNodeLocalTransition(service)
 		if stateErr != nil {
@@ -1436,15 +1442,29 @@ func (c *nodeLoadBalancerController) validateLivePublicNodeLocalServiceFirewall(
 			return &publicNodeLocalSiblingError{key: service.Namespace + "/" + service.Name, cause: cause}
 		}
 		intent, parseErr := parseNodeLoadBalancerService(service, nodeLoadBalancerDefaults{NodesPerShard: c.provider.config.NodeLoadBalancer.NodesPerShard})
+		// A sibling in a transition serves its active pool and its target pool.
+		servedPool := node.Labels[publicNodeLocalPoolLabel] == intent.Pool ||
+			(service.Annotations[annotationPublicNodeLocalActivePool] != "" &&
+				node.Labels[publicNodeLocalPoolLabel] == service.Annotations[annotationPublicNodeLocalActivePool]) ||
+			(service.Annotations[annotationPublicNodeLocalTargetPool] != "" &&
+				node.Labels[publicNodeLocalPoolLabel] == service.Annotations[annotationPublicNodeLocalTargetPool])
 		if parseErr != nil || service.DeletionTimestamp != nil || intent.Mode != nodeLoadBalancerModeLocal ||
-			!containsString(service.Finalizers, publicNodeLocalFinalizer) || node.Labels[publicNodeLocalPoolLabel] != intent.Pool {
+			!containsString(service.Finalizers, publicNodeLocalFinalizer) || !servedPool {
 			return siblingErr(errors.Join(parseErr, fmt.Errorf("public-node-local: firewall %s is not bound to a live valid local Service", firewall.UUID)))
 		}
 		desired, desiredErr := c.desiredServiceFirewall(service)
-		if desiredErr != nil || service.Annotations[annotationNodeLoadBalancerFirewallUUID] != firewall.UUID ||
+		previousHash, previousHashErr := nodeLoadBalancerFirewallSpecHash(firewall.Rules)
+		// During a policy transition the old firewall is the previous one in the
+		// ledger and carries the active policy.
+		isPrevious := service.Annotations[annotationNodeLoadBalancerPreviousFirewall] == firewall.UUID &&
+			previousHashErr == nil && previousHash == service.Annotations[annotationPublicNodeLocalActivePolicy]
+		if !isPrevious && (desiredErr != nil || service.Annotations[annotationNodeLoadBalancerFirewallUUID] != firewall.UUID ||
 			service.Annotations[annotationNodeLoadBalancerFirewallHash] != desired.Hash ||
-			!nodeLoadBalancerFirewallMatches(firewall, desired) {
+			!nodeLoadBalancerFirewallMatches(firewall, desired)) {
 			return siblingErr(errors.Join(desiredErr, fmt.Errorf("public-node-local: firewall %s lost its exact live Service ledger", firewall.UUID)))
+		}
+		if isPrevious {
+			desired.Hash = previousHash
 		}
 		readyNodes, endpointErr := c.publicNodeLocalReadyEndpointNodes(service)
 		if endpointErr != nil {
@@ -1478,9 +1498,12 @@ func (c *nodeLoadBalancerController) validateLivePublicNodeLocalServiceFirewall(
 				publicAdvertised = true
 			}
 		}
-		active := publicAdvertised &&
-			service.Annotations[annotationPublicNodeLocalActivePool] == intent.Pool &&
-			service.Annotations[annotationPublicNodeLocalActivePolicy] == desired.Hash
+		servedPolicy := desired.Hash == service.Annotations[annotationPublicNodeLocalActivePolicy] ||
+			(service.Annotations[annotationPublicNodeLocalTargetPolicy] != "" &&
+				desired.Hash == service.Annotations[annotationPublicNodeLocalTargetPolicy])
+		active := publicAdvertised && servedPolicy &&
+			(service.Annotations[annotationPublicNodeLocalActivePool] == intent.Pool ||
+				service.Annotations[annotationPublicNodeLocalActivePool] == node.Labels[publicNodeLocalPoolLabel])
 		staged := false
 		if service.Annotations[annotationNodeLoadBalancerFirewallAssigning] == firewall.UUID &&
 			service.Annotations[annotationPublicNodeLocalAssignPolicy] == desired.Hash {

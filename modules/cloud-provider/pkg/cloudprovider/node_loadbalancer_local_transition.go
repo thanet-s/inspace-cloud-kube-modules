@@ -68,9 +68,13 @@ func (c *nodeLoadBalancerController) syncPendingPublicNodeLocalTransition(
 		intent.Pool, desired.Hash, activePool, activePolicy,
 	)
 
-	if strings.TrimSpace(service.Annotations[annotationNodeLoadBalancerAllowRebuild]) == "true" {
+	allowed, allowErr := c.consumePublicNodeLocalRebuildAllowance(ctx, service, intent, desired)
+	if allowErr != nil {
+		return c.holdOrFailPublicNodeLocal(ctx, service, allowErr)
+	}
+	if allowed {
 		c.recordPublicNodeLocalEvent(ctx, service, publicNodeLocalReasonRebuildAllowed, fmt.Errorf(
-			"public-node-local: %s=true permits a withdraw and rebuild for this change: %w", annotationNodeLoadBalancerAllowRebuild, cause))
+			"public-node-local: %s permits one withdraw and rebuild for this change: %w", annotationNodeLoadBalancerAllowRebuild, cause))
 		return c.withdrawAndRequeuePublicNodeLocal(ctx, key, service)
 	}
 
@@ -117,6 +121,61 @@ func (c *nodeLoadBalancerController) holdPendingPublicNodeLocalTransition(ctx co
 	c.recordPublicNodeLocalEvent(ctx, service, publicNodeLocalReasonTransitionPending, cause)
 	retryAfter, _ := c.nextPublicNodeLocalHoldDelay(string(service.UID), cause)
 	return &errPublicNodeLocalHolding{cause: cause, retryAfter: retryAfter}
+}
+
+// consumePublicNodeLocalRebuildAllowance decides whether the operator escape
+// hatch applies to this target, and records the use before anything is
+// withdrawn. "true" is honoured while nothing was consumed; a value equal to the
+// target policy hash is honoured for that target only. Either way one target
+// is never rebuilt twice, and a later change needs a new, deliberate value.
+func (c *nodeLoadBalancerController) consumePublicNodeLocalRebuildAllowance(
+	ctx context.Context,
+	service *corev1.Service,
+	intent nodeLoadBalancerIntent,
+	desired desiredNodeLoadBalancerFirewall,
+) (bool, error) {
+	raw := strings.TrimSpace(service.Annotations[annotationNodeLoadBalancerAllowRebuild])
+	if raw == "" {
+		return false, nil
+	}
+	target := intent.Pool + "/" + desired.Hash
+	consumed := service.Annotations[annotationNodeLoadBalancerAllowRebuildConsumed]
+	switch {
+	case raw == desired.Hash && consumed != target:
+	case raw == "true" && consumed == "":
+	default:
+		return false, nil
+	}
+	_, _, err := c.updateExactParentService(ctx, service, func(copy *corev1.Service) (bool, error) {
+		if copy.Annotations[annotationNodeLoadBalancerAllowRebuild] != raw ||
+			copy.Annotations[annotationNodeLoadBalancerAllowRebuildConsumed] != consumed {
+			return false, errors.New("public-node-local: the escape hatch changed before it was consumed")
+		}
+		copy.Annotations[annotationNodeLoadBalancerAllowRebuildConsumed] = target
+		return true, nil
+	})
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// clearPublicNodeLocalRebuildConsumed forgets the consumed target once the
+// operator removed the annotation, so a later deliberate use counts again.
+func (c *nodeLoadBalancerController) clearPublicNodeLocalRebuildConsumed(ctx context.Context, service *corev1.Service) (bool, error) {
+	if service.Annotations[annotationNodeLoadBalancerAllowRebuild] != "" ||
+		service.Annotations[annotationNodeLoadBalancerAllowRebuildConsumed] == "" {
+		return false, nil
+	}
+	_, changed, err := c.updateExactParentService(ctx, service, func(copy *corev1.Service) (bool, error) {
+		if copy.Annotations[annotationNodeLoadBalancerAllowRebuild] != "" ||
+			copy.Annotations[annotationNodeLoadBalancerAllowRebuildConsumed] == "" {
+			return false, nil
+		}
+		delete(copy.Annotations, annotationNodeLoadBalancerAllowRebuildConsumed)
+		return true, nil
+	})
+	return changed, err
 }
 
 func (c *nodeLoadBalancerController) recordPublicNodeLocalEvent(ctx context.Context, service *corev1.Service, reason string, cause error) {

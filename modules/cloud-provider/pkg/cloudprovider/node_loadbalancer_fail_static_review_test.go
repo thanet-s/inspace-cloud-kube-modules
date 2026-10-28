@@ -1811,3 +1811,72 @@ func TestPublicNodeLocalUnionRecreatesMissingChildWithOldPorts(t *testing.T) {
 	deletePublicNodeLocalFixtureChild(t, f)
 	requireChildAndVIPsRestored(t, f, 2, 443, 8443)
 }
+
+// The escape hatch is single use: "true" is honoured for one target and the
+// controller records it as consumed, so a manifest that keeps the annotation
+// cannot replay a rebuild on a later change.
+func TestPublicNodeLocalAllowRebuildIsSingleUse(t *testing.T) {
+	f := newPublishedPublicNodeLocalFixtureN(t, 1)
+	oldHash := f.current(t).Annotations[annotationPublicNodeLocalActivePolicy]
+	setPublicNodeLocalFixturePorts(t, f, 443, 8443)
+	updatePublicNodeLocalFixtureService(t, f, func(s *corev1.Service) { s.Annotations[annotationNodeLoadBalancerAllowRebuild] = "true" })
+	reconcileUntilRepublished(t, f, 1, 80)
+	current := f.current(t)
+	if current.Annotations[annotationPublicNodeLocalActivePolicy] == oldHash || len(f.api.unassignedFirewalls) == 0 {
+		t.Fatalf("the first change was not rebuilt: %#v", current.Annotations)
+	}
+	desired, err := f.controller.desiredServiceFirewall(current)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := f.current(t).Annotations[annotationPublicNodeLocalActivePool] + "/" + desired.Hash; current.Annotations[annotationNodeLoadBalancerAllowRebuildConsumed] != want {
+		t.Fatalf("consumed marker = %q, want %q", current.Annotations[annotationNodeLoadBalancerAllowRebuildConsumed], want)
+	}
+	// The manifest still says "true". The next change runs in place.
+	unassigned := len(f.api.unassignedFirewalls)
+	old := f.current(t).Annotations[annotationNodeLoadBalancerFirewallUUID]
+	setPublicNodeLocalFixturePorts(t, f, 443)
+	runPolicyChange(t, f, 1, policyChangeWatch{oldFirewall: old, oldPorts: []int32{443, 8443}, newPorts: []int32{443}}, nil)
+	if len(f.api.unassignedFirewalls) == unassigned {
+		t.Fatal("the old firewall of the second change was never detached")
+	}
+	// Removing the annotation resets the marker; the next "true" counts again.
+	updatePublicNodeLocalFixtureService(t, f, func(s *corev1.Service) { delete(s.Annotations, annotationNodeLoadBalancerAllowRebuild) })
+	stepPublicNodeLocal(t, f, 0)
+	if got := f.current(t).Annotations[annotationNodeLoadBalancerAllowRebuildConsumed]; got != "" {
+		t.Fatalf("the consumed marker survived the annotation: %q", got)
+	}
+}
+
+// A value equal to the target policy hash permits that one target only.
+func TestPublicNodeLocalAllowRebuildByTargetHashIsKeyedToTheTarget(t *testing.T) {
+	f := newPublishedPublicNodeLocalFixtureN(t, 1)
+	setPublicNodeLocalFixturePorts(t, f, 443, 8443)
+	desiredOther, err := f.controller.desiredServiceFirewall(f.current(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The annotation names a different target: it is not honoured.
+	updatePublicNodeLocalFixtureService(t, f, func(s *corev1.Service) { s.Annotations[annotationNodeLoadBalancerAllowRebuild] = "deadbeef" })
+	old := f.current(t).Annotations[annotationNodeLoadBalancerFirewallUUID]
+	runPolicyChange(t, f, 1, policyChangeWatch{oldFirewall: old, oldPorts: []int32{443}, newPorts: []int32{443, 8443}}, nil)
+	if f.current(t).Annotations[annotationNodeLoadBalancerAllowRebuildConsumed] != "" {
+		t.Fatal("a value for another target was consumed")
+	}
+	// Now the annotation names the next target.
+	oldHash := f.current(t).Annotations[annotationPublicNodeLocalActivePolicy]
+	if oldHash != desiredOther.Hash {
+		t.Fatalf("unexpected policy %q", oldHash)
+	}
+	setPublicNodeLocalFixturePorts(t, f, 443)
+	next, err := f.controller.desiredServiceFirewall(f.current(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	updatePublicNodeLocalFixtureService(t, f, func(s *corev1.Service) { s.Annotations[annotationNodeLoadBalancerAllowRebuild] = next.Hash })
+	unassigned := len(f.api.unassignedFirewalls)
+	reconcileUntilRepublished(t, f, 1, 80)
+	if len(f.api.unassignedFirewalls) == unassigned {
+		t.Fatal("the named target was not rebuilt")
+	}
+}

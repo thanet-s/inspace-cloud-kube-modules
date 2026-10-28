@@ -22,11 +22,19 @@ const (
 	annotationNodeLoadBalancerMode = "service.inspace.cloud/node-lb-mode"
 	annotationNodeLoadBalancerPool = "service.inspace.cloud/node-lb-pool"
 	// annotationNodeLoadBalancerAllowRebuild is an operator escape hatch for a
-	// public-node-local Service. "true" lets the controller withdraw the serving
+	// public-node-local Service. It lets the controller withdraw the serving
 	// exposure and rebuild it when the pool or the firewall policy changes, which
-	// is a short outage. Without it a pool change and a policy widening keep
-	// serving the active exposure until a make-before-break transition exists.
-	annotationNodeLoadBalancerAllowRebuild  = "service.inspace.cloud/node-lb-allow-rebuild"
+	// is a short outage. Without it every change runs in place (make-before-break).
+	// It is single use. The value "true" is honoured for one target only: the
+	// controller records the consumed target in annotationNodeLoadBalancerAllowRebuildConsumed,
+	// and "true" is not honoured again until the annotation is removed. A value
+	// that equals the target firewall policy hash permits exactly that target.
+	// A manifest that keeps the annotation therefore cannot replay a rebuild on a
+	// later change.
+	annotationNodeLoadBalancerAllowRebuild = "service.inspace.cloud/node-lb-allow-rebuild"
+	// annotationNodeLoadBalancerAllowRebuildConsumed is "<pool>/<policy hash>" of
+	// the target that the escape hatch was used for.
+	annotationNodeLoadBalancerAllowRebuildConsumed = "service.inspace.cloud/node-lb-allow-rebuild-consumed"
 	annotationNodeLoadBalancerNodesPerShard = "service.inspace.cloud/node-lb-nodes-per-shard"
 	annotationNodeLoadBalancerCPU           = "service.inspace.cloud/node-lb-cpu"
 	annotationNodeLoadBalancerMemory        = "service.inspace.cloud/node-lb-memory"

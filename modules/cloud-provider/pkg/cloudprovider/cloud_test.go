@@ -1654,6 +1654,7 @@ type fakeAPI struct {
 	unassignedIPs                  []string
 	deletedIPs                     []string
 	createdFirewalls               []inspace.CreateFirewallRequest
+	firewallSequence               int
 	createFirewallErr              error
 	updatedFirewalls               []inspace.UpdateFirewallRequest
 	updateFirewallErr              error
@@ -1902,8 +1903,11 @@ func (f *fakeAPI) CreateFirewall(_ context.Context, _ string, request inspace.Cr
 			rules[index].UUID = fmt.Sprintf("10000000-0000-4000-8000-%012d", index+1)
 		}
 	}
+	// The sequence never goes back, so a firewall created after another one was
+	// deleted does not reuse its UUID.
+	f.firewallSequence = max(f.firewallSequence+1, len(f.firewalls)+1)
 	item := inspace.Firewall{
-		UUID:        fmt.Sprintf("00000000-0000-4000-8000-%012d", len(f.firewalls)+1),
+		UUID:        fmt.Sprintf("00000000-0000-4000-8000-%012d", f.firewallSequence),
 		DisplayName: request.DisplayName, Description: request.Description,
 		BillingAccountID: request.BillingAccountID, Rules: rules,
 	}

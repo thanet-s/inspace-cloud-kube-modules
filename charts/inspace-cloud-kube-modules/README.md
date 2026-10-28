@@ -300,19 +300,30 @@ not let two Cilium Services program the same node frontend.
 
 A serving `public-node-local` Service keeps serving while its spec changes, and
 nodes that are verifiably gone, excluded or without an endpoint still leave the
-edge one at a time. A change of `service.inspace.cloud/node-lb-pool`, or of the
-ports or `loadBalancerSourceRanges` that widens the exposed set, is held:
-CCM keeps the active exposure, emits `PublicNodeLocalTransitionPending`, and
-retries with a growing delay. While the change is held, no node is added when
-the policy differs (a pool-only change still adds nodes under the active pool).
-A strict narrowing (fewer ports, or source ranges that are a subset of the
-active ones) only removes exposure, so CCM applies it promptly by rebuilding
-the edge under the narrower policy and emits `PublicNodeLocalPolicyNarrowed`.
-To apply a held change anyway, accepting the short outage of the old
-withdraw-and-rebuild behavior, annotate the Service with
-`service.inspace.cloud/node-lb-allow-rebuild: "true"`. CCM then emits
-`PublicNodeLocalRebuildAllowed` and rebuilds. Remove the annotation afterwards,
-because it applies to every later pool or policy change as well.
+edge one at a time. A change of `service.inspace.cloud/node-lb-pool`, of the
+ports, or of `loadBalancerSourceRanges` (narrowing, widening or both) is applied
+in place, make-before-break, on the same Service, and the edge is never empty:
+CCM records the target pool and policy next to the active ones, serves the union
+of both, and promotes the target only when every target node is on the edge.
+For a pool switch, the target nodes get their child VIP, firewall and FIP first,
+and the old pool's nodes then leave in the usual order (FIP, firewall, VIP). For
+a policy change, CCM creates the second firewall, attaches it to the VMs next to
+the old one, promotes, then detaches and deletes the old firewall. The old
+firewall stays attached only until the new one is attached and read back, and
+the child Service keeps the union of the old and new ports and source ranges
+until the old firewall is gone, so no port closes before its firewall does. A
+change back to the active identity, or on to a third one, ends the transition
+first. If the target pool would take a protocol and port that a peer already
+serves, the change is refused with `PublicNodeLocalTransitionRefused` and the
+active exposure stays. While the target pool has no node that is Ready and has a
+local endpoint, the change waits with `PublicNodeLocalTransitionPending`.
+To apply a change by the old withdraw-and-rebuild instead, accepting the short
+outage, annotate the Service with `service.inspace.cloud/node-lb-allow-rebuild`.
+The value `true` is honoured once: CCM records the target it was used for in
+`service.inspace.cloud/node-lb-allow-rebuild-consumed` and emits
+`PublicNodeLocalRebuildAllowed`; a later change needs the annotation removed and
+set again. A value equal to the target firewall policy hash permits exactly that
+target. A manifest that keeps the annotation therefore cannot replay a rebuild.
 
 The generic public-NLB path remains an explicit, paid, TCP-only InSpace NLB. A
 Service using that path deliberately leaves `loadBalancerClass` unset for
