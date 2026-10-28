@@ -283,9 +283,11 @@ VM's firewalls back from the API, counts every one of them (not only its own)
 and refuses an attachment that would exceed `ccm.nodeLoadBalancer.maxFirewallsPerVM`
 (default `3`, range 1-10). The base node firewall counts, so a
 node has room for two Service firewalls by default. A refusal attaches nothing
-and keeps the existing exposure; the node is not added for that Service, CCM
-raises a `FirewallLimitExceeded` Warning Event on the Service and retries with
-capped backoff.
+and keeps the existing exposure; the node is not added for that Service. CCM
+raises a `FirewallLimitExceeded` Warning Event on the Service (shard, ICMP and
+other non-Service owners only log a warning) and retries with the capped hold
+backoff. The limit covers CCM attachments only: Karpenter and the cluster
+controller attach the base firewall to a new VM unguarded.
 
 For the Cilium datapath, CCM owns a same-namespace
 `inlb-dp-<service-identity>` child Service. It has

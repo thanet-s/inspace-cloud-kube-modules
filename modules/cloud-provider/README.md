@@ -717,11 +717,18 @@ below `1` as `3`). A
 firewall that is already attached does not add to the count. If the readback
 fails, the attachment is refused and retried.
 
-A refusal attaches nothing and is not a verified intent, so the Service keeps
-its last known good exposure (see fail-static above). The node is simply not
-added for that Service. The CCM logs the refusal, raises a `FirewallLimitExceeded`
-Warning Event on the Service with the VM, the current count and the limit, and
-retries with the normal capped backoff. Free a slot by removing a firewall from
+A refusal attaches nothing, persists nothing (no relation receipt and no
+Service update, so it does not re-enqueue itself) and is not a verified intent,
+so the Service keeps its last known good exposure (see fail-static above). The
+node is simply not added for that Service. The CCM logs the refusal and, for a
+per-Service firewall, raises a `FirewallLimitExceeded` Warning Event on the
+Service with the VM, the current count and the limit. Shard, aggregate, cluster
+ICMP and NodePool owners have no Service to attach an Event to and only log a
+warning. A `public-node-local` Service retries with the capped hold backoff (a
+repeating hold backs off up to 5 minutes); the shard and ICMP paths skip the
+VM at the limit, still attach the other VMs and report the shard not ready until
+the next pass. Acknowledged attachments are also remembered for two minutes, so
+a listing that lags behind cannot let a second firewall through. Free a slot by removing a firewall from
 that VM (for example by reducing the number of `public-node-local` Services on
 the node) or by raising the limit if you know your VMs tolerate it. Every
 firewall attach and detach is logged at info level with the Service, VM UUID
@@ -911,8 +918,9 @@ edge nodes, then requires an exact zero-owned-resource cloud audit.
 - A VM can carry at most three firewalls (configurable) before InSpace drops its
   new outbound connections, so one node can serve only a limited number of
   `public-node-local` Services. See [Per-VM firewall limit](#per-vm-firewall-limit).
-  The limit guards the CCM only; firewalls attached by the cluster controller
-  at VM creation or by hand are counted but not prevented.
+  The limit guards CCM attachments only. Karpenter and the cluster controller
+  attach the base firewall to a new VM unguarded, and firewalls attached by
+  hand are counted but not prevented.
 - The bootstrap binary consumes a YAML file; it does not yet watch the CRD,
   resolve Secret references through a Kubernetes management cluster, or use a
   Kubernetes finalizer. Lifecycle is explicit CLI reconciliation and owned
