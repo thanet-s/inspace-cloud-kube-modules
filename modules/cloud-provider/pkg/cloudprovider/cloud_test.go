@@ -181,11 +181,11 @@ func TestInstanceExistsOnlyNormalizesExactVMAbsence(t *testing.T) {
 			name: "corroborated exact GetVM 404 is absence",
 			api: &resolvedVMReadErrorAPI{
 				fakeAPI: &fakeAPI{network: &inspace.Network{
-					UUID: testNetworkUUID, VMUUIDs: []string{},
+					UUID: testNetworkUUID, VMUUIDs: []string{"99999999-1111-4222-8333-444444444444"},
 				}},
 				getErr:       notFound("/v1/bkk01/user-resource/vm"),
 				overrideList: true,
-				listResponse: []inspace.VM{},
+				listResponse: []inspace.VM{{UUID: "99999999-1111-4222-8333-444444444444"}},
 			},
 			node: &corev1.Node{Spec: corev1.NodeSpec{ProviderID: "inspace://bkk01/" + testVMUUID}},
 		},
@@ -261,8 +261,8 @@ func TestInstanceExistsCorroboratesProviderIDExactVMAbsence(t *testing.T) {
 		},
 		{
 			name:   "bound HTTP 400 with independent omissions",
-			getErr: boundMissingVM, listResponse: []inspace.VM{},
-			network:    &inspace.Network{UUID: testNetworkUUID, VMUUIDs: []string{}},
+			getErr: boundMissingVM, listResponse: []inspace.VM{otherVM},
+			network:    &inspace.Network{UUID: testNetworkUUID, VMUUIDs: []string{otherVM.UUID}},
 			wantAbsent: true,
 		},
 		{

@@ -92,6 +92,12 @@ const (
 	// emptyTargetSetGrace is how long an empty desired set keeps the last known
 	// good targets before targets whose VM is provably gone may be removed.
 	emptyTargetSetGrace = 15 * time.Minute
+	// addressShrinkGrace is how long InstanceMetadata holds a node's last
+	// ExternalIP when the floating-IP list comes back empty.
+	addressShrinkGrace = 5 * time.Minute
+	// absenceVerdictWindow is the span in which absent-VM verdicts are counted
+	// against the cluster-wide guard.
+	absenceVerdictWindow = 5 * time.Minute
 	// standardNLBRemovalRetryDelay is the fixed requeue for a durably pending
 	// removal. Resolution needs spaced readbacks, not exponential backoff that
 	// could stretch a Service deletion to the controller's five-minute ceiling.
@@ -210,6 +216,12 @@ type Provider struct {
 	// replaces every per-operation deadline. Production leaves it zero. It does
 	// not shorten the retire delay, which stays tied to the real deadlines.
 	standardNLBMutationTimeout time.Duration
+	// Node lifecycle memory: first empty-evidence absence per VM, absence
+	// verdicts inside the guard window, and first empty ExternalIP per Node.
+	lifecycleMu        sync.Mutex
+	emptyEvidenceSince map[string]time.Time
+	absenceVerdicts    map[string]time.Time
+	addressShrinkSince map[string]time.Time
 	// standardNLBEvents is optional; unit tests leave it nil.
 	standardNLBEvents record.EventRecorder
 }
@@ -222,6 +234,9 @@ type exactVMReadAbsenceError struct {
 	location string
 	uuid     string
 	cause    error
+	// tombstone marks a positive HTTP-200 "deleted" record, which is stronger
+	// evidence than an exact 404 and needs no second read.
+	tombstone bool
 }
 
 func (e *exactVMReadAbsenceError) Error() string {
@@ -418,8 +433,11 @@ func (p *Provider) InstanceExists(ctx context.Context, node *corev1.Node) (bool,
 	_, err := p.resolveVM(ctx, node)
 	var exactAbsence *exactVMReadAbsenceError
 	if errors.As(err, &exactAbsence) {
-		if corroborationErr := p.corroborateExactVMAbsence(ctx, exactAbsence.location, exactAbsence.uuid); corroborationErr != nil {
+		if corroborationErr := p.corroborateExactVMAbsence(ctx, exactAbsence.location, exactAbsence.uuid, exactAbsence.tombstone); corroborationErr != nil {
 			return false, corroborationErr
+		}
+		if guardErr := p.guardMassAbsence(ctx, node, exactAbsence.uuid); guardErr != nil {
+			return false, guardErr
 		}
 		return false, nil
 	}
@@ -465,12 +483,19 @@ func (p *Provider) InstanceMetadata(ctx context.Context, node *corev1.Node) (*cl
 	if err != nil {
 		return nil, err
 	}
-	addresses := make([]corev1.NodeAddress, 0, 4)
-	if vm.PrivateIPv4 != "" {
-		addresses = append(addresses, corev1.NodeAddress{Type: corev1.NodeInternalIP, Address: vm.PrivateIPv4})
+	// An empty private address is a wrong-but-200 answer, not a node without an
+	// InternalIP: publishing it would drop the InternalIP and break Cilium.
+	// Erroring makes cloud-node keep the last good addresses.
+	if vm.PrivateIPv4 == "" {
+		return nil, fmt.Errorf("cloudprovider: VM %s has no private IPv4 address in the InSpace answer; keeping the node's last addresses", vm.UUID)
 	}
+	addresses := make([]corev1.NodeAddress, 0, 4)
+	addresses = append(addresses, corev1.NodeAddress{Type: corev1.NodeInternalIP, Address: vm.PrivateIPv4})
 	externalIPv4, err := p.externalIPv4ForVM(ctx, location, vm)
 	if err != nil {
+		return nil, err
+	}
+	if err := p.holdExternalAddress(node, externalIPv4); err != nil {
 		return nil, err
 	}
 	if externalIPv4 != "" {
@@ -511,6 +536,41 @@ func instanceTypeForVM(vm *inspace.VM) string {
 		return fallback
 	}
 	return record.InstanceType
+}
+
+// holdExternalAddress keeps a node's last ExternalIP while the floating-IP list
+// answers empty, for addressShrinkGrace. A real unassignment shows up as a
+// persistent empty answer and is then accepted.
+func (p *Provider) holdExternalAddress(node *corev1.Node, externalIPv4 string) error {
+	p.lifecycleMu.Lock()
+	defer p.lifecycleMu.Unlock()
+	if externalIPv4 != "" {
+		delete(p.addressShrinkSince, node.Name)
+		return nil
+	}
+	hasExternal := false
+	for _, address := range node.Status.Addresses {
+		if address.Type == corev1.NodeExternalIP && net.ParseIP(address.Address) != nil && !strings.Contains(address.Address, ":") {
+			hasExternal = true
+		}
+	}
+	if !hasExternal {
+		delete(p.addressShrinkSince, node.Name)
+		return nil
+	}
+	if p.addressShrinkSince == nil {
+		p.addressShrinkSince = map[string]time.Time{}
+	}
+	now := p.standardNLBTime()
+	first, seen := p.addressShrinkSince[node.Name]
+	if !seen {
+		p.addressShrinkSince[node.Name] = now
+		first = now
+	}
+	if now.Before(first.Add(addressShrinkGrace)) {
+		return fmt.Errorf("cloudprovider: no floating IPv4 is listed for node %s that already has an ExternalIP; holding it for %s before accepting the change", node.Name, addressShrinkGrace)
+	}
+	return nil
 }
 
 func (p *Provider) externalIPv4ForVM(ctx context.Context, location string, vm *inspace.VM) (string, error) {
@@ -580,9 +640,10 @@ func (p *Provider) resolveVM(ctx context.Context, node *corev1.Node) (*inspace.V
 		}
 		if strings.EqualFold(strings.TrimSpace(vm.Status), "deleted") {
 			return nil, &exactVMReadAbsenceError{
-				location: id.Location,
-				uuid:     id.UUID,
-				cause:    errors.New("HTTP-200 VM detail is a deleted tombstone"),
+				location:  id.Location,
+				uuid:      id.UUID,
+				cause:     errors.New("HTTP-200 VM detail is a deleted tombstone"),
+				tombstone: true,
 			}
 		}
 		return vm, nil
@@ -631,7 +692,72 @@ func (p *Provider) resolveVM(ctx context.Context, node *corev1.Node) (*inspace.V
 	return vm, nil
 }
 
-func (p *Provider) corroborateExactVMAbsence(ctx context.Context, location, vmUUID string) error {
+// requireSpacedAbsence is the second leg of proof when the inventory or the VPC
+// membership is empty: an empty list is also what an API anomaly or a backend
+// failover looks like, so it only counts when the same VM is seen absent again
+// at least the convergence delay later.
+func (p *Provider) requireSpacedAbsence(vmUUID string) error {
+	p.lifecycleMu.Lock()
+	defer p.lifecycleMu.Unlock()
+	if p.emptyEvidenceSince == nil {
+		p.emptyEvidenceSince = map[string]time.Time{}
+	}
+	now := p.standardNLBTime()
+	first, seen := p.emptyEvidenceSince[vmUUID]
+	if !seen {
+		p.emptyEvidenceSince[vmUUID] = now
+		return fmt.Errorf("cloudprovider: exact VM %s read is absent but the VM inventory or VPC membership is empty; need a second spaced read before declaring it gone", vmUUID)
+	}
+	if now.Before(first.Add(standardNLBRemovalAbsenceDelay)) {
+		return fmt.Errorf("cloudprovider: exact VM %s absence is not yet confirmed by a spaced second read", vmUUID)
+	}
+	return nil
+}
+
+func (p *Provider) clearSpacedAbsence(vmUUID string) {
+	p.lifecycleMu.Lock()
+	delete(p.emptyEvidenceSince, vmUUID)
+	p.lifecycleMu.Unlock()
+}
+
+// guardMassAbsence refuses to declare more than half of the cluster's nodes
+// gone inside one window. cloud-node-lifecycle deletes a Node on a single false
+// answer, so a wrong-but-consistent API view would otherwise empty the cluster.
+func (p *Provider) guardMassAbsence(ctx context.Context, node *corev1.Node, vmUUID string) error {
+	if p.kubeClient == nil {
+		return nil
+	}
+	nodes, err := p.kubeClient.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return fmt.Errorf("cloudprovider: count Nodes before declaring VM %s gone: %w", vmUUID, err)
+	}
+	total := len(nodes.Items)
+	now := p.standardNLBTime()
+	p.lifecycleMu.Lock()
+	if p.absenceVerdicts == nil {
+		p.absenceVerdicts = map[string]time.Time{}
+	}
+	for uuid, at := range p.absenceVerdicts {
+		if now.Sub(at) > absenceVerdictWindow {
+			delete(p.absenceVerdicts, uuid)
+		}
+	}
+	p.absenceVerdicts[vmUUID] = now
+	gone := len(p.absenceVerdicts)
+	p.lifecycleMu.Unlock()
+	if total >= 2 && gone*2 > total {
+		klog.Warningf("refusing to declare VM %s gone: %d of %d nodes would be gone within %s", vmUUID, gone, total, absenceVerdictWindow)
+		if p.standardNLBEvents != nil && node != nil {
+			p.standardNLBEvents.Eventf(node, corev1.EventTypeWarning, "MassNodeAbsenceRefused",
+				"%d of %d nodes would be declared gone within %s; refusing to delete Node objects. Check the InSpace API view, then delete Nodes by hand if they are really gone",
+				gone, total, absenceVerdictWindow)
+		}
+		return fmt.Errorf("cloudprovider: refusing to declare VM %s gone: more than half of the nodes (%d of %d) would be gone within %s", vmUUID, gone, total, absenceVerdictWindow)
+	}
+	return nil
+}
+
+func (p *Provider) corroborateExactVMAbsence(ctx context.Context, location, vmUUID string, tombstone bool) error {
 	vms, err := p.api.ListVMs(ctx, location)
 	if err != nil {
 		return fmt.Errorf("cloudprovider: corroborate exact VM %s absence with VM inventory: %w", vmUUID, err)
@@ -686,6 +812,10 @@ func (p *Provider) corroborateExactVMAbsence(ctx context.Context, location, vmUU
 	if _, present := members[strings.ToLower(vmUUID)]; present {
 		return fmt.Errorf("cloudprovider: exact VM %s read is absent but configured VPC still contains it", vmUUID)
 	}
+	if !tombstone && (len(vms) == 0 || len(members) == 0) {
+		return p.requireSpacedAbsence(vmUUID)
+	}
+	p.clearSpacedAbsence(vmUUID)
 	return nil
 }
 
