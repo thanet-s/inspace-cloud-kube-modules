@@ -850,7 +850,7 @@ deleted Service while its Gateway exists.
 
 ## Development and verification
 
-Requires Go 1.27.2.
+Requires Go 1.27.3.
 
 ```sh
 make test
