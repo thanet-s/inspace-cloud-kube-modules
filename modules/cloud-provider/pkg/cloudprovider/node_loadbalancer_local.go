@@ -154,12 +154,8 @@ func (c *nodeLoadBalancerController) syncPublicNodeLocalPass(
 		return err
 	}
 	if winnerWaiting {
-		if activePool != "" {
-			// This Service keeps its own claim; the peer that still exposes an
-			// overlapping port has to clean up, not this serving Service.
-			return c.holdOrFailPublicNodeLocal(ctx, service, errors.New(
-				"public-node-local: a peer still exposes an overlapping protocol/port claim in the pool"))
-		}
+		// A serving Service never reaches the bootstrap, so it keeps its own claim
+		// in convergeActivePublicNodeLocal. Here nothing is serving yet.
 		if err := c.withdrawPublicNodeLocal(ctx, service); err != nil {
 			return err
 		}
@@ -208,9 +204,6 @@ func (c *nodeLoadBalancerController) syncPublicNodeLocalPass(
 		return c.holdOrFailPublicNodeLocal(ctx, service, err)
 	}
 	if waiting {
-		if activePool != "" {
-			return c.holdOrFailPublicNodeLocal(ctx, service, errors.New("public-node-local: active Service firewall is not authoritatively ready"))
-		}
 		c.requeuePublicNodeLocal(key)
 		return nil
 	}
@@ -269,7 +262,7 @@ func (c *nodeLoadBalancerController) syncPublicNodeLocalPass(
 	if assignmentFencePresent && service.Annotations[annotationNodeLoadBalancerFirewallAssigning] == "" {
 		return c.holdOrFailPublicNodeLocal(ctx, service, errors.New("public-node-local: incomplete durable assignment authorization cannot be adopted"))
 	}
-	if !assignmentFencePresent && (activePool == "" || !reflect.DeepEqual(service.Status.LoadBalancer, desiredPublicStatus)) {
+	if !assignmentFencePresent {
 		return c.holdOrFailPublicNodeLocal(ctx, service, errors.New("public-node-local: inactive or unpublished firewall assignment has no durable authorization fence"))
 	}
 	if service.Annotations[annotationNodeLoadBalancerFirewallAssigning] != "" && len(service.Status.LoadBalancer.Ingress) == 0 {
