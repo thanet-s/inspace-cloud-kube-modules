@@ -73,6 +73,10 @@ func initializeCloud(config *cloudconfig.CompletedConfig) cloud.Interface {
 	if err != nil {
 		klog.Fatal(err)
 	}
+	maxFirewallsPerVM, err := parseInt32WithDefault("INSPACE_NODE_LOAD_BALANCER_MAX_FIREWALLS_PER_VM", inspaceprovider.DefaultMaxFirewallsPerVM)
+	if err != nil {
+		klog.Fatal(err)
+	}
 	api, err := inspace.NewClient(inspace.Options{
 		BaseURL: baseURL, APIKey: apiKey, DangerouslyAllowMutations: allowMutations,
 		UserAgent: buildversion.UserAgent("inspace-cloud-controller-manager"),
@@ -93,6 +97,8 @@ func initializeCloud(config *cloudconfig.CompletedConfig) cloud.Interface {
 			Enabled:          nodeLoadBalancerEnabled,
 			DefaultNodeClass: os.Getenv("INSPACE_NODE_LOAD_BALANCER_DEFAULT_NODE_CLASS"),
 			NodesPerShard:    nodesPerShard,
+			// Values below 1 mean the default; the provider normalizes them.
+			MaxFirewallsPerVM: maxFirewallsPerVM,
 		},
 	})
 	if err != nil {

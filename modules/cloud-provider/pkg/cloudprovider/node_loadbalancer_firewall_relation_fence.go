@@ -14,6 +14,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/klog/v2"
 
 	inspace "github.com/thanet-s/inspace-cloud-kube-modules/modules/client"
 )
@@ -472,6 +473,9 @@ type nodeLoadBalancerFirewallRelationOwner struct {
 	authorize   func(context.Context, nodeLoadBalancerFirewallRelationFence, inspace.Firewall) error
 	// parkRetired parks a relation that keeps retiring without converging.
 	parkRetired bool
+	// service is the owning Service, when the owner is one. It receives the
+	// Warning Event for a refused attachment.
+	service *corev1.Service
 }
 
 type nodeLoadBalancerFirewallRelationOwnerSnapshot struct {
@@ -492,6 +496,7 @@ func (c *nodeLoadBalancerController) serviceFirewallRelationOwner(service *corev
 	return nodeLoadBalancerFirewallRelationOwner{
 		description: fmt.Sprintf("Service %s/%s", service.Namespace, service.Name),
 		parkRetired: true,
+		service:     service,
 		authorize: func(ctx context.Context, fence nodeLoadBalancerFirewallRelationFence, before inspace.Firewall) error {
 			return c.authorizeServiceFirewallRelationPreDispatch(ctx, service, fence, before)
 		},
@@ -1432,12 +1437,33 @@ func (c *nodeLoadBalancerController) reconcileNodeLoadBalancerFirewallRelation(
 		))
 	}
 
+	if issuedFence.operation == nodeLoadBalancerFirewallRelationAssign {
+		// A VM with too many firewalls loses its outbound connections. Read the
+		// VM's assignments last, right before the POST, and refuse an attachment
+		// that would exceed the limit. The refusal is not a verified intent: the
+		// caller keeps whatever already serves and retries.
+		if capacityErr := c.requireFirewallVMCapacity(ctx, issuedFence.firewallUUID, issuedFence.vmUUID); capacityErr != nil {
+			var limitErr *FirewallLimitExceededError
+			if errors.As(capacityErr, &limitErr) {
+				c.recordFirewallLimitExceeded(ctx, owner.service, owner.description, capacityErr)
+			} else {
+				klog.Warningf("node load balancer: %s: refuse to attach firewall %s to VM %s: %v",
+					owner.description, issuedFence.firewallUUID, issuedFence.vmUUID, capacityErr)
+			}
+			return rejectUndispatched(capacityErr)
+		}
+	}
+
+	klog.Infof("node load balancer: %s: %s firewall %s on VM %s",
+		owner.description, issuedFence.operation, issuedFence.firewallUUID, issuedFence.vmUUID)
 	var mutationErr error
 	if issuedFence.operation == nodeLoadBalancerFirewallRelationAssign {
 		mutationErr = c.provider.api.AssignFirewallToVM(ctx, c.provider.config.Location, issuedFence.firewallUUID, issuedFence.vmUUID)
 	} else {
 		mutationErr = c.provider.api.UnassignFirewallFromVM(ctx, c.provider.config.Location, issuedFence.firewallUUID, issuedFence.vmUUID)
 	}
+	klog.Infof("node load balancer: %s: %s firewall %s on VM %s returned: %v",
+		owner.description, issuedFence.operation, issuedFence.firewallUUID, issuedFence.vmUUID, mutationErr)
 	if nodeLoadBalancerMutationKnownPreDispatch(mutationErr) {
 		// The SDK produced this typed error before dispatch. Clear only the exact
 		// UID-pinned receipt using a detached bounded context; a canceled caller
@@ -1452,7 +1478,9 @@ func (c *nodeLoadBalancerController) reconcileNodeLoadBalancerFirewallRelation(
 		// A successful response is still not authoritative state. Perform one
 		// fresh readback; if the provider is eventually consistent, retain the
 		// fence and let a later reconciliation resolve it without another call.
-		_, readbackErr := c.reconcileNodeLoadBalancerFirewallRelation(ctx, owner, nil)
+		readbackConverged, readbackErr := c.reconcileNodeLoadBalancerFirewallRelation(ctx, owner, nil)
+		klog.Infof("node load balancer: %s: %s firewall %s on VM %s readback: converged=%t err=%v",
+			owner.description, issuedFence.operation, issuedFence.firewallUUID, issuedFence.vmUUID, readbackConverged, readbackErr)
 		if readbackErr != nil {
 			return false, readbackErr
 		}

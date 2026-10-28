@@ -2728,7 +2728,10 @@ func publicNodeLocalCauseClass(cause error) string {
 	var pending *nodeLoadBalancerFirewallRelationPendingError
 	var status *apierrors.StatusError
 	var api *inspace.APIError
+	var limit *FirewallLimitExceededError
 	switch {
+	case errors.As(cause, &limit):
+		return "firewall-limit"
 	case errors.Is(cause, errNodeLoadBalancerFirewallRelationParked):
 		return "relation-parked"
 	case errors.As(cause, &pending):

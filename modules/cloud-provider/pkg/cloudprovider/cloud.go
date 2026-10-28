@@ -195,6 +195,9 @@ type NodeLoadBalancerConfig struct {
 	Enabled          bool
 	DefaultNodeClass string
 	NodesPerShard    int32
+	// MaxFirewallsPerVM is the most firewalls the CCM lets one VM carry. Zero
+	// or a negative value means DefaultMaxFirewallsPerVM.
+	MaxFirewallsPerVM int32
 }
 
 type Provider struct {

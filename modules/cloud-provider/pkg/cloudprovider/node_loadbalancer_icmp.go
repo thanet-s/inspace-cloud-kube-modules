@@ -537,6 +537,12 @@ func (c *nodeLoadBalancerController) ensureClusterICMPFirewall(
 				if errors.As(relationErr, &healthDeferred) {
 					return firewall, false, nil
 				}
+				// A VM at its firewall limit keeps its current firewalls. The
+				// refusal was logged; the other VMs and the next pass go on.
+				var limitErr *FirewallLimitExceededError
+				if errors.As(relationErr, &limitErr) {
+					return firewall, false, nil
+				}
 				return nil, false, fmt.Errorf("node load balancer: assign cluster ICMP firewall %s to VM %s: %w", firewall.UUID, vmUUID, relationErr)
 			}
 			assignmentsReady = false

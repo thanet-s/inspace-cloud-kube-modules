@@ -163,6 +163,8 @@ spec:
               value: {{ .Values.karpenter.defaultNodeClass | quote }}
             - name: INSPACE_NODE_LOAD_BALANCER_NODES_PER_SHARD
               value: {{ .Values.ccm.nodeLoadBalancer.nodesPerShard | quote }}
+            - name: INSPACE_NODE_LOAD_BALANCER_MAX_FIREWALLS_PER_VM
+              value: {{ .Values.ccm.nodeLoadBalancer.maxFirewallsPerVM | quote }}
             {{- with .Values.ccm.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
