@@ -356,6 +356,8 @@ func TestStandardNLBReadbackNormalizesExactDuplicateRelationships(t *testing.T) 
 	}
 }
 
+// Targets are added before stale ones are removed, so for targets the failed
+// readback after the add blocks the dependent removal; rules still remove first.
 func TestStandardNLBRemovalReadFailureBlocksDependentAdd(t *testing.T) {
 	ctx := context.Background()
 	readErr := errors.New("removal readback unavailable")
@@ -379,10 +381,10 @@ func TestStandardNLBRemovalReadFailureBlocksDependentAdd(t *testing.T) {
 		provider := newStandardNLBProviderWithStore(t, api, newMemoryStandardNLBServiceStore())
 		setStandardNLBKubeNodes(provider, readyNode("worker-a", "inspace://bkk01/"+testVMUUID))
 		if err := provider.reconcileLoadBalancer(ctx, service, &base.lbs[0], []string{testVMUUID}, serviceRules(service)); err == nil || !strings.Contains(err.Error(), readErr.Error()) {
-			t.Fatalf("target removal/readback result = %v", err)
+			t.Fatalf("target add/readback result = %v", err)
 		}
-		if len(base.removedTargets) != 1 || len(base.addedTargets) != 0 {
-			t.Fatalf("dependent target add crossed failed readback: removed=%v added=%v", base.removedTargets, base.addedTargets)
+		if len(base.removedTargets) != 0 || len(base.addedTargets) != 1 {
+			t.Fatalf("dependent target removal crossed failed add readback: removed=%v added=%v", base.removedTargets, base.addedTargets)
 		}
 
 		api.failLoadBalancerListOn = 0

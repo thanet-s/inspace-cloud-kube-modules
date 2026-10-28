@@ -19,12 +19,32 @@ import (
 const (
 	nodeLoadBalancerClass = "inspace.cloud/node"
 
-	annotationNodeLoadBalancerMode          = "service.inspace.cloud/node-lb-mode"
-	annotationNodeLoadBalancerPool          = "service.inspace.cloud/node-lb-pool"
-	annotationNodeLoadBalancerNodesPerShard = "service.inspace.cloud/node-lb-nodes-per-shard"
-	annotationNodeLoadBalancerCPU           = "service.inspace.cloud/node-lb-cpu"
-	annotationNodeLoadBalancerMemory        = "service.inspace.cloud/node-lb-memory"
-	annotationNodeLoadBalancerShard         = "service.inspace.cloud/node-lb-shard"
+	annotationNodeLoadBalancerMode = "service.inspace.cloud/node-lb-mode"
+	annotationNodeLoadBalancerPool = "service.inspace.cloud/node-lb-pool"
+	// annotationNodeLoadBalancerAllowRebuild is an operator escape hatch for a
+	// public-node-local Service. It lets the controller withdraw the serving
+	// exposure and rebuild it when the pool or the firewall policy changes, which
+	// is a short outage. Without it every change runs in place (make-before-break).
+	// It is single use: whatever its value, the controller honours it once and
+	// records the raw value in annotationNodeLoadBalancerAllowRebuildConsumed. The
+	// value is honoured again only after the annotation is removed or set to
+	// another value, so a manifest that keeps it cannot replay a rebuild on a
+	// later change.
+	annotationNodeLoadBalancerAllowRebuild = "service.inspace.cloud/node-lb-allow-rebuild"
+	// annotationNodeLoadBalancerAllowRebuildConsumed is the raw value of the
+	// escape hatch that was used last.
+	annotationNodeLoadBalancerAllowRebuildConsumed = "service.inspace.cloud/node-lb-allow-rebuild-consumed"
+	// annotationNodeLoadBalancerRebuilding marks a rebuild that has begun and is
+	// not yet withdrawn. It is removed with the activation.
+	annotationNodeLoadBalancerRebuilding = "service.inspace.cloud/node-lb-rebuilding"
+	// annotationNodeLoadBalancerRebuildingAssigned lists the firewall/VM pairs that
+	// were assigned when the rebuild began. A pair that is no longer assigned
+	// means a detach was read back, and the rebuild can not be cancelled any more.
+	annotationNodeLoadBalancerRebuildingAssigned = "service.inspace.cloud/node-lb-rebuilding-assigned"
+	annotationNodeLoadBalancerNodesPerShard      = "service.inspace.cloud/node-lb-nodes-per-shard"
+	annotationNodeLoadBalancerCPU                = "service.inspace.cloud/node-lb-cpu"
+	annotationNodeLoadBalancerMemory             = "service.inspace.cloud/node-lb-memory"
+	annotationNodeLoadBalancerShard              = "service.inspace.cloud/node-lb-shard"
 
 	nodeLoadBalancerModeShared    = "public-node-shared"
 	nodeLoadBalancerModeDedicated = "public-node-dedicated"
@@ -730,8 +750,11 @@ func renderNodeLoadBalancerNodePoolManifest(name, nodeClassName string, shard no
 			"disruption": map[string]any{
 				"consolidateAfter":    "0s",
 				"consolidationPolicy": "WhenEmptyOrUnderutilized",
+				// Budget 0 stops voluntary disruption (drift, consolidation) of
+				// a load balancer node. Forced paths (deletion, interruption)
+				// are not budgeted and still work; operators roll a node by hand.
 				"budgets": []any{map[string]any{
-					"nodes": "10%",
+					"nodes": "0",
 				}},
 			},
 			"template": map[string]any{
@@ -742,7 +765,12 @@ func renderNodeLoadBalancerNodePoolManifest(name, nodeClassName string, shard no
 					nodeLoadBalancerModeLabel:      shard.Mode,
 				}},
 				"spec": map[string]any{
-					"expireAfter": "720h",
+					// A load balancer node owns a public IP, so replacing it
+					// changes the published address and drops customer traffic
+					// (NATS). Never expire it; roll nodes by hand. The CRD
+					// accepts "Never" and the API server stores it unchanged,
+					// so the exact spec readback stays stable.
+					"expireAfter": "Never",
 					"nodeClassRef": map[string]any{
 						"group": "karpenter.inspace.cloud", "kind": "InSpaceNodeClass", "name": nodeClassName,
 					},

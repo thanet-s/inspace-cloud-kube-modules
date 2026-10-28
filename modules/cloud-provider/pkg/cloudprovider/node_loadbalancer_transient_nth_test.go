@@ -2,6 +2,7 @@ package cloudprovider
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"reflect"
 	"testing"
@@ -48,20 +49,63 @@ func (a *nthListFirewallsErrorAPI) ListFirewalls(ctx context.Context, location s
 // a transient error, and returns the call counter.
 func installNthFailure(provider *Provider, api *fakeAPI, kind string, n int) *int {
 	if kind == "GetVM" {
-		wrapped := &nthGetVMErrorAPI{fakeAPI: api, failOn: n, err: transientProviderTimeout()}
+		return installNthFailureWith(provider, api, kind, n, transientProviderTimeout())
+	}
+	return installNthFailureWith(provider, api, kind, n, transientProviderError())
+}
+
+// installNthFailureWith fails the Nth call of kind with the given error.
+func installNthFailureWith(provider *Provider, api *fakeAPI, kind string, n int, err error) *int {
+	if kind == "GetVM" {
+		wrapped := &nthGetVMErrorAPI{fakeAPI: api, failOn: n, err: err}
 		provider.api = wrapped
 		return &wrapped.calls
 	}
-	wrapped := &nthListFirewallsErrorAPI{fakeAPI: api, failOn: n, err: transientProviderError()}
+	wrapped := &nthListFirewallsErrorAPI{fakeAPI: api, failOn: n, err: err}
 	provider.api = wrapped
 	return &wrapped.calls
+}
+
+// A definite failure on any single provider call must also leave a published
+// public-node-local Service alone: it is held, never withdrawn.
+func TestPublicNodeLocalKeepsStateOnNthDefiniteProviderCall(t *testing.T) {
+	for _, kind := range []string{"GetVM", "ListFirewalls"} {
+		for n := 1; n <= 24; n++ {
+			t.Run(fmt.Sprintf("%s call %d", kind, n), func(t *testing.T) {
+				f := newPublishedPublicNodeLocalFixture(t)
+				before := f.current(t)
+				datapathBefore := trackedPublicNodeLocalDatapath(t, f)
+				mutations := managedNodeLoadBalancerMutationSnapshot(f.api)
+				calls := installNthFailureWith(f.provider, f.api, kind, n, errors.New("canonical ownership mismatch"))
+
+				syncErr := f.controller.syncPublicNodeLocal(f.ctx, f.key, before)
+				if *calls < n {
+					t.Skipf("sync made only %d %s calls", *calls, kind)
+				}
+				var holding *errPublicNodeLocalHolding
+				if syncErr != nil && !errors.As(syncErr, &holding) {
+					t.Fatalf("definite failure was not held: %v", syncErr)
+				}
+				after := f.current(t)
+				if !reflect.DeepEqual(after.Status, before.Status) || !reflect.DeepEqual(after.Annotations, before.Annotations) {
+					t.Fatalf("parent changed: status=%#v annotations=%#v err=%v", after.Status, after.Annotations, syncErr)
+				}
+				if datapath := trackedPublicNodeLocalDatapath(t, f); !reflect.DeepEqual(datapath.Status, datapathBefore.Status) {
+					t.Fatalf("datapath status changed: %#v err=%v", datapath.Status, syncErr)
+				}
+				if got := managedNodeLoadBalancerMutationSnapshot(f.api); got != mutations {
+					t.Fatalf("firewall mutated: before=%#v after=%#v err=%v", mutations, got, syncErr)
+				}
+			})
+		}
+	}
 }
 
 // A transient failure on any single provider call, including calls inside the
 // publication gates, must leave a published public-node-local Service alone.
 func TestPublicNodeLocalKeepsStateOnNthTransientProviderCall(t *testing.T) {
 	for _, kind := range []string{"GetVM", "ListFirewalls"} {
-		for n := 1; n <= 12; n++ {
+		for n := 1; n <= 24; n++ {
 			t.Run(fmt.Sprintf("%s call %d", kind, n), func(t *testing.T) {
 				f := newPublishedPublicNodeLocalFixture(t)
 				before := f.current(t)

@@ -193,7 +193,7 @@ docker build --platform=linux/amd64 -f modules/csi-driver/Dockerfile \
 
 ## Tests
 
-Go 1.27.2 is required. From this repository:
+Go 1.27.3 is required. From this repository:
 
 ```sh
 make verify

@@ -476,7 +476,14 @@ func TestNodeLoadBalancerNodePoolAuthorizationRequiresFullHardenedProfile(t *tes
 		},
 		"changed expiry": func(t *testing.T, pool *unstructured.Unstructured) {
 			t.Helper()
-			if err := unstructured.SetNestedField(pool.Object, "Never", "spec", "template", "spec", "expireAfter"); err != nil {
+			if err := unstructured.SetNestedField(pool.Object, "720h", "spec", "template", "spec", "expireAfter"); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"changed disruption budget": func(t *testing.T, pool *unstructured.Unstructured) {
+			t.Helper()
+			budgets := []any{map[string]any{"nodes": "10%"}}
+			if err := unstructured.SetNestedSlice(pool.Object, budgets, "spec", "disruption", "budgets"); err != nil {
 				t.Fatal(err)
 			}
 		},

@@ -2,6 +2,7 @@ package cloudprovider
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"reflect"
@@ -247,6 +248,65 @@ func nodeLoadBalancerFirewallRelationRetireDue(fence nodeLoadBalancerFirewallRel
 	return !now.Before(issuedAt.Add(nodeLoadBalancerFirewallRelationRetireDelay)), nil
 }
 
+// nodeLoadBalancerFirewallRelationPendingError reports that a relation fence is
+// still waiting for cloud readback. It is a wait with a known end, not a
+// fault: the work item is requeued after retryAfter instead of backing off.
+type nodeLoadBalancerFirewallRelationPendingError struct {
+	message    string
+	retryAfter time.Duration
+}
+
+func (err *nodeLoadBalancerFirewallRelationPendingError) Error() string { return err.message }
+
+// nodeLoadBalancerRequeueDelay returns the fixed requeue delay of an error that
+// is a bounded wait. Other errors, including transient deferrals, keep the
+// rate-limited backoff.
+func nodeLoadBalancerRequeueDelay(err error) (time.Duration, bool) {
+	var pending *nodeLoadBalancerFirewallRelationPendingError
+	if errors.As(err, &pending) {
+		return pending.retryAfter, true
+	}
+	var holding *errPublicNodeLocalHolding
+	if errors.As(err, &holding) {
+		// A hold changes nothing, so a steady retry is safe and keeps recovery
+		// fast. A hold that repeats unchanged backs off.
+		if holding.retryAfter > 0 {
+			return holding.retryAfter, true
+		}
+		return nodeLoadBalancerRetry, true
+	}
+	return 0, false
+}
+
+// nodeLoadBalancerFirewallRelationPendingRetry returns how long to wait before
+// the next readback of an unresolved receipt. It never exceeds the time that is
+// left before the receipt may be retired.
+func nodeLoadBalancerFirewallRelationPendingRetry(
+	existing nodeLoadBalancerFirewallRelationFence,
+	converged bool,
+	now time.Time,
+	absenceDelay time.Duration,
+) time.Duration {
+	wait := nodeLoadBalancerRetry
+	if issuedAt, err := time.Parse(time.RFC3339Nano, existing.issuedAt); err == nil {
+		if untilRetire := issuedAt.Add(nodeLoadBalancerFirewallRelationRetireDelay).Sub(now); untilRetire < wait {
+			wait = untilRetire
+		}
+	}
+	if existing.operation == nodeLoadBalancerFirewallRelationUnassign && converged {
+		// The second absence read is due once the first one is old enough.
+		observedAt := now
+		if parsed, err := time.Parse(time.RFC3339Nano, existing.absenceObservedAt); err == nil {
+			observedAt = parsed
+		}
+		wait = observedAt.Add(absenceDelay).Sub(now)
+	}
+	if wait <= 0 {
+		return time.Second
+	}
+	return wait
+}
+
 func sameNodeLoadBalancerFirewallRelationIssue(left, right nodeLoadBalancerFirewallRelationFence) bool {
 	return left.operation == right.operation &&
 		strings.EqualFold(left.firewallUUID, right.firewallUUID) &&
@@ -410,6 +470,8 @@ type nodeLoadBalancerFirewallRelationOwner struct {
 	description string
 	read        func(context.Context) (nodeLoadBalancerFirewallRelationOwnerSnapshot, error)
 	authorize   func(context.Context, nodeLoadBalancerFirewallRelationFence, inspace.Firewall) error
+	// parkRetired parks a relation that keeps retiring without converging.
+	parkRetired bool
 }
 
 type nodeLoadBalancerFirewallRelationOwnerSnapshot struct {
@@ -429,6 +491,7 @@ func copyNodeLoadBalancerAnnotations(values map[string]string) map[string]string
 func (c *nodeLoadBalancerController) serviceFirewallRelationOwner(service *corev1.Service) nodeLoadBalancerFirewallRelationOwner {
 	return nodeLoadBalancerFirewallRelationOwner{
 		description: fmt.Sprintf("Service %s/%s", service.Namespace, service.Name),
+		parkRetired: true,
 		authorize: func(ctx context.Context, fence nodeLoadBalancerFirewallRelationFence, before inspace.Firewall) error {
 			return c.authorizeServiceFirewallRelationPreDispatch(ctx, service, fence, before)
 		},
@@ -783,7 +846,18 @@ func (c *nodeLoadBalancerController) authorizeServiceFirewallRelationPreDispatch
 	if err != nil {
 		return err
 	}
-	if intent.Mode == nodeLoadBalancerModeLocal {
+	if intent.Mode == nodeLoadBalancerModeLocal && current.Annotations[annotationPublicNodeLocalActivePool] != "" {
+		// A serving Service adds one node at a time; only that VM must be proven.
+		// While a pool change is pending, the active pool governs the add.
+		intent.Pool = current.Annotations[annotationPublicNodeLocalActivePool]
+		if target := current.Annotations[annotationPublicNodeLocalTargetPool]; target != "" {
+			// During a union the add converges to the target.
+			intent.Pool = target
+		}
+		if err := c.validateActivePublicNodeLocalAssignState(ctx, current, intent, desired, fence.firewallUUID, fence.vmUUID); err != nil {
+			return err
+		}
+	} else if intent.Mode == nodeLoadBalancerModeLocal {
 		addresses, patched, addressErr := c.publicNodeLocalAddresses(ctx, current, intent)
 		if addressErr != nil {
 			return addressErr
@@ -1066,6 +1140,7 @@ func (c *nodeLoadBalancerController) reconcileNodeLoadBalancerFirewallRelation(
 	var issuedFence *nodeLoadBalancerFirewallRelationFence
 	confirmRemovalImmediately := false
 	retryPreDispatchProofImmediately := false
+	pendingRetry := nodeLoadBalancerRetry
 	values := copyNodeLoadBalancerAnnotations(snapshot.annotations)
 	changed := false
 	existingValue := values[annotationNodeLoadBalancerFirewallRelationIssued]
@@ -1104,6 +1179,9 @@ func (c *nodeLoadBalancerController) reconcileNodeLoadBalancerFirewallRelation(
 			// dispatch stays fenced until the retirement interval elapses.
 			delete(values, annotationNodeLoadBalancerFirewallRelationIssued)
 			delete(values, annotationNodeLoadBalancerFirewallRelationOwnerUID)
+			if owner.parkRetired {
+				recordNodeLoadBalancerFirewallRelationRetirement(values, existing, c.nodeLoadBalancerFirewallRelationTime())
+			}
 			cleared, observationChanged = true, true
 		} else {
 			cleared, observationChanged, observationErr = advanceNodeLoadBalancerFirewallRelationObservation(
@@ -1113,6 +1191,12 @@ func (c *nodeLoadBalancerController) reconcileNodeLoadBalancerFirewallRelation(
 				c.nodeLoadBalancerFirewallRelationTime(),
 				c.nodeLoadBalancerFirewallRelationAbsenceDelay(),
 			)
+			if cleared {
+				// The relation converged, which ends the retirement streak of this
+				// relation only.
+				clearNodeLoadBalancerFirewallRelationRetirement(
+					values, nodeLoadBalancerFirewallRelationKey(existing), c.nodeLoadBalancerFirewallRelationTime())
+			}
 		}
 		if observationErr != nil {
 			return false, observationErr
@@ -1122,6 +1206,9 @@ func (c *nodeLoadBalancerController) reconcileNodeLoadBalancerFirewallRelation(
 			result = outcomeCleared
 		} else {
 			result = outcomePending
+			pendingRetry = nodeLoadBalancerFirewallRelationPendingRetry(
+				existing, converged, c.nodeLoadBalancerFirewallRelationTime(), c.nodeLoadBalancerFirewallRelationAbsenceDelay(),
+			)
 			confirmRemovalImmediately = existing.operation == nodeLoadBalancerFirewallRelationUnassign &&
 				converged && existing.absenceObservedAt == "" &&
 				c.nodeLoadBalancerFirewallRelationAbsenceDelay() == 0
@@ -1143,7 +1230,29 @@ func (c *nodeLoadBalancerController) reconcileNodeLoadBalancerFirewallRelation(
 				changed = true
 				result = outcomeCleared
 			}
+			if clearNodeLoadBalancerFirewallRelationRetirement(
+				values, nodeLoadBalancerFirewallRelationKey(*desired), c.nodeLoadBalancerFirewallRelationTime(),
+			) {
+				changed = true
+				result = outcomeCleared
+			}
 		} else {
+			if owner.parkRetired && values[annotationNodeLoadBalancerFirewallRelationRetired] != "" {
+				key := nodeLoadBalancerFirewallRelationKey(*desired)
+				now := c.nodeLoadBalancerFirewallRelationTime()
+				if record, found := parseNodeLoadBalancerFirewallRelationRetirements(
+					values[annotationNodeLoadBalancerFirewallRelationRetired],
+				)[key]; found && record.Count >= nodeLoadBalancerFirewallRelationParkRetirements {
+					if now.Before(record.At.Add(nodeLoadBalancerFirewallRelationParkDuration)) {
+						// Nothing is dispatched or persisted: the relation just waits out
+						// its park so the owner's other relations can proceed.
+						return false, fmt.Errorf("%w: %s on %s", errNodeLoadBalancerFirewallRelationParked, key, owner.description)
+					}
+					// A finished park starts a new streak. Other relations keep theirs.
+					clearNodeLoadBalancerFirewallRelationRetirement(values, key, now)
+					changed = true
+				}
+			}
 			issued := *desired
 			readyToIssue := true
 			if desired.operation == nodeLoadBalancerFirewallRelationUnassign {
@@ -1170,10 +1279,12 @@ func (c *nodeLoadBalancerController) reconcileNodeLoadBalancerFirewallRelation(
 						changed = true
 						readyToIssue = false
 						result = outcomePreDispatchProof
+						pendingRetry = max(c.nodeLoadBalancerFirewallRelationAbsenceDelay(), time.Second)
 						retryPreDispatchProofImmediately = c.nodeLoadBalancerFirewallRelationAbsenceDelay() == 0
 					} else if now.Before(observedAt.Add(c.nodeLoadBalancerFirewallRelationAbsenceDelay())) {
 						readyToIssue = false
 						result = outcomePreDispatchProof
+						pendingRetry = max(observedAt.Add(c.nodeLoadBalancerFirewallRelationAbsenceDelay()).Sub(now), time.Second)
 					} else {
 						issued.targetAbsentAt = observedAt.Format(time.RFC3339Nano)
 						delete(values, annotationNodeLoadBalancerFirewallRelationVMAbsent)
@@ -1239,13 +1350,19 @@ func (c *nodeLoadBalancerController) reconcileNodeLoadBalancerFirewallRelation(
 		}
 		return true, nil
 	case outcomePending:
-		return false, fmt.Errorf(
-			"node load balancer: %s firewall relation mutation %s remains ambiguous; waiting for authoritative cloud readback",
-			owner.description,
-			mustNodeLoadBalancerFirewallRelationFenceValue(owner, desired),
-		)
+		return false, &nodeLoadBalancerFirewallRelationPendingError{
+			message: fmt.Sprintf(
+				"node load balancer: %s firewall relation mutation %s remains ambiguous; waiting for authoritative cloud readback",
+				owner.description,
+				mustNodeLoadBalancerFirewallRelationFenceValue(owner, desired),
+			),
+			retryAfter: pendingRetry,
+		}
 	case outcomePreDispatchProof:
-		return false, errors.New("node load balancer: waiting for spaced exact VM-absence authority before firewall detach")
+		return false, &nodeLoadBalancerFirewallRelationPendingError{
+			message:    "node load balancer: waiting for spaced exact VM-absence authority before firewall detach",
+			retryAfter: pendingRetry,
+		}
 	case outcomeCleared:
 		// The cloud relationship was authoritatively re-read before this exact
 		// Kubernetes fence was cleared. Stop this pass: when desired is non-nil,
@@ -1469,4 +1586,114 @@ func nodeLoadBalancerFirewallAssignmentVMs(firewall inspace.Firewall) ([]string,
 	}
 	sort.Strings(result)
 	return result, nil
+}
+
+// errNodeLoadBalancerFirewallRelationParked reports a relation that was retired
+// repeatedly without ever converging. It is not dispatched again until the park
+// ends, so other relations of the same owner can proceed.
+var errNodeLoadBalancerFirewallRelationParked = errors.New("node load balancer: firewall relation is parked after repeated unresolved retirements")
+
+const (
+	nodeLoadBalancerFirewallRelationParkRetirements = 3
+	nodeLoadBalancerFirewallRelationParkDuration    = 30 * time.Minute
+
+	annotationNodeLoadBalancerFirewallRelationRetired = "service.inspace.cloud/node-lb-firewall-relation-retired"
+)
+
+// nodeLoadBalancerFirewallRelationKey names a logical relation, independent of
+// the issue identity of any one attempt.
+func nodeLoadBalancerFirewallRelationKey(fence nodeLoadBalancerFirewallRelationFence) string {
+	return string(fence.operation) + "/" + strings.ToLower(fence.firewallUUID) + "/" + strings.ToLower(fence.vmUUID)
+}
+
+// nodeLoadBalancerFirewallRelationRetirementRecords bounds how many relations
+// the retirement annotation tracks.
+const nodeLoadBalancerFirewallRelationRetirementRecords = 16
+
+// nodeLoadBalancerFirewallRelationRetirement is the retirement streak of one
+// logical relation.
+type nodeLoadBalancerFirewallRelationRetirement struct {
+	Count int       `json:"n"`
+	At    time.Time `json:"at"`
+}
+
+// parseNodeLoadBalancerFirewallRelationRetirements reads the per relation
+// retirement records. A malformed value counts as no record: it can only
+// shorten a park, never dispatch a relation that the fence would refuse.
+func parseNodeLoadBalancerFirewallRelationRetirements(value string) map[string]nodeLoadBalancerFirewallRelationRetirement {
+	records := map[string]nodeLoadBalancerFirewallRelationRetirement{}
+	if value == "" {
+		return records
+	}
+	if err := json.Unmarshal([]byte(value), &records); err != nil {
+		return map[string]nodeLoadBalancerFirewallRelationRetirement{}
+	}
+	for key, record := range records {
+		if record.Count < 1 || record.At.IsZero() {
+			delete(records, key)
+		}
+	}
+	return records
+}
+
+// storeNodeLoadBalancerFirewallRelationRetirements writes the records back. A
+// finished park and a streak older than a park are dropped, and the oldest
+// records go first when the bound is exceeded. An empty map removes the key.
+func storeNodeLoadBalancerFirewallRelationRetirements(
+	values map[string]string,
+	records map[string]nodeLoadBalancerFirewallRelationRetirement,
+	now time.Time,
+) {
+	for key, record := range records {
+		if !now.Before(record.At.Add(nodeLoadBalancerFirewallRelationParkDuration)) {
+			delete(records, key)
+		}
+	}
+	for len(records) > nodeLoadBalancerFirewallRelationRetirementRecords {
+		oldestKey, oldest := "", time.Time{}
+		for key, record := range records {
+			if oldestKey == "" || record.At.Before(oldest) || (record.At.Equal(oldest) && key < oldestKey) {
+				oldestKey, oldest = key, record.At
+			}
+		}
+		delete(records, oldestKey)
+	}
+	if len(records) == 0 {
+		delete(values, annotationNodeLoadBalancerFirewallRelationRetired)
+		return
+	}
+	encoded, err := json.Marshal(records)
+	if err != nil {
+		delete(values, annotationNodeLoadBalancerFirewallRelationRetired)
+		return
+	}
+	values[annotationNodeLoadBalancerFirewallRelationRetired] = string(encoded)
+}
+
+// recordNodeLoadBalancerFirewallRelationRetirement counts one more retirement
+// of this logical relation and leaves every other relation's record alone.
+func recordNodeLoadBalancerFirewallRelationRetirement(
+	values map[string]string,
+	retired nodeLoadBalancerFirewallRelationFence,
+	now time.Time,
+) {
+	key := nodeLoadBalancerFirewallRelationKey(retired)
+	records := parseNodeLoadBalancerFirewallRelationRetirements(values[annotationNodeLoadBalancerFirewallRelationRetired])
+	record := records[key]
+	record.Count++
+	record.At = now.UTC()
+	records[key] = record
+	storeNodeLoadBalancerFirewallRelationRetirements(values, records, now)
+}
+
+// clearNodeLoadBalancerFirewallRelationRetirement ends the streak of one
+// relation, and reports whether a record was removed.
+func clearNodeLoadBalancerFirewallRelationRetirement(values map[string]string, key string, now time.Time) bool {
+	records := parseNodeLoadBalancerFirewallRelationRetirements(values[annotationNodeLoadBalancerFirewallRelationRetired])
+	if _, found := records[key]; !found {
+		return false
+	}
+	delete(records, key)
+	storeNodeLoadBalancerFirewallRelationRetirements(values, records, now)
+	return true
 }

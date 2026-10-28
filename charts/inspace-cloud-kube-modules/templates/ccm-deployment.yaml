@@ -11,6 +11,13 @@ metadata:
 spec:
   replicas: {{ .Values.ccm.replicaCount }}
   revisionHistoryLimit: 3
+  # Each replica binds hostNetwork port 10258, so a surge pod can never be
+  # scheduled next to the old one. Replace in place, one pod at a time.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
   selector:
     matchLabels:
       {{- include "inspace.selectorLabels" (dict "root" . "component" $component) | nindent 6 }}
@@ -39,9 +46,27 @@ spec:
       nodeSelector:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.ccm.affinity }}
+      {{- if .Values.ccm.affinity }}
       affinity:
-        {{- toYaml . | nindent 8 }}
+        {{- toYaml .Values.ccm.affinity | nindent 8 }}
+      {{- else if eq .Values.ccm.antiAffinity "required" }}
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels:
+                  {{- include "inspace.selectorLabels" (dict "root" . "component" $component) | nindent 18 }}
+      {{- else if eq .Values.ccm.antiAffinity "preferred" }}
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    {{- include "inspace.selectorLabels" (dict "root" . "component" $component) | nindent 20 }}
       {{- end }}
       {{- with .Values.ccm.tolerations }}
       tolerations:
@@ -62,6 +87,25 @@ spec:
             {{- range .Values.ccm.extraArgs }}
             - {{ . | quote }}
             {{- end }}
+          # The secure port is fixed at 10258; do not override --secure-port in
+          # extraArgs or the probe below stops matching.
+          ports:
+            - name: https
+              containerPort: 10258
+              protocol: TCP
+          {{- with .Values.ccm.livenessProbe }}
+          {{- if .enabled }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: https
+              scheme: HTTPS
+            initialDelaySeconds: {{ .initialDelaySeconds }}
+            periodSeconds: {{ .periodSeconds }}
+            timeoutSeconds: {{ .timeoutSeconds }}
+            failureThreshold: {{ .failureThreshold }}
+          {{- end }}
+          {{- end }}
           env:
             - name: INSPACE_API_TOKEN
               valueFrom:

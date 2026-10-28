@@ -27,8 +27,11 @@ import (
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/kubernetes/scheme"
+	typedcorev1 "k8s.io/client-go/kubernetes/typed/core/v1"
 	discoverylisters "k8s.io/client-go/listers/discovery/v1"
 	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/tools/record"
 	cloud "k8s.io/cloud-provider"
 	cloudproviderapi "k8s.io/cloud-provider/api"
 	"k8s.io/klog/v2"
@@ -47,6 +50,18 @@ const (
 	LabelLoadBalancerScope          = "inspace.cloud/load-balancer-scope"
 	LoadBalancerScopePublic         = "public"
 	LoadBalancerScopePrivate        = "private"
+
+	// annotationStandardNLBUnpublishedAt records when the public markers were
+	// first seen dropped from a Service that still owns an NLB or floating IP.
+	annotationStandardNLBUnpublishedAt = "service.inspace.cloud/public-nlb-unpublished-at"
+	// annotationStandardNLBEmptyTargetsSince records when the desired target
+	// set first came up empty, so the grace period survives restarts.
+	annotationStandardNLBEmptyTargetsSince = "service.inspace.cloud/public-nlb-empty-targets-since"
+
+	// AnnotationReleasePublicLoadBalancer is the explicit opt-in that lets an
+	// unpublished Service delete its public NLB and floating IP. Without it the
+	// resources are held, because the public IP cannot be recovered once freed.
+	AnnotationReleasePublicLoadBalancer = "inspace.cloud/release-public-load-balancer"
 
 	clusterAutoscalerDeletionTaint = "ToBeDeletedByClusterAutoscaler"
 	karpenterDisruptionTaint       = "karpenter.sh/disrupted"
@@ -74,6 +89,15 @@ const (
 	standardNLBDeleteLoadBalancer = "delete-load-balancer"
 
 	standardNLBRemovalAbsenceDelay = 30 * time.Second
+	// emptyTargetSetGrace is how long an empty desired set keeps the last known
+	// good targets before targets whose VM is provably gone may be removed.
+	emptyTargetSetGrace = 15 * time.Minute
+	// addressShrinkGrace is how long InstanceMetadata holds a node's last
+	// ExternalIP when the floating-IP list comes back empty.
+	addressShrinkGrace = 5 * time.Minute
+	// absenceVerdictWindow is the span in which absent-VM verdicts are counted
+	// against the cluster-wide guard.
+	absenceVerdictWindow = 5 * time.Minute
 	// standardNLBRemovalRetryDelay is the fixed requeue for a durably pending
 	// removal. Resolution needs spaced readbacks, not exponential backoff that
 	// could stretch a Service deletion to the controller's five-minute ceiling.
@@ -118,6 +142,9 @@ type standardNLBMutationFence struct {
 	TargetPort        int32  `json:"targetPort,omitempty"`
 	IssuedAt          string `json:"issuedAt,omitempty"`
 	AbsenceObservedAt string `json:"absenceObservedAt,omitempty"`
+	// Attempt counts retired create receipts. One re-create is allowed after a
+	// create stayed absent through the retire window; a second needs a human.
+	Attempt int `json:"attempt,omitempty"`
 }
 
 // API is the exact SDK surface used by the CCM and permits loopback-only
@@ -185,6 +212,18 @@ type Provider struct {
 	endpointSlicesSynced         cache.InformerSynced
 	standardNLBNow               func() time.Time
 	standardNLBAbsentDelay       time.Duration
+	// standardNLBMutationTimeout is a test-only override: when non-zero it
+	// replaces every per-operation deadline. Production leaves it zero. It does
+	// not shorten the retire delay, which stays tied to the real deadlines.
+	standardNLBMutationTimeout time.Duration
+	// Node lifecycle memory: first empty-evidence absence per VM, absence
+	// verdicts inside the guard window, and first empty ExternalIP per Node.
+	lifecycleMu        sync.Mutex
+	emptyEvidenceSince map[string]time.Time
+	absenceVerdicts    map[string]time.Time
+	addressShrinkSince map[string]time.Time
+	// standardNLBEvents is optional; unit tests leave it nil.
+	standardNLBEvents record.EventRecorder
 }
 
 // exactVMReadAbsenceError distinguishes absence returned by the one canonical
@@ -195,6 +234,9 @@ type exactVMReadAbsenceError struct {
 	location string
 	uuid     string
 	cause    error
+	// tombstone marks a positive HTTP-200 "deleted" record, which is stronger
+	// evidence than an exact 404 and needs no second read.
+	tombstone bool
 }
 
 func (e *exactVMReadAbsenceError) Error() string {
@@ -333,6 +375,13 @@ func (p *Provider) Initialize(clientBuilder cloud.ControllerClientBuilder, stopC
 	}
 	p.kubeClient = client
 	p.standardNLBServiceStore = kubernetesStandardNLBServiceStore{client: client}
+	broadcaster := record.NewBroadcaster()
+	broadcaster.StartRecordingToSink(&typedcorev1.EventSinkImpl{Interface: client.CoreV1().Events("")})
+	p.standardNLBEvents = broadcaster.NewRecorder(scheme.Scheme, corev1.EventSource{Component: "inspace-cloud-controller-manager"})
+	go func() {
+		<-stopCh
+		broadcaster.Shutdown()
+	}()
 	if p.config.NodeLoadBalancer.Enabled {
 		restConfig, err := clientBuilder.Config("inspace-node-load-balancer-controller")
 		if err != nil {
@@ -384,8 +433,11 @@ func (p *Provider) InstanceExists(ctx context.Context, node *corev1.Node) (bool,
 	_, err := p.resolveVM(ctx, node)
 	var exactAbsence *exactVMReadAbsenceError
 	if errors.As(err, &exactAbsence) {
-		if corroborationErr := p.corroborateExactVMAbsence(ctx, exactAbsence.location, exactAbsence.uuid); corroborationErr != nil {
+		if corroborationErr := p.corroborateExactVMAbsence(ctx, exactAbsence.location, exactAbsence.uuid, exactAbsence.tombstone); corroborationErr != nil {
 			return false, corroborationErr
+		}
+		if guardErr := p.guardMassAbsence(ctx, node, exactAbsence.uuid); guardErr != nil {
+			return false, guardErr
 		}
 		return false, nil
 	}
@@ -431,12 +483,19 @@ func (p *Provider) InstanceMetadata(ctx context.Context, node *corev1.Node) (*cl
 	if err != nil {
 		return nil, err
 	}
-	addresses := make([]corev1.NodeAddress, 0, 4)
-	if vm.PrivateIPv4 != "" {
-		addresses = append(addresses, corev1.NodeAddress{Type: corev1.NodeInternalIP, Address: vm.PrivateIPv4})
+	// An empty private address is a wrong-but-200 answer, not a node without an
+	// InternalIP: publishing it would drop the InternalIP and break Cilium.
+	// Erroring makes cloud-node keep the last good addresses.
+	if vm.PrivateIPv4 == "" {
+		return nil, fmt.Errorf("cloudprovider: VM %s has no private IPv4 address in the InSpace answer; keeping the node's last addresses", vm.UUID)
 	}
+	addresses := make([]corev1.NodeAddress, 0, 4)
+	addresses = append(addresses, corev1.NodeAddress{Type: corev1.NodeInternalIP, Address: vm.PrivateIPv4})
 	externalIPv4, err := p.externalIPv4ForVM(ctx, location, vm)
 	if err != nil {
+		return nil, err
+	}
+	if err := p.holdExternalAddress(node, externalIPv4); err != nil {
 		return nil, err
 	}
 	if externalIPv4 != "" {
@@ -477,6 +536,41 @@ func instanceTypeForVM(vm *inspace.VM) string {
 		return fallback
 	}
 	return record.InstanceType
+}
+
+// holdExternalAddress keeps a node's last ExternalIP while the floating-IP list
+// answers empty, for addressShrinkGrace. A real unassignment shows up as a
+// persistent empty answer and is then accepted.
+func (p *Provider) holdExternalAddress(node *corev1.Node, externalIPv4 string) error {
+	p.lifecycleMu.Lock()
+	defer p.lifecycleMu.Unlock()
+	if externalIPv4 != "" {
+		delete(p.addressShrinkSince, node.Name)
+		return nil
+	}
+	hasExternal := false
+	for _, address := range node.Status.Addresses {
+		if address.Type == corev1.NodeExternalIP && net.ParseIP(address.Address) != nil && !strings.Contains(address.Address, ":") {
+			hasExternal = true
+		}
+	}
+	if !hasExternal {
+		delete(p.addressShrinkSince, node.Name)
+		return nil
+	}
+	if p.addressShrinkSince == nil {
+		p.addressShrinkSince = map[string]time.Time{}
+	}
+	now := p.standardNLBTime()
+	first, seen := p.addressShrinkSince[node.Name]
+	if !seen {
+		p.addressShrinkSince[node.Name] = now
+		first = now
+	}
+	if now.Before(first.Add(addressShrinkGrace)) {
+		return fmt.Errorf("cloudprovider: no floating IPv4 is listed for node %s that already has an ExternalIP; holding it for %s before accepting the change", node.Name, addressShrinkGrace)
+	}
+	return nil
 }
 
 func (p *Provider) externalIPv4ForVM(ctx context.Context, location string, vm *inspace.VM) (string, error) {
@@ -544,11 +638,16 @@ func (p *Provider) resolveVM(ctx context.Context, node *corev1.Node) (*inspace.V
 		if err := p.validateResolvedVM(ctx, vm, id.UUID); err != nil {
 			return nil, err
 		}
+		if !strings.EqualFold(strings.TrimSpace(vm.Status), "deleted") {
+			// Seen alive: any earlier empty-evidence absence no longer counts.
+			p.clearSpacedAbsence(id.UUID)
+		}
 		if strings.EqualFold(strings.TrimSpace(vm.Status), "deleted") {
 			return nil, &exactVMReadAbsenceError{
-				location: id.Location,
-				uuid:     id.UUID,
-				cause:    errors.New("HTTP-200 VM detail is a deleted tombstone"),
+				location:  id.Location,
+				uuid:      id.UUID,
+				cause:     errors.New("HTTP-200 VM detail is a deleted tombstone"),
+				tombstone: true,
 			}
 		}
 		return vm, nil
@@ -597,7 +696,83 @@ func (p *Provider) resolveVM(ctx context.Context, node *corev1.Node) (*inspace.V
 	return vm, nil
 }
 
-func (p *Provider) corroborateExactVMAbsence(ctx context.Context, location, vmUUID string) error {
+// requireSpacedAbsence is the second leg of proof when the inventory or the VPC
+// membership is empty: an empty list is also what an API anomaly or a backend
+// failover looks like, so it only counts when the same VM is seen absent again
+// at least the convergence delay later.
+func (p *Provider) requireSpacedAbsence(vmUUID string) error {
+	p.lifecycleMu.Lock()
+	defer p.lifecycleMu.Unlock()
+	if p.emptyEvidenceSince == nil {
+		p.emptyEvidenceSince = map[string]time.Time{}
+	}
+	now := p.standardNLBTime()
+	first, seen := p.emptyEvidenceSince[vmUUID]
+	if !seen {
+		p.emptyEvidenceSince[vmUUID] = now
+		return fmt.Errorf("cloudprovider: exact VM %s read is absent but the VM inventory or VPC membership is empty; need a second spaced read before declaring it gone", vmUUID)
+	}
+	if now.Before(first.Add(standardNLBRemovalAbsenceDelay)) {
+		return fmt.Errorf("cloudprovider: exact VM %s absence is not yet confirmed by a spaced second read", vmUUID)
+	}
+	return nil
+}
+
+func (p *Provider) clearSpacedAbsence(vmUUID string) {
+	p.lifecycleMu.Lock()
+	delete(p.emptyEvidenceSince, vmUUID)
+	p.lifecycleMu.Unlock()
+}
+
+// guardMassAbsence refuses to declare more than half of the cluster's nodes
+// gone inside one window. cloud-node-lifecycle deletes a Node on a single false
+// answer, so a wrong-but-consistent API view would otherwise empty the cluster.
+func (p *Provider) guardMassAbsence(ctx context.Context, node *corev1.Node, vmUUID string) error {
+	if p.kubeClient == nil {
+		return nil
+	}
+	nodes, err := p.kubeClient.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return fmt.Errorf("cloudprovider: count Nodes before declaring VM %s gone: %w", vmUUID, err)
+	}
+	total := len(nodes.Items)
+	now := p.standardNLBTime()
+	p.lifecycleMu.Lock()
+	if p.absenceVerdicts == nil {
+		p.absenceVerdicts = map[string]time.Time{}
+	}
+	for uuid, at := range p.absenceVerdicts {
+		if now.Sub(at) > absenceVerdictWindow {
+			delete(p.absenceVerdicts, uuid)
+		}
+	}
+	// Only allowed verdicts count, and a refusal records nothing, so a refused
+	// VM cannot keep itself (or its neighbours) inside the window: the guard is
+	// a rate limit of at most half the cluster per window, not a permanent block.
+	gone := len(p.absenceVerdicts)
+	if _, counted := p.absenceVerdicts[vmUUID]; !counted {
+		gone++
+	}
+	refuse := total >= 2 && gone*2 > total
+	if !refuse {
+		if _, counted := p.absenceVerdicts[vmUUID]; !counted {
+			p.absenceVerdicts[vmUUID] = now
+		}
+	}
+	p.lifecycleMu.Unlock()
+	if refuse {
+		klog.Warningf("refusing to declare VM %s gone: %d of %d nodes would be gone within %s", vmUUID, gone, total, absenceVerdictWindow)
+		if p.standardNLBEvents != nil && node != nil {
+			p.standardNLBEvents.Eventf(node, corev1.EventTypeWarning, "MassNodeAbsenceRefused",
+				"%d of %d nodes would be declared gone within %s; refusing to delete Node objects. Check the InSpace API view, then delete Nodes by hand if they are really gone",
+				gone, total, absenceVerdictWindow)
+		}
+		return fmt.Errorf("cloudprovider: refusing to declare VM %s gone: more than half of the nodes (%d of %d) would be gone within %s", vmUUID, gone, total, absenceVerdictWindow)
+	}
+	return nil
+}
+
+func (p *Provider) corroborateExactVMAbsence(ctx context.Context, location, vmUUID string, tombstone bool) error {
 	vms, err := p.api.ListVMs(ctx, location)
 	if err != nil {
 		return fmt.Errorf("cloudprovider: corroborate exact VM %s absence with VM inventory: %w", vmUUID, err)
@@ -652,6 +827,10 @@ func (p *Provider) corroborateExactVMAbsence(ctx context.Context, location, vmUU
 	if _, present := members[strings.ToLower(vmUUID)]; present {
 		return fmt.Errorf("cloudprovider: exact VM %s read is absent but configured VPC still contains it", vmUUID)
 	}
+	if !tombstone && (len(vms) == 0 || len(members) == 0) {
+		return p.requireSpacedAbsence(vmUUID)
+	}
+	p.clearSpacedAbsence(vmUUID)
 	return nil
 }
 
@@ -799,25 +978,24 @@ func (f standardNLBMutationFence) validate() error {
 	switch f.Operation {
 	case standardNLBCreateLoadBalancer, standardNLBCreateFloatingIP:
 		if strings.TrimSpace(f.ResourceName) == "" || f.LoadBalancerUUID != "" || f.TargetUUID != "" ||
-			f.RuleUUID != "" || f.Protocol != "" || f.SourcePort != 0 || f.TargetPort != 0 || f.AbsenceObservedAt != "" {
+			f.RuleUUID != "" || f.Protocol != "" || f.SourcePort != 0 || f.TargetPort != 0 {
 			return fmt.Errorf("cloudprovider: %s fence has inconsistent resource identity", f.Operation)
 		}
 	case standardNLBAssignFloatingIP:
 		address, err := netip.ParseAddr(f.ResourceName)
 		if err != nil || !address.Is4() || !address.IsGlobalUnicast() || address.IsPrivate() || address.String() != f.ResourceName ||
 			!validNodeLoadBalancerCloudUUID(f.LoadBalancerUUID) || f.TargetUUID != "" || f.RuleUUID != "" ||
-			f.Protocol != "" || f.SourcePort != 0 || f.TargetPort != 0 || f.AbsenceObservedAt != "" {
+			f.Protocol != "" || f.SourcePort != 0 || f.TargetPort != 0 {
 			return errors.New("cloudprovider: assign-floating-ip fence has inconsistent resource identity")
 		}
 	case standardNLBAddTarget:
 		if !validNodeLoadBalancerCloudUUID(f.LoadBalancerUUID) || !validNodeLoadBalancerCloudUUID(f.TargetUUID) ||
-			f.ResourceName != "" || f.RuleUUID != "" || f.Protocol != "" || f.SourcePort != 0 || f.TargetPort != 0 || f.AbsenceObservedAt != "" {
+			f.ResourceName != "" || f.RuleUUID != "" || f.Protocol != "" || f.SourcePort != 0 || f.TargetPort != 0 {
 			return errors.New("cloudprovider: add-target fence has inconsistent resource identity")
 		}
 	case standardNLBAddRule:
 		if !validNodeLoadBalancerCloudUUID(f.LoadBalancerUUID) || f.ResourceName != "" || f.TargetUUID != "" ||
-			f.RuleUUID != "" || f.Protocol != "TCP" || f.SourcePort < 1 || f.SourcePort > 65535 || f.TargetPort < 1 || f.TargetPort > 65535 ||
-			f.AbsenceObservedAt != "" {
+			f.RuleUUID != "" || f.Protocol != "TCP" || f.SourcePort < 1 || f.SourcePort > 65535 || f.TargetPort < 1 || f.TargetPort > 65535 {
 			return errors.New("cloudprovider: add-rule fence has inconsistent resource identity")
 		}
 	case standardNLBUnassignFloatingIP:
@@ -850,6 +1028,10 @@ func (f standardNLBMutationFence) validate() error {
 		}
 	default:
 		return fmt.Errorf("cloudprovider: public NLB mutation fence has unknown operation %q", f.Operation)
+	}
+	createOperation := f.Operation == standardNLBCreateLoadBalancer || f.Operation == standardNLBCreateFloatingIP
+	if f.Attempt < 0 || f.Attempt > 1 || (f.Attempt != 0 && !createOperation) {
+		return fmt.Errorf("cloudprovider: %s fence has an invalid attempt count %d", f.Operation, f.Attempt)
 	}
 	if f.Version == standardNLBLegacyMutationVersion && standardNLBRemovalOperation(f.Operation) {
 		return fmt.Errorf("cloudprovider: legacy public NLB mutation fence version %d cannot describe removal %q", f.Version, f.Operation)
@@ -1036,6 +1218,11 @@ func (p *Provider) stageStandardNLBMutation(
 		return standardNLBMutationFence{}, "", err
 	}
 	if existing != nil {
+		if existing.Operation == desired.Operation && existing.ResourceName == desired.ResourceName {
+			// A retired create keeps its count so a re-staged intent cannot
+			// reset the one-re-create budget.
+			desired.Attempt = existing.Attempt
+		}
 		if existing.Phase == standardNLBPhaseIssued && !sameStandardNLBMutationIntent(*existing, desired) {
 			return standardNLBMutationFence{}, "", fmt.Errorf("cloudprovider: issued %s mutation must resolve before staging %s", existing.Operation, desired.Operation)
 		}
@@ -1066,6 +1253,24 @@ func standardNLBMutationKnownPreDispatch(err error) bool {
 	return errors.Is(err, inspace.ErrMutationBlocked) || errors.Is(err, inspace.ErrMutationNotDispatched)
 }
 
+// standardNLBMutationNotApplied is true when no request was dispatched or the
+// API gave a definite 4xx. Only the idempotent add-target, add-rule and assign
+// paths use it, after an exact readback shows the change absent, so the receipt
+// is cleared and retried instead of waiting out the retire window. Creates keep
+// their receipt: a paid create can report a 4xx after it committed.
+func standardNLBMutationNotApplied(err error) bool {
+	if standardNLBMutationKnownPreDispatch(err) {
+		return true
+	}
+	var apiErr *inspace.APIError
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+	return apiErr.StatusCode >= 400 && apiErr.StatusCode < 500 &&
+		apiErr.StatusCode != 408 && apiErr.StatusCode != 429 &&
+		!apiErr.Retryable && !apiErr.ResponseBodyIncomplete && !apiErr.ResponseBodyMalformed
+}
+
 func standardNLBMutationError(action string, err error) error {
 	if err == nil {
 		return nil
@@ -1090,11 +1295,89 @@ func (p *Provider) clearStandardNLBFenceAfterProvenNonDispatch(
 	}
 	clearCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), durableReceiptWriteTimeout)
 	defer cancel()
-	_, clearErr := p.replaceStandardNLBFence(clearCtx, service, expectedRaw, nil)
+	// A re-created create (Attempt > 0) follows an earlier dispatch that may
+	// still land, so clearing to nothing would reset the one-re-create budget
+	// and allow a fresh attempt-0 create: a third paid resource. Keep the count
+	// in an intent receipt instead.
+	var next *standardNLBMutationFence
+	if issued, parseErr := parseStandardNLBFence(expectedRaw); parseErr == nil && issued != nil && issued.Attempt > 0 &&
+		(issued.Operation == standardNLBCreateLoadBalancer || issued.Operation == standardNLBCreateFloatingIP) {
+		next = &standardNLBMutationFence{
+			Version: standardNLBMutationVersion, Operation: issued.Operation, Phase: standardNLBPhaseIntent,
+			RequestHash: issued.RequestHash, ResourceName: issued.ResourceName, Attempt: issued.Attempt,
+		}
+	}
+	_, clearErr := p.replaceStandardNLBFence(clearCtx, service, expectedRaw, next)
 	if clearErr != nil {
 		clearErr = fmt.Errorf("cloudprovider: clear proven non-dispatched public NLB receipt: %w", clearErr)
 	}
 	return errors.Join(rejection, clearErr)
+}
+
+// retireAbsentStandardNLBAdditive decides whether an issued additive receipt
+// whose resource is still absent can be dropped. A timed-out call may land
+// late, so nothing is retired before the slowest deadline plus a spacing delay
+// has passed since issue, and then only after two exact absent reads at least
+// the convergence delay apart. Adds and assignments are idempotent, so the
+// caller then replays them. A create is retired into a fresh intent that
+// carries Attempt+1: one re-create is allowed, a second one is refused so a
+// slow paid resource can never be duplicated more than once.
+func (p *Provider) retireAbsentStandardNLBAdditive(
+	ctx context.Context,
+	service *corev1.Service,
+	issued standardNLBMutationFence,
+) (bool, error) {
+	fence, raw, err := p.readStandardNLBFence(ctx, service)
+	if err != nil {
+		return false, err
+	}
+	if fence == nil {
+		return true, nil
+	}
+	if fence.Phase != standardNLBPhaseIssued || !sameStandardNLBMutationIntent(*fence, issued) {
+		return false, fmt.Errorf("cloudprovider: public NLB %s receipt changed while checking its absence", issued.Operation)
+	}
+	issuedAt, err := time.Parse(time.RFC3339Nano, fence.IssuedAt)
+	if err != nil {
+		return false, fmt.Errorf("cloudprovider: public NLB %s receipt has an invalid timestamp: %w", fence.Operation, err)
+	}
+	now := p.standardNLBTime()
+	if now.Before(issuedAt.Add(standardNLBAdditiveRetireDelay(fence.Operation))) {
+		return false, nil
+	}
+	if fence.AbsenceObservedAt == "" {
+		updated := *fence
+		updated.AbsenceObservedAt = now.Format(time.RFC3339Nano)
+		_, err := p.replaceStandardNLBFence(ctx, service, raw, &updated)
+		return false, err
+	}
+	observedAt, err := time.Parse(time.RFC3339Nano, fence.AbsenceObservedAt)
+	if err != nil {
+		return false, fmt.Errorf("cloudprovider: public NLB %s receipt has invalid absence evidence: %w", fence.Operation, err)
+	}
+	if now.Before(observedAt.Add(p.standardNLBRemovalDelay())) {
+		return false, nil
+	}
+	var next *standardNLBMutationFence
+	if fence.Operation == standardNLBCreateLoadBalancer || fence.Operation == standardNLBCreateFloatingIP {
+		if fence.Attempt >= 1 {
+			return false, fmt.Errorf(
+				"cloudprovider: public %s was already re-created once and is still absent after the retire window; "+
+					"refusing another paid create until the Service receipt is resolved manually",
+				fence.Operation,
+			)
+		}
+		next = &standardNLBMutationFence{
+			Version: standardNLBMutationVersion, Operation: fence.Operation, Phase: standardNLBPhaseIntent,
+			RequestHash: fence.RequestHash, ResourceName: fence.ResourceName, Attempt: fence.Attempt + 1,
+		}
+	}
+	klog.Warningf("retiring public NLB %s receipt for Service %s/%s: issued at %s and absent on two spaced reads",
+		fence.Operation, service.Namespace, service.Name, fence.IssuedAt)
+	if _, err := p.replaceStandardNLBFence(ctx, service, raw, next); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func standardNLBRemovalOperation(operation string) bool {
@@ -1334,7 +1617,25 @@ func (p *Provider) ensureStandardNLBLoadBalancer(
 			return nil, false, fmt.Errorf("cloudprovider: visible NLB %s does not match fenced create name %q", discovered.UUID, fence.ResourceName)
 		}
 		if fence.RequestHash != requestHash {
-			return nil, false, errors.New("cloudprovider: visible NLB cannot resolve its create fence because the exact requested rules or targets changed")
+			// A slow create can land after the node set moved. When only the
+			// targets differ, adopt the NLB and let the normal reconcile move
+			// its targets; a rules change still fails closed.
+			adopted := request
+			adopted.Targets = standardNLBVisibleCreateTargets(discovered)
+			adoptedHash, hashErr := standardNLBRequestHash(adopted)
+			if hashErr != nil {
+				return nil, false, hashErr
+			}
+			if adoptedHash != fence.RequestHash {
+				return nil, false, errors.New("cloudprovider: visible NLB cannot resolve its create fence because the exact requested rules or targets changed")
+			}
+			if err := validateStandardNLBInitialPolicy(discovered, adopted); err != nil {
+				return nil, false, err
+			}
+			if _, err := p.replaceStandardNLBFence(ctx, service, raw, nil); err != nil {
+				return nil, false, fmt.Errorf("cloudprovider: promote visible fenced NLB %s: %w", discovered.UUID, err)
+			}
+			return discovered, false, nil
 		}
 		if err := validateStandardNLBInitialPolicy(discovered, request); err != nil {
 			return nil, false, err
@@ -1346,6 +1647,18 @@ func (p *Provider) ensureStandardNLBLoadBalancer(
 	}
 	if fence != nil && fence.Operation != standardNLBCreateLoadBalancer {
 		return nil, false, fmt.Errorf("cloudprovider: %s mutation must resolve before creating the public NLB", fence.Operation)
+	}
+	if fence != nil && fence.Phase == standardNLBPhaseIssued && fence.ResourceName == request.DisplayName {
+		retired, retireErr := p.retireAbsentStandardNLBAdditive(ctx, service, *fence)
+		if retireErr != nil {
+			return nil, false, retireErr
+		}
+		if !retired {
+			return nil, false, fmt.Errorf(
+				"cloudprovider: public NLB create issued at %s remains ambiguous; refusing a second paid create until %q is observable or the retire window passes",
+				fence.IssuedAt, fence.ResourceName,
+			)
+		}
 	}
 
 	fenceValue, raw, err := p.stageStandardNLBMutation(ctx, service, desired)
@@ -1381,7 +1694,9 @@ func (p *Provider) ensureStandardNLBLoadBalancer(
 		rejection := fmt.Errorf("cloudprovider: reject public NLB create at final Service authority: %w", err)
 		return nil, false, p.clearStandardNLBFenceAfterProvenNonDispatch(ctx, service, raw, rejection)
 	}
-	created, createErr := p.api.CreateLoadBalancer(ctx, p.config.Location, request)
+	mutationCtx, cancelMutation := p.standardNLBMutationContext(ctx, standardNLBCreateLoadBalancerTimeout)
+	created, createErr := p.api.CreateLoadBalancer(mutationCtx, p.config.Location, request)
+	cancelMutation()
 	observed, listErr := p.findOwnedLoadBalancer(ctx, service)
 	if listErr != nil {
 		return nil, false, errors.Join(standardNLBMutationError("create public NLB", createErr), fmt.Errorf("cloudprovider: authoritative NLB create readback: %w", listErr))
@@ -1460,6 +1775,18 @@ func (p *Provider) ensureStandardNLBPublicFloatingIP(
 	if fence != nil && fence.Operation != standardNLBCreateFloatingIP {
 		return nil, fmt.Errorf("cloudprovider: %s mutation must resolve before creating the public floating IP", fence.Operation)
 	}
+	if fence != nil && fence.Phase == standardNLBPhaseIssued && fence.ResourceName == request.Name {
+		retired, retireErr := p.retireAbsentStandardNLBAdditive(ctx, service, *fence)
+		if retireErr != nil {
+			return nil, retireErr
+		}
+		if !retired {
+			return nil, fmt.Errorf(
+				"cloudprovider: public floating IP create issued at %s remains ambiguous; refusing a second create until %q is observable or the retire window passes",
+				fence.IssuedAt, fence.ResourceName,
+			)
+		}
+	}
 
 	fenceValue, raw, err := p.stageStandardNLBMutation(ctx, service, desired)
 	if err != nil {
@@ -1494,7 +1821,9 @@ func (p *Provider) ensureStandardNLBPublicFloatingIP(
 		rejection := fmt.Errorf("cloudprovider: reject public floating-IP create at final Service authority: %w", err)
 		return nil, p.clearStandardNLBFenceAfterProvenNonDispatch(ctx, service, raw, rejection)
 	}
-	created, createErr := p.api.CreateFloatingIP(ctx, p.config.Location, request)
+	mutationCtx, cancelMutation := p.standardNLBMutationContext(ctx, standardNLBCreateFloatingIPTimeout)
+	created, createErr := p.api.CreateFloatingIP(mutationCtx, p.config.Location, request)
+	cancelMutation()
 	observed, listErr := p.findOwnedFloatingIP(ctx, service)
 	if listErr != nil {
 		return nil, errors.Join(standardNLBMutationError("create public floating IP", createErr), fmt.Errorf("cloudprovider: authoritative floating IP create readback: %w", listErr))
@@ -1571,6 +1900,18 @@ func (p *Provider) ensureStandardNLBFloatingIPAssignment(
 	if err := validateServiceFloatingIPUnassigned(floatingIP); err != nil {
 		return nil, err
 	}
+	if fence != nil && fence.Phase == standardNLBPhaseIssued {
+		retired, retireErr := p.retireAbsentStandardNLBAdditive(ctx, service, *fence)
+		if retireErr != nil {
+			return nil, retireErr
+		}
+		if !retired {
+			return nil, fmt.Errorf(
+				"cloudprovider: floating IP %s assignment to NLB %s issued at %s remains ambiguous; refusing a blind replay until the retire window passes",
+				floatingIP.Address, loadBalancer.UUID, fence.IssuedAt,
+			)
+		}
+	}
 	fenceValue, raw, err := p.stageStandardNLBMutation(ctx, service, desired)
 	if err != nil {
 		return nil, err
@@ -1607,7 +1948,9 @@ func (p *Provider) ensureStandardNLBFloatingIPAssignment(
 		rejection := fmt.Errorf("cloudprovider: reject floating-IP assignment at final Service authority: %w", err)
 		return nil, p.clearStandardNLBFenceAfterProvenNonDispatch(ctx, service, raw, rejection)
 	}
-	_, mutationErr := p.api.AssignFloatingIP(ctx, p.config.Location, floatingIP.Address, loadBalancer.UUID, "load_balancer")
+	mutationCtx, cancelMutation := p.standardNLBMutationContext(ctx, standardNLBAssignTimeout)
+	_, mutationErr := p.api.AssignFloatingIP(mutationCtx, p.config.Location, floatingIP.Address, loadBalancer.UUID, "load_balancer")
+	cancelMutation()
 	observed, listErr := p.findOwnedFloatingIP(ctx, service)
 	if listErr != nil {
 		return nil, errors.Join(mutationErr, fmt.Errorf("cloudprovider: authoritative floating IP assignment readback: %w", listErr))
@@ -1626,7 +1969,7 @@ func (p *Provider) ensureStandardNLBFloatingIPAssignment(
 			return nil, err
 		}
 	}
-	if standardNLBMutationKnownPreDispatch(mutationErr) {
+	if standardNLBMutationNotApplied(mutationErr) {
 		return nil, p.clearStandardNLBFenceAfterProvenNonDispatch(ctx, service, raw, mutationErr)
 	}
 	if mutationErr != nil {
@@ -1667,11 +2010,18 @@ func (p *Provider) EnsureLoadBalancer(ctx context.Context, _ string, service *co
 				return nil, cloud.ImplementedElsewhere
 			}
 		}
+		if held, err := p.holdUnpublishedStandardNLB(ctx, service, lb, floatingIP); err != nil {
+			return nil, err
+		} else if held != nil {
+			// The NLB keeps following the Service while it is held.
+			return nil, errors.Join(held, p.reconcileHeldStandardNLB(ctx, service, lb, nodes))
+		}
 		if err := p.cleanupOwnedLoadBalancer(ctx, service, lb); err != nil {
 			return nil, err
 		}
 		return &corev1.LoadBalancerStatus{}, nil
 	}
+	p.clearUnpublishedMark(ctx, service)
 	if err := validateServiceFloatingIPState(floatingIP, lb); err != nil {
 		return nil, err
 	}
@@ -1752,8 +2102,16 @@ func (p *Provider) updateLoadBalancer(ctx context.Context, service *corev1.Servi
 				return cloud.ImplementedElsewhere
 			}
 		}
+		if held, err := p.holdUnpublishedStandardNLB(ctx, service, lb, floatingIP); err != nil {
+			return err
+		} else if held != nil {
+			// UpdateLoadBalancer runs on every node event; the Ensure path
+			// already reports the hold, so stay quiet here.
+			return p.reconcileHeldStandardNLB(ctx, service, lb, nodes)
+		}
 		return p.cleanupOwnedLoadBalancer(ctx, service, lb)
 	}
+	p.clearUnpublishedMark(ctx, service)
 	if err := validateServiceFloatingIPState(floatingIP, lb); err != nil {
 		return err
 	}
@@ -1798,6 +2156,149 @@ func (p *Provider) EnsureLoadBalancerDeleted(ctx context.Context, _ string, serv
 		return err
 	}
 	return p.cleanupOwnedLoadBalancer(ctx, service, lb)
+}
+
+// standardNLBReleaseAuthorized reports whether the owner has asked, after the
+// public markers were dropped, to delete the public NLB and floating IP. The
+// release annotation carries an RFC3339 time that must be later than the
+// recorded drop, so a value left from an earlier edit (or a plain "true")
+// cannot release an IP the owner has since forgotten about.
+func standardNLBReleaseAuthorized(service *corev1.Service) bool {
+	droppedAt, err := time.Parse(time.RFC3339Nano, service.Annotations[annotationStandardNLBUnpublishedAt])
+	if err != nil {
+		return false
+	}
+	releaseAt, err := time.Parse(time.RFC3339Nano, service.Annotations[AnnotationReleasePublicLoadBalancer])
+	return err == nil && releaseAt.After(droppedAt)
+}
+
+// standardNLBUnpublishHeld is true for a live LoadBalancer Service that lost its
+// public markers and has not been authorized to release. A Service that is
+// deleting or no longer a LoadBalancer is handled by the stock deletion path.
+func standardNLBUnpublishHeld(service *corev1.Service) bool {
+	if service.DeletionTimestamp != nil || service.Spec.Type != corev1.ServiceTypeLoadBalancer ||
+		service.Spec.LoadBalancerClass != nil {
+		return false
+	}
+	if explicitPublic, err := explicitPublicRequested(service); err != nil || explicitPublic {
+		return false
+	}
+	return !standardNLBReleaseAuthorized(service)
+}
+
+// holdUnpublishedStandardNLB returns a non-nil hold when a live Service lost its
+// public markers but still owns an NLB or floating IP. A dropped label or
+// annotation is usually a Helm/GitOps slip, and freeing the public IP cannot be
+// undone (DNS and customer allow-lists break), so deletion needs the Service to
+// be deleted (or changed to another type, which the stock controller handles
+// as a deletion) or a release time later than the drop. A cleanup already in
+// flight is allowed to finish so its receipt cannot be stranded. The first pass
+// records the drop time and raises one Event; later passes stay silent.
+func (p *Provider) holdUnpublishedStandardNLB(
+	ctx context.Context,
+	service *corev1.Service,
+	lb *inspace.LoadBalancer,
+	floatingIP *inspace.FloatingIP,
+) (hold error, err error) {
+	if lb == nil && floatingIP == nil {
+		return nil, nil
+	}
+	if p.standardNLBServiceStore == nil {
+		return nil, errors.New("cloudprovider: Initialize must install the Service metadata store before public NLB mutation")
+	}
+	current, err := p.standardNLBServiceStore.GetExact(ctx, service)
+	if err != nil {
+		return nil, fmt.Errorf("cloudprovider: read Service before holding an unpublished NLB: %w", err)
+	}
+	if err := validateExactStandardNLBService(service, current); err != nil {
+		return nil, err
+	}
+	if standardNLBReleaseAuthorized(current) {
+		return nil, nil
+	}
+	fence, err := parseStandardNLBFence(current.Annotations[annotationStandardNLBMutation])
+	if err != nil {
+		return nil, err
+	}
+	if fence != nil {
+		switch fence.Operation {
+		case standardNLBUnassignFloatingIP, standardNLBDeleteFloatingIP, standardNLBDeleteLoadBalancer:
+			return nil, nil
+		}
+	}
+	if current.Annotations[annotationStandardNLBUnpublishedAt] == "" {
+		marked := current.DeepCopy()
+		if marked.Annotations == nil {
+			marked.Annotations = map[string]string{}
+		}
+		marked.Annotations[annotationStandardNLBUnpublishedAt] = p.standardNLBTime().Format(time.RFC3339Nano)
+		if _, err := p.standardNLBServiceStore.UpdateExact(ctx, marked); err != nil {
+			return nil, fmt.Errorf("cloudprovider: record when the public markers were dropped: %w", err)
+		}
+		klog.Warningf("Service %s/%s lost its public markers; keeping its public NLB and floating IP", service.Namespace, service.Name)
+		if p.standardNLBEvents != nil {
+			p.standardNLBEvents.Eventf(service, corev1.EventTypeWarning, "PublicLoadBalancerHeld",
+				"The public markers were removed; the public NLB and floating IP are kept. Set %s to an RFC3339 time later than %s to delete them",
+				AnnotationReleasePublicLoadBalancer, marked.Annotations[annotationStandardNLBUnpublishedAt])
+		}
+	}
+	return fmt.Errorf(
+		"cloudprovider: Service %s/%s is no longer marked public but still owns a public NLB or floating IP; "+
+			"keeping them. Set annotation %s to an RFC3339 time later than the recorded drop (%s) to delete them, "+
+			"restore the public markers, or delete the Service",
+		service.Namespace, service.Name, AnnotationReleasePublicLoadBalancer, annotationStandardNLBUnpublishedAt,
+	), nil
+}
+
+// clearUnpublishedMark forgets the drop time once the Service is public again,
+// so a later unpublish starts a fresh hold.
+func (p *Provider) clearUnpublishedMark(ctx context.Context, service *corev1.Service) {
+	if _, marked := service.Annotations[annotationStandardNLBUnpublishedAt]; !marked || p.standardNLBServiceStore == nil {
+		return
+	}
+	current, err := p.standardNLBServiceStore.GetExact(ctx, service)
+	if err == nil {
+		err = validateExactStandardNLBService(service, current)
+	}
+	if err == nil {
+		if _, stored := current.Annotations[annotationStandardNLBUnpublishedAt]; stored {
+			cleared := current.DeepCopy()
+			delete(cleared.Annotations, annotationStandardNLBUnpublishedAt)
+			_, err = p.standardNLBServiceStore.UpdateExact(ctx, cleared)
+		}
+	}
+	if err != nil {
+		klog.Warningf("clear the unpublished mark of Service %s/%s: %v", service.Namespace, service.Name, err)
+	}
+}
+
+// heldReconcileKey marks a context whose mutations belong to a held-NLB
+// reconcile. Only then does the final Service authority accept forwarding
+// changes for a Service without public markers; every other path (deletion,
+// withdrawal) still treats such a Service as cleanup-only.
+type heldReconcileKey struct{}
+
+func heldReconcile(ctx context.Context) bool {
+	held, _ := ctx.Value(heldReconcileKey{}).(bool)
+	return held
+}
+
+// reconcileHeldStandardNLB keeps targets and rules of a held NLB following the
+// Service so a node rollout cannot strand the public IP on dead targets. It
+// never creates, assigns or deletes anything.
+func (p *Provider) reconcileHeldStandardNLB(ctx context.Context, service *corev1.Service, lb *inspace.LoadBalancer, nodes []*corev1.Node) error {
+	if lb == nil {
+		return nil
+	}
+	ctx = context.WithValue(ctx, heldReconcileKey{}, true)
+	if err := validateServiceShape(service); err != nil {
+		return err
+	}
+	targets, err := p.targetUUIDs(ctx, service, nodes)
+	if err != nil {
+		return err
+	}
+	return p.reconcileLoadBalancer(ctx, service, lb, targets, serviceRules(service))
 }
 
 func (p *Provider) cleanupOwnedLoadBalancer(ctx context.Context, service *corev1.Service, lb *inspace.LoadBalancer) error {
@@ -1858,7 +2359,9 @@ func (p *Provider) cleanupOwnedLoadBalancer(ctx context.Context, service *corev1
 		rejection := fmt.Errorf("cloudprovider: reject public NLB delete at final Service authority: %w", authorityErr)
 		return p.clearStandardNLBFenceAfterProvenNonDispatch(ctx, service, raw, rejection)
 	}
-	deleteErr := p.api.DeleteLoadBalancer(ctx, p.config.Location, lb.UUID)
+	mutationCtx, cancelMutation := p.standardNLBMutationContext(ctx, standardNLBDeleteTimeout)
+	deleteErr := p.api.DeleteLoadBalancer(mutationCtx, p.config.Location, lb.UUID)
+	cancelMutation()
 	if standardNLBMutationKnownPreDispatch(deleteErr) {
 		return p.clearStandardNLBFenceAfterProvenNonDispatch(ctx, service, raw, deleteErr)
 	}
@@ -2128,7 +2631,9 @@ func (p *Provider) cleanupOwnedFloatingIP(
 			rejection := fmt.Errorf("cloudprovider: reject floating-IP unassign at final Service authority: %w", err)
 			return p.clearStandardNLBFenceAfterProvenNonDispatch(ctx, service, raw, rejection)
 		}
-		_, unassignErr := p.api.UnassignFloatingIP(ctx, p.config.Location, address)
+		mutationCtx, cancelMutation := p.standardNLBMutationContext(ctx, standardNLBDeleteTimeout)
+		_, unassignErr := p.api.UnassignFloatingIP(mutationCtx, p.config.Location, address)
+		cancelMutation()
 		if standardNLBMutationKnownPreDispatch(unassignErr) {
 			return p.clearStandardNLBFenceAfterProvenNonDispatch(ctx, service, raw, unassignErr)
 		}
@@ -2198,7 +2703,9 @@ func (p *Provider) cleanupOwnedFloatingIP(
 		rejection := fmt.Errorf("cloudprovider: reject floating-IP delete at final Service authority: %w", err)
 		return p.clearStandardNLBFenceAfterProvenNonDispatch(ctx, service, raw, rejection)
 	}
-	deleteErr := p.api.DeleteFloatingIP(ctx, p.config.Location, address)
+	mutationCtx, cancelMutation := p.standardNLBMutationContext(ctx, standardNLBDeleteTimeout)
+	deleteErr := p.api.DeleteFloatingIP(mutationCtx, p.config.Location, address)
+	cancelMutation()
 	if standardNLBMutationKnownPreDispatch(deleteErr) {
 		return p.clearStandardNLBFenceAfterProvenNonDispatch(ctx, service, raw, deleteErr)
 	}
@@ -2650,6 +3157,7 @@ type standardNLBLiveDesiredState struct {
 	service          *corev1.Service
 	public           bool
 	lifecycleCleanup bool
+	held             bool
 	targets          []string
 	rules            []inspace.LoadBalancerRule
 }
@@ -2694,6 +3202,14 @@ func (p *Provider) readStandardNLBLiveDesiredState(
 		}
 		state.lifecycleCleanup = !explicitPublic
 		state.public = explicitPublic
+		if !explicitPublic && heldReconcile(ctx) && standardNLBUnpublishHeld(current) {
+			// Held: not public, but not released either. Forwarding state may
+			// still follow the Service; creates, assignments and deletions
+			// stay unauthorized.
+			state.lifecycleCleanup = false
+			state.public = true
+			state.held = true
+		}
 	}
 	needsLivePolicy := true
 	switch fence.Operation {
@@ -2705,7 +3221,11 @@ func (p *Provider) readStandardNLBLiveDesiredState(
 		needsLivePolicy = false
 	}
 	if state.public && needsLivePolicy {
-		if err := validateService(current); err != nil {
+		policy := validateService
+		if state.held {
+			policy = validateServiceShape
+		}
+		if err := policy(current); err != nil {
 			return standardNLBLiveDesiredState{}, fmt.Errorf("cloudprovider: final public NLB Service policy: %w", err)
 		}
 		state.targets, err = p.freshStandardNLBTargetUUIDs(ctx, current)
@@ -2812,6 +3332,15 @@ func (p *Provider) authorizeStandardNLBMutationPreDispatch(
 		}
 		return nil
 	}
+	requireNotHeld := func() error {
+		if err := requirePublic(); err != nil {
+			return err
+		}
+		if state.held {
+			return errors.New("cloudprovider: creating or assigning public NLB resources is not authorized while the Service is held")
+		}
+		return nil
+	}
 	requestHashMatches := func(value any) error {
 		hash, hashErr := standardNLBRequestHash(value)
 		if hashErr != nil {
@@ -2825,7 +3354,7 @@ func (p *Provider) authorizeStandardNLBMutationPreDispatch(
 
 	switch fence.Operation {
 	case standardNLBCreateLoadBalancer:
-		if err := requirePublic(); err != nil {
+		if err := requireNotHeld(); err != nil {
 			return err
 		}
 		request := standardNLBDesiredRequest(p, state.service, state.targets, state.rules)
@@ -2842,7 +3371,7 @@ func (p *Provider) authorizeStandardNLBMutationPreDispatch(
 		}
 		return nil
 	case standardNLBCreateFloatingIP:
-		if err := requirePublic(); err != nil {
+		if err := requireNotHeld(); err != nil {
 			return err
 		}
 		request := inspace.CreateFloatingIPRequest{
@@ -2857,7 +3386,7 @@ func (p *Provider) authorizeStandardNLBMutationPreDispatch(
 		_, err := p.authorizeStandardNLBTopology(ctx, state)
 		return err
 	case standardNLBAssignFloatingIP:
-		if err := requirePublic(); err != nil {
+		if err := requireNotHeld(); err != nil {
 			return err
 		}
 		if err := requestHashMatches(struct {
@@ -3409,15 +3938,24 @@ func (p *Provider) resolvePendingStandardNLBAdd(
 			_, err := p.replaceStandardNLBFence(ctx, service, raw, nil)
 			return err
 		}
-		if fence.Phase == standardNLBPhaseIssued {
-			return fmt.Errorf(
-				"cloudprovider: add target %s to NLB %s issued at %s remains ambiguous; refusing a blind replay",
-				fence.TargetUUID, fence.LoadBalancerUUID, fence.IssuedAt,
-			)
-		}
 		if !desiredStandardNLBTarget(targetUUIDs, fence.TargetUUID) {
+			// The exact read above shows the target absent and the Service no
+			// longer wants it: a stuck add must not block the rest of the
+			// reconcile. If it lands late, the normal removal path handles it.
 			_, err := p.replaceStandardNLBFence(ctx, service, raw, nil)
 			return err
+		}
+		if fence.Phase == standardNLBPhaseIssued {
+			retired, retireErr := p.retireAbsentStandardNLBAdditive(ctx, service, *fence)
+			if retireErr != nil {
+				return retireErr
+			}
+			if !retired {
+				return fmt.Errorf(
+					"cloudprovider: add target %s to NLB %s issued at %s remains ambiguous; refusing a blind replay until the retire window passes",
+					fence.TargetUUID, fence.LoadBalancerUUID, fence.IssuedAt,
+				)
+			}
 		}
 		return nil
 	case standardNLBAddRule:
@@ -3437,15 +3975,21 @@ func (p *Provider) resolvePendingStandardNLBAdd(
 			_, err := p.replaceStandardNLBFence(ctx, service, raw, nil)
 			return err
 		}
-		if fence.Phase == standardNLBPhaseIssued {
-			return fmt.Errorf(
-				"cloudprovider: add rule %d->%d to NLB %s issued at %s remains ambiguous; refusing a blind replay",
-				fence.SourcePort, fence.TargetPort, fence.LoadBalancerUUID, fence.IssuedAt,
-			)
-		}
 		if !desiredStandardNLBRule(rules, *fence) {
 			_, err := p.replaceStandardNLBFence(ctx, service, raw, nil)
 			return err
+		}
+		if fence.Phase == standardNLBPhaseIssued {
+			retired, retireErr := p.retireAbsentStandardNLBAdditive(ctx, service, *fence)
+			if retireErr != nil {
+				return retireErr
+			}
+			if !retired {
+				return fmt.Errorf(
+					"cloudprovider: add rule %d->%d to NLB %s issued at %s remains ambiguous; refusing a blind replay until the retire window passes",
+					fence.SourcePort, fence.TargetPort, fence.LoadBalancerUUID, fence.IssuedAt,
+				)
+			}
 		}
 		return nil
 	default:
@@ -3501,7 +4045,9 @@ func (p *Provider) addStandardNLBTarget(
 		rejection := fmt.Errorf("cloudprovider: reject add-target at final Service authority: %w", err)
 		return nil, p.clearStandardNLBFenceAfterProvenNonDispatch(ctx, service, raw, rejection)
 	}
-	response, mutationErr := p.api.AddLoadBalancerTarget(ctx, p.config.Location, lb.UUID, targetUUID)
+	mutationCtx, cancelMutation := p.standardNLBMutationContext(ctx, standardNLBRelationTimeout)
+	response, mutationErr := p.api.AddLoadBalancerTarget(mutationCtx, p.config.Location, lb.UUID, targetUUID)
+	cancelMutation()
 	observed, exactAbsent, readErr := p.readExactOwnedStandardNLB(ctx, service, lb.UUID)
 	if readErr != nil {
 		return nil, errors.Join(mutationErr, fmt.Errorf("cloudprovider: authoritative NLB target readback: %w", readErr))
@@ -3521,7 +4067,7 @@ func (p *Provider) addStandardNLBTarget(
 			return observed, nil
 		}
 	}
-	if standardNLBMutationKnownPreDispatch(mutationErr) {
+	if standardNLBMutationNotApplied(mutationErr) {
 		return nil, p.clearStandardNLBFenceAfterProvenNonDispatch(ctx, service, raw, mutationErr)
 	}
 	if mutationErr != nil {
@@ -3572,7 +4118,9 @@ func (p *Provider) addStandardNLBRule(
 		rejection := fmt.Errorf("cloudprovider: reject add-rule at final Service authority: %w", err)
 		return nil, p.clearStandardNLBFenceAfterProvenNonDispatch(ctx, service, raw, rejection)
 	}
-	response, mutationErr := p.api.AddLoadBalancerRule(ctx, p.config.Location, lb.UUID, rule)
+	mutationCtx, cancelMutation := p.standardNLBMutationContext(ctx, standardNLBRelationTimeout)
+	response, mutationErr := p.api.AddLoadBalancerRule(mutationCtx, p.config.Location, lb.UUID, rule)
+	cancelMutation()
 	observed, exactAbsent, readErr := p.readExactOwnedStandardNLB(ctx, service, lb.UUID)
 	if readErr != nil {
 		return nil, errors.Join(mutationErr, fmt.Errorf("cloudprovider: authoritative NLB rule readback: %w", readErr))
@@ -3593,7 +4141,7 @@ func (p *Provider) addStandardNLBRule(
 			return observed, nil
 		}
 	}
-	if standardNLBMutationKnownPreDispatch(mutationErr) {
+	if standardNLBMutationNotApplied(mutationErr) {
 		return nil, p.clearStandardNLBFenceAfterProvenNonDispatch(ctx, service, raw, mutationErr)
 	}
 	if mutationErr != nil {
@@ -3641,7 +4189,9 @@ func (p *Provider) removeStandardNLBTarget(
 		rejection := fmt.Errorf("cloudprovider: reject remove-target at final Service authority: %w", authorityErr)
 		return nil, p.clearStandardNLBFenceAfterProvenNonDispatch(ctx, service, raw, rejection)
 	}
-	mutationErr := p.api.RemoveLoadBalancerTarget(ctx, p.config.Location, lb.UUID, targetUUID)
+	mutationCtx, cancelMutation := p.standardNLBMutationContext(ctx, standardNLBRelationTimeout)
+	mutationErr := p.api.RemoveLoadBalancerTarget(mutationCtx, p.config.Location, lb.UUID, targetUUID)
+	cancelMutation()
 	if standardNLBMutationKnownPreDispatch(mutationErr) {
 		return nil, p.clearStandardNLBFenceAfterProvenNonDispatch(ctx, service, raw, mutationErr)
 	}
@@ -3709,7 +4259,9 @@ func (p *Provider) removeStandardNLBRule(
 		rejection := fmt.Errorf("cloudprovider: reject remove-rule at final Service authority: %w", authorityErr)
 		return nil, p.clearStandardNLBFenceAfterProvenNonDispatch(ctx, service, raw, rejection)
 	}
-	mutationErr := p.api.RemoveLoadBalancerRule(ctx, p.config.Location, lb.UUID, ruleUUID)
+	mutationCtx, cancelMutation := p.standardNLBMutationContext(ctx, standardNLBRelationTimeout)
+	mutationErr := p.api.RemoveLoadBalancerRule(mutationCtx, p.config.Location, lb.UUID, ruleUUID)
+	cancelMutation()
 	if standardNLBMutationKnownPreDispatch(mutationErr) {
 		return nil, p.clearStandardNLBFenceAfterProvenNonDispatch(ctx, service, raw, mutationErr)
 	}
@@ -3733,6 +4285,91 @@ func (p *Provider) removeStandardNLBRule(
 	return nil, errors.Join(mutationErr, observeErr, standardNLBRemovalPending(fence))
 }
 
+// noteEmptyTargetSet records, once, when the desired target set first came up
+// empty and raises one Warning Event for that state change. The start time is
+// kept on the Service so the grace period survives controller restarts.
+func (p *Provider) noteEmptyTargetSet(ctx context.Context, service *corev1.Service, lb *inspace.LoadBalancer) (time.Time, error) {
+	if p.standardNLBServiceStore == nil {
+		return time.Time{}, nil
+	}
+	current, err := p.standardNLBServiceStore.GetExact(ctx, service)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("cloudprovider: read empty target set mark: %w", err)
+	}
+	if err := validateExactStandardNLBService(service, current); err != nil {
+		return time.Time{}, err
+	}
+	if value := current.Annotations[annotationStandardNLBEmptyTargetsSince]; value != "" {
+		since, parseErr := time.Parse(time.RFC3339Nano, value)
+		if parseErr != nil {
+			return time.Time{}, fmt.Errorf("cloudprovider: invalid empty target set mark %q: %w", value, parseErr)
+		}
+		return since, nil
+	}
+	now := p.standardNLBTime()
+	marked := current.DeepCopy()
+	if marked.Annotations == nil {
+		marked.Annotations = map[string]string{}
+	}
+	marked.Annotations[annotationStandardNLBEmptyTargetsSince] = now.Format(time.RFC3339Nano)
+	if _, err := p.standardNLBServiceStore.UpdateExact(ctx, marked); err != nil {
+		return time.Time{}, fmt.Errorf("cloudprovider: record empty target set mark: %w", err)
+	}
+	klog.Warningf("public NLB %s of Service %s/%s: desired target set is empty; keeping the %d last known good targets for %s",
+		lb.UUID, service.Namespace, service.Name, len(lb.Targets), emptyTargetSetGrace)
+	if p.standardNLBEvents != nil {
+		p.standardNLBEvents.Eventf(service, corev1.EventTypeWarning, "EmptyTargetSetHeld",
+			"No eligible node is available for public NLB %s; keeping its %d current targets for %s before dropping targets whose VM is gone",
+			lb.UUID, len(lb.Targets), emptyTargetSetGrace)
+	}
+	return now, nil
+}
+
+func (p *Provider) clearEmptyTargetSet(ctx context.Context, service *corev1.Service) error {
+	if p.standardNLBServiceStore == nil {
+		return nil
+	}
+	current, err := p.standardNLBServiceStore.GetExact(ctx, service)
+	if err != nil {
+		return err
+	}
+	if err := validateExactStandardNLBService(service, current); err != nil {
+		return err
+	}
+	if _, marked := current.Annotations[annotationStandardNLBEmptyTargetsSince]; !marked {
+		return nil
+	}
+	cleared := current.DeepCopy()
+	delete(cleared.Annotations, annotationStandardNLBEmptyTargetsSince)
+	_, err = p.standardNLBServiceStore.UpdateExact(ctx, cleared)
+	return err
+}
+
+// emptyTargetSetMayRemove reports whether one target may go while the desired
+// set is empty: only after the grace period, and only when an exact VM read
+// proves the VM is gone.
+func (p *Provider) emptyTargetSetMayRemove(
+	ctx context.Context,
+	service *corev1.Service,
+	lb *inspace.LoadBalancer,
+	targetUUID string,
+	since time.Time,
+) (bool, error) {
+	if since.IsZero() || p.standardNLBTime().Before(since.Add(emptyTargetSetGrace)) {
+		return false, nil
+	}
+	_, err := p.api.GetVM(ctx, p.config.Location, targetUUID)
+	if err == nil {
+		return false, nil
+	}
+	if !inspace.IsNotFound(err) {
+		return false, fmt.Errorf("cloudprovider: read VM %s of NLB %s before dropping it: %w", targetUUID, lb.UUID, err)
+	}
+	klog.Warningf("public NLB %s of Service %s/%s: dropping target %s because its VM no longer exists",
+		lb.UUID, service.Namespace, service.Name, targetUUID)
+	return true, nil
+}
+
 func (p *Provider) reconcileLoadBalancer(ctx context.Context, service *corev1.Service, lb *inspace.LoadBalancer, targetUUIDs []string, rules []inspace.LoadBalancerRule) error {
 	if err := p.resolvePendingStandardNLBAdd(ctx, service, lb, targetUUIDs, rules); err != nil {
 		return err
@@ -3744,20 +4381,68 @@ func (p *Provider) reconcileLoadBalancer(ctx context.Context, service *corev1.Se
 	currentTargets := make(map[string]struct{}, len(lb.Targets))
 	for _, target := range lb.Targets {
 		currentTargets[target.TargetUUID] = struct{}{}
-		if _, wanted := desiredTargets[target.TargetUUID]; !wanted {
-			_, err := p.removeStandardNLBTarget(ctx, service, lb, target.TargetUUID)
-			return err
-		}
 	}
+	// Add before remove: a rollout must never leave the NLB without a target
+	// while each removal waits for its negative readbacks. A failed add is kept
+	// and reported at the end so it cannot starve removals and rule updates.
+	var addErr error
 	for _, uuid := range targetUUIDs {
 		if _, exists := currentTargets[uuid]; !exists {
 			refreshed, err := p.addStandardNLBTarget(ctx, service, lb, uuid)
 			if err != nil {
-				return err
+				addErr = err
+				break
 			}
 			lb = refreshed
 			currentTargets[uuid] = struct{}{}
 		}
+	}
+	var emptySince time.Time
+	if len(desiredTargets) == 0 && len(lb.Targets) > 0 {
+		since, noteErr := p.noteEmptyTargetSet(ctx, service, lb)
+		if noteErr != nil {
+			return errors.Join(addErr, noteErr)
+		}
+		emptySince = since
+	} else if len(desiredTargets) > 0 {
+		if _, marked := service.Annotations[annotationStandardNLBEmptyTargetsSince]; marked {
+			if clearErr := p.clearEmptyTargetSet(ctx, service); clearErr != nil {
+				klog.Warningf("clear the empty target set mark of Service %s/%s: %v", service.Namespace, service.Name, clearErr)
+			}
+		}
+	}
+	servingDesired := 0
+	for _, target := range lb.Targets {
+		if _, wanted := desiredTargets[target.TargetUUID]; wanted {
+			servingDesired++
+		}
+	}
+	for _, target := range lb.Targets {
+		if _, wanted := desiredTargets[target.TargetUUID]; wanted {
+			continue
+		}
+		if servingDesired == 0 && len(desiredTargets) > 0 {
+			klog.Warningf("public NLB %s of Service %s/%s: no desired target serves yet; keeping the %d current targets",
+				lb.UUID, service.Namespace, service.Name, len(lb.Targets))
+			break
+		}
+		if len(desiredTargets) == 0 {
+			// An empty desired set usually means NotReady nodes, an API
+			// brownout or a pod restart, not "serve nothing". Like upstream
+			// (KEP-3458) keep the last known good targets instead of
+			// turning a transient fault into an outage. The hold is bounded:
+			// after the grace period only targets whose VM is provably gone
+			// are removed.
+			removable, holdErr := p.emptyTargetSetMayRemove(ctx, service, lb, target.TargetUUID, emptySince)
+			if holdErr != nil {
+				return errors.Join(addErr, holdErr)
+			}
+			if !removable {
+				continue
+			}
+		}
+		_, err := p.removeStandardNLBTarget(ctx, service, lb, target.TargetUUID)
+		return errors.Join(addErr, err)
 	}
 
 	desiredRules := make(map[int32]inspace.LoadBalancerRule, len(rules))
@@ -3773,7 +4458,7 @@ func (p *Provider) reconcileLoadBalancer(ctx context.Context, service *corev1.Se
 				return fmt.Errorf("cloudprovider: forwarding rule on port %d has no UUID", current.SourcePort)
 			}
 			_, err := p.removeStandardNLBRule(ctx, service, lb, current.UUID)
-			return err
+			return errors.Join(addErr, err)
 		}
 	}
 	for _, desired := range rules {
@@ -3782,12 +4467,12 @@ func (p *Provider) reconcileLoadBalancer(ctx context.Context, service *corev1.Se
 		}
 		refreshed, err := p.addStandardNLBRule(ctx, service, lb, desired)
 		if err != nil {
-			return err
+			return errors.Join(addErr, err)
 		}
 		lb = refreshed
 		currentRules[desired.SourcePort] = desired
 	}
-	return nil
+	return addErr
 }
 
 func validateService(service *corev1.Service) error {
@@ -3803,6 +4488,18 @@ func validateService(service *corev1.Service) error {
 	}
 	if !explicitPublic {
 		return errors.New("cloudprovider: InSpace NLB requires the public scope label and public=true annotation")
+	}
+	return validateServiceShape(service)
+}
+
+// validateServiceShape checks the parts of a Service the NLB can express,
+// without requiring the public markers.
+func validateServiceShape(service *corev1.Service) error {
+	if service == nil {
+		return errors.New("cloudprovider: service is required")
+	}
+	if len(service.Spec.LoadBalancerSourceRanges) != 0 {
+		return errors.New("cloudprovider: loadBalancerSourceRanges is unsupported; InSpace NLB exposes TCP forwarding only")
 	}
 	for _, port := range service.Spec.Ports {
 		if port.Protocol != "" && port.Protocol != corev1.ProtocolTCP {
@@ -4020,3 +4717,51 @@ var (
 	_ cloud.InstancesV2  = (*Provider)(nil)
 	_ cloud.LoadBalancer = (*Provider)(nil)
 )
+
+// Each NLB or floating-IP mutation gets its own deadline so a hung InSpace POST
+// cannot hold the single worker and the global mutex for the client's 5-minute
+// timeout, yet slow-but-healthy calls are not cut off. Create NLB is the
+// slowest; a cut-off call is ambiguous like any timeout and is resolved by the
+// durable receipt, the readbacks and the retire rule.
+const (
+	standardNLBCreateLoadBalancerTimeout = 5 * time.Minute
+	standardNLBCreateFloatingIPTimeout   = 90 * time.Second
+	standardNLBAssignTimeout             = 3 * time.Minute
+	standardNLBDeleteTimeout             = 3 * time.Minute
+	standardNLBRelationTimeout           = 2 * time.Minute
+)
+
+// standardNLBAdditiveRetireDelay is how long an issued additive receipt stays
+// authoritative: the deadline of its own operation plus the spacing delay. Only
+// after it, and two exact absent reads, may the receipt be retired. It always
+// uses the real per-operation deadline, never the test override.
+func standardNLBAdditiveRetireDelay(operation string) time.Duration {
+	timeout := standardNLBRelationTimeout
+	switch operation {
+	case standardNLBCreateLoadBalancer:
+		timeout = standardNLBCreateLoadBalancerTimeout
+	case standardNLBCreateFloatingIP:
+		timeout = standardNLBCreateFloatingIPTimeout
+	case standardNLBAssignFloatingIP:
+		timeout = standardNLBAssignTimeout
+	}
+	return timeout + standardNLBRemovalAbsenceDelay
+}
+
+func (p *Provider) standardNLBMutationContext(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	if p.standardNLBMutationTimeout > 0 {
+		timeout = p.standardNLBMutationTimeout
+	}
+	return context.WithTimeout(ctx, timeout)
+}
+
+// standardNLBVisibleCreateTargets rebuilds the target list of a create request
+// from what the visible NLB carries, in the sorted order requests use.
+func standardNLBVisibleCreateTargets(lb *inspace.LoadBalancer) []inspace.LoadBalancerTarget {
+	targets := make([]inspace.LoadBalancerTarget, 0, len(lb.Targets))
+	for _, target := range lb.Targets {
+		targets = append(targets, inspace.LoadBalancerTarget{TargetUUID: target.TargetUUID, TargetType: "vm"})
+	}
+	sort.Slice(targets, func(i, j int) bool { return targets[i].TargetUUID < targets[j].TargetUUID })
+	return targets
+}

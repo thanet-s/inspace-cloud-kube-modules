@@ -126,6 +126,14 @@ do not conflict. A conflict automatically creates another shard. The optional
 own FIP, so values above one publish multiple addresses rather than one virtual
 IP.
 
+The CCM runs two `hostNetwork` replicas that each bind port 10258. By default
+the chart keeps them on different nodes (`ccm.antiAffinity: required`), replaces
+pods in place (`maxSurge: 0`, `maxUnavailable: 1`), restarts a wedged process
+through a slow `/healthz` liveness probe (`ccm.livenessProbe`), and renders a
+PodDisruptionBudget with `maxUnavailable: 1` when `ccm.replicaCount` is above
+one (`ccm.podDisruptionBudget`). A non-empty `ccm.affinity` replaces the
+generated anti-affinity.
+
 Dedicated mode always creates a separate shard and supports an exact catalog
 shape through Service annotations:
 
@@ -297,6 +305,49 @@ all `public-node-local` Services, even when their current endpoint-node sets do
 not overlap. The lowest lexicographic Service UID wins deterministically. CCM
 withdraws the losing Service and emits `PublicNodeLocalPortConflict`; it does
 not let two Cilium Services program the same node frontend.
+
+A serving `public-node-local` Service keeps serving while its spec changes, and
+nodes that are verifiably gone, excluded or without an endpoint still leave the
+edge one at a time. A change of `service.inspace.cloud/node-lb-pool`, of the
+ports, or of `loadBalancerSourceRanges` (narrowing, widening or both) is applied
+in place, make-before-break, on the same Service, and the edge is never empty:
+CCM records the target pool and policy next to the active ones, serves the union
+of both, and promotes the target only when every target node is on the edge.
+For a pool switch, the target nodes get their child VIP, firewall and FIP first,
+and the old pool's nodes then leave in the usual order (FIP, firewall, VIP). For
+a policy change, CCM creates the second firewall, attaches it to the VMs next to
+the old one, promotes, then detaches and deletes the old firewall. The old
+firewall stays attached only until the new one is attached and read back, and
+the child Service keeps the union of the old and new ports and source ranges
+until the old firewall is gone, so no port closes before its firewall does. A
+change back to the active identity, or on to a third one, ends the transition
+first. If the target pool would take a protocol and port that a peer already
+serves, the change is refused with `PublicNodeLocalTransitionRefused` and the
+active exposure stays. While the target pool has no node that is Ready and has a
+local endpoint, the change waits with `PublicNodeLocalTransitionPending`.
+To apply a change by the old withdraw-and-rebuild instead, accepting the short
+outage, annotate the Service with `service.inspace.cloud/node-lb-allow-rebuild`
+and any value. CCM honours a value once: it records the raw value in
+`service.inspace.cloud/node-lb-allow-rebuild-consumed`, emits
+`PublicNodeLocalRebuildAllowed`, and finishes the withdrawal before it rebuilds,
+even if the cloud detach readback lags. The same value is not honoured again
+until the annotation is removed or set to another value, so a manifest that
+keeps it cannot replay a rebuild on a later change.
+
+Runbook for a rebuild that does not finish. A rebuild sets
+`service.inspace.cloud/node-lb-rebuilding` and withdraws the edge first; it ends
+when every Service firewall detach has been read back. A VM of another billing
+account or VPC, or a parked firewall relation (`PublicNodeLocalFirewallRelationStuck`),
+can keep a detach from ever reading back. To cancel, remove the
+`node-lb-allow-rebuild` annotation. If no detach has been read back yet, CCM
+clears the marker and the Service goes back to normal in-place convergence,
+carrying the pending change out make-before-break. If a detach has already been
+read back, the rebuild cannot be cancelled: CCM emits `PublicNodeLocalRebuildStuck`
+and keeps withdrawing. Recover by making the blocked detach possible: remove or
+fix the blocking VM (for example drain and delete a node whose VM is in another
+billing account), or wait for the park of the relation to end (CCM retries a
+parked detach of the previous firewall at every pass, and the other parked
+relations after 30 minutes). As a last resort delete and recreate the Service.
 
 The generic public-NLB path remains an explicit, paid, TCP-only InSpace NLB. A
 Service using that path deliberately leaves `loadBalancerClass` unset for
