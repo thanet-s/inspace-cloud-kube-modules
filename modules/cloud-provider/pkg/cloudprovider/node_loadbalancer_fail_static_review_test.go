@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -13,6 +14,8 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	kubefake "k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
+
+	inspace "github.com/thanet-s/inspace-cloud-kube-modules/modules/client"
 )
 
 // The incumbent keeps its claim from the parent's own state. A child that is
@@ -323,4 +326,71 @@ func TestPublicNodeLocalStuckAddDoesNotStarveGoneRemoval(t *testing.T) {
 		}
 	}
 	t.Fatalf("the gone node stayed on the edge behind the stuck add: %#v", observePublicNodeLocal(t, f))
+}
+
+// A cloud answer alone (an empty VPC member list) never withdraws the whole
+// Service after one observation. It takes two reads that are spaced apart.
+func TestPublicNodeLocalFullWithdrawNeedsSpacedConfirmationFromCloudOnlyEvidence(t *testing.T) {
+	f := newPublishedPublicNodeLocalFixtureN(t, 2)
+	now := time.Date(2026, 10, 28, 12, 0, 0, 0, time.UTC)
+	f.controller.publicNodeLocalNow = func() time.Time { return now }
+	f.api.network = &inspace.Network{UUID: testNetworkUUID, VMUUIDs: []string{}}
+	before := f.current(t)
+	childBefore := trackedPublicNodeLocalDatapath(t, f)
+
+	for pass := 0; pass < 12; pass++ {
+		err := f.controller.syncPublicNodeLocal(f.ctx, f.key, f.current(t))
+		var holding *errPublicNodeLocalHolding
+		if err != nil && !errors.As(err, &holding) {
+			t.Fatalf("pass %d: %v", pass, err)
+		}
+		if !reflect.DeepEqual(f.current(t).Status, before.Status) || len(f.api.unassignedFirewalls) != 0 ||
+			!reflect.DeepEqual(trackedPublicNodeLocalDatapath(t, f).Status, childBefore.Status) {
+			t.Fatalf("pass %d: one observation of an empty member list withdrew the Service", pass)
+		}
+	}
+	now = now.Add(nodeLoadBalancerAbsenceConfirmationDelay + time.Second)
+	for pass := 0; pass < 60; pass++ {
+		// With an empty member list the relation fence itself refuses to touch
+		// the VMs, so the attempt shows as a fail-closed error.
+		err := f.controller.syncPublicNodeLocal(f.ctx, f.key, f.current(t))
+		var holding *errPublicNodeLocalHolding
+		if err != nil && !errors.As(err, &holding) && strings.Contains(err.Error(), "failing closed") {
+			return
+		}
+		if current := f.current(t); len(current.Status.LoadBalancer.Ingress) == 0 &&
+			current.Annotations[annotationPublicNodeLocalActivePool] == "" {
+			return
+		}
+	}
+	t.Fatalf("the second spaced observation did not withdraw the Service: %#v", f.current(t).Status)
+}
+
+// A recovered member list resets the confirmation.
+func TestPublicNodeLocalFullWithdrawConfirmationResetsWhenNodesReturn(t *testing.T) {
+	f := newPublishedPublicNodeLocalFixtureN(t, 2)
+	now := time.Date(2026, 10, 28, 12, 0, 0, 0, time.UTC)
+	f.controller.publicNodeLocalNow = func() time.Time { return now }
+	good := f.api.network
+	f.api.network = &inspace.Network{UUID: testNetworkUUID, VMUUIDs: []string{}}
+	for pass := 0; pass < 3; pass++ {
+		_ = f.controller.syncPublicNodeLocal(f.ctx, f.key, f.current(t))
+	}
+	f.api.network = good
+	now = now.Add(time.Minute)
+	for pass := 0; pass < 3; pass++ {
+		_ = f.controller.syncPublicNodeLocal(f.ctx, f.key, f.current(t))
+	}
+	f.api.network = &inspace.Network{UUID: testNetworkUUID, VMUUIDs: []string{}}
+	for pass := 0; pass < 12; pass++ {
+		// A withdrawal attempt would report a fail-closed error here.
+		err := f.controller.syncPublicNodeLocal(f.ctx, f.key, f.current(t))
+		var holding *errPublicNodeLocalHolding
+		if err != nil && !errors.As(err, &holding) {
+			t.Fatalf("pass %d tried to withdraw on a first observation: %v", pass, err)
+		}
+	}
+	if got := len(f.current(t).Status.LoadBalancer.Ingress); got != 2 {
+		t.Fatalf("an earlier observation counted after the member list recovered: %d FIPs", got)
+	}
 }

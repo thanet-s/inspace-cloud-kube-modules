@@ -133,6 +133,9 @@ type nodeLoadBalancerController struct {
 	// removal, never speed it up.
 	endpointGoneMu    sync.Mutex
 	endpointGoneSince map[string]time.Time
+	// allGoneSince records, in memory only, when every published Node of a Service
+	// was first seen gone on cloud evidence alone. Guarded by endpointGoneMu.
+	allGoneSince map[string]time.Time
 
 	nodesSynced          cache.InformerSynced
 	servicesSynced       cache.InformerSynced

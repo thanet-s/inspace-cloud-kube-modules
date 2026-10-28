@@ -23,6 +23,8 @@ const (
 	publicNodeLocalEndpointGoneGrace = 60 * time.Second
 
 	publicNodeLocalReasonNoReadyEndpoints = "PublicNodeLocalNoReadyEndpoints"
+
+	publicNodeLocalReasonAwaitingConfirmation = "PublicNodeLocalAwaitingConfirmation"
 )
 
 func (c *nodeLoadBalancerController) publicNodeLocalClock() time.Time {
@@ -309,13 +311,38 @@ func (c *nodeLoadBalancerController) convergeActivePublicNodeLocal(
 		}
 	}
 	if len(keep) == 0 && len(fips) != 0 {
-		// Every published Node is verified gone: nothing is left to serve.
+		// Every published Node is gone. A withdrawal of the whole Service needs
+		// the Node objects themselves as evidence, or two reads that are spaced
+		// apart: one odd cloud answer (an empty VPC member list) must not close
+		// the edge on its own.
+		evidenced := true
+		for name := range removeGone {
+			if _, ok := nodes.NodeEvidence[name]; !ok {
+				evidenced = false
+			}
+		}
+		if !evidenced {
+			since := c.noteAllGone(string(service.UID), now)
+			if elapsed := now.Sub(since); elapsed < nodeLoadBalancerAbsenceConfirmationDelay {
+				if eventErr := c.recordPublicNodeLocalHoldEvent(ctx, service, publicNodeLocalReasonAwaitingConfirmation, errors.New(
+					"public-node-local: every published Node looks gone on cloud evidence alone; waiting for a second spaced read before withdrawing")); eventErr != nil {
+					klog.Warningf("public-node-local %s/%s: record Event: %v", service.Namespace, service.Name, eventErr)
+				}
+				if c.queue != nil {
+					c.queue.AddAfter(key, nodeLoadBalancerAbsenceConfirmationDelay-elapsed)
+				}
+				return nil
+			}
+		}
+		c.clearAllGone(string(service.UID))
+		// Nothing is left to serve.
 		if err := c.withdrawPublicNodeLocal(ctx, service); err != nil {
 			return err
 		}
 		c.requeuePublicNodeLocal(key)
 		return nil
 	}
+	c.clearAllGone(string(service.UID))
 
 	if nextCheck > 0 && c.queue != nil {
 		c.queue.AddAfter(key, nextCheck)
@@ -713,4 +740,27 @@ func (c *nodeLoadBalancerController) validateActivePublicNodeLocalAssignState(
 		return errors.New("public-node-local: durable firewall assignment fence does not cover the VM")
 	}
 	return nil
+}
+
+// noteAllGone returns when the Service was first seen with every published Node
+// gone on cloud evidence alone.
+func (c *nodeLoadBalancerController) noteAllGone(uid string, now time.Time) time.Time {
+	c.endpointGoneMu.Lock()
+	defer c.endpointGoneMu.Unlock()
+	if c.allGoneSince == nil {
+		c.allGoneSince = map[string]time.Time{}
+	}
+	since, found := c.allGoneSince[uid]
+	if !found {
+		c.allGoneSince[uid] = now
+		return now
+	}
+	return since
+}
+
+// clearAllGone forgets the confirmation of a Service.
+func (c *nodeLoadBalancerController) clearAllGone(uid string) {
+	c.endpointGoneMu.Lock()
+	defer c.endpointGoneMu.Unlock()
+	delete(c.allGoneSince, uid)
 }

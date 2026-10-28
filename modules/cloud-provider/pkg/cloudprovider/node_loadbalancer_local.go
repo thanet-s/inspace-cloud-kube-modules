@@ -515,6 +515,9 @@ const (
 type publicNodeLocalNodeVerdict struct {
 	kind   publicNodeLocalNodeKind
 	reason string
+	// nodeObject marks a Gone verdict that rests on the Node object itself (its
+	// labels), not only on a cloud answer.
+	nodeObject bool
 }
 
 func publicNodeLocalNodeIs(kind publicNodeLocalNodeKind, reason string) publicNodeLocalNodeVerdict {
@@ -531,6 +534,9 @@ type publicNodeLocalNodeSet struct {
 	Unverified      map[string]error
 	EndpointMissing map[string]nodeLoadBalancerAddress
 	NotEligible     map[string]string
+	// NodeEvidence names the Gone entries that rest on the Node object itself
+	// (deleted, excluded, left the pool, absent), not only on a cloud answer.
+	NodeEvidence map[string]struct{}
 	// Nodes holds every listed Node by name, so callers can resolve identities.
 	Nodes map[string]*corev1.Node
 }
@@ -577,6 +583,7 @@ func (c *nodeLoadBalancerController) classifyPublicNodeLocalNodesMode(
 		Unverified:      map[string]error{},
 		EndpointMissing: map[string]nodeLoadBalancerAddress{},
 		NotEligible:     map[string]string{},
+		NodeEvidence:    map[string]struct{}{},
 		Nodes:           map[string]*corev1.Node{},
 	}
 	readyEndpoints, err := c.publicNodeLocalReadyEndpointNodes(service)
@@ -603,11 +610,13 @@ func (c *nodeLoadBalancerController) classifyPublicNodeLocalNodesMode(
 		}
 		if !node.DeletionTimestamp.IsZero() {
 			set.Gone[node.Name] = "the Node is being deleted"
+			set.NodeEvidence[node.Name] = struct{}{}
 			continue
 		}
 		if nodeExcludedFromLoadBalancers(node) || nodeHasControlPlaneRole(node) {
 			// Both are explicit operator intent, so the Node leaves the edge.
 			set.Gone[node.Name] = "the Node is excluded from external load balancers or is a control-plane Node"
+			set.NodeEvidence[node.Name] = struct{}{}
 			continue
 		}
 		if !loadBalancerNodeEligible(node) {
@@ -622,6 +631,9 @@ func (c *nodeLoadBalancerController) classifyPublicNodeLocalNodesMode(
 		switch verdict.kind {
 		case publicNodeLocalNodeGone:
 			set.Gone[node.Name] = verdict.reason
+			if verdict.nodeObject {
+				set.NodeEvidence[node.Name] = struct{}{}
+			}
 			continue
 		case publicNodeLocalNodeNotEligible:
 			set.NotEligible[node.Name] = verdict.reason
@@ -687,12 +699,14 @@ func (c *nodeLoadBalancerController) classifyPublicNodeLocalNodesMode(
 		for _, ingress := range datapath.Status.LoadBalancer.Ingress {
 			if _, known := knownPrivate[ingress.IP]; !known {
 				set.Gone[ingress.IP] = "the Node object is absent"
+				set.NodeEvidence[ingress.IP] = struct{}{}
 			}
 		}
 	}
 	for _, ingress := range service.Status.LoadBalancer.Ingress {
 		if _, known := knownPublic[ingress.IP]; !known {
 			set.Gone[ingress.IP] = "the Node object is absent"
+			set.NodeEvidence[ingress.IP] = struct{}{}
 		}
 	}
 	return set, patchedNode, nil, nil
@@ -774,7 +788,9 @@ func (c *nodeLoadBalancerController) authorizePublicNodeLocalNodeVerdict(
 		}
 	}
 	if !karpenterBacked && node.Labels[publicNodeLocalPoolLabel] != pool {
-		return gone("the Node left the " + pool + " pool")
+		verdict, patched, err := gone("the Node left the " + pool + " pool")
+		verdict.nodeObject = true
+		return verdict, patched, err
 	}
 	providerIdentity, err := providerid.Parse(node.Spec.ProviderID)
 	if err != nil || providerIdentity.Location != c.provider.config.Location || providerIdentity.String() != node.Spec.ProviderID {
