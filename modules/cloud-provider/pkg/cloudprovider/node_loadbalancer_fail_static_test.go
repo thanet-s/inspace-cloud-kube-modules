@@ -868,3 +868,71 @@ func TestPublicNodeLocalAuditSkipsSubjectOwnFirewall(t *testing.T) {
 		t.Fatalf("the subject must not enqueue itself: queue length %d", f.controller.queue.Len())
 	}
 }
+
+func TestPublicNodeLocalChildSpecDriftRepairsInPlace(t *testing.T) {
+	f := newPublishedPublicNodeLocalFixture(t)
+	name := nodeLoadBalancerDatapathName(f.service)
+	drifted := trackedPublicNodeLocalDatapath(t, f)
+	drifted.Spec.Selector = map[string]string{"app": "stale"}
+	drifted.Spec.ExternalTrafficPolicy = corev1.ServiceExternalTrafficPolicyCluster
+	if _, err := f.provider.kubeClient.CoreV1().Services(drifted.Namespace).Update(f.ctx, drifted, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	parentBefore := f.current(t)
+	childStatusBefore := trackedPublicNodeLocalDatapath(t, f).Status
+
+	if err := f.controller.syncPublicNodeLocal(f.ctx, f.key, parentBefore); err != nil {
+		t.Fatalf("repair pass: %v", err)
+	}
+	repaired := trackedPublicNodeLocalDatapath(t, f)
+	if repaired.Name != name || !publicNodeLocalDatapathMatches(repaired, f.service, "edge") {
+		t.Fatalf("the child spec was not repaired: %#v", repaired.Spec)
+	}
+	if !reflect.DeepEqual(repaired.Status, childStatusBefore) {
+		t.Fatalf("the child status changed: %#v", repaired.Status)
+	}
+	parentAfter := f.current(t)
+	if !reflect.DeepEqual(parentAfter.Status, parentBefore.Status) || !reflect.DeepEqual(parentAfter.Annotations, parentBefore.Annotations) {
+		t.Fatalf("the parent changed: %#v", parentAfter.Status)
+	}
+	if len(f.api.unassignedFirewalls) != 0 {
+		t.Fatalf("a firewall was detached: %v", f.api.unassignedFirewalls)
+	}
+}
+
+func TestPublicNodeLocalMissingChildIsRecreatedWithoutWithdraw(t *testing.T) {
+	f := newPublishedPublicNodeLocalFixture(t)
+	name := nodeLoadBalancerDatapathName(f.service)
+	if err := f.provider.kubeClient.CoreV1().Services(f.service.Namespace).Delete(f.ctx, name, metav1.DeleteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	parentBefore := f.current(t)
+	_, vmUUID, privateIP, _ := publicNodeLocalFixtureNode(0)
+	restored := false
+	for pass := 0; pass < 10 && !restored; pass++ {
+		if err := f.controller.syncPublicNodeLocal(f.ctx, f.key, f.current(t)); err != nil {
+			t.Fatalf("pass %d: %v", pass, err)
+		}
+		parent := f.current(t)
+		if !reflect.DeepEqual(parent.Status, parentBefore.Status) {
+			t.Fatalf("pass %d: the parent FIPs changed: %#v", pass, parent.Status)
+		}
+		if len(f.api.unassignedFirewalls) != 0 || f.api.firewalls[0].ResourcesAssigned[0].ResourceUUID != vmUUID {
+			t.Fatalf("pass %d: the firewall assignment changed", pass)
+		}
+		child := trackedPublicNodeLocalDatapathOrNil(f)
+		restored = child != nil && len(child.Status.LoadBalancer.Ingress) == 1 && child.Status.LoadBalancer.Ingress[0].IP == privateIP
+	}
+	if !restored {
+		t.Fatal("the child and its VIPs were not restored")
+	}
+}
+
+func trackedPublicNodeLocalDatapathOrNil(f *publicNodeLocalTransientFixture) *corev1.Service {
+	kube := f.provider.kubeClient.(*kubefake.Clientset)
+	object, err := kube.Tracker().Get(corev1.SchemeGroupVersion.WithResource("services"), f.service.Namespace, nodeLoadBalancerDatapathName(f.service))
+	if err != nil {
+		return nil
+	}
+	return object.(*corev1.Service).DeepCopy()
+}

@@ -691,7 +691,7 @@ func TestPublicNodeLocalFreshFenceResumesPartialMultiNodeAssignment(t *testing.T
 	}
 }
 
-func TestPublicNodeLocalDriftCannotMutateChildWhileAssignmentFenceIsUnresolved(t *testing.T) {
+func TestPublicNodeLocalDriftRepairsChildInPlace(t *testing.T) {
 	ctx := context.Background()
 	service := publicNodeLocalTestService("drift", "drift-service-uid", "edge", corev1.ProtocolTCP, 443)
 	service.Finalizers = []string{publicNodeLocalFinalizer}
@@ -707,15 +707,19 @@ func TestPublicNodeLocalDriftCannotMutateChildWhileAssignmentFenceIsUnresolved(t
 	controller := &nodeLoadBalancerController{provider: provider}
 
 	_, changed, err := controller.ensurePublicNodeLocalDatapath(ctx, service, "edge")
-	if err == nil || !strings.Contains(err.Error(), "waiting for exact Service firewall detachment readback") || changed {
-		t.Fatalf("unresolved assignment fence did not block child mutation: changed=%t err=%v", changed, err)
+	if err != nil || !changed {
+		t.Fatalf("child drift was not repaired in place: changed=%t err=%v", changed, err)
 	}
 	stored, getErr := provider.kubeClient.CoreV1().Services(datapath.Namespace).Get(ctx, datapath.Name, metav1.GetOptions{})
 	if getErr != nil {
 		t.Fatal(getErr)
 	}
-	if !reflect.DeepEqual(stored.Spec.Selector, map[string]string{"app": "stale"}) {
-		t.Fatalf("drifted child mutated before withdrawal proof: %#v", stored.Spec.Selector)
+	if !reflect.DeepEqual(stored.Spec.Selector, service.Spec.Selector) {
+		t.Fatalf("drifted child selector was not repaired: %#v", stored.Spec.Selector)
+	}
+	// A child spec update never widens the firewall gate, so it needs no withdrawal.
+	if unassigned := provider.api.(*fakeAPI).unassignedFirewalls; len(unassigned) != 0 {
+		t.Fatalf("child repair detached a firewall: %v", unassigned)
 	}
 }
 

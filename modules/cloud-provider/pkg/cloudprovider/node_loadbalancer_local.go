@@ -443,17 +443,10 @@ func (c *nodeLoadBalancerController) ensurePublicNodeLocalDatapath(
 		return nil, false, fmt.Errorf("public-node-local: get private datapath Service: %w", err)
 	}
 	desired := desiredPublicNodeLocalDatapath(service, pool)
+	// The child only carries the private VIPs for Cilium; the public gate is the
+	// firewall on the VM. Repairing the child therefore never needs the parent
+	// to be withdrawn, and the status subresource survives a spec update.
 	if apierrors.IsNotFound(err) {
-		stillExposed, exposureErr := c.publicNodeLocalServiceStillExposed(ctx, service)
-		if exposureErr != nil {
-			return nil, false, exposureErr
-		}
-		if stillExposed {
-			if withdrawErr := c.withdrawPublicNodeLocal(ctx, service); withdrawErr != nil {
-				return nil, false, withdrawErr
-			}
-			return nil, true, nil
-		}
 		created, createErr := client.Create(ctx, desired, metav1.CreateOptions{})
 		return created, createErr == nil, createErr
 	}
@@ -461,30 +454,15 @@ func (c *nodeLoadBalancerController) ensurePublicNodeLocalDatapath(
 		return nil, false, fmt.Errorf("public-node-local: datapath Service %s/%s has foreign ownership", service.Namespace, name)
 	}
 	if existing.DeletionTimestamp != nil {
-		stillExposed, exposureErr := c.publicNodeLocalServiceStillExposed(ctx, service)
-		if exposureErr != nil {
-			return nil, false, exposureErr
-		}
-		if stillExposed {
-			if withdrawErr := c.withdrawPublicNodeLocal(ctx, service); withdrawErr != nil {
-				return nil, false, withdrawErr
-			}
-		}
 		return existing, true, nil
 	}
 	if existing.Spec.LoadBalancerClass == nil || *existing.Spec.LoadBalancerClass != nodeLoadBalancerDatapathClass {
-		stillExposed, exposureErr := c.publicNodeLocalServiceStillExposed(ctx, service)
-		if exposureErr != nil {
-			return nil, false, exposureErr
-		}
-		if stillExposed {
-			if withdrawErr := c.withdrawPublicNodeLocal(ctx, service); withdrawErr != nil {
-				return nil, false, withdrawErr
-			}
-			return existing, true, nil
-		}
 		if err := deleteServiceWithUIDPrecondition(ctx, client, existing); err != nil && !apierrors.IsNotFound(err) {
 			return nil, false, fmt.Errorf("public-node-local: replace exact-owned datapath with immutable class drift: %w", err)
+		}
+		if eventErr := c.recordPublicNodeLocalHoldEvent(ctx, service, "PublicNodeLocalDatapathReplaced", fmt.Errorf(
+			"public-node-local: replaced private datapath Service %s/%s that drifted to another load balancer class", service.Namespace, name)); eventErr != nil {
+			klog.Warningf("public-node-local %s/%s: record Event: %v", service.Namespace, service.Name, eventErr)
 		}
 		return nil, true, nil
 	}
@@ -492,18 +470,7 @@ func (c *nodeLoadBalancerController) ensurePublicNodeLocalDatapath(
 	if publicNodeLocalDatapathMatches(existing, service, pool) {
 		return existing, false, nil
 	}
-	// Close a drifted exact-owned datapath before changing its selectors or
-	// traffic policy. The next reconciliation applies the desired spec.
-	stillExposed, exposureErr := c.publicNodeLocalServiceStillExposed(ctx, service)
-	if exposureErr != nil {
-		return nil, false, exposureErr
-	}
-	if stillExposed {
-		if withdrawErr := c.withdrawPublicNodeLocal(ctx, service); withdrawErr != nil {
-			return nil, false, withdrawErr
-		}
-		return existing, true, nil
-	}
+	desired.Status = *existing.Status.DeepCopy()
 	updated, updateErr := client.Update(ctx, desired, metav1.UpdateOptions{})
 	return updated, updateErr == nil, updateErr
 }
