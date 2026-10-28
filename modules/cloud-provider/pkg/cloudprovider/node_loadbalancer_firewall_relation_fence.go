@@ -265,6 +265,11 @@ func nodeLoadBalancerRequeueDelay(err error) (time.Duration, bool) {
 	if errors.As(err, &pending) {
 		return pending.retryAfter, true
 	}
+	var holding *errPublicNodeLocalHolding
+	if errors.As(err, &holding) {
+		// A hold changes nothing, so a steady retry is safe and keeps recovery fast.
+		return nodeLoadBalancerRetry, true
+	}
 	return 0, false
 }
 

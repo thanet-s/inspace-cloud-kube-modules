@@ -18,6 +18,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/klog/v2"
 
 	inspace "github.com/thanet-s/inspace-cloud-kube-modules/modules/client"
 	cloudv1 "github.com/thanet-s/inspace-cloud-kube-modules/modules/cloud-provider/api/v1alpha1"
@@ -81,7 +82,7 @@ func (c *nodeLoadBalancerController) syncPublicNodeLocal(
 		}
 		eventErr := c.recordNodeLoadBalancerReservedPortEvent(ctx, service, cause)
 		if containsString(service.Finalizers, publicNodeLocalFinalizer) {
-			return errors.Join(c.failPublicNodeLocalClosed(ctx, service, cause), eventErr)
+			return errors.Join(c.holdOrFailPublicNodeLocal(ctx, service, cause), eventErr)
 		}
 		return errors.Join(cause, eventErr)
 	}
@@ -98,27 +99,28 @@ func (c *nodeLoadBalancerController) syncPublicNodeLocal(
 
 	desiredFirewall, err := c.desiredServiceFirewall(service)
 	if err != nil {
-		return c.failPublicNodeLocalClosed(ctx, service, err)
+		return c.holdOrFailPublicNodeLocal(ctx, service, err)
 	}
 	activePool := service.Annotations[annotationPublicNodeLocalActivePool]
 	activePolicy := service.Annotations[annotationPublicNodeLocalActivePolicy]
 	if (activePool == "") != (activePolicy == "") {
-		return c.failPublicNodeLocalClosed(ctx, service, errors.New("public-node-local: incomplete persisted activation identity"))
+		return c.holdOrFailPublicNodeLocal(ctx, service, errors.New("public-node-local: incomplete persisted activation identity"))
 	}
 	if activePool == "" && len(service.Status.LoadBalancer.Ingress) != 0 {
-		return c.failPublicNodeLocalClosed(ctx, service, errors.New("public-node-local: public status exists without persisted activation authorization"))
+		return c.holdOrFailPublicNodeLocal(ctx, service, errors.New("public-node-local: public status exists without persisted activation authorization"))
 	}
 	if activePool != "" && (activePool != intent.Pool || activePolicy != desiredFirewall.Hash) {
-		if err := c.withdrawPublicNodeLocal(ctx, service); err != nil {
-			return err
-		}
-		c.requeuePublicNodeLocal(key)
-		return nil
+		// A changed pool or policy is not an emergency. The active exposure keeps
+		// serving untouched until a make-before-break transition can replace it.
+		return c.recordPublicNodeLocalHoldEvent(ctx, service, publicNodeLocalReasonTransitionPending, fmt.Errorf(
+			"public-node-local: the Service intent (pool %q, firewall policy %q) differs from the active exposure (pool %q, firewall policy %q); keeping the active exposure",
+			intent.Pool, desiredFirewall.Hash, activePool, activePolicy,
+		))
 	}
 
 	addresses, patchedNode, err := c.publicNodeLocalAddresses(ctx, service, intent)
 	if err != nil {
-		return c.failPublicNodeLocalClosed(ctx, service, err)
+		return c.holdOrFailPublicNodeLocal(ctx, service, err)
 	}
 	loses, winnerWaiting, conflictErr := c.publicNodeLocalPortConflict(ctx, service, intent)
 	if loses {
@@ -129,7 +131,7 @@ func (c *nodeLoadBalancerController) syncPublicNodeLocal(
 		return errors.Join(c.recordPublicNodeLocalConflictEvent(ctx, service, cause), c.failPublicNodeLocalClosed(ctx, service, cause))
 	}
 	if conflictErr != nil {
-		return c.failPublicNodeLocalClosed(ctx, service, conflictErr)
+		return c.holdOrFailPublicNodeLocal(ctx, service, conflictErr)
 	}
 	if cleared, err := c.clearPublicNodeLocalConflict(ctx, service); err != nil || cleared {
 		if cleared {
@@ -138,6 +140,12 @@ func (c *nodeLoadBalancerController) syncPublicNodeLocal(
 		return err
 	}
 	if winnerWaiting {
+		if activePool != "" {
+			// This Service keeps its own claim; the peer that still exposes an
+			// overlapping port has to clean up, not this serving Service.
+			return c.holdOrFailPublicNodeLocal(ctx, service, errors.New(
+				"public-node-local: a peer still exposes an overlapping protocol/port claim in the pool"))
+		}
 		if err := c.withdrawPublicNodeLocal(ctx, service); err != nil {
 			return err
 		}
@@ -156,7 +164,7 @@ func (c *nodeLoadBalancerController) syncPublicNodeLocal(
 
 	datapath, changed, err := c.ensurePublicNodeLocalDatapath(ctx, service, intent.Pool)
 	if err != nil {
-		return c.failPublicNodeLocalClosed(ctx, service, err)
+		return c.holdOrFailPublicNodeLocal(ctx, service, err)
 	}
 	if changed {
 		c.requeuePublicNodeLocal(key)
@@ -183,11 +191,11 @@ func (c *nodeLoadBalancerController) syncPublicNodeLocal(
 	var waiting bool
 	service, firewall, waiting, err = c.preparePublicNodeLocalFirewall(ctx, service)
 	if err != nil {
-		return c.failPublicNodeLocalClosed(ctx, service, err)
+		return c.holdOrFailPublicNodeLocal(ctx, service, err)
 	}
 	if waiting {
 		if activePool != "" {
-			return c.failPublicNodeLocalClosed(ctx, service, errors.New("public-node-local: active Service firewall is not authoritatively ready"))
+			return c.holdOrFailPublicNodeLocal(ctx, service, errors.New("public-node-local: active Service firewall is not authoritatively ready"))
 		}
 		c.requeuePublicNodeLocal(key)
 		return nil
@@ -197,33 +205,33 @@ func (c *nodeLoadBalancerController) syncPublicNodeLocal(
 		// detached before reactivating the private Cilium frontend. This
 		// closes the stale-assignment window after an uncertain cloud read.
 		if err := c.detachServiceFirewallFromOtherNodes(ctx, service, firewall, nil); err != nil {
-			return c.failPublicNodeLocalClosed(ctx, service, err)
+			return c.holdOrFailPublicNodeLocal(ctx, service, err)
 		}
 	}
 	datapath, changed, err = c.ensurePublicNodeLocalDatapathStatus(ctx, service, datapath, intent.Pool, desiredPrivateStatus)
 	if err != nil {
-		return c.failPublicNodeLocalClosed(ctx, service, err)
+		return c.holdOrFailPublicNodeLocal(ctx, service, err)
 	}
 	if changed {
 		c.requeuePublicNodeLocal(key)
 		return nil
 	}
 	if !reflect.DeepEqual(datapath.Status.LoadBalancer, desiredPrivateStatus) {
-		return c.failPublicNodeLocalClosed(ctx, service, errors.New("public-node-local: private datapath status did not read back exactly"))
+		return c.holdOrFailPublicNodeLocal(ctx, service, errors.New("public-node-local: private datapath status did not read back exactly"))
 	}
 
 	if err := c.detachServiceFirewallFromOtherNodes(ctx, service, firewall, selectedNodes); err != nil {
-		return c.failPublicNodeLocalClosed(ctx, service, err)
+		return c.holdOrFailPublicNodeLocal(ctx, service, err)
 	}
 
 	assignmentsMatch, err := c.publicNodeLocalFirewallAssignmentsMatch(ctx, service, intent, desiredFirewall, firewall.UUID, selectedNodes)
 	if err != nil {
-		return c.failPublicNodeLocalClosed(ctx, service, err)
+		return c.holdOrFailPublicNodeLocal(ctx, service, err)
 	}
 	if !assignmentsMatch {
 		authorized, _, err := c.ensurePublicNodeLocalAssignmentIntent(ctx, service, intent, desiredFirewall, firewall.UUID, addresses)
 		if err != nil {
-			return c.failPublicNodeLocalClosed(ctx, service, err)
+			return c.holdOrFailPublicNodeLocal(ctx, service, err)
 		}
 		service = authorized
 		// A fresh exact fence may have been persisted by a previous process that
@@ -231,28 +239,28 @@ func (c *nodeLoadBalancerController) syncPublicNodeLocal(
 		// the idempotent missing assignments after the helper has validated that
 		// durable authorization; the cloud mutation validates it again per VM.
 		if err := c.assignPublicNodeLocalFirewallWithFence(ctx, service, intent, desiredFirewall, firewall, addresses); err != nil {
-			return c.failPublicNodeLocalClosed(ctx, service, err)
+			return c.holdOrFailPublicNodeLocal(ctx, service, err)
 		}
 		c.requeuePublicNodeLocal(key)
 		return nil
 	}
 	assignmentsMatch, err = c.publicNodeLocalFirewallAssignmentsMatch(ctx, service, intent, desiredFirewall, firewall.UUID, selectedNodes)
 	if err != nil {
-		return c.failPublicNodeLocalClosed(ctx, service, err)
+		return c.holdOrFailPublicNodeLocal(ctx, service, err)
 	}
 	if !assignmentsMatch {
-		return c.failPublicNodeLocalClosed(ctx, service, errors.New("public-node-local: firewall assignments changed after exact readback"))
+		return c.holdOrFailPublicNodeLocal(ctx, service, errors.New("public-node-local: firewall assignments changed after exact readback"))
 	}
 	assignmentFencePresent := publicNodeLocalAssignmentFencePresent(service)
 	if assignmentFencePresent && service.Annotations[annotationNodeLoadBalancerFirewallAssigning] == "" {
-		return c.failPublicNodeLocalClosed(ctx, service, errors.New("public-node-local: incomplete durable assignment authorization cannot be adopted"))
+		return c.holdOrFailPublicNodeLocal(ctx, service, errors.New("public-node-local: incomplete durable assignment authorization cannot be adopted"))
 	}
 	if !assignmentFencePresent && (activePool == "" || !reflect.DeepEqual(service.Status.LoadBalancer, desiredPublicStatus)) {
-		return c.failPublicNodeLocalClosed(ctx, service, errors.New("public-node-local: inactive or unpublished firewall assignment has no durable authorization fence"))
+		return c.holdOrFailPublicNodeLocal(ctx, service, errors.New("public-node-local: inactive or unpublished firewall assignment has no durable authorization fence"))
 	}
 	if service.Annotations[annotationNodeLoadBalancerFirewallAssigning] != "" && len(service.Status.LoadBalancer.Ingress) == 0 {
 		if cleared, clearErr := c.clearPublicNodeLocalWithdrawalEvidenceAfterAssignment(ctx, service, intent, desiredFirewall, firewall.UUID, addresses); clearErr != nil {
-			return c.failPublicNodeLocalClosed(ctx, service, clearErr)
+			return c.holdOrFailPublicNodeLocal(ctx, service, clearErr)
 		} else if cleared {
 			c.requeuePublicNodeLocal(key)
 			return nil
@@ -261,7 +269,7 @@ func (c *nodeLoadBalancerController) syncPublicNodeLocal(
 
 	validated, err := c.validatePublicNodeLocalPublicationState(ctx, service, intent, desiredFirewall, firewall.UUID, addresses, activePool != "", false)
 	if err != nil {
-		return c.failPublicNodeLocalClosed(ctx, service, err)
+		return c.holdOrFailPublicNodeLocal(ctx, service, err)
 	}
 	service = validated
 	if activePool == "" {
@@ -275,26 +283,26 @@ func (c *nodeLoadBalancerController) syncPublicNodeLocal(
 	}
 	validated, err = c.validatePublicNodeLocalPublicationState(ctx, service, intent, desiredFirewall, firewall.UUID, addresses, true, false)
 	if err != nil {
-		return c.failPublicNodeLocalClosed(ctx, service, err)
+		return c.holdOrFailPublicNodeLocal(ctx, service, err)
 	}
 	service = validated
 	published, _, err := c.updatePublicNodeLocalStatusBound(ctx, service, desiredPublicStatus)
 	if err != nil {
-		return c.failPublicNodeLocalClosed(ctx, service, err)
+		return c.holdOrFailPublicNodeLocal(ctx, service, err)
 	}
 	updated, err := c.validatePublicNodeLocalPublicationState(ctx, published, intent, desiredFirewall, firewall.UUID, addresses, true, true)
 	if err != nil {
 		// A failed gate returns no Service; withdraw through the pre-gate one.
-		return c.failPublicNodeLocalClosed(ctx, service, err)
+		return c.holdOrFailPublicNodeLocal(ctx, service, err)
 	}
 	if updated.Annotations[annotationNodeLoadBalancerFirewallAssigning] != "" {
 		cleared, wasCleared, err := c.clearPublicNodeLocalAssignmentIntent(ctx, updated, intent, desiredFirewall, firewall.UUID, addresses)
 		if err != nil {
-			return c.failPublicNodeLocalClosed(ctx, updated, err)
+			return c.holdOrFailPublicNodeLocal(ctx, updated, err)
 		}
 		if wasCleared {
 			if _, err := c.validatePublicNodeLocalPublicationState(ctx, cleared, intent, desiredFirewall, firewall.UUID, addresses, true, true); err != nil {
-				return c.failPublicNodeLocalClosed(ctx, updated, err)
+				return c.holdOrFailPublicNodeLocal(ctx, updated, err)
 			}
 		}
 	}
@@ -2035,6 +2043,74 @@ func (c *nodeLoadBalancerController) failPublicNodeLocalClosed(ctx context.Conte
 	return errors.Join(cause, c.withdrawPublicNodeLocal(ctx, service))
 }
 
+const (
+	publicNodeLocalReasonHolding           = "PublicNodeLocalHolding"
+	publicNodeLocalReasonTransitionPending = "PublicNodeLocalTransitionPending"
+)
+
+// holdOrFailPublicNodeLocal is the failure path for every cause that is not
+// verified intent. A Service that is already serving keeps its last known good
+// exposure and reports the cause; only a Service that exposes nothing yet
+// fails closed. Transient provider causes defer, as before.
+func (c *nodeLoadBalancerController) holdOrFailPublicNodeLocal(ctx context.Context, service *corev1.Service, cause error) error {
+	if deferral := deferOnTransientProviderError("public-node-local", cause); deferral != nil {
+		return deferral
+	}
+	var pending *nodeLoadBalancerFirewallRelationPendingError
+	if errors.As(cause, &pending) {
+		// A bounded wait for cloud readback is not a fault, and withdrawing
+		// while a relation receipt is unresolved would only add more fences.
+		return cause
+	}
+	if service == nil || (service.Annotations[annotationPublicNodeLocalActivePool] == "" && len(service.Status.LoadBalancer.Ingress) == 0) {
+		return c.failPublicNodeLocalClosed(ctx, service, cause)
+	}
+	if eventErr := c.recordPublicNodeLocalHoldEvent(ctx, service, publicNodeLocalReasonHolding, cause); eventErr != nil {
+		klog.Warningf("public-node-local %s/%s: record hold Event: %v", service.Namespace, service.Name, eventErr)
+	}
+	return &errPublicNodeLocalHolding{cause: cause}
+}
+
+// recordPublicNodeLocalHoldEvent makes a hold visible on the Service. The Event
+// name derives from the Service UID, the reason and the cause, so a repeated
+// cause neither spams Events nor writes any Service annotation.
+func (c *nodeLoadBalancerController) recordPublicNodeLocalHoldEvent(
+	ctx context.Context,
+	service *corev1.Service,
+	reason string,
+	cause error,
+) error {
+	if service == nil || cause == nil {
+		return nil
+	}
+	message := cause.Error()
+	if len(message) > 900 {
+		message = message[:900] + "..."
+	}
+	now := metav1.Now()
+	_, err := c.provider.kubeClient.CoreV1().Events(service.Namespace).Create(ctx, &corev1.Event{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      service.Name + "." + shortHash(string(service.UID)+"\x00"+reason+"\x00"+cause.Error()),
+			Namespace: service.Namespace,
+		},
+		InvolvedObject: corev1.ObjectReference{
+			APIVersion: "v1", Kind: "Service", Namespace: service.Namespace,
+			Name: service.Name, UID: service.UID,
+		},
+		Reason:         reason,
+		Message:        message,
+		Source:         corev1.EventSource{Component: "inspace-cloud-controller-manager"},
+		FirstTimestamp: now,
+		LastTimestamp:  now,
+		Count:          1,
+		Type:           corev1.EventTypeWarning,
+	}, metav1.CreateOptions{})
+	if apierrors.IsAlreadyExists(err) {
+		return nil
+	}
+	return err
+}
+
 func (c *nodeLoadBalancerController) cleanupPublicNodeLocal(ctx context.Context, key string, service *corev1.Service) error {
 	if err := c.withdrawPublicNodeLocal(ctx, service); err != nil {
 		return err
@@ -2194,3 +2270,15 @@ func (c *nodeLoadBalancerController) requeuePublicNodeLocal(key string) {
 		c.queue.AddAfter(key, nodeLoadBalancerRetry)
 	}
 }
+
+// errPublicNodeLocalHolding reports that a pass stopped on an error that is not
+// verified intent, and that the last known good exposure was left in place.
+type errPublicNodeLocalHolding struct {
+	cause error
+}
+
+func (e *errPublicNodeLocalHolding) Error() string {
+	return "public-node-local: holding the last known good exposure: " + e.cause.Error()
+}
+
+func (e *errPublicNodeLocalHolding) Unwrap() error { return e.cause }

@@ -154,6 +154,10 @@ func TestNodeLoadBalancerRequeueDelayForError(t *testing.T) {
 	if delay, ok := nodeLoadBalancerRequeueDelay(fmt.Errorf("wrapped: %w", pending)); !ok || delay != 7*time.Second {
 		t.Fatalf("pending delay = %s ok=%t", delay, ok)
 	}
+	holding := &errPublicNodeLocalHolding{cause: errors.New("definite")}
+	if delay, ok := nodeLoadBalancerRequeueDelay(fmt.Errorf("wrapped: %w", holding)); !ok || delay != nodeLoadBalancerRetry {
+		t.Fatalf("holding delay = %s ok=%t", delay, ok)
+	}
 	transient := &errTransientProviderDeferral{cause: errors.New("api down")}
 	if delay, ok := nodeLoadBalancerRequeueDelay(transient); ok {
 		t.Fatalf("transient deferral got a fixed delay %s", delay)

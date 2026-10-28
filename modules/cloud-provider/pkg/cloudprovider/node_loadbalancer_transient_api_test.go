@@ -263,12 +263,12 @@ func TestPublicNodeLocalKeepsPublishedStateOnTransientProviderErrors(t *testing.
 	}
 }
 
-// A definite publication-gate failure must withdraw the published address. The
-// gates return no Service on failure, so the withdrawal has to use the Service
-// read before the gate rather than the nil result. Drift the private datapath
-// on each of its reads in turn: whichever read trips a definite failure, the
-// public address must be gone afterwards.
-func TestPublicNodeLocalDefiniteDatapathDriftWithdraws(t *testing.T) {
+// A definite publication-gate failure must hold the published address and
+// report it. The gates return no Service on failure, so the hold has to use
+// the Service read before the gate rather than the nil result. Drift the
+// private datapath on each of its reads in turn: whichever read trips a
+// definite failure, the public address and the firewall must stay in place.
+func TestPublicNodeLocalDefiniteDatapathDriftAtGateHolds(t *testing.T) {
 	probe := newPublishedPublicNodeLocalFixture(t)
 	probeKube := probe.provider.kubeClient.(*kubefake.Clientset)
 	datapathName := nodeLoadBalancerDatapathName(probe.service)
@@ -333,11 +333,15 @@ func TestPublicNodeLocalDefiniteDatapathDriftWithdraws(t *testing.T) {
 			if inspace.IsTransient(err) {
 				t.Fatalf("definite drift reported as transient: %v", err)
 			}
-			if got := fixture.current(t).Status.LoadBalancer.Ingress; len(got) != 0 {
-				t.Fatalf("definite failure %q left the public address published: %#v", err, got)
+			var holding *errPublicNodeLocalHolding
+			if !errors.As(err, &holding) {
+				t.Fatalf("definite failure %q is not a holding error", err)
 			}
-			if len(fixture.api.unassignedFirewalls) == unassignedBefore {
-				t.Fatalf("definite failure %q did not detach the firewall", err)
+			if got := fixture.current(t).Status.LoadBalancer.Ingress; len(got) != 1 {
+				t.Fatalf("definite failure %q did not keep the public address published: %#v", err, got)
+			}
+			if len(fixture.api.unassignedFirewalls) != unassignedBefore {
+				t.Fatalf("definite failure %q detached the firewall", err)
 			}
 		})
 	}
