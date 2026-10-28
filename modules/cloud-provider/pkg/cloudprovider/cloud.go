@@ -1087,6 +1087,24 @@ func standardNLBMutationKnownPreDispatch(err error) bool {
 	return errors.Is(err, inspace.ErrMutationBlocked) || errors.Is(err, inspace.ErrMutationNotDispatched)
 }
 
+// standardNLBMutationNotApplied is true when no request was dispatched or the
+// API gave a definite 4xx. Only the idempotent add-target, add-rule and assign
+// paths use it, after an exact readback shows the change absent, so the receipt
+// is cleared and retried instead of waiting out the retire window. Creates keep
+// their receipt: a paid create can report a 4xx after it committed.
+func standardNLBMutationNotApplied(err error) bool {
+	if standardNLBMutationKnownPreDispatch(err) {
+		return true
+	}
+	var apiErr *inspace.APIError
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+	return apiErr.StatusCode >= 400 && apiErr.StatusCode < 500 &&
+		apiErr.StatusCode != 408 && apiErr.StatusCode != 429 &&
+		!apiErr.Retryable && !apiErr.ResponseBodyIncomplete && !apiErr.ResponseBodyMalformed
+}
+
 func standardNLBMutationError(action string, err error) error {
 	if err == nil {
 		return nil
@@ -1773,7 +1791,7 @@ func (p *Provider) ensureStandardNLBFloatingIPAssignment(
 			return nil, err
 		}
 	}
-	if standardNLBMutationKnownPreDispatch(mutationErr) {
+	if standardNLBMutationNotApplied(mutationErr) {
 		return nil, p.clearStandardNLBFenceAfterProvenNonDispatch(ctx, service, raw, mutationErr)
 	}
 	if mutationErr != nil {
@@ -3740,7 +3758,7 @@ func (p *Provider) addStandardNLBTarget(
 			return observed, nil
 		}
 	}
-	if standardNLBMutationKnownPreDispatch(mutationErr) {
+	if standardNLBMutationNotApplied(mutationErr) {
 		return nil, p.clearStandardNLBFenceAfterProvenNonDispatch(ctx, service, raw, mutationErr)
 	}
 	if mutationErr != nil {
@@ -3814,7 +3832,7 @@ func (p *Provider) addStandardNLBRule(
 			return observed, nil
 		}
 	}
-	if standardNLBMutationKnownPreDispatch(mutationErr) {
+	if standardNLBMutationNotApplied(mutationErr) {
 		return nil, p.clearStandardNLBFenceAfterProvenNonDispatch(ctx, service, raw, mutationErr)
 	}
 	if mutationErr != nil {
@@ -3971,20 +3989,34 @@ func (p *Provider) reconcileLoadBalancer(ctx context.Context, service *corev1.Se
 		currentTargets[target.TargetUUID] = struct{}{}
 	}
 	// Add before remove: a rollout must never leave the NLB without a target
-	// while each removal waits for its negative readbacks.
+	// while each removal waits for its negative readbacks. A failed add is kept
+	// and reported at the end so it cannot starve removals and rule updates.
+	var addErr error
 	for _, uuid := range targetUUIDs {
 		if _, exists := currentTargets[uuid]; !exists {
 			refreshed, err := p.addStandardNLBTarget(ctx, service, lb, uuid)
 			if err != nil {
-				return err
+				addErr = err
+				break
 			}
 			lb = refreshed
 			currentTargets[uuid] = struct{}{}
 		}
 	}
+	servingDesired := 0
+	for _, target := range lb.Targets {
+		if _, wanted := desiredTargets[target.TargetUUID]; wanted {
+			servingDesired++
+		}
+	}
 	for _, target := range lb.Targets {
 		if _, wanted := desiredTargets[target.TargetUUID]; wanted {
 			continue
+		}
+		if servingDesired == 0 && len(desiredTargets) > 0 {
+			klog.Warningf("public NLB %s of Service %s/%s: no desired target serves yet; keeping the %d current targets",
+				lb.UUID, service.Namespace, service.Name, len(lb.Targets))
+			break
 		}
 		if len(desiredTargets) == 0 {
 			// An empty desired set usually means NotReady nodes, an API
@@ -3996,7 +4028,7 @@ func (p *Provider) reconcileLoadBalancer(ctx context.Context, service *corev1.Se
 			break
 		}
 		_, err := p.removeStandardNLBTarget(ctx, service, lb, target.TargetUUID)
-		return err
+		return errors.Join(addErr, err)
 	}
 
 	desiredRules := make(map[int32]inspace.LoadBalancerRule, len(rules))
@@ -4012,7 +4044,7 @@ func (p *Provider) reconcileLoadBalancer(ctx context.Context, service *corev1.Se
 				return fmt.Errorf("cloudprovider: forwarding rule on port %d has no UUID", current.SourcePort)
 			}
 			_, err := p.removeStandardNLBRule(ctx, service, lb, current.UUID)
-			return err
+			return errors.Join(addErr, err)
 		}
 	}
 	for _, desired := range rules {
@@ -4021,12 +4053,12 @@ func (p *Provider) reconcileLoadBalancer(ctx context.Context, service *corev1.Se
 		}
 		refreshed, err := p.addStandardNLBRule(ctx, service, lb, desired)
 		if err != nil {
-			return err
+			return errors.Join(addErr, err)
 		}
 		lb = refreshed
 		currentRules[desired.SourcePort] = desired
 	}
-	return nil
+	return addErr
 }
 
 func validateService(service *corev1.Service) error {
@@ -4259,6 +4291,7 @@ var (
 	_ cloud.InstancesV2  = (*Provider)(nil)
 	_ cloud.LoadBalancer = (*Provider)(nil)
 )
+
 // Each NLB or floating-IP mutation gets its own deadline so a hung InSpace POST
 // cannot hold the single worker and the global mutex for the client's 5-minute
 // timeout, yet slow-but-healthy calls are not cut off. Create NLB is the
