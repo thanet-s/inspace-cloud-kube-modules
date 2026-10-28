@@ -466,7 +466,10 @@ Services may still use `Cluster`; unhealthy, deleting, excluded, or disrupting
 nodes are filtered there as well. Nodes carrying either
 `node-role.kubernetes.io/control-plane` or the legacy
 `node-role.kubernetes.io/master` label are never public NLB targets in either
-mode; adding or removing either role reconciles targets immediately. Kubernetes
+mode; adding or removing either role reconciles targets immediately. New targets are added before stale ones are removed, and the last known good
+targets are kept when the desired set is empty (for example every node NotReady
+or a Local Service with no Ready endpoint), so a transient fault never empties
+the NLB. Kubernetes
 defaults an omitted `externalTrafficPolicy` to `Cluster` before CCM observes the
 Service, so set `Local` explicitly when local-endpoint targeting is required.
 Private Cilium L2 Services must remain `externalTrafficPolicy: Cluster`.
@@ -649,8 +652,11 @@ already protected nodes and sibling Services published; the new VM remains
 ineligible until a later authoritative readback. If an advertised VM loses an
 assignment, only its affected shard is withdrawn before repair.
 
-For the paid NLB path, if either public marker is removed, CCM deletes every deterministically owned
-FIP/NLB before handing the Service to another implementation. Discovery and
+For the paid NLB path, removing either public marker holds the owned FIP/NLB and
+reports an error on the Service, because a freed public IP cannot be recovered.
+Set `inspace.cloud/release-public-load-balancer: "true"` on the Service to let
+CCM delete every deterministically owned FIP/NLB before handing it to another
+implementation; deleting the Service always releases them. Discovery and
 deletion remain ownership-based even after markers change, preventing legacy
 resources from leaking. Public FIP list/create/assignment responses must match
 the deterministic name, billing account, active enabled non-virtual `public`

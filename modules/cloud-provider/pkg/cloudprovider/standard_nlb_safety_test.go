@@ -2,9 +2,12 @@ package cloudprovider
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	inspace "github.com/thanet-s/inspace-cloud-kube-modules/modules/client"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 // orderedTargetAPI records the NLB target count at the moment of each target
@@ -110,5 +113,71 @@ func TestReconcileLoadBalancerStillRemovesStaleTargetsWhenOthersRemain(t *testin
 	})
 	if !reflectStrings(base.removedTargets, []string{testVMUUIDB}) {
 		t.Fatalf("removed targets = %v, want only the stale one", base.removedTargets)
+	}
+}
+
+func publishedStandardNLB(t *testing.T) (*fakeAPI, *Provider, *corev1.Service, []*corev1.Node) {
+	t.Helper()
+	api := &fakeAPI{}
+	provider := newTestProvider(t, api)
+	service := testService()
+	nodes := []*corev1.Node{readyNode("worker-0", "inspace://bkk01/"+testVMUUID)}
+	setStandardNLBKubeNodes(provider, nodes...)
+	if _, err := provider.EnsureLoadBalancer(context.Background(), "ignored", service, nodes); err != nil {
+		t.Fatal(err)
+	}
+	if len(api.lbs) != 1 || len(api.floatingIPs) != 1 {
+		t.Fatalf("setup: LBs=%d FIPs=%d", len(api.lbs), len(api.floatingIPs))
+	}
+	return api, provider, service, nodes
+}
+
+func TestDroppingPublicMarkerHoldsFloatingIPUntilExplicitRelease(t *testing.T) {
+	for name, unpublish := range map[string]func(*corev1.Service){
+		"label removed":        func(s *corev1.Service) { delete(s.Labels, LabelLoadBalancerScope) },
+		"annotation removed":   func(s *corev1.Service) { delete(s.Annotations, AnnotationPublicLoadBalancer) },
+		"annotation set false": func(s *corev1.Service) { s.Annotations[AnnotationPublicLoadBalancer] = "false" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			api, provider, service, nodes := publishedStandardNLB(t)
+			unpublish(service)
+			syncMemoryStandardNLBServiceIntent(t, provider.standardNLBServiceStore, service)
+
+			if _, err := provider.EnsureLoadBalancer(context.Background(), "ignored", service, nodes); err == nil ||
+				!strings.Contains(err.Error(), AnnotationReleasePublicLoadBalancer) {
+				t.Fatalf("EnsureLoadBalancer() error = %v, want a hold that names %s", err, AnnotationReleasePublicLoadBalancer)
+			}
+			if err := provider.UpdateLoadBalancer(context.Background(), "ignored", service, nodes); err != nil {
+				t.Fatalf("UpdateLoadBalancer() error = %v, want a quiet hold", err)
+			}
+			if len(api.unassignedIPs) != 0 || len(api.deletedIPs) != 0 || len(api.deletedLBs) != 0 ||
+				len(api.lbs) != 1 || len(api.floatingIPs) != 1 {
+				t.Fatalf("hold still mutated: unassign=%v deleteIP=%v deleteLB=%v LBs=%d FIPs=%d",
+					api.unassignedIPs, api.deletedIPs, api.deletedLBs, len(api.lbs), len(api.floatingIPs))
+			}
+
+			service.Annotations[AnnotationReleasePublicLoadBalancer] = "true"
+			syncMemoryStandardNLBServiceIntent(t, provider.standardNLBServiceStore, service)
+			requireStandardNLBConvergence(t, func() error {
+				_, err := provider.EnsureLoadBalancer(context.Background(), "ignored", service, nodes)
+				return err
+			})
+			if len(api.deletedIPs) != 1 || len(api.floatingIPs) != 0 || len(api.lbs) != 0 {
+				t.Fatalf("explicit release did not clean up: deleteIP=%v LBs=%d FIPs=%d", api.deletedIPs, len(api.lbs), len(api.floatingIPs))
+			}
+		})
+	}
+}
+
+func TestServiceDeletionStillReleasesFloatingIPWithoutOptIn(t *testing.T) {
+	api, provider, service, _ := publishedStandardNLB(t)
+	now := metav1.Now()
+	service.DeletionTimestamp = &now
+	syncMemoryStandardNLBServiceIntent(t, provider.standardNLBServiceStore, service)
+	requireStandardNLBConvergence(t, func() error {
+		return provider.EnsureLoadBalancerDeleted(context.Background(), "ignored", service)
+	})
+	if len(api.floatingIPs) != 0 || len(api.lbs) != 0 {
+		t.Fatalf("deletion left resources: LBs=%d FIPs=%d", len(api.lbs), len(api.floatingIPs))
 	}
 }

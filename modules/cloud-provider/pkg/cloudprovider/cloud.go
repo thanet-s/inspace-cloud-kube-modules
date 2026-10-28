@@ -48,6 +48,11 @@ const (
 	LoadBalancerScopePublic         = "public"
 	LoadBalancerScopePrivate        = "private"
 
+	// AnnotationReleasePublicLoadBalancer is the explicit opt-in that lets an
+	// unpublished Service delete its public NLB and floating IP. Without it the
+	// resources are held, because the public IP cannot be recovered once freed.
+	AnnotationReleasePublicLoadBalancer = "inspace.cloud/release-public-load-balancer"
+
 	clusterAutoscalerDeletionTaint = "ToBeDeletedByClusterAutoscaler"
 	karpenterDisruptionTaint       = "karpenter.sh/disrupted"
 	nodeRoleControlPlaneLabel      = "node-role.kubernetes.io/control-plane"
@@ -1667,6 +1672,12 @@ func (p *Provider) EnsureLoadBalancer(ctx context.Context, _ string, service *co
 				return nil, cloud.ImplementedElsewhere
 			}
 		}
+		if held, err := p.holdUnpublishedStandardNLB(ctx, service, lb, floatingIP); err != nil || held != nil {
+			if err == nil {
+				err = held
+			}
+			return nil, err
+		}
 		if err := p.cleanupOwnedLoadBalancer(ctx, service, lb); err != nil {
 			return nil, err
 		}
@@ -1752,6 +1763,14 @@ func (p *Provider) updateLoadBalancer(ctx context.Context, service *corev1.Servi
 				return cloud.ImplementedElsewhere
 			}
 		}
+		if held, err := p.holdUnpublishedStandardNLB(ctx, service, lb, floatingIP); err != nil {
+			return err
+		} else if held != nil {
+			// UpdateLoadBalancer runs on every node event; the Ensure path
+			// already reports the hold as an error event.
+			klog.Warning(held)
+			return nil
+		}
 		return p.cleanupOwnedLoadBalancer(ctx, service, lb)
 	}
 	if err := validateServiceFloatingIPState(floatingIP, lb); err != nil {
@@ -1798,6 +1817,41 @@ func (p *Provider) EnsureLoadBalancerDeleted(ctx context.Context, _ string, serv
 		return err
 	}
 	return p.cleanupOwnedLoadBalancer(ctx, service, lb)
+}
+
+// holdUnpublishedStandardNLB returns a non-nil hold when a live Service lost its
+// public markers but still owns an NLB or floating IP. A dropped label or
+// annotation is usually a Helm/GitOps slip, and freeing the public IP cannot be
+// undone (DNS and customer allow-lists break), so deletion needs either Service
+// deletion or the explicit release annotation. A cleanup already in flight is
+// allowed to finish so its receipt cannot be stranded.
+func (p *Provider) holdUnpublishedStandardNLB(
+	ctx context.Context,
+	service *corev1.Service,
+	lb *inspace.LoadBalancer,
+	floatingIP *inspace.FloatingIP,
+) (hold error, err error) {
+	if lb == nil && floatingIP == nil {
+		return nil, nil
+	}
+	if service.DeletionTimestamp != nil || service.Annotations[AnnotationReleasePublicLoadBalancer] == "true" {
+		return nil, nil
+	}
+	fence, _, err := p.readStandardNLBFence(ctx, service)
+	if err != nil {
+		return nil, err
+	}
+	if fence != nil {
+		switch fence.Operation {
+		case standardNLBUnassignFloatingIP, standardNLBDeleteFloatingIP, standardNLBDeleteLoadBalancer:
+			return nil, nil
+		}
+	}
+	return fmt.Errorf(
+		"cloudprovider: Service %s/%s is no longer marked public but still owns a public NLB or floating IP; "+
+			"keeping them. Set annotation %s=true to delete them, or restore the public markers",
+		service.Namespace, service.Name, AnnotationReleasePublicLoadBalancer,
+	), nil
 }
 
 func (p *Provider) cleanupOwnedLoadBalancer(ctx context.Context, service *corev1.Service, lb *inspace.LoadBalancer) error {
