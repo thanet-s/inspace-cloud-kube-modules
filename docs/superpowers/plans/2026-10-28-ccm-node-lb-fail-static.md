@@ -120,8 +120,13 @@ Union(A,B) --intent becomes C--> Steady(A) first, then Union(A,C)
 any --Service deleted or mode off--> cleanupPublicNodeLocal (withdraw; the only full teardown)
 ```
 
-In Phase A, `intent != active` holds Steady(A) with the Event `PublicNodeLocalTransitionPending`.
-It touches nothing, so no outage can occur before Phase B ships.
+In Phase A, `intent != active` holds Steady(A) with the Event `PublicNodeLocalTransitionPending`, so no
+outage can occur before Phase B ships. The hold still converges nodes under the active identity (a pool
+change runs the full incremental pass; a policy change removes gone nodes under the ledger firewall)
+and requeues with the hold delay. Two exits exist before Phase B: a strict narrowing of the policy
+(fewer ports, or source ranges that are a subset) only removes exposure and is applied promptly by
+rebuilding, and the annotation `service.inspace.cloud/node-lb-allow-rebuild: "true"` permits the old
+withdraw and rebuild for any pending change.
 
 ### 2.3 Held versus withdrawn
 
@@ -176,12 +181,11 @@ Conventions for every task:
 
 - Write the failing test first, run it, and see it fail. Make the minimal change, run it again, and
   see it pass. Then run the whole package. Commit one task per commit.
-- Test helper: `GOTEST="sh /c/Users/JOJO/AppData/Local/Temp/claude/C--Users-JOJO-inspace-cloud-kube-modules/98a5d3a1-116b-44c4-93a9-8310294012a3/scratchpad/gotest.sh"`.
-  That script is `docker run golang:1.27.2 go "$@"` with `-w /src/modules/<module>`, so any equal
-  Docker command works.
-- Focused run: `$GOTEST cloud-provider test ./pkg/cloudprovider/ -run '<Regex>' -count=1`.
-- Gate after each task: `$GOTEST cloud-provider test ./pkg/cloudprovider/ -count=1` and
-  `$GOTEST cloud-provider vet ./pkg/cloudprovider/`.
+- Run Go from `modules/cloud-provider` with `GOWORK=off`. Any Go 1.27 toolchain works, a container
+  included.
+- Focused run: `GOWORK=off go test ./pkg/cloudprovider/ -run '<Regex>' -count=1`.
+- Gate after each task: `GOWORK=off go test ./pkg/cloudprovider/ -count=1` and
+  `GOWORK=off go vet ./pkg/cloudprovider/`.
 - Fixtures: `newPublishedPublicNodeLocalFixture` (transient_api_test.go:168),
   `publicNodeLocalTestService/Node/EndpointSliceLister` (local_test.go:914-980). Add a two-node
   variant, `newPublishedPublicNodeLocalFixtureN(t, n)`, in A6.
