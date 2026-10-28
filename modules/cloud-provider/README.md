@@ -662,7 +662,10 @@ The first pass records the drop time in
 and rules keep following the Service. To delete the FIP/NLB without deleting the
 Service, set `inspace.cloud/release-public-load-balancer` to an RFC3339 time
 later than that recorded drop; a plain `true` or an older time is ignored, so a
-stale opt-in cannot release an IP later. Republishing clears the mark. Deleting
+stale opt-in cannot release an IP later. The comparison is between the time you
+write and the controller's clock; if the two clocks disagree, the failure
+direction is safe, because a release time that is not clearly later leaves the
+hold in place. Republishing clears the mark. Deleting
 the Service always releases the FIP/NLB, and so does changing its type (for
 example to `ClusterIP`), because the stock controller then treats the load
 balancer as no longer wanted and runs the same deletion. Discovery and

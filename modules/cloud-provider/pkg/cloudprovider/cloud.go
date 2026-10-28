@@ -92,10 +92,6 @@ const (
 	// emptyTargetSetGrace is how long an empty desired set keeps the last known
 	// good targets before targets whose VM is provably gone may be removed.
 	emptyTargetSetGrace = 15 * time.Minute
-	// standardNLBAdditiveRetireDelay is how long an issued additive receipt
-	// stays authoritative: the slowest deadline plus the spaced-read delay.
-	// Only after it, and two exact absent reads, may the receipt be retired.
-	standardNLBAdditiveRetireDelay = standardNLBCreateLoadBalancerTimeout + standardNLBRemovalAbsenceDelay
 	// standardNLBRemovalRetryDelay is the fixed requeue for a durably pending
 	// removal. Resolution needs spaced readbacks, not exponential backoff that
 	// could stretch a Service deletion to the controller's five-minute ceiling.
@@ -210,7 +206,10 @@ type Provider struct {
 	endpointSlicesSynced         cache.InformerSynced
 	standardNLBNow               func() time.Time
 	standardNLBAbsentDelay       time.Duration
-	standardNLBMutationTimeout   time.Duration
+	// standardNLBMutationTimeout is a test-only override: when non-zero it
+	// replaces every per-operation deadline. Production leaves it zero. It does
+	// not shorten the retire delay, which stays tied to the real deadlines.
+	standardNLBMutationTimeout time.Duration
 	// standardNLBEvents is optional; unit tests leave it nil.
 	standardNLBEvents record.EventRecorder
 }
@@ -1151,7 +1150,19 @@ func (p *Provider) clearStandardNLBFenceAfterProvenNonDispatch(
 	}
 	clearCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), durableReceiptWriteTimeout)
 	defer cancel()
-	_, clearErr := p.replaceStandardNLBFence(clearCtx, service, expectedRaw, nil)
+	// A re-created create (Attempt > 0) follows an earlier dispatch that may
+	// still land, so clearing to nothing would reset the one-re-create budget
+	// and allow a fresh attempt-0 create: a third paid resource. Keep the count
+	// in an intent receipt instead.
+	var next *standardNLBMutationFence
+	if issued, parseErr := parseStandardNLBFence(expectedRaw); parseErr == nil && issued != nil && issued.Attempt > 0 &&
+		(issued.Operation == standardNLBCreateLoadBalancer || issued.Operation == standardNLBCreateFloatingIP) {
+		next = &standardNLBMutationFence{
+			Version: standardNLBMutationVersion, Operation: issued.Operation, Phase: standardNLBPhaseIntent,
+			RequestHash: issued.RequestHash, ResourceName: issued.ResourceName, Attempt: issued.Attempt,
+		}
+	}
+	_, clearErr := p.replaceStandardNLBFence(clearCtx, service, expectedRaw, next)
 	if clearErr != nil {
 		clearErr = fmt.Errorf("cloudprovider: clear proven non-dispatched public NLB receipt: %w", clearErr)
 	}
@@ -1186,7 +1197,7 @@ func (p *Provider) retireAbsentStandardNLBAdditive(
 		return false, fmt.Errorf("cloudprovider: public NLB %s receipt has an invalid timestamp: %w", fence.Operation, err)
 	}
 	now := p.standardNLBTime()
-	if now.Before(issuedAt.Add(standardNLBAdditiveRetireDelay)) {
+	if now.Before(issuedAt.Add(standardNLBAdditiveRetireDelay(fence.Operation))) {
 		return false, nil
 	}
 	if fence.AbsenceObservedAt == "" {
@@ -4574,6 +4585,23 @@ const (
 	standardNLBDeleteTimeout             = 3 * time.Minute
 	standardNLBRelationTimeout           = 2 * time.Minute
 )
+
+// standardNLBAdditiveRetireDelay is how long an issued additive receipt stays
+// authoritative: the deadline of its own operation plus the spacing delay. Only
+// after it, and two exact absent reads, may the receipt be retired. It always
+// uses the real per-operation deadline, never the test override.
+func standardNLBAdditiveRetireDelay(operation string) time.Duration {
+	timeout := standardNLBRelationTimeout
+	switch operation {
+	case standardNLBCreateLoadBalancer:
+		timeout = standardNLBCreateLoadBalancerTimeout
+	case standardNLBCreateFloatingIP:
+		timeout = standardNLBCreateFloatingIPTimeout
+	case standardNLBAssignFloatingIP:
+		timeout = standardNLBAssignTimeout
+	}
+	return timeout + standardNLBRemovalAbsenceDelay
+}
 
 func (p *Provider) standardNLBMutationContext(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
 	if p.standardNLBMutationTimeout > 0 {

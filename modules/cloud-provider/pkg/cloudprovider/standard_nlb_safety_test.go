@@ -240,7 +240,7 @@ func TestStandardNLBMutationIsBoundedAndTheNextReconcileMakesProgress(t *testing
 	if err := run(); err == nil || time.Since(started) > 5*time.Second {
 		t.Fatalf("reconcile within the retire window: err=%v took %s, want a prompt pending error", err, time.Since(started))
 	}
-	now = now.Add(standardNLBAdditiveRetireDelay + time.Second)
+	now = now.Add(standardNLBAdditiveRetireDelay(standardNLBAddTarget) + time.Second)
 	_ = run()
 	now = now.Add(standardNLBRemovalAbsenceDelay + time.Second)
 	if err := run(); err != nil {

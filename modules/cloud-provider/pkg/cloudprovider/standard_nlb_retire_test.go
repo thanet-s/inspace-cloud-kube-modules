@@ -113,8 +113,8 @@ func (f *retireFixture) advance(d time.Duration) { f.now = f.now.Add(d) }
 
 // passRetireWindow walks the clock past the retire delay and the spaced second
 // read, running one reconcile after each step, and returns the last result.
-func (f *retireFixture) passRetireWindow(run func() error) error {
-	f.advance(standardNLBAdditiveRetireDelay + time.Second)
+func (f *retireFixture) passRetireWindow(operation string, run func() error) error {
+	f.advance(standardNLBAdditiveRetireDelay(operation) + time.Second)
 	_ = run() // the first absent read records the evidence
 	f.advance(standardNLBRemovalAbsenceDelay + time.Second)
 	return run()
@@ -144,7 +144,7 @@ func TestSlowAddTargetIsRetiredAndReplayedOnlyAfterSpacedAbsence(t *testing.T) {
 	if err := run(); err == nil || f.api.calls["AddLoadBalancerTarget"] != 1 {
 		t.Fatalf("within the retire delay: err=%v calls=%d, want a pending error and no replay", err, f.api.calls["AddLoadBalancerTarget"])
 	}
-	f.advance(standardNLBAdditiveRetireDelay)
+	f.advance(standardNLBAdditiveRetireDelay(standardNLBAddTarget))
 	if err := run(); err == nil || f.api.calls["AddLoadBalancerTarget"] != 1 {
 		t.Fatalf("first absent read: err=%v calls=%d, want a pending error and no replay", err, f.api.calls["AddLoadBalancerTarget"])
 	}
@@ -191,7 +191,7 @@ func TestSlowAddRuleIsRetiredAndReplayedAfterSpacedAbsence(t *testing.T) {
 	if err := run(); err == nil {
 		t.Fatal("first reconcile should report the ambiguous add")
 	}
-	_ = f.passRetireWindow(run)
+	_ = f.passRetireWindow(standardNLBAddRule, run)
 	requireStandardNLBConvergence(t, run)
 	if f.api.calls["AddLoadBalancerRule"] != 2 || len(f.api.lbs[0].ForwardingRules) != 1 {
 		t.Fatalf("rule replay: calls=%d rules=%v", f.api.calls["AddLoadBalancerRule"], f.api.lbs[0].ForwardingRules)
@@ -207,7 +207,7 @@ func TestSlowFloatingIPAssignmentIsRetiredAndReplayed(t *testing.T) {
 	if err := f.ensure(); err == nil || f.api.calls["AssignFloatingIP"] != 1 {
 		t.Fatalf("within the delay: err=%v calls=%d", err, f.api.calls["AssignFloatingIP"])
 	}
-	_ = f.passRetireWindow(f.ensure)
+	_ = f.passRetireWindow(standardNLBAssignFloatingIP, f.ensure)
 	if err := f.ensure(); err != nil {
 		t.Fatal(err)
 	}
@@ -226,11 +226,11 @@ func TestSlowNLBCreateIsRecreatedAtMostOnce(t *testing.T) {
 	if err := f.ensure(); err == nil || f.api.calls["CreateLoadBalancer"] != 1 {
 		t.Fatalf("within the delay: err=%v creates=%d, want no second paid create", err, f.api.calls["CreateLoadBalancer"])
 	}
-	_ = f.passRetireWindow(f.ensure)
+	_ = f.passRetireWindow(standardNLBCreateLoadBalancer, f.ensure)
 	if f.api.calls["CreateLoadBalancer"] != 2 {
 		t.Fatalf("creates after the retire window = %d, want exactly one re-create", f.api.calls["CreateLoadBalancer"])
 	}
-	err := f.passRetireWindow(f.ensure)
+	err := f.passRetireWindow(standardNLBCreateLoadBalancer, f.ensure)
 	if f.api.calls["CreateLoadBalancer"] != 2 || err == nil || !strings.Contains(err.Error(), "manually") {
 		t.Fatalf("third create must stay refused: creates=%d err=%v", f.api.calls["CreateLoadBalancer"], err)
 	}
@@ -278,12 +278,26 @@ func TestSlowFloatingIPCreateIsRecreatedAtMostOnce(t *testing.T) {
 	if err := f.ensure(); err == nil || f.api.calls["CreateFloatingIP"] != 1 {
 		t.Fatalf("within the delay: err=%v creates=%d", err, f.api.calls["CreateFloatingIP"])
 	}
-	_ = f.passRetireWindow(f.ensure)
+	_ = f.passRetireWindow(standardNLBCreateFloatingIP, f.ensure)
 	if f.api.calls["CreateFloatingIP"] != 2 {
 		t.Fatalf("FIP creates = %d, want exactly one re-create", f.api.calls["CreateFloatingIP"])
 	}
-	err := f.passRetireWindow(f.ensure)
+	err := f.passRetireWindow(standardNLBCreateFloatingIP, f.ensure)
 	if f.api.calls["CreateFloatingIP"] != 2 || err == nil || !strings.Contains(err.Error(), "manually") {
 		t.Fatalf("third FIP create must stay refused: creates=%d err=%v", f.api.calls["CreateFloatingIP"], err)
+	}
+}
+
+func TestAdditiveRetireDelayFollowsEachOperationsOwnDeadline(t *testing.T) {
+	for operation, want := range map[string]time.Duration{
+		standardNLBAddTarget:          2*time.Minute + 30*time.Second,
+		standardNLBAddRule:            2*time.Minute + 30*time.Second,
+		standardNLBAssignFloatingIP:   3*time.Minute + 30*time.Second,
+		standardNLBCreateFloatingIP:   2 * time.Minute,
+		standardNLBCreateLoadBalancer: 5*time.Minute + 30*time.Second,
+	} {
+		if got := standardNLBAdditiveRetireDelay(operation); got != want {
+			t.Errorf("retire delay for %s = %s, want %s", operation, got, want)
+		}
 	}
 }
