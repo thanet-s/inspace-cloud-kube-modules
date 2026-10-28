@@ -1764,6 +1764,10 @@ func (c *nodeLoadBalancerController) assignPublicNodeLocalFirewallWithFence(
 				operation: nodeLoadBalancerFirewallRelationAssign, firewallUUID: firewall.UUID, vmUUID: vmUUID,
 			},
 		)
+		if errors.Is(relationErr, errNodeLoadBalancerFirewallRelationParked) {
+			c.recordPublicNodeLocalStuckRelation(ctx, service, relationErr)
+			continue
+		}
 		if relationErr != nil {
 			return fmt.Errorf("public-node-local: assign firewall %s to VM %s: %w", firewall.UUID, vmUUID, relationErr)
 		}
@@ -2270,7 +2274,15 @@ func (c *nodeLoadBalancerController) failPublicNodeLocalClosed(ctx context.Conte
 const (
 	publicNodeLocalReasonHolding           = "PublicNodeLocalHolding"
 	publicNodeLocalReasonTransitionPending = "PublicNodeLocalTransitionPending"
+	publicNodeLocalReasonRelationStuck     = "PublicNodeLocalFirewallRelationStuck"
 )
+
+// recordPublicNodeLocalStuckRelation makes a parked firewall relation visible.
+func (c *nodeLoadBalancerController) recordPublicNodeLocalStuckRelation(ctx context.Context, service *corev1.Service, cause error) {
+	if err := c.recordPublicNodeLocalHoldEvent(ctx, service, publicNodeLocalReasonRelationStuck, cause); err != nil {
+		klog.Warningf("public-node-local %s/%s: record Event: %v", service.Namespace, service.Name, err)
+	}
+}
 
 // holdOrFailPublicNodeLocal is the failure path for every cause that is not
 // verified intent. A Service that is already serving keeps its last known good
@@ -2462,6 +2474,7 @@ func (c *nodeLoadBalancerController) cleanupPublicNodeLocal(ctx context.Context,
 			annotationPublicNodeLocalAssignVMs,
 			annotationNodeLoadBalancerFWDeleteTarget,
 			annotationNodeLoadBalancerFWDeleteIssued,
+			annotationNodeLoadBalancerFirewallRelationRetired,
 		} {
 			if copy.Annotations[annotation] != "" {
 				delete(copy.Annotations, annotation)

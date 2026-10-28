@@ -4828,6 +4828,11 @@ func (c *nodeLoadBalancerController) detachServiceFirewallFromOtherNodes(
 				operation: nodeLoadBalancerFirewallRelationUnassign, firewallUUID: firewall.UUID, vmUUID: vmUUID,
 			},
 		)
+		if errors.Is(relationErr, errNodeLoadBalancerFirewallRelationParked) {
+			// A relation that never converges must not block the other VMs.
+			c.recordPublicNodeLocalStuckRelation(ctx, service, relationErr)
+			continue
+		}
 		if relationErr != nil {
 			return fmt.Errorf("node load balancer: unassign firewall %s from stale VM %s: %w", firewall.UUID, vmUUID, relationErr)
 		}
