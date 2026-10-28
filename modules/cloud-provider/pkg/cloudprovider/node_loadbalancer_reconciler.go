@@ -92,6 +92,11 @@ const (
 	nodeLoadBalancerAbsenceConfirmations     = 3
 )
 
+// The public-node-local assignment intent must outlive the relation receipt
+// retirement (RetireDelay) plus two spaced absence reads. A shorter intent
+// expired before the receipt could retire and caused a detach and assign loop.
+const nodeLoadBalancerPublicNodeLocalAssignTimeout = nodeLoadBalancerFirewallRelationRetireDelay + 2*nodeLoadBalancerAbsenceConfirmationDelay
+
 type nodeLoadBalancerAddress struct {
 	Node        *corev1.Node
 	PrivateIPv4 string

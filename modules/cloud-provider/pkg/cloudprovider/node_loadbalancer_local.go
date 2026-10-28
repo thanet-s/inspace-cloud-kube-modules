@@ -1064,7 +1064,7 @@ func (c *nodeLoadBalancerController) validateLivePublicNodeLocalServiceFirewall(
 			}
 			startedAt, timeErr := time.Parse(time.RFC3339Nano, service.Annotations[annotationNodeLoadBalancerFirewallAssignAt])
 			now := time.Now().UTC()
-			staged = canonical && seenVM && timeErr == nil && !startedAt.After(now) && now.Before(startedAt.Add(nodeLoadBalancerPendingCreateTimeout))
+			staged = canonical && seenVM && timeErr == nil && !startedAt.After(now) && now.Before(startedAt.Add(nodeLoadBalancerPublicNodeLocalAssignTimeout))
 		}
 		if !active && !staged {
 			return fmt.Errorf("public-node-local: firewall %s VM assignment has no active or durable staged authorization", firewall.UUID)
@@ -1454,17 +1454,29 @@ func (c *nodeLoadBalancerController) ensurePublicNodeLocalAssignmentIntent(
 		policy := copy.Annotations[annotationPublicNodeLocalAssignPolicy]
 		storedVMs := copy.Annotations[annotationPublicNodeLocalAssignVMs]
 		if assigning != "" || started != "" || policy != "" || storedVMs != "" {
-			if assigning != firewallUUID || policy != desired.Hash || storedVMs != vmSet || started == "" {
-				return false, errors.New("public-node-local: durable firewall assignment authorization no longer matches the desired VM set")
-			}
 			startedAt, parseErr := time.Parse(time.RFC3339Nano, started)
-			if parseErr != nil {
-				return false, fmt.Errorf("public-node-local: invalid assignment authorization timestamp: %w", parseErr)
+			expired := started != "" && parseErr == nil &&
+				!now.Before(startedAt.Add(nodeLoadBalancerPublicNodeLocalAssignTimeout))
+			if expired {
+				if copy.Annotations[annotationNodeLoadBalancerFirewallRelationIssued] != "" {
+					// An unresolved relation receipt still owns this intent. Wait for
+					// its bounded retirement instead of failing the Service.
+					return false, &nodeLoadBalancerFirewallRelationPendingError{
+						message:    "public-node-local: expired assignment authorization is waiting for its firewall relation receipt to resolve",
+						retryAfter: nodeLoadBalancerRetry,
+					}
+				}
+				// Nothing was dispatched under the expired intent, so renew it for the
+				// current VM set rather than failing a Service that may be serving.
+			} else {
+				if assigning != firewallUUID || policy != desired.Hash || storedVMs != vmSet || started == "" {
+					return false, errors.New("public-node-local: durable firewall assignment authorization no longer matches the desired VM set")
+				}
+				if parseErr != nil {
+					return false, fmt.Errorf("public-node-local: invalid assignment authorization timestamp: %w", parseErr)
+				}
+				return false, nil
 			}
-			if !now.Before(startedAt.Add(nodeLoadBalancerPendingCreateTimeout)) {
-				return false, errors.New("public-node-local: timed out waiting for authoritative firewall assignment readback")
-			}
-			return false, nil
 		}
 		if copy.Annotations == nil {
 			copy.Annotations = map[string]string{}
@@ -1603,7 +1615,7 @@ func (c *nodeLoadBalancerController) validatePublicNodeLocalAssignmentState(
 			return fmt.Errorf("public-node-local: invalid durable assignment timestamp: %w", err)
 		}
 		now := time.Now().UTC()
-		if startedAt.After(now) || !now.Before(startedAt.Add(nodeLoadBalancerPendingCreateTimeout)) {
+		if startedAt.After(now) || !now.Before(startedAt.Add(nodeLoadBalancerPublicNodeLocalAssignTimeout)) {
 			return errors.New("public-node-local: durable firewall assignment fence is not fresh")
 		}
 	}
