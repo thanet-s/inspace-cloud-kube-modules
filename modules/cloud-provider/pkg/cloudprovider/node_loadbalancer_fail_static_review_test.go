@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -171,5 +172,41 @@ func TestPublicNodeLocalNodeClassWithoutProfileIsGone(t *testing.T) {
 	verdict, err = f.verdict(t, nil)
 	if verdict.kind == publicNodeLocalNodeGone || verdict.kind == publicNodeLocalNodeAuthorized {
 		t.Fatalf("an absent class was treated as %#v (err=%v), want an ambiguous node", verdict, err)
+	}
+}
+
+// While no Node has a Ready endpoint, the per-node grace does not run. One pod
+// that comes back must not remove every other Node at once.
+func TestPublicNodeLocalGraceRestartsWhenAnEndpointReturns(t *testing.T) {
+	f := newPublishedPublicNodeLocalFixtureN(t, 3)
+	now := time.Date(2026, 10, 28, 12, 0, 0, 0, time.UTC)
+	f.controller.publicNodeLocalNow = func() time.Time { return now }
+	_, _, _, pub1 := publicNodeLocalFixtureNode(0)
+	_, _, _, pub2 := publicNodeLocalFixtureNode(1)
+	_, _, _, pub3 := publicNodeLocalFixtureNode(2)
+	run := func(passes int) {
+		t.Helper()
+		for pass := 0; pass < passes; pass++ {
+			err := f.controller.syncPublicNodeLocal(f.ctx, f.key, f.current(t))
+			var holding *errPublicNodeLocalHolding
+			if err != nil && !errors.As(err, &holding) {
+				t.Fatalf("pass %d: %v", pass, err)
+			}
+		}
+	}
+	f.setEndpoints(t)
+	run(2)
+	now = now.Add(time.Hour)
+	run(2)
+
+	f.setEndpoints(t, "edge-0")
+	run(4)
+	if observed := observePublicNodeLocal(t, f); !observed.fips[pub2] || !observed.fips[pub3] {
+		t.Fatalf("one returning pod removed the other Nodes at once: %#v", observed)
+	}
+	now = now.Add(publicNodeLocalEndpointGoneGrace + time.Second)
+	run(20)
+	if observed := observePublicNodeLocal(t, f); observed.fips[pub2] || observed.fips[pub3] || !observed.fips[pub1] {
+		t.Fatalf("the Nodes without an endpoint stayed after the grace: %#v", observed)
 	}
 }

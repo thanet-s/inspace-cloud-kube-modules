@@ -244,12 +244,15 @@ func (c *nodeLoadBalancerController) convergeActivePublicNodeLocal(
 		return member.public != "" && found
 	}
 	noteGone := func(name string) {
-		goneKeys[string(service.UID)+"/"+name] = struct{}{}
-		since := c.noteEndpointGone(string(service.UID)+"/"+name, now)
 		if readyEmpty {
+			// Nothing serves, so no Node is "the one that lost its endpoint". The
+			// grace does not run, and pruning below forgets any timer that ran, so
+			// the first pod that returns starts a fresh grace for every other Node.
 			keep[name] = struct{}{}
 			return
 		}
+		goneKeys[string(service.UID)+"/"+name] = struct{}{}
+		since := c.noteEndpointGone(string(service.UID)+"/"+name, now)
 		if elapsed := now.Sub(since); elapsed >= publicNodeLocalEndpointGoneGrace {
 			remove[name] = struct{}{}
 			return
