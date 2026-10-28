@@ -42,6 +42,7 @@ test "$(grep -Fc '    namespace: inspace-system' "$tmpdir/ccm-rbac.yaml")" -eq 2
 grep -Fx '  kind: Role' "$tmpdir/ccm-rbac.yaml" >/dev/null
 grep -Fx '  name: extension-apiserver-authentication-reader' "$tmpdir/ccm-rbac.yaml" >/dev/null
 grep -Fx '    verbs: ["get", "list", "watch", "patch", "update", "delete"]' "$tmpdir/ccm-rbac.yaml" >/dev/null
+grep -Fx '    verbs: ["create", "get", "patch", "update"]' "$tmpdir/ccm-rbac.yaml" >/dev/null
 grep -Fx '    resources: ["tokenreviews"]' "$tmpdir/ccm-rbac.yaml" >/dev/null
 grep -Fx '    resources: ["subjectaccessreviews"]' "$tmpdir/ccm-rbac.yaml" >/dev/null
 
@@ -313,6 +314,7 @@ grep -Fx 'kind: RoleBinding' "$standalone_ccm" >/dev/null
 grep -Fx '  name: extension-apiserver-authentication-reader' "$standalone_ccm" >/dev/null
 grep -Fx '      dnsPolicy: Default' "$standalone_ccm" >/dev/null
 grep -Fx '    verbs: ["get", "list", "watch", "patch", "update", "delete"]' "$standalone_ccm" >/dev/null
+grep -Fx '    verbs: ["create", "get", "patch", "update"]' "$standalone_ccm" >/dev/null
 grep -Fx '    resources: ["tokenreviews"]' "$standalone_ccm" >/dev/null
 grep -Fx '    resources: ["subjectaccessreviews"]' "$standalone_ccm" >/dev/null
 require_toleration "$standalone_csi"

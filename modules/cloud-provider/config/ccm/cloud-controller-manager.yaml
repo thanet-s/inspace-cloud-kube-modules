@@ -35,7 +35,7 @@ rules:
     verbs: ["get", "create", "update", "delete"]
   - apiGroups: [""]
     resources: ["events"]
-    verbs: ["create", "patch", "update"]
+    verbs: ["create", "get", "patch", "update"]
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
     verbs: ["get", "list", "watch", "create", "update", "patch"]
@@ -225,6 +225,8 @@ spec:
                   key: nodeLoadBalancerDefaultNodeClass
             - name: INSPACE_NODE_LOAD_BALANCER_NODES_PER_SHARD
               value: "1"
+            - name: INSPACE_NODE_LOAD_BALANCER_MAX_FIREWALLS_PER_VM
+              value: "3"
           resources:
             requests:
               cpu: 100m

@@ -35,6 +35,10 @@ ccm:
     # by static Karpenter capacity and Cilium private-IP Service frontends.
     enabled: true
     nodesPerShard: 1
+    # Most firewalls one VM may carry. InSpace drops every new outbound
+    # connection of a VM with four or more firewalls, so the CCM refuses an
+    # attachment that would exceed this. Allowed range 1-10.
+    maxFirewallsPerVM: 3
   replicaCount: 2
   image:
     repository: ghcr.io/thanet-s/inspace-cloud-controller-manager

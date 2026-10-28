@@ -1529,8 +1529,10 @@ func TestNodeLoadBalancerFirewallRelationMutationBlockedClearsWithoutReadback(t 
 	if converged || !errors.Is(err, inspace.ErrMutationBlocked) {
 		t.Fatalf("blocked relation mutation result: converged=%t err=%v", converged, err)
 	}
-	if api.assignCalls != 1 || api.listCalls != 1 {
-		t.Fatalf("blocked relation mutation calls: assign=%d list=%d, want 1/1", api.assignCalls, api.listCalls)
+	// One list for the fence state and one for the pre-attach firewall count;
+	// none after the blocked mutation.
+	if api.assignCalls != 1 || api.listCalls != 2 {
+		t.Fatalf("blocked relation mutation calls: assign=%d list=%d, want 1/2", api.assignCalls, api.listCalls)
 	}
 	stored := getNodeLoadBalancerTestService(t, context.Background(), provider, service.Namespace, service.Name)
 	if stored.Annotations[annotationNodeLoadBalancerFirewallRelationIssued] != "" ||

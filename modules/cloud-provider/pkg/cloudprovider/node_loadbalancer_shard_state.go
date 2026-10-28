@@ -1500,6 +1500,13 @@ func (c *nodeLoadBalancerController) ensureShardFirewallAssignments(
 			},
 		)
 		if relationErr != nil {
+			// A VM at its firewall limit is skipped: it stays unattached and the
+			// readback below reports the shard as not ready, so the other VMs
+			// still get their firewall.
+			var limitErr *FirewallLimitExceededError
+			if errors.As(relationErr, &limitErr) {
+				continue
+			}
 			return false, nil, fmt.Errorf("node load balancer: attach shard firewall %s to new VM %s: %w", firewall.UUID, vmUUID, relationErr)
 		}
 		if !converged {

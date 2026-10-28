@@ -195,6 +195,9 @@ type NodeLoadBalancerConfig struct {
 	Enabled          bool
 	DefaultNodeClass string
 	NodesPerShard    int32
+	// MaxFirewallsPerVM is the most firewalls the CCM lets one VM carry. Zero
+	// or a negative value means DefaultMaxFirewallsPerVM.
+	MaxFirewallsPerVM int32
 }
 
 type Provider struct {
@@ -224,6 +227,10 @@ type Provider struct {
 	addressShrinkSince map[string]time.Time
 	// standardNLBEvents is optional; unit tests leave it nil.
 	standardNLBEvents record.EventRecorder
+	// recentFirewallAssigns remembers firewall attachments the API acknowledged
+	// but a listing may not show yet, per VM UUID then firewall UUID.
+	recentFirewallMu      sync.Mutex
+	recentFirewallAssigns map[string]map[string]time.Time
 }
 
 // exactVMReadAbsenceError distinguishes absence returned by the one canonical

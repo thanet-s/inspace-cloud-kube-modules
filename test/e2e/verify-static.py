@@ -1153,6 +1153,7 @@ def verify_node_load_balancer_helm_contract() -> None:
         ("INSPACE_NODE_LOAD_BALANCER_ENABLED", "true"),
         ("INSPACE_NODE_LOAD_BALANCER_DEFAULT_NODE_CLASS", "ci-workers"),
         ("INSPACE_NODE_LOAD_BALANCER_NODES_PER_SHARD", "1"),
+        ("INSPACE_NODE_LOAD_BALANCER_MAX_FIREWALLS_PER_VM", "3"),
     ):
         require(
             re.search(
@@ -1170,6 +1171,7 @@ def verify_node_load_balancer_helm_contract() -> None:
         ("karpenter.sh", "nodepools", '["get", "list", "create", "update", "delete"]'),
         ("karpenter.sh", "nodeclaims", '["get", "list"]'),
         ("karpenter.inspace.cloud", "inspacenodeclasses", '["get", "create", "update", "delete"]'),
+        ("", "events", '["create", "get", "patch", "update"]'),
     ):
         rule = (
             f'  - apiGroups: ["{api_group}"]\n'

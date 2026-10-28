@@ -697,6 +697,43 @@ with no private IPv4 is an error, so the node keeps its last addresses, and an
 empty floating-IP list does not drop an existing ExternalIP until it has stayed
 empty for five minutes.
 
+### Per-VM firewall limit
+
+InSpace drops every new outbound connection (TCP and ICMP) of a VM that has
+four or more firewalls attached, whatever the rule count; inbound traffic and
+replies keep working, and the VM recovers a couple of seconds after a firewall
+is detached. A `public-node-local` node already carries the base node firewall
+and one firewall per Service that exposes it, so a few Services can reach the
+limit and cut the kubelet off the API server.
+
+Before the CCM attaches any firewall to a VM (a per-Service firewall, a shard
+or aggregate firewall, the cluster ICMP firewall, or a make-before-break
+target) it reads the VM's firewalls back from the InSpace API, counts every
+firewall on the VM and not only its own, and refuses an attachment that would
+exceed `MaxFirewallsPerVM` (default `3`; set
+`INSPACE_NODE_LOAD_BALANCER_MAX_FIREWALLS_PER_VM` or the chart value
+`ccm.nodeLoadBalancer.maxFirewallsPerVM`, range 1-10; the CCM treats a value
+below `1` as `3`). A
+firewall that is already attached does not add to the count. If the readback
+fails, the attachment is refused and retried.
+
+A refusal attaches nothing, persists nothing (no relation receipt and no
+Service update, so it does not re-enqueue itself) and is not a verified intent,
+so the Service keeps its last known good exposure (see fail-static above). The
+node is simply not added for that Service. The CCM logs the refusal and, for a
+per-Service firewall, raises a `FirewallLimitExceeded` Warning Event on the
+Service with the VM, the current count and the limit. Shard, aggregate, cluster
+ICMP and NodePool owners have no Service to attach an Event to and only log a
+warning. A `public-node-local` Service retries with the capped hold backoff (a
+repeating hold backs off up to 5 minutes); the shard and ICMP paths skip the
+VM at the limit, still attach the other VMs and report the shard not ready until
+the next pass. Acknowledged attachments are also remembered for two minutes, so
+a listing that lags behind cannot let a second firewall through. Free a slot by removing a firewall from
+that VM (for example by reducing the number of `public-node-local` Services on
+the node) or by raising the limit if you know your VMs tolerate it. Every
+firewall attach and detach is logged at info level with the Service, VM UUID
+and firewall UUID.
+
 For that paid NLB path, `Service.spec.loadBalancerSourceRanges` is rejected
 because the InSpace NLB API exposes TCP port forwarding, not source-range
 filtering. Use InSpace firewalls or in-cluster policy where appropriate. UDP
@@ -878,6 +915,12 @@ edge nodes, then requires an exact zero-owned-resource cloud audit.
 
 ## Remaining production gaps
 
+- A VM can carry at most three firewalls (configurable) before InSpace drops its
+  new outbound connections, so one node can serve only a limited number of
+  `public-node-local` Services. See [Per-VM firewall limit](#per-vm-firewall-limit).
+  The limit guards CCM attachments only. Karpenter and the cluster controller
+  attach the base firewall to a new VM unguarded, and firewalls attached by
+  hand are counted but not prevented.
 - The bootstrap binary consumes a YAML file; it does not yet watch the CRD,
   resolve Secret references through a Kubernetes management cluster, or use a
   Kubernetes finalizer. Lifecycle is explicit CLI reconciliation and owned
