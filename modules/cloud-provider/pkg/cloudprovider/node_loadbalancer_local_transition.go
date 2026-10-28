@@ -277,3 +277,85 @@ func (c *nodeLoadBalancerController) setPublicNodeLocalDatapathStatusHeld(
 	}
 	return nil
 }
+
+const (
+	annotationPublicNodeLocalTargetPool   = "service.inspace.cloud/public-node-local-target-pool"
+	annotationPublicNodeLocalTargetPolicy = "service.inspace.cloud/public-node-local-target-policy"
+	// annotationPublicNodeLocalDatapathTargetPool is set on the child while a
+	// transition is in progress, so peers can attribute its exposure to both pools.
+	annotationPublicNodeLocalDatapathTargetPool = "service.inspace.cloud/public-node-local-target-pool"
+)
+
+type publicNodeLocalTransitionPhase int
+
+const (
+	// publicNodeLocalPhaseInactive: nothing is serving.
+	publicNodeLocalPhaseInactive publicNodeLocalTransitionPhase = iota
+	// publicNodeLocalPhaseSteady: the active exposure is the only one.
+	publicNodeLocalPhaseSteady
+	// publicNodeLocalPhaseUnion: the active and the target exposure are both
+	// being served until the target is converged.
+	publicNodeLocalPhaseUnion
+	// publicNodeLocalPhasePromoted: the target was promoted and the old
+	// firewall is still being detached and deleted.
+	publicNodeLocalPhasePromoted
+	// publicNodeLocalPhaseInvalid: the annotations contradict each other.
+	publicNodeLocalPhaseInvalid
+)
+
+type publicNodeLocalTransitionState struct {
+	Phase        publicNodeLocalTransitionPhase
+	ActivePool   string
+	ActivePolicy string
+	TargetPool   string
+	TargetPolicy string
+}
+
+// Work is the identity that adds converge to: the target while a union runs,
+// the active identity otherwise.
+func (s publicNodeLocalTransitionState) Work() (pool, policy string) {
+	if s.Phase == publicNodeLocalPhaseUnion {
+		return s.TargetPool, s.TargetPolicy
+	}
+	return s.ActivePool, s.ActivePolicy
+}
+
+// publicNodeLocalTransition reads the transition phase from the parent
+// annotations. An inconsistent set is Invalid and must be held, never acted on.
+func publicNodeLocalTransition(service *corev1.Service) (publicNodeLocalTransitionState, error) {
+	state := publicNodeLocalTransitionState{
+		ActivePool:   service.Annotations[annotationPublicNodeLocalActivePool],
+		ActivePolicy: service.Annotations[annotationPublicNodeLocalActivePolicy],
+		TargetPool:   service.Annotations[annotationPublicNodeLocalTargetPool],
+		TargetPolicy: service.Annotations[annotationPublicNodeLocalTargetPolicy],
+	}
+	invalid := func(reason string) (publicNodeLocalTransitionState, error) {
+		state.Phase = publicNodeLocalPhaseInvalid
+		return state, fmt.Errorf("public-node-local: invalid transition annotations: %s", reason)
+	}
+	if (state.ActivePool == "") != (state.ActivePolicy == "") {
+		return invalid("incomplete activation identity")
+	}
+	if (state.TargetPool == "") != (state.TargetPolicy == "") {
+		return invalid("target pool and policy must be set together")
+	}
+	if state.TargetPool != "" {
+		if state.ActivePool == "" {
+			return invalid("a target without an activation")
+		}
+		if state.TargetPool == state.ActivePool && state.TargetPolicy == state.ActivePolicy {
+			return invalid("the target equals the active identity")
+		}
+		state.Phase = publicNodeLocalPhaseUnion
+		return state, nil
+	}
+	switch {
+	case state.ActivePool == "":
+		state.Phase = publicNodeLocalPhaseInactive
+	case service.Annotations[annotationNodeLoadBalancerPreviousFirewall] != "":
+		state.Phase = publicNodeLocalPhasePromoted
+	default:
+		state.Phase = publicNodeLocalPhaseSteady
+	}
+	return state, nil
+}
