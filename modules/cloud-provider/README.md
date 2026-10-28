@@ -678,6 +678,25 @@ NLB's private address is neither the control-plane VIP nor an address in the
 reserved Cilium pool. A collision triggers deterministic owned FIP/NLB cleanup
 and fails the reconciliation.
 
+Runbook: while a Service's public NLB (or floating IP) create is still
+ambiguous, that is, its mutation receipt shows `create-load-balancer` or
+`create-floating-ip` issued and the resource is not yet visible, do not toggle
+the Service's public markers off and on. The receipt carries the one-re-create
+budget, and a drop-and-restore cycle can end with a fresh create while the
+original still lands: more than one paid resource and an ownership-name
+collision. Wait until the resource appears, or the retire window passes and the
+CCM re-creates once, or the receipt is resolved by hand.
+
+Node lifecycle safety: a Node is declared gone only on an exact VM 404 (or a
+deleted tombstone) plus a populated VM inventory and VPC membership. If either
+list is empty, the same VM must be seen absent again at least 30 seconds later.
+If more than half of the nodes would be declared gone within five minutes, the
+CCM refuses, logs, and raises a `MassNodeAbsenceRefused` Event on the Node;
+delete such Nodes by hand once you have checked the InSpace view. A VM answer
+with no private IPv4 is an error, so the node keeps its last addresses, and an
+empty floating-IP list does not drop an existing ExternalIP until it has stayed
+empty for five minutes.
+
 For that paid NLB path, `Service.spec.loadBalancerSourceRanges` is rejected
 because the InSpace NLB API exposes TCP port forwarding, not source-range
 filtering. Use InSpace firewalls or in-cluster policy where appropriate. UDP
