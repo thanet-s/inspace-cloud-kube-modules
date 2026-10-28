@@ -479,3 +479,75 @@ func TestPublicNodeLocalActivePublishReadsBackVIPAndAssignment(t *testing.T) {
 		})
 	}
 }
+
+// A hold whose cause never changes backs off from the hold delay up to a cap,
+// and the Event tells the operator how long the hold has lasted.
+func TestPublicNodeLocalUnchangingHoldBacksOffExponentially(t *testing.T) {
+	f := newPublishedPublicNodeLocalFixture(t)
+	corrupt := func() {
+		updatePublicNodeLocalFixtureService(t, f, func(s *corev1.Service) {
+			delete(s.Annotations, annotationPublicNodeLocalActivePolicy)
+		})
+	}
+	corrupt()
+	var delays []time.Duration
+	for pass := 0; pass < 12; pass++ {
+		err := f.controller.syncPublicNodeLocal(f.ctx, f.key, f.current(t))
+		delay, fixed := nodeLoadBalancerRequeueDelay(err)
+		if !fixed {
+			t.Fatalf("pass %d: error %v has no fixed requeue delay", pass, err)
+		}
+		delays = append(delays, delay)
+	}
+	if delays[0] != nodeLoadBalancerRetry {
+		t.Fatalf("first hold delay = %s, want %s", delays[0], nodeLoadBalancerRetry)
+	}
+	for index := 1; index < len(delays); index++ {
+		if delays[index] < delays[index-1] || delays[index] > publicNodeLocalHoldBackoffMax {
+			t.Fatalf("delays %v are not a capped non-decreasing backoff", delays)
+		}
+	}
+	if delays[1] != 2*nodeLoadBalancerRetry || delays[len(delays)-1] != publicNodeLocalHoldBackoffMax {
+		t.Fatalf("delays %v do not double up to the %s cap", delays, publicNodeLocalHoldBackoffMax)
+	}
+	requirePublicNodeLocalEvent(t, f, "PublicNodeLocalHolding")
+	requirePublicNodeLocalEvent(t, f, "PublicNodeLocalHoldBackoff")
+
+	// A pass that makes progress resets the backoff.
+	updatePublicNodeLocalFixtureService(t, f, func(s *corev1.Service) {
+		s.Annotations[annotationPublicNodeLocalActivePolicy] = f.current(t).Annotations[annotationNodeLoadBalancerFirewallHash]
+	})
+	if err := f.controller.syncPublicNodeLocal(f.ctx, f.key, f.current(t)); err != nil {
+		t.Fatalf("healthy pass: %v", err)
+	}
+	corrupt()
+	err := f.controller.syncPublicNodeLocal(f.ctx, f.key, f.current(t))
+	if delay, _ := nodeLoadBalancerRequeueDelay(err); delay != nodeLoadBalancerRetry {
+		t.Fatalf("the backoff survived a healthy pass: %s", delay)
+	}
+}
+
+// The Event name derives from the reason and a stable cause class, never from
+// the full cause text, so a changing message updates one Event.
+func TestPublicNodeLocalHoldEventNameIgnoresCauseText(t *testing.T) {
+	f := newPublishedPublicNodeLocalFixture(t)
+	service := f.current(t)
+	for _, text := range []string{"first cause 1", "second cause 2", "third cause 3"} {
+		if err := f.controller.recordPublicNodeLocalHoldEvent(f.ctx, service, "PublicNodeLocalHolding", errors.New(text)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	events, err := f.provider.kubeClient.CoreV1().Events(service.Namespace).List(f.ctx, metav1.ListOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events.Items) != 1 {
+		t.Fatalf("%d Events for one reason and cause class, want 1: %#v", len(events.Items), events.Items)
+	}
+	if got := events.Items[0].Message; !strings.Contains(got, "third cause 3") {
+		t.Fatalf("the Event kept a stale message: %q", got)
+	}
+	if events.Items[0].Count != 3 {
+		t.Fatalf("Event count = %d, want 3", events.Items[0].Count)
+	}
+}

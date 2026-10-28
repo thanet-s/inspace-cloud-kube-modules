@@ -63,6 +63,20 @@ func (c *nodeLoadBalancerController) syncPublicNodeLocal(
 	key string,
 	service *corev1.Service,
 ) error {
+	err := c.syncPublicNodeLocalPass(ctx, key, service)
+	var holding *errPublicNodeLocalHolding
+	if service != nil && !errors.As(err, &holding) {
+		// Only an unchanged hold backs off. Progress, or any other outcome, resets it.
+		c.resetPublicNodeLocalHold(string(service.UID))
+	}
+	return err
+}
+
+func (c *nodeLoadBalancerController) syncPublicNodeLocalPass(
+	ctx context.Context,
+	key string,
+	service *corev1.Service,
+) error {
 	if service == nil {
 		return errors.New("public-node-local: Service is required")
 	}
@@ -2304,6 +2318,19 @@ const (
 	publicNodeLocalReasonHolding           = "PublicNodeLocalHolding"
 	publicNodeLocalReasonTransitionPending = "PublicNodeLocalTransitionPending"
 	publicNodeLocalReasonRelationStuck     = "PublicNodeLocalFirewallRelationStuck"
+	publicNodeLocalReasonHoldBackoff       = "PublicNodeLocalHoldBackoff"
+
+	// publicNodeLocalHoldBackoffNotice is the repeat count at which the backoff
+	// is announced.
+	publicNodeLocalHoldBackoffNotice = 3
+
+	// publicNodeLocalHoldBackoffMax caps the requeue delay of a hold whose cause
+	// does not change.
+	publicNodeLocalHoldBackoffMax = 5 * time.Minute
+
+	// publicNodeLocalHoldEventRefresh is how often an unchanged hold Event is
+	// rewritten.
+	publicNodeLocalHoldEventRefresh = 5 * time.Minute
 )
 
 // recordPublicNodeLocalStuckRelation makes a parked firewall relation visible.
@@ -2333,12 +2360,42 @@ func (c *nodeLoadBalancerController) holdOrFailPublicNodeLocal(ctx context.Conte
 	if eventErr := c.recordPublicNodeLocalHoldEvent(ctx, service, publicNodeLocalReasonHolding, cause); eventErr != nil {
 		klog.Warningf("public-node-local %s/%s: record hold Event: %v", service.Namespace, service.Name, eventErr)
 	}
-	return &errPublicNodeLocalHolding{cause: cause}
+	retryAfter, held := c.nextPublicNodeLocalHoldDelay(string(service.UID), cause)
+	if held == publicNodeLocalHoldBackoffNotice {
+		// One stable Event per repeating hold tells the operator it backs off.
+		if eventErr := c.recordPublicNodeLocalHoldEvent(ctx, service, publicNodeLocalReasonHoldBackoff, fmt.Errorf(
+			"public-node-local: the same hold repeats; retries back off up to %s: %w", publicNodeLocalHoldBackoffMax, cause)); eventErr != nil {
+			klog.Warningf("public-node-local %s/%s: record backoff Event: %v", service.Namespace, service.Name, eventErr)
+		}
+	}
+	return &errPublicNodeLocalHolding{cause: cause, retryAfter: retryAfter}
+}
+
+// publicNodeLocalCauseClass names the kind of a hold cause. It is stable across
+// repeats of the same fault, unlike the cause text, which embeds UUIDs, names
+// and timestamps.
+func publicNodeLocalCauseClass(cause error) string {
+	var pending *nodeLoadBalancerFirewallRelationPendingError
+	var status *apierrors.StatusError
+	var api *inspace.APIError
+	switch {
+	case errors.Is(cause, errNodeLoadBalancerFirewallRelationParked):
+		return "relation-parked"
+	case errors.As(cause, &pending):
+		return "relation-pending"
+	case errors.As(cause, &status):
+		return "kubernetes-api"
+	case errors.As(cause, &api):
+		return "provider-api"
+	default:
+		return "state"
+	}
 }
 
 // recordPublicNodeLocalHoldEvent makes a hold visible on the Service. The Event
-// name derives from the Service UID, the reason and the cause, so a repeated
-// cause neither spams Events nor writes any Service annotation.
+// name derives from the Service UID, the reason and a stable cause class, so a
+// changing cause text updates one Event instead of creating a new one, and no
+// Service annotation is written.
 func (c *nodeLoadBalancerController) recordPublicNodeLocalHoldEvent(
 	ctx context.Context,
 	service *corev1.Service,
@@ -2353,11 +2410,10 @@ func (c *nodeLoadBalancerController) recordPublicNodeLocalHoldEvent(
 		message = message[:900] + "..."
 	}
 	now := metav1.Now()
-	_, err := c.provider.kubeClient.CoreV1().Events(service.Namespace).Create(ctx, &corev1.Event{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      service.Name + "." + shortHash(string(service.UID)+"\x00"+reason+"\x00"+cause.Error()),
-			Namespace: service.Namespace,
-		},
+	name := service.Name + "." + shortHash(string(service.UID)+"\x00"+reason+"\x00"+publicNodeLocalCauseClass(cause))
+	client := c.provider.kubeClient.CoreV1().Events(service.Namespace)
+	_, err := client.Create(ctx, &corev1.Event{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: service.Namespace},
 		InvolvedObject: corev1.ObjectReference{
 			APIVersion: "v1", Kind: "Service", Namespace: service.Namespace,
 			Name: service.Name, UID: service.UID,
@@ -2370,7 +2426,24 @@ func (c *nodeLoadBalancerController) recordPublicNodeLocalHoldEvent(
 		Count:          1,
 		Type:           corev1.EventTypeWarning,
 	}, metav1.CreateOptions{})
-	if apierrors.IsAlreadyExists(err) {
+	if !apierrors.IsAlreadyExists(err) {
+		return err
+	}
+	existing, err := client.Get(ctx, name, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if existing.Message == message && now.Sub(existing.LastTimestamp.Time) < publicNodeLocalHoldEventRefresh {
+		return nil
+	}
+	existing.Message = message
+	existing.LastTimestamp = now
+	existing.Count++
+	_, err = client.Update(ctx, existing, metav1.UpdateOptions{})
+	if apierrors.IsNotFound(err) || apierrors.IsConflict(err) {
 		return nil
 	}
 	return err
@@ -2541,6 +2614,8 @@ func (c *nodeLoadBalancerController) requeuePublicNodeLocal(key string) {
 // verified intent, and that the last known good exposure was left in place.
 type errPublicNodeLocalHolding struct {
 	cause error
+	// retryAfter is the requeue delay. Zero means the plain hold delay.
+	retryAfter time.Duration
 }
 
 func (e *errPublicNodeLocalHolding) Error() string {
@@ -2559,3 +2634,43 @@ type publicNodeLocalSiblingError struct {
 func (e *publicNodeLocalSiblingError) Error() string { return e.cause.Error() }
 
 func (e *publicNodeLocalSiblingError) Unwrap() error { return e.cause }
+
+// publicNodeLocalHold is the in-memory record of a hold that repeats.
+type publicNodeLocalHold struct {
+	cause  string
+	passes int
+}
+
+// nextPublicNodeLocalHoldDelay returns the requeue delay for a hold and how many
+// consecutive passes ended in this same hold. The delay starts at the plain hold
+// delay and doubles for every repeat up to publicNodeLocalHoldBackoffMax, so a
+// state that never changes does not run a full VM audit every 10 seconds. A
+// different cause starts over.
+func (c *nodeLoadBalancerController) nextPublicNodeLocalHoldDelay(uid string, cause error) (time.Duration, int) {
+	c.holdMu.Lock()
+	defer c.holdMu.Unlock()
+	if c.holds == nil {
+		c.holds = map[string]publicNodeLocalHold{}
+	}
+	hold := c.holds[uid]
+	text := cause.Error()
+	if hold.cause != text {
+		hold = publicNodeLocalHold{cause: text}
+	}
+	hold.passes++
+	c.holds[uid] = hold
+	delay := nodeLoadBalancerRetry
+	for repeat := 1; repeat < hold.passes && delay < publicNodeLocalHoldBackoffMax; repeat++ {
+		delay *= 2
+	}
+	if delay > publicNodeLocalHoldBackoffMax {
+		delay = publicNodeLocalHoldBackoffMax
+	}
+	return delay, hold.passes
+}
+
+func (c *nodeLoadBalancerController) resetPublicNodeLocalHold(uid string) {
+	c.holdMu.Lock()
+	defer c.holdMu.Unlock()
+	delete(c.holds, uid)
+}
