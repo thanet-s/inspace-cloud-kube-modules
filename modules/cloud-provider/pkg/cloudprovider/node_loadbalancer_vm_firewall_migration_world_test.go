@@ -56,6 +56,8 @@ type migrationCluster struct {
 	required map[string][]inspace.FirewallRule
 	// observe, when set, runs after every mutating cloud call.
 	observe func(call string)
+	// afterPass, when set, runs after every pass of the fault runs.
+	afterPass func()
 }
 
 func newMigrationCluster(t *testing.T, vms ...migrationVM) *migrationCluster {

@@ -112,7 +112,17 @@ func (c *nodeLoadBalancerController) syncPublicNodeLocalPass(
 	}
 	if publicNodeLocalServicePerVM(service) && !c.publicNodeLocalPerVMModeEnabled() {
 		// The Service lives on the per-VM firewall and this controller does not run
-		// that mode. Nothing here may touch the firewalls of its VMs: it holds.
+		// that mode. Nothing here may touch the firewalls of its VMs: it holds, and the
+		// VM passes move it back onto its own firewall (spec section 7.4). The pass
+		// that finds it back there ends the hold.
+		flipped, flipErr := c.flipReversedPublicNodeLocal(ctx, service)
+		if flipErr != nil {
+			return c.holdOrFailPublicNodeLocal(ctx, service, flipErr)
+		}
+		if flipped {
+			c.requeuePublicNodeLocal(key)
+			return nil
+		}
 		return c.holdOrFailPublicNodeLocal(ctx, service, publicNodeLocalPerVMHeldError(service))
 	}
 	if err := c.publicNodeLocalVMFirewallMigrationHold(ctx, service); err != nil {
@@ -1450,6 +1460,9 @@ func (c *nodeLoadBalancerController) auditPublicNodeLocalVMFirewalls(
 			firewallVM == vmUUID &&
 			inspace.ValidateNodeLoadBalancerVMFirewallIdentity(firewall, c.provider.config.ClusterID, vmUUID, c.provider.config.BillingAccountID) == nil {
 			if !c.publicNodeLocalPerVMModeEnabled() {
+				// The Services of this VM hold, and its VM pass moves them back onto
+				// their own firewalls.
+				c.queueVMFirewall(vmUUID)
 				return &publicNodeLocalPerVMStatePresentError{vmUUID: vmUUID, firewallUUID: firewall.UUID}
 			}
 			vmFirewalls++
@@ -2884,7 +2897,16 @@ func (c *nodeLoadBalancerController) recordPublicNodeLocalHoldEvent(
 func (c *nodeLoadBalancerController) cleanupPublicNodeLocal(ctx context.Context, key string, service *corev1.Service) error {
 	if publicNodeLocalServicePerVM(service) && !c.publicNodeLocalPerVMModeEnabled() {
 		// Its entries live on the VM firewalls, which this mode does not manage:
-		// finalizing now would orphan them. It waits for the mode to come back.
+		// finalizing now would orphan them. It waits for the mode to come back, or for
+		// the reverse migration to give it its own firewall again.
+		flipped, flipErr := c.flipReversedPublicNodeLocal(ctx, service)
+		if flipErr != nil {
+			return c.holdOrFailPublicNodeLocal(ctx, service, flipErr)
+		}
+		if flipped {
+			c.requeuePublicNodeLocal(key)
+			return nil
+		}
 		return c.holdOrFailPublicNodeLocal(ctx, service, publicNodeLocalPerVMHeldError(service))
 	}
 	if err := c.withdrawPublicNodeLocal(ctx, service); err != nil {

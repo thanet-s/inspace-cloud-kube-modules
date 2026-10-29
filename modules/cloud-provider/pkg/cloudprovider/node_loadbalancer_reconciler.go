@@ -146,6 +146,10 @@ type nodeLoadBalancerController struct {
 	// per-VM firewall anchors and the scan for orphans. Guarded by vmFirewallOrphanMu.
 	vmFirewallEnqueuedAt time.Time
 	vmFirewallScannedAt  time.Time
+	// vmFirewallLastGoneAt is when this process last saw an anchor deleted. The
+	// durable record of a reverse migration ending is the stamp on the anchors left.
+	// Guarded by vmFirewallOrphanMu.
+	vmFirewallLastGoneAt time.Time
 	// allGoneSince records, in memory only, when every published Node of a Service
 	// was first seen gone on cloud evidence alone. Guarded by endpointGoneMu.
 	allGoneSince map[string]time.Time
@@ -397,14 +401,18 @@ func (c *nodeLoadBalancerController) enqueueAll() {
 		runtime.HandleError(fmt.Errorf("node load balancer: list Services for enqueue: %w", err))
 		return
 	}
+	perVMServices := false
 	for _, service := range services {
 		if isNodeLoadBalancerService(service) ||
 			containsString(service.Finalizers, nodeLoadBalancerFinalizer) ||
 			containsString(service.Finalizers, publicNodeLocalFinalizer) {
 			c.queue.Add(service.Namespace + "/" + service.Name)
 		}
+		if publicNodeLocalServicePerVM(service) {
+			perVMServices = true
+		}
 	}
-	c.enqueueVMFirewalls()
+	c.enqueueVMFirewalls(perVMServices)
 }
 
 func isNodeLoadBalancerService(service *corev1.Service) bool {
@@ -2047,6 +2055,12 @@ type desiredNodeLoadBalancerFirewall struct {
 }
 
 func (c *nodeLoadBalancerController) desiredServiceFirewall(service *corev1.Service) (desiredNodeLoadBalancerFirewall, error) {
+	return desiredServiceFirewallFor(c.provider.config.ClusterID, c.provider.config.BillingAccountID, service)
+}
+
+// desiredServiceFirewallFor is the pure form of desiredServiceFirewall, for the
+// planners that work from values and not from a controller.
+func desiredServiceFirewallFor(cluster string, billingAccountID int64, service *corev1.Service) (desiredNodeLoadBalancerFirewall, error) {
 	serviceUID := string(service.UID)
 	if serviceUID == "" {
 		return desiredNodeLoadBalancerFirewall{}, errors.New("node load balancer: Service UID is required before creating a firewall")
@@ -2075,13 +2089,13 @@ func (c *nodeLoadBalancerController) desiredServiceFirewall(service *corev1.Serv
 		}
 		rules = append(rules, rule)
 	}
-	name, hash, err := inspace.NodeLoadBalancerServiceFirewallName(c.provider.config.ClusterID, serviceUID, rules)
+	name, hash, err := inspace.NodeLoadBalancerServiceFirewallName(cluster, serviceUID, rules)
 	if err != nil {
 		return desiredNodeLoadBalancerFirewall{}, err
 	}
 	return desiredNodeLoadBalancerFirewall{
 		Request: inspace.CreateFirewallRequest{
-			DisplayName: name, Description: "Managed InSpace node load balancer Service firewall", BillingAccountID: c.provider.config.BillingAccountID, Rules: rules,
+			DisplayName: name, Description: "Managed InSpace node load balancer Service firewall", BillingAccountID: billingAccountID, Rules: rules,
 		},
 		Hash: hash,
 	}, nil

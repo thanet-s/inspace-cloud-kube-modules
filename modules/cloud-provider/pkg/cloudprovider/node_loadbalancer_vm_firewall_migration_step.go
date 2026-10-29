@@ -173,6 +173,9 @@ func (c *nodeLoadBalancerController) stepVMFirewallMigration(ctx context.Context
 		}
 		return true, vmFirewallWait(nodeLoadBalancerRetry, "public-node-local: the migration of VM %s waits: %s", vmUUID, reason)
 	}
+	if plan.Direction == vmFirewallMigrationDirectionReverse {
+		return true, c.stepVMFirewallReverse(ctx, vmUUID, anchor, plan)
+	}
 	switch plan.Phase {
 	case vmFirewallMigrationPhasePlanned:
 		err = c.openVMFirewallMigration(ctx, vmUUID, anchor, plan)

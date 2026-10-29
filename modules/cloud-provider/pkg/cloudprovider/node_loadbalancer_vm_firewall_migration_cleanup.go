@@ -163,28 +163,12 @@ func (c *nodeLoadBalancerController) cleanupMigratedService(
 	return changed, nil
 }
 
-// blockVMFirewallMigration announces that the migration of a VM can not go on
-// without an operator and holds it.
-func (c *nodeLoadBalancerController) blockVMFirewallMigration(ctx context.Context, vmUUID string, plan vmFirewallMigrationPlan, reason string) error {
-	cause := &errVMFirewallMigrationBlocked{vmUUID: vmUUID, reason: reason}
-	read, err := c.readVMFirewallMigration(ctx)
-	if err == nil {
-		var services []*corev1.Service
-		for _, source := range plan.Sources {
-			if svc := read.services[source.UID]; svc != nil {
-				services = append(services, svc.DeepCopy())
-			}
-		}
-		c.recordVMFirewallEvent(ctx, services, publicNodeLocalReasonVMFirewallMigrationBlocked, cause)
-	}
-	return cause
-}
-
 // sourceChangedBeforeOpen handles a source that changed before the per-VM
 // firewall was open (spec section 7.2, abort before M3). The plan becomes an
 // abort, which undoes what was added. An adopt that already committed can not be
-// undone here: the rename would have to be reversed, which the reverse migration
-// does; until then the VM holds and says so.
+// undone by an abort: the record becomes a reverse migration instead, which waits
+// for the sources to be steady again and then renames the firewall back (spec
+// section 7.4).
 func (c *nodeLoadBalancerController) sourceChangedBeforeOpen(
 	ctx context.Context,
 	vmUUID string,
@@ -194,8 +178,7 @@ func (c *nodeLoadBalancerController) sourceChangedBeforeOpen(
 ) error {
 	view := vmFirewallAnchorView{cm: anchor}
 	if plan.Strategy == vmFirewallMigrationStrategyAdopt && view.uuid() != "" {
-		return c.blockVMFirewallMigration(ctx, vmUUID, plan,
-			fmt.Sprintf("a source changed after firewall %s was renamed into the per-VM firewall (%v); the rename has to be reversed", plan.Adoptee, cause))
+		return c.convertAdoptedMigrationToReverse(ctx, vmUUID, anchor, plan, cause)
 	}
 	klog.Warningf("node load balancer: abort the migration of VM %s to the per-VM firewall: %v", vmUUID, cause)
 	next := plan
@@ -255,7 +238,7 @@ func (c *nodeLoadBalancerController) authorizeVMFirewallMigrationAbort(vmUUID st
 func (c *nodeLoadBalancerController) abortVMFirewallMigration(ctx context.Context, vmUUID string, anchor *corev1.ConfigMap, plan vmFirewallMigrationPlan) error {
 	view := vmFirewallAnchorView{cm: anchor}
 	if plan.Strategy == vmFirewallMigrationStrategyAdopt && view.uuid() != "" {
-		return c.blockVMFirewallMigration(ctx, vmUUID, plan, "the adopted firewall can not be un-adopted by an abort; the rename has to be reversed")
+		return c.convertAdoptedMigrationToReverse(ctx, vmUUID, anchor, plan, errors.New("the adopt committed while the migration was aborting"))
 	}
 	applied, err := view.applied()
 	if err != nil {
