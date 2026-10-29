@@ -133,6 +133,11 @@ type nodeLoadBalancerController struct {
 	// removal, never speed it up.
 	endpointGoneMu    sync.Mutex
 	endpointGoneSince map[string]time.Time
+	// vmFirewallOrphanSince records, in memory only, when the VM of an
+	// unanchored per-VM firewall was first seen gone. A restart can only delay
+	// the delete of such an orphan.
+	vmFirewallOrphanMu    sync.Mutex
+	vmFirewallOrphanSince map[string]time.Time
 	// allGoneSince records, in memory only, when every published Node of a Service
 	// was first seen gone on cloud evidence alone. Guarded by endpointGoneMu.
 	allGoneSince map[string]time.Time

@@ -145,6 +145,14 @@ func (c *nodeLoadBalancerController) refuseFirewallAttach(ctx context.Context, o
 	var limitErr *FirewallLimitExceededError
 	if errors.As(cause, &limitErr) {
 		c.recordFirewallLimitExceeded(ctx, owner.service, owner.description, cause)
+		if owner.members != nil {
+			for _, member := range owner.members(ctx) {
+				if member == nil || (owner.service != nil && member.UID == owner.service.UID) {
+					continue
+				}
+				c.recordFirewallLimitExceeded(ctx, member, owner.description, cause)
+			}
+		}
 		return
 	}
 	klog.Warningf("node load balancer: %s: refuse to attach firewall %s to VM %s: %v",
