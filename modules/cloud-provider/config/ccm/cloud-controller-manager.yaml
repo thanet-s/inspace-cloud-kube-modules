@@ -73,6 +73,32 @@ subjects:
     name: inspace-cloud-controller-manager
     namespace: kube-system
 ---
+# Per-VM firewall anchors (inlb-vmfw-<VM UUID>) live in this namespace. Granted
+# in every firewall mode: the reverse migration runs with perVM off.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: inspace-cloud-controller-manager-configmaps
+  namespace: kube-system
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch", "create", "update", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: inspace-cloud-controller-manager-configmaps
+  namespace: kube-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: inspace-cloud-controller-manager-configmaps
+subjects:
+  - kind: ServiceAccount
+    name: inspace-cloud-controller-manager
+    namespace: kube-system
+---
 # Replace placeholder values before applying. API credentials belong in the
 # separately created inspace-cloud-credentials Secret, never this ConfigMap.
 apiVersion: v1
@@ -227,6 +253,16 @@ spec:
               value: "1"
             - name: INSPACE_NODE_LOAD_BALANCER_MAX_FIREWALLS_PER_VM
               value: "3"
+            - name: INSPACE_NODE_LOAD_BALANCER_LOCAL_FIREWALL_MODE
+              value: "perService"
+            - name: INSPACE_NODE_LOAD_BALANCER_VM_FIREWALL_MIGRATION
+              value: "manual"
+            - name: INSPACE_NODE_LOAD_BALANCER_VM_FIREWALL_SETTLE_SECONDS
+              value: "10"
+            - name: INSPACE_CCM_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
           resources:
             requests:
               cpu: 100m

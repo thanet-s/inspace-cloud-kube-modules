@@ -42,6 +42,44 @@ def manifest_document(text: str, kind: str, name: str) -> str:
     return matches[0]
 
 
+def verify_ccm_namespace_and_configmap_role(rendered: str, label: str) -> None:
+    """The CCM needs its own namespace and the ConfigMap Role in every mode.
+
+    Reverse migration runs with the firewall mode off, so these must not depend
+    on perVM.
+    """
+    deployment = manifest_document(
+        rendered, "Deployment", "verify-inspace-cloud-kube-modules-ccm"
+    )
+    require(
+        "            - name: INSPACE_CCM_NAMESPACE\n"
+        "              valueFrom:\n"
+        "                fieldRef:\n"
+        "                  fieldPath: metadata.namespace\n" in deployment,
+        f"{label}: CCM must set INSPACE_CCM_NAMESPACE from the downward API",
+    )
+    role = manifest_document(
+        rendered, "Role", "verify-inspace-cloud-kube-modules-ccm-configmaps"
+    )
+    require("\n  namespace: kube-system\n" in role,
+            f"{label}: CCM ConfigMap Role must live in the release namespace")
+    require(
+        '    resources: ["configmaps"]\n'
+        '    verbs: ["get", "list", "watch", "create", "update", "delete"]' in role,
+        f"{label}: CCM ConfigMap Role must grant exactly get, list, watch, create, update, delete",
+    )
+    require(role.count("  - apiGroups:") == 1,
+            f"{label}: CCM ConfigMap Role must have one rule")
+    binding = manifest_document(
+        rendered, "RoleBinding", "verify-inspace-cloud-kube-modules-ccm-configmaps"
+    )
+    require(
+        "  kind: Role\n  name: verify-inspace-cloud-kube-modules-ccm-configmaps" in binding
+        and "    name: verify-inspace-cloud-kube-modules-ccm\n    namespace: kube-system" in binding,
+        f"{label}: CCM ConfigMap RoleBinding must bind the CCM service account to the Role",
+    )
+
+
 def single_kind_document(text: str, kind: str) -> str:
     matches = [
         document
@@ -1154,6 +1192,9 @@ def verify_node_load_balancer_helm_contract() -> None:
         ("INSPACE_NODE_LOAD_BALANCER_DEFAULT_NODE_CLASS", "ci-workers"),
         ("INSPACE_NODE_LOAD_BALANCER_NODES_PER_SHARD", "1"),
         ("INSPACE_NODE_LOAD_BALANCER_MAX_FIREWALLS_PER_VM", "3"),
+        ("INSPACE_NODE_LOAD_BALANCER_LOCAL_FIREWALL_MODE", "perVM"),
+        ("INSPACE_NODE_LOAD_BALANCER_VM_FIREWALL_MIGRATION", "manual"),
+        ("INSPACE_NODE_LOAD_BALANCER_VM_FIREWALL_SETTLE_SECONDS", "10"),
     ):
         require(
             re.search(
@@ -1164,6 +1205,7 @@ def verify_node_load_balancer_helm_contract() -> None:
             f"rendered CCM must set {variable}={value}",
         )
 
+    verify_ccm_namespace_and_configmap_role(rendered, "ci values (perVM)")
     ccm_role = manifest_document(
         rendered, "ClusterRole", "verify-inspace-cloud-kube-modules-ccm"
     )
@@ -1193,6 +1235,32 @@ def verify_node_load_balancer_helm_contract() -> None:
         "Helm must render with the optional CCM Node-LB controller disabled:\n"
         f"{disabled_result.stdout}{disabled_result.stderr}",
     )
+    per_service_result = subprocess.run(
+        [*render_command, "--set", "ccm.nodeLoadBalancer.publicNodeLocal.firewallMode=perService"],
+        cwd=repository, capture_output=True, text=True, check=False,
+    )
+    require(per_service_result.returncode == 0,
+            f"Helm must render firewallMode=perService:\n{per_service_result.stdout}{per_service_result.stderr}")
+    require(
+        re.search(
+            r"(?m)^            - name: INSPACE_NODE_LOAD_BALANCER_LOCAL_FIREWALL_MODE\n"
+            r"              value: \"perService\"$",
+            per_service_result.stdout,
+        ) is not None,
+        "firewallMode=perService must render INSPACE_NODE_LOAD_BALANCER_LOCAL_FIREWALL_MODE=perService",
+    )
+    verify_ccm_namespace_and_configmap_role(per_service_result.stdout, "perService")
+    for bad_value in (
+        "ccm.nodeLoadBalancer.publicNodeLocal.firewallMode=bogus",
+        "ccm.nodeLoadBalancer.publicNodeLocal.vmFirewallMigration=bogus",
+        "ccm.nodeLoadBalancer.publicNodeLocal.vmFirewallSettleSeconds=9",
+        "ccm.nodeLoadBalancer.publicNodeLocal.vmFirewallSettleSeconds=601",
+    ):
+        bad_result = subprocess.run(
+            [*render_command, "--set", bad_value],
+            cwd=repository, capture_output=True, text=True, check=False,
+        )
+        require(bad_result.returncode != 0, f"Helm schema must reject {bad_value}")
     unsafe_csi_timeout = subprocess.run(
         [*render_command, "--set", "csi.sidecars.provisioner.timeoutSeconds=599"],
         cwd=repository,

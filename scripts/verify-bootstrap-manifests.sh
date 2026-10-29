@@ -38,7 +38,12 @@ helm template bootstrap "$chart" --namespace inspace-system --values "$values" \
   --show-only templates/ccm-rbac.yaml >"$tmpdir/ccm-rbac.yaml"
 grep -Fx 'kind: RoleBinding' "$tmpdir/ccm-rbac.yaml" >/dev/null
 test "$(grep -Fc '  namespace: kube-system' "$tmpdir/ccm-rbac.yaml")" -eq 1
-test "$(grep -Fc '    namespace: inspace-system' "$tmpdir/ccm-rbac.yaml")" -eq 2
+test "$(grep -Fc '    namespace: inspace-system' "$tmpdir/ccm-rbac.yaml")" -eq 3
+# The per-VM firewall anchor ConfigMap Role is namespaced to the release and
+# present in every firewall mode (reverse migration runs with perVM off).
+test "$(grep -Fc '  namespace: inspace-system' "$tmpdir/ccm-rbac.yaml")" -eq 5
+grep -Fx '    resources: ["configmaps"]' "$tmpdir/ccm-rbac.yaml" >/dev/null
+grep -Fx '    verbs: ["get", "list", "watch", "create", "update", "delete"]' "$tmpdir/ccm-rbac.yaml" >/dev/null
 grep -Fx '  kind: Role' "$tmpdir/ccm-rbac.yaml" >/dev/null
 grep -Fx '  name: extension-apiserver-authentication-reader' "$tmpdir/ccm-rbac.yaml" >/dev/null
 grep -Fx '    verbs: ["get", "list", "watch", "patch", "update", "delete"]' "$tmpdir/ccm-rbac.yaml" >/dev/null
@@ -317,6 +322,12 @@ grep -Fx '    verbs: ["get", "list", "watch", "patch", "update", "delete"]' "$st
 grep -Fx '    verbs: ["create", "get", "patch", "update"]' "$standalone_ccm" >/dev/null
 grep -Fx '    resources: ["tokenreviews"]' "$standalone_ccm" >/dev/null
 grep -Fx '    resources: ["subjectaccessreviews"]' "$standalone_ccm" >/dev/null
+grep -Fx '  name: inspace-cloud-controller-manager-configmaps' "$standalone_ccm" >/dev/null
+grep -Fx '    resources: ["configmaps"]' "$standalone_ccm" >/dev/null
+grep -Fx '    verbs: ["get", "list", "watch", "create", "update", "delete"]' "$standalone_ccm" >/dev/null
+grep -Fx '            - name: INSPACE_CCM_NAMESPACE' "$standalone_ccm" >/dev/null
+grep -Fx '                  fieldPath: metadata.namespace' "$standalone_ccm" >/dev/null
+grep -Fx '              value: "perService"' "$standalone_ccm" >/dev/null
 require_toleration "$standalone_csi"
 require_toleration "$standalone_karpenter"
 test "$(grep -Fc '            - --timeout=600s' "$standalone_csi")" -eq 3

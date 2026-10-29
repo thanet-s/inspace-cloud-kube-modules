@@ -165,6 +165,16 @@ spec:
               value: {{ .Values.ccm.nodeLoadBalancer.nodesPerShard | quote }}
             - name: INSPACE_NODE_LOAD_BALANCER_MAX_FIREWALLS_PER_VM
               value: {{ .Values.ccm.nodeLoadBalancer.maxFirewallsPerVM | quote }}
+            - name: INSPACE_NODE_LOAD_BALANCER_LOCAL_FIREWALL_MODE
+              value: {{ .Values.ccm.nodeLoadBalancer.publicNodeLocal.firewallMode | quote }}
+            - name: INSPACE_NODE_LOAD_BALANCER_VM_FIREWALL_MIGRATION
+              value: {{ .Values.ccm.nodeLoadBalancer.publicNodeLocal.vmFirewallMigration | quote }}
+            - name: INSPACE_NODE_LOAD_BALANCER_VM_FIREWALL_SETTLE_SECONDS
+              value: {{ .Values.ccm.nodeLoadBalancer.publicNodeLocal.vmFirewallSettleSeconds | quote }}
+            - name: INSPACE_CCM_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
             {{- with .Values.ccm.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
