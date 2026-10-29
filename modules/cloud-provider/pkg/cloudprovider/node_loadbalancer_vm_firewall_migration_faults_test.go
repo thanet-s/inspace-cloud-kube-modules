@@ -91,16 +91,39 @@ type migrationFaultRun struct {
 }
 
 func runTHLiveWithFault(t *testing.T, kind migrationFault, at int) migrationFaultRun {
-	m := newTHLiveCluster(t)
-	m.trackCoverage()
+	return runMigrationWithFault(t, kind, at,
+		func(t *testing.T) *migrationCluster {
+			m := newTHLiveCluster(t)
+			m.trackCoverage()
+			return m
+		},
+		func(m *migrationCluster) {
+			for _, vm := range m.vms {
+				m.annotateNode(vm.name, "true")
+			}
+		},
+		(*migrationCluster).allMigrated)
+}
+
+// runMigrationWithFault runs one migration of a cluster with one fault. prepare
+// builds the cluster and everything that happens before the fault window, start
+// begins the migration, and finished says when it is over. Writes and cloud calls
+// are counted from start on.
+func runMigrationWithFault(
+	t *testing.T,
+	kind migrationFault,
+	at int,
+	prepare func(*testing.T) *migrationCluster,
+	start func(*migrationCluster),
+	finished func(*migrationCluster) bool,
+) migrationFaultRun {
+	m := prepare(t)
 	faultAPI := &migrationFaultAPI{API: m.provider.api}
 	if kind == faultCloudFailed || kind == faultCloudLost {
 		faultAPI.at, faultAPI.applied = at, kind == faultCloudLost
 	}
 	m.provider.api = faultAPI
-	for _, vm := range m.vms {
-		m.annotateNode(vm.name, "true")
-	}
+	start(m)
 	writes, down, fired, restarted := 0, false, false, false
 	m.kube.PrependReactor("*", "*", func(action kubetesting.Action) (bool, runtime.Object, error) {
 		verb, resource := action.GetVerb(), action.GetResource().Resource
@@ -139,7 +162,7 @@ func runTHLiveWithFault(t *testing.T, kind migrationFault, at int) migrationFaul
 		return false, nil, nil
 	})
 	var last error
-	for pass := 0; pass < 6000 && !m.allMigrated(); pass++ {
+	for pass := 0; pass < 6000 && !finished(m); pass++ {
 		m.clock = m.clock.Add(7 * time.Second)
 		step := func(err error) {
 			if err == nil {
@@ -169,8 +192,11 @@ func runTHLiveWithFault(t *testing.T, kind migrationFault, at int) migrationFaul
 			last = m.controller.syncPublicNodeLocal(m.ctx, m.key(name), m.service(name))
 			step(last)
 		}
+		if m.afterPass != nil {
+			m.afterPass()
+		}
 	}
-	if !m.allMigrated() {
+	if !finished(m) {
 		t.Fatalf("%s at %d: never finished; last %v", kind, at, last)
 	}
 	// The limit gate and the coverage check hold for every run, fault or not.

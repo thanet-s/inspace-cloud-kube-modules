@@ -47,10 +47,19 @@ func parseVMFirewallQueueKey(key string) (string, bool) {
 }
 
 // enqueueVMFirewalls queues every VM that has an anchor. It is silent when the
-// anchors cannot be listed: the per-Service mode needs no ConfigMap access.
-func (c *nodeLoadBalancerController) enqueueVMFirewalls() {
-	if !c.publicNodeLocalPerVMModeEnabled() || c.queue == nil {
+// anchors cannot be listed: the per-Service mode needs no ConfigMap access. In
+// that mode it looks only when a Service still lives on the per-VM firewall
+// (perVMServices), so a cluster that never had per-VM state reads no ConfigMap;
+// the VM passes then move those Services back (spec section 7.4).
+func (c *nodeLoadBalancerController) enqueueVMFirewalls(perVMServices bool) {
+	perVMMode := c.publicNodeLocalPerVMModeEnabled()
+	if c.queue == nil || (!perVMMode && !perVMServices) {
 		return
+	}
+	if !perVMMode {
+		if _, err := c.vmFirewallNamespace(); err != nil {
+			return
+		}
 	}
 	now := time.Now()
 	c.vmFirewallOrphanMu.Lock()
@@ -67,6 +76,9 @@ func (c *nodeLoadBalancerController) enqueueVMFirewalls() {
 	}
 	for index := range anchors {
 		c.queue.Add(vmFirewallQueueKey((vmFirewallAnchorView{cm: &anchors[index]}).vm()))
+	}
+	if !perVMMode {
+		return
 	}
 	// A VM that has no anchor yet may be about to migrate.
 	candidates, err := c.vmFirewallMigrationCandidateVMs(context.Background())
@@ -111,7 +123,7 @@ func (c *nodeLoadBalancerController) enqueueVMFirewallOrphans(ctx context.Contex
 // holds on anything it cannot verify; none removes a rule on a guess.
 func (c *nodeLoadBalancerController) syncVMFirewall(ctx context.Context, vmUUID string) error {
 	if !c.publicNodeLocalPerVMModeEnabled() {
-		return nil
+		return c.syncVMFirewallPerService(ctx, vmUUID)
 	}
 	anchor, err := c.getVMFirewallAnchor(ctx, vmUUID)
 	if err != nil {

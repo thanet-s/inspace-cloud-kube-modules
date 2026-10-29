@@ -363,6 +363,7 @@ func (c *nodeLoadBalancerController) finalizeVMFirewallAnchor(ctx context.Contex
 	if err != nil && !apierrors.IsNotFound(err) {
 		return fmt.Errorf("public-node-local: delete the VM firewall anchor: %w", err)
 	}
+	c.noteVMFirewallAnchorGone()
 	return nil
 }
 

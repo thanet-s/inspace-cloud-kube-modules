@@ -63,7 +63,7 @@ func validateVMFirewallReversePlan(p vmFirewallMigrationPlan) error {
 // vmFirewallReverseServiceWaiting names why a member Service is not steady
 // enough to move back to its own firewall, or returns "" when it is. The
 // firewall create keys are not part of it: the reverse writes them itself.
-func vmFirewallReverseServiceWaiting(svc *corev1.Service) string {
+func vmFirewallReverseServiceWaiting(svc *corev1.Service, allowReceipt bool) string {
 	switch {
 	case svc.DeletionTimestamp != nil:
 		return "is being deleted; it finishes once the per-VM mode is on again, or the reverse migration waits for it to be gone"
@@ -77,8 +77,8 @@ func vmFirewallReverseServiceWaiting(svc *corev1.Service) string {
 		return "is still retiring a previous firewall or policy"
 	case publicNodeLocalAssignmentFencePresent(svc):
 		return "has an assignment fence"
-	case svc.Annotations[annotationNodeLoadBalancerFirewallRelationIssued] != "" ||
-		svc.Annotations[annotationNodeLoadBalancerFirewallRelationOwnerUID] != "":
+	case !allowReceipt && (svc.Annotations[annotationNodeLoadBalancerFirewallRelationIssued] != "" ||
+		svc.Annotations[annotationNodeLoadBalancerFirewallRelationOwnerUID] != ""):
 		return "has an unresolved firewall relation receipt"
 	case svc.Annotations[annotationNodeLoadBalancerRebuilding] != "" || svc.Annotations[annotationNodeLoadBalancerRebuildingAssigned] != "":
 		return "is rebuilding"
@@ -190,7 +190,7 @@ func planVMFirewallReverse(
 		if svc == nil {
 			return plan, &errVMFirewallMigrationDeferred{vmUUID: vmUUID, reason: fmt.Sprintf("waiting: Service %s is gone; its entry leaves with the ordinary upkeep", member.UID)}
 		}
-		if reason := vmFirewallReverseServiceWaiting(svc); reason != "" {
+		if reason := vmFirewallReverseServiceWaiting(svc, false); reason != "" {
 			return plan, &errVMFirewallMigrationDeferred{vmUUID: vmUUID, reason: fmt.Sprintf("waiting: Service %s/%s %s", svc.Namespace, svc.Name, reason)}
 		}
 		if vmFirewallReverseCreateInFlight(svc) {

@@ -146,6 +146,10 @@ type nodeLoadBalancerController struct {
 	// per-VM firewall anchors and the scan for orphans. Guarded by vmFirewallOrphanMu.
 	vmFirewallEnqueuedAt time.Time
 	vmFirewallScannedAt  time.Time
+	// vmFirewallLastGoneAt is when the last anchor was deleted, in memory only: the
+	// reverse migration ends with its anchor, and the next VM waits from here.
+	// Guarded by vmFirewallOrphanMu.
+	vmFirewallLastGoneAt time.Time
 	// allGoneSince records, in memory only, when every published Node of a Service
 	// was first seen gone on cloud evidence alone. Guarded by endpointGoneMu.
 	allGoneSince map[string]time.Time
@@ -397,14 +401,18 @@ func (c *nodeLoadBalancerController) enqueueAll() {
 		runtime.HandleError(fmt.Errorf("node load balancer: list Services for enqueue: %w", err))
 		return
 	}
+	perVMServices := false
 	for _, service := range services {
 		if isNodeLoadBalancerService(service) ||
 			containsString(service.Finalizers, nodeLoadBalancerFinalizer) ||
 			containsString(service.Finalizers, publicNodeLocalFinalizer) {
 			c.queue.Add(service.Namespace + "/" + service.Name)
 		}
+		if publicNodeLocalServicePerVM(service) {
+			perVMServices = true
+		}
 	}
-	c.enqueueVMFirewalls()
+	c.enqueueVMFirewalls(perVMServices)
 }
 
 func isNodeLoadBalancerService(service *corev1.Service) bool {

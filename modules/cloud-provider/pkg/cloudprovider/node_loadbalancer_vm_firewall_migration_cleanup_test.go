@@ -1,7 +1,6 @@
 package cloudprovider
 
 import (
-	"errors"
 	"reflect"
 	"testing"
 	"time"
@@ -263,10 +262,13 @@ func TestVMFirewallMigrationAbortBeforeCommitB(t *testing.T) {
 	}
 }
 
-// An adopt that committed can not be undone by an abort: the VM holds with an
-// Event, and nothing else is touched.
-func TestVMFirewallMigrationAbortAfterAdoptCommittedBlocks(t *testing.T) {
+// An adopt that committed can not be undone by an abort: the record is turned
+// around into a reverse migration. It waits, touching nothing, while a Service
+// is not steady, and when the Service is back it renames the firewall back under
+// the name of the Service it came from.
+func TestVMFirewallMigrationAbortAfterAdoptCommittedTurnsAround(t *testing.T) {
 	m := newRelayMigrationCluster(t, VMFirewallMigrationManual)
+	prod := m.firewallOfService("relay-prod")
 	m.trackCoverage()
 	m.annotateNode(mgRelay.name, "true")
 	for pass := 0; pass < 20 && len(m.api.updatedFirewalls) == 0; pass++ {
@@ -276,19 +278,45 @@ func TestVMFirewallMigrationAbortAfterAdoptCommittedBlocks(t *testing.T) {
 		t.Fatal("the adopt did not land")
 	}
 	m.setServiceAnnotation("relay-staging", annotationPublicNodeLocalTargetPolicy, "00000000")
-	writes := m.writes()
-	var last error
 	for pass := 0; pass < 6; pass++ {
-		last = m.vmRound()[mgRelay.name]
+		_ = m.vmRound()
 	}
-	var blocked *errVMFirewallMigrationBlocked
-	if !errors.As(last, &blocked) {
-		t.Fatalf("the VM pass = %v, want blocked", last)
+	plan := m.plan(mgRelay)
+	if plan == nil || plan.Direction != vmFirewallMigrationDirectionReverse || plan.Strategy != vmFirewallMigrationStrategyAdopt || plan.Adoptee != "relay-prod-uid" {
+		t.Fatalf("plan = %#v, want a reverse adopt into relay-prod", plan)
 	}
-	if m.eventsWithReason(publicNodeLocalReasonVMFirewallMigrationBlocked) == 0 {
-		t.Fatal("no Blocked Event")
+	if m.eventsWithReason(publicNodeLocalReasonVMFirewallMigrationWaiting) == 0 {
+		t.Fatal("no Waiting Event")
 	}
-	if m.writes() != writes || m.plan(mgRelay).Phase != vmFirewallMigrationPhasePlanned {
-		t.Fatalf("a blocked VM moved: phase %s", m.plan(mgRelay).Phase)
+	// While the Service is not steady the reverse waits and writes nothing.
+	for pass := 0; pass < 20 && plan.Phase != vmFirewallMigrationPhaseDetaching; pass++ {
+		_ = m.vmRound()
+		plan = m.plan(mgRelay)
+	}
+	writes, puts := m.writes(), len(m.api.updatedFirewalls)
+	for pass := 0; pass < 10; pass++ {
+		_ = m.vmRound()
+	}
+	if m.writes() != writes || m.anchor(mgRelay) == nil {
+		t.Fatalf("the reverse moved while a Service was not steady: %d writes", m.writes()-writes)
+	}
+	m.setServiceAnnotation("relay-staging", annotationPublicNodeLocalTargetPolicy, "")
+	for pass := 0; pass < 100 && m.anchor(mgRelay) != nil; pass++ {
+		_ = m.vmRound()
+	}
+	if m.anchor(mgRelay) != nil {
+		t.Fatalf("the reverse never finished: %#v", m.anchor(mgRelay).Annotations)
+	}
+	if got := len(m.api.updatedFirewalls) - puts; got != 1 {
+		t.Fatalf("%d PUTs after the turn around, want the one rename back", got)
+	}
+	if got := m.firewallOfService("relay-prod"); got == nil || got.UUID != prod.UUID || got.EffectiveName() != prod.EffectiveName() || len(got.Rules) != 1 {
+		t.Fatalf("relay-prod's firewall = %#v, want %s as it was", got, prod.EffectiveName())
+	}
+	if got := len(m.firewallsOf(mgRelay)); got != 3 || m.perVMFirewallsLeft() != 0 {
+		t.Fatalf("the relay VM carries %d firewalls, per-VM firewalls %d", got, m.perVMFirewallsLeft())
+	}
+	if m.gate.maxObservedFirewallsPerVM > 3 || m.gate.refusedAttaches != 0 {
+		t.Fatalf("peak %d firewalls, %d refused attaches", m.gate.maxObservedFirewallsPerVM, m.gate.refusedAttaches)
 	}
 }

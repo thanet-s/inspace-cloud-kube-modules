@@ -1049,6 +1049,8 @@ func (c *nodeLoadBalancerController) resolveVMFirewallReceipt(
 		return c.deleteVMFirewall(ctx, anchor)
 	case vmFirewallOpAdopt:
 		return c.resolveVMFirewallAdoptReceipt(ctx, anchor, items, members)
+	case vmFirewallOpUnadopt:
+		return c.resolveVMFirewallUnadoptReceipt(ctx, anchor, items, members)
 	default:
 		return false, fmt.Errorf("public-node-local: VM firewall receipt operation %q cannot be resolved here", op)
 	}

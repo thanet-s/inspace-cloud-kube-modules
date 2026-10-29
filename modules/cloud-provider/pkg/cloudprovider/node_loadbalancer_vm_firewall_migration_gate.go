@@ -117,9 +117,10 @@ func (c *nodeLoadBalancerController) publicNodeLocalVMFirewallMigrationHold(ctx 
 	// deletes its firewall, which clears that annotation, before it flips the
 	// Service to the per-VM firewall. In between, the Service has no firewall of
 	// its own and must not create one.
-	if !c.publicNodeLocalPerVMModeEnabled() || publicNodeLocalServicePerVM(svc) {
+	if !c.publicNodeLocalPerVMModeEnabled() {
 		return nil
 	}
+	onPerVM := publicNodeLocalServicePerVM(svc)
 	anchors, err := c.listVMFirewallAnchors(ctx)
 	if err != nil {
 		return err
@@ -133,12 +134,21 @@ func (c *nodeLoadBalancerController) publicNodeLocalVMFirewallMigrationHold(ctx 
 		if !ok {
 			continue
 		}
+		// A Service on the per-VM firewall is held only by a reverse migration that
+		// started while the mode was off and is moving it back.
+		if onPerVM && plan.Direction != vmFirewallMigrationDirectionReverse {
+			continue
+		}
 		for _, source := range plan.Sources {
 			if source.UID != string(svc.UID) {
 				continue
 			}
+			target := "the per-VM firewall"
+			if plan.Direction == vmFirewallMigrationDirectionReverse {
+				target = "per-Service firewalls"
+			}
 			cause := vmFirewallWait(nodeLoadBalancerRetry,
-				"public-node-local: Service %s/%s waits: VM %s is moving to the per-VM firewall (%s)", svc.Namespace, svc.Name, view.vm(), plan.Phase)
+				"public-node-local: Service %s/%s waits: VM %s is moving to %s (%s)", svc.Namespace, svc.Name, view.vm(), target, plan.Phase)
 			c.recordPublicNodeLocalEvent(ctx, svc, publicNodeLocalReasonVMFirewallMigrationWaiting, cause)
 			return c.holdOrFailPublicNodeLocal(ctx, svc, cause)
 		}
