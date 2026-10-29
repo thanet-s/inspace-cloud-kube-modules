@@ -83,7 +83,7 @@ func ValidateNodeLoadBalancerVMFirewallIdentity(firewall Firewall, cluster, vmUU
 		return err
 	}
 	for index, row := range firewall.ResourcesAssigned {
-		if row.ResourceType != "vm" || row.ResourceUUID != vmUUID {
+		if !strings.EqualFold(row.ResourceType, "vm") || row.ResourceUUID != vmUUID {
 			return fmt.Errorf("VM firewall assignment %d (%s/%s) is not VM %q", index, row.ResourceType, row.ResourceUUID, vmUUID)
 		}
 	}

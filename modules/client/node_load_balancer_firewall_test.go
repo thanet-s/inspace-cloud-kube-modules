@@ -191,6 +191,9 @@ func TestNodeLoadBalancerVMFirewallContractGoldenVectors(t *testing.T) {
 	if want := "inlb-" + nodeLoadBalancerShortHash("cluster-a") + "-vm-" + testVMFirewallUUID; name != want || len(name) != 53 {
 		t.Fatalf("name = %q (len %d), want %q (len 53)", name, len(name), want)
 	}
+	if name != "inlb-34ab3e1c-vm-11111111-1111-4111-8111-111111111111" {
+		t.Fatalf("literal golden name = %q", name)
+	}
 	uuid, ok := ParseNodeLoadBalancerVMFirewallName("cluster-a", name)
 	if !ok || uuid != testVMFirewallUUID {
 		t.Fatalf("parse = %q, %v", uuid, ok)
@@ -207,6 +210,9 @@ func TestNodeLoadBalancerVMFirewallContractGoldenVectors(t *testing.T) {
 	canonical, err := canonicalNodeLoadBalancerPortFirewallPolicy("VM", rules)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if hash != "886b49b4595740174f390bc5167cbad8dcf0fa8dc41ef711e805d1e8941cb1e6" {
+		t.Fatalf("literal golden hash = %q", hash)
 	}
 	if hash != nodeLoadBalancerFullHash(canonical) || len(hash) != 64 {
 		t.Fatalf("hash = %q", hash)
@@ -305,10 +311,11 @@ func TestValidateNodeLoadBalancerVMFirewallIdentity(t *testing.T) {
 	noDesc := good
 	noDesc.Description = ""
 	accept := map[string]Firewall{
-		"no rows":           good,
-		"own row":           withRows(FirewallResource{ResourceType: "vm", ResourceUUID: testVMFirewallUUID}),
-		"duplicate own row": withRows(FirewallResource{ResourceType: "vm", ResourceUUID: testVMFirewallUUID}, FirewallResource{ResourceType: "vm", ResourceUUID: testVMFirewallUUID}),
-		"empty description": noDesc,
+		"no rows":                  good,
+		"own row":                  withRows(FirewallResource{ResourceType: "vm", ResourceUUID: testVMFirewallUUID}),
+		"duplicate own row":        withRows(FirewallResource{ResourceType: "vm", ResourceUUID: testVMFirewallUUID}, FirewallResource{ResourceType: "vm", ResourceUUID: testVMFirewallUUID}),
+		"empty description":        noDesc,
+		"upper-case resource type": withRows(FirewallResource{ResourceType: "VM", ResourceUUID: testVMFirewallUUID}),
 	}
 	for label, fw := range accept {
 		if err := ValidateNodeLoadBalancerVMFirewallIdentity(fw, "cluster-a", testVMFirewallUUID, 42); err != nil {
