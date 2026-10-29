@@ -49,6 +49,8 @@ type migrationCluster struct {
 	services   []string
 	endpoints  map[string][]string
 	clock      time.Time
+	// history is the number of firewalls each VM carried over time.
+	history map[string][]int
 	// observe, when set, runs after every mutating cloud call.
 	observe func(call string)
 }
@@ -112,7 +114,6 @@ func newMigrationCluster(t *testing.T, vms ...migrationVM) *migrationCluster {
 		t: t, ctx: context.Background(), api: api, gate: gate, provider: provider, controller: controller, kube: kube,
 		vms: vms, endpoints: map[string][]string{}, clock: time.Now().UTC(),
 	}
-	gate.limit = 0
 	return m
 }
 
@@ -340,6 +341,89 @@ func (m *migrationCluster) runUntil(limit int, what string, cond func() bool) {
 		}
 	}
 	m.t.Fatalf("%s: never reached in %d rounds; last errors %v", what, limit, last)
+}
+
+// migrationObserverAPI reports every mutating cloud call to the cluster's
+// observer, so an invariant is checked between any two calls and not only
+// between passes.
+type migrationObserverAPI struct {
+	API
+	m *migrationCluster
+}
+
+func (a *migrationObserverAPI) after(call string) {
+	if a.m.observe != nil {
+		a.m.observe(call)
+	}
+}
+
+func (a *migrationObserverAPI) CreateFirewall(ctx context.Context, location string, request inspace.CreateFirewallRequest) (*inspace.Firewall, error) {
+	firewall, err := a.API.CreateFirewall(ctx, location, request)
+	a.after("create " + request.DisplayName)
+	return firewall, err
+}
+
+func (a *migrationObserverAPI) UpdateFirewall(ctx context.Context, location, uuid string, request inspace.UpdateFirewallRequest) (*inspace.Firewall, error) {
+	firewall, err := a.API.UpdateFirewall(ctx, location, uuid, request)
+	a.after("update " + uuid)
+	return firewall, err
+}
+
+func (a *migrationObserverAPI) AssignFirewallToVM(ctx context.Context, location, firewallUUID, vmUUID string) error {
+	err := a.API.AssignFirewallToVM(ctx, location, firewallUUID, vmUUID)
+	a.after("assign " + firewallUUID + "/" + vmUUID)
+	return err
+}
+
+func (a *migrationObserverAPI) UnassignFirewallFromVM(ctx context.Context, location, firewallUUID, vmUUID string) error {
+	err := a.API.UnassignFirewallFromVM(ctx, location, firewallUUID, vmUUID)
+	a.after("unassign " + firewallUUID + "/" + vmUUID)
+	return err
+}
+
+func (a *migrationObserverAPI) DeleteFirewall(ctx context.Context, location, uuid string) error {
+	err := a.API.DeleteFirewall(ctx, location, uuid)
+	a.after("delete " + uuid)
+	return err
+}
+
+// trackCoverage records what every VM must keep allowing, from the firewalls it
+// carries now, and from then on checks it after every mutating cloud call and
+// records the number of firewalls each VM carries. The migration may move rules
+// between firewalls; it may never leave a port that serves uncovered.
+func (m *migrationCluster) trackCoverage() {
+	m.t.Helper()
+	base := publicNodeLocalTestBaseFirewall("").UUID
+	required := map[string][]inspace.FirewallRule{}
+	for _, vm := range m.vms {
+		for _, firewall := range m.firewallsOf(vm) {
+			if firewall.UUID != base {
+				required[vm.uuid] = append(required[vm.uuid], firewall.Rules...)
+			}
+		}
+	}
+	m.history = map[string][]int{}
+	record := func() {
+		for _, vm := range m.vms {
+			count := len(m.firewallsOf(vm))
+			if h := m.history[vm.uuid]; len(h) == 0 || h[len(h)-1] != count {
+				m.history[vm.uuid] = append(h, count)
+			}
+		}
+	}
+	record()
+	m.observe = func(call string) {
+		record()
+		for _, vm := range m.vms {
+			allow := edgeAllowOf(m.firewallsOf(vm))
+			for _, rule := range required[vm.uuid] {
+				if !allow.covers(rule) {
+					m.t.Errorf("after %q: VM %s no longer allows %s/%d %v", call, vm.name, rule.Protocol, *rule.PortStart, rule.EndpointSpec)
+				}
+			}
+		}
+	}
+	m.provider.api = &migrationObserverAPI{API: m.provider.api, m: m}
 }
 
 // writes counts the mutating cloud calls so far.
