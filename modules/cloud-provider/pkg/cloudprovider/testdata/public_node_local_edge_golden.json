@@ -50,7 +50,7 @@
       443
     ]
   },
-  "bootstrap 3 nodes": {
+  "baseline steady state 3 nodes": {
     "passes": [
       "ok",
       "ok",

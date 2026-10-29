@@ -254,7 +254,7 @@ func edgeCharacterizationScenarios() []struct {
 		name string
 		run  func(t *testing.T) publicNodeLocalEdgeTrace
 	}{
-		{"bootstrap 3 nodes", func(t *testing.T) publicNodeLocalEdgeTrace {
+		{"baseline steady state 3 nodes", func(t *testing.T) publicNodeLocalEdgeTrace {
 			f := newPublishedPublicNodeLocalFixtureN(t, 3)
 			r := newEdgeScenarioRun(t, f)
 			r.until(3, nil)

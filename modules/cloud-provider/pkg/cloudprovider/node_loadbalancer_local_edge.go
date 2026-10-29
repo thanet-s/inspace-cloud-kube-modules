@@ -11,7 +11,10 @@ import (
 
 // edgeID names the firewall edge a public-node-local Service serves through.
 type edgeID struct {
-	// policy is the firewall policy hash the edge enforces.
+	// policy is the firewall policy hash the edge enforces. The per-Service
+	// backend fills it for the callers but does not read it: it works from
+	// firewallUUID and the ledger annotations. The per-VM backend (its Retire
+	// in particular) reads it.
 	policy string
 	// firewallUUID is the cloud firewall of the edge (per-Service only).
 	firewallUUID string
@@ -68,7 +71,10 @@ func perServiceEdgeID(firewall *inspace.Firewall, policy string) edgeID {
 }
 
 // perServicePreviousPolicy is the policy hash of the previous firewall, from
-// its rules; empty when it cannot be computed.
+// its rules; empty when it cannot be computed. It is informational for the
+// per-Service backend, which never reads edgeID.policy, so a hashing failure
+// must not turn into an error here: that would change behaviour. The per-VM
+// backend must not rely on this fallback.
 func perServicePreviousPolicy(previous *inspace.Firewall) string {
 	if previous == nil {
 		return ""

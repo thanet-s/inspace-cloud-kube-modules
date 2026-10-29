@@ -855,7 +855,7 @@ func (c *nodeLoadBalancerController) activePublicNodeLocalContract(
 			return nil, errors.New("public-node-local: live firewall ledger or policy changed during an incremental change")
 		}
 	}
-	if current.Annotations[annotationNodeLoadBalancerFirewallUUID] != edge.fenceValue() ||
+	if current.Annotations[annotationNodeLoadBalancerFirewallUUID] != edge.firewallUUID ||
 		current.Annotations[annotationNodeLoadBalancerFirewallHash] != desired.Hash {
 		return nil, errors.New("public-node-local: live firewall ledger or policy changed during an incremental change")
 	}
@@ -1092,7 +1092,7 @@ func (c *nodeLoadBalancerController) verifyActivePublicNodeLocalPublication(
 	}
 	var assigned map[string]struct{}
 	for index := range owned {
-		if owned[index].UUID == edge.fenceValue() {
+		if owned[index].UUID == edge.firewallUUID {
 			assignments, assignErr := nodeLoadBalancerFirewallVMAssignments(owned[index])
 			if assignErr != nil {
 				return assignErr
@@ -1104,7 +1104,7 @@ func (c *nodeLoadBalancerController) verifyActivePublicNodeLocalPublication(
 		}
 	}
 	if assigned == nil {
-		return fmt.Errorf("public-node-local: Service firewall %s is absent after publication", edge.fenceValue())
+		return fmt.Errorf("public-node-local: Service firewall %s is absent after publication", edge.firewallUUID)
 	}
 	nodes, patched, err := c.classifyPublicNodeLocalNodesInTransition(ctx, current)
 	if err != nil {

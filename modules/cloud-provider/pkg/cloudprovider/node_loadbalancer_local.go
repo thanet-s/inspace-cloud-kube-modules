@@ -2193,7 +2193,7 @@ func (c *nodeLoadBalancerController) validatePublicNodeLocalAssignmentState(
 		return err
 	}
 	if !reflect.DeepEqual(currentDesired, desired) ||
-		current.Annotations[annotationNodeLoadBalancerFirewallUUID] != edge.fenceValue() ||
+		current.Annotations[annotationNodeLoadBalancerFirewallUUID] != edge.firewallUUID ||
 		current.Annotations[annotationNodeLoadBalancerFirewallHash] != desired.Hash {
 		return errors.New("public-node-local: live firewall ledger or policy changed during assignment authorization")
 	}
@@ -2305,10 +2305,10 @@ func (c *nodeLoadBalancerController) clearPublicNodeLocalWithdrawalEvidenceAfter
 			return false, fmt.Errorf("public-node-local: Node %s is not eligible withdrawal recovery proof", address.Node.Name)
 		}
 		vmUUID, _ := nodeLoadBalancerVMUUID(address.Node)
-		provedPairs[edge.fenceValue()+"/"+vmUUID] = struct{}{}
+		provedPairs[edge.firewallUUID+"/"+vmUUID] = struct{}{}
 	}
 	_, changed, err := c.updateExactParentService(ctx, service, func(copy *corev1.Service) (bool, error) {
-		if copy.Annotations[annotationNodeLoadBalancerFirewallUUID] != edge.fenceValue() ||
+		if copy.Annotations[annotationNodeLoadBalancerFirewallUUID] != edge.firewallUUID ||
 			copy.Annotations[annotationNodeLoadBalancerFirewallHash] != desired.Hash ||
 			copy.Annotations[annotationNodeLoadBalancerFirewallAssigning] != edge.fenceValue() ||
 			copy.Annotations[annotationNodeLoadBalancerFirewallAssignAt] == "" ||
@@ -2388,7 +2388,7 @@ func (c *nodeLoadBalancerController) publicNodeLocalFirewallAssignmentsMatch(
 		return false, err
 	}
 	if !reflect.DeepEqual(currentDesired, desired) ||
-		current.Annotations[annotationNodeLoadBalancerFirewallUUID] != edge.fenceValue() ||
+		current.Annotations[annotationNodeLoadBalancerFirewallUUID] != edge.firewallUUID ||
 		current.Annotations[annotationNodeLoadBalancerFirewallHash] != desired.Hash {
 		return false, errors.New("public-node-local: firewall assignment readback is not bound to the exact current Service ledger and policy")
 	}
@@ -2410,7 +2410,7 @@ func (c *nodeLoadBalancerController) publicNodeLocalFirewallAssignmentsMatch(
 	}
 	matches := 0
 	for _, firewall := range items {
-		if firewall.UUID != edge.fenceValue() {
+		if firewall.UUID != edge.firewallUUID {
 			continue
 		}
 		matches++
@@ -2431,7 +2431,7 @@ func (c *nodeLoadBalancerController) publicNodeLocalFirewallAssignmentsMatch(
 		}
 	}
 	if matches > 1 {
-		return false, fmt.Errorf("public-node-local: firewall UUID %s appears multiple times", edge.fenceValue())
+		return false, fmt.Errorf("public-node-local: firewall UUID %s appears multiple times", edge.firewallUUID)
 	}
 	return matches == 1, nil
 }
@@ -2487,7 +2487,7 @@ func (c *nodeLoadBalancerController) validatePublicNodeLocalPublicationState(
 		return nil, err
 	}
 	if !reflect.DeepEqual(currentDesired, desired) ||
-		current.Annotations[annotationNodeLoadBalancerFirewallUUID] != edge.fenceValue() ||
+		current.Annotations[annotationNodeLoadBalancerFirewallUUID] != edge.firewallUUID ||
 		current.Annotations[annotationNodeLoadBalancerFirewallHash] != desired.Hash {
 		return nil, errors.New("public-node-local: live firewall ledger or policy changed at the publication gate")
 	}
