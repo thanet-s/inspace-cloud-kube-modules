@@ -338,7 +338,9 @@ func (e perVMEdge) waitForUnmigratedVM(ctx context.Context, svc *corev1.Service,
 		if err != nil {
 			return err
 		}
-		if anchor != nil && anchor.Annotations[annotationVMFirewallMigration] != "" {
+		// A finished migration keeps its record for the pacing of the next VM; only a
+		// plan that is not done holds the add.
+		if vmFirewallMigrationInFlight(anchor) {
 			reason = fmt.Sprintf("VM %s has a firewall migration in flight", vmUUID)
 		}
 	}

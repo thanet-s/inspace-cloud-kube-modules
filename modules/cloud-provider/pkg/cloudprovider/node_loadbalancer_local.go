@@ -115,6 +115,9 @@ func (c *nodeLoadBalancerController) syncPublicNodeLocalPass(
 		// that mode. Nothing here may touch the firewalls of its VMs: it holds.
 		return c.holdOrFailPublicNodeLocal(ctx, service, publicNodeLocalPerVMHeldError(service))
 	}
+	if err := c.publicNodeLocalVMFirewallMigrationHold(ctx, service); err != nil {
+		return err
+	}
 
 	desiredFirewall, err := c.desiredServiceFirewall(service)
 	if err != nil {

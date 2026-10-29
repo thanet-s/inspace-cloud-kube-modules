@@ -68,6 +68,15 @@ func (c *nodeLoadBalancerController) enqueueVMFirewalls() {
 	for index := range anchors {
 		c.queue.Add(vmFirewallQueueKey((vmFirewallAnchorView{cm: &anchors[index]}).vm()))
 	}
+	// A VM that has no anchor yet may be about to migrate.
+	candidates, err := c.vmFirewallMigrationCandidateVMs(context.Background())
+	if err != nil {
+		klog.V(2).Infof("node load balancer: list Nodes for the VM firewall migration: %v", err)
+		return
+	}
+	for _, vmUUID := range candidates {
+		c.queue.Add(vmFirewallQueueKey(vmUUID))
+	}
 }
 
 // enqueueVMFirewallOrphans queues the VM of every per-VM firewall in the cloud,
@@ -128,6 +137,10 @@ func (c *nodeLoadBalancerController) syncVMFirewall(ctx context.Context, vmUUID 
 	if view.get(annotationVMFirewallRepair) != "" {
 		return c.repairVMFirewall(ctx, anchor)
 	}
+	if view.get(annotationVMFirewallMigration) != "" {
+		_, err := c.stepVMFirewallMigration(ctx, vmUUID, anchor)
+		return err
+	}
 	applied, err := view.applied()
 	if err != nil {
 		return err
@@ -165,7 +178,7 @@ func (c *nodeLoadBalancerController) syncUnanchoredVMFirewall(
 		return vmFirewallDrift(vmUUID, "%v", err)
 	}
 	if firewall == nil {
-		return nil
+		return c.startVMFirewallMigration(ctx, vmUUID, items)
 	}
 	if len(firewall.ResourcesAssigned) == 0 {
 		return c.collectOrphanVMFirewall(ctx, *firewall, members)
