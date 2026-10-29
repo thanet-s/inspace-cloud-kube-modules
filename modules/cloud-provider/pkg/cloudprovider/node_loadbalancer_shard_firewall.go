@@ -237,7 +237,6 @@ func nodeLoadBalancerShardFirewallUpdateRequest(
 		return inspace.UpdateFirewallRequest{}, fmt.Errorf("node load balancer: current shard firewall lost exact ownership: %w", err)
 	}
 
-	currentRuleUUIDs := make(map[string]string, len(current.Rules))
 	seenUUIDs := make(map[string]struct{}, len(current.Rules))
 	for _, rule := range current.Rules {
 		if !nodeLoadBalancerFirewallUUIDPattern.MatchString(rule.UUID) {
@@ -248,21 +247,32 @@ func nodeLoadBalancerShardFirewallUpdateRequest(
 			return inspace.UpdateFirewallRequest{}, fmt.Errorf("node load balancer: current shard firewall reuses rule UUID %q", rule.UUID)
 		}
 		seenUUIDs[uuidKey] = struct{}{}
-		currentRuleUUIDs[nodeLoadBalancerShardFirewallRuleLogicalKey(rule)] = rule.UUID
 	}
 
-	rules := make([]inspace.FirewallRule, 0, len(desired.Request.Rules))
-	for _, desiredRule := range desired.Request.Rules {
+	return inspace.UpdateFirewallRequest{
+		Name:        desired.Request.DisplayName,
+		Description: desired.Request.Description,
+		Rules:       retainFirewallRuleUUIDs(current.Rules, desired.Request.Rules),
+	}, nil
+}
+
+// retainFirewallRuleUUIDs returns a copy of desired in which every rule whose
+// logical protocol/port is already present in current keeps its provider UUID.
+// A new logical port has an empty UUID and a removed one is absent, so only the
+// source ranges of a surviving port change in place.
+func retainFirewallRuleUUIDs(current, desired []inspace.FirewallRule) []inspace.FirewallRule {
+	currentRuleUUIDs := make(map[string]string, len(current))
+	for _, rule := range current {
+		currentRuleUUIDs[nodeLoadBalancerShardFirewallRuleLogicalKey(rule)] = rule.UUID
+	}
+	rules := make([]inspace.FirewallRule, 0, len(desired))
+	for _, desiredRule := range desired {
 		copy := desiredRule
 		copy.EndpointSpec = append([]string(nil), desiredRule.EndpointSpec...)
 		copy.UUID = currentRuleUUIDs[nodeLoadBalancerShardFirewallRuleLogicalKey(desiredRule)]
 		rules = append(rules, copy)
 	}
-	return inspace.UpdateFirewallRequest{
-		Name:        desired.Request.DisplayName,
-		Description: desired.Request.Description,
-		Rules:       rules,
-	}, nil
+	return rules
 }
 
 func validateNodeLoadBalancerShardFirewallPolicy(policy nodeLoadBalancerShardFirewallPolicy) error {

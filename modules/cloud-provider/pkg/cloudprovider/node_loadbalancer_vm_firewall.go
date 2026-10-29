@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 
 	inspace "github.com/thanet-s/inspace-cloud-kube-modules/modules/client"
 )
@@ -307,4 +308,200 @@ func (l vmFirewallLedger) without(k vmFirewallMemberKey) (vmFirewallLedger, bool
 	}
 	next.Members = kept
 	return next, found
+}
+
+const (
+	// vmFirewallSettleDefault is how long a Service waits after a per-VM
+	// firewall change is read back before it relies on the new edge.
+	// LIVE-8.2 measured 2026-10-29: rules took effect at most about 1.0 s after
+	// the call started (0.43 s after it returned); 2 x max is about 2 s, so the
+	// 10 s floor applies.
+	vmFirewallSettleDefault = 10 * time.Second
+	// vmFirewallRenameSupported says a firewall can be renamed in place.
+	// LIVE-8.2 measured 2026-10-29: supported only through the display_name field
+	// of a PUT (the client sends it as such). The name field is accepted and
+	// silently ignored, so a rename is always verified by reading the name back.
+	vmFirewallRenameSupported = true
+	// maxVMFirewallRules is the client-side rule-count limit; 0 means none.
+	// LIVE-8.2 measured 2026-10-29: no limit up to 50 rules. PUT latency grows
+	// with the rule count (about 3.3 s at 20, about 10 s at 50), which
+	// vmFirewallMutationTimeout accounts for.
+	maxVMFirewallRules = 0
+
+	// vmFirewallMutationTimeoutBase and vmFirewallMutationTimeoutPerRule size the
+	// deadline of one create or PUT: the measured latency was about 1 s plus
+	// 0.2 s per rule, and the allowance is several times that.
+	vmFirewallMutationTimeoutBase    = 30 * time.Second
+	vmFirewallMutationTimeoutPerRule = 2 * time.Second
+)
+
+// maxVMFirewallRulesForTest lets a test lower the limit; production never
+// changes it from maxVMFirewallRules.
+var maxVMFirewallRulesForTest = maxVMFirewallRules
+
+// vmFirewallMutationTimeout is the deadline of one create or PUT with ruleCount
+// rules. It never exceeds nodeLoadBalancerShardFirewallMutationTimeout, so the
+// receipt retire delay still proves that a timed-out request is not in flight.
+func vmFirewallMutationTimeout(ruleCount int) time.Duration {
+	if ruleCount < 0 {
+		ruleCount = 0
+	}
+	timeout := vmFirewallMutationTimeoutBase + time.Duration(ruleCount)*vmFirewallMutationTimeoutPerRule
+	if timeout > nodeLoadBalancerShardFirewallMutationTimeout {
+		return nodeLoadBalancerShardFirewallMutationTimeout
+	}
+	return timeout
+}
+
+// errVMFirewallPortConflict reports that two Services ask for one public port
+// of the same VM. The operation that would create it is refused and nothing is
+// persisted; existing members stay untouched.
+type errVMFirewallPortConflict struct {
+	Protocol string
+	Port     int32
+	UIDs     []string
+}
+
+func (e *errVMFirewallPortConflict) Error() string {
+	return fmt.Sprintf("public-node-local: VM firewall %s/%d is requested by more than one Service (%s)",
+		e.Protocol, e.Port, strings.Join(e.UIDs, ", "))
+}
+
+// errVMFirewallRuleLimit reports a merge with more rules than the client-side
+// limit allows.
+type errVMFirewallRuleLimit struct{ Rules, Limit int }
+
+func (e *errVMFirewallRuleLimit) Error() string {
+	return fmt.Sprintf("public-node-local: VM firewall would carry %d rules, above the limit of %d", e.Rules, e.Limit)
+}
+
+// mergeVMFirewallLedger returns the rules of the per-VM firewall: for every
+// protocol/port, the sources of the one Service that asks for it. Within one
+// Service (a policy transition) the sources are the union and any wins.
+func mergeVMFirewallLedger(l vmFirewallLedger) ([]inspace.FirewallRule, error) {
+	if len(l.Members) == 0 {
+		return nil, errors.New("public-node-local: an empty VM firewall ledger has no rules; delete the firewall instead")
+	}
+	type claim struct {
+		owners  map[string]struct{}
+		any     bool
+		sources map[string]struct{}
+	}
+	claims := map[string]*claim{}
+	order := []vmFirewallRule{}
+	for _, member := range l.Members {
+		for _, rule := range member.Rules {
+			key := fmt.Sprintf("%s/%d", rule.Protocol, rule.Port)
+			c := claims[key]
+			if c == nil {
+				c = &claim{owners: map[string]struct{}{}, sources: map[string]struct{}{}}
+				claims[key] = c
+				order = append(order, vmFirewallRule{Protocol: rule.Protocol, Port: rule.Port})
+			}
+			c.owners[member.UID] = struct{}{}
+			if len(rule.Sources) == 0 {
+				c.any = true
+			}
+			for _, source := range rule.Sources {
+				c.sources[source] = struct{}{}
+			}
+		}
+	}
+	sortVMFirewallRules(order)
+	rules := make([]inspace.FirewallRule, 0, len(order))
+	for _, id := range order {
+		c := claims[fmt.Sprintf("%s/%d", id.Protocol, id.Port)]
+		if len(c.owners) > 1 {
+			uids := make([]string, 0, len(c.owners))
+			for uid := range c.owners {
+				uids = append(uids, uid)
+			}
+			sort.Strings(uids)
+			return nil, &errVMFirewallPortConflict{Protocol: id.Protocol, Port: id.Port, UIDs: uids}
+		}
+		port := id.Port
+		rule := inspace.FirewallRule{
+			Protocol: id.Protocol, Direction: "inbound",
+			PortStart: &port, PortEnd: &port, EndpointSpecType: "any",
+		}
+		if !c.any {
+			sources := make([]string, 0, len(c.sources))
+			for source := range c.sources {
+				sources = append(sources, source)
+			}
+			sort.Strings(sources)
+			rule.EndpointSpecType = "ip_prefixes"
+			rule.EndpointSpec = sources
+		}
+		rules = append(rules, rule)
+	}
+	if limit := maxVMFirewallRulesForTest; limit > 0 && len(rules) > limit {
+		return nil, &errVMFirewallRuleLimit{Rules: len(rules), Limit: limit}
+	}
+	if _, err := inspace.NodeLoadBalancerVMFirewallSpecHash(rules); err != nil {
+		return nil, err
+	}
+	return rules, nil
+}
+
+// vmFirewallCreateRequest is the create body for the first member of a VM.
+func vmFirewallCreateRequest(cluster, vmUUID string, billing int64, merged []inspace.FirewallRule) (inspace.CreateFirewallRequest, error) {
+	name, err := inspace.NodeLoadBalancerVMFirewallName(cluster, vmUUID)
+	if err != nil {
+		return inspace.CreateFirewallRequest{}, err
+	}
+	if billing < 1 {
+		return inspace.CreateFirewallRequest{}, errors.New("public-node-local: the billing account is required to create a VM firewall")
+	}
+	if _, err := inspace.NodeLoadBalancerVMFirewallSpecHash(merged); err != nil {
+		return inspace.CreateFirewallRequest{}, err
+	}
+	rules := retainFirewallRuleUUIDs(nil, merged)
+	return inspace.CreateFirewallRequest{
+		DisplayName: name, Description: inspace.NodeLoadBalancerVMFirewallDescription,
+		BillingAccountID: billing, Rules: rules,
+	}, nil
+}
+
+// vmFirewallUpdateRequest is the full replace-style PUT body that turns
+// current into merged. Rules whose protocol/port survive keep their provider
+// UUID. The name goes out as display_name, the only field InSpace honours.
+func vmFirewallUpdateRequest(cluster, vmUUID string, current inspace.Firewall, merged []inspace.FirewallRule) (inspace.UpdateFirewallRequest, error) {
+	name, err := inspace.NodeLoadBalancerVMFirewallName(cluster, vmUUID)
+	if err != nil {
+		return inspace.UpdateFirewallRequest{}, err
+	}
+	if !nodeLoadBalancerFirewallUUIDPattern.MatchString(current.UUID) {
+		return inspace.UpdateFirewallRequest{}, fmt.Errorf("public-node-local: current VM firewall UUID %q is invalid", current.UUID)
+	}
+	if current.Name != "" && current.DisplayName != "" && current.Name != current.DisplayName {
+		return inspace.UpdateFirewallRequest{}, errors.New("public-node-local: current VM firewall has conflicting name fields")
+	}
+	if current.EffectiveName() != name {
+		return inspace.UpdateFirewallRequest{}, fmt.Errorf("public-node-local: firewall %q is not the VM firewall %q", current.EffectiveName(), name)
+	}
+	if current.Description != "" && current.Description != inspace.NodeLoadBalancerVMFirewallDescription {
+		return inspace.UpdateFirewallRequest{}, fmt.Errorf("public-node-local: current VM firewall description %q is not the managed description", current.Description)
+	}
+	seen := map[string]struct{}{}
+	for _, rule := range current.Rules {
+		if rule.UUID == "" {
+			continue
+		}
+		if !nodeLoadBalancerFirewallUUIDPattern.MatchString(rule.UUID) {
+			return inspace.UpdateFirewallRequest{}, fmt.Errorf("public-node-local: current VM firewall rule UUID %q is invalid", rule.UUID)
+		}
+		if _, duplicate := seen[strings.ToLower(rule.UUID)]; duplicate {
+			return inspace.UpdateFirewallRequest{}, fmt.Errorf("public-node-local: current VM firewall reuses rule UUID %q", rule.UUID)
+		}
+		seen[strings.ToLower(rule.UUID)] = struct{}{}
+	}
+	if _, err := inspace.NodeLoadBalancerVMFirewallSpecHash(merged); err != nil {
+		return inspace.UpdateFirewallRequest{}, err
+	}
+	return inspace.UpdateFirewallRequest{
+		Name:        name,
+		Description: inspace.NodeLoadBalancerVMFirewallDescription,
+		Rules:       retainFirewallRuleUUIDs(current.Rules, merged),
+	}, nil
 }
