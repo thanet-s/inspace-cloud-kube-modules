@@ -19,6 +19,13 @@ ccm:
   replicaCount: {{ 1 if control_plane_replicas | int == 1 else 2 }}
   image:
     digest: "{{ deploy_modules_release_images['inspace-cloud-controller-manager'].platformDigest }}"
+{% if ccm_public_node_local_firewall_mode is defined or ccm_public_node_local_vm_firewall_migration is defined or ccm_public_node_local_vm_firewall_settle_seconds is defined %}
+  nodeLoadBalancer:
+    publicNodeLocal:
+      firewallMode: {{ ccm_public_node_local_firewall_mode | default('perService') }}
+      vmFirewallMigration: {{ ccm_public_node_local_vm_firewall_migration | default('manual') }}
+      vmFirewallSettleSeconds: {{ ccm_public_node_local_vm_firewall_settle_seconds | default(10) | int }}
+{% endif %}
 
 karpenter:
   replicaCount: {{ 1 if control_plane_replicas | int == 1 else 2 }}

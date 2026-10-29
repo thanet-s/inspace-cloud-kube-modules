@@ -160,6 +160,22 @@
       - csi_storage_class_default | default(false) is boolean
     fail_msg: "csi_storage_class_default must be true or false."
 
+# Public-node-local firewall mode chart values. All optional; when none is set the
+# rendered chart values do not mention them and the chart defaults apply.
+- name: Require valid public-node-local firewall mode settings
+  ansible.builtin.assert:
+    that:
+      - ccm_public_node_local_firewall_mode | default('perService') in ['perService', 'perVM']
+      - ccm_public_node_local_vm_firewall_migration | default('manual') in ['manual', 'auto']
+      - ccm_public_node_local_vm_firewall_settle_seconds | default(10) is integer
+      - ccm_public_node_local_vm_firewall_settle_seconds | default(10) is not boolean
+      - ccm_public_node_local_vm_firewall_settle_seconds | default(10) | int >= 10
+      - ccm_public_node_local_vm_firewall_settle_seconds | default(10) | int <= 600
+    fail_msg: >-
+      ccm_public_node_local_firewall_mode must be perService or perVM,
+      ccm_public_node_local_vm_firewall_migration must be manual or auto, and
+      ccm_public_node_local_vm_firewall_settle_seconds must be an integer from 10 to 600.
+
 # False skips the one-time reboot that init gives the bastion and every control
 # plane after the first-boot apt-get upgrade. skip_os_upgrade: true skips it too.
 - name: Require a boolean post-upgrade reboot choice
