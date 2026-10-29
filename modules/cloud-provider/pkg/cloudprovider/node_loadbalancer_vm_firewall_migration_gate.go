@@ -79,7 +79,9 @@ func (c *nodeLoadBalancerController) vmFirewallMigrationAllowed(
 		if !ok {
 			continue
 		}
-		if view.vm() == vmUUID && plan.Phase != vmFirewallMigrationPhaseDone {
+		if view.vm() == vmUUID {
+			// A migration that started continues, and so does the cleanup after it,
+			// whatever the Node annotation says now; only a hold stops it.
 			return true, ""
 		}
 		if plan.Phase != vmFirewallMigrationPhaseDone {
@@ -111,7 +113,11 @@ func (c *nodeLoadBalancerController) vmFirewallMigrationAllowed(
 // Service on several VMs is "mixed" in between: some of its VMs carry the
 // per-VM firewall and some its own, and only the migration may touch either.
 func (c *nodeLoadBalancerController) publicNodeLocalVMFirewallMigrationHold(ctx context.Context, svc *corev1.Service) error {
-	if !c.publicNodeLocalPerVMModeEnabled() || publicNodeLocalServicePerVM(svc) || svc.Annotations[annotationNodeLoadBalancerFirewallUUID] == "" {
+	// The firewall-uuid annotation is not a condition: the cleanup of a source
+	// deletes its firewall, which clears that annotation, before it flips the
+	// Service to the per-VM firewall. In between, the Service has no firewall of
+	// its own and must not create one.
+	if !c.publicNodeLocalPerVMModeEnabled() || publicNodeLocalServicePerVM(svc) {
 		return nil
 	}
 	anchors, err := c.listVMFirewallAnchors(ctx)

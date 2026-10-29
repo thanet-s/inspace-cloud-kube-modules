@@ -79,7 +79,12 @@ func (c *nodeLoadBalancerController) validateVMFirewallMigrationSources(
 	for _, source := range plan.Sources {
 		svc := read.services[source.UID]
 		if svc == nil || svc.DeletionTimestamp != nil {
-			return sourceChanged("the Service %s of firewall %s is gone or being deleted", source.UID, source.Firewall)
+			if strict {
+				return sourceChanged("the Service %s of firewall %s is gone or being deleted", source.UID, source.Firewall)
+			}
+			// After the per-VM firewall is open, a Service that is leaving takes its
+			// own firewall with it; the migration only waits for that.
+			continue
 		}
 		if svc.Annotations[annotationNodeLoadBalancerFirewallUUID] != source.Firewall ||
 			svc.Annotations[annotationPublicNodeLocalActivePolicy] != source.Policy || publicNodeLocalServicePerVM(svc) {
@@ -171,7 +176,9 @@ func (c *nodeLoadBalancerController) stepVMFirewallMigration(ctx context.Context
 	case vmFirewallMigrationPhaseDetaching:
 		err = c.detachVMFirewallMigration(ctx, vmUUID, anchor, plan)
 	case vmFirewallMigrationPhaseDone:
-		return true, nil
+		return true, c.cleanupVMFirewallMigration(ctx, plan)
+	case vmFirewallMigrationPhaseAborting:
+		err = c.abortVMFirewallMigration(ctx, vmUUID, anchor, plan)
 	default:
 		err = fmt.Errorf("public-node-local: the migration of VM %s is in phase %q, which this build can not continue", vmUUID, plan.Phase)
 	}
@@ -230,6 +237,11 @@ func (c *nodeLoadBalancerController) openVMFirewallMigration(ctx context.Context
 		}
 		result, err := c.vmFirewallStep(ctx, vmUUID, vmFirewallDelta{Add: &member},
 			c.authorizeVMFirewallMigrationOpen(vmUUID, plan), c.vmFirewallMemberLookup(vmUUID, nil))
+		var changed *errVMFirewallMigrationSourceChanged
+		if errors.As(err, &changed) {
+			// The final authority found a source changed after the plan was checked.
+			return c.sourceChangedBeforeOpen(ctx, vmUUID, anchor, plan, err)
+		}
 		if err != nil {
 			return err
 		}
@@ -350,6 +362,12 @@ func (c *nodeLoadBalancerController) detachVMFirewallMigration(ctx context.Conte
 			continue
 		}
 		svc := read.services[source.UID]
+		if svc == nil || svc.DeletionTimestamp != nil {
+			if firewall, listed := exactNodeLoadBalancerFirewallFromItemsOptional(read.items, source.Firewall); listed && vmFirewallAttachedTo(*firewall, vmUUID) {
+				return vmFirewallWait(nodeLoadBalancerRetry, "public-node-local: Service %s is leaving; its cleanup detaches firewall %s from VM %s", source.UID, source.Firewall, vmUUID)
+			}
+			continue
+		}
 		if svc.Annotations[annotationNodeLoadBalancerFirewallRelationIssued] != "" {
 			// A receipt of an earlier detach (ours, or one that survived a restart)
 			// is resolved before anything else is issued for the Service.
@@ -391,6 +409,9 @@ func (c *nodeLoadBalancerController) detachVMFirewallMigration(ctx context.Conte
 		return err
 	}
 	c.queueVMFirewall(vmUUID)
+	// This VM may have made a firewall of another VM single-VM, which a deferred
+	// migration was waiting for.
+	c.queueDeferredVMFirewallMigrations(ctx)
 	return nil
 }
 
@@ -405,17 +426,4 @@ func exactNodeLoadBalancerFirewallFromItemsOptional(items []inspace.Firewall, uu
 		return nil, false
 	}
 	return firewall, true
-}
-
-// sourceChangedBeforeOpen handles a source that changed before the per-VM
-// firewall was open. The abort lands with the cleanup task; until then the VM
-// holds and says why.
-func (c *nodeLoadBalancerController) sourceChangedBeforeOpen(
-	ctx context.Context,
-	vmUUID string,
-	_ *corev1.ConfigMap,
-	_ vmFirewallMigrationPlan,
-	cause error,
-) error {
-	return fmt.Errorf("public-node-local: VM %s: %w", vmUUID, cause)
 }
