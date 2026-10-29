@@ -30,3 +30,28 @@ func perVMTestFirewall(t *testing.T, cluster, vmUUID string, uuid string, ports 
 		},
 	}
 }
+
+// vmTestRule builds one ledger rule. No sources means any source.
+func vmTestRule(protocol string, port int32, sources ...string) vmFirewallRule {
+	if sources == nil {
+		sources = []string{}
+	}
+	return vmFirewallRule{Protocol: protocol, Port: port, Sources: sources}
+}
+
+// vmTestMember builds a ledger member whose policy hash is the real one.
+func vmTestMember(t *testing.T, uid string, rules ...vmFirewallRule) vmFirewallMember {
+	t.Helper()
+	member := vmFirewallMember{UID: uid, Rules: rules}
+	policy, err := inspace.NodeLoadBalancerServiceFirewallSpecHash(vmFirewallMemberFirewallRules(member))
+	if err != nil {
+		t.Fatal(err)
+	}
+	member.Policy = policy
+	return member
+}
+
+// vmTestLedger builds a ledger with the given members, in the order given.
+func vmTestLedger(members ...vmFirewallMember) vmFirewallLedger {
+	return vmFirewallLedger{V: 1, Members: members}
+}
