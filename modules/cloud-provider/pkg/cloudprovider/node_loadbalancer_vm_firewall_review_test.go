@@ -104,7 +104,9 @@ func TestVMFirewallSettleFailsClosedOnCorruptStamp(t *testing.T) {
 	}
 }
 
-func TestVMFirewallAdoptReceiptIsRejectedWithATypedError(t *testing.T) {
+// The forward migration resolves adopt receipts. One that does not name the
+// firewall it adopts is not one this code wrote: it is corruption, and holds.
+func TestVMFirewallAdoptReceiptWithoutATargetIsCorrupt(t *testing.T) {
 	f := newVMFirewallFixture(t)
 	member := f.member(f.addService("svc-a", 1935))
 	f.seedVMFirewall(vmTestVM, vmTestFirewallUUID, true, member)
@@ -114,8 +116,8 @@ func TestVMFirewallAdoptReceiptIsRejectedWithATypedError(t *testing.T) {
 		a[annotationVMFirewallIssuedAt] = f.clock.Format(time.RFC3339Nano)
 	})
 	_, err := f.step(vmTestVM, addDelta(member), nil)
-	if !errors.Is(err, errVMFirewallAdoptUnsupported) {
-		t.Fatalf("error = %v, want errVMFirewallAdoptUnsupported", err)
+	if !errors.Is(err, errVMFirewallLedgerCorrupt) {
+		t.Fatalf("error = %v, want a corrupt-receipt error", err)
 	}
 }
 

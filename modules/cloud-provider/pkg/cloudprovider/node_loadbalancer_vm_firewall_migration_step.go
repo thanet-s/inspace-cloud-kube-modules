@@ -419,14 +419,3 @@ func (c *nodeLoadBalancerController) sourceChangedBeforeOpen(
 ) error {
 	return fmt.Errorf("public-node-local: VM %s: %w", vmUUID, cause)
 }
-
-// adoptVMFirewallMigration is M2 for the strategy that renames a firewall.
-func (c *nodeLoadBalancerController) adoptVMFirewallMigration(
-	_ context.Context,
-	vmUUID string,
-	_ *corev1.ConfigMap,
-	_ vmFirewallMigrationPlan,
-	_ vmFirewallMigrationRead,
-) error {
-	return fmt.Errorf("public-node-local: VM %s needs the adopt strategy, which this build does not run yet", vmUUID)
-}
