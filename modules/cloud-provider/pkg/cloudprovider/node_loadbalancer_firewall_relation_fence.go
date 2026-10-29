@@ -476,6 +476,10 @@ type nodeLoadBalancerFirewallRelationOwner struct {
 	// service is the owning Service, when the owner is one. It receives the
 	// Warning Event for a refused attachment.
 	service *corev1.Service
+	// members are the Services that depend on the relation when the owner is
+	// not a Service (the per-VM firewall anchor). They receive the Warning Event
+	// for a refused attachment too. Nil for every other owner.
+	members func(context.Context) []*corev1.Service
 }
 
 type nodeLoadBalancerFirewallRelationOwnerSnapshot struct {

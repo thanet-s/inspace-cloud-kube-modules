@@ -10,7 +10,9 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	kubefake "k8s.io/client-go/kubernetes/fake"
+	kubetesting "k8s.io/client-go/testing"
 
 	inspace "github.com/thanet-s/inspace-cloud-kube-modules/modules/client"
 )
@@ -164,7 +166,10 @@ func newVMFirewallFixture(t *testing.T) *vmFirewallFixture {
 			UUID: vmUUID, Name: name, Hostname: name, Status: "running",
 			PrivateIPv4: privateIP, BillingAccountID: 42, NetworkUUID: testNetworkUUID,
 		})
-		objects = append(objects, publicNodeLocalTestNode(name, vmUUID, privateIP, publicIP))
+		node := publicNodeLocalTestNode(name, vmUUID, privateIP, publicIP)
+		node.Labels[nodeLoadBalancerNodeLabel] = "true"
+		node.Labels[nodeLoadBalancerNodeClusterLabel] = "unit-test-cluster"
+		objects = append(objects, node)
 	}
 	base := publicNodeLocalTestBaseFirewall(vmTestVM)
 	base.ResourcesAssigned = append(base.ResourcesAssigned, inspace.FirewallResource{ResourceType: "vm", ResourceUUID: vmTestOtherVM})
@@ -172,7 +177,17 @@ func newVMFirewallFixture(t *testing.T) *vmFirewallFixture {
 
 	gate := &limitEnforcingFirewallAPI{API: api}
 	provider := newTestProvider(t, gate)
-	provider.kubeClient = kubefake.NewSimpleClientset(objects...)
+	kube := kubefake.NewSimpleClientset(objects...)
+	// The fake apiserver does not assign UIDs; the real one does.
+	kube.PrependReactor("create", "configmaps", func(action kubetesting.Action) (bool, runtime.Object, error) {
+		if create, ok := action.(kubetesting.CreateAction); ok {
+			if cm, ok := create.GetObject().(*corev1.ConfigMap); ok && cm.UID == "" {
+				cm.UID = types.UID("uid-" + cm.Name)
+			}
+		}
+		return false, nil, nil
+	})
+	provider.kubeClient = kube
 	provider.config.NodeLoadBalancer.ControllerNamespace = vmTestNamespace
 	f := &vmFirewallFixture{
 		t: t, ctx: context.Background(), api: api, gate: gate, provider: provider,
@@ -278,6 +293,78 @@ func (f *vmFirewallFixture) vmFirewall(vmUUID string) *inspace.Firewall {
 		}
 	}
 	return nil
+}
+
+// seedVMFirewall puts a settled per-VM firewall into the fake cloud together
+// with its anchor: the firewall carries the merged rules of members, and the
+// anchor records them as applied. The firewall is attached to vmUUID when
+// attached is true.
+func (f *vmFirewallFixture) seedVMFirewall(vmUUID, firewallUUID string, attached bool, members ...vmFirewallMember) *corev1.ConfigMap {
+	f.t.Helper()
+	ledger := vmTestLedger(members...)
+	encoded, err := encodeVMFirewallLedger(ledger)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	merged, err := mergeVMFirewallLedger(ledger)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	hash, err := inspace.NodeLoadBalancerVMFirewallSpecHash(merged)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	name, err := inspace.NodeLoadBalancerVMFirewallName(f.provider.config.ClusterID, vmUUID)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	rules := retainFirewallRuleUUIDs(nil, merged)
+	for index := range rules {
+		rules[index].UUID = fmt.Sprintf("bbbbbbbb-0000-4000-8000-%012d", index+1)
+	}
+	firewall := inspace.Firewall{UUID: firewallUUID, DisplayName: name, BillingAccountID: 42, Rules: rules}
+	if attached {
+		firewall.ResourcesAssigned = []inspace.FirewallResource{{ResourceType: "vm", ResourceUUID: vmUUID}}
+	}
+	f.api.firewalls = append(f.api.firewalls, firewall)
+	anchor, err := f.controller.createVMFirewallAnchor(f.ctx, vmUUID)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	updated, _, err := f.controller.updateVMFirewallAnchor(f.ctx, anchor, func(cm *corev1.ConfigMap) (bool, error) {
+		cm.Annotations[annotationVMFirewallUUID] = firewallUUID
+		cm.Annotations[annotationVMFirewallApplied] = encoded
+		cm.Annotations[annotationVMFirewallAppliedHash] = hash
+		cm.Annotations[annotationVMFirewallAppliedAt] = f.clock.Format(time.RFC3339Nano)
+		return true, nil
+	})
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	return updated
+}
+
+// setAnchor applies mutate to the anchor of vmUUID.
+func (f *vmFirewallFixture) setAnchor(vmUUID string, mutate func(map[string]string)) *corev1.ConfigMap {
+	f.t.Helper()
+	updated, _, err := f.controller.updateVMFirewallAnchor(f.ctx, f.anchor(vmUUID), func(cm *corev1.ConfigMap) (bool, error) {
+		mutate(cm.Annotations)
+		return true, nil
+	})
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	return updated
+}
+
+// addForeignFirewall attaches an unrelated valid-looking firewall to vmUUID.
+func (f *vmFirewallFixture) addForeignFirewall(vmUUID string, index int) {
+	f.api.firewalls = append(f.api.firewalls, inspace.Firewall{
+		UUID:              fmt.Sprintf("77777777-0000-4000-8000-%012d", index),
+		DisplayName:       fmt.Sprintf("foreign-%d", index),
+		BillingAccountID:  42,
+		ResourcesAssigned: []inspace.FirewallResource{{ResourceType: "vm", ResourceUUID: vmUUID}},
+	})
 }
 
 // firewallCount is how many firewalls are attached to vmUUID in the fake cloud.
