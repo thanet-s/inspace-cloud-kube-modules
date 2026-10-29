@@ -2645,14 +2645,11 @@ func (c *nodeLoadBalancerController) withdrawPublicNodeLocal(ctx context.Context
 	// The cloud firewall is the functional public edge. Close and positively
 	// read it back before removing either Kubernetes status; otherwise a crash
 	// can leave a FIP reaching a host listener after the private VIP vanished.
-	if err := c.detachOwnedServiceFirewallsForFailure(ctx, service); err != nil {
-		return err
-	}
-	detached, err := c.serviceFirewallsDetached(ctx, service)
+	proven, err := c.publicNodeLocalEdgeFor(service).WithdrawAll(ctx, service)
 	if err != nil {
 		return err
 	}
-	if !detached {
+	if !proven {
 		return errors.New("public-node-local: waiting for exact Service firewall detachment readback")
 	}
 	if err := c.clearServiceLoadBalancerStatus(ctx, service); err != nil {
