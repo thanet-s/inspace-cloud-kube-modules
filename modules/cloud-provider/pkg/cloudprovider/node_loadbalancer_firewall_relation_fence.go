@@ -882,7 +882,7 @@ func (c *nodeLoadBalancerController) authorizeServiceFirewallRelationPreDispatch
 			return fmt.Errorf("VM %s is not a current authorized local endpoint", fence.vmUUID)
 		}
 		if err := c.validatePublicNodeLocalAssignmentState(
-			ctx, current, intent, desired, fence.firewallUUID, addresses, true, false,
+			ctx, current, intent, desired, edgeID{policy: desired.Hash, firewallUUID: fence.firewallUUID}, addresses, true, false,
 		); err != nil {
 			return err
 		}
