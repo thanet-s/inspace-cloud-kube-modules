@@ -24,14 +24,15 @@ import (
 	inspace "github.com/thanet-s/inspace-cloud-kube-modules/modules/client"
 )
 
-// migrationVM names one VM of a migration cluster.
-type migrationVM struct{ name, uuid, private, public string }
+// migrationVM names one VM of a migration cluster. pool is the public-node-local
+// pool of its Node; empty means the default "edge".
+type migrationVM struct{ name, uuid, private, public, pool string }
 
 // The three VMs of th-live: two gateways and the relay.
 var (
-	mgGateway1 = migrationVM{"gw-1", "ee1b82ca-2222-4333-8444-555555555555", "10.0.0.21", "203.0.113.21"}
-	mgGateway2 = migrationVM{"gw-2", "0069af98-2222-4333-8444-555555555555", "10.0.0.22", "203.0.113.22"}
-	mgRelay    = migrationVM{"relay-1", "c6bcc2f2-2222-4333-8444-555555555555", "10.0.0.23", "203.0.113.23"}
+	mgGateway1 = migrationVM{"gw-1", "ee1b82ca-2222-4333-8444-555555555555", "10.0.0.21", "203.0.113.21", ""}
+	mgGateway2 = migrationVM{"gw-2", "0069af98-2222-4333-8444-555555555555", "10.0.0.22", "203.0.113.22", ""}
+	mgRelay    = migrationVM{"relay-1", "c6bcc2f2-2222-4333-8444-555555555555", "10.0.0.23", "203.0.113.23", ""}
 )
 
 // migrationCluster is a v1.1.9 cluster that the tests then move to the per-VM
@@ -51,6 +52,8 @@ type migrationCluster struct {
 	clock      time.Time
 	// history is the number of firewalls each VM carried over time.
 	history map[string][]int
+	// required is what each VM must keep allowing, as trackCoverage captured it.
+	required map[string][]inspace.FirewallRule
 	// observe, when set, runs after every mutating cloud call.
 	observe func(call string)
 }
@@ -63,6 +66,9 @@ func newMigrationCluster(t *testing.T, vms ...migrationVM) *migrationCluster {
 	base.ResourcesAssigned = nil
 	for _, vm := range vms {
 		node := publicNodeLocalTestNode(vm.name, vm.uuid, vm.private, vm.public)
+		if vm.pool != "" {
+			node.Labels[publicNodeLocalPoolLabel] = vm.pool
+		}
 		api.vms = append(api.vms, inspace.VM{
 			UUID: vm.uuid, Name: vm.name, Hostname: vm.name, Status: "running",
 			PrivateIPv4: vm.private, BillingAccountID: 42, NetworkUUID: testNetworkUUID,
@@ -166,7 +172,13 @@ func mgPort(protocol corev1.Protocol, port int32) corev1.ServicePort {
 // addService creates a Service served from the named Nodes.
 func (m *migrationCluster) addService(name, uid string, ports []corev1.ServicePort, nodes []string, ranges ...string) {
 	m.t.Helper()
-	svc := publicNodeLocalTestService(name, uid, "edge", corev1.ProtocolTCP, 1)
+	pool := "edge"
+	if len(nodes) != 0 {
+		if vmPool := m.vm(nodes[0]).pool; vmPool != "" {
+			pool = vmPool
+		}
+	}
+	svc := publicNodeLocalTestService(name, uid, pool, corev1.ProtocolTCP, 1)
 	svc.Spec.Ports = ports
 	svc.Spec.LoadBalancerSourceRanges = ranges
 	if _, err := m.kube.CoreV1().Services(svc.Namespace).Create(m.ctx, svc, metav1.CreateOptions{}); err != nil {
@@ -402,6 +414,7 @@ func (m *migrationCluster) trackCoverage() {
 			}
 		}
 	}
+	m.required = required
 	m.history = map[string][]int{}
 	record := func() {
 		for _, vm := range m.vms {
