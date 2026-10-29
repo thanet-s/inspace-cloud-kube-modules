@@ -6592,3 +6592,62 @@ func (f *fakeAPI) releaseFloatingIPsForVM(uuid string) {
 		}
 	}
 }
+
+func TestPublicNodeLocalAcceptsOwnVMFirewall(t *testing.T) {
+	const vmUUID = "11111111-1111-4111-8111-111111111111"
+	const otherVM = "22222222-2222-4222-8222-222222222222"
+	assigned := func(firewall sdk.Firewall, vms ...string) sdk.Firewall {
+		firewall.ResourcesAssigned = nil
+		for _, vm := range vms {
+			firewall.ResourcesAssigned = append(firewall.ResourcesAssigned, sdk.FirewallResource{ResourceType: "vm", ResourceUUID: vm})
+		}
+		return firewall
+	}
+	vmFirewall := func(cluster, vm, uuid string, assignedTo ...string) sdk.Firewall {
+		port := int32(1935)
+		firewall := sdk.Firewall{
+			UUID: uuid, BillingAccountID: 1, Description: sdk.NodeLoadBalancerVMFirewallDescription,
+			Rules: []sdk.FirewallRule{{
+				UUID: "public-tcp-1935", Protocol: "tcp", Direction: "inbound",
+				PortStart: &port, PortEnd: &port, EndpointSpecType: "any",
+			}},
+		}
+		name, err := sdk.NodeLoadBalancerVMFirewallName(cluster, vm)
+		if err != nil {
+			t.Fatal(err)
+		}
+		firewall.DisplayName = name
+		return assigned(firewall, assignedTo...)
+	}
+	base := assigned(secureFirewall(), vmUUID)
+	service := assigned(nodeLoadBalancerServiceFirewall("cluster-a", "service-uid-a"), vmUUID)
+	own := vmFirewall("cluster-a", vmUUID, "70000000-0000-4000-8000-000000000001", vmUUID)
+	validate := func(firewalls ...sdk.Firewall) (bool, error) {
+		return validateWorkerFirewallAssignments(
+			firewalls, base.UUID, vmUUID, base.BillingAccountID, true,
+			inspacev1.FirewallProfilePublicNodeLocal, "cluster-a", "", "nodeclaim-a",
+		)
+	}
+
+	if ok, err := validate(base, own); err != nil || !ok {
+		t.Fatalf("own per-VM firewall rejected: ok=%t err=%v", ok, err)
+	}
+	if ok, err := validate(base, service, own); err != nil || !ok {
+		t.Fatalf("migration shape (base + Service + per-VM) rejected: ok=%t err=%v", ok, err)
+	}
+
+	secondVM := vmFirewall("cluster-a", vmUUID, "70000000-0000-4000-8000-000000000002", vmUUID)
+	for name, firewalls := range map[string][]sdk.Firewall{
+		"another VM's firewall attached here": {base, vmFirewall("cluster-a", otherVM, "70000000-0000-4000-8000-000000000003", vmUUID)},
+		"two per-VM firewalls":                {base, own, vmFirewall("cluster-a", otherVM, "70000000-0000-4000-8000-000000000004", vmUUID)},
+		"two firewalls for this VM":           {base, own, secondVM},
+		"also assigned to a second VM":        {base, vmFirewall("cluster-a", vmUUID, "70000000-0000-4000-8000-000000000005", vmUUID, otherVM)},
+		"foreign cluster":                     {base, vmFirewall("cluster-b", vmUUID, "70000000-0000-4000-8000-000000000006", vmUUID)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := validate(firewalls...); !errors.Is(err, cloudapi.ErrOwnershipMismatch) {
+				t.Fatalf("invalid per-VM firewall set accepted: %v", err)
+			}
+		})
+	}
+}

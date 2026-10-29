@@ -5906,6 +5906,7 @@ func validateWorkerFirewallAssignments(firewalls []sdk.Firewall, intendedFirewal
 		intendedFirewall = byUUID[intendedFirewallUUID]
 		intendedCount := 0
 		seenAdditional := make(map[string]struct{}, len(assignments))
+		vmFirewallCount := 0
 		for _, firewallUUID := range assignments {
 			if firewallUUID == intendedFirewallUUID {
 				intendedCount++
@@ -5919,6 +5920,19 @@ func validateWorkerFirewallAssignments(firewalls []sdk.Firewall, intendedFirewal
 				return false, fmt.Errorf("%w: public-node-local VM %s has duplicate Service firewall %s assignments", cloudapi.ErrOwnershipMismatch, vmUUID, firewallUUID)
 			}
 			seenAdditional[firewallUUID] = struct{}{}
+			if firewallVM, isVMFirewall := sdk.ParseNodeLoadBalancerVMFirewallName(clusterName, firewall.EffectiveName()); isVMFirewall {
+				if firewallVM != vmUUID {
+					return false, fmt.Errorf("%w: public-node-local VM %s carries per-VM firewall %s that belongs to VM %s", cloudapi.ErrOwnershipMismatch, vmUUID, firewallUUID, firewallVM)
+				}
+				if err := sdk.ValidateNodeLoadBalancerVMFirewallIdentity(*firewall, clusterName, vmUUID, intendedFirewall.BillingAccountID); err != nil {
+					return false, fmt.Errorf("%w: public-node-local VM %s per-VM firewall %s: %v", cloudapi.ErrOwnershipMismatch, vmUUID, firewallUUID, err)
+				}
+				vmFirewallCount++
+				if vmFirewallCount > 1 {
+					return false, fmt.Errorf("%w: public-node-local VM %s has more than one per-VM firewall", cloudapi.ErrOwnershipMismatch, vmUUID)
+				}
+				continue
+			}
 			if err := sdk.ValidateNodeLoadBalancerServiceFirewall(*firewall, clusterName, intendedFirewall.BillingAccountID); err != nil {
 				return false, fmt.Errorf("%w: public-node-local VM %s additional firewall %s: %v", cloudapi.ErrOwnershipMismatch, vmUUID, firewallUUID, err)
 			}
