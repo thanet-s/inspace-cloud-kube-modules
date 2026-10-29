@@ -583,6 +583,10 @@ func (c *nodeLoadBalancerController) vmFirewallStep(
 	observation, err := c.observeVMFirewall(vmUUID, view, applied, items)
 	if err != nil {
 		if errors.Is(err, errVMFirewallDrift) && delta.LedgerOnly && view.uuid() != "" && !vmFirewallListed(items, view.uuid()) {
+			// This retires every entry of the anchor under the authority of the one
+			// Service that asked. That is safe only because the VM is proven gone
+			// (checked just below): no entry protects anything that is left.
+			//
 			// The VM is gone and its firewall too: there is nothing left to
 			// drift from. With the VM proven absent the whole anchor is retired
 			// through the delete receipt, whose three spaced absent reads prove
@@ -693,6 +697,18 @@ func (c *nodeLoadBalancerController) vmFirewallStep(
 			return vmFirewallStepResult{}, errors.New("public-node-local: an add must never narrow the VM firewall; make-before-break")
 		}
 	}
+	if observation.firewall != nil && len(applied.Members) != 0 {
+		mergedHash, hashErr := inspace.NodeLoadBalancerVMFirewallSpecHash(merged)
+		if hashErr != nil {
+			return vmFirewallStepResult{}, hashErr
+		}
+		if mergedHash == view.appliedHash() {
+			// The entry changes who owns a rule, not what the firewall allows: the
+			// ledger moves on, and the cloud is not touched. A PUT would only widen
+			// the blast radius of the change to the Services next to it.
+			return vmFirewallStepResult{FirewallUUID: view.uuid()}, c.commitVMFirewallLedgerUnchanged(ctx, vmUUID, anchor, next, authorize, observation.firewall)
+		}
+	}
 	op := vmFirewallOpUpdate
 	if observation.firewall == nil {
 		op = vmFirewallOpCreate
@@ -701,6 +717,43 @@ func (c *nodeLoadBalancerController) vmFirewallStep(
 		return vmFirewallStepResult{}, err
 	}
 	return vmFirewallStepResult{FirewallUUID: view.uuid()}, nil
+}
+
+// commitVMFirewallLedgerUnchanged records a ledger whose merged rules are the
+// ones the firewall already has. The authority still runs, and the write is a
+// compare-and-swap on the applied ledger it was derived from; applied-hash and
+// applied-at keep describing the cloud, which did not change.
+func (c *nodeLoadBalancerController) commitVMFirewallLedgerUnchanged(
+	ctx context.Context,
+	vmUUID string,
+	anchor *corev1.ConfigMap,
+	next vmFirewallLedger,
+	authorize vmFirewallDeltaAuthority,
+	firewall *inspace.Firewall,
+) error {
+	if err := authorize(ctx, anchor, firewall); err != nil {
+		return fmt.Errorf("public-node-local: reject the VM firewall ledger change for %s at final authority: %w", vmUUID, err)
+	}
+	nextRaw, err := encodeVMFirewallLedger(next)
+	if err != nil {
+		return err
+	}
+	appliedRaw := anchor.Annotations[annotationVMFirewallApplied]
+	_, changed, err := c.updateVMFirewallAnchor(ctx, anchor, func(cm *corev1.ConfigMap) (bool, error) {
+		view := vmFirewallAnchorView{cm: cm}
+		if view.hasReceipt() || view.get(annotationVMFirewallApplied) != appliedRaw {
+			return false, errors.New("public-node-local: the VM firewall anchor changed before the ledger change")
+		}
+		cm.Annotations[annotationVMFirewallApplied] = nextRaw
+		return true, nil
+	})
+	if err != nil {
+		return err
+	}
+	if !changed {
+		return errors.New("public-node-local: the VM firewall ledger change was not persisted")
+	}
+	return nil
 }
 
 var vmFirewallReceiptKeys = []string{
@@ -1158,6 +1211,11 @@ func (c *nodeLoadBalancerController) vmEdgeAssigned(
 			continue // a corrupt anchor holds its VM: the Service is not open there
 		}
 		_, inApplied := applied.find(key)
+		if view.pendingOp() == string(vmFirewallOpDelete) {
+			// The firewall of this VM is being deleted: nobody is open on it, and the
+			// delete is the VM pass's, so it is no ambiguity for a Service to plan around.
+			continue
+		}
 		if view.hasReceipt() {
 			concerns := inApplied
 			if pending, pendingErr := view.pending(); pendingErr == nil {
@@ -1201,7 +1259,7 @@ type errPublicNodeLocalVMFirewallSettling struct {
 }
 
 func (e *errPublicNodeLocalVMFirewallSettling) Error() string {
-	return fmt.Sprintf("public-node-local: the VM firewall of %s was applied just now; waiting %s for it to take effect", e.vmUUID, e.retryAfter)
+	return fmt.Sprintf("public-node-local: the VM firewall of %s was applied just now; waiting for it to take effect (%s)", e.vmUUID, e.retryAfter)
 }
 
 // vmFirewallSettle is how long a change must have been read back before a

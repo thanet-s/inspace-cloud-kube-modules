@@ -3,6 +3,7 @@ package cloudprovider
 import (
 	"context"
 	"errors"
+	"sort"
 
 	corev1 "k8s.io/api/core/v1"
 
@@ -20,11 +21,84 @@ type edgeID struct {
 	firewallUUID string
 	// snapshot is the firewall read Prepare or Active made (per-Service only).
 	snapshot *inspace.Firewall
+	// perVM marks the edge of the per-VM firewall. It owns no cloud firewall of
+	// its own: the Service holds ledger entries on the anchors of its VMs.
+	perVM bool
+	// open is, for a per-VM edge, the VMs where the Service is open under policy
+	// as Prepare or Active read them (every readback of spec section 4.5 held).
+	open map[string]struct{}
+	// listed is, for a per-VM edge, the VMs whose anchor lists an entry of the
+	// Service under policy, open or not. A removal works from it, so an entry
+	// whose attach never happened is still taken out.
+	listed map[string]struct{}
 }
 
-// fenceValue is what the durable assignment fence stores for the edge.
+// fenceValue is what the durable assignment fence stores for the edge in the
+// assigning-uuid key. A per-VM edge stores nothing there: its fence is the
+// assigning-edge key (see fenceMatches).
 func (id edgeID) fenceValue() string {
 	return id.firewallUUID
+}
+
+// fenceMatches says whether the durable assignment fence on annotations is the
+// fence of this edge.
+func (id edgeID) fenceMatches(annotations map[string]string) bool {
+	if id.perVM {
+		return annotations[annotationNodeLoadBalancerFirewallAssigning] == "" &&
+			annotations[annotationPublicNodeLocalAssignEdge] == publicNodeLocalEdgePerVM
+	}
+	return annotations[annotationNodeLoadBalancerFirewallAssigning] == id.fenceValue()
+}
+
+// writeFence stores this edge's fence identity on annotations.
+func (id edgeID) writeFence(annotations map[string]string) {
+	if id.perVM {
+		annotations[annotationPublicNodeLocalAssignEdge] = publicNodeLocalEdgePerVM
+		return
+	}
+	annotations[annotationNodeLoadBalancerFirewallAssigning] = id.fenceValue()
+}
+
+// ledgerMatches says whether the per-Service firewall ledger of the Service
+// annotations is the one this edge expects for policy. A per-VM Service keeps
+// no per-Service firewall ledger at all.
+func (id edgeID) ledgerMatches(annotations map[string]string, policy string) bool {
+	if id.perVM {
+		return annotations[annotationNodeLoadBalancerFirewallUUID] == "" && annotations[annotationNodeLoadBalancerFirewallHash] == ""
+	}
+	return annotations[annotationNodeLoadBalancerFirewallUUID] == id.firewallUUID &&
+		annotations[annotationNodeLoadBalancerFirewallHash] == policy
+}
+
+// stale lists the VMs the edge is attached to that are not in keep.
+func (id edgeID) stale(keep map[string]struct{}) ([]string, error) {
+	if id.perVM {
+		stale := make([]string, 0)
+		for vmUUID := range id.listed {
+			if _, kept := keep[vmUUID]; !kept {
+				stale = append(stale, vmUUID)
+			}
+		}
+		sort.Strings(stale)
+		return stale, nil
+	}
+	if id.snapshot == nil {
+		return nil, nil
+	}
+	return staleNodeLoadBalancerFirewallAssignments(*id.snapshot, keep)
+}
+
+// known reports whether the edge has anything to read: a firewall snapshot, or
+// the entries of a per-VM edge.
+func (id edgeID) known() bool { return id.snapshot != nil || id.perVM }
+
+// attachedTo reports whether the edge is attached to vmUUID.
+func (id edgeID) attachedTo(vmUUID string) bool {
+	if id.perVM {
+		_, listed := id.listed[vmUUID]
+		return listed
+	}
+	return id.snapshot != nil && firewallAssignedToVM(*id.snapshot, vmUUID)
 }
 
 // publicNodeLocalEdge is every operation the public-node-local state machine
@@ -58,8 +132,15 @@ type perServiceEdge struct{ c *nodeLoadBalancerController }
 
 var _ publicNodeLocalEdge = perServiceEdge{}
 
-// publicNodeLocalEdgeFor picks the edge backend of a Service.
-func (c *nodeLoadBalancerController) publicNodeLocalEdgeFor(_ *corev1.Service) publicNodeLocalEdge {
+// publicNodeLocalEdgeFor picks the edge backend of a Service. The per-VM
+// backend is chosen only when the firewall mode is perVM, and then only for a
+// Service that already lives on it or that has no per-Service firewall state
+// at all. Every other Service stays on its per-Service firewall until a
+// migration moves it.
+func (c *nodeLoadBalancerController) publicNodeLocalEdgeFor(svc *corev1.Service) publicNodeLocalEdge {
+	if c.publicNodeLocalPerVMModeEnabled() && publicNodeLocalUsesPerVMEdge(svc) {
+		return perVMEdge{c: c}
+	}
 	return perServiceEdge{c: c}
 }
 
@@ -119,6 +200,9 @@ func (e perServiceEdge) ResolvePending(ctx context.Context, svc *corev1.Service)
 }
 
 func (e perServiceEdge) Assign(ctx context.Context, svc *corev1.Service, intent nodeLoadBalancerIntent, desired desiredNodeLoadBalancerFirewall, id edgeID, addresses []nodeLoadBalancerAddress) (bool, error) {
+	if err := e.c.waitForPerVMVM(ctx, svc, addresses); err != nil {
+		return false, err
+	}
 	if err := e.c.assignPublicNodeLocalFirewallWithFence(ctx, svc, intent, desired, id.snapshot, addresses); err != nil {
 		return false, err
 	}

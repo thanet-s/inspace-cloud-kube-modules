@@ -88,6 +88,18 @@ func (s publicNodeLocalNodeSet) holdCause(waiting error) error {
 	return waiting
 }
 
+// assignFenceClock is the time the assignment-fence freshness is judged at.
+func (c *nodeLoadBalancerController) assignFenceClock() time.Time {
+	if c.assignFenceNow != nil {
+		return c.assignFenceNow().UTC()
+	}
+	return assignFenceWall().UTC()
+}
+
+// assignFenceWall is the wall clock behind assignFenceClock. It is time.Now in
+// production; the tests replace it, once, with a clock that never steps back.
+var assignFenceWall = time.Now
+
 func (c *nodeLoadBalancerController) publicNodeLocalClock() time.Time {
 	if c.publicNodeLocalNow != nil {
 		return c.publicNodeLocalNow().UTC()
@@ -537,11 +549,11 @@ func (c *nodeLoadBalancerController) convergeActivePublicNodeLocal(
 		sort.Strings(foreignNames)
 		var foreignNotes []string
 		for _, leaving := range []edgeID{current, previous} {
-			if leaving.snapshot == nil {
+			if !leaving.known() {
 				continue
 			}
 			for _, name := range foreignNames {
-				if firewallAssignedToVM(*leaving.snapshot, members[name].vmUUID) {
+				if leaving.attachedTo(members[name].vmUUID) {
 					foreignNotes = append(foreignNotes, fmt.Sprintf(
 						"Node %s runs on a VM of another billing account or VPC; Service firewall %s stays assigned to it and needs an operator",
 						name, leaving.firewallUUID))
@@ -556,10 +568,10 @@ func (c *nodeLoadBalancerController) convergeActivePublicNodeLocal(
 		// The current firewall and, while one is left over, the previous one: a
 		// node that leaves loses both before its child VIP goes.
 		for _, leaving := range []edgeID{current, previous} {
-			if leaving.snapshot == nil {
+			if !leaving.known() {
 				continue
 			}
-			stale, err := staleNodeLoadBalancerFirewallAssignments(*leaving.snapshot, keepVMSet)
+			stale, err := leaving.stale(keepVMSet)
 			if err != nil {
 				return true, c.holdOrFailPublicNodeLocal(ctx, service, err)
 			}
@@ -722,6 +734,17 @@ func (c *nodeLoadBalancerController) convergeActivePublicNodeLocal(
 		return nil
 	}
 	if len(addFIP) != 0 {
+		if current.perVM {
+			// A VM is published only after its per-VM firewall has been read back for
+			// the settle delay. A wait is not a fault: the pass holds nothing back.
+			if settleErr := c.vmFirewallSettleGate(ctx, service, vmFirewallSettleVMs(addFIP)); settleErr != nil {
+				var settling *errPublicNodeLocalVMFirewallSettling
+				if errors.As(settleErr, &settling) {
+					return settleErr
+				}
+				return c.holdOrFailPublicNodeLocal(ctx, service, settleErr)
+			}
+		}
 		next := map[string]struct{}{}
 		for ip := range fips {
 			next[ip] = struct{}{}
@@ -855,8 +878,7 @@ func (c *nodeLoadBalancerController) activePublicNodeLocalContract(
 			return nil, errors.New("public-node-local: live firewall ledger or policy changed during an incremental change")
 		}
 	}
-	if current.Annotations[annotationNodeLoadBalancerFirewallUUID] != edge.firewallUUID ||
-		current.Annotations[annotationNodeLoadBalancerFirewallHash] != desired.Hash {
+	if !edge.ledgerMatches(current.Annotations, desired.Hash) {
 		return nil, errors.New("public-node-local: live firewall ledger or policy changed during an incremental change")
 	}
 	if workPool != intent.Pool || workPolicy != desired.Hash {
@@ -884,11 +906,11 @@ func (c *nodeLoadBalancerController) ensureActivePublicNodeLocalAssignmentIntent
 		return service, err
 	}
 	vmSet := strings.Join(vmUUIDs, ",")
-	now := time.Now().UTC()
+	now := c.assignFenceClock()
 	updated, _, err := c.updateExactParentService(ctx, current, func(copy *corev1.Service) (bool, error) {
 		startedAt, parseErr := time.Parse(time.RFC3339Nano, copy.Annotations[annotationNodeLoadBalancerFirewallAssignAt])
 		fresh := parseErr == nil && !startedAt.After(now) && now.Before(startedAt.Add(nodeLoadBalancerPublicNodeLocalAssignTimeout))
-		if fresh && copy.Annotations[annotationNodeLoadBalancerFirewallAssigning] == edge.fenceValue() &&
+		if fresh && edge.fenceMatches(copy.Annotations) &&
 			copy.Annotations[annotationPublicNodeLocalAssignPolicy] == desired.Hash &&
 			copy.Annotations[annotationPublicNodeLocalAssignVMs] == vmSet {
 			return false, nil
@@ -896,10 +918,10 @@ func (c *nodeLoadBalancerController) ensureActivePublicNodeLocalAssignmentIntent
 		if copy.Annotations == nil {
 			copy.Annotations = map[string]string{}
 		}
-		if !fresh || copy.Annotations[annotationNodeLoadBalancerFirewallAssigning] != edge.fenceValue() {
+		if !fresh || !edge.fenceMatches(copy.Annotations) {
 			copy.Annotations[annotationNodeLoadBalancerFirewallAssignAt] = now.Format(time.RFC3339Nano)
 		}
-		copy.Annotations[annotationNodeLoadBalancerFirewallAssigning] = edge.fenceValue()
+		edge.writeFence(copy.Annotations)
 		copy.Annotations[annotationPublicNodeLocalAssignPolicy] = desired.Hash
 		copy.Annotations[annotationPublicNodeLocalAssignVMs] = vmSet
 		return true, nil
@@ -928,6 +950,7 @@ func (c *nodeLoadBalancerController) clearActivePublicNodeLocalAssignmentIntent(
 			annotationNodeLoadBalancerFirewallAssignAt,
 			annotationPublicNodeLocalAssignPolicy,
 			annotationPublicNodeLocalAssignVMs,
+			annotationPublicNodeLocalAssignEdge,
 		} {
 			if copy.Annotations[key] != "" {
 				delete(copy.Annotations, key)
@@ -1009,11 +1032,12 @@ func (c *nodeLoadBalancerController) validateActivePublicNodeLocalAssignState(
 		return fmt.Errorf("public-node-local: VM %s is absent from the exact child VIP status", vmUUID)
 	}
 	started, err := time.Parse(time.RFC3339Nano, current.Annotations[annotationNodeLoadBalancerFirewallAssignAt])
-	now := time.Now().UTC()
+	now := c.assignFenceClock()
 	if err != nil || started.After(now) || !now.Before(started.Add(nodeLoadBalancerPublicNodeLocalAssignTimeout)) {
-		return errors.New("public-node-local: durable firewall assignment fence is not fresh")
+		return fmt.Errorf("public-node-local: durable firewall assignment fence is not fresh (started %q, parsed %s, now %s, parse error %v)",
+			current.Annotations[annotationNodeLoadBalancerFirewallAssignAt], started, now, err)
 	}
-	if current.Annotations[annotationNodeLoadBalancerFirewallAssigning] != edge.fenceValue() ||
+	if !edge.fenceMatches(current.Annotations) ||
 		current.Annotations[annotationPublicNodeLocalAssignPolicy] != desired.Hash ||
 		!containsString(strings.Split(current.Annotations[annotationPublicNodeLocalAssignVMs], ","), vmUUID) {
 		return errors.New("public-node-local: durable firewall assignment fence does not cover the VM")
@@ -1086,25 +1110,41 @@ func (c *nodeLoadBalancerController) verifyActivePublicNodeLocalPublication(
 		return errors.New("public-node-local: private datapath spec changed after publication")
 	}
 	vips := publicNodeLocalIngressSet(datapath.Status.LoadBalancer)
-	owned, err := c.ownedServiceFirewalls(ctx, current)
-	if err != nil {
-		return err
-	}
 	var assigned map[string]struct{}
-	for index := range owned {
-		if owned[index].UUID == edge.firewallUUID {
-			assignments, assignErr := nodeLoadBalancerFirewallVMAssignments(owned[index])
-			if assignErr != nil {
-				return assignErr
-			}
-			assigned = make(map[string]struct{}, len(assignments))
-			for vmUUID := range assignments {
-				assigned[vmUUID] = struct{}{}
+	if edge.perVM {
+		// A fresh read of the per-VM firewalls, not the one the pass planned with.
+		items, listErr := c.provider.api.ListFirewalls(ctx, c.provider.config.Location)
+		if listErr != nil {
+			return listErr
+		}
+		anchors, anchorErr := c.listVMFirewallAnchors(ctx)
+		if anchorErr != nil {
+			return anchorErr
+		}
+		var assignErr error
+		if assigned, assignErr = c.vmEdgeAssigned(string(current.UID), edge.policy, items, anchors); assignErr != nil {
+			return assignErr
+		}
+	} else {
+		owned, err := c.ownedServiceFirewalls(ctx, current)
+		if err != nil {
+			return err
+		}
+		for index := range owned {
+			if owned[index].UUID == edge.firewallUUID {
+				assignments, assignErr := nodeLoadBalancerFirewallVMAssignments(owned[index])
+				if assignErr != nil {
+					return assignErr
+				}
+				assigned = make(map[string]struct{}, len(assignments))
+				for vmUUID := range assignments {
+					assigned[vmUUID] = struct{}{}
+				}
 			}
 		}
-	}
-	if assigned == nil {
-		return fmt.Errorf("public-node-local: Service firewall %s is absent after publication", edge.firewallUUID)
+		if assigned == nil {
+			return fmt.Errorf("public-node-local: Service firewall %s is absent after publication", edge.firewallUUID)
+		}
 	}
 	nodes, patched, err := c.classifyPublicNodeLocalNodesInTransition(ctx, current)
 	if err != nil {

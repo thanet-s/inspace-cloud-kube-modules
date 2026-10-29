@@ -4,10 +4,12 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"k8s.io/apimachinery/pkg/util/wait"
 	cloud "k8s.io/cloud-provider"
@@ -77,6 +79,22 @@ func initializeCloud(config *cloudconfig.CompletedConfig) cloud.Interface {
 	if err != nil {
 		klog.Fatal(err)
 	}
+	localFirewallMode, err := parseLocalFirewallMode()
+	if err != nil {
+		klog.Fatal(err)
+	}
+	vmFirewallMigration, err := parseVMFirewallMigration()
+	if err != nil {
+		klog.Fatal(err)
+	}
+	vmFirewallSettle, err := parseVMFirewallSettle()
+	if err != nil {
+		klog.Fatal(err)
+	}
+	controllerNamespace := parseCCMNamespace()
+	if err := requireNamespaceForPerVM(localFirewallMode, controllerNamespace); err != nil {
+		klog.Fatal(err)
+	}
 	api, err := inspace.NewClient(inspace.Options{
 		BaseURL: baseURL, APIKey: apiKey, DangerouslyAllowMutations: allowMutations,
 		UserAgent: buildversion.UserAgent("inspace-cloud-controller-manager"),
@@ -99,7 +117,10 @@ func initializeCloud(config *cloudconfig.CompletedConfig) cloud.Interface {
 			NodesPerShard:    nodesPerShard,
 			// Values below 1 mean the default; the provider normalizes them.
 			MaxFirewallsPerVM:   maxFirewallsPerVM,
-			ControllerNamespace: parseCCMNamespace(),
+			ControllerNamespace: controllerNamespace,
+			LocalFirewallMode:   localFirewallMode,
+			VMFirewallMigration: vmFirewallMigration,
+			VMFirewallSettle:    vmFirewallSettle,
 		},
 	})
 	if err != nil {
@@ -128,6 +149,62 @@ func parseMaxFirewallsPerVM() (int32, error) {
 // through the downward API). An unset value is the empty string.
 func parseCCMNamespace() string {
 	return strings.TrimSpace(os.Getenv("INSPACE_CCM_NAMESPACE"))
+}
+
+// parseLocalFirewallMode reads how public-node-local Services hold their cloud
+// firewall: one per Service (the default) or one per VM. Any other value is an
+// error, so a typo never silently picks a mode.
+func parseLocalFirewallMode() (inspaceprovider.PublicNodeLocalFirewallMode, error) {
+	value := strings.TrimSpace(os.Getenv("INSPACE_NODE_LOAD_BALANCER_LOCAL_FIREWALL_MODE"))
+	switch inspaceprovider.PublicNodeLocalFirewallMode(value) {
+	case "":
+		return inspaceprovider.PublicNodeLocalFirewallModePerService, nil
+	case inspaceprovider.PublicNodeLocalFirewallModePerService:
+		return inspaceprovider.PublicNodeLocalFirewallModePerService, nil
+	case inspaceprovider.PublicNodeLocalFirewallModePerVM:
+		return inspaceprovider.PublicNodeLocalFirewallModePerVM, nil
+	}
+	return "", fmt.Errorf("INSPACE_NODE_LOAD_BALANCER_LOCAL_FIREWALL_MODE must be %q or %q",
+		inspaceprovider.PublicNodeLocalFirewallModePerService, inspaceprovider.PublicNodeLocalFirewallModePerVM)
+}
+
+// parseVMFirewallMigration reads whether VMs migrate to the per-VM firewall on
+// their own (auto) or only when their Node asks for it (manual, the default).
+func parseVMFirewallMigration() (inspaceprovider.VMFirewallMigrationMode, error) {
+	value := strings.TrimSpace(os.Getenv("INSPACE_NODE_LOAD_BALANCER_VM_FIREWALL_MIGRATION"))
+	switch inspaceprovider.VMFirewallMigrationMode(value) {
+	case "":
+		return inspaceprovider.VMFirewallMigrationManual, nil
+	case inspaceprovider.VMFirewallMigrationManual:
+		return inspaceprovider.VMFirewallMigrationManual, nil
+	case inspaceprovider.VMFirewallMigrationAuto:
+		return inspaceprovider.VMFirewallMigrationAuto, nil
+	}
+	return "", fmt.Errorf("INSPACE_NODE_LOAD_BALANCER_VM_FIREWALL_MIGRATION must be %q or %q",
+		inspaceprovider.VMFirewallMigrationManual, inspaceprovider.VMFirewallMigrationAuto)
+}
+
+// parseVMFirewallSettle reads the settle delay in seconds. Unset means the
+// measured default (zero here); a set value must be 10 to 600.
+func parseVMFirewallSettle() (time.Duration, error) {
+	value := strings.TrimSpace(os.Getenv("INSPACE_NODE_LOAD_BALANCER_VM_FIREWALL_SETTLE_SECONDS"))
+	if value == "" {
+		return 0, nil
+	}
+	seconds, err := strconv.ParseInt(value, 10, 32)
+	if err != nil || seconds < 10 || seconds > 600 {
+		return 0, errors.New("INSPACE_NODE_LOAD_BALANCER_VM_FIREWALL_SETTLE_SECONDS must be an integer from 10 to 600")
+	}
+	return time.Duration(seconds) * time.Second, nil
+}
+
+// requireNamespaceForPerVM refuses to start the per-VM mode without the
+// namespace its anchor ConfigMaps live in.
+func requireNamespaceForPerVM(mode inspaceprovider.PublicNodeLocalFirewallMode, namespace string) error {
+	if mode == inspaceprovider.PublicNodeLocalFirewallModePerVM && strings.TrimSpace(namespace) == "" {
+		return errors.New("INSPACE_CCM_NAMESPACE is required when INSPACE_NODE_LOAD_BALANCER_LOCAL_FIREWALL_MODE is perVM")
+	}
+	return nil
 }
 
 func parseInt32WithDefault(name string, fallback int32) (int32, error) {

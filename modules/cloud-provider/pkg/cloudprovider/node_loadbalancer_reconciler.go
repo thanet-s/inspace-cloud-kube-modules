@@ -125,6 +125,10 @@ type nodeLoadBalancerController struct {
 	// production constructor always installs the real clock and convergence delay.
 	firewallRelationNow         func() time.Time
 	firewallRelationAbsentDelay time.Duration
+	// assignFenceNow is the clock of the assignment-fence freshness checks. It is
+	// nil in production, where the wall clock is used; tests install a clock that
+	// never steps back, because a fence is stamped and checked by different calls.
+	assignFenceNow func() time.Time
 	// publicNodeLocalNow is the clock of the endpoint-gone grace. It is nil in
 	// production, where the wall clock is used.
 	publicNodeLocalNow func() time.Time
@@ -138,6 +142,10 @@ type nodeLoadBalancerController struct {
 	// the delete of such an orphan.
 	vmFirewallOrphanMu    sync.Mutex
 	vmFirewallOrphanSince map[string]time.Time
+	// vmFirewallEnqueuedAt and vmFirewallScannedAt rate-limit the queueing of the
+	// per-VM firewall anchors and the scan for orphans. Guarded by vmFirewallOrphanMu.
+	vmFirewallEnqueuedAt time.Time
+	vmFirewallScannedAt  time.Time
 	// allGoneSince records, in memory only, when every published Node of a Service
 	// was first seen gone on cloud evidence alone. Guarded by endpointGoneMu.
 	allGoneSince map[string]time.Time
@@ -301,6 +309,7 @@ func (c *nodeLoadBalancerController) Run(stopCh <-chan struct{}) {
 			return
 		case <-ticker.C:
 			c.enqueueAll()
+			c.enqueueVMFirewallOrphans(ctx)
 		}
 	}
 }
@@ -395,6 +404,7 @@ func (c *nodeLoadBalancerController) enqueueAll() {
 			c.queue.Add(service.Namespace + "/" + service.Name)
 		}
 	}
+	c.enqueueVMFirewalls()
 }
 
 func isNodeLoadBalancerService(service *corev1.Service) bool {
@@ -3187,7 +3197,7 @@ func (c *nodeLoadBalancerController) ensureServiceFirewallAssignmentIntent(
 	if !nodeLoadBalancerDatapathMatchesDesired(datapath, current, activeShard) || len(datapath.Status.LoadBalancer.Ingress) == 0 {
 		return nil, false, errors.New("node load balancer: exact private VIP must exist before firewall assignment authorization")
 	}
-	started := time.Now().UTC().Format(time.RFC3339Nano)
+	started := c.assignFenceClock().Format(time.RFC3339Nano)
 	updated, changed, err := c.updateExactParentService(ctx, current, func(copy *corev1.Service) (bool, error) {
 		if copy.Annotations[annotationNodeLoadBalancerDatapathActive] != activeShard ||
 			copy.Annotations[annotationNodeLoadBalancerFirewallUUID] != firewallUUID ||
@@ -6307,7 +6317,7 @@ func (c *nodeLoadBalancerController) confirmMissingServiceFirewallsForWithdrawal
 	missing []string,
 	notBefore time.Time,
 ) (bool, error) {
-	now := time.Now().UTC()
+	now := c.assignFenceClock()
 	if now.Before(notBefore) {
 		return false, nil
 	}

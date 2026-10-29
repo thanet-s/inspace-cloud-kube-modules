@@ -913,6 +913,35 @@ Karpenter components, exercises elastic workers, CSI detach/reattach, private
 Cilium L2 Services, the paid TCP NLB, managed Node-LB shards, and endpoint-local
 edge nodes, then requires an exact zero-owned-resource cloud audit.
 
+## Rolling back the per-VM firewall mode for good
+
+`INSPACE_NODE_LOAD_BALANCER_LOCAL_FIREWALL_MODE=perVM` keeps one firewall per
+public-node-local VM, with a ledger in an anchor ConfigMap
+`inlb-vmfw-<vmUUID>` in the CCM namespace. A Service that lives on it carries
+the annotation `service.inspace.cloud/public-node-local-firewall-mode: per-vm`.
+With the mode set back to `perService`, such a Service holds (Event
+`PublicNodeLocalPerVMStatePresent`) and, when it is deleted, keeps its
+finalizer, because finalizing would orphan its entries on the VM firewalls.
+The supported path is to turn the mode back on and delete the Service. If the
+mode is gone for good (the chart or image no longer has it), release the
+Service by hand, in this order:
+
+1. Close the edge. For every anchor that lists the Service, remove its entries
+   by hand from the `service.inspace.cloud/vmfw-applied` ledger, or delete the
+   per-VM firewall `inlb-<cluster8>-vm-<vmUUID>` in the InSpace console once
+   no other Service uses the VM, and delete the anchor (remove its finalizer
+   `service.inspace.cloud/vm-firewall-state` first). Check that no firewall of
+   the VM still allows the Service's ports.
+2. Clear the exposure: remove the Service's `status.loadBalancer.ingress`
+   and its child `inlb-dp-*` Service status.
+3. Remove the finalizer `service.inspace.cloud/public-node-local` from the
+   Service (`kubectl patch svc <name> --type=json -p '[{"op":"remove","path":"/metadata/finalizers/0"}]'`,
+   after checking the index), then delete the child Service if it remains.
+
+Do steps 1 and 2 before step 3: removing the finalizer first leaves ports open
+on the VM with nothing left that tracks them. Never downgrade Karpenter while a
+per-VM firewall exists.
+
 ## Remaining production gaps
 
 - A VM can carry at most three firewalls (configurable) before InSpace drops its

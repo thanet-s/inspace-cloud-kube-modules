@@ -95,6 +95,36 @@ func (c *nodeLoadBalancerController) commitVMFirewallAnchorDiff(
 	return err
 }
 
+// publicNodeLocalVMNodeHealthy is nodeLoadBalancerNodeHealthy for a
+// public-node-local Node: Ready, not being deleted or drained, with both
+// addresses, and carrying a pool instead of the shard-mode node-lb label.
+func publicNodeLocalVMNodeHealthy(node *corev1.Node) bool {
+	if node == nil || node.Labels[publicNodeLocalPoolLabel] == "" {
+		return false
+	}
+	probe := node.DeepCopy()
+	probe.Labels[nodeLoadBalancerNodeLabel] = "true"
+	return nodeLoadBalancerNodeHealthy(probe)
+}
+
+// requirePublicNodeLocalFirewallVM requires exactly one healthy public-node-local
+// Node for the VM.
+func requirePublicNodeLocalFirewallVM(nodes []*corev1.Node, vmUUID string) error {
+	matches := 0
+	for _, node := range nodes {
+		if candidate, ok := nodeLoadBalancerVMUUID(node); ok && candidate == vmUUID && publicNodeLocalVMNodeHealthy(node) {
+			matches++
+		}
+	}
+	switch matches {
+	case 1:
+		return nil
+	case 0:
+		return fmt.Errorf("%w: VM %s has 0 healthy public-node-local Nodes, want exactly one", errNodeLoadBalancerFirewallVMNotHealthy, vmUUID)
+	}
+	return fmt.Errorf("VM %s has %d healthy public-node-local Nodes, want exactly one", vmUUID, matches)
+}
+
 // vmFirewallPutReceiptOpen reports an unresolved create, PUT or adopt, issued or
 // only staged. A staged delete is not one: it is the intent that authorizes the
 // detach.
@@ -184,7 +214,9 @@ func (c *nodeLoadBalancerController) authorizeVMFirewallRelationPreDispatch(
 		if err != nil {
 			return err
 		}
-		if err := requireAuthorizedNodeLoadBalancerFirewallVM([]*corev1.Node{node}, fence.vmUUID); err != nil {
+		// A public-node-local VM is an ordinary Karpenter Node with the pool label;
+		// it does not carry the shard-mode node-lb label.
+		if err := requirePublicNodeLocalFirewallVM([]*corev1.Node{node}, fence.vmUUID); err != nil {
 			return err
 		}
 		// The firewall and the anchor are the final observations before the call.
