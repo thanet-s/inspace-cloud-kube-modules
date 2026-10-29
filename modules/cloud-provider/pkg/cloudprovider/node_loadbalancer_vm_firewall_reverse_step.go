@@ -411,8 +411,10 @@ func (c *nodeLoadBalancerController) attachVMFirewallReverse(ctx context.Context
 			continue
 		}
 		svc := read.services[source.UID]
-		if svc == nil {
-			continue // gone: its entry leaves with the ordinary upkeep
+		if svc == nil || svc.DeletionTimestamp != nil {
+			// Gone: its entry leaves with the ordinary upkeep. Being deleted: its
+			// entry leaves on that intent, and it needs no firewall of its own.
+			continue
 		}
 		if svc.Annotations[annotationNodeLoadBalancerFirewallRelationIssued] != "" ||
 			svc.Annotations[annotationNodeLoadBalancerFirewallRelationOwnerUID] != "" {
@@ -597,8 +599,7 @@ func (c *nodeLoadBalancerController) authorizeVMFirewallReverseRemove(vmUUID str
 		if err != nil {
 			return err
 		}
-		if !ok || plan.Direction != vmFirewallMigrationDirectionReverse || plan.Phase != vmFirewallMigrationPhaseDetaching ||
-			plan.Strategy != vmFirewallMigrationStrategyHeadroom {
+		if !ok || plan.Direction != vmFirewallMigrationDirectionReverse || plan.Phase != vmFirewallMigrationPhaseDetaching {
 			return errors.New("public-node-local: the reverse migration is not retiring entries, so no entry may leave the per-VM firewall")
 		}
 		source, listed := plan.sourceOfService(key.UID)
@@ -615,6 +616,19 @@ func (c *nodeLoadBalancerController) authorizeVMFirewallReverseRemove(vmUUID str
 		svc := read.services[key.UID]
 		if svc == nil {
 			return fmt.Errorf("public-node-local: Service %s is gone; its entry leaves through the upkeep after two spaced reads", key.UID)
+		}
+		if svc.DeletionTimestamp != nil {
+			// Verified intent: the Service is being deleted, so nothing is left to
+			// serve for it, and it needs no firewall of its own to take its entry off.
+			return nil
+		}
+		if plan.Strategy == vmFirewallMigrationStrategyAdopt {
+			// The adoptee takes the per-VM firewall by rename while it lives; its
+			// entry stays until then, and the others' entries go with the rename.
+			adoptee := read.services[plan.Adoptee]
+			if adoptee != nil && adoptee.DeletionTimestamp == nil {
+				return errors.New("public-node-local: the per-VM firewall is renamed into the adoptee, not retired entry by entry")
+			}
 		}
 		if err := c.reverseMemberChanged(svc, source, false); err != nil {
 			return err
@@ -658,16 +672,27 @@ func (c *nodeLoadBalancerController) detachVMFirewallReverse(ctx context.Context
 			return err
 		}
 	}
-	if plan.Strategy == vmFirewallMigrationStrategyAdopt {
-		return c.unadoptVMFirewallReverse(ctx, vmUUID, anchor, plan, applied, read)
-	}
+	// Entries of Services that are being deleted leave first, one per pass.
 	member := applied.Members[0]
+	for _, candidate := range applied.Members {
+		if svc := read.services[candidate.UID]; svc != nil && svc.DeletionTimestamp != nil {
+			member = candidate
+			break
+		}
+	}
+	if svc := read.services[member.UID]; svc == nil || svc.DeletionTimestamp == nil {
+		if plan.Strategy == vmFirewallMigrationStrategyAdopt {
+			if adoptee := read.services[plan.Adoptee]; adoptee != nil && adoptee.DeletionTimestamp == nil {
+				return c.unadoptVMFirewallReverse(ctx, vmUUID, anchor, plan, applied, read)
+			}
+		}
+	}
 	key := member.key()
 	source, listed := plan.sourceOfService(key.UID)
 	if !listed {
 		return vmFirewallDrift(vmUUID, "the per-VM firewall holds an entry of Service %s that the reverse migration does not move", key.UID)
 	}
-	if svc := read.services[key.UID]; svc != nil {
+	if svc := read.services[key.UID]; svc != nil && svc.DeletionTimestamp == nil {
 		if err := c.reverseMemberChanged(svc, source, false); err != nil {
 			return err
 		}

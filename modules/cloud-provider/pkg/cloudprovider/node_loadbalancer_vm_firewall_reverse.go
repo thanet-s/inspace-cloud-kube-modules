@@ -72,7 +72,7 @@ func vmFirewallReverseServiceWaiting(svc *corev1.Service, allowReceipt bool) str
 	case svc.Annotations[annotationPublicNodeLocalActivePool] == "" || svc.Annotations[annotationPublicNodeLocalActivePolicy] == "":
 		return "is not serving yet"
 	case svc.Annotations[annotationPublicNodeLocalTargetPool] != "" || svc.Annotations[annotationPublicNodeLocalTargetPolicy] != "":
-		return "has a pool or policy change in flight; turn the per-VM mode on to finish it, or revert the change"
+		return "has a pool or policy change in flight; the reverse waits until the change is reverted or has finished"
 	case svc.Annotations[annotationNodeLoadBalancerPreviousFirewall] != "" || svc.Annotations[annotationPublicNodeLocalPromotedAt] != "":
 		return "is still retiring a previous firewall or policy"
 	case publicNodeLocalAssignmentFencePresent(svc):
@@ -154,17 +154,11 @@ func planVMFirewallReverse(
 	if !vmFirewallAttachedTo(*perVM, vmUUID) {
 		return plan, vmFirewallDrift(vmUUID, "the per-VM firewall %s is not attached to the VM", perVMUUID)
 	}
-	k := len(applied.Members)
-	if k >= limit {
-		return plan, &errVMFirewallMigrationBlocked{vmUUID: vmUUID, reason: fmt.Sprintf(
-			"k exceeds per-Service capacity: %d Services share VM %s, and the per-Service mode fits at most %d beside the base firewall",
-			k, vmUUID, limit-1)}
-	}
 	seenUID := map[string]struct{}{}
 	for _, member := range applied.Members {
 		if _, dup := seenUID[member.UID]; dup {
 			return plan, &errVMFirewallMigrationBlocked{vmUUID: vmUUID, reason: fmt.Sprintf(
-				"Service %s has two policies on the per-VM firewall (a policy change in flight); turn the per-VM mode on to finish it", member.UID)}
+				"Service %s has two policies on the per-VM firewall (a policy change in flight); the reverse waits until the change has finished or is reverted", member.UID)}
 		}
 		seenUID[member.UID] = struct{}{}
 	}
@@ -177,6 +171,7 @@ func planVMFirewallReverse(
 		isPerVM   bool              // the Service names the per-VM firewall itself as its own
 		onVM      bool              // the own firewall is attached to this VM
 		singleVM  bool
+		deleting  bool // the Service is being deleted: its entry leaves, it needs no firewall
 	}
 	states := make([]memberState, 0, len(applied.Members))
 	known := map[string]struct{}{perVMUUID: {}}
@@ -190,6 +185,12 @@ func planVMFirewallReverse(
 		if svc == nil {
 			return plan, &errVMFirewallMigrationDeferred{vmUUID: vmUUID, reason: fmt.Sprintf("waiting: Service %s is gone; its entry leaves with the ordinary upkeep", member.UID)}
 		}
+		if svc.DeletionTimestamp != nil {
+			// A Service that is being deleted gets no firewall of its own; its entry
+			// leaves the per-VM firewall on that verified intent.
+			states = append(states, memberState{member: member, svc: svc, deleting: true})
+			continue
+		}
 		if reason := vmFirewallReverseServiceWaiting(svc, false); reason != "" {
 			return plan, &errVMFirewallMigrationDeferred{vmUUID: vmUUID, reason: fmt.Sprintf("waiting: Service %s/%s %s", svc.Namespace, svc.Name, reason)}
 		}
@@ -202,7 +203,7 @@ func planVMFirewallReverse(
 		}
 		if desired.Hash != member.Policy || svc.Annotations[annotationPublicNodeLocalActivePolicy] != member.Policy {
 			return plan, &errVMFirewallMigrationDeferred{vmUUID: vmUUID, reason: fmt.Sprintf(
-				"waiting: Service %s/%s wants policy %s, but the per-VM firewall serves %s; revert the change or turn the per-VM mode on",
+				"waiting: Service %s/%s wants policy %s, but the per-VM firewall serves %s; the reverse waits until the Service asks for the serving policy again",
 				svc.Namespace, svc.Name, desired.Hash, member.Policy)}
 		}
 		state := memberState{member: member, svc: svc, desired: desired, singleVM: len(publicNodeLocalIngressSet(svc.Status.LoadBalancer)) <= 1}
@@ -242,6 +243,20 @@ func planVMFirewallReverse(
 			state.onVM = vmFirewallAttachedTo(*state.canonical, vmUUID)
 		}
 		states = append(states, state)
+	}
+
+	// Members that are being deleted take no slot; k counts the others.
+	everyone := states
+	states = nil
+	for _, state := range everyone {
+		if !state.deleting {
+			states = append(states, state)
+		}
+	}
+	if k := len(states); k >= limit {
+		return plan, &errVMFirewallMigrationBlocked{vmUUID: vmUUID, reason: fmt.Sprintf(
+			"k exceeds per-Service capacity: %d Services share VM %s, and the per-Service mode fits at most %d beside the base firewall",
+			k, vmUUID, limit-1)}
 	}
 
 	// What else is on the VM: exactly the base firewall.
@@ -310,7 +325,7 @@ func planVMFirewallReverse(
 		plan.Strategy = vmFirewallMigrationStrategyAdopt
 		plan.Adoptee = states[adopteeIndex].member.UID
 	}
-	for _, state := range states {
+	for _, state := range everyone {
 		source := vmFirewallMigrationSource{UID: state.member.UID, Policy: state.member.Policy}
 		if state.canonical != nil {
 			source.Firewall = state.canonical.UUID

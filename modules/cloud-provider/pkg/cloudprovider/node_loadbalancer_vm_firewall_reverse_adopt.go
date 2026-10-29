@@ -514,8 +514,19 @@ func (c *nodeLoadBalancerController) flipReversedPublicNodeLocal(ctx context.Con
 			}
 		}
 	}
-	// A Service that is being deleted goes back too: its own cleanup then runs on
-	// the per-Service path.
+	if svc.DeletionTimestamp != nil {
+		// A Service that is being deleted needs no firewall of its own: with no
+		// anchor listing it, its own cleanup runs on the per-Service path, which
+		// withdraws what it published.
+		_, changed, err := c.updateExactParentService(ctx, svc, func(copy *corev1.Service) (bool, error) {
+			if !publicNodeLocalServicePerVM(copy) {
+				return false, nil
+			}
+			delete(copy.Annotations, annotationPublicNodeLocalFirewallMode)
+			return true, nil
+		})
+		return changed, err
+	}
 	probe := svc.DeepCopy()
 	probe.DeletionTimestamp = nil
 	own, hash := svc.Annotations[annotationNodeLoadBalancerFirewallUUID], svc.Annotations[annotationNodeLoadBalancerFirewallHash]

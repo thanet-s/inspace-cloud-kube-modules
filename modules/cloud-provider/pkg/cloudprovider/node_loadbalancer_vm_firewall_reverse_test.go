@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	inspace "github.com/thanet-s/inspace-cloud-kube-modules/modules/client"
 )
@@ -270,6 +271,26 @@ func TestPlanVMFirewallReverseWaitsForAServiceThatIsNotSteady(t *testing.T) {
 			t.Fatalf("err = %v, want a deferral that says the Service is gone", err)
 		}
 	})
+}
+
+func TestPlanVMFirewallReverseSkipsAServiceBeingDeleted(t *testing.T) {
+	w := newReverseWorld(t)
+	w.service("relay-prod", "relay-prod-uid", 1, 1935)
+	w.service("relay-staging", "relay-staging-uid", 1, 1936)
+	w.service("traefik-public-relay", "traefik-public-relay-uid", 1, 80)
+	w.seed()
+	now := metav1.Now()
+	w.services[2].DeletionTimestamp = &now
+	plan, err := w.plan(3)
+	if err != nil {
+		t.Fatalf("three members, one being deleted: %v", err)
+	}
+	if len(plan.Sources) != 3 || plan.Adoptee == "traefik-public-relay-uid" {
+		t.Fatalf("plan = %#v: the member that is going away stays a source and takes no firewall", plan)
+	}
+	if plan.Strategy != vmFirewallMigrationStrategyAdopt || plan.Adoptee != "relay-staging-uid" {
+		t.Fatalf("plan = %#v, want the two live members planned as for k=2", plan)
+	}
 }
 
 func TestPlanVMFirewallReverseTakesTheFirewallOfAnUnfinishedAdoptBack(t *testing.T) {
