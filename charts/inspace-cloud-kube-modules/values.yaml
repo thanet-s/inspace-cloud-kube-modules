@@ -39,6 +39,24 @@ ccm:
     # connection of a VM with four or more firewalls, so the CCM refuses an
     # attachment that would exceed this. Allowed range 1-10.
     maxFirewallsPerVM: 3
+    # How a public-node-local Service holds its cloud firewall.
+    #   perService: one firewall per Service (the default, the v1.1.9 layout).
+    #   perVM: one firewall per VM that holds the rules of every Service on it,
+    #     so a VM stays at base + one firewall however many Services it serves.
+    # Turning perVM off with per-VM state present runs the reverse migration.
+    # Never downgrade the CCM or Karpenter below v1.1.10 while a per-VM
+    # firewall (inlb-<cluster>-vm-<VM UUID>) exists. See the chart README.
+    publicNodeLocal:
+      firewallMode: perService
+      # manual: a VM migrates only when its Node has
+      #   service.inspace.cloud/public-node-local-vm-firewall-migrate: "true".
+      # auto: every VM migrates, one at a time. The Node annotation value
+      #   "hold" pauses a VM in both modes.
+      vmFirewallMigration: manual
+      # Seconds to wait after new rules are written before the old firewall is
+      # detached. Measured 2026-10-29: new rules take effect in about 1 s, so
+      # 10 s is the floor. Allowed range 10-600.
+      vmFirewallSettleSeconds: 10
   replicaCount: 2
   image:
     repository: ghcr.io/thanet-s/inspace-cloud-controller-manager

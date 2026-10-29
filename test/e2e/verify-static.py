@@ -42,6 +42,44 @@ def manifest_document(text: str, kind: str, name: str) -> str:
     return matches[0]
 
 
+def verify_ccm_namespace_and_configmap_role(rendered: str, label: str) -> None:
+    """The CCM needs its own namespace and the ConfigMap Role in every mode.
+
+    Reverse migration runs with the firewall mode off, so these must not depend
+    on perVM.
+    """
+    deployment = manifest_document(
+        rendered, "Deployment", "verify-inspace-cloud-kube-modules-ccm"
+    )
+    require(
+        "            - name: INSPACE_CCM_NAMESPACE\n"
+        "              valueFrom:\n"
+        "                fieldRef:\n"
+        "                  fieldPath: metadata.namespace\n" in deployment,
+        f"{label}: CCM must set INSPACE_CCM_NAMESPACE from the downward API",
+    )
+    role = manifest_document(
+        rendered, "Role", "verify-inspace-cloud-kube-modules-ccm-configmaps"
+    )
+    require("\n  namespace: kube-system\n" in role,
+            f"{label}: CCM ConfigMap Role must live in the release namespace")
+    require(
+        '    resources: ["configmaps"]\n'
+        '    verbs: ["get", "list", "create", "update", "delete"]' in role,
+        f"{label}: CCM ConfigMap Role must grant exactly get, list, create, update, delete",
+    )
+    require(role.count("  - apiGroups:") == 1,
+            f"{label}: CCM ConfigMap Role must have one rule")
+    binding = manifest_document(
+        rendered, "RoleBinding", "verify-inspace-cloud-kube-modules-ccm-configmaps"
+    )
+    require(
+        "  kind: Role\n  name: verify-inspace-cloud-kube-modules-ccm-configmaps" in binding
+        and "    name: verify-inspace-cloud-kube-modules-ccm\n    namespace: kube-system" in binding,
+        f"{label}: CCM ConfigMap RoleBinding must bind the CCM service account to the Role",
+    )
+
+
 def single_kind_document(text: str, kind: str) -> str:
     matches = [
         document
@@ -1154,6 +1192,9 @@ def verify_node_load_balancer_helm_contract() -> None:
         ("INSPACE_NODE_LOAD_BALANCER_DEFAULT_NODE_CLASS", "ci-workers"),
         ("INSPACE_NODE_LOAD_BALANCER_NODES_PER_SHARD", "1"),
         ("INSPACE_NODE_LOAD_BALANCER_MAX_FIREWALLS_PER_VM", "3"),
+        ("INSPACE_NODE_LOAD_BALANCER_LOCAL_FIREWALL_MODE", "perVM"),
+        ("INSPACE_NODE_LOAD_BALANCER_VM_FIREWALL_MIGRATION", "manual"),
+        ("INSPACE_NODE_LOAD_BALANCER_VM_FIREWALL_SETTLE_SECONDS", "10"),
     ):
         require(
             re.search(
@@ -1164,6 +1205,7 @@ def verify_node_load_balancer_helm_contract() -> None:
             f"rendered CCM must set {variable}={value}",
         )
 
+    verify_ccm_namespace_and_configmap_role(rendered, "ci values (perVM)")
     ccm_role = manifest_document(
         rendered, "ClusterRole", "verify-inspace-cloud-kube-modules-ccm"
     )
@@ -1193,6 +1235,32 @@ def verify_node_load_balancer_helm_contract() -> None:
         "Helm must render with the optional CCM Node-LB controller disabled:\n"
         f"{disabled_result.stdout}{disabled_result.stderr}",
     )
+    per_service_result = subprocess.run(
+        [*render_command, "--set", "ccm.nodeLoadBalancer.publicNodeLocal.firewallMode=perService"],
+        cwd=repository, capture_output=True, text=True, check=False,
+    )
+    require(per_service_result.returncode == 0,
+            f"Helm must render firewallMode=perService:\n{per_service_result.stdout}{per_service_result.stderr}")
+    require(
+        re.search(
+            r"(?m)^            - name: INSPACE_NODE_LOAD_BALANCER_LOCAL_FIREWALL_MODE\n"
+            r"              value: \"perService\"$",
+            per_service_result.stdout,
+        ) is not None,
+        "firewallMode=perService must render INSPACE_NODE_LOAD_BALANCER_LOCAL_FIREWALL_MODE=perService",
+    )
+    verify_ccm_namespace_and_configmap_role(per_service_result.stdout, "perService")
+    for bad_value in (
+        "ccm.nodeLoadBalancer.publicNodeLocal.firewallMode=bogus",
+        "ccm.nodeLoadBalancer.publicNodeLocal.vmFirewallMigration=bogus",
+        "ccm.nodeLoadBalancer.publicNodeLocal.vmFirewallSettleSeconds=9",
+        "ccm.nodeLoadBalancer.publicNodeLocal.vmFirewallSettleSeconds=601",
+    ):
+        bad_result = subprocess.run(
+            [*render_command, "--set", bad_value],
+            cwd=repository, capture_output=True, text=True, check=False,
+        )
+        require(bad_result.returncode != 0, f"Helm schema must reject {bad_value}")
     unsafe_csi_timeout = subprocess.run(
         [*render_command, "--set", "csi.sidecars.provisioner.timeoutSeconds=599"],
         cwd=repository,
@@ -2319,6 +2387,80 @@ def verify_rke2_agent_token_e2e(init_playbook: str) -> None:
         and "/rke2-token" not in agent_secret
         and "no_log: true" in secret,
         "the E2E worker Secret must carry the agent token, never the server token",
+    )
+
+
+def verify_race_runs_have_long_timeout(repository: pathlib.Path) -> None:
+    """A -race run of pkg/cloudprovider exceeds the default 10m go test timeout."""
+    candidates = [repository / "Makefile", repository / "DEVELOPMENT.md"]
+    candidates += sorted((repository / ".github/workflows").glob("*.y*ml"))
+    candidates += sorted((repository / "scripts").glob("*.sh"))
+    candidates += sorted((repository / "modules").glob("*/Makefile"))
+    race_runs = 0
+    for path in candidates:
+        for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            if re.search(r"go test\b.*(?<!\S)-race\b", line):
+                race_runs += 1
+                require(
+                    re.search(r"-timeout[= ]60m\b", line) is not None,
+                    f"{path.relative_to(repository)}:{number}: a -race go test run needs -timeout 60m",
+                )
+    makefile = (repository / "modules/cloud-provider/Makefile").read_text(encoding="utf-8")
+    require(
+        re.search(r"(?m)^test-race:\n\tGOWORK=\$\(GOWORK\) go test -race -timeout 60m \./pkg/cloudprovider$", makefile)
+        is not None,
+        "modules/cloud-provider/Makefile must keep a test-race target with -timeout 60m",
+    )
+    require(race_runs >= 1, "no -race go test run found to check")
+
+
+def verify_per_vm_scenario_contract(repository: pathlib.Path) -> None:
+    """The e2e runs the per-VM firewall scenario with both continuity probes."""
+    playbook = (repository / "test/e2e/test.yml").read_text(encoding="utf-8")
+    makefile = (repository / "Makefile").read_text(encoding="utf-8")
+    require(
+        "python3 test/e2e/scripts/long-lived-tcp-probe.py --self-test" in makefile,
+        "make e2e-static must run the long-lived TCP probe self-test",
+    )
+    require(
+        "INSPACE_NODE_LOAD_BALANCER_LOCAL_FIREWALL_MODE=perVM" in playbook
+        and "INSPACE_NODE_LOAD_BALANCER_LOCAL_FIREWALL_MODE=perService" in playbook
+        and "INSPACE_NODE_LOAD_BALANCER_VM_FIREWALL_MIGRATION=auto" in playbook,
+        "test.yml must switch the CCM to perVM, then back to perService",
+    )
+    scenario_start = playbook.index("Switch the CCM to the per-VM public-node-local firewall")
+    scenario_end = playbook.index("Delete the public-node-local Service immediately after exposure checks")
+    scenario = playbook[scenario_start:scenario_end]
+    require(
+        scenario.count("--firewall-mode") >= 5 and "--extra-service" in scenario,
+        "the per-VM scenario must verify the firewall with --firewall-mode perVM",
+    )
+    for step in (
+        "Add a second Service on the edge VM",
+        "Add a third Service on the edge VM",
+        "Change the source ranges of the third Service",
+        "Remove the third Service",
+    ):
+        require(step in scenario, f"the per-VM scenario lost its step: {step}")
+    require(
+        scenario.count("/opt/e2e/scripts/continuous-http-probe.py") == 1
+        and scenario.count("/opt/e2e/scripts/long-lived-tcp-probe.py") == 1,
+        "the per-VM scenario must run the HTTP probe and the long-lived TCP probe once each",
+    )
+    require(
+        scenario.count('- "10"') >= 2 and "--max-outage" in scenario and "--max-stall" in scenario,
+        "the per-VM scenario probes must fail on an outage or stall above 10 seconds",
+    )
+    require(
+        "ansible.builtin.async_status" in scenario
+        and "e2e_public_local_http_probe_job" in scenario
+        and "e2e_public_local_tcp_probe_job" in scenario,
+        "the per-VM scenario must collect both probe results",
+    )
+    capacity = (repository / "test/e2e/templates/public-node-local-capacity.yaml.j2").read_text(encoding="utf-8")
+    require(
+        "name: tcp-echo" in capacity and "containerPort: 19000" in capacity,
+        "the edge workload must serve the long-lived TCP echo on 19000",
     )
 
 
@@ -4658,6 +4800,8 @@ def main() -> None:
     )
     verify_rke2_agent_token_e2e(init_playbook)
     verify_credentials_stay_off_argv(repository)
+    verify_race_runs_have_long_timeout(repository)
+    verify_per_vm_scenario_contract(repository)
     print("E2E static contract verified (no live resources touched)")
 
 

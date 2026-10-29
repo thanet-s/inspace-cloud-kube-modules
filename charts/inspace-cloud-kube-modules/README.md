@@ -384,6 +384,153 @@ See [`service-private-l2.yaml`](examples/service-private-l2.yaml),
 [`service-public-node-local.yaml`](examples/service-public-node-local.yaml), and
 [`egress-gateway-static.yaml`](examples/egress-gateway-static.yaml).
 
+### Public-node-local firewall mode
+
+By default every `public-node-local` Service owns one InSpace firewall per
+Service (`perService`, the v1.1.9 layout). A VM that carries the base firewall
+and two Services is already at the limit of three, so a VM can serve two
+`public-node-local` Services at most. `perVM` keeps one firewall per VM that
+holds the rules of every Service published on it, so a VM stays at the base
+firewall plus one however many Services it serves.
+
+| Value | Default | Meaning |
+|---|---|---|
+| `ccm.nodeLoadBalancer.publicNodeLocal.firewallMode` | `perService` | `perService` or `perVM`. |
+| `ccm.nodeLoadBalancer.publicNodeLocal.vmFirewallMigration` | `manual` | `manual`: a VM migrates only when its Node asks for it. `auto`: every VM migrates, one at a time. |
+| `ccm.nodeLoadBalancer.publicNodeLocal.vmFirewallSettleSeconds` | `10` | Wait after new rules are written before the old firewall is detached. Allowed range 10-600. |
+
+The chart always sets `INSPACE_CCM_NAMESPACE` (downward API), in every firewall
+mode. It creates a namespaced `Role` and `RoleBinding` for `configmaps` in the
+release namespace in every firewall mode too, but only when
+`ccm.nodeLoadBalancer.enabled` is `true`. Per-VM state lives in one anchor ConfigMap `inlb-vmfw-<VM UUID>` per VM
+in that namespace, and the reverse migration needs both even though it runs
+with the mode off. The standalone manifest
+`modules/cloud-provider/config/ccm/cloud-controller-manager.yaml` has the same.
+
+A per-VM firewall is named `inlb-<cluster hash>-vm-<VM UUID>`. A Service that
+lives on it carries `service.inspace.cloud/public-node-local-firewall-mode:
+per-vm` and no per-Service firewall annotations.
+
+Facts from the live test of 2026-10-29 on a throwaway VM, which the settle
+delay and the migration order rest on:
+
+- A firewall PUT does not touch established flows or new connections on rules
+  that did not change, whether the rule is in the same firewall or in a sibling.
+  New rules take effect about 1 s after the call starts. The 10 s default is
+  the floor.
+- A rule that is removed or narrowed stalls the established flow on that port
+  at once (packets are dropped, no RST). So every step is make-before-break: the
+  new rule is in place before the old one leaves.
+- Rename works only through `display_name`; `name` is accepted and ignored.
+  `description` is never stored. A single firewall cannot be read by UUID
+  (`GET` returns 405); the CCM reads the list.
+- A PUT with 50 rules takes about 10 s, with 3-4 rules about 1 s.
+- A VM with four or more firewalls loses every new outbound connection, so
+  every attach goes through the limit guard (`maxFirewallsPerVM`, default 3).
+
+#### Enable
+
+Every step has a gate; stop at the first one that fails and use its rollback.
+
+0. Read only. Record each VM's firewalls, the annotations of every
+   `public-node-local` Service, and the CCM and Karpenter versions. Every
+   Service must be steady (no target, previous, assigning, relation or
+   withdraw annotations). A VM that already carries three firewalls migrates by
+   adoption (step 5), so one of its Service firewalls must be attached to that
+   VM only.
+1. Deploy Karpenter and the CCM together at v1.1.10 or later with `perService`.
+   Karpenter must be upgraded first or together: v1.1.9 Karpenter rejects the
+   per-VM firewall and fails `ListVMs` for the cluster.
+2. Soak one day. Firewall counts must not change and no
+   `PublicNodeLocalPerVMStatePresent` Event may appear.
+3. On a test cluster run the e2e per-VM scenario (`test/e2e`).
+4. Set `firewallMode: perVM` with `vmFirewallMigration: manual`. Nothing
+   migrates. Then annotate one Node
+   `service.inspace.cloud/public-node-local-vm-firewall-migrate: "true"`, watch
+   that VM's firewall count (never above 3), and remove the annotation when its
+   Services show `firewall-mode: per-vm`. Repeat for the next VM. VMs migrate one
+   at a time, with a pause of four settle periods between them.
+5. A VM that already carries three firewalls migrates by adoption: the CCM
+   renames one Service firewall into the per-VM firewall in a single PUT, so the
+   count never reaches four. Do this in a window without live streams.
+6. Add the new Service on the VM (a third Service now fits). The firewall takes
+   one PUT.
+7. Move traffic to it (for example the gateway status address).
+8. Soak with the old nodes still serving as the fallback.
+9. Delete the old Service. Its entries leave the per-VM firewalls; the last
+   member's removal detaches and deletes each firewall and its anchor.
+
+Use `vmFirewallMigration: auto` only on a cluster where every VM may migrate
+without a Node annotation.
+
+#### Per-VM Node annotations
+
+`service.inspace.cloud/public-node-local-vm-firewall-migrate` on a Node:
+
+- `"true"`: migrate this VM (manual mode). Remove it when the VM is done.
+- `"hold"`: pause this VM in both modes, forward and reverse. A migration that
+  has started stops at its next step; the Services on the VM keep serving.
+  Remove the annotation to continue.
+
+Watch `PublicNodeLocalVMFirewallMigrationWaiting` (a Service on the VM is not
+steady, another VM is migrating, or the pacing delay runs) and
+`PublicNodeLocalVMFirewallMigrationBlocked` (no adoptee: remove the VM from
+one Service temporarily, or migrate another VM first).
+
+#### Roll back
+
+Never downgrade the CCM below v1.1.10 while per-VM state exists. v1.1.9 on
+migrated state keeps serving, never detaches the per-VM firewall and never
+exceeds three firewalls per VM, but it is not frozen: after one hold Event it
+creates a per-Service firewall for each Service and attaches it wherever there
+is room. Downgrade Karpenter below v1.1.10 only when no per-VM firewall exists.
+
+Order:
+
+1. Set `firewallMode: perService` on the v1.1.10 CCM. The reverse migration
+   runs per VM, one at a time: it re-attaches each Service's own firewall, then
+   detaches and deletes the per-VM firewall (a VM with two Services renames the
+   per-VM firewall into the second Service's own firewall). A VM that serves
+   three or more Services can not go back, because per-Service mode can not hold
+   it; the reverse refuses it with an Event. Delete or move the extra Service
+   first.
+2. Wait until it has finished: no ConfigMap with the label
+   `inspace.cloud/node-lb-vm-firewall=true` is left in the CCM namespace, and no
+   firewall named `inlb-<cluster hash>-vm-*` exists in InSpace.
+3. Only then downgrade the images.
+
+If the CCM misbehaves at any point, scale it to 0. The datapath keeps serving
+without it. Fix forward.
+
+If a VM already serves three Services (for example after a third Service was
+added to it), take that Service out first: move its traffic back, then delete
+it so its entry leaves the firewall. Then follow the steps above.
+
+#### Clean up after an accidental downgrade
+
+If v1.1.9 ran on per-VM state it can leave stray per-Service firewalls and
+assignment fences behind (for example a Service that holds forever with a
+firewall that was created but never attached). Do not delete or rebuild
+`public-node-local` Services while v1.1.9 is running on that state. To clean up:
+
+1. Upgrade the CCM to v1.1.10. The audit recognises the per-VM state again and
+   the Services hold.
+2. Clear the stale assignment fences on each affected Service:
+   `service.inspace.cloud/node-lb-firewall-assigning-uuid`,
+   `service.inspace.cloud/node-lb-firewall-assigning-started-at`,
+   `service.inspace.cloud/public-node-local-assigning-policy`,
+   `service.inspace.cloud/public-node-local-assigning-vms` and
+   `service.inspace.cloud/public-node-local-assigning-edge`. Also clear the
+   per-Service firewall UUID and hash annotations (`node-lb-firewall-uuid`,
+   `node-lb-firewall-hash`) that v1.1.9 wrote for a firewall it never attached.
+3. Detach the stray per-Service firewall
+   `inlb-<cluster hash>-<Service UID>-<hash>` from every VM it is attached to,
+   then delete it. Leave the per-VM firewalls alone.
+4. Set `firewallMode: perService` (or leave it) and let the reverse migration
+   run: it only starts on Services that are steady, which is why steps 2 and 3
+   come first. Finish with steps 2 and 3 of the rollback order above before any
+   downgrade.
+
 ## Dedicated workload egress
 
 Bootstrap enables Cilium Egress Gateway together with its required BPF

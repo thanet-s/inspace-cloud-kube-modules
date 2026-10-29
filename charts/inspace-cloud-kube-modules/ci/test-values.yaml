@@ -9,3 +9,7 @@ global:
 karpenter:
   clusterName: ci-rke2
   defaultNodeClass: ci-workers
+ccm:
+  nodeLoadBalancer:
+    publicNodeLocal:
+      firewallMode: perVM

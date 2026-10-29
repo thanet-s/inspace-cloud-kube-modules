@@ -1,4 +1,4 @@
-.PHONY: all build image fmt test smoke vet live-read live-test clean
+.PHONY: all build image fmt test test-race smoke vet live-read live-test clean
 
 GOWORK ?= off
 IMAGE_PLATFORM ?= linux/amd64
@@ -10,6 +10,11 @@ fmt:
 
 test:
 	GOWORK=$(GOWORK) go test ./...
+
+# The race detector slows pkg/cloudprovider past the default 10m go test
+# timeout, so every -race run of it needs -timeout 60m.
+test-race:
+	GOWORK=$(GOWORK) go test -race -timeout 60m ./pkg/cloudprovider
 
 smoke:
 	GOWORK=$(GOWORK) go test ./pkg/bootstrap -run '^(TestReconcileBuildsBastionThenExactlyThreeControlPlaneVMs|TestReconcileAndDestroySingleControlPlaneTopology|TestReconcileSequencesControlPlaneCreatesAfterPriorFirewallReadback)$$' -count=1 -v

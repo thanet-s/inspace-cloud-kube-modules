@@ -88,11 +88,21 @@
         "nodeLoadBalancer": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["enabled", "nodesPerShard", "maxFirewallsPerVM"],
+          "required": ["enabled", "nodesPerShard", "maxFirewallsPerVM", "publicNodeLocal"],
           "properties": {
             "enabled": {"type": "boolean"},
             "nodesPerShard": {"type": "integer", "minimum": 1, "maximum": 10, "default": 1},
-            "maxFirewallsPerVM": {"type": "integer", "minimum": 1, "maximum": 10, "default": 3}
+            "maxFirewallsPerVM": {"type": "integer", "minimum": 1, "maximum": 10, "default": 3},
+            "publicNodeLocal": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["firewallMode", "vmFirewallMigration", "vmFirewallSettleSeconds"],
+              "properties": {
+                "firewallMode": {"type": "string", "enum": ["perService", "perVM"], "default": "perService"},
+                "vmFirewallMigration": {"type": "string", "enum": ["manual", "auto"], "default": "manual"},
+                "vmFirewallSettleSeconds": {"type": "integer", "minimum": 10, "maximum": 600, "default": 10}
+              }
+            }
           }
         },
         "replicaCount": {"type": "integer", "minimum": 1, "maximum": 10},

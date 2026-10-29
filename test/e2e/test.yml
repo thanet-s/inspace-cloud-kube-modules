@@ -422,6 +422,12 @@
     e2e_public_local_service_manifest: "{{ lookup('env', 'E2E_STATE_DIR') }}/public-node-local-service.yaml"
     e2e_private_local_service_manifest: "{{ lookup('env', 'E2E_STATE_DIR') }}/private-local-service.yaml"
     e2e_public_local_snapshot: "{{ lookup('env', 'E2E_STATE_DIR') }}/public-node-local-present.json"
+    e2e_public_local_long_manifest: "{{ lookup('env', 'E2E_STATE_DIR') }}/public-node-local-per-vm-long.yaml"
+    e2e_public_local_extra_manifest: "{{ lookup('env', 'E2E_STATE_DIR') }}/public-node-local-per-vm-extra.yaml"
+    e2e_public_local_http_probe_stop: "{{ lookup('env', 'E2E_STATE_DIR') }}/public-node-local-http-probe.stop"
+    e2e_public_local_http_probe_ready: "{{ lookup('env', 'E2E_STATE_DIR') }}/public-node-local-http-probe.ready"
+    e2e_public_local_tcp_probe_stop: "{{ lookup('env', 'E2E_STATE_DIR') }}/public-node-local-tcp-probe.stop"
+    e2e_public_local_tcp_probe_ready: "{{ lookup('env', 'E2E_STATE_DIR') }}/public-node-local-tcp-probe.ready"
     e2e_public_local_nodeclass_name: "{{ e2e_state.publicLocalNodeClassName }}"
     e2e_public_local_nodepool_name: "{{ e2e_state.publicLocalNodePoolName }}"
     e2e_public_local_pool: "{{ e2e_state.publicLocalPool }}"
@@ -2501,6 +2507,340 @@
             mode: "0600"
           no_log: true
 
+        # Per-VM firewall scenario on the live edge VM. The CCM release default
+        # is perService, so the play switches the running CCM to perVM with
+        # automatic migration, proves the Services on one VM share one firewall
+        # through add, change and remove, then switches back and proves the
+        # reverse migration leaves no per-VM state. The retained HTTP Service
+        # and one long-lived TCP connection must survive every step.
+        - name: Reset the per-VM scenario probe fences
+          ansible.builtin.file:
+            path: "{{ item }}"
+            state: absent
+          loop:
+            - "{{ e2e_public_local_http_probe_stop }}"
+            - "{{ e2e_public_local_http_probe_ready }}"
+            - "{{ e2e_public_local_tcp_probe_stop }}"
+            - "{{ e2e_public_local_tcp_probe_ready }}"
+
+        - name: Switch the CCM to the per-VM public-node-local firewall with automatic migration
+          ansible.builtin.command:
+            argv:
+              - kubectl
+              - -n
+              - kube-system
+              - set
+              - env
+              - deployment/inspace-ccm
+              - INSPACE_NODE_LOAD_BALANCER_LOCAL_FIREWALL_MODE=perVM
+              - INSPACE_NODE_LOAD_BALANCER_VM_FIREWALL_MIGRATION=auto
+          changed_when: true
+
+        - name: Wait for the per-VM CCM rollout
+          ansible.builtin.command:
+            argv: [kubectl, -n, kube-system, rollout, status, deployment/inspace-ccm, --timeout=10m]
+          changed_when: false
+
+        - name: Continuously probe the retained HTTP Service across the migration and every per-VM change
+          ansible.builtin.command:
+            argv:
+              - /opt/e2e/scripts/continuous-http-probe.py
+              - --url
+              - "http://{{ (lookup('file', e2e_public_local_snapshot) | from_json).nodes[0].publicIP }}:80/"
+              - --expected
+              - "{{ e2e_marker }}-public-local"
+              - --stop-file
+              - "{{ e2e_public_local_http_probe_stop }}"
+              - --ready-file
+              - "{{ e2e_public_local_http_probe_ready }}"
+              - --overall-timeout
+              - "7200"
+              - --max-outage
+              - "10"
+          async: 7500
+          poll: 0
+          register: e2e_public_local_http_probe_job
+          changed_when: false
+          no_log: true
+
+        - name: Require the retained HTTP probe to be watching before the migration is judged
+          ansible.builtin.wait_for:
+            path: "{{ e2e_public_local_http_probe_ready }}"
+            state: present
+            timeout: 60
+
+        - name: Prove the live Service migrated to one per-VM firewall with a matching anchor
+          ansible.builtin.command:
+            argv:
+              - /opt/e2e/scripts/verify-public-node-local.py
+              - --state
+              - "{{ e2e_state_file }}"
+              - --kubeconfig
+              - "{{ e2e_kubeconfig }}"
+              - --baseline
+              - "{{ e2e_node_lb_baseline }}"
+              - --expect
+              - present
+              - --firewall-mode
+              - perVM
+          register: e2e_public_local_per_vm_migrated
+          changed_when: false
+          retries: 180
+          delay: 10
+          until: e2e_public_local_per_vm_migrated.rc == 0
+          no_log: true
+
+        - name: Render the long-lived TCP Service
+          ansible.builtin.template:
+            src: templates/public-node-local-per-vm-long.yaml.j2
+            dest: "{{ e2e_public_local_long_manifest }}"
+            mode: "0600"
+
+        - name: Render the Service that the scenario adds, changes and removes
+          ansible.builtin.template:
+            src: templates/public-node-local-per-vm-extra.yaml.j2
+            dest: "{{ e2e_public_local_extra_manifest }}"
+            mode: "0600"
+
+        - name: Add a second Service on the edge VM
+          ansible.builtin.command:
+            argv: [kubectl, apply, --server-side, --field-manager=inspace-e2e, -f, "{{ e2e_public_local_long_manifest }}"]
+          changed_when: true
+
+        - name: Prove two Services share the one per-VM firewall
+          ansible.builtin.command:
+            argv:
+              - /opt/e2e/scripts/verify-public-node-local.py
+              - --state
+              - "{{ e2e_state_file }}"
+              - --kubeconfig
+              - "{{ e2e_kubeconfig }}"
+              - --baseline
+              - "{{ e2e_node_lb_baseline }}"
+              - --expect
+              - present
+              - --firewall-mode
+              - perVM
+              - --extra-service
+              - inspace-e2e-public-local-long
+          register: e2e_public_local_per_vm_two
+          changed_when: false
+          retries: 180
+          delay: 10
+          until: e2e_public_local_per_vm_two.rc == 0
+          no_log: true
+
+        - name: Hold one long-lived TCP connection to the second Service through the remaining changes
+          ansible.builtin.command:
+            argv:
+              - /opt/e2e/scripts/long-lived-tcp-probe.py
+              - --host
+              - "{{ (lookup('file', e2e_public_local_snapshot) | from_json).nodes[0].publicIP }}"
+              - --port
+              - "19000"
+              - --stop-file
+              - "{{ e2e_public_local_tcp_probe_stop }}"
+              - --ready-file
+              - "{{ e2e_public_local_tcp_probe_ready }}"
+              - --overall-timeout
+              - "7200"
+              - --max-stall
+              - "10"
+          async: 7500
+          poll: 0
+          register: e2e_public_local_tcp_probe_job
+          changed_when: false
+          no_log: true
+
+        - name: Require the long-lived TCP flow to be established before the next change
+          ansible.builtin.wait_for:
+            path: "{{ e2e_public_local_tcp_probe_ready }}"
+            state: present
+            timeout: 60
+
+        - name: Add a third Service on the edge VM
+          ansible.builtin.command:
+            argv: [kubectl, apply, --server-side, --field-manager=inspace-e2e, -f, "{{ e2e_public_local_extra_manifest }}"]
+          changed_when: true
+
+        - name: Prove three Services share the one per-VM firewall
+          ansible.builtin.command:
+            argv:
+              - /opt/e2e/scripts/verify-public-node-local.py
+              - --state
+              - "{{ e2e_state_file }}"
+              - --kubeconfig
+              - "{{ e2e_kubeconfig }}"
+              - --baseline
+              - "{{ e2e_node_lb_baseline }}"
+              - --expect
+              - present
+              - --firewall-mode
+              - perVM
+              - --extra-service
+              - inspace-e2e-public-local-long
+              - --extra-service
+              - inspace-e2e-public-local-extra
+          register: e2e_public_local_per_vm_three
+          changed_when: false
+          retries: 180
+          delay: 10
+          until: e2e_public_local_per_vm_three.rc == 0
+          no_log: true
+
+        - name: Change the source ranges of the third Service
+          ansible.builtin.command:
+            argv:
+              - kubectl
+              - -n
+              - default
+              - patch
+              - service/inspace-e2e-public-local-extra
+              - --type=merge
+              - --patch
+              - '{"spec":{"loadBalancerSourceRanges":["192.0.2.0/24"]}}'
+          changed_when: true
+
+        - name: Prove the per-VM firewall followed the changed source ranges
+          ansible.builtin.command:
+            argv:
+              - /opt/e2e/scripts/verify-public-node-local.py
+              - --state
+              - "{{ e2e_state_file }}"
+              - --kubeconfig
+              - "{{ e2e_kubeconfig }}"
+              - --baseline
+              - "{{ e2e_node_lb_baseline }}"
+              - --expect
+              - present
+              - --firewall-mode
+              - perVM
+              - --extra-service
+              - inspace-e2e-public-local-long
+              - --extra-service
+              - inspace-e2e-public-local-extra
+          register: e2e_public_local_per_vm_changed
+          changed_when: false
+          retries: 180
+          delay: 10
+          until: e2e_public_local_per_vm_changed.rc == 0
+          no_log: true
+
+        - name: Remove the third Service
+          ansible.builtin.command:
+            argv: [kubectl, -n, default, delete, service/inspace-e2e-public-local-extra, --wait=false]
+          changed_when: true
+
+        - name: Prove the per-VM firewall shrank to the two remaining Services
+          ansible.builtin.command:
+            argv:
+              - /opt/e2e/scripts/verify-public-node-local.py
+              - --state
+              - "{{ e2e_state_file }}"
+              - --kubeconfig
+              - "{{ e2e_kubeconfig }}"
+              - --baseline
+              - "{{ e2e_node_lb_baseline }}"
+              - --expect
+              - present
+              - --firewall-mode
+              - perVM
+              - --extra-service
+              - inspace-e2e-public-local-long
+          register: e2e_public_local_per_vm_removed
+          changed_when: false
+          retries: 180
+          delay: 10
+          until: e2e_public_local_per_vm_removed.rc == 0
+          no_log: true
+
+        - name: Stop the per-VM scenario probes
+          ansible.builtin.file:
+            path: "{{ item }}"
+            state: touch
+          loop:
+            - "{{ e2e_public_local_http_probe_stop }}"
+            - "{{ e2e_public_local_tcp_probe_stop }}"
+
+        - name: Require the retained HTTP Service to have had no outage above 10 seconds
+          ansible.builtin.async_status:
+            jid: "{{ e2e_public_local_http_probe_job.ansible_job_id }}"
+          register: e2e_public_local_http_probe_result
+          changed_when: false
+          retries: 30
+          delay: 1
+          until: e2e_public_local_http_probe_result.finished
+          no_log: true
+
+        - name: Require the long-lived TCP flow to have had no reset and no stall above 10 seconds
+          ansible.builtin.async_status:
+            jid: "{{ e2e_public_local_tcp_probe_job.ansible_job_id }}"
+          register: e2e_public_local_tcp_probe_result
+          changed_when: false
+          retries: 30
+          delay: 1
+          until: e2e_public_local_tcp_probe_result.finished
+          no_log: true
+
+        - name: Remove the second Service before the reverse migration
+          ansible.builtin.command:
+            argv: [kubectl, -n, default, delete, service/inspace-e2e-public-local-long, --wait=false]
+          changed_when: true
+
+        - name: Switch the CCM back to the per-Service firewall
+          ansible.builtin.command:
+            argv:
+              - kubectl
+              - -n
+              - kube-system
+              - set
+              - env
+              - deployment/inspace-ccm
+              - INSPACE_NODE_LOAD_BALANCER_LOCAL_FIREWALL_MODE=perService
+          changed_when: true
+
+        - name: Wait for the per-Service CCM rollout
+          ansible.builtin.command:
+            argv: [kubectl, -n, kube-system, rollout, status, deployment/inspace-ccm, --timeout=10m]
+          changed_when: false
+
+        - name: Set the CCM migration back to manual
+          ansible.builtin.command:
+            argv:
+              - kubectl
+              - -n
+              - kube-system
+              - set
+              - env
+              - deployment/inspace-ccm
+              - INSPACE_NODE_LOAD_BALANCER_VM_FIREWALL_MIGRATION=manual
+          changed_when: true
+
+        - name: Wait for the manual-migration CCM rollout
+          ansible.builtin.command:
+            argv: [kubectl, -n, kube-system, rollout, status, deployment/inspace-ccm, --timeout=10m]
+          changed_when: false
+
+        - name: Prove the reverse migration restored the per-Service firewall and left no per-VM state
+          ansible.builtin.command:
+            argv:
+              - /opt/e2e/scripts/verify-public-node-local.py
+              - --state
+              - "{{ e2e_state_file }}"
+              - --kubeconfig
+              - "{{ e2e_kubeconfig }}"
+              - --baseline
+              - "{{ e2e_node_lb_baseline }}"
+              - --expect
+              - present
+              - --probe-public
+          register: e2e_public_local_reversed
+          changed_when: false
+          retries: 240
+          delay: 10
+          until: e2e_public_local_reversed.rc == 0
+          no_log: true
+
         - name: Delete the public-node-local Service immediately after exposure checks
           ansible.builtin.command:
             argv:
@@ -2602,6 +2942,27 @@
           until: e2e_public_local_absent.rc == 0
           no_log: true
       always:
+        - name: Stop any per-VM scenario probe before fallback cleanup
+          ansible.builtin.file:
+            path: "{{ item }}"
+            state: touch
+          loop:
+            - "{{ e2e_public_local_http_probe_stop }}"
+            - "{{ e2e_public_local_tcp_probe_stop }}"
+
+        - name: Delete the per-VM scenario Services before fallback capacity cleanup
+          ansible.builtin.command:
+            argv:
+              - kubectl
+              - -n
+              - default
+              - delete
+              - service/inspace-e2e-public-local-long
+              - service/inspace-e2e-public-local-extra
+              - --ignore-not-found
+              - --wait=false
+          changed_when: true
+
         - name: Delete the public-node-local Service before fallback capacity cleanup
           ansible.builtin.command:
             argv:
@@ -2617,7 +2978,7 @@
         - name: Wait for the public-node-local firewall finalizer before capacity cleanup
           ansible.builtin.shell: |
             set -euo pipefail
-            test -z "$(kubectl -n default get service/inspace-e2e-public-local --ignore-not-found -o name)"
+            test -z "$(kubectl -n default get service/inspace-e2e-public-local service/inspace-e2e-public-local-long service/inspace-e2e-public-local-extra --ignore-not-found -o name)"
           args:
             executable: /bin/bash
           register: e2e_public_local_fallback_service_absent
