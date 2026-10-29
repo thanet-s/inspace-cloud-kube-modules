@@ -543,11 +543,18 @@ func (e perVMEdge) removalReason(ctx context.Context, current *corev1.Service, v
 		if err != nil {
 			return vmRemovalNotAllowed, err
 		}
+		// The removal being authorized holds the receipt of its own VM, so that
+		// anchor is read without it: it is the active policy that must be open.
+		for index := range anchors {
+			if (vmFirewallAnchorView{cm: &anchors[index]}).vm() == vmUUID {
+				anchors[index] = *stripVMFirewallReceipt(&anchors[index])
+			}
+		}
 		open, err := c.vmEdgeAssigned(string(current.UID), activePolicy, items, anchors)
 		if err != nil && !errors.Is(err, errVMFirewallReceiptPending) {
 			return vmRemovalNotAllowed, err
 		}
-		if _, active := open[vmUUID]; active && err == nil {
+		if _, active := open[vmUUID]; active {
 			return vmRemovalSuperseded, nil
 		}
 	}
@@ -559,6 +566,15 @@ func (e perVMEdge) removalReason(ctx context.Context, current *corev1.Service, v
 		return vmRemovalNodeLeaving, nil
 	}
 	return vmRemovalNotAllowed, nil
+}
+
+// stripVMFirewallReceipt returns a copy of the anchor without its PUT receipt.
+func stripVMFirewallReceipt(anchor *corev1.ConfigMap) *corev1.ConfigMap {
+	clean := anchor.DeepCopy()
+	for _, key := range vmFirewallReceiptKeys {
+		delete(clean.Annotations, key)
+	}
+	return clean
 }
 
 // removalTarget is one entry to take off one VM.

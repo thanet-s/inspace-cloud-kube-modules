@@ -457,6 +457,220 @@ func buildPerVMPublicNodeLocalFixture(t *testing.T, n int, shape func(*corev1.Se
 	}
 }
 
+// edgeAllows is the effective inbound allow set of a VM: for every
+// protocol/port the sources of all its firewalls; nil means any source.
+type edgeAllowSet map[string]map[string]struct{}
+
+func edgeAllowKey(rule inspace.FirewallRule) (string, bool) {
+	if !strings.EqualFold(rule.Direction, "inbound") || rule.PortStart == nil || rule.PortEnd == nil || *rule.PortStart != *rule.PortEnd {
+		return "", false
+	}
+	return fmt.Sprintf("%s/%d", strings.ToLower(rule.Protocol), *rule.PortStart), true
+}
+
+func edgeAllowOf(firewalls []inspace.Firewall) edgeAllowSet {
+	allow := edgeAllowSet{}
+	for _, firewall := range firewalls {
+		for _, rule := range firewall.Rules {
+			key, ok := edgeAllowKey(rule)
+			if !ok {
+				continue
+			}
+			if rule.EndpointSpecType != "ip_prefixes" {
+				allow[key] = nil
+				continue
+			}
+			if existing, seen := allow[key]; seen && existing == nil {
+				continue
+			}
+			if allow[key] == nil {
+				allow[key] = map[string]struct{}{}
+			}
+			for _, source := range rule.EndpointSpec {
+				allow[key][source] = struct{}{}
+			}
+		}
+	}
+	return allow
+}
+
+// covers reports whether the allow set admits every source of the rule.
+func (a edgeAllowSet) covers(rule inspace.FirewallRule) bool {
+	key, ok := edgeAllowKey(rule)
+	if !ok {
+		return true
+	}
+	sources, open := a[key]
+	if !open {
+		return false
+	}
+	if sources == nil {
+		return true
+	}
+	if rule.EndpointSpecType != "ip_prefixes" {
+		return false
+	}
+	for _, source := range rule.EndpointSpec {
+		if _, ok := sources[source]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// activeServiceRules are the rules of the policy a Service serves right now,
+// from whichever edge holds it: the per-VM ledgers, or the per-Service firewall
+// whose rules hash to the active policy.
+func activeServiceRules(f *publicNodeLocalTransientFixture, service *corev1.Service) []inspace.FirewallRule {
+	policy := service.Annotations[annotationPublicNodeLocalActivePolicy]
+	if policy == "" {
+		return nil
+	}
+	if publicNodeLocalServicePerVM(service) {
+		anchors, err := f.controller.listVMFirewallAnchors(f.ctx)
+		if err != nil {
+			return nil
+		}
+		for index := range anchors {
+			ledger, err := (vmFirewallAnchorView{cm: &anchors[index]}).applied()
+			if err != nil {
+				continue
+			}
+			if member, found := ledger.find(vmFirewallMemberKey{UID: string(service.UID), Policy: policy}); found {
+				return vmFirewallMemberFirewallRules(member)
+			}
+		}
+		return nil
+	}
+	for _, firewall := range f.api.firewalls {
+		if !strings.HasPrefix(firewall.EffectiveName(), nodeLoadBalancerFirewallServicePrefix(f.provider.config.ClusterID, string(service.UID))) {
+			continue
+		}
+		if hash, err := nodeLoadBalancerFirewallSpecHash(firewall.Rules); err == nil && hash == policy {
+			return firewall.Rules
+		}
+	}
+	return nil
+}
+
+// requireVMEdgeSafe is the invariant every pass of every scenario keeps, on
+// either firewall mode:
+//
+//  1. every published FIP is on a VM whose attached firewalls together allow
+//     every port of the Service's active policy, from at least its sources;
+//  2. no VM carries a Service's rules without the Service's child VIP on it;
+//  3. no VM ever carried more firewalls than the limit, and no attach was
+//     refused by it (the controller itself never tries a fourth).
+func requireVMEdgeSafe(t *testing.T, f *publicNodeLocalTransientFixture, services ...*corev1.Service) {
+	t.Helper()
+	if len(services) == 0 {
+		services = []*corev1.Service{f.current(t)}
+	}
+	nodes, err := f.provider.kubeClient.CoreV1().Nodes().List(f.ctx, metav1.ListOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	vmOfPublic := map[string]string{}
+	privateOfVM := map[string]string{}
+	for index := range nodes.Items {
+		node := &nodes.Items[index]
+		vmUUID, ok := nodeLoadBalancerVMUUID(node)
+		if !ok {
+			continue
+		}
+		if public, ok := nodeLoadBalancerNodeExternalIPv4(node); ok {
+			vmOfPublic[public] = vmUUID
+		}
+		if private, ok := nodeLoadBalancerNodeInternalIPv4(node); ok {
+			privateOfVM[vmUUID] = private
+		}
+	}
+	for _, raw := range services {
+		service, err := f.provider.kubeClient.CoreV1().Services(raw.Namespace).Get(f.ctx, raw.Name, metav1.GetOptions{})
+		if err != nil {
+			continue
+		}
+		required := activeServiceRules(f, service)
+		for _, ingress := range service.Status.LoadBalancer.Ingress {
+			vmUUID, known := vmOfPublic[ingress.IP]
+			if !known {
+				continue
+			}
+			allow := edgeAllowOf(vmFirewallsOfVM(f, vmUUID))
+			for _, rule := range required {
+				if !allow.covers(rule) {
+					t.Fatalf("FIP %s on VM %s is published but its firewalls do not allow %s from %v: %#v",
+						ingress.IP, vmUUID, rule.Protocol, rule.EndpointSpec, vmFirewallsOfVM(f, vmUUID))
+				}
+			}
+		}
+		var child *corev1.Service
+		if object, getErr := f.provider.kubeClient.CoreV1().Services(service.Namespace).Get(f.ctx, nodeLoadBalancerDatapathName(service), metav1.GetOptions{}); getErr == nil {
+			child = object
+		}
+		for _, firewall := range f.api.firewalls {
+			if _, isVM := inspace.ParseNodeLoadBalancerVMFirewallName(f.provider.config.ClusterID, firewall.EffectiveName()); !isVM &&
+				!strings.HasPrefix(firewall.EffectiveName(), nodeLoadBalancerFirewallServicePrefix(f.provider.config.ClusterID, string(service.UID))) {
+				continue
+			}
+			carries := false
+			if publicNodeLocalServicePerVM(service) {
+				anchors, listErr := f.controller.listVMFirewallAnchors(f.ctx)
+				if listErr == nil {
+					for index := range anchors {
+						view := vmFirewallAnchorView{cm: &anchors[index]}
+						if view.uuid() == firewall.UUID && len(view.memberKeys(string(service.UID))) != 0 {
+							carries = true
+						}
+					}
+				}
+			} else {
+				carries = strings.HasPrefix(firewall.EffectiveName(), nodeLoadBalancerFirewallServicePrefix(f.provider.config.ClusterID, string(service.UID)))
+			}
+			if !carries || child == nil {
+				continue
+			}
+			vips := publicNodeLocalIngressSet(child.Status.LoadBalancer)
+			for _, row := range firewall.ResourcesAssigned {
+				if private := privateOfVM[row.ResourceUUID]; private != "" {
+					if _, has := vips[private]; !has {
+						t.Fatalf("VM %s carries the rules of Service %s without its child VIP %s: vips=%v", row.ResourceUUID, service.Name, private, vips)
+					}
+				}
+			}
+		}
+	}
+	if f.gate != nil {
+		limit := f.gate.limit
+		if limit < 1 {
+			limit = int(DefaultMaxFirewallsPerVM)
+		}
+		if f.gate.maxObservedFirewallsPerVM > limit {
+			t.Fatalf("a VM carried %d firewalls, limit %d", f.gate.maxObservedFirewallsPerVM, limit)
+		}
+		if f.gate.refusedAttaches != 0 {
+			t.Fatalf("%d attaches ran into the firewall limit: the controller must never try a fourth", f.gate.refusedAttaches)
+		}
+	}
+}
+
+// requireSteadyFirewallCount requires exactly want firewalls on each of the
+// first nodes VMs, the steady state of a single Service: the base firewall and
+// one more.
+func requireSteadyFirewallCount(t *testing.T, f *publicNodeLocalTransientFixture, nodes, want int) {
+	t.Helper()
+	for index := 0; index < nodes; index++ {
+		_, vmUUID, _, _ := publicNodeLocalFixtureNode(index)
+		if got := len(vmFirewallsOfVM(f, vmUUID)); got != want {
+			t.Fatalf("VM %d carries %d firewalls, want %d: %#v", index, got, want, vmFirewallsOfVM(f, vmUUID))
+		}
+	}
+}
+
+func inspaceVMResource(vmUUID string) inspace.FirewallResource {
+	return inspace.FirewallResource{ResourceType: "vm", ResourceUUID: vmUUID}
+}
+
 // vmFirewallsOfVM lists the firewalls attached to vmUUID in the fake cloud.
 func vmFirewallsOfVM(f *publicNodeLocalTransientFixture, vmUUID string) []inspace.Firewall {
 	var out []inspace.Firewall

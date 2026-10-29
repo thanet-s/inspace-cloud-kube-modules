@@ -51,6 +51,31 @@ func removeDelta(m vmFirewallMember) vmFirewallDelta {
 }
 func ruleSummary(rules []inspace.FirewallRule) []string { return mergedRuleSummary(rules) }
 
+// An entry that changes who owns a rule but not what the firewall allows moves
+// the ledger and leaves the cloud alone: no PUT, so no change for the Services
+// next to it.
+func TestVMFirewallStepSkipsPutWhenMergedRulesAreUnchanged(t *testing.T) {
+	f := newVMFirewallFixture(t)
+	wide := vmTestMember(t, "svc-wide", vmTestRule("tcp", 80), vmTestRule("tcp", 443))
+	f.seedVMFirewall(vmTestVM, "99999999-0000-4000-8000-000000000001", true, wide)
+	narrow := vmTestMember(t, "svc-wide", vmTestRule("tcp", 443))
+	before := len(f.api.updatedFirewalls)
+
+	result := f.stepUntilConverged(vmTestVM, addDelta(narrow))
+	if !result.Converged || len(f.api.updatedFirewalls) != before {
+		t.Fatalf("an add that changes no rule must not PUT: %d updates", len(f.api.updatedFirewalls)-before)
+	}
+	applied, err := vmFirewallAnchorView{cm: f.anchor(vmTestVM)}.applied()
+	if err != nil || len(applied.Members) != 2 {
+		t.Fatalf("applied ledger = %#v, %v", applied, err)
+	}
+	// Taking the wide entry out narrows the firewall: that one is a PUT.
+	f.stepUntilConverged(vmTestVM, removeDelta(wide))
+	if got := len(f.api.updatedFirewalls) - before; got != 1 {
+		t.Fatalf("%d PUTs for the narrowing, want exactly 1", got)
+	}
+}
+
 func TestVMFirewallStepCreateThenAttach(t *testing.T) {
 	f := newVMFirewallFixture(t)
 	service := f.addService("svc-a", 1935)
