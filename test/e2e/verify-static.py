@@ -2414,6 +2414,56 @@ def verify_race_runs_have_long_timeout(repository: pathlib.Path) -> None:
     require(race_runs >= 1, "no -race go test run found to check")
 
 
+def verify_per_vm_scenario_contract(repository: pathlib.Path) -> None:
+    """The e2e runs the per-VM firewall scenario with both continuity probes."""
+    playbook = (repository / "test/e2e/test.yml").read_text(encoding="utf-8")
+    makefile = (repository / "Makefile").read_text(encoding="utf-8")
+    require(
+        "python3 test/e2e/scripts/long-lived-tcp-probe.py --self-test" in makefile,
+        "make e2e-static must run the long-lived TCP probe self-test",
+    )
+    require(
+        "INSPACE_NODE_LOAD_BALANCER_LOCAL_FIREWALL_MODE=perVM" in playbook
+        and "INSPACE_NODE_LOAD_BALANCER_LOCAL_FIREWALL_MODE=perService" in playbook
+        and "INSPACE_NODE_LOAD_BALANCER_VM_FIREWALL_MIGRATION=auto" in playbook,
+        "test.yml must switch the CCM to perVM, then back to perService",
+    )
+    scenario_start = playbook.index("Switch the CCM to the per-VM public-node-local firewall")
+    scenario_end = playbook.index("Delete the public-node-local Service immediately after exposure checks")
+    scenario = playbook[scenario_start:scenario_end]
+    require(
+        scenario.count("--firewall-mode") >= 5 and "--extra-service" in scenario,
+        "the per-VM scenario must verify the firewall with --firewall-mode perVM",
+    )
+    for step in (
+        "Add a second Service on the edge VM",
+        "Add a third Service on the edge VM",
+        "Change the source ranges of the third Service",
+        "Remove the third Service",
+    ):
+        require(step in scenario, f"the per-VM scenario lost its step: {step}")
+    require(
+        scenario.count("/opt/e2e/scripts/continuous-http-probe.py") == 1
+        and scenario.count("/opt/e2e/scripts/long-lived-tcp-probe.py") == 1,
+        "the per-VM scenario must run the HTTP probe and the long-lived TCP probe once each",
+    )
+    require(
+        scenario.count('- "10"') >= 2 and "--max-outage" in scenario and "--max-stall" in scenario,
+        "the per-VM scenario probes must fail on an outage or stall above 10 seconds",
+    )
+    require(
+        "ansible.builtin.async_status" in scenario
+        and "e2e_public_local_http_probe_job" in scenario
+        and "e2e_public_local_tcp_probe_job" in scenario,
+        "the per-VM scenario must collect both probe results",
+    )
+    capacity = (repository / "test/e2e/templates/public-node-local-capacity.yaml.j2").read_text(encoding="utf-8")
+    require(
+        "name: tcp-echo" in capacity and "containerPort: 19000" in capacity,
+        "the edge workload must serve the long-lived TCP echo on 19000",
+    )
+
+
 def verify_credentials_stay_off_argv(repository: pathlib.Path) -> None:
     """No playbook, script, or runbook puts a credential on a command line."""
     roots = ("deploy", "test/e2e", "scripts", "modules", "charts", "README.md", "DEVELOPMENT.md")
@@ -4751,6 +4801,7 @@ def main() -> None:
     verify_rke2_agent_token_e2e(init_playbook)
     verify_credentials_stay_off_argv(repository)
     verify_race_runs_have_long_timeout(repository)
+    verify_per_vm_scenario_contract(repository)
     print("E2E static contract verified (no live resources touched)")
 
 

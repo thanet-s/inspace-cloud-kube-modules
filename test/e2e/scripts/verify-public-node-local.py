@@ -34,6 +34,24 @@ IMMUTABLE_INVENTORY_KEYS = {
     "vms", "networks", "firewalls", "floatingIPs", "loadBalancers", "disks",
     "buckets", "servicePackages",
 }
+MODE_PER_SERVICE = "perService"
+MODE_PER_VM = "perVM"
+FIREWALL_MODE_ANNOTATION = "service.inspace.cloud/public-node-local-firewall-mode"
+VM_ANCHOR_PREFIX = "inlb-vmfw-"
+VM_ANCHOR_LABEL = "inspace.cloud/node-lb-vm-firewall"
+VM_ANCHOR_CLUSTER_LABEL = "inspace.cloud.node-restriction.kubernetes.io/cluster"
+VM_ANCHOR_VM = "service.inspace.cloud/vmfw-vm"
+VM_ANCHOR_UUID = "service.inspace.cloud/vmfw-uuid"
+VM_ANCHOR_APPLIED_HASH = "service.inspace.cloud/vmfw-applied-hash"
+VM_ANCHOR_PENDING_KEYS = (
+    "service.inspace.cloud/vmfw-pending",
+    "service.inspace.cloud/vmfw-pending-hash",
+    "service.inspace.cloud/vmfw-pending-op",
+    "service.inspace.cloud/vmfw-issued-at",
+    "service.inspace.cloud/vmfw-adopt-uuid",
+    "service.inspace.cloud/vmfw-delete-target",
+)
+VM_FIREWALL_DESCRIPTION = "Managed InSpace public-node-local VM firewall"
 VM_UUID_PATTERN = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
 )
@@ -153,6 +171,72 @@ def service_firewall_identity(cluster: str, service_uid: str) -> tuple[str, str]
     policy_hash = hashlib.sha256(canonical.encode()).hexdigest()[:8]
     cluster_hash = hashlib.sha256(cluster.encode()).hexdigest()[:8]
     return f"inlb-{cluster_hash}-{service_uid}-{policy_hash}", policy_hash
+
+
+def cluster_hash(cluster: str) -> str:
+    return hashlib.sha256(cluster.encode()).hexdigest()[:8]
+
+
+def vm_firewall_name(cluster: str, vm_uuid: str) -> str:
+    return f"inlb-{cluster_hash(cluster)}-vm-{vm_uuid}"
+
+
+def rule_key(protocol: str, port: int, endpoint_type: str, endpoints: list[str]) -> str:
+    """The canonical key of one inbound port rule, as the CCM hashes it."""
+    return "|".join([protocol, str(port), endpoint_type, ",".join(sorted(endpoints))])
+
+
+def firewall_rule_keys(rules: list[dict]) -> list[str]:
+    """Canonical keys of a live firewall's rules; any non-canonical rule fails."""
+    keys = []
+    for rule in rules:
+        require(
+            isinstance(rule, dict)
+            and rule.get("direction") == "inbound"
+            and rule.get("protocol") in ("tcp", "udp")
+            and isinstance(rule.get("port_start"), int)
+            and rule.get("port_start") == rule.get("port_end"),
+            "per-VM firewall holds a rule that is not one inbound TCP/UDP port",
+        )
+        endpoint_type = rule.get("endpoint_spec_type")
+        endpoints = list(rule.get("endpoint_spec") or [])
+        require(
+            (endpoint_type == "any" and not endpoints)
+            or (endpoint_type == "ip_prefixes" and endpoints),
+            "per-VM firewall holds a rule with a non-canonical source",
+        )
+        keys.append(rule_key(rule["protocol"], rule["port_start"], endpoint_type, endpoints))
+    require(len(keys) == len(set(keys)), "per-VM firewall holds a duplicate rule")
+    return sorted(keys)
+
+
+def vm_firewall_policy_hash(keys: list[str]) -> str:
+    """The full policy hash the CCM writes to the anchor as applied-hash."""
+    return hashlib.sha256("\n".join(sorted(keys)).encode()).hexdigest()
+
+
+def service_rule_keys(service: dict) -> list[str]:
+    """The rule keys one Service asks for: its ports with its source ranges."""
+    spec = service.get("spec", {})
+    ranges = sorted(spec.get("loadBalancerSourceRanges") or [])
+    keys = []
+    for port in spec.get("ports", []):
+        protocol = str(port.get("protocol", "TCP")).lower()
+        if ranges:
+            keys.append(rule_key(protocol, port["port"], "ip_prefixes", ranges))
+        else:
+            keys.append(rule_key(protocol, port["port"], "any", []))
+    return keys
+
+
+def expected_vm_rule_keys(services: list[dict]) -> list[str]:
+    """The union a per-VM firewall must hold for the Services on its VM."""
+    keys = []
+    for service in services:
+        keys.extend(service_rule_keys(service))
+    ports = [key.split("|")[0] + "|" + key.split("|")[1] for key in keys]
+    require(len(ports) == len(set(ports)), "two Services on one VM claim the same public port")
+    return sorted(keys)
 
 
 def service_identity(namespace: str, name: str, uid: str) -> str:
@@ -611,6 +695,149 @@ def service_firewall(service: dict, firewalls: list[dict], cluster: str, vm_uuid
     return {"uuid": firewall.get("uuid"), "name": name, "hash": policy_hash}
 
 
+def per_service_firewall_annotations(service: dict) -> list[str]:
+    """Keys of any per-Service firewall state still set on a Service."""
+    return sorted(
+        key for key, value in service.get("metadata", {}).get("annotations", {}).items()
+        if key.startswith("service.inspace.cloud/node-lb-")
+        and "firewall" in key
+        and value not in (None, "")
+    )
+
+
+def require_per_vm_service(service: dict) -> None:
+    annotations = service.get("metadata", {}).get("annotations", {})
+    name = service.get("metadata", {}).get("name", "?")
+    require(
+        annotations.get(FIREWALL_MODE_ANNOTATION) == "per-vm",
+        f"Service {name} lacks {FIREWALL_MODE_ANNOTATION}: per-vm",
+    )
+    stray = per_service_firewall_annotations(service)
+    require(not stray, f"per-VM Service {name} still has per-Service firewall annotations: {stray}")
+    pending = [
+        key for key, value in annotations.items()
+        if (key.startswith("service.inspace.cloud/vmfw-") or key.startswith("service.inspace.cloud/public-node-local-assigning"))
+        and value not in (None, "")
+    ]
+    require(not pending, f"Service {name} retains unresolved per-VM firewall mutation state: {pending}")
+
+
+def require_vm_firewall_anchor(
+    anchor: dict | None,
+    cluster: str,
+    vm_uuid: str,
+    firewall: dict,
+    policy_hash: str,
+) -> None:
+    require(anchor is not None, f"VM {vm_uuid} has a per-VM firewall but no anchor ConfigMap")
+    metadata = anchor.get("metadata", {})
+    annotations = metadata.get("annotations", {})
+    labels = metadata.get("labels", {})
+    require(
+        metadata.get("name") == VM_ANCHOR_PREFIX + vm_uuid
+        and labels.get(VM_ANCHOR_LABEL) == "true"
+        and labels.get(VM_ANCHOR_CLUSTER_LABEL) == cluster
+        and annotations.get(VM_ANCHOR_VM) == vm_uuid,
+        f"anchor of VM {vm_uuid} lacks its exact name, labels or VM annotation",
+    )
+    require(
+        annotations.get(VM_ANCHOR_UUID) == firewall.get("uuid"),
+        f"anchor of VM {vm_uuid} names a different firewall than the one attached",
+    )
+    require(
+        annotations.get(VM_ANCHOR_APPLIED_HASH) == policy_hash,
+        f"anchor applied-hash of VM {vm_uuid} differs from the live firewall policy hash",
+    )
+    pending = [key for key in VM_ANCHOR_PENDING_KEYS if annotations.get(key)]
+    require(not pending, f"anchor of VM {vm_uuid} retains unresolved mutation state: {pending}")
+
+
+def require_vm_firewalls(
+    cluster: str,
+    vm_uuids: list[str],
+    services: list[dict],
+    firewalls: list[dict],
+    anchors: dict[str, dict | None],
+    billing_account: int,
+) -> list[dict]:
+    """Per-VM mode: exactly one per-VM firewall per VM, matching its anchor.
+
+    ``services`` are the Services published on every one of the VMs. No
+    per-Service firewall of any of them may exist.
+    """
+    expected_keys = expected_vm_rule_keys(services)
+    expected_hash = vm_firewall_policy_hash(expected_keys)
+    proofs = []
+    for vm_uuid in sorted(vm_uuids):
+        name = vm_firewall_name(cluster, vm_uuid)
+        matches = [firewall for firewall in firewalls if effective_name(firewall) == name]
+        require(len(matches) == 1, f"VM {vm_uuid} must have exactly one per-VM firewall, found {len(matches)}")
+        firewall = matches[0]
+        require(
+            firewall.get("billing_account_id") == billing_account
+            and firewall.get("description") in (None, "", VM_FIREWALL_DESCRIPTION),
+            f"per-VM firewall of VM {vm_uuid} has the wrong billing account or description",
+        )
+        assignments = [
+            (str(resource.get("resource_type", "")).lower(), resource.get("resource_uuid"))
+            for resource in firewall.get("resources_assigned", [])
+        ]
+        require(
+            assignments == [("vm", vm_uuid)],
+            f"per-VM firewall of VM {vm_uuid} is not assigned to exactly that VM",
+        )
+        keys = firewall_rule_keys(firewall.get("rules", []))
+        policy_hash = vm_firewall_policy_hash(keys)
+        require(
+            keys == expected_keys and policy_hash == expected_hash,
+            f"per-VM firewall of VM {vm_uuid} does not hold exactly the rules of its Services",
+        )
+        require_vm_firewall_anchor(anchors.get(vm_uuid), cluster, vm_uuid, firewall, policy_hash)
+        proofs.append({"vmUUID": vm_uuid, "uuid": firewall.get("uuid"), "name": name, "hash": policy_hash})
+    for service in services:
+        uid = service.get("metadata", {}).get("uid", "")
+        prefix = f"inlb-{cluster_hash(cluster)}-{uid}-"
+        require(
+            not any(effective_name(firewall).startswith(prefix) for firewall in firewalls),
+            "a per-VM Service still has a per-Service firewall",
+        )
+    return proofs
+
+
+def require_no_vm_firewalls(cluster: str, vm_uuids: list[str], firewalls: list[dict]) -> None:
+    for vm_uuid in vm_uuids:
+        name = vm_firewall_name(cluster, vm_uuid)
+        require(
+            not any(effective_name(firewall) == name for firewall in firewalls),
+            f"per-VM firewall of VM {vm_uuid} remains with no Service on it",
+        )
+
+
+def require_no_per_vm_state(cluster: str, anchors: list[dict], firewalls: list[dict]) -> None:
+    """After a reverse migration no anchor and no per-VM firewall may remain."""
+    names = [item.get("metadata", {}).get("name", "?") for item in anchors]
+    require(not names, f"per-VM anchor ConfigMaps remain in per-Service mode: {names}")
+    prefix = f"inlb-{cluster_hash(cluster)}-vm-"
+    remaining = [effective_name(item) for item in firewalls if effective_name(item).startswith(prefix)]
+    require(not remaining, f"per-VM firewalls remain in per-Service mode: {remaining}")
+
+
+def list_vm_anchors(kubeconfig: str, namespace: str, cluster: str) -> list[dict]:
+    selector = f"{VM_ANCHOR_LABEL}=true,{VM_ANCHOR_CLUSTER_LABEL}={cluster}"
+    listing = kubectl(kubeconfig, "-n", namespace, "get", "configmap", "-l", selector)
+    return [] if listing is None else listing.get("items", [])
+
+
+def vm_anchors(kubeconfig: str, namespace: str, vm_uuids: list[str]) -> dict[str, dict | None]:
+    return {
+        vm_uuid: kubectl(
+            kubeconfig, "-n", namespace, "get", "configmap", VM_ANCHOR_PREFIX + vm_uuid,
+            "--ignore-not-found=true",
+        )
+        for vm_uuid in vm_uuids
+    }
+
+
 def require_service_contract(service: dict, state: dict) -> None:
     metadata = service.get("metadata", {})
     spec = service.get("spec", {})
@@ -800,6 +1027,25 @@ def udp_probe(proof: dict, marker: str) -> list[str]:
     return probed
 
 
+def require_replacement_firewall(old: object, new: object) -> None:
+    """A per-Service firewall follows the Service; a per-VM one follows the VM."""
+    if isinstance(old, dict) and old.get("mode") == MODE_PER_VM:
+        require(
+            isinstance(new, dict) and new.get("mode") == MODE_PER_VM,
+            "edge replacement left the per-VM firewall mode",
+        )
+        old_vms, new_vms = old["vmFirewalls"], new["vmFirewalls"]
+        require(
+            len(old_vms) == 1 and len(new_vms) == 1
+            and old_vms[0]["vmUUID"] != new_vms[0]["vmUUID"]
+            and old_vms[0]["uuid"] != new_vms[0]["uuid"]
+            and old_vms[0]["hash"] == new_vms[0]["hash"],
+            "edge replacement did not move the per-VM firewall to the new VM with the same policy",
+        )
+        return
+    require(new == old, "edge replacement changed the Service-owned firewall identity")
+
+
 def require_replacement(anchor: dict, current: dict) -> None:
     old_nodes = anchor.get("nodes", [])
     new_nodes = current.get("nodes", [])
@@ -818,10 +1064,7 @@ def require_replacement(anchor: dict, current: dict) -> None:
             and old[key] != new[key],
             f"edge replacement retained old {key}",
         )
-    require(
-        current.get("firewall") == anchor.get("firewall"),
-        "edge replacement changed the Service-owned firewall identity",
-    )
+    require_replacement_firewall(anchor.get("firewall"), current.get("firewall"))
 
     active_vms = [item for item in api_get("user-resource/vm/list") if active(item)]
     require(
@@ -839,7 +1082,15 @@ def require_replacement(anchor: dict, current: dict) -> None:
     )
 
 
-def prove_present(state: dict, kubeconfig: str, baseline: dict, probe: bool) -> dict:
+def prove_present(
+    state: dict,
+    kubeconfig: str,
+    baseline: dict,
+    probe: bool,
+    firewall_mode: str = MODE_PER_SERVICE,
+    ccm_namespace: str = "kube-system",
+    extra_services: tuple[str, ...] = (),
+) -> dict:
     require_nlb_baseline(baseline)
     service = kubectl(kubeconfig, "-n", "default", "get", "service", SERVICE_NAME)
     require(service is not None, f"Service/{SERVICE_NAME} is absent")
@@ -861,7 +1112,29 @@ def prove_present(state: dict, kubeconfig: str, baseline: dict, probe: bool) -> 
         state,
         [item["privateIP"] for item in proof_nodes],
     )
-    firewall = service_firewall(service, firewalls, state["clusterName"], vm_uuids, assigned=True)
+    if firewall_mode == MODE_PER_VM:
+        services = [service] + [
+            kubectl(kubeconfig, "-n", "default", "get", "service", extra) for extra in extra_services
+        ]
+        require(all(item is not None for item in services), "a per-VM scenario Service is absent")
+        for item in services:
+            require_per_vm_service(item)
+        vm_proofs = require_vm_firewalls(
+            state["clusterName"],
+            vm_uuids,
+            services,
+            firewalls,
+            vm_anchors(kubeconfig, ccm_namespace, vm_uuids),
+            int(os.environ["INSPACE_BILLING_ACCOUNT_ID"]),
+        )
+        firewall = {"mode": MODE_PER_VM, "vmFirewalls": vm_proofs}
+    else:
+        firewall = service_firewall(service, firewalls, state["clusterName"], vm_uuids, assigned=True)
+        require_no_per_vm_state(
+            state["clusterName"],
+            list_vm_anchors(kubeconfig, ccm_namespace, state["clusterName"]),
+            firewalls,
+        )
     proof = {
         "phase": "present",
         "serviceUID": service["metadata"]["uid"],
@@ -878,7 +1151,13 @@ def prove_present(state: dict, kubeconfig: str, baseline: dict, probe: bool) -> 
     return proof
 
 
-def prove_withdrawn(state: dict, kubeconfig: str, baseline: dict, anchor: dict) -> dict:
+def prove_withdrawn(
+    state: dict,
+    kubeconfig: str,
+    baseline: dict,
+    anchor: dict,
+    firewall_mode: str = MODE_PER_SERVICE,
+) -> dict:
     require_nlb_baseline(baseline)
     service = kubectl(kubeconfig, "-n", "default", "get", "service", SERVICE_NAME)
     require(service is not None, f"Service/{SERVICE_NAME} is absent during endpoint withdrawal")
@@ -888,7 +1167,11 @@ def prove_withdrawn(state: dict, kubeconfig: str, baseline: dict, anchor: dict) 
     require(ready_endpoint_nodes(kubeconfig) == [], "Service retained a Ready local endpoint after scale-to-zero")
     nodes, claims = require_capacity_objects(state, kubeconfig, expect_ready_pods=False)
     proof_nodes, firewalls, vm_uuids = cloud_capacity(state, nodes, claims, require_service_firewall=False)
-    service_firewall(service, firewalls, state["clusterName"], vm_uuids, assigned=False)
+    if firewall_mode == MODE_PER_VM:
+        require_per_vm_service(service)
+        require_no_vm_firewalls(state["clusterName"], vm_uuids, firewalls)
+    else:
+        service_firewall(service, firewalls, state["clusterName"], vm_uuids, assigned=False)
     require(
         [{key: item[key] for key in ("node", "nodeClaim", "vmUUID", "privateIP", "publicIP", "fipName")} for item in proof_nodes]
         == [{key: item[key] for key in ("node", "nodeClaim", "vmUUID", "privateIP", "publicIP", "fipName")} for item in anchor["nodes"]],
@@ -904,7 +1187,13 @@ def service_firewall_prefix(state: dict) -> str:
     return f"inlb-{cluster_hash}-{uid}-"
 
 
-def prove_service_absent(state: dict, kubeconfig: str, baseline: dict, anchor: dict | None) -> dict:
+def prove_service_absent(
+    state: dict,
+    kubeconfig: str,
+    baseline: dict,
+    anchor: dict | None,
+    firewall_mode: str = MODE_PER_SERVICE,
+) -> dict:
     require_nlb_baseline(baseline)
     service = kubectl(kubeconfig, "-n", "default", "get", "service", SERVICE_NAME, "--ignore-not-found=true")
     require(service is None, f"Service/{SERVICE_NAME} still exists")
@@ -918,7 +1207,9 @@ def prove_service_absent(state: dict, kubeconfig: str, baseline: dict, anchor: d
         "public-local Service firewall remains after Service deletion",
     )
     nodes, claims = require_capacity_objects(state, kubeconfig, expect_ready_pods=True)
-    proof_nodes, _, _ = cloud_capacity(state, nodes, claims, require_service_firewall=False)
+    proof_nodes, active_firewalls, vm_uuids = cloud_capacity(state, nodes, claims, require_service_firewall=False)
+    if firewall_mode == MODE_PER_VM:
+        require_no_vm_firewalls(state["clusterName"], vm_uuids, active_firewalls)
     if anchor is not None:
         stable_keys = ("node", "nodeClaim", "vmUUID", "privateIP", "publicIP", "fipName")
         require(
@@ -929,7 +1220,12 @@ def prove_service_absent(state: dict, kubeconfig: str, baseline: dict, anchor: d
     return {"phase": "service-absent", "nodes": proof_nodes}
 
 
-def prove_absent(state: dict, kubeconfig: str, baseline: dict) -> dict:
+def prove_absent(
+    state: dict,
+    kubeconfig: str,
+    baseline: dict,
+    firewall_mode: str = MODE_PER_SERVICE,
+) -> dict:
     require_nlb_baseline(baseline)
     uid = state.get("publicLocalServiceUID", "")
     require(isinstance(uid, str) and uid, "ownership journal lacks the public-local Service UID")
@@ -969,6 +1265,12 @@ def prove_absent(state: dict, kubeconfig: str, baseline: dict) -> dict:
         not any(active(item) and effective_name(item).startswith(prefix) for item in api_get("network/firewalls")),
         "public-local Service firewall remains after complete cleanup",
     )
+    if firewall_mode == MODE_PER_VM:
+        per_vm_prefix = f"inlb-{cluster_hash(cluster)}-vm-"
+        require(
+            not any(active(item) and effective_name(item).startswith(per_vm_prefix) for item in api_get("network/firewalls")),
+            "a per-VM firewall remains after complete cleanup",
+        )
     return {"phase": "absent"}
 
 
@@ -984,6 +1286,23 @@ def main() -> None:
     )
     parser.add_argument("--anchor")
     parser.add_argument("--probe-public", action="store_true")
+    parser.add_argument(
+        "--firewall-mode",
+        choices=(MODE_PER_SERVICE, MODE_PER_VM),
+        default=MODE_PER_SERVICE,
+        help="how the CCM holds the edge firewall: one per Service or one per VM",
+    )
+    parser.add_argument(
+        "--ccm-namespace",
+        default="kube-system",
+        help="namespace of the per-VM anchor ConfigMaps (the CCM namespace)",
+    )
+    parser.add_argument(
+        "--extra-service",
+        action="append",
+        default=[],
+        help="another Service on the same edge VM that the per-VM firewall must also hold",
+    )
     args = parser.parse_args()
 
     state = read_state(pathlib.Path(args.state))
@@ -994,7 +1313,10 @@ def main() -> None:
         require(isinstance(anchor, dict) and anchor.get("phase") == "present", "public-local anchor is invalid")
 
     if args.expect == "present":
-        result = prove_present(state, args.kubeconfig, baseline, args.probe_public)
+        result = prove_present(
+            state, args.kubeconfig, baseline, args.probe_public,
+            args.firewall_mode, args.ccm_namespace, tuple(args.extra_service),
+        )
         if anchor is not None:
             require_replacement(anchor, result)
             result["replacementOf"] = anchor["nodes"][0]["nodeClaim"]
@@ -1006,11 +1328,11 @@ def main() -> None:
         )
     elif args.expect == "withdrawn":
         require(anchor is not None, "withdrawn proof requires --anchor")
-        result = prove_withdrawn(state, args.kubeconfig, baseline, anchor)
+        result = prove_withdrawn(state, args.kubeconfig, baseline, anchor, args.firewall_mode)
     elif args.expect == "service-absent":
-        result = prove_service_absent(state, args.kubeconfig, baseline, anchor)
+        result = prove_service_absent(state, args.kubeconfig, baseline, anchor, args.firewall_mode)
     else:
-        result = prove_absent(state, args.kubeconfig, baseline)
+        result = prove_absent(state, args.kubeconfig, baseline, args.firewall_mode)
     print(json.dumps(result, sort_keys=True))
 
 
