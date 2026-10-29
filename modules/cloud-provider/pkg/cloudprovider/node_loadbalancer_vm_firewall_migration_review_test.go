@@ -206,6 +206,39 @@ func TestVMFirewallMigrationDeletingTheAdopteeServiceFinishesSafely(t *testing.T
 	}
 }
 
+// Without the perVM mode (a rollback before the reverse migration exists) nobody
+// can take the entry of a Service off the per-VM firewall, so deleting the
+// Service whose firewall was adopted holds fail-closed instead of finalizing it
+// with its port still open.
+func TestVMFirewallMigrationDeletingTheAdopteeServiceHoldsInPerServiceMode(t *testing.T) {
+	m := newRelayMigrationCluster(t, VMFirewallMigrationManual)
+	m.annotateNode(mgRelay.name, "true")
+	m.runUntil(300, "the adopt landed", func() bool { return m.perVMFirewall(mgRelay) != nil })
+	m.provider.config.NodeLoadBalancer.LocalFirewallMode = PublicNodeLocalFirewallModePerService
+	m.restart()
+
+	svc := m.service("relay-prod")
+	now := metav1.Now()
+	svc.DeletionTimestamp = &now
+	if _, err := m.kube.CoreV1().Services(svc.Namespace).Update(m.ctx, svc, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	var last error
+	for pass := 0; pass < 30; pass++ {
+		m.clock = m.clock.Add(7 * time.Second)
+		last = m.controller.syncPublicNodeLocal(m.ctx, m.key("relay-prod"), m.service("relay-prod"))
+	}
+	if last == nil || !strings.Contains(last.Error(), "lost deterministic Service identity") {
+		t.Fatalf("deletion pass = %v, want the fail-closed identity hold", last)
+	}
+	if !containsString(m.service("relay-prod").Finalizers, publicNodeLocalFinalizer) {
+		t.Fatal("the Service was finalized with its port still open")
+	}
+	if perVM := m.perVMFirewall(mgRelay); perVM == nil || !rulePorts(perVM)[1935] || !vmFirewallAttachedTo(*perVM, mgRelay.uuid) {
+		t.Fatal("the per-VM firewall no longer serves 1935")
+	}
+}
+
 // L3: an abort takes an entry off the per-VM firewall only when its Service is
 // gone or its own firewall is still on the VM to cover it.
 func TestVMFirewallMigrationAbortKeepsAnEntryNothingElseCovers(t *testing.T) {
