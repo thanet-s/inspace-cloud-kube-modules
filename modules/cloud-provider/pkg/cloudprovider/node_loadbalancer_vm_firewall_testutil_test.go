@@ -2,6 +2,7 @@ package cloudprovider
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -13,6 +14,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	kubefake "k8s.io/client-go/kubernetes/fake"
 	kubetesting "k8s.io/client-go/testing"
+	"k8s.io/client-go/util/workqueue"
 
 	inspace "github.com/thanet-s/inspace-cloud-kube-modules/modules/client"
 )
@@ -370,4 +372,101 @@ func (f *vmFirewallFixture) addForeignFirewall(vmUUID string, index int) {
 // firewallCount is how many firewalls are attached to vmUUID in the fake cloud.
 func (f *vmFirewallFixture) firewallCount(vmUUID string) int {
 	return f.gate.countPerVM(f.ctx)[vmUUID]
+}
+
+// newPerVMPublicNodeLocalFixture is newPublishedPublicNodeLocalFixtureN on the
+// per-VM firewall mode: the namespace of the anchors is set, the settle delay
+// is as short as the clock allows, every VM carries the base firewall, and the
+// provider API refuses an attach beyond the firewall limit and records the most
+// firewalls any VM ever carried. The Service is published on n Nodes.
+func newPerVMPublicNodeLocalFixture(t *testing.T, n int) *publicNodeLocalTransientFixture {
+	return newPerVMPublicNodeLocalFixtureWith(t, n, nil)
+}
+
+func newPerVMPublicNodeLocalFixtureWith(t *testing.T, n int, shape func(*corev1.Service)) *publicNodeLocalTransientFixture {
+	t.Helper()
+	f := buildPerVMPublicNodeLocalFixture(t, n, shape)
+	for attempt := 0; attempt < 200; attempt++ {
+		err := f.controller.syncPublicNodeLocal(f.ctx, f.key, f.current(t))
+		var settling *errPublicNodeLocalVMFirewallSettling
+		var pending *nodeLoadBalancerFirewallRelationPendingError
+		var holding *errPublicNodeLocalHolding
+		if err != nil && !errors.As(err, &settling) && !errors.As(err, &pending) && !errors.As(err, &holding) {
+			t.Fatalf("publish reconcile %d: %v", attempt, err)
+		}
+		current := f.current(t)
+		if len(current.Status.LoadBalancer.Ingress) == n && !publicNodeLocalAssignmentFencePresent(current) {
+			return f
+		}
+	}
+	t.Fatalf("per-VM fixture did not publish: %#v", f.current(t).Annotations)
+	return nil
+}
+
+// buildPerVMPublicNodeLocalFixture builds the fixture without running a pass.
+func buildPerVMPublicNodeLocalFixture(t *testing.T, n int, shape func(*corev1.Service)) *publicNodeLocalTransientFixture {
+	t.Helper()
+	service := publicNodeLocalTestService("edge", "edge-service-uid", "edge", corev1.ProtocolTCP, 443)
+	if shape != nil {
+		shape(service)
+	}
+	api := &fakeAPI{}
+	objects := []runtime.Object{service.DeepCopy()}
+	nodeNames := make([]string, 0, n)
+	base := publicNodeLocalTestBaseFirewall("")
+	base.ResourcesAssigned = nil
+	for i := 0; i < n; i++ {
+		name, vmUUID, privateIP, publicIP := publicNodeLocalFixtureNode(i)
+		node := publicNodeLocalTestNode(name, vmUUID, privateIP, publicIP)
+		api.vms = append(api.vms, inspace.VM{UUID: vmUUID, Name: node.Name, Hostname: node.Name, Status: "running", PrivateIPv4: privateIP, BillingAccountID: 42, NetworkUUID: testNetworkUUID})
+		api.floatingIPs = append(api.floatingIPs, inspace.FloatingIP{
+			Address: publicIP, BillingAccountID: 42, Type: "public", Enabled: true,
+			AssignedTo: vmUUID, AssignedToResourceType: "virtual_machine", AssignedToPrivateIP: privateIP,
+		})
+		base.ResourcesAssigned = append(base.ResourcesAssigned, inspace.FirewallResource{ResourceType: "vm", ResourceUUID: vmUUID})
+		objects = append(objects, node.DeepCopy())
+		nodeNames = append(nodeNames, name)
+	}
+	api.firewalls = append(api.firewalls, base)
+	gate := &limitEnforcingFirewallAPI{API: &publicNodeLocalFilteringIPAPI{fakeAPI: api}}
+	provider := newTestProvider(t, gate)
+	kube := kubefake.NewSimpleClientset(objects...)
+	// The fake apiserver does not assign UIDs; the real one does.
+	kube.PrependReactor("create", "configmaps", func(action kubetesting.Action) (bool, runtime.Object, error) {
+		if create, ok := action.(kubetesting.CreateAction); ok {
+			if cm, ok := create.GetObject().(*corev1.ConfigMap); ok && cm.UID == "" {
+				cm.UID = types.UID("uid-" + cm.Name)
+			}
+		}
+		return false, nil, nil
+	})
+	provider.kubeClient = kube
+	provider.config.NodeLoadBalancer.LocalFirewallMode = PublicNodeLocalFirewallModePerVM
+	provider.config.NodeLoadBalancer.ControllerNamespace = vmTestNamespace
+	provider.config.NodeLoadBalancer.VMFirewallSettle = time.Nanosecond
+	controller := &nodeLoadBalancerController{
+		provider: provider,
+		queue:    workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]()),
+	}
+	t.Cleanup(controller.queue.ShutDown)
+	controller.endpointSlices = publicNodeLocalTestEndpointSliceLister(t, service, nodeNames...)
+	return &publicNodeLocalTransientFixture{
+		ctx: context.Background(), api: api, provider: provider, controller: controller,
+		service: service, key: service.Namespace + "/" + service.Name, endpointNodes: nodeNames,
+		gate: gate,
+	}
+}
+
+// vmFirewallsOfVM lists the firewalls attached to vmUUID in the fake cloud.
+func vmFirewallsOfVM(f *publicNodeLocalTransientFixture, vmUUID string) []inspace.Firewall {
+	var out []inspace.Firewall
+	for _, firewall := range f.api.firewalls {
+		for _, row := range firewall.ResourcesAssigned {
+			if strings.EqualFold(row.ResourceType, "vm") && strings.EqualFold(row.ResourceUUID, vmUUID) {
+				out = append(out, firewall)
+				break
+			}
+		}
+	}
+	return out
 }

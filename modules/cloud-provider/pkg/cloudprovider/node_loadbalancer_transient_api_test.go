@@ -166,6 +166,9 @@ type publicNodeLocalTransientFixture struct {
 	service       *corev1.Service
 	key           string
 	endpointNodes []string
+	// gate is set by the per-VM fixtures: the firewall limit and the peak
+	// number of firewalls any VM carried.
+	gate *limitEnforcingFirewallAPI
 }
 
 func newPublishedPublicNodeLocalFixture(t *testing.T) *publicNodeLocalTransientFixture {

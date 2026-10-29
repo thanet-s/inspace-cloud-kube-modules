@@ -88,7 +88,7 @@ func (c *nodeLoadBalancerController) syncPendingPublicNodeLocalTransition(
 	if refusal != nil {
 		reason, cause = publicNodeLocalReasonTransitionRefused, refusal
 	}
-	if refusal == nil && service.Annotations[annotationNodeLoadBalancerPreviousFirewall] == "" &&
+	if refusal == nil && !publicNodeLocalOldEdgePending(service) &&
 		!publicNodeLocalAssignmentFencePresent(service) {
 		started, startErr := c.startPublicNodeLocalTransition(ctx, service, intent, desired)
 		if startErr != nil {
@@ -327,10 +327,10 @@ func (c *nodeLoadBalancerController) finishPreviousPublicNodeLocalFirewall(
 	keep map[string]struct{},
 	members map[string]publicNodeLocalMember,
 ) (bool, error) {
-	if service.Annotations[annotationNodeLoadBalancerPreviousFirewall] == "" {
+	if !publicNodeLocalOldEdgePending(service) {
 		return false, nil
 	}
-	if previous.snapshot != nil {
+	if previous.known() {
 		stay := map[string]struct{}{}
 		var stayNodes []*corev1.Node
 		for name := range keep {
@@ -343,7 +343,7 @@ func (c *nodeLoadBalancerController) finishPreviousPublicNodeLocalFirewall(
 				stayNodes = append(stayNodes, member.node)
 			}
 		}
-		stale, err := staleNodeLoadBalancerFirewallAssignments(*previous.snapshot, stay)
+		stale, err := previous.stale(stay)
 		if err != nil {
 			return true, c.holdOrFailPublicNodeLocal(ctx, service, err)
 		}
@@ -352,7 +352,7 @@ func (c *nodeLoadBalancerController) finishPreviousPublicNodeLocalFirewall(
 			if err != nil {
 				return true, c.holdOrFailPublicNodeLocal(ctx, service, err)
 			}
-			if len(parked) != 0 {
+			if len(parked) != 0 && !previous.perVM {
 				if err := c.unparkPublicNodeLocalUnassign(ctx, service, previous.firewallUUID, parked); err != nil {
 					return true, c.holdOrFailPublicNodeLocal(ctx, service, err)
 				}
@@ -493,7 +493,7 @@ func publicNodeLocalTransition(service *corev1.Service) (publicNodeLocalTransiti
 	switch {
 	case state.ActivePool == "":
 		state.Phase = publicNodeLocalPhaseInactive
-	case service.Annotations[annotationNodeLoadBalancerPreviousFirewall] != "":
+	case publicNodeLocalOldEdgePending(service):
 		state.Phase = publicNodeLocalPhasePromoted
 	default:
 		state.Phase = publicNodeLocalPhaseSteady
@@ -593,7 +593,7 @@ func (c *nodeLoadBalancerController) startPublicNodeLocalTransition(
 			copy.Annotations[annotationPublicNodeLocalActivePolicy] != activePolicy ||
 			copy.Annotations[annotationPublicNodeLocalTargetPool] != "" ||
 			copy.Annotations[annotationPublicNodeLocalTargetPolicy] != "" ||
-			copy.Annotations[annotationNodeLoadBalancerPreviousFirewall] != "" ||
+			publicNodeLocalOldEdgePending(copy) ||
 			publicNodeLocalAssignmentFencePresent(copy) {
 			return false, errors.Join(errors.New("public-node-local: the Service changed before the transition could start"), parseErr, desiredErr)
 		}
@@ -614,10 +614,12 @@ func (c *nodeLoadBalancerController) promotePublicNodeLocalTransition(
 	targetPool, targetPolicy, firewallUUID string,
 ) error {
 	_, _, err := c.updateExactParentService(ctx, service, func(copy *corev1.Service) (bool, error) {
+		perVM := publicNodeLocalServicePerVM(copy)
 		if copy.Annotations[annotationPublicNodeLocalTargetPool] != targetPool ||
 			copy.Annotations[annotationPublicNodeLocalTargetPolicy] != targetPolicy ||
-			copy.Annotations[annotationNodeLoadBalancerFirewallUUID] != firewallUUID ||
-			copy.Annotations[annotationNodeLoadBalancerFirewallHash] != targetPolicy ||
+			(!perVM && (copy.Annotations[annotationNodeLoadBalancerFirewallUUID] != firewallUUID ||
+				copy.Annotations[annotationNodeLoadBalancerFirewallHash] != targetPolicy)) ||
+			(perVM && (copy.Annotations[annotationNodeLoadBalancerFirewallUUID] != "" || copy.Annotations[annotationNodeLoadBalancerFirewallHash] != "")) ||
 			publicNodeLocalAssignmentFencePresent(copy) {
 			return false, errors.New("public-node-local: the transition changed before promotion")
 		}
@@ -628,13 +630,16 @@ func (c *nodeLoadBalancerController) promotePublicNodeLocalTransition(
 		if parseErr != nil || desiredErr != nil || liveIntent.Pool != targetPool || liveDesired.Hash != targetPolicy {
 			return false, errors.Join(errors.New("public-node-local: the live Service is no longer the target at promotion"), parseErr, desiredErr)
 		}
+		oldPolicy := copy.Annotations[annotationPublicNodeLocalActivePolicy]
 		copy.Annotations[annotationPublicNodeLocalActivePool] = targetPool
 		copy.Annotations[annotationPublicNodeLocalActivePolicy] = targetPolicy
 		setPublicNodeLocalActivePorts(copy)
 		delete(copy.Annotations, annotationPublicNodeLocalTargetPool)
 		delete(copy.Annotations, annotationPublicNodeLocalTargetPolicy)
 		delete(copy.Annotations, annotationPublicNodeLocalTargetSince)
-		if copy.Annotations[annotationNodeLoadBalancerPreviousFirewall] != "" {
+		// A per-VM Service has no previous firewall. Its old policy entries are the
+		// tail, marked here until the last one is retired.
+		if copy.Annotations[annotationNodeLoadBalancerPreviousFirewall] != "" || (perVM && oldPolicy != targetPolicy) {
 			copy.Annotations[annotationPublicNodeLocalPromotedAt] = c.publicNodeLocalClock().Format(time.RFC3339)
 		}
 		return true, nil
@@ -665,7 +670,8 @@ func (c *nodeLoadBalancerController) abortPublicNodeLocalTransition(
 	var restore *inspace.Firewall
 	ledgerPolicy := service.Annotations[annotationNodeLoadBalancerFirewallHash]
 	previousUUID := service.Annotations[annotationNodeLoadBalancerPreviousFirewall]
-	if ledgerPolicy != state.ActivePolicy {
+	perVM := publicNodeLocalServicePerVM(service)
+	if !perVM && ledgerPolicy != state.ActivePolicy {
 		// The ledger already moved to the target firewall. Only the exact previous
 		// firewall, proven to carry the active policy, may take it back.
 		if previousUUID == "" {
@@ -705,6 +711,11 @@ func (c *nodeLoadBalancerController) abortPublicNodeLocalTransition(
 		delete(copy.Annotations, annotationPublicNodeLocalTargetPool)
 		delete(copy.Annotations, annotationPublicNodeLocalTargetPolicy)
 		delete(copy.Annotations, annotationPublicNodeLocalTargetSince)
+		if perVM && state.TargetPolicy != state.ActivePolicy {
+			// The target's entries are the old policy now: the tail retires them
+			// once the active policy is open wherever they stand.
+			copy.Annotations[annotationPublicNodeLocalPromotedAt] = c.publicNodeLocalClock().Format(time.RFC3339)
+		}
 		if restore != nil {
 			// The assignment intent named the target firewall, which is retired now.
 			// Nothing is assigned under it any more; a stale receipt is resolved by
@@ -714,6 +725,7 @@ func (c *nodeLoadBalancerController) abortPublicNodeLocalTransition(
 				annotationNodeLoadBalancerFirewallAssignAt,
 				annotationPublicNodeLocalAssignPolicy,
 				annotationPublicNodeLocalAssignVMs,
+				annotationPublicNodeLocalAssignEdge,
 			} {
 				delete(copy.Annotations, fenceKey)
 			}
