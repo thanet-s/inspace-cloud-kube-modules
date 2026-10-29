@@ -450,11 +450,13 @@ func buildPerVMPublicNodeLocalFixture(t *testing.T, n int, shape func(*corev1.Se
 	}
 	t.Cleanup(controller.queue.ShutDown)
 	controller.endpointSlices = publicNodeLocalTestEndpointSliceLister(t, service, nodeNames...)
-	return &publicNodeLocalTransientFixture{
+	fixture := &publicNodeLocalTransientFixture{
 		ctx: context.Background(), api: api, provider: provider, controller: controller,
 		service: service, key: service.Namespace + "/" + service.Name, endpointNodes: nodeNames,
 		gate: gate,
 	}
+	fixture.requireGateClean(t)
+	return fixture
 }
 
 // edgeAllows is the effective inbound allow set of a VM: for every
@@ -518,39 +520,37 @@ func (a edgeAllowSet) covers(rule inspace.FirewallRule) bool {
 	return true
 }
 
-// activeServiceRules are the rules of the policy a Service serves right now,
-// from whichever edge holds it: the per-VM ledgers, or the per-Service firewall
-// whose rules hash to the active policy.
-func activeServiceRules(f *publicNodeLocalTransientFixture, service *corev1.Service) []inspace.FirewallRule {
-	policy := service.Annotations[annotationPublicNodeLocalActivePolicy]
-	if policy == "" {
-		return nil
-	}
+// servicePolicyRules lists, one entry per policy, the rules the edge holds for a
+// Service: the ledger entries on the VM anchors, or the Service firewalls.
+func servicePolicyRules(f *publicNodeLocalTransientFixture, service *corev1.Service) [][]inspace.FirewallRule {
+	var policies [][]inspace.FirewallRule
 	if publicNodeLocalServicePerVM(service) {
 		anchors, err := f.controller.listVMFirewallAnchors(f.ctx)
 		if err != nil {
 			return nil
 		}
+		seen := map[vmFirewallMemberKey]bool{}
 		for index := range anchors {
 			ledger, err := (vmFirewallAnchorView{cm: &anchors[index]}).applied()
 			if err != nil {
 				continue
 			}
-			if member, found := ledger.find(vmFirewallMemberKey{UID: string(service.UID), Policy: policy}); found {
-				return vmFirewallMemberFirewallRules(member)
+			for _, member := range ledger.Members {
+				if member.UID == string(service.UID) && !seen[member.key()] {
+					seen[member.key()] = true
+					policies = append(policies, vmFirewallMemberFirewallRules(member))
+				}
 			}
 		}
-		return nil
+		return policies
 	}
+	prefix := nodeLoadBalancerFirewallServicePrefix(f.provider.config.ClusterID, string(service.UID))
 	for _, firewall := range f.api.firewalls {
-		if !strings.HasPrefix(firewall.EffectiveName(), nodeLoadBalancerFirewallServicePrefix(f.provider.config.ClusterID, string(service.UID))) {
-			continue
-		}
-		if hash, err := nodeLoadBalancerFirewallSpecHash(firewall.Rules); err == nil && hash == policy {
-			return firewall.Rules
+		if strings.HasPrefix(firewall.EffectiveName(), prefix) {
+			policies = append(policies, firewall.Rules)
 		}
 	}
-	return nil
+	return policies
 }
 
 // requireVMEdgeSafe is the invariant every pass of every scenario keeps, on
@@ -590,23 +590,28 @@ func requireVMEdgeSafe(t *testing.T, f *publicNodeLocalTransientFixture, service
 		if err != nil {
 			continue
 		}
-		required := activeServiceRules(f, service)
-		if service.DeletionTimestamp != nil || service.Annotations[annotationNodeLoadBalancerRebuilding] != "" {
-			// A withdrawal closes the firewall first and clears the status after the
-			// readback, by design: the FIP is allowed to outlive its rules.
-			required = nil
-		}
+		policies := servicePolicyRules(f, service)
+		withdrawing := service.DeletionTimestamp != nil || service.Annotations[annotationNodeLoadBalancerRebuilding] != ""
 		for _, ingress := range service.Status.LoadBalancer.Ingress {
 			vmUUID, known := vmOfPublic[ingress.IP]
 			if !known {
 				continue
 			}
+			// A published VM carries at least one whole policy of its Service: the
+			// active one, the target one while the union runs, or the old one while it
+			// is retired. A withdrawal closes the firewall first, by design.
 			allow := edgeAllowOf(vmFirewallsOfVM(f, vmUUID))
-			for _, rule := range required {
-				if !allow.covers(rule) {
-					t.Fatalf("FIP %s on VM %s is published but its firewalls do not allow %s from %v: %#v",
-						ingress.IP, vmUUID, rule.Protocol, rule.EndpointSpec, vmFirewallsOfVM(f, vmUUID))
+			covered := withdrawing || len(policies) == 0
+			for _, rules := range policies {
+				whole := true
+				for _, rule := range rules {
+					whole = whole && allow.covers(rule)
 				}
+				covered = covered || whole
+			}
+			if !covered {
+				t.Fatalf("FIP %s on VM %s is published but its firewalls cover no whole policy of the Service %d: %#v",
+					ingress.IP, vmUUID, len(policies), vmFirewallsOfVM(f, vmUUID))
 			}
 		}
 		var child *corev1.Service
@@ -636,6 +641,10 @@ func requireVMEdgeSafe(t *testing.T, f *publicNodeLocalTransientFixture, service
 				continue
 			}
 			vips := publicNodeLocalIngressSet(child.Status.LoadBalancer)
+			if len(vips) == 0 {
+				// A child that was lost and recreated is being repaired from the edge.
+				continue
+			}
 			for _, row := range firewall.ResourcesAssigned {
 				if private := privateOfVM[row.ResourceUUID]; private != "" {
 					if _, has := vips[private]; !has {
@@ -669,6 +678,85 @@ func requireSteadyFirewallCount(t *testing.T, f *publicNodeLocalTransientFixture
 		if got := len(vmFirewallsOfVM(f, vmUUID)); got != want {
 			t.Fatalf("VM %d carries %d firewalls, want %d: %#v", index, got, want, vmFirewallsOfVM(f, vmUUID))
 		}
+	}
+}
+
+// perVMEntryPolicies is how many policies of the Service the anchor of vmUUID
+// lists.
+func perVMEntryPolicies(t *testing.T, f *publicNodeLocalTransientFixture, service *corev1.Service, vmUUID string) int {
+	t.Helper()
+	anchor, err := f.controller.getVMFirewallAnchor(f.ctx, vmUUID)
+	if err != nil || anchor == nil {
+		return 0
+	}
+	return len((vmFirewallAnchorView{cm: anchor}).memberKeys(string(service.UID)))
+}
+
+// perVMFixtureBaseFirewallUUID is the base firewall every VM of a gated fixture
+// carries, so a steady VM shows the two firewalls of production.
+const perVMFixtureBaseFirewallUUID = "22222222-2222-4222-8222-222222222222"
+
+// publicNodeLocalTestMode is the firewall mode the shared fixtures run in. The
+// dual-mode scenario test sets it for the length of one scenario.
+var publicNodeLocalTestMode = PublicNodeLocalFirewallModePerService
+
+// publicNodeLocalTestGated makes the per-Service fixtures carry the base
+// firewall and the firewall limit gate too, so the same invariant runs on both
+// modes. Only the dual-mode scenario test sets it.
+var publicNodeLocalTestGated = false
+
+// gateFixture gives a built fixture the base firewall on every VM and a
+// provider API that enforces the firewall limit and records the peak count. A
+// scenario that ever drove a VM past the limit, or tried to, fails when it ends.
+func (f *publicNodeLocalTransientFixture) gateFixture(t *testing.T) {
+	t.Helper()
+	if f.gate != nil {
+		return
+	}
+	inner := f.provider.api
+	if inner == API(f.api) {
+		inner = &publicNodeLocalFilteringIPAPI{fakeAPI: f.api}
+	}
+	f.gate = &limitEnforcingFirewallAPI{API: inner}
+	f.provider.api = f.gate
+	base := publicNodeLocalTestBaseFirewall("")
+	base.ResourcesAssigned = nil
+	for _, vm := range f.api.vms {
+		base.ResourcesAssigned = append(base.ResourcesAssigned, inspaceVMResource(vm.UUID))
+	}
+	f.api.firewalls = append(f.api.firewalls, base)
+	f.requireGateClean(t)
+}
+
+// requireGateClean registers the end-of-scenario check of the firewall limit.
+func (f *publicNodeLocalTransientFixture) requireGateClean(t *testing.T) {
+	t.Cleanup(func() {
+		limit := f.gate.limit
+		if limit < 1 {
+			limit = int(DefaultMaxFirewallsPerVM)
+		}
+		if f.gate.maxObservedFirewallsPerVM > limit {
+			t.Errorf("a VM carried %d firewalls, limit %d", f.gate.maxObservedFirewallsPerVM, limit)
+		}
+		if f.gate.refusedAttaches != 0 {
+			t.Errorf("%d attaches ran into the firewall limit: the controller must never try one", f.gate.refusedAttaches)
+		}
+	})
+}
+
+// attachFixtureBaseFirewall puts the base firewall on a VM added to a fixture
+// that has one, as Karpenter does when it creates the VM.
+func (f *publicNodeLocalTransientFixture) attachFixtureBaseFirewall(vmUUID string) {
+	for index := range f.api.firewalls {
+		if f.api.firewalls[index].UUID != perVMFixtureBaseFirewallUUID {
+			continue
+		}
+		for _, row := range f.api.firewalls[index].ResourcesAssigned {
+			if row.ResourceUUID == vmUUID {
+				return
+			}
+		}
+		f.api.firewalls[index].ResourcesAssigned = append(f.api.firewalls[index].ResourcesAssigned, inspaceVMResource(vmUUID))
 	}
 }
 

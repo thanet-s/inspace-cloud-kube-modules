@@ -448,6 +448,10 @@ func observePublicNodeLocal(t *testing.T, f *publicNodeLocalTransientFixture) pu
 		observed.vips[ingress.IP] = true
 	}
 	for _, firewall := range f.api.firewalls {
+		if firewall.UUID == perVMFixtureBaseFirewallUUID {
+			// The base firewall is on every VM and says nothing about the Service.
+			continue
+		}
 		for _, resource := range firewall.ResourcesAssigned {
 			observed.assigned[resource.ResourceUUID] = true
 		}
@@ -493,6 +497,7 @@ func (f *publicNodeLocalTransientFixture) addNode(t *testing.T, index int) {
 	if _, err := f.provider.kubeClient.CoreV1().Nodes().Create(f.ctx, node, metav1.CreateOptions{}); err != nil {
 		t.Fatal(err)
 	}
+	f.attachFixtureBaseFirewall(vmUUID)
 	f.setEndpoints(t, append(append([]string(nil), f.endpointNodes...), name)...)
 }
 

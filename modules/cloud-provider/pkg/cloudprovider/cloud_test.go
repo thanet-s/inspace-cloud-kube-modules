@@ -1659,6 +1659,7 @@ type fakeAPI struct {
 	deletedIPs                     []string
 	createdFirewalls               []inspace.CreateFirewallRequest
 	firewallSequence               int
+	ruleSequence                   int
 	createFirewallErr              error
 	updatedFirewalls               []inspace.UpdateFirewallRequest
 	updateFirewallErr              error
@@ -1934,7 +1935,9 @@ func (f *fakeAPI) UpdateFirewall(_ context.Context, _, uuid string, request insp
 		rules := append([]inspace.FirewallRule(nil), request.Rules...)
 		for index := range rules {
 			if rules[index].UUID == "" {
-				rules[index].UUID = fmt.Sprintf("20000000-0000-4000-8000-%012d", index+1)
+				// The provider issues a new UUID for every new rule, never a repeat.
+				f.ruleSequence++
+				rules[index].UUID = fmt.Sprintf("20000000-0000-4000-8000-%012d", f.ruleSequence)
 			}
 		}
 		f.firewalls[i].Rules = rules

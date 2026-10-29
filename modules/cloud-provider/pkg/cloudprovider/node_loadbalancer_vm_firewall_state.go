@@ -1211,6 +1211,11 @@ func (c *nodeLoadBalancerController) vmEdgeAssigned(
 			continue // a corrupt anchor holds its VM: the Service is not open there
 		}
 		_, inApplied := applied.find(key)
+		if view.pendingOp() == string(vmFirewallOpDelete) {
+			// The firewall of this VM is being deleted: nobody is open on it, and the
+			// delete is the VM pass's, so it is no ambiguity for a Service to plan around.
+			continue
+		}
 		if view.hasReceipt() {
 			concerns := inApplied
 			if pending, pendingErr := view.pending(); pendingErr == nil {

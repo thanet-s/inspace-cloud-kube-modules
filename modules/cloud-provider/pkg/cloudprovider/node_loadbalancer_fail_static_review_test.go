@@ -368,6 +368,11 @@ func TestPublicNodeLocalFullWithdrawNeedsSpacedConfirmationFromCloudOnlyEvidence
 		if err != nil && !errors.As(err, &holding) && strings.Contains(err.Error(), "failing closed") {
 			return
 		}
+		// A per-VM firewall is deleted by the transaction, whose relation fence
+		// refuses the same way and holds the Service.
+		if err != nil && publicNodeLocalServicePerVM(f.current(t)) && strings.Contains(err.Error(), "lacks unique exact GET/list/VPC identity") {
+			return
+		}
 		if current := f.current(t); len(current.Status.LoadBalancer.Ingress) == 0 &&
 			current.Annotations[annotationPublicNodeLocalActivePool] == "" {
 			return
@@ -592,6 +597,9 @@ func runPublicNodeLocalPasses(t *testing.T, f *publicNodeLocalTransientFixture, 
 		waiting := err != nil && strings.Contains(err.Error(), "waiting for exact Service firewall detachment readback")
 		if err != nil && !errors.As(err, &holding) && !errors.As(err, &pending) && !waiting {
 			t.Fatalf("pass %d: %v", pass, err)
+		}
+		if f.gate != nil {
+			requireVMEdgeSafe(t, f)
 		}
 		if stop != nil && stop() {
 			return
@@ -1059,6 +1067,9 @@ func moveFixtureNodeToPool(t *testing.T, f *publicNodeLocalTransientFixture, ind
 // a firewall and a child VIP.
 func requireTransitionEdgeSafe(t *testing.T, f *publicNodeLocalTransientFixture, pass int, nodes ...int) publicNodeLocalObservation {
 	t.Helper()
+	if f.gate != nil {
+		requireVMEdgeSafe(t, f)
+	}
 	observed := observePublicNodeLocal(t, f)
 	if len(f.current(t).Status.LoadBalancer.Ingress) == 0 {
 		t.Fatalf("pass %d: the parent status is empty", pass)
@@ -1253,18 +1264,18 @@ func runPolicyChange(t *testing.T, f *publicNodeLocalTransientFixture, nodes int
 		current := f.current(t)
 		done = current.Annotations[annotationPublicNodeLocalActivePolicy] != oldHash &&
 			current.Annotations[annotationPublicNodeLocalTargetPolicy] == "" &&
-			current.Annotations[annotationNodeLoadBalancerPreviousFirewall] == "" &&
+			!publicNodeLocalOldEdgePending(current) &&
 			!publicNodeLocalAssignmentFencePresent(current) &&
 			publicNodeLocalDatapathMatches(trackedPublicNodeLocalDatapath(t, f), current, current.Annotations[annotationPublicNodeLocalActivePool])
 	}
 	if !done {
 		t.Fatalf("the policy change never completed: %#v", f.current(t).Annotations)
 	}
-	if !sawBoth {
+	if watch.oldFirewall != "" && !sawBoth {
 		t.Fatal("the old and the new firewall were never attached together")
 	}
 	for _, firewall := range f.api.firewalls {
-		if firewall.UUID == watch.oldFirewall {
+		if watch.oldFirewall != "" && firewall.UUID == watch.oldFirewall {
 			t.Fatalf("the old firewall %s still exists", watch.oldFirewall)
 		}
 	}
@@ -1315,7 +1326,8 @@ func TestPublicNodeLocalPortRemovalClosesFirewallBeforeVIP(t *testing.T) {
 	old := f.current(t).Annotations[annotationNodeLoadBalancerFirewallUUID]
 	setPublicNodeLocalFixturePorts(t, f, 443)
 	runPolicyChange(t, f, 2, policyChangeWatch{oldFirewall: old, oldPorts: []int32{443, 80}, newPorts: []int32{443}}, nil)
-	if len(f.api.unassignedFirewalls) == 0 {
+	if len(f.api.unassignedFirewalls) == 0 && !publicNodeLocalServicePerVM(f.current(t)) {
+		// A per-VM firewall is narrowed in place; there is no old firewall to detach.
 		t.Fatal("the old firewall was never detached")
 	}
 }
@@ -1346,8 +1358,14 @@ func stepPublicNodeLocal(t *testing.T, f *publicNodeLocalTransientFixture, pass 
 	var holding *errPublicNodeLocalHolding
 	var pending *nodeLoadBalancerFirewallRelationPendingError
 	waiting := err != nil && strings.Contains(err.Error(), "waiting for")
+	if err != nil {
+		t.Logf("pass %d held: %v", pass, err)
+	}
 	if err != nil && !errors.As(err, &holding) && !errors.As(err, &pending) && !waiting {
 		t.Fatalf("pass %d: %v", pass, err)
+	}
+	if f.gate != nil {
+		requireVMEdgeSafe(t, f)
 	}
 }
 
@@ -1402,6 +1420,9 @@ func TestPublicNodeLocalPolicyChangeRevertRestoresActiveFirewall(t *testing.T) {
 	vm1 := "11111111-2222-4333-8444-555555555555"
 	setPublicNodeLocalFixturePorts(t, f, 443, 8443)
 	runUntil(t, f, []int{0, 1}, 80, "the target firewall is attached", func(o publicNodeLocalObservation, s *corev1.Service) bool {
+		if publicNodeLocalServicePerVM(s) {
+			return s.Annotations[annotationPublicNodeLocalTargetPolicy] != "" && perVMEntryPolicies(t, f, s, vm1) == 2
+		}
 		return s.Annotations[annotationPublicNodeLocalTargetPolicy] != "" && s.Annotations[annotationNodeLoadBalancerFirewallUUID] != old &&
 			len(firewallsOfVM(f, vm1)) == 2
 	})
@@ -1471,8 +1492,11 @@ func TestPublicNodeLocalPoolAndPolicyChangeTogether(t *testing.T) {
 		if s.Annotations[annotationPublicNodeLocalActivePool] == "edge" {
 			// Until the promotion the new firewall goes to the target pool only; the
 			// old pool's VM keeps the old firewall and nothing else.
+			if old == "" && perVMEntryPolicies(t, f, s, vmA) > 1 {
+				t.Fatalf("the new policy was added to the old pool VM before the promotion")
+			}
 			for uuid := range firewallsOfVM(f, vmA) {
-				if uuid != old {
+				if old != "" && uuid != old {
 					t.Fatalf("the new firewall %s was attached to the old pool VM before the promotion", uuid)
 				}
 			}
@@ -1810,7 +1834,7 @@ func TestPublicNodeLocalUnionRecreatesMissingChildWithOldPorts(t *testing.T) {
 	for pass := 0; pass < 80; pass++ {
 		stepPublicNodeLocal(t, f, pass)
 		current := f.current(t)
-		if current.Annotations[annotationPublicNodeLocalTargetPolicy] != "" && current.Annotations[annotationNodeLoadBalancerFirewallUUID] != old {
+		if current.Annotations[annotationPublicNodeLocalTargetPolicy] != "" && (publicNodeLocalServicePerVM(current) || current.Annotations[annotationNodeLoadBalancerFirewallUUID] != old) {
 			break
 		}
 	}

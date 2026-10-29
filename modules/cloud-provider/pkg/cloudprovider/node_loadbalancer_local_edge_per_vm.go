@@ -158,6 +158,11 @@ func (c *nodeLoadBalancerController) perVMEdgeID(
 	listed := map[string]struct{}{}
 	for index := range anchors {
 		view := vmFirewallAnchorView{cm: &anchors[index]}
+		if vmFirewallEntriesClosed(view, items) {
+			// The firewall is being deleted and is already off the VM: nothing is left
+			// to take off, though the anchor goes on with its delete in the VM pass.
+			continue
+		}
 		for _, key := range view.memberKeys(serviceUID) {
 			if key.Policy == policy {
 				listed[view.vm()] = struct{}{}
@@ -277,19 +282,27 @@ func (e perVMEdge) ResolvePending(ctx context.Context, svc *corev1.Service) (boo
 	if err != nil {
 		return false, err
 	}
+	items, err := c.provider.api.ListFirewalls(ctx, c.provider.config.Location)
+	if err != nil {
+		return false, err
+	}
 	resolved := true
 	for index := range anchors {
 		view := vmFirewallAnchorView{cm: &anchors[index]}
 		if len(view.memberKeys(string(svc.UID))) == 0 {
 			continue
 		}
+		if vmFirewallEntriesClosed(view, items) {
+			// The delete of an emptied VM firewall is the VM pass's; the Service has
+			// nothing left on that VM to wait for.
+			if c.queue != nil {
+				c.queue.Add(vmFirewallQueueKey(view.vm()))
+			}
+			continue
+		}
 		members := c.vmFirewallMemberLookup(view.vm(), svc)
 		switch {
 		case view.hasReceipt():
-			items, listErr := c.provider.api.ListFirewalls(ctx, c.provider.config.Location)
-			if listErr != nil {
-				return false, listErr
-			}
 			resolved = false
 			if _, err := c.resolveVMFirewallReceipt(ctx, &anchors[index], items, members); err != nil {
 				return false, err
@@ -619,6 +632,24 @@ func (e perVMEdge) removeOne(ctx context.Context, svc *corev1.Service, target vm
 		c.recordPublicNodeLocalStuckRelation(ctx, svc, err)
 		return []string{target.vmUUID}, nil
 	}
+	var pending *nodeLoadBalancerFirewallRelationPendingError
+	if errors.As(err, &pending) {
+		// The last entry of a VM ends with the delete of its firewall, which waits
+		// for spaced absence reads. Once the firewall is off the VM the Service has
+		// nothing more to wait for; the VM pass finishes the delete.
+		if _, open, closedErr := c.vmFirewallServiceClosed(ctx, string(svc.UID)); closedErr == nil {
+			onVM := false
+			for _, left := range open {
+				onVM = onVM || left.vmUUID == target.vmUUID
+			}
+			if !onVM {
+				if c.queue != nil {
+					c.queue.AddAfter(vmFirewallQueueKey(target.vmUUID), pending.retryAfter)
+				}
+				return nil, nil
+			}
+		}
+	}
 	return nil, err
 }
 
@@ -679,6 +710,17 @@ func (e perVMEdge) Retire(ctx context.Context, svc *corev1.Service, id edgeID) (
 	return true, nil
 }
 
+// vmFirewallEntriesClosed says whether every entry of an anchor is closed on its
+// VM: the anchor is deleting its firewall and the firewall is already gone or
+// detached. The entries are still on the anchor until the delete ends.
+func vmFirewallEntriesClosed(view vmFirewallAnchorView, items []inspace.Firewall) bool {
+	if view.pendingOp() != string(vmFirewallOpDelete) {
+		return false
+	}
+	firewall, err := exactNodeLoadBalancerFirewallFromItems(items, view.uuid())
+	return err != nil || !vmFirewallAttachedTo(*firewall, view.vm())
+}
+
 // vmFirewallServiceClosed says whether the Service is closed on every VM: no
 // anchor lists it, or the only anchors that do are being deleted and the
 // firewall of each is already detached from its VM.
@@ -698,12 +740,8 @@ func (c *nodeLoadBalancerController) vmFirewallServiceClosed(ctx context.Context
 		if len(keys) == 0 {
 			continue
 		}
-		if view.pendingOp() == string(vmFirewallOpDelete) {
-			firewall, listErr := exactNodeLoadBalancerFirewallFromItems(items, view.uuid())
-			if listErr != nil || !vmFirewallAttachedTo(*firewall, view.vm()) {
-				// Gone, or detached: the VM no longer carries the Service's ports.
-				continue
-			}
+		if vmFirewallEntriesClosed(view, items) {
+			continue
 		}
 		for _, key := range keys {
 			open = append(open, vmFirewallRemovalTarget{vmUUID: view.vm(), key: key})
@@ -727,20 +765,22 @@ func (e perVMEdge) WithdrawAll(ctx context.Context, svc *corev1.Service) (bool, 
 	if closed {
 		return true, nil
 	}
-	target := open[0]
-	anchor, err := c.getVMFirewallAnchor(ctx, target.vmUUID)
-	if err != nil {
-		return false, err
+	// A withdrawal closes every VM in one pass, as the per-Service edge detaches
+	// them all: each VM advances one durable step, and the first fault stops it.
+	// A receipt on a VM, ours or a sibling's, is resolved by that step before the
+	// next delta.
+	var first error
+	reported := map[string]struct{}{}
+	for _, target := range open {
+		if _, done := reported[target.vmUUID]; done {
+			continue
+		}
+		reported[target.vmUUID] = struct{}{}
+		if _, err := e.removeOne(ctx, svc, target, e.authorizeWithdraw(svc)); err != nil && first == nil {
+			first = err
+		}
 	}
-	if anchor != nil && (vmFirewallAnchorView{cm: anchor}).hasReceipt() {
-		// A receipt on the VM, ours or a sibling's, is resolved before the next
-		// delta; the step does exactly that.
-		_, err := c.vmFirewallStep(ctx, target.vmUUID, vmFirewallDelta{Remove: &target.key},
-			e.authorizeWithdraw(svc), c.vmFirewallMemberLookup(target.vmUUID, svc))
-		return false, err
-	}
-	_, err = e.removeOne(ctx, svc, target, e.authorizeWithdraw(svc))
-	return false, err
+	return false, first
 }
 
 // authorizeWithdraw is the authority of a withdrawal: the caller reached it on

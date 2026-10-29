@@ -190,6 +190,9 @@ func newPublishedPublicNodeLocalFixtureN(t *testing.T, n int) *publicNodeLocalTr
 // the caller may shape before the first reconcile.
 func newPublishedPublicNodeLocalFixtureWith(t *testing.T, n int, shape func(*corev1.Service)) *publicNodeLocalTransientFixture {
 	t.Helper()
+	if publicNodeLocalTestMode == PublicNodeLocalFirewallModePerVM {
+		return newPerVMPublicNodeLocalFixtureWith(t, n, shape)
+	}
 	service := publicNodeLocalTestService("edge", "edge-service-uid", "edge", corev1.ProtocolTCP, 443)
 	if shape != nil {
 		shape(service)
@@ -225,6 +228,9 @@ func newPublishedPublicNodeLocalFixtureWith(t *testing.T, n int, shape func(*cor
 	fixture := &publicNodeLocalTransientFixture{
 		ctx: context.Background(), api: api, provider: provider, controller: controller,
 		service: service, key: service.Namespace + "/" + service.Name, endpointNodes: nodeNames,
+	}
+	if publicNodeLocalTestGated {
+		fixture.gateFixture(t)
 	}
 	for attempt := 0; attempt < 40; attempt++ {
 		if err := controller.syncPublicNodeLocal(fixture.ctx, fixture.key, fixture.current(t)); err != nil {

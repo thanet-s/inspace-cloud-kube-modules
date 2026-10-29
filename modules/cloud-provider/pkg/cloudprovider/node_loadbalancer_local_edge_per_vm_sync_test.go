@@ -143,9 +143,13 @@ func TestPerVMNodeDeletedVMAlive(t *testing.T) {
 	if f.anchorOf(t, vm2) == nil {
 		t.Fatal("the anchor must outlive its Node")
 	}
+	// The Service pass takes the entry off; the VM pass finishes the delete of
+	// the emptied firewall and its anchor.
+	f.controller.firewallRelationAbsentDelay = 0
 	for pass := 0; pass < 80 && f.anchorOf(t, vm2) != nil; pass++ {
 		stepPublicNodeLocal(t, f, pass)
 		requireVMEdgeSafe(t, f)
+		_ = f.controller.syncVMFirewall(f.ctx, vm2)
 	}
 	if f.anchorOf(t, vm2) != nil {
 		t.Fatalf("the entry never left the VM whose Node was deleted: %#v", f.anchorOf(t, vm2).Annotations)
