@@ -10,6 +10,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/klog/v2"
 
 	inspace "github.com/thanet-s/inspace-cloud-kube-modules/modules/client"
 )
@@ -273,4 +274,691 @@ func (a vmFirewallAnchorView) appliedAt() (time.Time, bool, error) {
 func (a vmFirewallAnchorView) hasReceipt() bool {
 	return a.get(annotationVMFirewallPending) != "" || a.get(annotationVMFirewallPendingOp) != "" ||
 		a.get(annotationVMFirewallIssuedAt) != "" || a.get(annotationVMFirewallDeleteTarget) != ""
+}
+
+const (
+	vmFirewallDriftReason        = "PublicNodeLocalVMFirewallDrift"
+	vmFirewallPortConflictReason = "PublicNodeLocalVMPortConflict"
+
+	// vmFirewallNewFirewall stands in for the UUID of a firewall that does not
+	// exist yet when the attach capacity of a VM is checked before a create.
+	vmFirewallNewFirewall = "(new per-VM firewall)"
+)
+
+// errVMFirewallDrift reports a per-VM firewall whose cloud state is not what
+// its anchor recorded. Every Service on the VM holds; nothing is mutated and
+// nothing is removed.
+var errVMFirewallDrift = errors.New("public-node-local: VM firewall drifted from its recorded ledger")
+
+func vmFirewallDrift(vmUUID, format string, args ...any) error {
+	return fmt.Errorf("%w: VM %s: %s", errVMFirewallDrift, vmUUID, fmt.Sprintf(format, args...))
+}
+
+type vmFirewallOp string
+
+const (
+	vmFirewallOpCreate vmFirewallOp = "create"
+	vmFirewallOpUpdate vmFirewallOp = "update"
+	vmFirewallOpDelete vmFirewallOp = "delete"
+	vmFirewallOpAdopt  vmFirewallOp = "adopt"
+)
+
+// vmFirewallDelta is the one ledger change a transaction makes: add or remove
+// exactly one entry. LedgerOnly applies to a removal on a VM that is proven
+// gone: nothing can reach it, so no PUT is made.
+type vmFirewallDelta struct {
+	Add        *vmFirewallMember
+	Remove     *vmFirewallMemberKey
+	LedgerOnly bool
+}
+
+func (d vmFirewallDelta) validate() error {
+	if (d.Add == nil) == (d.Remove == nil) {
+		return errors.New("public-node-local: a VM firewall delta adds or removes exactly one entry")
+	}
+	if d.LedgerOnly && d.Remove == nil {
+		return errors.New("public-node-local: a ledger-only VM firewall delta must be a removal")
+	}
+	if d.Add != nil {
+		return validateVMFirewallMember(*d.Add)
+	}
+	return nil
+}
+
+// vmFirewallDeltaAuthority is the last check before a mutation crosses the
+// provider boundary: it re-derives, from live state, that the Service still
+// wants (add) or has verifiably given up (remove) this entry. fresh is the
+// per-VM firewall just re-read, nil for a create.
+type vmFirewallDeltaAuthority func(ctx context.Context, anchor *corev1.ConfigMap, fresh *inspace.Firewall) error
+
+type vmFirewallStepResult struct {
+	// Converged is true when the delta is applied, read back and, for an add,
+	// the firewall is attached to the VM.
+	Converged    bool
+	AppliedAt    time.Time
+	FirewallUUID string
+}
+
+func vmFirewallWait(retry time.Duration, format string, args ...any) error {
+	if retry < time.Second {
+		retry = time.Second
+	}
+	return &nodeLoadBalancerFirewallRelationPendingError{message: fmt.Sprintf(format, args...), retryAfter: retry}
+}
+
+func (c *nodeLoadBalancerController) vmFirewallMemberServices(ctx context.Context, members func(context.Context) []*corev1.Service) []*corev1.Service {
+	if members == nil {
+		return nil
+	}
+	return members(ctx)
+}
+
+func (c *nodeLoadBalancerController) recordVMFirewallEvent(ctx context.Context, services []*corev1.Service, reason string, cause error) {
+	for _, service := range services {
+		if service == nil {
+			continue
+		}
+		if err := c.recordPublicNodeLocalHoldEvent(ctx, service, reason, cause); err != nil {
+			klog.Warningf("node load balancer: record %s Event on %s/%s: %v", reason, service.Namespace, service.Name, err)
+		}
+	}
+}
+
+func (c *nodeLoadBalancerController) refuseVMFirewallCreate(ctx context.Context, vmUUID string, services []*corev1.Service, cause error) {
+	for _, service := range services {
+		if service != nil {
+			c.recordFirewallLimitExceeded(ctx, service, "VM firewall anchor "+vmUUID, cause)
+		}
+	}
+}
+
+// vmFirewallByNameFromItems returns the one firewall with the given name, nil
+// when there is none, and an error when case-folded rows make the name
+// ambiguous.
+func vmFirewallByNameFromItems(items []inspace.Firewall, name string) (*inspace.Firewall, error) {
+	var exact *inspace.Firewall
+	matches := 0
+	for index := range items {
+		if !strings.EqualFold(items[index].EffectiveName(), name) {
+			continue
+		}
+		matches++
+		if items[index].EffectiveName() == name {
+			copy := items[index]
+			exact = &copy
+		}
+	}
+	if matches == 0 {
+		return nil, nil
+	}
+	if matches != 1 || exact == nil {
+		return nil, fmt.Errorf("public-node-local: firewall name %q has %d case-folded rows and no unique exact owner", name, matches)
+	}
+	return exact, nil
+}
+
+func vmFirewallAttachedTo(firewall inspace.Firewall, vmUUID string) bool {
+	for _, row := range firewall.ResourcesAssigned {
+		if strings.EqualFold(row.ResourceType, "vm") && strings.EqualFold(row.ResourceUUID, vmUUID) {
+			return true
+		}
+	}
+	return false
+}
+
+// vmFirewallMergedNarrows reports whether after closes anything before opened:
+// a port that is gone, or a source range that no longer covers the old one.
+// An add must never narrow. A removal narrows only what no entry needs any
+// more, which mergeVMFirewallLedger guarantees by construction.
+func vmFirewallMergedNarrows(before, after []inspace.FirewallRule) bool {
+	type view struct {
+		any     bool
+		sources map[string]struct{}
+	}
+	index := func(rules []inspace.FirewallRule) map[string]view {
+		out := map[string]view{}
+		for _, rule := range rules {
+			v := view{sources: map[string]struct{}{}}
+			if rule.EndpointSpecType == "any" {
+				v.any = true
+			}
+			for _, source := range rule.EndpointSpec {
+				v.sources[source] = struct{}{}
+			}
+			out[nodeLoadBalancerShardFirewallRuleLogicalKey(rule)] = v
+		}
+		return out
+	}
+	was, now := index(before), index(after)
+	for key, old := range was {
+		current, kept := now[key]
+		if !kept {
+			return true
+		}
+		if current.any {
+			continue
+		}
+		if old.any {
+			return true
+		}
+		for source := range old.sources {
+			if _, covered := current.sources[source]; !covered {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+type vmFirewallObservation struct {
+	firewall *inspace.Firewall
+	attached bool
+}
+
+// observeVMFirewall validates the applied state of a VM: the firewall the
+// anchor names must be present by UUID and by name as one resource, owned,
+// attached to this VM only and carry exactly the applied rules. Anything else
+// is drift.
+func (c *nodeLoadBalancerController) observeVMFirewall(
+	vmUUID string,
+	view vmFirewallAnchorView,
+	applied vmFirewallLedger,
+	items []inspace.Firewall,
+) (vmFirewallObservation, error) {
+	cluster := c.provider.config.ClusterID
+	name, err := inspace.NodeLoadBalancerVMFirewallName(cluster, vmUUID)
+	if err != nil {
+		return vmFirewallObservation{}, err
+	}
+	byName, err := vmFirewallByNameFromItems(items, name)
+	if err != nil {
+		return vmFirewallObservation{}, vmFirewallDrift(vmUUID, "%v", err)
+	}
+	uuid := view.uuid()
+	if uuid == "" {
+		if len(applied.Members) != 0 {
+			return vmFirewallObservation{}, vmFirewallDrift(vmUUID, "the anchor records an applied ledger but no firewall UUID")
+		}
+		if byName != nil {
+			return vmFirewallObservation{}, vmFirewallDrift(vmUUID, "firewall %s carries the per-VM name but the anchor does not own it", byName.UUID)
+		}
+		return vmFirewallObservation{}, nil
+	}
+	exact, err := exactNodeLoadBalancerFirewallFromItems(items, uuid)
+	if err != nil {
+		return vmFirewallObservation{}, vmFirewallDrift(vmUUID, "recorded firewall %s is not readable: %v", uuid, err)
+	}
+	if byName == nil || byName.UUID != exact.UUID {
+		return vmFirewallObservation{}, vmFirewallDrift(vmUUID, "recorded firewall %s is not the one carrying the per-VM name", uuid)
+	}
+	if err := inspace.ValidateNodeLoadBalancerVMFirewall(*exact, cluster, vmUUID, c.provider.config.BillingAccountID, view.appliedHash()); err != nil {
+		return vmFirewallObservation{}, vmFirewallDrift(vmUUID, "firewall %s: %v", uuid, err)
+	}
+	return vmFirewallObservation{firewall: exact, attached: vmFirewallAttachedTo(*exact, vmUUID)}, nil
+}
+
+// vmFirewallStep makes exactly one ledger change on one VM and carries it to the
+// cloud: create, PUT or (in a later task) delete, then the attach. Every call
+// advances at most one durable step and returns; callers repeat it until
+// Converged. The rules of members outside the delta always come from the
+// anchor ledger, never from live Service specs, so a broken sibling keeps its
+// recorded rules. Removal needs the verified intent that authorize re-derives.
+func (c *nodeLoadBalancerController) vmFirewallStep(
+	ctx context.Context,
+	vmUUID string,
+	delta vmFirewallDelta,
+	authorize vmFirewallDeltaAuthority,
+	members func(context.Context) []*corev1.Service,
+) (vmFirewallStepResult, error) {
+	if err := delta.validate(); err != nil {
+		return vmFirewallStepResult{}, err
+	}
+	if authorize == nil {
+		return vmFirewallStepResult{}, errors.New("public-node-local: a VM firewall step needs its authority check")
+	}
+	if delta.LedgerOnly {
+		return vmFirewallStepResult{}, errors.New("public-node-local: ledger-only VM firewall removal is not available yet")
+	}
+	cluster := c.provider.config.ClusterID
+	name, err := inspace.NodeLoadBalancerVMFirewallName(cluster, vmUUID)
+	if err != nil {
+		return vmFirewallStepResult{}, err
+	}
+	anchor, err := c.getVMFirewallAnchor(ctx, vmUUID)
+	if err != nil {
+		return vmFirewallStepResult{}, err
+	}
+	items, err := c.provider.api.ListFirewalls(ctx, c.provider.config.Location)
+	if err != nil {
+		return vmFirewallStepResult{}, fmt.Errorf("public-node-local: list firewalls for VM %s: %w", vmUUID, err)
+	}
+	if anchor == nil {
+		if delta.Remove != nil {
+			// Nothing was ever recorded for this VM.
+			return vmFirewallStepResult{Converged: true}, nil
+		}
+		existing, nameErr := vmFirewallByNameFromItems(items, name)
+		if nameErr != nil {
+			return vmFirewallStepResult{}, vmFirewallDrift(vmUUID, "%v", nameErr)
+		}
+		if existing != nil {
+			return vmFirewallStepResult{}, vmFirewallDrift(vmUUID, "firewall %s carries the per-VM name but no anchor records it", existing.UUID)
+		}
+		// Refuse before anything is persisted: a VM at the firewall limit gets no
+		// anchor and no receipt.
+		if capacityErr := c.firewallVMCapacityFromItems(items, vmFirewallNewFirewall, vmUUID); capacityErr != nil {
+			c.refuseVMFirewallCreate(ctx, vmUUID, c.vmFirewallMemberServices(ctx, members), capacityErr)
+			return vmFirewallStepResult{}, capacityErr
+		}
+		if anchor, err = c.createVMFirewallAnchor(ctx, vmUUID); err != nil {
+			return vmFirewallStepResult{}, err
+		}
+	}
+	view := vmFirewallAnchorView{cm: anchor}
+	if view.hasReceipt() {
+		_, err := c.resolveVMFirewallReceipt(ctx, anchor, items, members)
+		return vmFirewallStepResult{}, err
+	}
+	if anchor.Annotations[annotationNodeLoadBalancerFirewallRelationIssued] != "" {
+		// An attach or detach is still unresolved: settle it before anything else.
+		_, err := c.reconcileNodeLoadBalancerFirewallRelation(ctx, c.vmFirewallRelationOwner(vmUUID, members), nil)
+		return vmFirewallStepResult{}, err
+	}
+	applied, err := view.applied()
+	if err != nil {
+		return vmFirewallStepResult{}, err
+	}
+	observation, err := c.observeVMFirewall(vmUUID, view, applied, items)
+	if err != nil {
+		if errors.Is(err, errVMFirewallDrift) {
+			c.recordVMFirewallEvent(ctx, c.vmFirewallMemberServices(ctx, members), vmFirewallDriftReason, err)
+		}
+		return vmFirewallStepResult{}, err
+	}
+
+	var next vmFirewallLedger
+	unchanged := false
+	switch {
+	case delta.Add != nil:
+		if _, present := applied.find(delta.Add.key()); present {
+			next, unchanged = applied, true
+		} else if next, err = applied.with(*delta.Add); err != nil {
+			return vmFirewallStepResult{}, err
+		}
+	default:
+		var found bool
+		next, found = applied.without(*delta.Remove)
+		unchanged = !found
+	}
+
+	if unchanged {
+		if delta.Remove != nil {
+			return vmFirewallStepResult{Converged: true, FirewallUUID: view.uuid()}, nil
+		}
+		if !observation.attached {
+			fence := nodeLoadBalancerFirewallRelationFence{
+				operation: nodeLoadBalancerFirewallRelationAssign, firewallUUID: view.uuid(), vmUUID: vmUUID,
+			}
+			_, err := c.reconcileNodeLoadBalancerFirewallRelation(ctx, c.vmFirewallRelationOwner(vmUUID, members), &fence)
+			return vmFirewallStepResult{FirewallUUID: view.uuid()}, err
+		}
+		appliedAt, _, err := view.appliedAt()
+		if err != nil {
+			return vmFirewallStepResult{}, err
+		}
+		return vmFirewallStepResult{Converged: true, AppliedAt: appliedAt, FirewallUUID: view.uuid()}, nil
+	}
+
+	if len(next.Members) == 0 {
+		return vmFirewallStepResult{}, errors.New("public-node-local: removing the last VM firewall entry is not available yet")
+	}
+	merged, err := mergeVMFirewallLedger(next)
+	if err != nil {
+		var conflict *errVMFirewallPortConflict
+		if errors.As(err, &conflict) && delta.Add != nil {
+			var asking []*corev1.Service
+			for _, service := range c.vmFirewallMemberServices(ctx, members) {
+				if service != nil && string(service.UID) == delta.Add.UID {
+					asking = append(asking, service)
+				}
+			}
+			c.recordVMFirewallEvent(ctx, asking, vmFirewallPortConflictReason, err)
+		}
+		return vmFirewallStepResult{}, err
+	}
+	if delta.Add != nil && len(applied.Members) != 0 {
+		before, mergeErr := mergeVMFirewallLedger(applied)
+		if mergeErr != nil {
+			return vmFirewallStepResult{}, mergeErr
+		}
+		if vmFirewallMergedNarrows(before, merged) {
+			return vmFirewallStepResult{}, errors.New("public-node-local: an add must never narrow the VM firewall; make-before-break")
+		}
+	}
+	op := vmFirewallOpUpdate
+	if observation.firewall == nil {
+		op = vmFirewallOpCreate
+	}
+	if err := c.runVMFirewallMutation(ctx, vmUUID, anchor, observation, op, next, merged, authorize, members); err != nil {
+		return vmFirewallStepResult{}, err
+	}
+	return vmFirewallStepResult{FirewallUUID: view.uuid()}, nil
+}
+
+var vmFirewallReceiptKeys = []string{
+	annotationVMFirewallPending,
+	annotationVMFirewallPendingHash,
+	annotationVMFirewallPendingOp,
+	annotationVMFirewallPendingAt,
+	annotationVMFirewallIssuedAt,
+	annotationVMFirewallIssueID,
+}
+
+func vmFirewallSameReceipt(a, b map[string]string) bool {
+	for _, key := range vmFirewallReceiptKeys {
+		if a[key] != b[key] {
+			return false
+		}
+	}
+	return true
+}
+
+// stageVMFirewallMutation records the next ledger as pending. It fails if the
+// applied ledger moved or any receipt appeared since the caller read the anchor.
+func (c *nodeLoadBalancerController) stageVMFirewallMutation(
+	ctx context.Context,
+	anchor *corev1.ConfigMap,
+	op vmFirewallOp,
+	appliedRaw, pendingRaw, pendingHash string,
+) (*corev1.ConfigMap, error) {
+	now := c.nodeLoadBalancerFirewallRelationTime().Format(time.RFC3339Nano)
+	updated, changed, err := c.updateVMFirewallAnchor(ctx, anchor, func(cm *corev1.ConfigMap) (bool, error) {
+		view := vmFirewallAnchorView{cm: cm}
+		if view.hasReceipt() || view.get(annotationVMFirewallApplied) != appliedRaw {
+			return false, errors.New("public-node-local: the VM firewall anchor changed before the mutation was staged")
+		}
+		cm.Annotations[annotationVMFirewallPending] = pendingRaw
+		cm.Annotations[annotationVMFirewallPendingHash] = pendingHash
+		cm.Annotations[annotationVMFirewallPendingOp] = string(op)
+		cm.Annotations[annotationVMFirewallPendingAt] = now
+		return true, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if !changed {
+		return nil, errors.New("public-node-local: the VM firewall mutation was not staged")
+	}
+	return updated, nil
+}
+
+// issueVMFirewallMutation records the issued receipt in its own write, before
+// the HTTP call, so a crash in between can never be mistaken for a dispatched
+// request that committed.
+func (c *nodeLoadBalancerController) issueVMFirewallMutation(ctx context.Context, staged *corev1.ConfigMap) (*corev1.ConfigMap, error) {
+	token, err := newNodeLoadBalancerFirewallCreateIssuedToken()
+	if err != nil {
+		return nil, err
+	}
+	now := c.nodeLoadBalancerFirewallRelationTime().Format(time.RFC3339Nano)
+	updated, changed, err := c.updateVMFirewallAnchor(ctx, staged, func(cm *corev1.ConfigMap) (bool, error) {
+		if cm.Annotations[annotationVMFirewallPending] != staged.Annotations[annotationVMFirewallPending] ||
+			cm.Annotations[annotationVMFirewallPendingAt] != staged.Annotations[annotationVMFirewallPendingAt] ||
+			cm.Annotations[annotationVMFirewallIssuedAt] != "" {
+			return false, errors.New("public-node-local: the staged VM firewall mutation changed before it was issued")
+		}
+		cm.Annotations[annotationVMFirewallIssuedAt] = now
+		cm.Annotations[annotationVMFirewallIssueID] = token
+		return true, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if !changed {
+		return nil, errors.New("public-node-local: the VM firewall mutation was not issued")
+	}
+	return updated, nil
+}
+
+// resetVMFirewallReceipt clears a receipt whose request provably never left
+// this process. It uses a detached context: a canceled caller must not strand
+// an issued receipt that no request backs.
+func (c *nodeLoadBalancerController) resetVMFirewallReceipt(ctx context.Context, anchor *corev1.ConfigMap) error {
+	resetCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), durableReceiptWriteTimeout)
+	defer cancel()
+	expected := anchor.Annotations
+	_, _, err := c.updateVMFirewallAnchor(resetCtx, anchor, func(cm *corev1.ConfigMap) (bool, error) {
+		if !vmFirewallSameReceipt(cm.Annotations, expected) {
+			return false, errors.New("public-node-local: the VM firewall receipt changed before it was reset")
+		}
+		for _, key := range vmFirewallReceiptKeys {
+			delete(cm.Annotations, key)
+		}
+		delete(cm.Annotations, annotationVMFirewallAbsenceCount)
+		delete(cm.Annotations, annotationVMFirewallAbsenceCheckedAt)
+		return true, nil
+	})
+	if err != nil {
+		return fmt.Errorf("public-node-local: reset the VM firewall receipt: %w", err)
+	}
+	return nil
+}
+
+// commitVMFirewallMutation turns the pending ledger into the applied one after
+// an exact readback, and clears the receipt, in one write.
+func (c *nodeLoadBalancerController) commitVMFirewallMutation(ctx context.Context, anchor *corev1.ConfigMap, firewall inspace.Firewall) error {
+	expected := anchor.Annotations
+	now := c.nodeLoadBalancerFirewallRelationTime().Format(time.RFC3339Nano)
+	_, changed, err := c.updateVMFirewallAnchor(ctx, anchor, func(cm *corev1.ConfigMap) (bool, error) {
+		if !vmFirewallSameReceipt(cm.Annotations, expected) || cm.Annotations[annotationVMFirewallPending] == "" {
+			return false, errors.New("public-node-local: the VM firewall receipt changed before its commit")
+		}
+		cm.Annotations[annotationVMFirewallApplied] = cm.Annotations[annotationVMFirewallPending]
+		cm.Annotations[annotationVMFirewallAppliedHash] = cm.Annotations[annotationVMFirewallPendingHash]
+		cm.Annotations[annotationVMFirewallAppliedAt] = now
+		cm.Annotations[annotationVMFirewallUUID] = firewall.UUID
+		for _, key := range vmFirewallReceiptKeys {
+			delete(cm.Annotations, key)
+		}
+		delete(cm.Annotations, annotationVMFirewallAbsenceCount)
+		delete(cm.Annotations, annotationVMFirewallAbsenceCheckedAt)
+		return true, nil
+	})
+	if err != nil {
+		return fmt.Errorf("public-node-local: commit the VM firewall mutation: %w", err)
+	}
+	if !changed {
+		return errors.New("public-node-local: the VM firewall mutation was not committed")
+	}
+	return nil
+}
+
+// authorizeVMFirewallMutation is the pre-dispatch authority of one create or
+// PUT: the receipt is still exactly the one this process issued, the firewall is
+// unchanged since it was read, and the delta's own authority holds.
+func (c *nodeLoadBalancerController) authorizeVMFirewallMutation(
+	ctx context.Context,
+	vmUUID string,
+	issued *corev1.ConfigMap,
+	op vmFirewallOp,
+	observation vmFirewallObservation,
+	authorize vmFirewallDeltaAuthority,
+) error {
+	sameReceipt := func() (*corev1.ConfigMap, error) {
+		current, err := c.getVMFirewallAnchor(ctx, vmUUID)
+		if err != nil {
+			return nil, err
+		}
+		if current == nil || current.UID != issued.UID || !vmFirewallSameReceipt(current.Annotations, issued.Annotations) {
+			return nil, errors.New("public-node-local: the VM firewall receipt changed during final authority")
+		}
+		return current, nil
+	}
+	if _, err := sameReceipt(); err != nil {
+		return err
+	}
+	var fresh *inspace.Firewall
+	switch op {
+	case vmFirewallOpUpdate:
+		current, err := c.exactNodeLoadBalancerFirewallFresh(ctx, observation.firewall.UUID)
+		if err != nil {
+			return err
+		}
+		if !nodeLoadBalancerFirewallAuthorityUnchanged(*observation.firewall, *current) {
+			return fmt.Errorf("public-node-local: VM firewall %s changed after the mutation was issued", current.UUID)
+		}
+		fresh = current
+	case vmFirewallOpCreate:
+		name, err := inspace.NodeLoadBalancerVMFirewallName(c.provider.config.ClusterID, vmUUID)
+		if err != nil {
+			return err
+		}
+		existing, absent, err := c.exactNodeLoadBalancerFirewallNameFresh(ctx, name)
+		if err != nil {
+			return err
+		}
+		if !absent || existing != nil {
+			return fmt.Errorf("public-node-local: firewall %s already carries the per-VM name", name)
+		}
+		if err := c.requireFirewallVMCapacity(ctx, vmFirewallNewFirewall, vmUUID); err != nil {
+			return err
+		}
+	default:
+		return fmt.Errorf("public-node-local: unsupported VM firewall operation %q", op)
+	}
+	anchor, err := sameReceipt()
+	if err != nil {
+		return err
+	}
+	if err := authorize(ctx, anchor, fresh); err != nil {
+		return err
+	}
+	_, err = sameReceipt()
+	return err
+}
+
+func (c *nodeLoadBalancerController) runVMFirewallMutation(
+	ctx context.Context,
+	vmUUID string,
+	anchor *corev1.ConfigMap,
+	observation vmFirewallObservation,
+	op vmFirewallOp,
+	next vmFirewallLedger,
+	merged []inspace.FirewallRule,
+	authorize vmFirewallDeltaAuthority,
+	members func(context.Context) []*corev1.Service,
+) error {
+	cluster := c.provider.config.ClusterID
+	nextRaw, err := encodeVMFirewallLedger(next)
+	if err != nil {
+		return err
+	}
+	hash, err := inspace.NodeLoadBalancerVMFirewallSpecHash(merged)
+	if err != nil {
+		return err
+	}
+	var (
+		createRequest inspace.CreateFirewallRequest
+		updateRequest inspace.UpdateFirewallRequest
+	)
+	switch op {
+	case vmFirewallOpCreate:
+		createRequest, err = vmFirewallCreateRequest(cluster, vmUUID, c.provider.config.BillingAccountID, merged)
+	case vmFirewallOpUpdate:
+		updateRequest, err = vmFirewallUpdateRequest(cluster, vmUUID, *observation.firewall, merged)
+	default:
+		err = fmt.Errorf("public-node-local: unsupported VM firewall operation %q", op)
+	}
+	if err != nil {
+		return err
+	}
+	appliedRaw := anchor.Annotations[annotationVMFirewallApplied]
+	staged, err := c.stageVMFirewallMutation(ctx, anchor, op, appliedRaw, nextRaw, hash)
+	if err != nil {
+		return err
+	}
+	issued, err := c.issueVMFirewallMutation(ctx, staged)
+	if err != nil {
+		return err
+	}
+	if err := c.authorizeVMFirewallMutation(ctx, vmUUID, issued, op, observation, authorize); err != nil {
+		var limit *FirewallLimitExceededError
+		if errors.As(err, &limit) {
+			c.refuseVMFirewallCreate(ctx, vmUUID, c.vmFirewallMemberServices(ctx, members), err)
+		}
+		rejection := fmt.Errorf("public-node-local: reject VM firewall %s for %s at final pre-dispatch authority: %w", op, vmUUID, err)
+		if resetErr := c.resetVMFirewallReceipt(ctx, issued); resetErr != nil {
+			return errors.Join(rejection, resetErr)
+		}
+		return rejection
+	}
+
+	timeout := vmFirewallMutationTimeout(len(merged))
+	callCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	klog.Infof("node load balancer: VM firewall %s for %s with %d rules", op, vmUUID, len(merged))
+	var dispatchErr error
+	switch op {
+	case vmFirewallOpCreate:
+		_, dispatchErr = c.provider.api.CreateFirewall(callCtx, c.provider.config.Location, createRequest)
+	case vmFirewallOpUpdate:
+		_, dispatchErr = c.provider.api.UpdateFirewall(callCtx, c.provider.config.Location, observation.firewall.UUID, updateRequest)
+	}
+	if dispatchErr != nil {
+		dispatchErr = fmt.Errorf("public-node-local: %s VM firewall for %s: %w", op, vmUUID, dispatchErr)
+		if nodeLoadBalancerMutationKnownPreDispatch(dispatchErr) {
+			return errors.Join(dispatchErr, c.resetVMFirewallReceipt(ctx, issued))
+		}
+	}
+	items, listErr := c.provider.api.ListFirewalls(ctx, c.provider.config.Location)
+	if listErr != nil {
+		return errors.Join(dispatchErr, fmt.Errorf("public-node-local: read back the VM firewall of %s: %w", vmUUID, listErr))
+	}
+	current, getErr := c.getVMFirewallAnchor(ctx, vmUUID)
+	if getErr != nil || current == nil {
+		return errors.Join(dispatchErr, getErr, errors.New("public-node-local: the VM firewall anchor disappeared during a mutation"))
+	}
+	if _, resolveErr := c.resolveVMFirewallReceipt(ctx, current, items, members); resolveErr != nil {
+		return errors.Join(dispatchErr, resolveErr)
+	}
+	return nil
+}
+
+// resolveVMFirewallReceipt settles an issued or staged create or PUT from a
+// fresh listing. It reports true once the receipt is gone: committed or reset.
+func (c *nodeLoadBalancerController) resolveVMFirewallReceipt(
+	ctx context.Context,
+	anchor *corev1.ConfigMap,
+	items []inspace.Firewall,
+	members func(context.Context) []*corev1.Service,
+) (bool, error) {
+	view := vmFirewallAnchorView{cm: anchor}
+	vmUUID := view.vm()
+	op := vmFirewallOp(view.pendingOp())
+	switch op {
+	case vmFirewallOpCreate, vmFirewallOpUpdate:
+	default:
+		return false, fmt.Errorf("public-node-local: VM firewall receipt operation %q cannot be resolved here", op)
+	}
+	if view.get(annotationVMFirewallIssuedAt) == "" {
+		// Staged but never issued: no request was ever authorized.
+		return true, c.resetVMFirewallReceipt(ctx, anchor)
+	}
+	cluster := c.provider.config.ClusterID
+	name, err := inspace.NodeLoadBalancerVMFirewallName(cluster, vmUUID)
+	if err != nil {
+		return false, err
+	}
+	byName, err := vmFirewallByNameFromItems(items, name)
+	if err != nil {
+		return false, vmFirewallDrift(vmUUID, "%v", err)
+	}
+	if byName != nil {
+		hash, hashErr := inspace.NodeLoadBalancerVMFirewallSpecHash(byName.Rules)
+		if hashErr == nil && hash == view.get(annotationVMFirewallPendingHash) &&
+			(op == vmFirewallOpCreate || byName.UUID == view.uuid()) {
+			return true, c.commitVMFirewallMutation(ctx, anchor, *byName)
+		}
+	}
+	return false, vmFirewallWait(nodeLoadBalancerRetry, "public-node-local: VM firewall %s for %s is not read back yet", op, vmUUID)
 }
