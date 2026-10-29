@@ -160,7 +160,6 @@ func TestReverseMigrationRefusesKThree(t *testing.T) {
 	})
 	m.trackCoverage()
 	before := m.statusSnapshot()
-	writes := m.writes()
 
 	m.switchToPerService()
 	// A block is an error the work queue retries with backoff, like a hold.
@@ -210,14 +209,15 @@ func TestReverseMigrationRefusesKThree(t *testing.T) {
 			t.Errorf("%s left the per-VM edge", name)
 		}
 	}
+	if m.anchor(mgGateway1) != nil || m.anchor(mgGateway2) != nil || publicNodeLocalServicePerVM(m.service("traefik-public")) {
+		t.Error("the gateways, which carry one Service, were not reversed")
+	}
 	if now := m.statusSnapshot(); !reflect.DeepEqual(now, before) {
 		t.Fatalf("a Service changed its status or VIPs:\n before %v\n after  %v", before, now)
 	}
 	if m.gate.maxObservedFirewallsPerVM > 3 || m.gate.refusedAttaches != 0 {
 		t.Errorf("peak %d firewalls, %d refused attaches", m.gate.maxObservedFirewallsPerVM, m.gate.refusedAttaches)
 	}
-	// traefik-public is on the gateways only, so it did not move with the relay VM held.
-	_ = writes
 	// Nothing more happens, ever: another stretch of passes writes nothing.
 	steady := m.writes()
 	for pass := 0; pass < 40; pass++ {
