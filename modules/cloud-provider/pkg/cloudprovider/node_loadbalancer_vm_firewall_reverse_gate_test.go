@@ -129,6 +129,38 @@ func TestReverseMigrationOneAtATimeAndPaced(t *testing.T) {
 	}
 }
 
+// The pacing delay survives a restart of the controller between two VMs: it is
+// remembered on the anchors that are left, not in memory.
+func TestReverseMigrationPacingSurvivesARestart(t *testing.T) {
+	m := newTHLiveCluster(t)
+	migrateTHLiveForward(m)
+	m.switchToPerService()
+	var lastGone time.Time
+	var gaps []time.Duration
+	anchors := m.anchorsLeft()
+	for pass := 0; pass < 1500 && !m.allReversed(); pass++ {
+		m.reverseRound()
+		if left := m.anchorsLeft(); left < anchors {
+			lastGone = m.clock
+			m.restart() // the crash that forgets everything in memory
+			anchors = left
+			continue
+		}
+		if !lastGone.IsZero() && len(m.reverseInFlight()) == 1 {
+			gaps = append(gaps, m.clock.Sub(lastGone))
+			lastGone = time.Time{}
+		}
+	}
+	if !m.allReversed() || len(gaps) < 2 {
+		t.Fatalf("reversed %v, gaps %v", m.allReversed(), gaps)
+	}
+	for _, gap := range gaps {
+		if gap < 4*m.provider.vmFirewallSettle() {
+			t.Errorf("after a restart the next VM started %s after the last one, want at least %s", gap, 4*m.provider.vmFirewallSettle())
+		}
+	}
+}
+
 // Without the rename the way back still works where a slot is free: the gateways
 // attach and retire; the relay VM, which needs a rename, is blocked with an Event
 // and keeps its per-VM firewall.

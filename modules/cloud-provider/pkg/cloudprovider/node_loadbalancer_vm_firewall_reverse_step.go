@@ -26,10 +26,10 @@ func (c *nodeLoadBalancerController) vmFirewallReverseTimeNow() time.Time {
 	return c.nodeLoadBalancerFirewallRelationTime()
 }
 
-// noteVMFirewallAnchorGone remembers, in memory only, when an anchor was last
-// deleted. The reverse migration ends with its anchor, so the next VM's pacing
-// delay counts from here; a restart only shortens the wait for the next VM, and
-// "one VM at a time" is read from the anchors.
+// noteVMFirewallAnchorGone remembers in memory when an anchor was last deleted,
+// for the pacing of the next reverse VM. The durable copy is the stamp on the
+// anchors that are left (stampVMFirewallReverseDone); this one only covers the
+// last anchor of all.
 func (c *nodeLoadBalancerController) noteVMFirewallAnchorGone() {
 	c.vmFirewallOrphanMu.Lock()
 	c.vmFirewallLastGoneAt = c.vmFirewallReverseTimeNow()
@@ -40,6 +40,50 @@ func (c *nodeLoadBalancerController) vmFirewallLastGone() time.Time {
 	c.vmFirewallOrphanMu.Lock()
 	defer c.vmFirewallOrphanMu.Unlock()
 	return c.vmFirewallLastGoneAt
+}
+
+// annotationVMFirewallReverseDoneAt is stamped on every other anchor just before
+// the anchor of a reversed VM is deleted: the reverse ends with its anchor, so
+// the time it ended lives on the anchors of the VMs still to come, and the pacing
+// delay survives a restart.
+const annotationVMFirewallReverseDoneAt = vmFirewallAnnotationPrefix + "reverse-done-at"
+
+// stampVMFirewallReverseDone writes the time a reverse migration is ending onto
+// every other anchor. It runs before the anchor of the finished VM is deleted, so
+// a crash leaves the stamp or the anchor, never neither.
+func (c *nodeLoadBalancerController) stampVMFirewallReverseDone(ctx context.Context, finished *corev1.ConfigMap) error {
+	anchors, err := c.listVMFirewallAnchors(ctx)
+	if err != nil {
+		return err
+	}
+	now := c.vmFirewallReverseTimeNow().Format(time.RFC3339Nano)
+	for index := range anchors {
+		if anchors[index].Name == finished.Name {
+			continue
+		}
+		if _, _, err := c.updateVMFirewallAnchor(ctx, &anchors[index], func(cm *corev1.ConfigMap) (bool, error) {
+			if cm.Annotations[annotationVMFirewallReverseDoneAt] == now {
+				return false, nil
+			}
+			cm.Annotations[annotationVMFirewallReverseDoneAt] = now
+			return true, nil
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// vmFirewallReverseLastDone is the latest end of a reverse migration the anchors
+// or this process remember.
+func (c *nodeLoadBalancerController) vmFirewallReverseLastDone(anchors []corev1.ConfigMap) time.Time {
+	last := c.vmFirewallLastGone()
+	for index := range anchors {
+		if at, err := time.Parse(time.RFC3339Nano, anchors[index].Annotations[annotationVMFirewallReverseDoneAt]); err == nil && at.After(last) {
+			last = at
+		}
+	}
+	return last
 }
 
 // isAdoptee says whether the Service takes the per-VM firewall by rename (reverse
@@ -162,7 +206,7 @@ func (c *nodeLoadBalancerController) startVMFirewallReverse(
 		}
 	}
 	now := c.vmFirewallReverseTimeNow()
-	if last := c.vmFirewallLastGone(); !last.IsZero() {
+	if last := c.vmFirewallReverseLastDone(anchors); !last.IsZero() {
 		if until := last.Add(4 * c.provider.vmFirewallSettle()); now.Before(until) {
 			return vmFirewallWait(until.Sub(now), "public-node-local: the reverse migration of VM %s waits for the pacing delay after the last VM", vmUUID)
 		}

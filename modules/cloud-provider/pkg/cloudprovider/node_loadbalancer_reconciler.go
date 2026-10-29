@@ -146,8 +146,8 @@ type nodeLoadBalancerController struct {
 	// per-VM firewall anchors and the scan for orphans. Guarded by vmFirewallOrphanMu.
 	vmFirewallEnqueuedAt time.Time
 	vmFirewallScannedAt  time.Time
-	// vmFirewallLastGoneAt is when the last anchor was deleted, in memory only: the
-	// reverse migration ends with its anchor, and the next VM waits from here.
+	// vmFirewallLastGoneAt is when this process last saw an anchor deleted. The
+	// durable record of a reverse migration ending is the stamp on the anchors left.
 	// Guarded by vmFirewallOrphanMu.
 	vmFirewallLastGoneAt time.Time
 	// allGoneSince records, in memory only, when every published Node of a Service

@@ -450,6 +450,9 @@ func (c *nodeLoadBalancerController) deleteVMFirewallAnchorAfterUnadopt(ctx cont
 	if fresh.UID != anchor.UID || fresh.Annotations[annotationVMFirewallPendingOp] != string(vmFirewallOpUnadopt) {
 		return errors.New("public-node-local: the VM firewall rename receipt changed before the anchor was deleted")
 	}
+	if err := c.stampVMFirewallReverseDone(ctx, fresh); err != nil {
+		return err
+	}
 	if containsString(fresh.Finalizers, vmFirewallAnchorFinalizer) {
 		stripped := fresh.DeepCopy()
 		kept := stripped.Finalizers[:0]

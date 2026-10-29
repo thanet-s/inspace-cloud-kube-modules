@@ -347,6 +347,12 @@ func (c *nodeLoadBalancerController) finalizeVMFirewallAnchor(ctx context.Contex
 		fresh.Annotations[annotationVMFirewallPendingOp] != string(vmFirewallOpDelete) {
 		return errors.New("public-node-local: the VM firewall delete receipt changed before the anchor was finalized")
 	}
+	if plan, ok, planErr := (vmFirewallAnchorView{cm: fresh}).migration(); planErr == nil && ok && plan.Direction == vmFirewallMigrationDirectionReverse {
+		// The end of a reverse migration is remembered on the anchors still to come.
+		if err := c.stampVMFirewallReverseDone(ctx, fresh); err != nil {
+			return err
+		}
+	}
 	stripped := fresh.DeepCopy()
 	kept := stripped.Finalizers[:0]
 	for _, finalizer := range stripped.Finalizers {
