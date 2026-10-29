@@ -193,6 +193,10 @@ func (c *nodeLoadBalancerController) startVMFirewallMigration(ctx context.Contex
 		}
 		return vmFirewallWait(nodeLoadBalancerRetry, "public-node-local: the migration of VM %s waits: %s", vmUUID, reason)
 	}
+	// The per-VM firewall is attached to this VM, which needs a healthy Node.
+	if !publicNodeLocalVMNodeHealthy(node) {
+		return vmFirewallWait(nodeLoadBalancerRetry, "public-node-local: the migration of VM %s waits: its Node %s is not healthy", vmUUID, node.Name)
+	}
 	baseUUID, err := c.vmFirewallMigrationBaseFirewall(ctx)
 	if err != nil {
 		return err

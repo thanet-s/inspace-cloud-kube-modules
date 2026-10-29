@@ -145,28 +145,33 @@ func (c *nodeLoadBalancerController) writeVMFirewallMigrationPlan(
 }
 
 // stepVMFirewallMigration advances the migration recorded on an anchor by at
-// most one durable step. It reports true once the VM is done. Every phase
-// resumes from the record and the receipts, so a restart between any two
-// writes continues where the last one stopped.
+// most one durable step. It reports whether the migration owns this pass; it
+// does not when the VM has no public-node-local Node any more, and the pass
+// then goes on with the VM's ordinary upkeep, which collects what a gone VM
+// left. Every phase resumes from the record and the receipts, so a restart
+// between any two writes continues where the last one stopped.
 func (c *nodeLoadBalancerController) stepVMFirewallMigration(ctx context.Context, vmUUID string, anchor *corev1.ConfigMap) (bool, error) {
 	view := vmFirewallAnchorView{cm: anchor}
 	plan, ok, err := view.migration()
 	if err != nil || !ok {
-		return false, err
+		return err != nil, err
 	}
 	node, err := c.publicNodeLocalNodeOfVM(ctx, vmUUID)
 	if err != nil {
-		return false, err
+		return true, err
+	}
+	if node == nil {
+		return false, nil
 	}
 	anchors, err := c.listVMFirewallAnchors(ctx)
 	if err != nil {
-		return false, err
+		return true, err
 	}
 	if allowed, reason := c.vmFirewallMigrationAllowed(ctx, vmUUID, node, anchors, c.nodeLoadBalancerFirewallRelationTime()); !allowed {
 		if vmFirewallMigrationReasonSilent(reason) {
-			return false, nil
+			return true, nil
 		}
-		return false, vmFirewallWait(nodeLoadBalancerRetry, "public-node-local: the migration of VM %s waits: %s", vmUUID, reason)
+		return true, vmFirewallWait(nodeLoadBalancerRetry, "public-node-local: the migration of VM %s waits: %s", vmUUID, reason)
 	}
 	switch plan.Phase {
 	case vmFirewallMigrationPhasePlanned:
@@ -182,7 +187,7 @@ func (c *nodeLoadBalancerController) stepVMFirewallMigration(ctx context.Context
 	default:
 		err = fmt.Errorf("public-node-local: the migration of VM %s is in phase %q, which this build can not continue", vmUUID, plan.Phase)
 	}
-	return false, err
+	return true, err
 }
 
 // authorizeVMFirewallMigrationOpen is the final authority of an add of the

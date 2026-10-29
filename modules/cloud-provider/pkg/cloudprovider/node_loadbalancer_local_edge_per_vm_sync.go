@@ -138,8 +138,9 @@ func (c *nodeLoadBalancerController) syncVMFirewall(ctx context.Context, vmUUID 
 		return c.repairVMFirewall(ctx, anchor)
 	}
 	if view.get(annotationVMFirewallMigration) != "" {
-		_, err := c.stepVMFirewallMigration(ctx, vmUUID, anchor)
-		return err
+		if handled, err := c.stepVMFirewallMigration(ctx, vmUUID, anchor); handled || err != nil {
+			return err
+		}
 	}
 	applied, err := view.applied()
 	if err != nil {

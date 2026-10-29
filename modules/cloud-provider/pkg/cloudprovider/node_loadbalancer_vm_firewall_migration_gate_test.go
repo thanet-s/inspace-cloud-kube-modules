@@ -225,3 +225,38 @@ func TestAnAddOnAMigratingVMWaits(t *testing.T) {
 		t.Fatalf("a done migration must not hold a per-VM add: %v", err)
 	}
 }
+
+// The per-VM firewall is attached to the VM, so a Node that is not ready does
+// not start a migration.
+func TestVMFirewallMigrationWaitsForAHealthyNode(t *testing.T) {
+	m := newGatewayCluster(t, VMFirewallMigrationManual)
+	m.annotateNode(mgGateway1.name, "true")
+	node, err := m.kube.CoreV1().Nodes().Get(m.ctx, mgGateway1.name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	node.Status.Conditions = []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionFalse}}
+	if _, err := m.kube.CoreV1().Nodes().UpdateStatus(m.ctx, node, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	err = m.controller.syncVMFirewall(m.ctx, mgGateway1.uuid)
+	if err == nil || !strings.Contains(err.Error(), "not healthy") || m.anchor(mgGateway1) != nil {
+		t.Fatalf("a NotReady Node: err=%v anchor=%v", err, m.anchor(mgGateway1))
+	}
+}
+
+// A VM whose Node is gone is not the migration's any more: the pass falls
+// through to the ordinary upkeep and does not wait forever.
+func TestVMFirewallMigrationLeavesAGoneNodeToTheUpkeep(t *testing.T) {
+	m := newGatewayCluster(t, VMFirewallMigrationManual)
+	m.annotateNode(mgGateway1.name, "true")
+	m.runUntil(300, "the first gateway is done", m.phaseIs(mgGateway1, vmFirewallMigrationPhaseDone))
+	if err := m.kube.CoreV1().Nodes().Delete(m.ctx, mgGateway1.name, metav1.DeleteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	for pass := 0; pass < 3; pass++ {
+		if err := m.controller.syncVMFirewall(m.ctx, mgGateway1.uuid); err != nil && strings.Contains(err.Error(), "migration") {
+			t.Fatalf("a gone Node keeps the migration waiting: %v", err)
+		}
+	}
+}
