@@ -115,6 +115,23 @@ func TestVMFirewallLiveConstants(t *testing.T) {
 	}
 }
 
+// InSpace ignores the name field of a PUT and answers 200, so a rename counts
+// only when the name reads back.
+func TestVMFirewallRenameIsVerifiedByReadback(t *testing.T) {
+	ignored := inspace.Firewall{Name: "inlb-old", DisplayName: "inlb-old"}
+	if vmFirewallRenameApplied(ignored, "inlb-new") {
+		t.Fatal("an ignored rename must not read as applied")
+	}
+	renamed := inspace.Firewall{DisplayName: "inlb-new"}
+	if !vmFirewallRenameApplied(renamed, "inlb-new") {
+		t.Fatal("a renamed firewall must read as applied")
+	}
+	request, err := vmFirewallUpdateRequest(vmTestCluster, vmTestVM, vmTestCurrentFirewall(t), nil)
+	if err == nil {
+		t.Fatalf("an empty rule set must not produce a request: %#v", request)
+	}
+}
+
 // PUT latency grew with the rule count in the live test (about 1 s at 4 rules,
 // 3.3 s at 20, 10 s at 50), so the per-PUT deadline has to grow with it, and it
 // must stay below the retire delay so a timed-out request can never still be in

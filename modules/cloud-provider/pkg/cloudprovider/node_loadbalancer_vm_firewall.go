@@ -353,6 +353,14 @@ func vmFirewallMutationTimeout(ruleCount int) time.Duration {
 	return timeout
 }
 
+// vmFirewallRenameApplied reports whether a rename read back. InSpace honours
+// only the display_name field of a PUT; the name field is accepted with a 200
+// and ignored, so a rename is never assumed from the response. Only the name
+// read back from the list endpoint proves it (a single GET is not available).
+func vmFirewallRenameApplied(firewall inspace.Firewall, wantName string) bool {
+	return firewall.EffectiveName() == wantName
+}
+
 // errVMFirewallPortConflict reports that two Services ask for one public port
 // of the same VM. The operation that would create it is refused and nothing is
 // persisted; existing members stay untouched.

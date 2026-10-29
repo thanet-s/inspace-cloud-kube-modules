@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -283,6 +284,10 @@ const (
 	// vmFirewallNewFirewall stands in for the UUID of a firewall that does not
 	// exist yet when the attach capacity of a VM is checked before a create.
 	vmFirewallNewFirewall = "(new per-VM firewall)"
+
+	// vmFirewallCreateAbsenceReads is how many spaced absent reads retire an
+	// ambiguous create after the retire delay.
+	vmFirewallCreateAbsenceReads = 2
 )
 
 // errVMFirewallDrift reports a per-VM firewall whose cloud state is not what
@@ -944,21 +949,114 @@ func (c *nodeLoadBalancerController) resolveVMFirewallReceipt(
 		// Staged but never issued: no request was ever authorized.
 		return true, c.resetVMFirewallReceipt(ctx, anchor)
 	}
+	issuedAt, err := time.Parse(time.RFC3339Nano, view.get(annotationVMFirewallIssuedAt))
+	if err != nil {
+		return false, corruptVMFirewallLedger("anchor %s issued-at %q: %v", anchor.Name, view.get(annotationVMFirewallIssuedAt), err)
+	}
+	now := c.nodeLoadBalancerFirewallRelationTime()
+	retireAt := issuedAt.Add(nodeLoadBalancerFirewallRelationRetireDelay)
+	untilRetire := retireAt.Sub(now)
+	if untilRetire > nodeLoadBalancerRetry {
+		untilRetire = nodeLoadBalancerRetry
+	}
 	cluster := c.provider.config.ClusterID
 	name, err := inspace.NodeLoadBalancerVMFirewallName(cluster, vmUUID)
 	if err != nil {
 		return false, err
 	}
+	drift := func(format string, args ...any) (bool, error) {
+		err := vmFirewallDrift(vmUUID, format, args...)
+		c.recordVMFirewallEvent(ctx, c.vmFirewallMemberServices(ctx, members), vmFirewallDriftReason, err)
+		return false, err
+	}
 	byName, err := vmFirewallByNameFromItems(items, name)
 	if err != nil {
-		return false, vmFirewallDrift(vmUUID, "%v", err)
+		return drift("%v", err)
 	}
-	if byName != nil {
-		hash, hashErr := inspace.NodeLoadBalancerVMFirewallSpecHash(byName.Rules)
-		if hashErr == nil && hash == view.get(annotationVMFirewallPendingHash) &&
-			(op == vmFirewallOpCreate || byName.UUID == view.uuid()) {
+	pendingHash := view.get(annotationVMFirewallPendingHash)
+
+	if op == vmFirewallOpCreate {
+		if byName != nil {
+			// A create that landed late, or one the readback simply saw: adopt it
+			// by its deterministic name when it carries exactly the pending rules.
+			hash, hashErr := inspace.NodeLoadBalancerVMFirewallSpecHash(byName.Rules)
+			if hashErr != nil || hash != pendingHash {
+				return drift("firewall %s carries the per-VM name with rules other than the pending create", byName.UUID)
+			}
+			if err := inspace.ValidateNodeLoadBalancerVMFirewall(*byName, cluster, vmUUID, c.provider.config.BillingAccountID, pendingHash); err != nil {
+				return drift("firewall %s: %v", byName.UUID, err)
+			}
 			return true, c.commitVMFirewallMutation(ctx, anchor, *byName)
 		}
+		if now.Before(retireAt) {
+			return false, vmFirewallWait(untilRetire, "public-node-local: VM firewall create for %s is ambiguous; waiting for readback", vmUUID)
+		}
+		return c.retireAbsentVMFirewallCreate(ctx, anchor, now)
 	}
-	return false, vmFirewallWait(nodeLoadBalancerRetry, "public-node-local: VM firewall %s for %s is not read back yet", op, vmUUID)
+
+	firewall, err := exactNodeLoadBalancerFirewallFromItems(items, view.uuid())
+	if err != nil {
+		return drift("recorded firewall %s is not readable during a PUT: %v", view.uuid(), err)
+	}
+	if byName == nil || byName.UUID != firewall.UUID {
+		return drift("recorded firewall %s is not the one carrying the per-VM name", view.uuid())
+	}
+	hash, hashErr := inspace.NodeLoadBalancerVMFirewallSpecHash(firewall.Rules)
+	if hashErr != nil {
+		return drift("firewall %s: %v", firewall.UUID, hashErr)
+	}
+	if hash == pendingHash {
+		return true, c.commitVMFirewallMutation(ctx, anchor, *firewall)
+	}
+	if hash == view.appliedHash() {
+		if now.Before(retireAt) {
+			return false, vmFirewallWait(untilRetire, "public-node-local: VM firewall update for %s is ambiguous; waiting for readback", vmUUID)
+		}
+		// The request can no longer be in flight and a fresh read still shows the
+		// applied rules, so it did not commit. Clear this one receipt, once; the
+		// next pass re-derives the change and issues it again with full authority.
+		return true, c.resetVMFirewallReceipt(ctx, anchor)
+	}
+	return drift("firewall %s has rules that are neither the applied nor the pending ledger", firewall.UUID)
+}
+
+// retireAbsentVMFirewallCreate counts the spaced absent reads that, after the
+// retire delay, prove an ambiguous create did not commit. Two reads at least
+// one confirmation delay apart retire the receipt.
+func (c *nodeLoadBalancerController) retireAbsentVMFirewallCreate(ctx context.Context, anchor *corev1.ConfigMap, now time.Time) (bool, error) {
+	view := vmFirewallAnchorView{cm: anchor}
+	delay := c.nodeLoadBalancerFirewallRelationAbsenceDelay()
+	count := 0
+	if raw := view.get(annotationVMFirewallAbsenceCount); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed < 1 || parsed > nodeLoadBalancerAbsenceConfirmations {
+			return false, corruptVMFirewallLedger("anchor %s absence count %q", anchor.Name, raw)
+		}
+		count = parsed
+	}
+	if count > 0 {
+		checked, err := time.Parse(time.RFC3339Nano, view.get(annotationVMFirewallAbsenceCheckedAt))
+		if err != nil {
+			return false, corruptVMFirewallLedger("anchor %s absence-checked-at %q", anchor.Name, view.get(annotationVMFirewallAbsenceCheckedAt))
+		}
+		if now.Before(checked.Add(delay)) {
+			return false, vmFirewallWait(checked.Add(delay).Sub(now), "public-node-local: VM firewall create for %s: waiting for the second spaced absent read", view.vm())
+		}
+		if count+1 >= vmFirewallCreateAbsenceReads {
+			return true, c.resetVMFirewallReceipt(ctx, anchor)
+		}
+	}
+	expected := anchor.Annotations
+	_, _, err := c.updateVMFirewallAnchor(ctx, anchor, func(cm *corev1.ConfigMap) (bool, error) {
+		if !vmFirewallSameReceipt(cm.Annotations, expected) {
+			return false, errors.New("public-node-local: the VM firewall receipt changed before its absence was recorded")
+		}
+		cm.Annotations[annotationVMFirewallAbsenceCount] = strconv.Itoa(count + 1)
+		cm.Annotations[annotationVMFirewallAbsenceCheckedAt] = now.Format(time.RFC3339Nano)
+		return true, nil
+	})
+	if err != nil {
+		return false, err
+	}
+	return false, vmFirewallWait(delay, "public-node-local: VM firewall create for %s: first absent read recorded", view.vm())
 }
