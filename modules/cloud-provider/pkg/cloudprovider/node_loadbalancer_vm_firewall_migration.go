@@ -26,6 +26,7 @@ const (
 	publicNodeLocalReasonVMFirewallMigrationBlocked = "PublicNodeLocalVMFirewallMigrationBlocked"
 
 	vmFirewallMigrationDirectionForward = "forward"
+	vmFirewallMigrationDirectionReverse = "reverse"
 
 	vmFirewallMigrationPhasePlanned   = "planned"
 	vmFirewallMigrationPhaseOpened    = "opened"
@@ -50,6 +51,16 @@ type vmFirewallMigrationSource struct {
 // vmFirewallMigrationPlan is the plan and the progress record of one VM. The
 // anchor stores it as JSON in the migration annotation; the audit reads the
 // phase and the source firewalls from it.
+//
+// A forward plan moves the per-Service firewalls of the VM onto its per-VM
+// firewall: Sources are those firewalls, sorted by firewall UUID, and Adoptee is
+// the firewall UUID that is renamed (strategy B). A reverse plan moves the
+// Services of the per-VM firewall back onto their own firewalls: Sources are
+// the ledger members, sorted by Service UID, each with the UUID of its
+// per-Service firewall when that exists at plan time and empty when it is yet
+// to be created, and Adoptee is the Service UID whose firewall the per-VM
+// firewall is renamed into (strategy B). Strategy A attaches every member's own
+// firewall and then retires the per-VM firewall.
 type vmFirewallMigrationPlan struct {
 	Direction string                      `json:"direction"`
 	Phase     string                      `json:"phase"`
@@ -58,6 +69,9 @@ type vmFirewallMigrationPlan struct {
 	Adoptee   string                      `json:"adoptee,omitempty"`
 	// DoneAt is when the phase became done; it paces the next VM.
 	DoneAt string `json:"doneAt,omitempty"`
+	// OpenedAt is when a reverse plan's last attach read back; its settle delay
+	// counts from here.
+	OpenedAt string `json:"openedAt,omitempty"`
 }
 
 // errVMFirewallMigrationDeferred says the VM can not be planned yet: a Service
@@ -95,8 +109,14 @@ func (p vmFirewallMigrationPlan) sourceOfService(uid string) (vmFirewallMigratio
 }
 
 func validateVMFirewallMigrationPlan(p vmFirewallMigrationPlan) error {
+	if p.Direction == vmFirewallMigrationDirectionReverse {
+		return validateVMFirewallReversePlan(p)
+	}
 	if p.Direction != vmFirewallMigrationDirectionForward {
 		return fmt.Errorf("unsupported migration direction %q", p.Direction)
+	}
+	if p.OpenedAt != "" {
+		return errors.New("only a reverse migration has an opened time")
 	}
 	switch p.Phase {
 	case vmFirewallMigrationPhasePlanned, vmFirewallMigrationPhaseOpened, vmFirewallMigrationPhaseDetaching,
