@@ -445,9 +445,8 @@ func buildPerVMPublicNodeLocalFixture(t *testing.T, n int, shape func(*corev1.Se
 	provider.config.NodeLoadBalancer.ControllerNamespace = vmTestNamespace
 	provider.config.NodeLoadBalancer.VMFirewallSettle = time.Nanosecond
 	controller := &nodeLoadBalancerController{
-		provider:       provider,
-		assignFenceNow: testAssignFenceClock,
-		queue:          workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]()),
+		provider: provider,
+		queue:    workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]()),
 	}
 	t.Cleanup(controller.queue.ShutDown)
 	controller.endpointSlices = publicNodeLocalTestEndpointSliceLister(t, service, nodeNames...)

@@ -13,6 +13,10 @@ import (
 // with "durable firewall assignment fence is not fresh".
 var testAssignFenceClock = newNonSteppingClock(time.Now)
 
+// Every controller the tests build, 165 literals of them, reads the fence
+// clock through assignFenceWall, so none can be left on the raw wall clock.
+func init() { assignFenceWall = testAssignFenceClock }
+
 func newNonSteppingClock(wall func() time.Time) func() time.Time {
 	var mu sync.Mutex
 	var last time.Time

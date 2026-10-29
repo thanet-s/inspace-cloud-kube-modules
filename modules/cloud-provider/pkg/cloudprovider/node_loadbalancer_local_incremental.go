@@ -93,8 +93,12 @@ func (c *nodeLoadBalancerController) assignFenceClock() time.Time {
 	if c.assignFenceNow != nil {
 		return c.assignFenceNow().UTC()
 	}
-	return time.Now().UTC()
+	return assignFenceWall().UTC()
 }
+
+// assignFenceWall is the wall clock behind assignFenceClock. It is time.Now in
+// production; the tests replace it, once, with a clock that never steps back.
+var assignFenceWall = time.Now
 
 func (c *nodeLoadBalancerController) publicNodeLocalClock() time.Time {
 	if c.publicNodeLocalNow != nil {

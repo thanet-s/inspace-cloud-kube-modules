@@ -3197,7 +3197,7 @@ func (c *nodeLoadBalancerController) ensureServiceFirewallAssignmentIntent(
 	if !nodeLoadBalancerDatapathMatchesDesired(datapath, current, activeShard) || len(datapath.Status.LoadBalancer.Ingress) == 0 {
 		return nil, false, errors.New("node load balancer: exact private VIP must exist before firewall assignment authorization")
 	}
-	started := time.Now().UTC().Format(time.RFC3339Nano)
+	started := c.assignFenceClock().Format(time.RFC3339Nano)
 	updated, changed, err := c.updateExactParentService(ctx, current, func(copy *corev1.Service) (bool, error) {
 		if copy.Annotations[annotationNodeLoadBalancerDatapathActive] != activeShard ||
 			copy.Annotations[annotationNodeLoadBalancerFirewallUUID] != firewallUUID ||
@@ -6317,7 +6317,7 @@ func (c *nodeLoadBalancerController) confirmMissingServiceFirewallsForWithdrawal
 	missing []string,
 	notBefore time.Time,
 ) (bool, error) {
-	now := time.Now().UTC()
+	now := c.assignFenceClock()
 	if now.Before(notBefore) {
 		return false, nil
 	}
