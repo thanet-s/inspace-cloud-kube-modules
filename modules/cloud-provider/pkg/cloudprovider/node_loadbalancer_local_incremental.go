@@ -88,6 +88,14 @@ func (s publicNodeLocalNodeSet) holdCause(waiting error) error {
 	return waiting
 }
 
+// assignFenceClock is the time the assignment-fence freshness is judged at.
+func (c *nodeLoadBalancerController) assignFenceClock() time.Time {
+	if c.assignFenceNow != nil {
+		return c.assignFenceNow().UTC()
+	}
+	return time.Now().UTC()
+}
+
 func (c *nodeLoadBalancerController) publicNodeLocalClock() time.Time {
 	if c.publicNodeLocalNow != nil {
 		return c.publicNodeLocalNow().UTC()
@@ -894,7 +902,7 @@ func (c *nodeLoadBalancerController) ensureActivePublicNodeLocalAssignmentIntent
 		return service, err
 	}
 	vmSet := strings.Join(vmUUIDs, ",")
-	now := time.Now().UTC()
+	now := c.assignFenceClock()
 	updated, _, err := c.updateExactParentService(ctx, current, func(copy *corev1.Service) (bool, error) {
 		startedAt, parseErr := time.Parse(time.RFC3339Nano, copy.Annotations[annotationNodeLoadBalancerFirewallAssignAt])
 		fresh := parseErr == nil && !startedAt.After(now) && now.Before(startedAt.Add(nodeLoadBalancerPublicNodeLocalAssignTimeout))
@@ -1020,7 +1028,7 @@ func (c *nodeLoadBalancerController) validateActivePublicNodeLocalAssignState(
 		return fmt.Errorf("public-node-local: VM %s is absent from the exact child VIP status", vmUUID)
 	}
 	started, err := time.Parse(time.RFC3339Nano, current.Annotations[annotationNodeLoadBalancerFirewallAssignAt])
-	now := time.Now().UTC()
+	now := c.assignFenceClock()
 	if err != nil || started.After(now) || !now.Before(started.Add(nodeLoadBalancerPublicNodeLocalAssignTimeout)) {
 		return errors.New("public-node-local: durable firewall assignment fence is not fresh")
 	}

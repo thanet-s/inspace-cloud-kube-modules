@@ -1532,6 +1532,7 @@ func restartPublicNodeLocalController(f *publicNodeLocalTransientFixture) {
 		provider:       f.provider,
 		queue:          workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]()),
 		endpointSlices: f.controller.endpointSlices,
+		assignFenceNow: testAssignFenceClock,
 	}
 	f.controller = controller
 }

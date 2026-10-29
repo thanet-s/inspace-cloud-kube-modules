@@ -125,6 +125,10 @@ type nodeLoadBalancerController struct {
 	// production constructor always installs the real clock and convergence delay.
 	firewallRelationNow         func() time.Time
 	firewallRelationAbsentDelay time.Duration
+	// assignFenceNow is the clock of the assignment-fence freshness checks. It is
+	// nil in production, where the wall clock is used; tests install a clock that
+	// never steps back, because a fence is stamped and checked by different calls.
+	assignFenceNow func() time.Time
 	// publicNodeLocalNow is the clock of the endpoint-gone grace. It is nil in
 	// production, where the wall clock is used.
 	publicNodeLocalNow func() time.Time

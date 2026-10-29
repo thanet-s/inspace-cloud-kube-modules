@@ -1609,7 +1609,7 @@ func (c *nodeLoadBalancerController) validateLivePublicNodeLocalServiceFirewall(
 				}
 			}
 			startedAt, timeErr := time.Parse(time.RFC3339Nano, service.Annotations[annotationNodeLoadBalancerFirewallAssignAt])
-			now := time.Now().UTC()
+			now := c.assignFenceClock()
 			staged = canonical && seenVM && timeErr == nil && !startedAt.After(now) && now.Before(startedAt.Add(nodeLoadBalancerPublicNodeLocalAssignTimeout))
 		}
 		if !active && !staged {
@@ -2110,7 +2110,7 @@ func (c *nodeLoadBalancerController) ensurePublicNodeLocalAssignmentIntent(
 	if err := c.validatePublicNodeLocalAssignmentState(ctx, current, intent, desired, edge, addresses, false, false); err != nil {
 		return current, false, err
 	}
-	now := time.Now().UTC()
+	now := c.assignFenceClock()
 	updated, changed, err := c.updateExactParentService(ctx, current, func(copy *corev1.Service) (bool, error) {
 		assigning := copy.Annotations[annotationNodeLoadBalancerFirewallAssigning]
 		started := copy.Annotations[annotationNodeLoadBalancerFirewallAssignAt]
@@ -2286,7 +2286,7 @@ func (c *nodeLoadBalancerController) validatePublicNodeLocalAssignmentState(
 		if err != nil {
 			return fmt.Errorf("public-node-local: invalid durable assignment timestamp: %w", err)
 		}
-		now := time.Now().UTC()
+		now := c.assignFenceClock()
 		if startedAt.After(now) || !now.Before(startedAt.Add(nodeLoadBalancerPublicNodeLocalAssignTimeout)) {
 			return errors.New("public-node-local: durable firewall assignment fence is not fresh")
 		}

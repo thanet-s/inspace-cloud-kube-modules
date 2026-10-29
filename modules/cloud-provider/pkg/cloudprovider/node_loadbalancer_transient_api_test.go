@@ -220,8 +220,9 @@ func newPublishedPublicNodeLocalFixtureWith(t *testing.T, n int, shape func(*cor
 	}
 	provider.kubeClient = kubefake.NewSimpleClientset(objects...)
 	controller := &nodeLoadBalancerController{
-		provider: provider,
-		queue:    workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]()),
+		provider:       provider,
+		assignFenceNow: testAssignFenceClock,
+		queue:          workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]()),
 	}
 	t.Cleanup(controller.queue.ShutDown)
 	controller.endpointSlices = publicNodeLocalTestEndpointSliceLister(t, service, nodeNames...)
