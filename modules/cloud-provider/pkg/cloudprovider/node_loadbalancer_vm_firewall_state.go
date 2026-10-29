@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -1077,4 +1078,101 @@ func (c *nodeLoadBalancerController) retireAbsentVMFirewallCreate(ctx context.Co
 		return false, err
 	}
 	return false, vmFirewallWait(delay, "public-node-local: VM firewall create for %s: first absent read recorded", view.vm())
+}
+
+// errVMFirewallReceiptPending reports a VM whose anchor holds an unresolved
+// receipt that concerns the asking Service. The VM is ambiguous for every
+// member: callers resolve the receipt and requeue, and never plan on top of it.
+var errVMFirewallReceiptPending = errors.New("public-node-local: a VM firewall receipt is unresolved")
+
+// vmEdgeAssigned returns the VMs on which Service serviceUID is open under
+// policy. A VM is in the set only when every one of these holds in one fresh
+// read: the anchor applied ledger has the entry, the anchor has no receipt,
+// the firewall its uuid names is in items, attached to this VM and only this
+// VM, owned (name, billing, description), with exactly the applied rules.
+// Anything else leaves the VM out; an open receipt that concerns the Service
+// is also reported through errVMFirewallReceiptPending.
+func (c *nodeLoadBalancerController) vmEdgeAssigned(
+	serviceUID, policy string,
+	items []inspace.Firewall,
+	anchors []corev1.ConfigMap,
+) (map[string]struct{}, error) {
+	assigned := map[string]struct{}{}
+	pendingVMs := []string{}
+	key := vmFirewallMemberKey{UID: serviceUID, Policy: policy}
+	for index := range anchors {
+		view := vmFirewallAnchorView{cm: &anchors[index]}
+		vmUUID := view.vm()
+		applied, err := view.applied()
+		if err != nil {
+			continue // a corrupt anchor holds its VM: the Service is not open there
+		}
+		_, inApplied := applied.find(key)
+		if view.hasReceipt() {
+			concerns := inApplied
+			if pending, pendingErr := view.pending(); pendingErr == nil {
+				_, inPending := pending.find(key)
+				concerns = concerns || inPending
+			} else {
+				concerns = true
+			}
+			if concerns {
+				pendingVMs = append(pendingVMs, vmUUID)
+			}
+			continue
+		}
+		if !inApplied || !validNodeLoadBalancerCloudUUID(view.uuid()) {
+			continue
+		}
+		firewall, err := exactNodeLoadBalancerFirewallFromItems(items, view.uuid())
+		if err != nil || !vmFirewallAttachedTo(*firewall, vmUUID) {
+			continue
+		}
+		if err := inspace.ValidateNodeLoadBalancerVMFirewall(
+			*firewall, c.provider.config.ClusterID, vmUUID, c.provider.config.BillingAccountID, view.appliedHash(),
+		); err != nil {
+			continue
+		}
+		assigned[vmUUID] = struct{}{}
+	}
+	if len(pendingVMs) != 0 {
+		sort.Strings(pendingVMs)
+		return assigned, fmt.Errorf("%w on VM(s) %s", errVMFirewallReceiptPending, strings.Join(pendingVMs, ", "))
+	}
+	return assigned, nil
+}
+
+// errPublicNodeLocalVMFirewallSettling reports a Service step that must wait
+// for the per-VM firewall change to take effect everywhere before it relies on
+// the new edge. It is a bounded wait with a fixed requeue, not a fault.
+type errPublicNodeLocalVMFirewallSettling struct {
+	vmUUID     string
+	retryAfter time.Duration
+}
+
+func (e *errPublicNodeLocalVMFirewallSettling) Error() string {
+	return fmt.Sprintf("public-node-local: the VM firewall of %s was applied just now; waiting %s for it to take effect", e.vmUUID, e.retryAfter)
+}
+
+// vmFirewallSettle is how long a change must have been read back before a
+// Service relies on it: the configured value, else the measured default.
+func (p *Provider) vmFirewallSettle() time.Duration {
+	if settle := p.config.NodeLoadBalancer.VMFirewallSettle; settle > 0 {
+		return settle
+	}
+	return vmFirewallSettleDefault
+}
+
+// vmFirewallSettleRemaining is how much of the settle delay is left, counted
+// from the anchor's applied-at. An anchor that never applied anything has
+// nothing to settle.
+func vmFirewallSettleRemaining(anchor *corev1.ConfigMap, settle time.Duration, now time.Time) time.Duration {
+	appliedAt, ok, err := vmFirewallAnchorView{cm: anchor}.appliedAt()
+	if err != nil || !ok {
+		return 0
+	}
+	if remaining := appliedAt.Add(settle).Sub(now); remaining > 0 {
+		return remaining
+	}
+	return 0
 }

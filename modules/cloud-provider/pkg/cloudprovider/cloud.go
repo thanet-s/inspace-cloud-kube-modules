@@ -202,6 +202,10 @@ type NodeLoadBalancerConfig struct {
 	// firewall keeps one anchor ConfigMap per VM there. It is optional until
 	// the per-VM firewall mode is on.
 	ControllerNamespace string
+	// VMFirewallSettle is how long a Service waits after a per-VM firewall
+	// change was read back before it relies on it. Zero or less means the
+	// measured default (vmFirewallSettleDefault).
+	VMFirewallSettle time.Duration
 }
 
 type Provider struct {

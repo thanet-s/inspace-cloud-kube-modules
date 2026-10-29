@@ -267,6 +267,14 @@ func nodeLoadBalancerRequeueDelay(err error) (time.Duration, bool) {
 	if errors.As(err, &pending) {
 		return pending.retryAfter, true
 	}
+	var settling *errPublicNodeLocalVMFirewallSettling
+	if errors.As(err, &settling) {
+		// A settle wait ends at a known time; the backoff must not grow.
+		if settling.retryAfter > 0 {
+			return settling.retryAfter, true
+		}
+		return nodeLoadBalancerRetry, true
+	}
 	var holding *errPublicNodeLocalHolding
 	if errors.As(err, &holding) {
 		// A hold changes nothing, so a steady retry is safe and keeps recovery
