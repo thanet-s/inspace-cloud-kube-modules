@@ -22,6 +22,10 @@ import (
 // shard. The firewall is attached once to a Node and subsequently updated in
 // place, so adding or removing a shared Service cannot flap an established VM.
 func (c *nodeLoadBalancerController) sync(ctx context.Context, key string) error {
+	if vmUUID, isVM := parseVMFirewallQueueKey(key); isVM {
+		// A VM key is no Service key: it must be told apart before the split.
+		return c.syncVMFirewall(ctx, vmUUID)
+	}
 	namespace, name, err := cache.SplitMetaNamespaceKey(key)
 	if err != nil {
 		return err

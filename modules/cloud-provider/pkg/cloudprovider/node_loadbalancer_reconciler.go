@@ -138,6 +138,10 @@ type nodeLoadBalancerController struct {
 	// the delete of such an orphan.
 	vmFirewallOrphanMu    sync.Mutex
 	vmFirewallOrphanSince map[string]time.Time
+	// vmFirewallEnqueuedAt and vmFirewallScannedAt rate-limit the queueing of the
+	// per-VM firewall anchors and the scan for orphans. Guarded by vmFirewallOrphanMu.
+	vmFirewallEnqueuedAt time.Time
+	vmFirewallScannedAt  time.Time
 	// allGoneSince records, in memory only, when every published Node of a Service
 	// was first seen gone on cloud evidence alone. Guarded by endpointGoneMu.
 	allGoneSince map[string]time.Time
@@ -301,6 +305,7 @@ func (c *nodeLoadBalancerController) Run(stopCh <-chan struct{}) {
 			return
 		case <-ticker.C:
 			c.enqueueAll()
+			c.enqueueVMFirewallOrphans(ctx)
 		}
 	}
 }
@@ -395,6 +400,7 @@ func (c *nodeLoadBalancerController) enqueueAll() {
 			c.queue.Add(service.Namespace + "/" + service.Name)
 		}
 	}
+	c.enqueueVMFirewalls()
 }
 
 func isNodeLoadBalancerService(service *corev1.Service) bool {
