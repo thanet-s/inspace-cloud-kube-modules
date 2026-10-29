@@ -137,20 +137,20 @@ const publicNodeLocalReasonOldFirewallAttached = "PublicNodeLocalOldFirewallAtta
 // stayed attached after the promotion. The narrowing is applied by the new
 // firewall only once the old one is detached, so the age is the length of the
 // window in which a port or source range that the Service dropped is still open.
-func (c *nodeLoadBalancerController) noteOldFirewallAttached(ctx context.Context, service *corev1.Service, current, previous *inspace.Firewall) {
-	if current == nil || previous == nil || service.Annotations[annotationPublicNodeLocalTargetPolicy] != "" {
+func (c *nodeLoadBalancerController) noteOldFirewallAttached(ctx context.Context, service *corev1.Service, current, previous edgeID) {
+	if current.snapshot == nil || previous.snapshot == nil || service.Annotations[annotationPublicNodeLocalTargetPolicy] != "" {
 		return
 	}
-	assignments, err := nodeLoadBalancerFirewallVMAssignments(*previous)
+	assignments, err := c.publicNodeLocalEdgeFor(service).Assigned(ctx, service, previous)
 	if err != nil || len(assignments) == 0 {
 		return
 	}
-	kept := make(map[string]struct{}, len(current.Rules))
-	for _, rule := range current.Rules {
+	kept := make(map[string]struct{}, len(current.snapshot.Rules))
+	for _, rule := range current.snapshot.Rules {
 		kept[nodeLoadBalancerFirewallRuleKey(rule)] = struct{}{}
 	}
 	narrowed := false
-	for _, rule := range previous.Rules {
+	for _, rule := range previous.snapshot.Rules {
 		if _, found := kept[nodeLoadBalancerFirewallRuleKey(rule)]; !found {
 			narrowed = true
 		}
@@ -164,7 +164,7 @@ func (c *nodeLoadBalancerController) noteOldFirewallAttached(ctx context.Context
 	}
 	c.recordPublicNodeLocalEvent(ctx, service, publicNodeLocalReasonOldFirewallAttached, fmt.Errorf(
 		"public-node-local: the narrowed previous firewall %s is still attached to %d VM(s), %s after the promotion; what the Service dropped stays open until it is detached",
-		previous.UUID, len(assignments), age))
+		previous.firewallUUID, len(assignments), age))
 }
 
 // unparkPublicNodeLocalUnassign ends the park of a detach of the previous
@@ -321,7 +321,8 @@ func (c *nodeLoadBalancerController) finishPreviousPublicNodeLocalFirewall(
 	ctx context.Context,
 	key string,
 	service *corev1.Service,
-	current, previous *inspace.Firewall,
+	edge publicNodeLocalEdge,
+	current, previous edgeID,
 	currentAssigned map[string]struct{},
 	keep map[string]struct{},
 	members map[string]publicNodeLocalMember,
@@ -329,7 +330,7 @@ func (c *nodeLoadBalancerController) finishPreviousPublicNodeLocalFirewall(
 	if service.Annotations[annotationNodeLoadBalancerPreviousFirewall] == "" {
 		return false, nil
 	}
-	if previous != nil {
+	if previous.snapshot != nil {
 		stay := map[string]struct{}{}
 		var stayNodes []*corev1.Node
 		for name := range keep {
@@ -342,17 +343,17 @@ func (c *nodeLoadBalancerController) finishPreviousPublicNodeLocalFirewall(
 				stayNodes = append(stayNodes, member.node)
 			}
 		}
-		stale, err := staleNodeLoadBalancerFirewallAssignments(*previous, stay)
+		stale, err := staleNodeLoadBalancerFirewallAssignments(*previous.snapshot, stay)
 		if err != nil {
 			return true, c.holdOrFailPublicNodeLocal(ctx, service, err)
 		}
 		if len(stale) != 0 {
-			parked, err := c.detachServiceFirewallFromOtherNodesParked(ctx, service, previous, stayNodes)
+			parked, err := edge.Unassign(ctx, service, previous, stayNodes)
 			if err != nil {
 				return true, c.holdOrFailPublicNodeLocal(ctx, service, err)
 			}
 			if len(parked) != 0 {
-				if err := c.unparkPublicNodeLocalUnassign(ctx, service, previous.UUID, parked); err != nil {
+				if err := c.unparkPublicNodeLocalUnassign(ctx, service, previous.firewallUUID, parked); err != nil {
 					return true, c.holdOrFailPublicNodeLocal(ctx, service, err)
 				}
 				c.requeuePublicNodeLocal(key)
@@ -366,7 +367,7 @@ func (c *nodeLoadBalancerController) finishPreviousPublicNodeLocalFirewall(
 			return false, nil
 		}
 	}
-	if err := c.cleanupPreviousFirewall(ctx, service); err != nil {
+	if _, err := edge.Retire(ctx, service, previous); err != nil {
 		return true, c.holdOrFailPublicNodeLocal(ctx, service, err)
 	}
 	c.requeuePublicNodeLocal(key)

@@ -2142,7 +2142,7 @@ func (c *nodeLoadBalancerController) assignPublicNodeLocalFirewallWithFence(
 		}
 		var validateErr error
 		if service.Annotations[annotationPublicNodeLocalActivePool] != "" {
-			validateErr = c.validateActivePublicNodeLocalAssignState(ctx, service, intent, desired, firewall.UUID, vmUUID)
+			validateErr = c.validateActivePublicNodeLocalAssignState(ctx, service, intent, desired, perServiceEdgeID(firewall, desired.Hash), vmUUID)
 		} else {
 			validateErr = c.validatePublicNodeLocalAssignmentState(ctx, service, intent, desired, perServiceEdgeID(firewall, desired.Hash), addresses, true, false)
 		}
