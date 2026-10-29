@@ -98,7 +98,8 @@ func initializeCloud(config *cloudconfig.CompletedConfig) cloud.Interface {
 			DefaultNodeClass: os.Getenv("INSPACE_NODE_LOAD_BALANCER_DEFAULT_NODE_CLASS"),
 			NodesPerShard:    nodesPerShard,
 			// Values below 1 mean the default; the provider normalizes them.
-			MaxFirewallsPerVM: maxFirewallsPerVM,
+			MaxFirewallsPerVM:   maxFirewallsPerVM,
+			ControllerNamespace: parseCCMNamespace(),
 		},
 	})
 	if err != nil {
@@ -121,6 +122,12 @@ func parseMaxFirewallsPerVM() (int32, error) {
 		return inspaceprovider.DefaultMaxFirewallsPerVM, nil
 	}
 	return limit, nil
+}
+
+// parseCCMNamespace reads the namespace the CCM runs in (the chart passes it
+// through the downward API). An unset value is the empty string.
+func parseCCMNamespace() string {
+	return strings.TrimSpace(os.Getenv("INSPACE_CCM_NAMESPACE"))
 }
 
 func parseInt32WithDefault(name string, fallback int32) (int32, error) {

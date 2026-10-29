@@ -198,6 +198,10 @@ type NodeLoadBalancerConfig struct {
 	// MaxFirewallsPerVM is the most firewalls the CCM lets one VM carry. Zero
 	// or a negative value means DefaultMaxFirewallsPerVM.
 	MaxFirewallsPerVM int32
+	// ControllerNamespace is the namespace the CCM runs in. The per-VM
+	// firewall keeps one anchor ConfigMap per VM there. It is optional until
+	// the per-VM firewall mode is on.
+	ControllerNamespace string
 }
 
 type Provider struct {
