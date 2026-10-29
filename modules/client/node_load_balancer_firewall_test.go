@@ -1,6 +1,8 @@
 package inspace
 
 import (
+	"encoding/hex"
+	"math/rand"
 	"strings"
 	"testing"
 )
@@ -154,5 +156,212 @@ func TestNodeLoadBalancerFirewallContractRejectsIdentityAndPolicyDrift(t *testin
 				t.Fatal("drifted Service firewall was accepted")
 			}
 		})
+	}
+}
+
+const testVMFirewallUUID = "11111111-1111-4111-8111-111111111111"
+
+func vmFirewallTestRules(t *testing.T, ports ...int32) []FirewallRule {
+	t.Helper()
+	rules := make([]FirewallRule, 0, len(ports))
+	for _, port := range ports {
+		p := port
+		rules = append(rules, FirewallRule{Protocol: "tcp", Direction: "inbound", PortStart: &p, PortEnd: &p, EndpointSpecType: "any"})
+	}
+	return rules
+}
+
+func vmFirewallTestFirewall(t *testing.T, cluster, vmUUID string, billing int64, rules []FirewallRule) Firewall {
+	t.Helper()
+	name, err := NodeLoadBalancerVMFirewallName(cluster, vmUUID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return Firewall{
+		UUID: "70000000-0000-4000-8000-000000000001", DisplayName: name, BillingAccountID: billing,
+		Description: NodeLoadBalancerVMFirewallDescription, Rules: rules,
+	}
+}
+
+func TestNodeLoadBalancerVMFirewallContractGoldenVectors(t *testing.T) {
+	name, err := NodeLoadBalancerVMFirewallName("cluster-a", testVMFirewallUUID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "inlb-" + nodeLoadBalancerShortHash("cluster-a") + "-vm-" + testVMFirewallUUID; name != want || len(name) != 53 {
+		t.Fatalf("name = %q (len %d), want %q (len 53)", name, len(name), want)
+	}
+	if name != "inlb-34ab3e1c-vm-11111111-1111-4111-8111-111111111111" {
+		t.Fatalf("literal golden name = %q", name)
+	}
+	uuid, ok := ParseNodeLoadBalancerVMFirewallName("cluster-a", name)
+	if !ok || uuid != testVMFirewallUUID {
+		t.Fatalf("parse = %q, %v", uuid, ok)
+	}
+	if _, ok := ParseNodeLoadBalancerVMFirewallName("cluster-b", name); ok {
+		t.Fatal("foreign cluster must not parse")
+	}
+
+	rules := vmFirewallTestRules(t, 443)
+	hash, err := NodeLoadBalancerVMFirewallSpecHash(rules)
+	if err != nil {
+		t.Fatal(err)
+	}
+	canonical, err := canonicalNodeLoadBalancerPortFirewallPolicy("VM", rules)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hash != "886b49b4595740174f390bc5167cbad8dcf0fa8dc41ef711e805d1e8941cb1e6" {
+		t.Fatalf("literal golden hash = %q", hash)
+	}
+	if hash != nodeLoadBalancerFullHash(canonical) || len(hash) != 64 {
+		t.Fatalf("hash = %q", hash)
+	}
+
+	two := vmFirewallTestRules(t, 443, 80)
+	rev := vmFirewallTestRules(t, 80, 443)
+	rev[0].UUID = "66666666-7777-4888-8999-aaaaaaaaaaaa"
+	a, err := NodeLoadBalancerVMFirewallSpecHash(two)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := NodeLoadBalancerVMFirewallSpecHash(rev)
+	if err != nil || a != b {
+		t.Fatalf("order/uuid dependent hash: %q vs %q (%v)", a, b, err)
+	}
+}
+
+func TestNodeLoadBalancerVMFirewallNameRejectsInvalidInput(t *testing.T) {
+	for _, tc := range []struct{ cluster, uuid string }{
+		{"", testVMFirewallUUID},
+		{"cluster-a", "11111111-1111-4111-8111-11111111111A"},
+		{"cluster-a", "11111111-1111-4111-8111-11111111111"},
+		{"cluster-a", "not-a-uuid"},
+	} {
+		if name, err := NodeLoadBalancerVMFirewallName(tc.cluster, tc.uuid); err == nil {
+			t.Fatalf("(%q,%q) accepted: %q", tc.cluster, tc.uuid, name)
+		}
+	}
+}
+
+func TestNodeLoadBalancerVMFirewallNameDisjointFromOtherPatterns(t *testing.T) {
+	rng := rand.New(rand.NewSource(1))
+	randUUID := func() string {
+		var b [16]byte
+		for i := range b {
+			b[i] = byte(rng.Intn(256))
+		}
+		b[6] = b[6]&0x0f | 0x40
+		b[8] = b[8]&0x3f | 0x80
+		h := hex.EncodeToString(b[:])
+		return h[0:8] + "-" + h[8:12] + "-" + h[12:16] + "-" + h[16:20] + "-" + h[20:]
+	}
+	rules := vmFirewallTestRules(t, 443)
+	shard, err := NodeLoadBalancerShardFirewallName("cluster-a", "inlb-7255785b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	icmp, _, err := NodeLoadBalancerClusterICMPFirewallName("cluster-a", []FirewallRule{{Protocol: "icmp", Direction: "inbound", EndpointSpecType: "any"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := ParseNodeLoadBalancerVMFirewallName("cluster-a", shard); ok {
+		t.Fatalf("shard name %q parsed as per-VM", shard)
+	}
+	if _, ok := ParseNodeLoadBalancerVMFirewallName("cluster-a", icmp); ok {
+		t.Fatalf("ICMP name %q parsed as per-VM", icmp)
+	}
+	for i := 0; i < 2000; i++ {
+		vm := randUUID()
+		name, err := NodeLoadBalancerVMFirewallName("cluster-a", vm)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if nodeLoadBalancerServiceFirewallPattern.MatchString(name) || nodeLoadBalancerShardFirewallPattern.MatchString(name) ||
+			nodeLoadBalancerICMPFirewallPattern.MatchString(name) || nodeLoadBalancerShardNamePattern.MatchString(name) {
+			t.Fatalf("per-VM name %q matches another pattern", name)
+		}
+		if err := ValidateNodeLoadBalancerServiceFirewall(Firewall{DisplayName: name, BillingAccountID: 42, Rules: rules}, "cluster-a", 42); err == nil {
+			t.Fatalf("Service validator accepted per-VM name %q", name)
+		}
+		svcName, _, err := NodeLoadBalancerServiceFirewallName("cluster-a", randUUID(), rules)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := ParseNodeLoadBalancerVMFirewallName("cluster-a", svcName); ok {
+			t.Fatalf("Service name %q parsed as per-VM", svcName)
+		}
+	}
+}
+
+func TestValidateNodeLoadBalancerVMFirewallIdentity(t *testing.T) {
+	const other = "22222222-2222-4222-8222-222222222222"
+	rules := vmFirewallTestRules(t, 443)
+	good := vmFirewallTestFirewall(t, "cluster-a", testVMFirewallUUID, 42, rules)
+	withRows := func(rows ...FirewallResource) Firewall {
+		fw := good
+		fw.ResourcesAssigned = rows
+		return fw
+	}
+	icmp := []FirewallRule{{Protocol: "icmp", Direction: "inbound", EndpointSpecType: "any"}}
+	rangeEnd := int32(81)
+	rangeRule := vmFirewallTestRules(t, 80)
+	rangeRule[0].PortEnd = &rangeEnd
+
+	noDesc := good
+	noDesc.Description = ""
+	accept := map[string]Firewall{
+		"no rows":                  good,
+		"own row":                  withRows(FirewallResource{ResourceType: "vm", ResourceUUID: testVMFirewallUUID}),
+		"duplicate own row":        withRows(FirewallResource{ResourceType: "vm", ResourceUUID: testVMFirewallUUID}, FirewallResource{ResourceType: "vm", ResourceUUID: testVMFirewallUUID}),
+		"empty description":        noDesc,
+		"upper-case resource type": withRows(FirewallResource{ResourceType: "VM", ResourceUUID: testVMFirewallUUID}),
+	}
+	for label, fw := range accept {
+		if err := ValidateNodeLoadBalancerVMFirewallIdentity(fw, "cluster-a", testVMFirewallUUID, 42); err != nil {
+			t.Fatalf("%s rejected: %v", label, err)
+		}
+	}
+
+	badDesc := good
+	badDesc.Description = "x"
+	reject := map[string]Firewall{
+		"other VM name":     vmFirewallTestFirewall(t, "cluster-a", other, 42, rules),
+		"foreign cluster":   vmFirewallTestFirewall(t, "cluster-b", testVMFirewallUUID, 42, rules),
+		"other billing":     vmFirewallTestFirewall(t, "cluster-a", testVMFirewallUUID, 43, rules),
+		"icmp rule":         vmFirewallTestFirewall(t, "cluster-a", testVMFirewallUUID, 42, icmp),
+		"port range":        vmFirewallTestFirewall(t, "cluster-a", testVMFirewallUUID, 42, rangeRule),
+		"other VM row":      withRows(FirewallResource{ResourceType: "vm", ResourceUUID: other}),
+		"uppercase row":     withRows(FirewallResource{ResourceType: "vm", ResourceUUID: "11111111-1111-4111-8111-11111111111A"}),
+		"non-vm row":        withRows(FirewallResource{ResourceType: "network", ResourceUUID: testVMFirewallUUID}),
+		"own and other row": withRows(FirewallResource{ResourceType: "vm", ResourceUUID: testVMFirewallUUID}, FirewallResource{ResourceType: "vm", ResourceUUID: other}),
+		"description x":     badDesc,
+	}
+	for label, fw := range reject {
+		if err := ValidateNodeLoadBalancerVMFirewallIdentity(fw, "cluster-a", testVMFirewallUUID, 42); err == nil {
+			t.Fatalf("%s accepted", label)
+		}
+	}
+}
+
+func TestValidateNodeLoadBalancerVMFirewallChecksHash(t *testing.T) {
+	rules := vmFirewallTestRules(t, 443)
+	fw := vmFirewallTestFirewall(t, "cluster-a", testVMFirewallUUID, 42, rules)
+	hash, err := NodeLoadBalancerVMFirewallSpecHash(rules)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateNodeLoadBalancerVMFirewall(fw, "cluster-a", testVMFirewallUUID, 42, hash); err != nil {
+		t.Fatal(err)
+	}
+	last := "0"
+	if hash[63] == '0' {
+		last = "1"
+	}
+	if err := ValidateNodeLoadBalancerVMFirewall(fw, "cluster-a", testVMFirewallUUID, 42, hash[:63]+last); err == nil {
+		t.Fatal("hash one hex off accepted")
+	}
+	if err := ValidateNodeLoadBalancerVMFirewall(fw, "cluster-a", testVMFirewallUUID, 42, ""); err == nil {
+		t.Fatal("empty hash accepted")
 	}
 }

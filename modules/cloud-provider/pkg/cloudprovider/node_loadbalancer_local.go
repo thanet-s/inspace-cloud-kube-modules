@@ -1418,6 +1418,12 @@ func (c *nodeLoadBalancerController) auditPublicNodeLocalVMFirewalls(
 			baseAssignments++
 			continue
 		}
+		if firewallVM, isVMFirewall := inspace.ParseNodeLoadBalancerVMFirewallName(c.provider.config.ClusterID, firewall.EffectiveName()); isVMFirewall &&
+			firewallVM == vmUUID &&
+			inspace.ValidateNodeLoadBalancerVMFirewallIdentity(firewall, c.provider.config.ClusterID, vmUUID, c.provider.config.BillingAccountID) == nil &&
+			!c.publicNodeLocalPerVMModeEnabled() {
+			return &publicNodeLocalPerVMStatePresentError{vmUUID: vmUUID, firewallUUID: firewall.UUID}
+		}
 		if err := inspace.ValidateNodeLoadBalancerServiceFirewall(
 			firewall,
 			c.provider.config.ClusterID,
@@ -2683,6 +2689,21 @@ const (
 	publicNodeLocalHoldEventRefresh = 5 * time.Minute
 )
 
+const publicNodeLocalReasonPerVMStatePresent = "PublicNodeLocalPerVMStatePresent"
+
+// publicNodeLocalPerVMStatePresentError reports that a VM carries its own
+// per-VM firewall while this controller does not run the per-VM mode. The
+// Service holds and never touches that firewall.
+type publicNodeLocalPerVMStatePresentError struct{ vmUUID, firewallUUID string }
+
+func (e *publicNodeLocalPerVMStatePresentError) Error() string {
+	return fmt.Sprintf("VM %s carries per-VM firewall %s but the per-VM firewall mode is not enabled; holding", e.vmUUID, e.firewallUUID)
+}
+
+// publicNodeLocalPerVMModeEnabled reports whether this controller owns per-VM
+// firewalls. Until the mode flag exists it is always false.
+func (c *nodeLoadBalancerController) publicNodeLocalPerVMModeEnabled() bool { return false }
+
 // recordPublicNodeLocalStuckRelation makes a parked firewall relation visible.
 func (c *nodeLoadBalancerController) recordPublicNodeLocalStuckRelation(ctx context.Context, service *corev1.Service, cause error) {
 	if err := c.recordPublicNodeLocalHoldEvent(ctx, service, publicNodeLocalReasonRelationStuck, cause); err != nil {
@@ -2707,7 +2728,12 @@ func (c *nodeLoadBalancerController) holdOrFailPublicNodeLocal(ctx context.Conte
 	if service == nil || (service.Annotations[annotationPublicNodeLocalActivePool] == "" && len(service.Status.LoadBalancer.Ingress) == 0) {
 		return c.failPublicNodeLocalClosed(ctx, service, cause)
 	}
-	if eventErr := c.recordPublicNodeLocalHoldEvent(ctx, service, publicNodeLocalReasonHolding, cause); eventErr != nil {
+	holdReason := publicNodeLocalReasonHolding
+	var perVMState *publicNodeLocalPerVMStatePresentError
+	if errors.As(cause, &perVMState) {
+		holdReason = publicNodeLocalReasonPerVMStatePresent
+	}
+	if eventErr := c.recordPublicNodeLocalHoldEvent(ctx, service, holdReason, cause); eventErr != nil {
 		klog.Warningf("public-node-local %s/%s: record hold Event: %v", service.Namespace, service.Name, eventErr)
 	}
 	retryAfter, held := c.nextPublicNodeLocalHoldDelay(string(service.UID), cause)
@@ -2729,7 +2755,10 @@ func publicNodeLocalCauseClass(cause error) string {
 	var status *apierrors.StatusError
 	var api *inspace.APIError
 	var limit *FirewallLimitExceededError
+	var perVMState *publicNodeLocalPerVMStatePresentError
 	switch {
+	case errors.As(cause, &perVMState):
+		return "per-vm-state"
 	case errors.As(cause, &limit):
 		return "firewall-limit"
 	case errors.Is(cause, errNodeLoadBalancerFirewallRelationParked):
