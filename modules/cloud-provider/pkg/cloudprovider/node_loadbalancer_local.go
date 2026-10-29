@@ -2699,8 +2699,10 @@ func (e *publicNodeLocalPerVMStatePresentError) Error() string {
 }
 
 // publicNodeLocalPerVMModeEnabled reports whether this controller owns per-VM
-// firewalls. Until the mode flag exists it is always false.
-func (c *nodeLoadBalancerController) publicNodeLocalPerVMModeEnabled() bool { return false }
+// firewalls: the firewall mode flag is perVM.
+func (c *nodeLoadBalancerController) publicNodeLocalPerVMModeEnabled() bool {
+	return c.provider.config.NodeLoadBalancer.LocalFirewallMode == PublicNodeLocalFirewallModePerVM
+}
 
 // recordPublicNodeLocalStuckRelation makes a parked firewall relation visible.
 func (c *nodeLoadBalancerController) recordPublicNodeLocalStuckRelation(ctx context.Context, service *corev1.Service, cause error) {

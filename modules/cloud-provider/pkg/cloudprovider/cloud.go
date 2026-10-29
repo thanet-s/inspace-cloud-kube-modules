@@ -206,7 +206,36 @@ type NodeLoadBalancerConfig struct {
 	// change was read back before it relies on it. Zero or less means the
 	// measured default (vmFirewallSettleDefault).
 	VMFirewallSettle time.Duration
+	// LocalFirewallMode says how public-node-local Services hold their cloud
+	// firewall. Empty means PublicNodeLocalFirewallModePerService.
+	LocalFirewallMode PublicNodeLocalFirewallMode
+	// VMFirewallMigration says whether VMs move to the per-VM firewall on
+	// their own. Empty means VMFirewallMigrationManual.
+	VMFirewallMigration VMFirewallMigrationMode
 }
+
+// PublicNodeLocalFirewallMode is how public-node-local Services hold their
+// cloud firewall.
+type PublicNodeLocalFirewallMode string
+
+const (
+	// PublicNodeLocalFirewallModePerService gives every Service its own firewall
+	// on every VM it publishes on. It is the default.
+	PublicNodeLocalFirewallModePerService PublicNodeLocalFirewallMode = "perService"
+	// PublicNodeLocalFirewallModePerVM keeps one firewall per VM that carries the
+	// rules of every Service published on it.
+	PublicNodeLocalFirewallModePerVM PublicNodeLocalFirewallMode = "perVM"
+)
+
+// VMFirewallMigrationMode says when a VM moves to the per-VM firewall.
+type VMFirewallMigrationMode string
+
+const (
+	// VMFirewallMigrationManual migrates a VM only when its Node asks for it.
+	VMFirewallMigrationManual VMFirewallMigrationMode = "manual"
+	// VMFirewallMigrationAuto migrates every VM, one at a time.
+	VMFirewallMigrationAuto VMFirewallMigrationMode = "auto"
+)
 
 type Provider struct {
 	api                          API
@@ -296,6 +325,20 @@ func New(api API, config Config) (*Provider, error) {
 		}
 		if config.NodeLoadBalancer.NodesPerShard < 1 || config.NodeLoadBalancer.NodesPerShard > 10 {
 			return nil, errors.New("cloudprovider: node load balancer nodes per shard must be between 1 and 10")
+		}
+		switch config.NodeLoadBalancer.LocalFirewallMode {
+		case "", PublicNodeLocalFirewallModePerService, PublicNodeLocalFirewallModePerVM:
+		default:
+			return nil, fmt.Errorf("cloudprovider: unknown public-node-local firewall mode %q", config.NodeLoadBalancer.LocalFirewallMode)
+		}
+		if config.NodeLoadBalancer.LocalFirewallMode == PublicNodeLocalFirewallModePerVM &&
+			strings.TrimSpace(config.NodeLoadBalancer.ControllerNamespace) == "" {
+			return nil, errors.New("cloudprovider: the per-VM firewall mode needs the CCM namespace")
+		}
+		switch config.NodeLoadBalancer.VMFirewallMigration {
+		case "", VMFirewallMigrationManual, VMFirewallMigrationAuto:
+		default:
+			return nil, fmt.Errorf("cloudprovider: unknown VM firewall migration mode %q", config.NodeLoadBalancer.VMFirewallMigration)
 		}
 		// Generated NodePools are 13 characters and Karpenter appends its
 		// five-character NodeClaim suffix. Keep the provider's
