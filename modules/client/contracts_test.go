@@ -263,7 +263,7 @@ func TestUpdateFirewallRequestOmitsEmptyRuleUUID(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	const want = `{"name":"inlb-owned-shard-deadbeef","description":"","rules":[{"protocol":"tcp","direction":"inbound","port_start":443,"port_end":443,"endpoint_spec_type":"any"}]}`
+	const want = `{"display_name":"inlb-owned-shard-deadbeef","description":"","rules":[{"protocol":"tcp","direction":"inbound","port_start":443,"port_end":443,"endpoint_spec_type":"any"}]}`
 	if string(data) != want {
 		t.Fatalf("UpdateFirewallRequest JSON = %s, want %s", data, want)
 	}
@@ -344,7 +344,7 @@ func contractHandler(t *testing.T) http.HandlerFunc {
 			if err != nil {
 				t.Fatal(err)
 			}
-			const want = `{"name":"inlb-owned-shard-deadbeef","description":"aggregate shard policy","rules":[{"uuid":"` + ruleUUID + `","protocol":"tcp","direction":"inbound","port_start":6443,"port_end":6443,"endpoint_spec_type":"ip_prefixes","endpoint_spec":["10.4.200.0/24"]},{"protocol":"udp","direction":"inbound","port_start":443,"port_end":443,"endpoint_spec_type":"any"}]}`
+			const want = `{"display_name":"inlb-owned-shard-deadbeef","description":"aggregate shard policy","rules":[{"uuid":"` + ruleUUID + `","protocol":"tcp","direction":"inbound","port_start":6443,"port_end":6443,"endpoint_spec_type":"ip_prefixes","endpoint_spec":["10.4.200.0/24"]},{"protocol":"udp","direction":"inbound","port_start":443,"port_end":443,"endpoint_spec_type":"any"}]}`
 			if string(body) != want {
 				t.Errorf("UpdateFirewall body = %s, want %s", body, want)
 			}

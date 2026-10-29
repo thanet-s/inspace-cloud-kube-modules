@@ -247,8 +247,9 @@ type CreateFirewallRequest struct {
 // UpdateFirewallRequest is the documented replace-style firewall update body.
 // Rule UUIDs are optional: include one to retain an existing rule identity and
 // leave it empty for a rule that the API should create.
+// The name travels as display_name: the API ignores a "name" field on PUT.
 type UpdateFirewallRequest struct {
-	Name        string         `json:"name"`
+	Name        string         `json:"display_name"`
 	Description string         `json:"description"`
 	Rules       []FirewallRule `json:"rules"`
 }
