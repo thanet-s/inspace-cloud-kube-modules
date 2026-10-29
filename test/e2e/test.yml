@@ -2804,6 +2804,23 @@
             argv: [kubectl, -n, kube-system, rollout, status, deployment/inspace-ccm, --timeout=10m]
           changed_when: false
 
+        - name: Set the CCM migration back to manual
+          ansible.builtin.command:
+            argv:
+              - kubectl
+              - -n
+              - kube-system
+              - set
+              - env
+              - deployment/inspace-ccm
+              - INSPACE_NODE_LOAD_BALANCER_VM_FIREWALL_MIGRATION=manual
+          changed_when: true
+
+        - name: Wait for the manual-migration CCM rollout
+          ansible.builtin.command:
+            argv: [kubectl, -n, kube-system, rollout, status, deployment/inspace-ccm, --timeout=10m]
+          changed_when: false
+
         - name: Prove the reverse migration restored the per-Service firewall and left no per-VM state
           ansible.builtin.command:
             argv:

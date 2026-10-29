@@ -399,9 +399,10 @@ firewall plus one however many Services it serves.
 | `ccm.nodeLoadBalancer.publicNodeLocal.vmFirewallMigration` | `manual` | `manual`: a VM migrates only when its Node asks for it. `auto`: every VM migrates, one at a time. |
 | `ccm.nodeLoadBalancer.publicNodeLocal.vmFirewallSettleSeconds` | `10` | Wait after new rules are written before the old firewall is detached. Allowed range 10-600. |
 
-The chart always sets `INSPACE_CCM_NAMESPACE` (downward API) and a namespaced
-`Role` and `RoleBinding` for `configmaps` in the release namespace, in every
-mode. Per-VM state lives in one anchor ConfigMap `inlb-vmfw-<VM UUID>` per VM
+The chart always sets `INSPACE_CCM_NAMESPACE` (downward API), in every firewall
+mode. It creates a namespaced `Role` and `RoleBinding` for `configmaps` in the
+release namespace in every firewall mode too, but only when
+`ccm.nodeLoadBalancer.enabled` is `true`. Per-VM state lives in one anchor ConfigMap `inlb-vmfw-<VM UUID>` per VM
 in that namespace, and the reverse migration needs both even though it runs
 with the mode off. The standalone manifest
 `modules/cloud-provider/config/ccm/cloud-controller-manager.yaml` has the same.

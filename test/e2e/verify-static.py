@@ -65,8 +65,8 @@ def verify_ccm_namespace_and_configmap_role(rendered: str, label: str) -> None:
             f"{label}: CCM ConfigMap Role must live in the release namespace")
     require(
         '    resources: ["configmaps"]\n'
-        '    verbs: ["get", "list", "watch", "create", "update", "delete"]' in role,
-        f"{label}: CCM ConfigMap Role must grant exactly get, list, watch, create, update, delete",
+        '    verbs: ["get", "list", "create", "update", "delete"]' in role,
+        f"{label}: CCM ConfigMap Role must grant exactly get, list, create, update, delete",
     )
     require(role.count("  - apiGroups:") == 1,
             f"{label}: CCM ConfigMap Role must have one rule")

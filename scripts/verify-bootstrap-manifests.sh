@@ -43,7 +43,7 @@ test "$(grep -Fc '    namespace: inspace-system' "$tmpdir/ccm-rbac.yaml")" -eq 3
 # present in every firewall mode (reverse migration runs with perVM off).
 test "$(grep -Fc '  namespace: inspace-system' "$tmpdir/ccm-rbac.yaml")" -eq 5
 grep -Fx '    resources: ["configmaps"]' "$tmpdir/ccm-rbac.yaml" >/dev/null
-grep -Fx '    verbs: ["get", "list", "watch", "create", "update", "delete"]' "$tmpdir/ccm-rbac.yaml" >/dev/null
+grep -Fx '    verbs: ["get", "list", "create", "update", "delete"]' "$tmpdir/ccm-rbac.yaml" >/dev/null
 grep -Fx '  kind: Role' "$tmpdir/ccm-rbac.yaml" >/dev/null
 grep -Fx '  name: extension-apiserver-authentication-reader' "$tmpdir/ccm-rbac.yaml" >/dev/null
 grep -Fx '    verbs: ["get", "list", "watch", "patch", "update", "delete"]' "$tmpdir/ccm-rbac.yaml" >/dev/null
@@ -324,7 +324,7 @@ grep -Fx '    resources: ["tokenreviews"]' "$standalone_ccm" >/dev/null
 grep -Fx '    resources: ["subjectaccessreviews"]' "$standalone_ccm" >/dev/null
 grep -Fx '  name: inspace-cloud-controller-manager-configmaps' "$standalone_ccm" >/dev/null
 grep -Fx '    resources: ["configmaps"]' "$standalone_ccm" >/dev/null
-grep -Fx '    verbs: ["get", "list", "watch", "create", "update", "delete"]' "$standalone_ccm" >/dev/null
+grep -Fx '    verbs: ["get", "list", "create", "update", "delete"]' "$standalone_ccm" >/dev/null
 grep -Fx '            - name: INSPACE_CCM_NAMESPACE' "$standalone_ccm" >/dev/null
 grep -Fx '                  fieldPath: metadata.namespace' "$standalone_ccm" >/dev/null
 grep -Fx '              value: "perService"' "$standalone_ccm" >/dev/null
