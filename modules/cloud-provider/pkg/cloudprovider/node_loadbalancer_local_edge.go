@@ -200,6 +200,9 @@ func (e perServiceEdge) ResolvePending(ctx context.Context, svc *corev1.Service)
 }
 
 func (e perServiceEdge) Assign(ctx context.Context, svc *corev1.Service, intent nodeLoadBalancerIntent, desired desiredNodeLoadBalancerFirewall, id edgeID, addresses []nodeLoadBalancerAddress) (bool, error) {
+	if err := e.c.waitForPerVMVM(ctx, svc, addresses); err != nil {
+		return false, err
+	}
 	if err := e.c.assignPublicNodeLocalFirewallWithFence(ctx, svc, intent, desired, id.snapshot, addresses); err != nil {
 		return false, err
 	}

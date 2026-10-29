@@ -2664,37 +2664,6 @@ func (c *nodeLoadBalancerController) clearPublicNodeLocalActivation(ctx context.
 	return err
 }
 
-func (c *nodeLoadBalancerController) detachPublicNodeLocalFirewalls(
-	ctx context.Context,
-	service *corev1.Service,
-	nodes []*corev1.Node,
-) error {
-	if publicNodeLocalServicePerVM(service) {
-		// A per-VM firewall is shared: the Service leaves a VM by a ledger delta,
-		// never by detaching the whole firewall.
-		edge := perVMEdge{c: c}
-		for _, policy := range []string{service.Annotations[annotationPublicNodeLocalActivePolicy], service.Annotations[annotationPublicNodeLocalTargetPolicy]} {
-			if policy == "" {
-				continue
-			}
-			if _, err := edge.Unassign(ctx, service, edgeID{perVM: true, policy: policy}, nodes); err != nil {
-				return err
-			}
-		}
-		return nil
-	}
-	owned, err := c.ownedServiceFirewalls(ctx, service)
-	if err != nil {
-		return err
-	}
-	for index := range owned {
-		if err := c.detachServiceFirewallFromOtherNodes(ctx, service, &owned[index], nodes); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 func (c *nodeLoadBalancerController) clearPublicNodeLocalDatapathStatus(ctx context.Context, service *corev1.Service) error {
 	client := c.provider.kubeClient.CoreV1().Services(service.Namespace)
 	datapath, err := client.Get(ctx, nodeLoadBalancerDatapathName(service), metav1.GetOptions{})

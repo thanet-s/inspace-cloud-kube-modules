@@ -563,21 +563,31 @@ func servicePolicyRules(f *publicNodeLocalTransientFixture, service *corev1.Serv
 //     refused by it (the controller itself never tries a fourth).
 func requireVMEdgeSafe(t *testing.T, f *publicNodeLocalTransientFixture, services ...*corev1.Service) {
 	t.Helper()
+	if err := vmEdgeViolation(f, services...); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// vmEdgeViolation is requireVMEdgeSafe returning what it found, so a test can
+// prove the invariant fails on a mutation.
+func vmEdgeViolation(f *publicNodeLocalTransientFixture, services ...*corev1.Service) error {
 	if len(services) == 0 {
-		services = []*corev1.Service{f.current(t)}
+		services = []*corev1.Service{f.service}
 	}
 	nodes, err := f.provider.kubeClient.CoreV1().Nodes().List(f.ctx, metav1.ListOptions{})
 	if err != nil {
-		t.Fatal(err)
+		return err
 	}
 	vmOfPublic := map[string]string{}
 	privateOfVM := map[string]string{}
+	poolOfVM := map[string]string{}
 	for index := range nodes.Items {
 		node := &nodes.Items[index]
 		vmUUID, ok := nodeLoadBalancerVMUUID(node)
 		if !ok {
 			continue
 		}
+		poolOfVM[vmUUID] = node.Labels[publicNodeLocalPoolLabel]
 		if public, ok := nodeLoadBalancerNodeExternalIPv4(node); ok {
 			vmOfPublic[public] = vmUUID
 		}
@@ -592,6 +602,19 @@ func requireVMEdgeSafe(t *testing.T, f *publicNodeLocalTransientFixture, service
 		}
 		policies := servicePolicyRules(f, service)
 		withdrawing := service.DeletionTimestamp != nil || service.Annotations[annotationNodeLoadBalancerRebuilding] != ""
+		if !withdrawing && len(service.Status.LoadBalancer.Ingress) != 0 && len(policies) == 0 {
+			// A published Service whose edge records no policy at all would pass any
+			// coverage check vacuously.
+			return fmt.Errorf("Service %s is published but no firewall or ledger records any policy for it", service.Name)
+		}
+		// Without a change pending, the spec is the oracle: it does not come from
+		// the controller state that could be the thing that is wrong.
+		var steady []inspace.FirewallRule
+		if desired, derr := f.controller.desiredServiceFirewall(service); derr == nil &&
+			service.Annotations[annotationPublicNodeLocalActivePolicy] == desired.Hash &&
+			service.Annotations[annotationPublicNodeLocalTargetPolicy] == "" {
+			steady = desired.Request.Rules
+		}
 		for _, ingress := range service.Status.LoadBalancer.Ingress {
 			vmUUID, known := vmOfPublic[ingress.IP]
 			if !known {
@@ -601,7 +624,17 @@ func requireVMEdgeSafe(t *testing.T, f *publicNodeLocalTransientFixture, service
 			// active one, the target one while the union runs, or the old one while it
 			// is retired. A withdrawal closes the firewall first, by design.
 			allow := edgeAllowOf(vmFirewallsOfVM(f, vmUUID))
-			covered := withdrawing || len(policies) == 0
+			covered := withdrawing
+			if !withdrawing && steady != nil && poolOfVM[vmUUID] == service.Annotations[annotationPublicNodeLocalActivePool] {
+				covered = true
+				for _, rule := range steady {
+					covered = covered && allow.covers(rule)
+				}
+				if !covered {
+					return fmt.Errorf("FIP %s on VM %s is published but its firewalls do not allow the rules the Service spec asks for: %#v",
+						ingress.IP, vmUUID, vmFirewallsOfVM(f, vmUUID))
+				}
+			}
 			for _, rules := range policies {
 				whole := true
 				for _, rule := range rules {
@@ -610,7 +643,7 @@ func requireVMEdgeSafe(t *testing.T, f *publicNodeLocalTransientFixture, service
 				covered = covered || whole
 			}
 			if !covered {
-				t.Fatalf("FIP %s on VM %s is published but its firewalls cover no whole policy of the Service %d: %#v",
+				return fmt.Errorf("FIP %s on VM %s is published but its firewalls cover no whole policy of the Service %d: %#v",
 					ingress.IP, vmUUID, len(policies), vmFirewallsOfVM(f, vmUUID))
 			}
 		}
@@ -648,7 +681,7 @@ func requireVMEdgeSafe(t *testing.T, f *publicNodeLocalTransientFixture, service
 			for _, row := range firewall.ResourcesAssigned {
 				if private := privateOfVM[row.ResourceUUID]; private != "" {
 					if _, has := vips[private]; !has {
-						t.Fatalf("VM %s carries the rules of Service %s without its child VIP %s: vips=%v", row.ResourceUUID, service.Name, private, vips)
+						return fmt.Errorf("VM %s carries the rules of Service %s without its child VIP %s: vips=%v", row.ResourceUUID, service.Name, private, vips)
 					}
 				}
 			}
@@ -660,12 +693,13 @@ func requireVMEdgeSafe(t *testing.T, f *publicNodeLocalTransientFixture, service
 			limit = int(DefaultMaxFirewallsPerVM)
 		}
 		if f.gate.maxObservedFirewallsPerVM > limit {
-			t.Fatalf("a VM carried %d firewalls, limit %d", f.gate.maxObservedFirewallsPerVM, limit)
+			return fmt.Errorf("a VM carried %d firewalls, limit %d", f.gate.maxObservedFirewallsPerVM, limit)
 		}
 		if f.gate.refusedAttaches != 0 {
-			t.Fatalf("%d attaches ran into the firewall limit: the controller must never try a fourth", f.gate.refusedAttaches)
+			return fmt.Errorf("%d attaches ran into the firewall limit: the controller must never try a fourth", f.gate.refusedAttaches)
 		}
 	}
+	return nil
 }
 
 // requireSteadyFirewallCount requires exactly want firewalls on each of the

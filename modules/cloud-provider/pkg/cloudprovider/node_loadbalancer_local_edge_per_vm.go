@@ -689,12 +689,11 @@ func (e perVMEdge) Retire(ctx context.Context, svc *corev1.Service, id edgeID) (
 			return false, err
 		}
 		if len(targets) != 0 {
-			target := targets[0]
-			if err := c.vmFirewallSettleGate(ctx, svc, []string{target.vmUUID}); err != nil {
-				return false, err
-			}
-			_, err := e.removeOne(ctx, svc, target, e.authorizeRemoval(svc, target.vmUUID, target.key))
-			return false, err
+			// Unassign is the only path that takes an old entry off a VM, with its
+			// authority and settle gate; the caller reaches Retire only once nothing
+			// is left to unassign. Entries that remain are on an anchor whose delete is
+			// still running, so the tail waits for it.
+			return false, nil
 		}
 	}
 	_, _, err := c.updateExactParentService(ctx, svc, func(copy *corev1.Service) (bool, error) {
@@ -717,8 +716,13 @@ func vmFirewallEntriesClosed(view vmFirewallAnchorView, items []inspace.Firewall
 	if view.pendingOp() != string(vmFirewallOpDelete) {
 		return false
 	}
+	// Only a clean zero-row lookup counts as gone. Case-folded duplicates or a
+	// malformed row are not proof of anything, so the entries stay open.
+	if !vmFirewallListed(items, view.uuid()) {
+		return true
+	}
 	firewall, err := exactNodeLoadBalancerFirewallFromItems(items, view.uuid())
-	return err != nil || !vmFirewallAttachedTo(*firewall, view.vm())
+	return err == nil && !vmFirewallAttachedTo(*firewall, view.vm())
 }
 
 // vmFirewallServiceClosed says whether the Service is closed on every VM: no
