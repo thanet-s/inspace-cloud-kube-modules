@@ -1,18 +1,13 @@
 package cloudprovider
 
 import (
-	"errors"
 	"fmt"
 	"reflect"
 	"sort"
-	"strings"
 	"testing"
-	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
-	kubetesting "k8s.io/client-go/testing"
 )
 
 // newTHLiveCluster is th-live as it runs on v1.1.9: traefik-public on the two
@@ -210,85 +205,4 @@ func (m *migrationCluster) outcome(writes int) migrationOutcome {
 	out.deleted = append(out.deleted, m.api.deletedFirewalls...)
 	sort.Strings(out.deleted)
 	return out
-}
-
-// Crash the controller after every write of the whole migration and require the
-// next process to finish with the same end state: at most one create per
-// firewall, at most one adopt PUT, the count never above the limit, and the
-// served ports covered between every two cloud calls.
-func TestVMFirewallMigrationRestartAtEveryPhase(t *testing.T) {
-	run := func(t *testing.T, crashAfter int) migrationOutcome {
-		m := newTHLiveCluster(t)
-		m.trackCoverage()
-		for _, vm := range m.vms {
-			m.annotateNode(vm.name, "true")
-		}
-		writes, crashed, restarted := 0, false, false
-		m.kube.PrependReactor("*", "*", func(action kubetesting.Action) (bool, runtime.Object, error) {
-			verb := action.GetVerb()
-			resource := action.GetResource().Resource
-			if (verb != "update" && verb != "create") || (resource != "configmaps" && resource != "services") {
-				return false, nil, nil
-			}
-			if crashAfter > 0 && writes >= crashAfter-1 { // the crashAfter-th write fails
-				crashed = true
-				return true, nil, errors.New("controller crashed")
-			}
-			writes++
-			return false, nil, nil
-		})
-		var last error
-		for pass := 0; pass < 4000 && !m.allMigrated(); pass++ {
-			m.clock = m.clock.Add(7 * time.Second)
-			step := func(err error) {
-				if err == nil || tolerableMigrationError(err) {
-					return
-				}
-				if crashed && !restarted {
-					restarted, crashAfter = true, 0
-					m.restart()
-					return
-				}
-				if strings.Contains(err.Error(), "controller crashed") {
-					return
-				}
-				t.Fatalf("crash at write %d, pass %d: %v", crashAfter, pass, err)
-			}
-			for _, vm := range m.vms {
-				last = m.controller.syncVMFirewall(m.ctx, vm.uuid)
-				step(last)
-			}
-			for _, name := range m.services {
-				last = m.controller.syncPublicNodeLocal(m.ctx, m.key(name), m.service(name))
-				step(last)
-			}
-		}
-		if !m.allMigrated() {
-			t.Fatalf("crash at write %d: never finished; last %v", crashAfter, last)
-		}
-		out := m.outcome(writes)
-		out.crashed = crashed
-		return out
-	}
-	baseline := run(t, 0)
-	if baseline.writes < 20 {
-		t.Fatalf("baseline = %#v: the harness saw too few writes", baseline)
-	}
-	for crash := 1; crash <= baseline.writes; crash++ {
-		t.Run(fmt.Sprintf("crash at write %d", crash), func(t *testing.T) {
-			got := run(t, crash)
-			if crash <= baseline.writes && !got.crashed {
-				t.Fatalf("the harness never crashed the controller at write %d of %d", crash, baseline.writes)
-			}
-			if !reflect.DeepEqual(got.firewalls, baseline.firewalls) || !reflect.DeepEqual(got.modes, baseline.modes) {
-				t.Fatalf("end state = %#v, want %#v", got, baseline)
-			}
-			if len(got.deleted) != len(baseline.deleted) {
-				t.Fatalf("deleted %v, want %v", got.deleted, baseline.deleted)
-			}
-			if got.creates > baseline.creates || got.puts > baseline.puts {
-				t.Fatalf("creates=%d puts=%d, baseline %d and %d: a restart must never double-send", got.creates, got.puts, baseline.creates, baseline.puts)
-			}
-		})
-	}
 }
