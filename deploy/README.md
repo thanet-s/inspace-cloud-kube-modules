@@ -262,6 +262,28 @@ annotations; see
 `destroy` deletes every Gateway before the LoadBalancer Services, so Cilium
 cannot recreate a Service that would receive a new paid NLB.
 
+## Public-node-local firewall mode
+
+Three optional inventory variables set the chart values under
+`ccm.nodeLoadBalancer.publicNodeLocal`. Set them here, not with `kubectl set
+env`: the next `update` would revert a manual change, and turning the mode off
+starts a reverse migration.
+
+| Variable | Default | Chart value |
+|---|---|---|
+| `ccm_public_node_local_firewall_mode` | `perService` | `firewallMode` (`perService` or `perVM`) |
+| `ccm_public_node_local_vm_firewall_migration` | `manual` | `vmFirewallMigration` (`manual` or `auto`) |
+| `ccm_public_node_local_vm_firewall_settle_seconds` | `10` | `vmFirewallSettleSeconds` (integer 10-600) |
+
+If none is defined, the rendered chart values are unchanged and existing
+clusters see no difference. If any one is defined, all three are rendered, the
+others with the defaults above. Preflight rejects any other value.
+
+Switching back to `perService` (or removing the variables after `perVM` was
+applied) triggers the reverse migration, one VM at a time. Never downgrade the
+modules while per-VM state exists. Read "Public-node-local firewall mode" in the
+chart README (`charts/inspace-cloud-kube-modules/README.md`) before enabling.
+
 ## Default StorageClass
 
 `csi_storage_class_default` (default `false`) adds the

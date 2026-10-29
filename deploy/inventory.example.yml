@@ -77,6 +77,15 @@ all:
     # default, so PVCs without storageClassName use it. update can flip it.
     csi_storage_class_default: false
 
+    # Public-node-local firewall mode (chart values ccm.nodeLoadBalancer.publicNodeLocal.*).
+    # Leave all three commented out to keep the chart defaults. Setting any one
+    # renders all three. perVM keeps one firewall per VM; switching back to
+    # perService runs the reverse migration. Never downgrade modules while
+    # per-VM state exists. See the chart README "Public-node-local firewall mode".
+    # ccm_public_node_local_firewall_mode: perService          # perService | perVM
+    # ccm_public_node_local_vm_firewall_migration: manual      # manual | auto
+    # ccm_public_node_local_vm_firewall_settle_seconds: 10     # 10-600
+
     # False makes init and update skip the default NodePool so GitOps can own
     # NodePools. The NodeClass below is always applied: Karpenter defaults to
     # it and CCM Node-LB copies it as the base of its load-balancer NodeClass.

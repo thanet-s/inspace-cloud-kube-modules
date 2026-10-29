@@ -173,6 +173,7 @@ def verify_gateway_api(inventory: str, cluster_template: str, preflight: str, in
     )
     verify_optional_default_node_pool(readme)
     verify_csi_default_storage_class(readme)
+    verify_public_node_local_firewall_mode_vars(readme)
     verify_public_node_local_node_class(readme)
 
 
@@ -223,6 +224,43 @@ def verify_csi_default_storage_class(readme: str) -> None:
         and "`csi_storage_class_default`" in readme
         and "## Default StorageClass" in readme,
         "example inventory and README must document the default-off csi_storage_class_default option",
+    )
+
+
+def verify_public_node_local_firewall_mode_vars(readme: str) -> None:
+    """Inventory variables set the per-VM firewall chart values; unset leaves the render untouched."""
+    values = read("deploy/templates/chart-values.yaml.j2").replace("\r\n", "\n")
+    variables = (
+        "ccm_public_node_local_firewall_mode",
+        "ccm_public_node_local_vm_firewall_migration",
+        "ccm_public_node_local_vm_firewall_settle_seconds",
+    )
+    condition = " or ".join(f"{name} is defined" for name in variables)
+    require(
+        "{% if " + condition + " %}\n"
+        "  nodeLoadBalancer:\n"
+        "    publicNodeLocal:\n"
+        "      firewallMode: {{ ccm_public_node_local_firewall_mode | default('perService') }}\n"
+        "      vmFirewallMigration: {{ ccm_public_node_local_vm_firewall_migration | default('manual') }}\n"
+        "      vmFirewallSettleSeconds: {{ ccm_public_node_local_vm_firewall_settle_seconds | default(10) | int }}\n"
+        "{% endif %}\n" in values,
+        "chart values must render the whole publicNodeLocal block only when a firewall mode variable is defined",
+    )
+    preflight = read("deploy/playbooks/tasks/preflight.yml")
+    require(
+        "ccm_public_node_local_firewall_mode | default('perService') in ['perService', 'perVM']" in preflight
+        and "ccm_public_node_local_vm_firewall_migration | default('manual') in ['manual', 'auto']" in preflight
+        and "ccm_public_node_local_vm_firewall_settle_seconds | default(10) | int >= 10" in preflight
+        and "ccm_public_node_local_vm_firewall_settle_seconds | default(10) | int <= 600" in preflight,
+        "preflight must validate the public-node-local firewall mode variables",
+    )
+    inventory = read("deploy/inventory.example.yml")
+    require(
+        all(f"`{name}`" in readme and name in inventory for name in variables)
+        and "## Public-node-local firewall mode" in readme
+        and "reverse migration" in readme
+        and "Never downgrade" in readme,
+        "example inventory and README must document the public-node-local firewall mode variables",
     )
 
 
