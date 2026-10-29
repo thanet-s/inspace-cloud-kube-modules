@@ -1409,6 +1409,10 @@ func (c *nodeLoadBalancerController) auditPublicNodeLocalVMFirewalls(
 	if network == nil || network.UUID != c.provider.config.NetworkUUID {
 		return errors.New("trusted VPC identity changed during firewall audit")
 	}
+	vmFirewalls := 0
+	// vmFirewallAttached says whether a valid per-VM firewall of this VM is attached,
+	// so a per-Service firewall next to it can be told from an unmigrated VM's.
+	vmFirewallAttached := c.publicNodeLocalPerVMModeEnabled() && perVMFirewallAttachedTo(items, c.provider.config.ClusterID, c.provider.config.BillingAccountID, vmUUID)
 	seen := make(map[string]struct{}, len(items))
 	baseAssignments := 0
 	var baseFirewall *inspace.Firewall
@@ -1441,9 +1445,18 @@ func (c *nodeLoadBalancerController) auditPublicNodeLocalVMFirewalls(
 		}
 		if firewallVM, isVMFirewall := inspace.ParseNodeLoadBalancerVMFirewallName(c.provider.config.ClusterID, firewall.EffectiveName()); isVMFirewall &&
 			firewallVM == vmUUID &&
-			inspace.ValidateNodeLoadBalancerVMFirewallIdentity(firewall, c.provider.config.ClusterID, vmUUID, c.provider.config.BillingAccountID) == nil &&
-			!c.publicNodeLocalPerVMModeEnabled() {
-			return &publicNodeLocalPerVMStatePresentError{vmUUID: vmUUID, firewallUUID: firewall.UUID}
+			inspace.ValidateNodeLoadBalancerVMFirewallIdentity(firewall, c.provider.config.ClusterID, vmUUID, c.provider.config.BillingAccountID) == nil {
+			if !c.publicNodeLocalPerVMModeEnabled() {
+				return &publicNodeLocalPerVMStatePresentError{vmUUID: vmUUID, firewallUUID: firewall.UUID}
+			}
+			vmFirewalls++
+			if err := c.auditPerVMFirewall(ctx, vmUUID, firewall, vmFirewalls); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := c.auditPerServiceFirewallOnPerVMMode(ctx, vmUUID, firewall, vmFirewallAttached); err != nil {
+			return err
 		}
 		if err := inspace.ValidateNodeLoadBalancerServiceFirewall(
 			firewall,
