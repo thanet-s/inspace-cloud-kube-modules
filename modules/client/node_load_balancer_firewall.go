@@ -19,7 +19,95 @@ var (
 	nodeLoadBalancerPolicyHashPattern      = regexp.MustCompile(`^[0-9a-f]{64}$`)
 	nodeLoadBalancerICMPFirewallPattern    = regexp.MustCompile(`^inlb-([0-9a-f]{32})-icmp-([0-9a-f]{8})$`)
 	nodeLoadBalancerServiceUIDPattern      = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,34}[a-z0-9])?$`)
+	nodeLoadBalancerVMFirewallPattern      = regexp.MustCompile(`^inlb-([0-9a-f]{8})-vm-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$`)
+	nodeLoadBalancerVMUUIDPattern          = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 )
+
+// NodeLoadBalancerVMFirewallDescription is the description of the single
+// CCM-owned firewall that carries every published rule of one
+// public-node-local VM.
+const NodeLoadBalancerVMFirewallDescription = "Managed InSpace public-node-local VM firewall"
+
+// NodeLoadBalancerVMFirewallName returns the stable per-VM firewall name.
+func NodeLoadBalancerVMFirewallName(cluster, vmUUID string) (string, error) {
+	if cluster == "" {
+		return "", errors.New("cluster identity is required")
+	}
+	if !nodeLoadBalancerVMUUIDPattern.MatchString(vmUUID) {
+		return "", fmt.Errorf("VM UUID %q must be a lowercase canonical UUID", vmUUID)
+	}
+	return "inlb-" + nodeLoadBalancerShortHash(cluster) + "-vm-" + vmUUID, nil
+}
+
+// ParseNodeLoadBalancerVMFirewallName returns the VM UUID of a per-VM
+// firewall name that belongs to cluster.
+func ParseNodeLoadBalancerVMFirewallName(cluster, name string) (string, bool) {
+	if cluster == "" {
+		return "", false
+	}
+	matches := nodeLoadBalancerVMFirewallPattern.FindStringSubmatch(name)
+	if len(matches) != 3 || matches[1] != nodeLoadBalancerShortHash(cluster) {
+		return "", false
+	}
+	return matches[2], true
+}
+
+// NodeLoadBalancerVMFirewallSpecHash returns the full SHA-256 policy hash of a
+// per-VM firewall. Rule UUIDs and input order do not affect it.
+func NodeLoadBalancerVMFirewallSpecHash(rules []FirewallRule) (string, error) {
+	canonical, err := canonicalNodeLoadBalancerPortFirewallPolicy("VM", rules)
+	if err != nil {
+		return "", err
+	}
+	return nodeLoadBalancerFullHash(canonical), nil
+}
+
+// ValidateNodeLoadBalancerVMFirewallIdentity authenticates a per-VM firewall
+// without a ledger: name, billing, description, canonical rules, and that it
+// is only assigned to vmUUID.
+func ValidateNodeLoadBalancerVMFirewallIdentity(firewall Firewall, cluster, vmUUID string, billingAccountID int64) error {
+	if cluster == "" || billingAccountID < 1 || firewall.BillingAccountID != billingAccountID {
+		return errors.New("VM firewall cluster and billing identity do not match")
+	}
+	name, err := NodeLoadBalancerVMFirewallName(cluster, vmUUID)
+	if err != nil {
+		return err
+	}
+	if firewall.EffectiveName() != name {
+		return fmt.Errorf("name %q is not the owned firewall for VM %q", firewall.EffectiveName(), vmUUID)
+	}
+	if firewall.Description != "" && firewall.Description != NodeLoadBalancerVMFirewallDescription {
+		return fmt.Errorf("VM firewall description %q is not the managed description", firewall.Description)
+	}
+	if _, err := NodeLoadBalancerVMFirewallSpecHash(firewall.Rules); err != nil {
+		return err
+	}
+	for index, row := range firewall.ResourcesAssigned {
+		if row.ResourceType != "vm" || row.ResourceUUID != vmUUID {
+			return fmt.Errorf("VM firewall assignment %d (%s/%s) is not VM %q", index, row.ResourceType, row.ResourceUUID, vmUUID)
+		}
+	}
+	return nil
+}
+
+// ValidateNodeLoadBalancerVMFirewall adds the policy hash check to
+// ValidateNodeLoadBalancerVMFirewallIdentity.
+func ValidateNodeLoadBalancerVMFirewall(firewall Firewall, cluster, vmUUID string, billingAccountID int64, expectedPolicyHash string) error {
+	if err := ValidateNodeLoadBalancerVMFirewallIdentity(firewall, cluster, vmUUID, billingAccountID); err != nil {
+		return err
+	}
+	if !nodeLoadBalancerPolicyHashPattern.MatchString(expectedPolicyHash) {
+		return fmt.Errorf("expected VM firewall policy hash %q is invalid", expectedPolicyHash)
+	}
+	actual, err := NodeLoadBalancerVMFirewallSpecHash(firewall.Rules)
+	if err != nil {
+		return err
+	}
+	if actual != expectedPolicyHash {
+		return fmt.Errorf("VM firewall policy hash %q does not match expected hash %q", actual, expectedPolicyHash)
+	}
+	return nil
+}
 
 // NodeLoadBalancerShardFirewallSpecHash returns the canonical policy hash for
 // the aggregate inbound TCP/UDP policy attached to one managed NodeLB shard.
