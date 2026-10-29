@@ -20,12 +20,25 @@ func (c *nodeLoadBalancerController) waitForPerVMVM(ctx context.Context, svc *co
 	}
 	for _, address := range addresses {
 		vmUUID, ok := nodeLoadBalancerVMUUID(address.Node)
-		if !ok || !perVMFirewallAttachedTo(items, c.provider.config.ClusterID, c.provider.config.BillingAccountID, vmUUID) {
+		if !ok {
+			continue
+		}
+		reason := ""
+		if perVMFirewallAttachedTo(items, c.provider.config.ClusterID, c.provider.config.BillingAccountID, vmUUID) {
+			reason = "carries a per-VM firewall"
+		} else if anchor, anchorErr := c.getVMFirewallAnchor(ctx, vmUUID); anchorErr != nil {
+			return anchorErr
+		} else if vmFirewallMigrationInFlight(anchor) {
+			// The migration is about to put the per-VM firewall on this VM: a
+			// per-Service firewall attached now would be a firewall too many.
+			reason = "has a firewall migration in flight"
+		}
+		if reason == "" {
 			continue
 		}
 		cause := vmFirewallWait(nodeLoadBalancerRetry,
-			"public-node-local: VM %s carries a per-VM firewall; Service %s/%s is still on a per-Service firewall and waits for its migration",
-			vmUUID, svc.Namespace, svc.Name)
+			"public-node-local: VM %s %s; Service %s/%s is still on a per-Service firewall and waits for its migration",
+			vmUUID, reason, svc.Namespace, svc.Name)
 		c.recordPublicNodeLocalEvent(ctx, svc, publicNodeLocalReasonVMFirewallMigrationWaiting, cause)
 		return cause
 	}

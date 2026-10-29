@@ -486,9 +486,8 @@ func vmFirewallUpdateRequest(cluster, vmUUID string, current inspace.Firewall, m
 	if !nodeLoadBalancerFirewallUUIDPattern.MatchString(current.UUID) {
 		return inspace.UpdateFirewallRequest{}, fmt.Errorf("public-node-local: current VM firewall UUID %q is invalid", current.UUID)
 	}
-	if current.Name != "" && current.DisplayName != "" && current.Name != current.DisplayName {
-		return inspace.UpdateFirewallRequest{}, errors.New("public-node-local: current VM firewall has conflicting name fields")
-	}
+	// The list `name` is not rewritten by a rename (only display_name is), so an
+	// adopted firewall legitimately carries two names; display_name is the one.
 	if current.EffectiveName() != name {
 		return inspace.UpdateFirewallRequest{}, fmt.Errorf("public-node-local: firewall %q is not the VM firewall %q", current.EffectiveName(), name)
 	}

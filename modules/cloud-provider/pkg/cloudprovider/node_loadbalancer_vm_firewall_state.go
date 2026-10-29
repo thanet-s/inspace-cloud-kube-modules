@@ -297,14 +297,6 @@ const (
 // nothing is removed.
 var errVMFirewallDrift = errors.New("public-node-local: VM firewall drifted from its recorded ledger")
 
-// errVMFirewallAdoptUnsupported is returned for a receipt of the adopt
-// operation. Adopt (renaming a per-Service firewall into the per-VM one) is
-// added by the forward migration in PR 5, which brings its own resolution: the
-// firewall carries another name until the rename reads back, so the by-name
-// resolution of create and update does not apply. Until then the VM holds, and
-// the receipt is left untouched.
-var errVMFirewallAdoptUnsupported = errors.New("public-node-local: VM firewall adopt receipts are resolved by the migration, which this build does not contain")
-
 func vmFirewallDrift(vmUUID, format string, args ...any) error {
 	return fmt.Errorf("%w: VM %s: %s", errVMFirewallDrift, vmUUID, fmt.Sprintf(format, args...))
 }
@@ -763,6 +755,7 @@ var vmFirewallReceiptKeys = []string{
 	annotationVMFirewallPendingAt,
 	annotationVMFirewallIssuedAt,
 	annotationVMFirewallIssueID,
+	annotationVMFirewallAdoptUUID,
 }
 
 func vmFirewallSameReceipt(a, b map[string]string) bool {
@@ -1055,7 +1048,7 @@ func (c *nodeLoadBalancerController) resolveVMFirewallReceipt(
 	case vmFirewallOpDelete:
 		return c.deleteVMFirewall(ctx, anchor)
 	case vmFirewallOpAdopt:
-		return false, fmt.Errorf("%w: anchor %s", errVMFirewallAdoptUnsupported, anchor.Name)
+		return c.resolveVMFirewallAdoptReceipt(ctx, anchor, items, members)
 	default:
 		return false, fmt.Errorf("public-node-local: VM firewall receipt operation %q cannot be resolved here", op)
 	}
