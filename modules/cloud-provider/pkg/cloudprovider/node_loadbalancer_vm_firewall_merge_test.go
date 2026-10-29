@@ -187,10 +187,18 @@ func TestVMFirewallUpdateRequestKeepsRuleUUIDs(t *testing.T) {
 			t.Fatal("a removed port must be absent")
 		}
 	}
-	conflicting := current
-	conflicting.Name = "another-name"
-	if _, err := vmFirewallUpdateRequest(vmTestCluster, vmTestVM, conflicting, merged); err == nil {
-		t.Fatal("conflicting Name and DisplayName must be refused")
+	// After an adopt the list `name` is the old per-Service name (a rename only
+	// rewrites display_name), so the two differ and the update is judged on
+	// display_name alone. A display_name that is not the per-VM name is refused.
+	adopted := current
+	adopted.Name = "inlb-00000000-old-service-name"
+	if _, err := vmFirewallUpdateRequest(vmTestCluster, vmTestVM, adopted, merged); err != nil {
+		t.Fatalf("an adopted firewall with a stale list name must be updatable: %v", err)
+	}
+	wrongDisplay := current
+	wrongDisplay.DisplayName = "another-name"
+	if _, err := vmFirewallUpdateRequest(vmTestCluster, vmTestVM, wrongDisplay, merged); err == nil {
+		t.Fatal("a display_name that is not the per-VM name must be refused")
 	}
 	badRuleUUID := vmTestCurrentFirewall(t)
 	badRuleUUID.Rules[0].UUID = "not-a-uuid"

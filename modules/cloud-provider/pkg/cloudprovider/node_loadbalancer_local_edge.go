@@ -224,5 +224,13 @@ func (e perServiceEdge) WithdrawAll(ctx context.Context, svc *corev1.Service) (b
 	if err := e.c.detachOwnedServiceFirewallsForFailure(ctx, svc); err != nil {
 		return false, err
 	}
-	return e.c.serviceFirewallsDetached(ctx, svc)
+	proven, err := e.c.serviceFirewallsDetached(ctx, svc)
+	if err != nil || !proven || !e.c.publicNodeLocalPerVMModeEnabled() {
+		return proven, err
+	}
+	// A migration may already have put entries of this Service on the per-VM
+	// firewall of some of its VMs (or renamed its own firewall into one). A
+	// Service that is being withdrawn takes those entries off; its own firewall,
+	// which is shared with other Services by then, is never detached.
+	return perVMEdge{c: e.c}.WithdrawAll(ctx, svc)
 }

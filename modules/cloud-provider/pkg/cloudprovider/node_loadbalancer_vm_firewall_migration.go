@@ -85,6 +85,15 @@ func (p vmFirewallMigrationPlan) source(firewall string) (vmFirewallMigrationSou
 	return vmFirewallMigrationSource{}, false
 }
 
+func (p vmFirewallMigrationPlan) sourceOfService(uid string) (vmFirewallMigrationSource, bool) {
+	for _, source := range p.Sources {
+		if source.UID == uid {
+			return source, true
+		}
+	}
+	return vmFirewallMigrationSource{}, false
+}
+
 func validateVMFirewallMigrationPlan(p vmFirewallMigrationPlan) error {
 	if p.Direction != vmFirewallMigrationDirectionForward {
 		return fmt.Errorf("unsupported migration direction %q", p.Direction)

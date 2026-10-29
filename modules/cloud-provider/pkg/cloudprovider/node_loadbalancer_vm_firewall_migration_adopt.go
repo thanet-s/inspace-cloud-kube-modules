@@ -30,9 +30,6 @@ func vmFirewallAdoptRequest(cluster, vmUUID string, current inspace.Firewall, me
 	if !nodeLoadBalancerFirewallUUIDPattern.MatchString(current.UUID) {
 		return inspace.UpdateFirewallRequest{}, fmt.Errorf("public-node-local: firewall UUID %q to adopt is invalid", current.UUID)
 	}
-	if current.Name != "" && current.DisplayName != "" && current.Name != current.DisplayName {
-		return inspace.UpdateFirewallRequest{}, errors.New("public-node-local: the firewall to adopt has conflicting name fields")
-	}
 	if current.EffectiveName() == name {
 		return inspace.UpdateFirewallRequest{}, fmt.Errorf("public-node-local: firewall %s already carries the per-VM name", current.UUID)
 	}
@@ -184,6 +181,9 @@ func (c *nodeLoadBalancerController) adoptVMFirewallMigration(
 			return vmFirewallDrift(vmUUID, "the anchor records firewall %s, the plan adopts %s", view.uuid(), plan.Adoptee)
 		}
 		for _, source := range plan.Sources {
+			if svc := read.services[source.UID]; svc == nil || svc.DeletionTimestamp != nil {
+				continue // withdrawn since the rename
+			}
 			if _, present := applied.find(vmFirewallMemberKey{UID: source.UID, Policy: source.Policy}); !present {
 				return vmFirewallDrift(vmUUID, "the adopted firewall does not record Service %s", source.UID)
 			}

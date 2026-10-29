@@ -79,11 +79,11 @@ func (c *nodeLoadBalancerController) validateVMFirewallMigrationSources(
 	for _, source := range plan.Sources {
 		svc := read.services[source.UID]
 		if svc == nil || svc.DeletionTimestamp != nil {
-			if strict {
+			if strict && !(plan.Strategy == vmFirewallMigrationStrategyAdopt && view.uuid() != "") {
 				return sourceChanged("the Service %s of firewall %s is gone or being deleted", source.UID, source.Firewall)
 			}
-			// After the per-VM firewall is open, a Service that is leaving takes its
-			// own firewall with it; the migration only waits for that.
+			// A Service that is leaving takes its own firewall with it, and its entry
+			// leaves the per-VM firewall with its withdrawal; the migration only waits.
 			continue
 		}
 		if svc.Annotations[annotationNodeLoadBalancerFirewallUUID] != source.Firewall ||
@@ -181,7 +181,9 @@ func (c *nodeLoadBalancerController) stepVMFirewallMigration(ctx context.Context
 	case vmFirewallMigrationPhaseDetaching:
 		err = c.detachVMFirewallMigration(ctx, vmUUID, anchor, plan)
 	case vmFirewallMigrationPhaseDone:
-		return true, c.cleanupVMFirewallMigration(ctx, plan)
+		// Nothing left to flip: the pass is the ordinary upkeep's again (drift,
+		// entries of Services that are gone, a gone VM, an empty anchor).
+		return c.cleanupVMFirewallMigration(ctx, plan)
 	case vmFirewallMigrationPhaseAborting:
 		err = c.abortVMFirewallMigration(ctx, vmUUID, anchor, plan)
 	default:
@@ -270,7 +272,14 @@ func (c *nodeLoadBalancerController) markVMFirewallMigrationOpened(ctx context.C
 	if err != nil {
 		return err
 	}
+	read, err := c.readVMFirewallMigration(ctx)
+	if err != nil {
+		return err
+	}
 	for _, source := range plan.Sources {
+		if svc := read.services[source.UID]; svc == nil || svc.DeletionTimestamp != nil {
+			continue // its withdrawal took the entry off, or will
+		}
 		if _, present := applied.find(vmFirewallMemberKey{UID: source.UID, Policy: source.Policy}); !present {
 			return fmt.Errorf("public-node-local: the per-VM firewall of VM %s does not hold the entry of Service %s yet", vmUUID, source.UID)
 		}

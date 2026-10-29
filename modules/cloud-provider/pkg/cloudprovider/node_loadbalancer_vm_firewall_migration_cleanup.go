@@ -40,15 +40,16 @@ func (c *nodeLoadBalancerController) publishedVMsOfService(ctx context.Context, 
 // cleanupVMFirewallMigration is M6 for the Services of a finished VM: each one
 // whose VMs are all open on the per-VM firewall, and whose own firewall is on no
 // VM, gives that firewall up and flips to the per-VM edge. One durable step per
-// call.
-func (c *nodeLoadBalancerController) cleanupVMFirewallMigration(ctx context.Context, plan vmFirewallMigrationPlan) error {
+// call. It reports whether it acted: when nothing is left to do, the VM pass
+// goes on with the ordinary upkeep of the VM.
+func (c *nodeLoadBalancerController) cleanupVMFirewallMigration(ctx context.Context, plan vmFirewallMigrationPlan) (bool, error) {
 	read, err := c.readVMFirewallMigration(ctx)
 	if err != nil {
-		return err
+		return true, err
 	}
 	anchors, err := c.listVMFirewallAnchors(ctx)
 	if err != nil {
-		return err
+		return true, err
 	}
 	for _, source := range plan.Sources {
 		svc := read.services[source.UID]
@@ -60,10 +61,10 @@ func (c *nodeLoadBalancerController) cleanupVMFirewallMigration(ctx context.Cont
 		}
 		acted, err := c.cleanupMigratedService(ctx, svc, source, read, anchors)
 		if err != nil || acted {
-			return err
+			return true, err
 		}
 	}
-	return nil
+	return false, nil
 }
 
 // cleanupMigratedService reports whether it made a durable step.
@@ -208,7 +209,9 @@ func (c *nodeLoadBalancerController) sourceChangedBeforeOpen(
 
 // authorizeVMFirewallMigrationAbort is the verified intent of the removals an
 // abort makes: the anchor's record says aborting.
-func (c *nodeLoadBalancerController) authorizeVMFirewallMigrationAbort(vmUUID string) vmFirewallDeltaAuthority {
+// An entry also leaves only if it narrows nothing that serves: its Service is
+// gone, or the Service's own firewall is still attached to the VM and covers it.
+func (c *nodeLoadBalancerController) authorizeVMFirewallMigrationAbort(vmUUID string, key vmFirewallMemberKey) vmFirewallDeltaAuthority {
 	return func(ctx context.Context, _ *corev1.ConfigMap, _ *inspace.Firewall) error {
 		fresh, err := c.getVMFirewallAnchor(ctx, vmUUID)
 		if err != nil {
@@ -223,6 +226,21 @@ func (c *nodeLoadBalancerController) authorizeVMFirewallMigrationAbort(vmUUID st
 		}
 		if !ok || plan.Phase != vmFirewallMigrationPhaseAborting {
 			return errors.New("public-node-local: the migration is not aborting, so no entry may leave the per-VM firewall")
+		}
+		read, err := c.readVMFirewallMigration(ctx)
+		if err != nil {
+			return err
+		}
+		if svc := read.services[key.UID]; svc == nil || svc.DeletionTimestamp != nil {
+			return nil
+		}
+		source, listed := plan.sourceOfService(key.UID)
+		if !listed {
+			return fmt.Errorf("public-node-local: Service %s is alive and is no source of this migration, so its entry stays", key.UID)
+		}
+		firewall, present := exactNodeLoadBalancerFirewallFromItemsOptional(read.items, source.Firewall)
+		if !present || !vmFirewallAttachedTo(*firewall, vmUUID) {
+			return fmt.Errorf("public-node-local: Service %s is alive and its own firewall %s is not on VM %s, so its entry stays", key.UID, source.Firewall, vmUUID)
 		}
 		return nil
 	}
@@ -244,13 +262,21 @@ func (c *nodeLoadBalancerController) abortVMFirewallMigration(ctx context.Contex
 		return err
 	}
 	if len(applied.Members) != 0 {
-		key := applied.Members[0].key()
-		_, err := c.vmFirewallStep(ctx, vmUUID, vmFirewallDelta{Remove: &key},
-			c.authorizeVMFirewallMigrationAbort(vmUUID), c.vmFirewallMemberLookup(vmUUID, nil))
-		if err == nil {
-			c.queueVMFirewall(vmUUID)
+		// The first entry whose removal narrows nothing that serves; if none, hold.
+		var held error
+		for _, member := range applied.Members {
+			key := member.key()
+			if held = c.authorizeVMFirewallMigrationAbort(vmUUID, key)(ctx, anchor, nil); held != nil {
+				continue
+			}
+			_, err := c.vmFirewallStep(ctx, vmUUID, vmFirewallDelta{Remove: &key},
+				c.authorizeVMFirewallMigrationAbort(vmUUID, key), c.vmFirewallMemberLookup(vmUUID, nil))
+			if err == nil {
+				c.queueVMFirewall(vmUUID)
+			}
+			return err
 		}
-		return err
+		return held
 	}
 	if view.uuid() != "" {
 		return vmFirewallDrift(vmUUID, "the anchor records firewall %s but no entries during an abort", view.uuid())

@@ -1912,8 +1912,8 @@ func (f *fakeAPI) CreateFirewall(_ context.Context, _ string, request inspace.Cr
 	// deleted does not reuse its UUID.
 	f.firewallSequence = max(f.firewallSequence+1, len(f.firewalls)+1)
 	item := inspace.Firewall{
-		UUID:        fmt.Sprintf("00000000-0000-4000-8000-%012d", f.firewallSequence),
-		DisplayName: request.DisplayName, Description: request.Description,
+		UUID: fmt.Sprintf("00000000-0000-4000-8000-%012d", f.firewallSequence),
+		Name: request.DisplayName, DisplayName: request.DisplayName, // the live API does not store the description
 		BillingAccountID: request.BillingAccountID, Rules: rules,
 	}
 	f.firewalls = append(f.firewalls, item)
@@ -1929,9 +1929,9 @@ func (f *fakeAPI) UpdateFirewall(_ context.Context, _, uuid string, request insp
 		if f.firewalls[i].UUID != uuid {
 			continue
 		}
-		f.firewalls[i].Name = request.Name
+		// Live: only display_name is honoured; name is accepted and ignored, and the
+		// description is not stored.
 		f.firewalls[i].DisplayName = request.Name
-		f.firewalls[i].Description = request.Description
 		rules := append([]inspace.FirewallRule(nil), request.Rules...)
 		for index := range rules {
 			if rules[index].UUID == "" {

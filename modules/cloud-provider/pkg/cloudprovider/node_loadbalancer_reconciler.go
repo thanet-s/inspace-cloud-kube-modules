@@ -6173,6 +6173,12 @@ func (c *nodeLoadBalancerController) serviceFirewallsForEmergencyDetach(
 	seen := map[string]int{}
 	var resultErr error
 	for _, firewall := range items {
+		if _, isVMFirewall := inspace.ParseNodeLoadBalancerVMFirewallName(c.provider.config.ClusterID, firewall.EffectiveName()); isVMFirewall {
+			// A Service firewall that a migration renamed into the per-VM firewall is
+			// shared by every Service on that VM now. A Service never detaches it; its
+			// own entries leave the per-VM ledger instead.
+			continue
+		}
 		_, exactPersisted := persisted[firewall.UUID]
 		strictOwned := nodeLoadBalancerFirewallOwnedByService(
 			firewall,
@@ -6380,6 +6386,11 @@ func (c *nodeLoadBalancerController) ownedServiceFirewalls(ctx context.Context, 
 	previousUUID := service.Annotations[annotationNodeLoadBalancerPreviousFirewall]
 	identityMatches := map[string]int{}
 	for _, firewall := range items {
+		if _, isVMFirewall := inspace.ParseNodeLoadBalancerVMFirewallName(c.provider.config.ClusterID, firewall.EffectiveName()); isVMFirewall {
+			// The per-Service firewall a migration renamed into the per-VM firewall is
+			// no longer owned by the Service alone; the Service never deletes it.
+			continue
+		}
 		if pendingUUID != "" && firewall.UUID == pendingUUID {
 			pendingUUIDMatches++
 			if firewall.EffectiveName() != pendingName {

@@ -93,6 +93,14 @@ func newMigrationCluster(t *testing.T, vms ...migrationVM) *migrationCluster {
 		}
 		return false, nil, nil
 	})
+	kube.PrependReactor("create", "services", func(action kubetesting.Action) (bool, runtime.Object, error) {
+		if create, ok := action.(kubetesting.CreateAction); ok {
+			if svc, ok := create.GetObject().(*corev1.Service); ok && svc.UID == "" {
+				svc.UID = types.UID("uid-" + svc.Name)
+			}
+		}
+		return false, nil, nil
+	})
 	provider.kubeClient = kube
 	provider.config.NodeLoadBalancer.DefaultNodeClass = "workers"
 	nodeClass := &unstructured.Unstructured{Object: map[string]any{
@@ -235,6 +243,7 @@ func (m *migrationCluster) restart() {
 		provider: m.provider, queue: workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]()),
 		endpointSlices:      m.controller.endpointSlices,
 		firewallRelationNow: m.now, firewallRelationAbsentDelay: nodeLoadBalancerAbsenceConfirmationDelay,
+		assignFenceNow: m.now,
 	}
 	m.t.Cleanup(m.controller.queue.ShutDown)
 }
