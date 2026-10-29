@@ -1928,6 +1928,9 @@ func (c *nodeLoadBalancerController) publicNodeLocalServiceStillExposed(
 	} else if !apierrors.IsNotFound(err) {
 		return false, fmt.Errorf("public-node-local: inspect conflict peer datapath: %w", err)
 	}
+	if exposed, err := c.vmFirewallExposesService(ctx, service); err != nil || exposed {
+		return exposed, err
+	}
 	owned, err := c.serviceFirewallsForEmergencyDetach(ctx, service)
 	if err != nil {
 		return false, fmt.Errorf("public-node-local: inspect conflict peer firewalls: %w", err)
@@ -2666,6 +2669,20 @@ func (c *nodeLoadBalancerController) detachPublicNodeLocalFirewalls(
 	service *corev1.Service,
 	nodes []*corev1.Node,
 ) error {
+	if publicNodeLocalServicePerVM(service) {
+		// A per-VM firewall is shared: the Service leaves a VM by a ledger delta,
+		// never by detaching the whole firewall.
+		edge := perVMEdge{c: c}
+		for _, policy := range []string{service.Annotations[annotationPublicNodeLocalActivePolicy], service.Annotations[annotationPublicNodeLocalTargetPolicy]} {
+			if policy == "" {
+				continue
+			}
+			if _, err := edge.Unassign(ctx, service, edgeID{perVM: true, policy: policy}, nodes); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 	owned, err := c.ownedServiceFirewalls(ctx, service)
 	if err != nil {
 		return err
@@ -2893,6 +2910,11 @@ func (c *nodeLoadBalancerController) recordPublicNodeLocalHoldEvent(
 }
 
 func (c *nodeLoadBalancerController) cleanupPublicNodeLocal(ctx context.Context, key string, service *corev1.Service) error {
+	if publicNodeLocalServicePerVM(service) && !c.publicNodeLocalPerVMModeEnabled() {
+		// Its entries live on the VM firewalls, which this mode does not manage:
+		// finalizing now would orphan them. It waits for the mode to come back.
+		return c.holdOrFailPublicNodeLocal(ctx, service, publicNodeLocalPerVMHeldError(service))
+	}
 	if err := c.withdrawPublicNodeLocal(ctx, service); err != nil {
 		return err
 	}
@@ -2906,6 +2928,9 @@ func (c *nodeLoadBalancerController) cleanupPublicNodeLocal(ctx context.Context,
 	if !absent {
 		c.requeuePublicNodeLocal(key)
 		return nil
+	}
+	if publicNodeLocalServicePerVM(service) {
+		return c.finalizePerVMPublicNodeLocal(ctx, key, service)
 	}
 	if waiting, completed, err := c.resumeOwnedServiceFirewallDelete(ctx, service); err != nil || waiting {
 		if waiting {
@@ -2978,7 +3003,13 @@ func (c *nodeLoadBalancerController) cleanupPublicNodeLocal(ctx context.Context,
 		}
 		return nil
 	}
-	_, _, err = c.updateExactParentService(ctx, service, func(copy *corev1.Service) (bool, error) {
+	return c.finalizePublicNodeLocal(ctx, service)
+}
+
+// finalizePublicNodeLocal removes the finalizer and the persisted state of a
+// Service whose edge, child and firewalls are proven gone.
+func (c *nodeLoadBalancerController) finalizePublicNodeLocal(ctx context.Context, service *corev1.Service) error {
+	_, _, err := c.updateExactParentService(ctx, service, func(copy *corev1.Service) (bool, error) {
 		if copy.DeletionTimestamp == nil && publicNodeLocalRequested(copy) {
 			return false, errors.New("public-node-local: Service became active before finalization")
 		}

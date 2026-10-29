@@ -591,6 +591,11 @@ func requireVMEdgeSafe(t *testing.T, f *publicNodeLocalTransientFixture, service
 			continue
 		}
 		required := activeServiceRules(f, service)
+		if service.DeletionTimestamp != nil || service.Annotations[annotationNodeLoadBalancerRebuilding] != "" {
+			// A withdrawal closes the firewall first and clears the status after the
+			// readback, by design: the FIP is allowed to outlive its rules.
+			required = nil
+		}
 		for _, ingress := range service.Status.LoadBalancer.Ingress {
 			vmUUID, known := vmOfPublic[ingress.IP]
 			if !known {

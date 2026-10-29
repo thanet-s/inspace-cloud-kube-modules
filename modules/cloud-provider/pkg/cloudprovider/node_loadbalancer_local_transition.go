@@ -752,6 +752,14 @@ func (c *nodeLoadBalancerController) publicNodeLocalChildFromActiveFirewall(
 	if activePolicy == "" {
 		return nil, nil
 	}
+	if publicNodeLocalServicePerVM(service) {
+		// The rules the Service serves are the ones its ledger entry recorded.
+		rules, err := c.perVMActiveRules(ctx, service, activePolicy)
+		if err != nil || rules == nil {
+			return nil, err
+		}
+		return publicNodeLocalChildFromRules(service, rules), nil
+	}
 	owned, err := c.ownedServiceFirewalls(ctx, service)
 	if err != nil {
 		return nil, err
@@ -761,47 +769,53 @@ func (c *nodeLoadBalancerController) publicNodeLocalChildFromActiveFirewall(
 		if hashErr != nil || hash != activePolicy {
 			continue
 		}
-		child := &corev1.Service{}
-		recordedPorts := publicNodeLocalActivePorts(service)
-		anySource := false
-		sources := map[string]struct{}{}
-		for _, rule := range owned[index].Rules {
-			if !strings.EqualFold(rule.Direction, "inbound") || rule.PortStart == nil || rule.PortEnd == nil || *rule.PortStart != *rule.PortEnd {
-				continue
-			}
-			protocol := corev1.ProtocolTCP
-			if strings.EqualFold(rule.Protocol, "udp") {
-				protocol = corev1.ProtocolUDP
-			} else if !strings.EqualFold(rule.Protocol, "tcp") {
-				continue
-			}
-			port := corev1.ServicePort{
-				Name: fmt.Sprintf("t-%s-%d", strings.ToLower(string(protocol)), *rule.PortStart), Protocol: protocol,
-				Port: *rule.PortStart, TargetPort: intstr.FromInt32(*rule.PortStart),
-			}
-			// The recorded active ports know the real name and target port.
-			for _, recorded := range recordedPorts {
-				if recorded.Port == port.Port && recorded.Protocol == protocol {
-					port = recorded
-				}
-			}
-			child.Spec.Ports = append(child.Spec.Ports, port)
-			if rule.EndpointSpecType != "ip_prefixes" {
-				anySource = true
-			}
-			for _, source := range rule.EndpointSpec {
-				sources[source] = struct{}{}
-			}
-		}
-		if !anySource {
-			for source := range sources {
-				child.Spec.LoadBalancerSourceRanges = append(child.Spec.LoadBalancerSourceRanges, source)
-			}
-			sort.Strings(child.Spec.LoadBalancerSourceRanges)
-		}
-		return child, nil
+		return publicNodeLocalChildFromRules(service, owned[index].Rules), nil
 	}
 	return nil, nil
+}
+
+// publicNodeLocalChildFromRules builds the child a Service served under the
+// given firewall rules: the ports they allow and the source ranges they allow.
+func publicNodeLocalChildFromRules(service *corev1.Service, rules []inspace.FirewallRule) *corev1.Service {
+	child := &corev1.Service{}
+	recordedPorts := publicNodeLocalActivePorts(service)
+	anySource := false
+	sources := map[string]struct{}{}
+	for _, rule := range rules {
+		if !strings.EqualFold(rule.Direction, "inbound") || rule.PortStart == nil || rule.PortEnd == nil || *rule.PortStart != *rule.PortEnd {
+			continue
+		}
+		protocol := corev1.ProtocolTCP
+		if strings.EqualFold(rule.Protocol, "udp") {
+			protocol = corev1.ProtocolUDP
+		} else if !strings.EqualFold(rule.Protocol, "tcp") {
+			continue
+		}
+		port := corev1.ServicePort{
+			Name: fmt.Sprintf("t-%s-%d", strings.ToLower(string(protocol)), *rule.PortStart), Protocol: protocol,
+			Port: *rule.PortStart, TargetPort: intstr.FromInt32(*rule.PortStart),
+		}
+		// The recorded active ports know the real name and target port.
+		for _, recorded := range recordedPorts {
+			if recorded.Port == port.Port && recorded.Protocol == protocol {
+				port = recorded
+			}
+		}
+		child.Spec.Ports = append(child.Spec.Ports, port)
+		if rule.EndpointSpecType != "ip_prefixes" {
+			anySource = true
+		}
+		for _, source := range rule.EndpointSpec {
+			sources[source] = struct{}{}
+		}
+	}
+	if !anySource {
+		for source := range sources {
+			child.Spec.LoadBalancerSourceRanges = append(child.Spec.LoadBalancerSourceRanges, source)
+		}
+		sort.Strings(child.Spec.LoadBalancerSourceRanges)
+	}
+	return child
 }
 
 // createPublicNodeLocalDatapathHeld recreates a lost child while the Service
@@ -962,6 +976,9 @@ const publicNodeLocalReasonRebuildStuck = "PublicNodeLocalRebuildStuck"
 // publicNodeLocalAssignedPairs lists the firewall/VM pairs that are assigned now,
 // bounded to 3000 bytes (an empty string when they do not fit).
 func (c *nodeLoadBalancerController) publicNodeLocalAssignedPairs(ctx context.Context, service *corev1.Service) (string, error) {
+	if publicNodeLocalServicePerVM(service) {
+		return c.perVMAssignedPairs(ctx, service)
+	}
 	firewalls, err := c.serviceFirewallsForEmergencyDetach(ctx, service)
 	if err != nil {
 		return "", err
@@ -994,6 +1011,9 @@ func (c *nodeLoadBalancerController) publicNodeLocalRebuildDetachReadBack(ctx co
 		// The assignments at the start were not recorded (none, or too many to
 		// keep): nothing proves that no detach was read back, so do not cancel.
 		return true, nil
+	}
+	if publicNodeLocalServicePerVM(service) {
+		return c.perVMRebuildDetachReadBack(ctx, service, journal)
 	}
 	firewalls, err := c.serviceFirewallsForEmergencyDetach(ctx, service)
 	if err != nil {
