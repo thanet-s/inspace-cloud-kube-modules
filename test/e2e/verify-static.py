@@ -2390,6 +2390,30 @@ def verify_rke2_agent_token_e2e(init_playbook: str) -> None:
     )
 
 
+def verify_race_runs_have_long_timeout(repository: pathlib.Path) -> None:
+    """A -race run of pkg/cloudprovider exceeds the default 10m go test timeout."""
+    candidates = [repository / "Makefile", repository / "DEVELOPMENT.md"]
+    candidates += sorted((repository / ".github/workflows").glob("*.y*ml"))
+    candidates += sorted((repository / "scripts").glob("*.sh"))
+    candidates += sorted((repository / "modules").glob("*/Makefile"))
+    race_runs = 0
+    for path in candidates:
+        for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            if re.search(r"go test\b.*(?<!\S)-race\b", line):
+                race_runs += 1
+                require(
+                    re.search(r"-timeout[= ]60m\b", line) is not None,
+                    f"{path.relative_to(repository)}:{number}: a -race go test run needs -timeout 60m",
+                )
+    makefile = (repository / "modules/cloud-provider/Makefile").read_text(encoding="utf-8")
+    require(
+        re.search(r"(?m)^test-race:\n\tGOWORK=\$\(GOWORK\) go test -race -timeout 60m \./pkg/cloudprovider$", makefile)
+        is not None,
+        "modules/cloud-provider/Makefile must keep a test-race target with -timeout 60m",
+    )
+    require(race_runs >= 1, "no -race go test run found to check")
+
+
 def verify_credentials_stay_off_argv(repository: pathlib.Path) -> None:
     """No playbook, script, or runbook puts a credential on a command line."""
     roots = ("deploy", "test/e2e", "scripts", "modules", "charts", "README.md", "DEVELOPMENT.md")
@@ -4726,6 +4750,7 @@ def main() -> None:
     )
     verify_rke2_agent_token_e2e(init_playbook)
     verify_credentials_stay_off_argv(repository)
+    verify_race_runs_have_long_timeout(repository)
     print("E2E static contract verified (no live resources touched)")
 
 
