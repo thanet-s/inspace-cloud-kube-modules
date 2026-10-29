@@ -29,6 +29,7 @@ const (
 	annotationVMFirewallApplied          = vmFirewallAnnotationPrefix + "applied"
 	annotationVMFirewallAppliedHash      = vmFirewallAnnotationPrefix + "applied-hash"
 	annotationVMFirewallAppliedAt        = vmFirewallAnnotationPrefix + "applied-at"
+	annotationVMFirewallAttachedAt       = vmFirewallAnnotationPrefix + "attached-at"
 	annotationVMFirewallPending          = vmFirewallAnnotationPrefix + "pending"
 	annotationVMFirewallPendingHash      = vmFirewallAnnotationPrefix + "pending-hash"
 	annotationVMFirewallPendingOp        = vmFirewallAnnotationPrefix + "pending-op"
@@ -295,6 +296,14 @@ const (
 // its anchor recorded. Every Service on the VM holds; nothing is mutated and
 // nothing is removed.
 var errVMFirewallDrift = errors.New("public-node-local: VM firewall drifted from its recorded ledger")
+
+// errVMFirewallAdoptUnsupported is returned for a receipt of the adopt
+// operation. Adopt (renaming a per-Service firewall into the per-VM one) is
+// added by the forward migration in PR 5, which brings its own resolution: the
+// firewall carries another name until the rename reads back, so the by-name
+// resolution of create and update does not apply. Until then the VM holds, and
+// the receipt is left untouched.
+var errVMFirewallAdoptUnsupported = errors.New("public-node-local: VM firewall adopt receipts are resolved by the migration, which this build does not contain")
 
 func vmFirewallDrift(vmUUID, format string, args ...any) error {
 	return fmt.Errorf("%w: VM %s: %s", errVMFirewallDrift, vmUUID, fmt.Sprintf(format, args...))
@@ -573,6 +582,16 @@ func (c *nodeLoadBalancerController) vmFirewallStep(
 	}
 	observation, err := c.observeVMFirewall(vmUUID, view, applied, items)
 	if err != nil {
+		if errors.Is(err, errVMFirewallDrift) && delta.LedgerOnly && view.uuid() != "" && !vmFirewallListed(items, view.uuid()) {
+			// The VM is gone and its firewall too: there is nothing left to
+			// drift from. With the VM proven absent the whole anchor is retired
+			// through the delete receipt, whose three spaced absent reads prove
+			// the firewall UUID is gone for good.
+			if owned, absent, authErr := c.nodeLoadBalancerFirewallRelationVMCloudAuthority(ctx, vmUUID); authErr == nil && absent && !owned {
+				stageErr := c.stageVMFirewallDelete(ctx, anchor, vmFirewallObservation{}, authorize)
+				return vmFirewallStepResult{FirewallUUID: view.uuid()}, stageErr
+			}
+		}
 		if errors.Is(err, errVMFirewallDrift) {
 			c.recordVMFirewallEvent(ctx, c.vmFirewallMemberServices(ctx, members), vmFirewallDriftReason, err)
 		}
@@ -599,17 +618,46 @@ func (c *nodeLoadBalancerController) vmFirewallStep(
 			return vmFirewallStepResult{Converged: true, FirewallUUID: view.uuid()}, nil
 		}
 		if !observation.attached {
+			if view.get(annotationVMFirewallAttachedAt) != "" {
+				// A new attach starts a new settle.
+				if _, _, err := c.updateVMFirewallAnchor(ctx, anchor, func(cm *corev1.ConfigMap) (bool, error) {
+					if _, present := cm.Annotations[annotationVMFirewallAttachedAt]; !present {
+						return false, nil
+					}
+					delete(cm.Annotations, annotationVMFirewallAttachedAt)
+					return true, nil
+				}); err != nil {
+					return vmFirewallStepResult{}, err
+				}
+			}
 			fence := nodeLoadBalancerFirewallRelationFence{
 				operation: nodeLoadBalancerFirewallRelationAssign, firewallUUID: view.uuid(), vmUUID: vmUUID,
 			}
 			_, err := c.reconcileNodeLoadBalancerFirewallRelation(ctx, c.vmFirewallRelationOwner(vmUUID, members), &fence)
 			return vmFirewallStepResult{FirewallUUID: view.uuid()}, err
 		}
-		appliedAt, _, err := view.appliedAt()
+		if view.get(annotationVMFirewallAttachedAt) == "" {
+			// The attach just read back: stamp it, so the settle counts from the
+			// moment the VM carries the firewall and not from the rule commit.
+			now := c.nodeLoadBalancerFirewallRelationTime().Format(time.RFC3339Nano)
+			stamped, _, err := c.updateVMFirewallAnchor(ctx, anchor, func(cm *corev1.ConfigMap) (bool, error) {
+				if cm.Annotations[annotationVMFirewallAttachedAt] != "" {
+					return false, nil
+				}
+				cm.Annotations[annotationVMFirewallAttachedAt] = now
+				return true, nil
+			})
+			if err != nil {
+				return vmFirewallStepResult{}, err
+			}
+			anchor = stamped
+			view = vmFirewallAnchorView{cm: anchor}
+		}
+		settledFrom, err := view.settledFrom()
 		if err != nil {
 			return vmFirewallStepResult{}, err
 		}
-		return vmFirewallStepResult{Converged: true, AppliedAt: appliedAt, FirewallUUID: view.uuid()}, nil
+		return vmFirewallStepResult{Converged: true, AppliedAt: settledFrom, FirewallUUID: view.uuid()}, nil
 	}
 
 	if delta.LedgerOnly {
@@ -953,6 +1001,8 @@ func (c *nodeLoadBalancerController) resolveVMFirewallReceipt(
 	case vmFirewallOpCreate, vmFirewallOpUpdate:
 	case vmFirewallOpDelete:
 		return c.deleteVMFirewall(ctx, anchor)
+	case vmFirewallOpAdopt:
+		return false, fmt.Errorf("%w: anchor %s", errVMFirewallAdoptUnsupported, anchor.Name)
 	default:
 		return false, fmt.Errorf("public-node-local: VM firewall receipt operation %q cannot be resolved here", op)
 	}
@@ -1163,15 +1213,58 @@ func (p *Provider) vmFirewallSettle() time.Duration {
 	return vmFirewallSettleDefault
 }
 
+func (a vmFirewallAnchorView) attachedAt() (time.Time, bool, error) {
+	raw := a.get(annotationVMFirewallAttachedAt)
+	if raw == "" {
+		return time.Time{}, false, nil
+	}
+	at, err := time.Parse(time.RFC3339Nano, raw)
+	if err != nil {
+		return time.Time{}, false, corruptVMFirewallLedger("anchor %s attached-at %q: %v", a.cm.Name, raw, err)
+	}
+	return at, true, nil
+}
+
+// settledFrom is the later of the last rule commit and the last attach
+// read-back: the edge is only open once both have happened.
+func (a vmFirewallAnchorView) settledFrom() (time.Time, error) {
+	appliedAt, appliedOK, err := a.appliedAt()
+	if err != nil {
+		return time.Time{}, err
+	}
+	attachedAt, attachedOK, err := a.attachedAt()
+	if err != nil {
+		return time.Time{}, err
+	}
+	if attachedOK && (!appliedOK || attachedAt.After(appliedAt)) {
+		return attachedAt, nil
+	}
+	return appliedAt, nil
+}
+
+func vmFirewallListed(items []inspace.Firewall, uuid string) bool {
+	for index := range items {
+		if strings.EqualFold(items[index].UUID, uuid) {
+			return true
+		}
+	}
+	return false
+}
+
 // vmFirewallSettleRemaining is how much of the settle delay is left, counted
-// from the anchor's applied-at. An anchor that never applied anything has
-// nothing to settle.
+// from the later of the anchor's applied-at and attached-at. An anchor that
+// never applied anything has nothing to settle. A stamp that cannot be read
+// fails closed: the full settle is returned, never zero.
 func vmFirewallSettleRemaining(anchor *corev1.ConfigMap, settle time.Duration, now time.Time) time.Duration {
-	appliedAt, ok, err := vmFirewallAnchorView{cm: anchor}.appliedAt()
-	if err != nil || !ok {
+	view := vmFirewallAnchorView{cm: anchor}
+	if view.get(annotationVMFirewallAppliedAt) == "" && view.get(annotationVMFirewallAttachedAt) == "" {
 		return 0
 	}
-	if remaining := appliedAt.Add(settle).Sub(now); remaining > 0 {
+	settledFrom, err := view.settledFrom()
+	if err != nil {
+		return settle
+	}
+	if remaining := settledFrom.Add(settle).Sub(now); remaining > 0 {
 		return remaining
 	}
 	return 0

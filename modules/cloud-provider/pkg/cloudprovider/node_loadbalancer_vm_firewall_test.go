@@ -105,10 +105,10 @@ func TestVMFirewallLedgerRejectsNonCanonical(t *testing.T) {
 	})
 	t.Run("with refuses a third entry and an exact duplicate", func(t *testing.T) {
 		l := vmTestLedger(vmTestMember(t, "svc-a", vmTestRule("tcp", 1)), vmTestMember(t, "svc-a", vmTestRule("tcp", 2)))
-		if _, err := l.with(vmTestMember(t, "svc-a", vmTestRule("tcp", 3))); !errors.Is(err, errVMFirewallLedgerCorrupt) {
+		if _, err := l.with(vmTestMember(t, "svc-a", vmTestRule("tcp", 3))); !errors.Is(err, errVMFirewallEntryOrder) {
 			t.Fatalf("third entry error = %v", err)
 		}
-		if _, err := l.with(vmTestMember(t, "svc-a", vmTestRule("tcp", 1))); !errors.Is(err, errVMFirewallLedgerCorrupt) {
+		if _, err := l.with(vmTestMember(t, "svc-a", vmTestRule("tcp", 1))); !errors.Is(err, errVMFirewallEntryOrder) {
 			t.Fatalf("duplicate error = %v", err)
 		}
 		next, err := l.with(vmTestMember(t, "svc-b", vmTestRule("tcp", 3)))

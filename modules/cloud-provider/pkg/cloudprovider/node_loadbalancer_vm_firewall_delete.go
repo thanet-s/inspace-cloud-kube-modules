@@ -34,9 +34,8 @@ func (c *nodeLoadBalancerController) stageVMFirewallDelete(
 	observation vmFirewallObservation,
 	authorize vmFirewallDeltaAuthority,
 ) error {
-	if observation.firewall == nil {
-		return errors.New("public-node-local: there is no VM firewall to delete")
-	}
+	// observation.firewall is nil when the VM and its firewall are both gone;
+	// the delete receipt then retires the anchor through its absence proof.
 	if err := authorize(ctx, anchor, observation.firewall); err != nil {
 		return fmt.Errorf("public-node-local: reject VM firewall delete for %s at final authority: %w", anchor.Annotations[annotationVMFirewallVM], err)
 	}
@@ -99,6 +98,15 @@ func (c *nodeLoadBalancerController) removeVMFirewallEntryLedgerOnly(
 			return false, errors.New("public-node-local: the VM firewall anchor changed before the ledger-only removal")
 		}
 		// applied-hash keeps describing the firewall as it is in the cloud.
+		//
+		// This is the one path that narrows the ledger without a PUT, so the
+		// make-before-break narrow guard (vmFirewallMergedNarrows) is not applied.
+		// That is safe only because the VM is proven gone: the
+		// nodeLoadBalancerFirewallRelationVMCloudAuthority check above is the
+		// canonical GET, the VM list and the VPC membership agreeing on absence,
+		// and the caller's authorize callback supplies the second spaced read. If
+		// that proof is ever weakened, this path would drop rules of a VM that
+		// might still be serving.
 		cm.Annotations[annotationVMFirewallApplied] = nextRaw
 		return true, nil
 	})

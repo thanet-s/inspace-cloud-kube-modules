@@ -50,7 +50,11 @@ const (
 
 var (
 	errVMFirewallLedgerCorrupt = errors.New("public-node-local: VM firewall ledger is corrupt")
-	vmFirewallPolicyPattern    = regexp.MustCompile(`^[0-9a-f]{8}$`)
+	// errVMFirewallEntryOrder is a caller-ordering error, not corruption: the
+	// entry is already there, or a Service already holds its old and new policy
+	// and the old one must be removed first.
+	errVMFirewallEntryOrder = errors.New("public-node-local: VM firewall ledger entry out of order")
+	vmFirewallPolicyPattern = regexp.MustCompile(`^[0-9a-f]{8}$`)
 )
 
 func corruptVMFirewallLedger(format string, args ...any) error {
@@ -276,7 +280,7 @@ func (l vmFirewallLedger) with(m vmFirewallMember) (vmFirewallLedger, error) {
 		return vmFirewallLedger{}, err
 	}
 	if _, exists := l.find(m.key()); exists {
-		return vmFirewallLedger{}, corruptVMFirewallLedger("member %s/%s is already in the ledger", m.UID, m.Policy)
+		return vmFirewallLedger{}, fmt.Errorf("%w: member %s/%s is already in the ledger", errVMFirewallEntryOrder, m.UID, m.Policy)
 	}
 	entries := 0
 	for _, member := range l.Members {
@@ -285,7 +289,7 @@ func (l vmFirewallLedger) with(m vmFirewallMember) (vmFirewallLedger, error) {
 		}
 	}
 	if entries >= vmFirewallMaxEntriesPerUID {
-		return vmFirewallLedger{}, corruptVMFirewallLedger("Service %s already has %d entries", m.UID, entries)
+		return vmFirewallLedger{}, fmt.Errorf("%w: Service %s already has %d entries; remove the old policy first", errVMFirewallEntryOrder, m.UID, entries)
 	}
 	next := canonicalVMFirewallLedger(l)
 	next.V = vmFirewallLedgerVersion
