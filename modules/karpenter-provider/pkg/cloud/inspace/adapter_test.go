@@ -6651,3 +6651,48 @@ func TestPublicNodeLocalAcceptsOwnVMFirewall(t *testing.T) {
 		})
 	}
 }
+
+func TestPublicNodeLocalRejectsOwnVMFirewallWithBadBillingOrDescription(t *testing.T) {
+	const vmUUID = "11111111-1111-4111-8111-111111111111"
+	base := secureFirewall()
+	base.ResourcesAssigned = []sdk.FirewallResource{{ResourceType: "vm", ResourceUUID: vmUUID}}
+	port := int32(1935)
+	name, err := sdk.NodeLoadBalancerVMFirewallName("cluster-a", vmUUID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	build := func(mutate func(*sdk.Firewall)) sdk.Firewall {
+		firewall := sdk.Firewall{
+			UUID: "70000000-0000-4000-8000-000000000001", DisplayName: name, BillingAccountID: base.BillingAccountID,
+			Description: sdk.NodeLoadBalancerVMFirewallDescription,
+			Rules: []sdk.FirewallRule{{
+				UUID: "public-tcp-1935", Protocol: "tcp", Direction: "inbound",
+				PortStart: &port, PortEnd: &port, EndpointSpecType: "any",
+			}},
+			ResourcesAssigned: []sdk.FirewallResource{{ResourceType: "vm", ResourceUUID: vmUUID}},
+		}
+		mutate(&firewall)
+		return firewall
+	}
+	for name, mutate := range map[string]func(*sdk.Firewall){
+		"valid":            func(*sdk.Firewall) {},
+		"empty desc":       func(f *sdk.Firewall) { f.Description = "" },
+		"upper-case VM":    func(f *sdk.Firewall) { f.ResourcesAssigned[0].ResourceType = "VM" },
+		"billing mismatch": func(f *sdk.Firewall) { f.BillingAccountID++ },
+		"bad description":  func(f *sdk.Firewall) { f.Description = "something else" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := validateWorkerFirewallAssignments(
+				[]sdk.Firewall{base, build(mutate)}, base.UUID, vmUUID, base.BillingAccountID, true,
+				inspacev1.FirewallProfilePublicNodeLocal, "cluster-a", "", "nodeclaim-a",
+			)
+			wantOK := name == "valid" || name == "empty desc" || name == "upper-case VM"
+			if wantOK && err != nil {
+				t.Fatalf("rejected: %v", err)
+			}
+			if !wantOK && !errors.Is(err, cloudapi.ErrOwnershipMismatch) {
+				t.Fatalf("accepted or wrong error: %v", err)
+			}
+		})
+	}
+}
