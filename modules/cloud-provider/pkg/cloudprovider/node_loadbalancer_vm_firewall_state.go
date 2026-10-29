@@ -583,6 +583,10 @@ func (c *nodeLoadBalancerController) vmFirewallStep(
 	observation, err := c.observeVMFirewall(vmUUID, view, applied, items)
 	if err != nil {
 		if errors.Is(err, errVMFirewallDrift) && delta.LedgerOnly && view.uuid() != "" && !vmFirewallListed(items, view.uuid()) {
+			// This retires every entry of the anchor under the authority of the one
+			// Service that asked. That is safe only because the VM is proven gone
+			// (checked just below): no entry protects anything that is left.
+			//
 			// The VM is gone and its firewall too: there is nothing left to
 			// drift from. With the VM proven absent the whole anchor is retired
 			// through the delete receipt, whose three spaced absent reads prove
