@@ -521,9 +521,6 @@ func (c *nodeLoadBalancerController) vmFirewallStep(
 	if authorize == nil {
 		return vmFirewallStepResult{}, errors.New("public-node-local: a VM firewall step needs its authority check")
 	}
-	if delta.LedgerOnly {
-		return vmFirewallStepResult{}, errors.New("public-node-local: ledger-only VM firewall removal is not available yet")
-	}
 	cluster := c.provider.config.ClusterID
 	name, err := inspace.NodeLoadBalancerVMFirewallName(cluster, vmUUID)
 	if err != nil {
@@ -614,8 +611,15 @@ func (c *nodeLoadBalancerController) vmFirewallStep(
 		return vmFirewallStepResult{Converged: true, AppliedAt: appliedAt, FirewallUUID: view.uuid()}, nil
 	}
 
+	if delta.LedgerOnly {
+		err := c.removeVMFirewallEntryLedgerOnly(ctx, vmUUID, anchor, observation, next, authorize)
+		return vmFirewallStepResult{FirewallUUID: view.uuid()}, err
+	}
 	if len(next.Members) == 0 {
-		return vmFirewallStepResult{}, errors.New("public-node-local: removing the last VM firewall entry is not available yet")
+		// An empty PUT is rejected, and the last member's closure is the detach
+		// itself: stage the delete and let the receipt carry it.
+		err := c.stageVMFirewallDelete(ctx, anchor, observation, authorize)
+		return vmFirewallStepResult{FirewallUUID: view.uuid()}, err
 	}
 	merged, err := mergeVMFirewallLedger(next)
 	if err != nil {
@@ -757,6 +761,10 @@ func (c *nodeLoadBalancerController) commitVMFirewallMutation(ctx context.Contex
 	_, changed, err := c.updateVMFirewallAnchor(ctx, anchor, func(cm *corev1.ConfigMap) (bool, error) {
 		if !vmFirewallSameReceipt(cm.Annotations, expected) || cm.Annotations[annotationVMFirewallPending] == "" {
 			return false, errors.New("public-node-local: the VM firewall receipt changed before its commit")
+		}
+		if cm.Annotations[annotationVMFirewallPending] == cm.Annotations[annotationVMFirewallApplied] {
+			// A PUT that restores the applied ledger is a repair: single use.
+			delete(cm.Annotations, annotationVMFirewallRepair)
 		}
 		cm.Annotations[annotationVMFirewallApplied] = cm.Annotations[annotationVMFirewallPending]
 		cm.Annotations[annotationVMFirewallAppliedHash] = cm.Annotations[annotationVMFirewallPendingHash]
@@ -942,6 +950,8 @@ func (c *nodeLoadBalancerController) resolveVMFirewallReceipt(
 	op := vmFirewallOp(view.pendingOp())
 	switch op {
 	case vmFirewallOpCreate, vmFirewallOpUpdate:
+	case vmFirewallOpDelete:
+		return c.deleteVMFirewall(ctx, anchor)
 	default:
 		return false, fmt.Errorf("public-node-local: VM firewall receipt operation %q cannot be resolved here", op)
 	}
@@ -1015,6 +1025,14 @@ func (c *nodeLoadBalancerController) resolveVMFirewallReceipt(
 		// The request can no longer be in flight and a fresh read still shows the
 		// applied rules, so it did not commit. Clear this one receipt, once; the
 		// next pass re-derives the change and issues it again with full authority.
+		return true, c.resetVMFirewallReceipt(ctx, anchor)
+	}
+	if pendingHash == view.appliedHash() {
+		// A repair PUT restores the applied rules over a drifted firewall, so a
+		// third state is exactly what an unchanged readback looks like for it.
+		if now.Before(retireAt) {
+			return false, vmFirewallWait(untilRetire, "public-node-local: VM firewall repair for %s is ambiguous; waiting for readback", vmUUID)
+		}
 		return true, c.resetVMFirewallReceipt(ctx, anchor)
 	}
 	return drift("firewall %s has rules that are neither the applied nor the pending ledger", firewall.UUID)
