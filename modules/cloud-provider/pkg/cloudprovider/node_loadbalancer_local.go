@@ -2288,7 +2288,7 @@ func (c *nodeLoadBalancerController) validatePublicNodeLocalAssignmentState(
 		}
 		now := c.assignFenceClock()
 		if startedAt.After(now) || !now.Before(startedAt.Add(nodeLoadBalancerPublicNodeLocalAssignTimeout)) {
-			return errors.New("public-node-local: durable firewall assignment fence is not fresh")
+			return fmt.Errorf("public-node-local: durable firewall assignment fence is not fresh (started %s, now %s)", startedAt, now)
 		}
 	}
 	return nil

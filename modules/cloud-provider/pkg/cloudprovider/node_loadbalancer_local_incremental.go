@@ -1034,7 +1034,8 @@ func (c *nodeLoadBalancerController) validateActivePublicNodeLocalAssignState(
 	started, err := time.Parse(time.RFC3339Nano, current.Annotations[annotationNodeLoadBalancerFirewallAssignAt])
 	now := c.assignFenceClock()
 	if err != nil || started.After(now) || !now.Before(started.Add(nodeLoadBalancerPublicNodeLocalAssignTimeout)) {
-		return errors.New("public-node-local: durable firewall assignment fence is not fresh")
+		return fmt.Errorf("public-node-local: durable firewall assignment fence is not fresh (started %q, parsed %s, now %s, parse error %v)",
+			current.Annotations[annotationNodeLoadBalancerFirewallAssignAt], started, now, err)
 	}
 	if !edge.fenceMatches(current.Annotations) ||
 		current.Annotations[annotationPublicNodeLocalAssignPolicy] != desired.Hash ||
