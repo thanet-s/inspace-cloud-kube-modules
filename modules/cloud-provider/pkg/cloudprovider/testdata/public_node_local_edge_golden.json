@@ -1,0 +1,836 @@
+{
+  "add node": {
+    "passes": [
+      "ok",
+      "ok",
+      "ok"
+    ],
+    "calls": [
+      "AssignFirewallToVM 00000000-0000-4000-8000-000000000001 22222222-2222-4333-8444-555555555555"
+    ],
+    "createdFirewalls": [
+      "inlb-08026f06-edge-service-uid-886b49b4"
+    ],
+    "updatedFirewalls": [],
+    "deletedFirewalls": [],
+    "assignedFirewalls": [
+      "00000000-0000-4000-8000-000000000001/11111111-2222-4333-8444-555555555555",
+      "00000000-0000-4000-8000-000000000001/22222222-2222-4333-8444-555555555555"
+    ],
+    "unassignedFirewalls": [],
+    "unassignedIPs": [],
+    "floatingIPs": [
+      "203.0.113.21=11111111-2222-4333-8444-555555555555",
+      "203.0.113.22=22222222-2222-4333-8444-555555555555"
+    ],
+    "firewallAssignments": [
+      "00000000-0000-4000-8000-000000000001/11111111-2222-4333-8444-555555555555",
+      "00000000-0000-4000-8000-000000000001/22222222-2222-4333-8444-555555555555"
+    ],
+    "ingress": [
+      "203.0.113.21",
+      "203.0.113.22"
+    ],
+    "finalizers": [
+      "service.inspace.cloud/public-node-local"
+    ],
+    "annotations": {
+      "service.inspace.cloud/node-lb-firewall-hash": "886b49b4",
+      "service.inspace.cloud/node-lb-firewall-uuid": "00000000-0000-4000-8000-000000000001",
+      "service.inspace.cloud/node-lb-mode": "public-node-local",
+      "service.inspace.cloud/node-lb-pool": "edge",
+      "service.inspace.cloud/public-node-local-active-policy": "886b49b4",
+      "service.inspace.cloud/public-node-local-active-pool": "edge",
+      "service.inspace.cloud/public-node-local-active-ports": "[{\"pr\":\"TCP\",\"p\":443}]"
+    },
+    "childAnnotations": {
+      "service.inspace.cloud/public-node-local-pool": "edge"
+    },
+    "childPorts": [
+      443
+    ]
+  },
+  "baseline steady state 3 nodes": {
+    "passes": [
+      "ok",
+      "ok",
+      "ok"
+    ],
+    "calls": [],
+    "createdFirewalls": [
+      "inlb-08026f06-edge-service-uid-886b49b4"
+    ],
+    "updatedFirewalls": [],
+    "deletedFirewalls": [],
+    "assignedFirewalls": [
+      "00000000-0000-4000-8000-000000000001/11111111-2222-4333-8444-555555555555",
+      "00000000-0000-4000-8000-000000000001/22222222-2222-4333-8444-555555555555",
+      "00000000-0000-4000-8000-000000000001/33333333-2222-4333-8444-555555555555"
+    ],
+    "unassignedFirewalls": [],
+    "unassignedIPs": [],
+    "floatingIPs": [
+      "203.0.113.21=11111111-2222-4333-8444-555555555555",
+      "203.0.113.22=22222222-2222-4333-8444-555555555555",
+      "203.0.113.23=33333333-2222-4333-8444-555555555555"
+    ],
+    "firewallAssignments": [
+      "00000000-0000-4000-8000-000000000001/11111111-2222-4333-8444-555555555555",
+      "00000000-0000-4000-8000-000000000001/22222222-2222-4333-8444-555555555555",
+      "00000000-0000-4000-8000-000000000001/33333333-2222-4333-8444-555555555555"
+    ],
+    "ingress": [
+      "203.0.113.21",
+      "203.0.113.22",
+      "203.0.113.23"
+    ],
+    "finalizers": [
+      "service.inspace.cloud/public-node-local"
+    ],
+    "annotations": {
+      "service.inspace.cloud/node-lb-firewall-hash": "886b49b4",
+      "service.inspace.cloud/node-lb-firewall-uuid": "00000000-0000-4000-8000-000000000001",
+      "service.inspace.cloud/node-lb-mode": "public-node-local",
+      "service.inspace.cloud/node-lb-pool": "edge",
+      "service.inspace.cloud/public-node-local-active-policy": "886b49b4",
+      "service.inspace.cloud/public-node-local-active-pool": "edge",
+      "service.inspace.cloud/public-node-local-active-ports": "[{\"pr\":\"TCP\",\"p\":443}]"
+    },
+    "childAnnotations": {
+      "service.inspace.cloud/public-node-local-pool": "edge"
+    },
+    "childPorts": [
+      443
+    ]
+  },
+  "peer on another pool": {
+    "passes": [
+      "ok",
+      "ok",
+      "ok",
+      "ok"
+    ],
+    "calls": [],
+    "createdFirewalls": [
+      "inlb-08026f06-edge-service-uid-886b49b4"
+    ],
+    "updatedFirewalls": [],
+    "deletedFirewalls": [],
+    "assignedFirewalls": [
+      "00000000-0000-4000-8000-000000000001/11111111-2222-4333-8444-555555555555",
+      "00000000-0000-4000-8000-000000000001/22222222-2222-4333-8444-555555555555"
+    ],
+    "unassignedFirewalls": [],
+    "unassignedIPs": [],
+    "floatingIPs": [
+      "203.0.113.21=11111111-2222-4333-8444-555555555555",
+      "203.0.113.22=22222222-2222-4333-8444-555555555555"
+    ],
+    "firewallAssignments": [
+      "00000000-0000-4000-8000-000000000001/11111111-2222-4333-8444-555555555555",
+      "00000000-0000-4000-8000-000000000001/22222222-2222-4333-8444-555555555555"
+    ],
+    "ingress": [
+      "203.0.113.21",
+      "203.0.113.22"
+    ],
+    "finalizers": [
+      "service.inspace.cloud/public-node-local"
+    ],
+    "annotations": {
+      "service.inspace.cloud/node-lb-firewall-hash": "886b49b4",
+      "service.inspace.cloud/node-lb-firewall-uuid": "00000000-0000-4000-8000-000000000001",
+      "service.inspace.cloud/node-lb-mode": "public-node-local",
+      "service.inspace.cloud/node-lb-pool": "edge",
+      "service.inspace.cloud/public-node-local-active-policy": "886b49b4",
+      "service.inspace.cloud/public-node-local-active-pool": "edge",
+      "service.inspace.cloud/public-node-local-active-ports": "[{\"pr\":\"TCP\",\"p\":443}]"
+    },
+    "childAnnotations": {
+      "service.inspace.cloud/public-node-local-pool": "edge"
+    },
+    "childPorts": [
+      443
+    ]
+  },
+  "pool change": {
+    "passes": [
+      "ok",
+      "ok",
+      "ok",
+      "ok",
+      "ok",
+      "ok",
+      "ok",
+      "ok",
+      "ok",
+      "ok"
+    ],
+    "calls": [
+      "AssignFirewallToVM 00000000-0000-4000-8000-000000000001 22222222-2222-4333-8444-555555555555",
+      "UnassignFirewallFromVM 00000000-0000-4000-8000-000000000001 11111111-2222-4333-8444-555555555555"
+    ],
+    "createdFirewalls": [
+      "inlb-08026f06-edge-service-uid-886b49b4"
+    ],
+    "updatedFirewalls": [],
+    "deletedFirewalls": [],
+    "assignedFirewalls": [
+      "00000000-0000-4000-8000-000000000001/11111111-2222-4333-8444-555555555555",
+      "00000000-0000-4000-8000-000000000001/22222222-2222-4333-8444-555555555555"
+    ],
+    "unassignedFirewalls": [
+      "00000000-0000-4000-8000-000000000001/11111111-2222-4333-8444-555555555555"
+    ],
+    "unassignedIPs": [],
+    "floatingIPs": [
+      "203.0.113.21=11111111-2222-4333-8444-555555555555",
+      "203.0.113.22=22222222-2222-4333-8444-555555555555"
+    ],
+    "firewallAssignments": [
+      "00000000-0000-4000-8000-000000000001/22222222-2222-4333-8444-555555555555"
+    ],
+    "ingress": [
+      "203.0.113.22"
+    ],
+    "finalizers": [
+      "service.inspace.cloud/public-node-local"
+    ],
+    "annotations": {
+      "service.inspace.cloud/node-lb-firewall-hash": "886b49b4",
+      "service.inspace.cloud/node-lb-firewall-uuid": "00000000-0000-4000-8000-000000000001",
+      "service.inspace.cloud/node-lb-mode": "public-node-local",
+      "service.inspace.cloud/node-lb-pool": "spe-relay-share",
+      "service.inspace.cloud/public-node-local-active-policy": "886b49b4",
+      "service.inspace.cloud/public-node-local-active-pool": "spe-relay-share",
+      "service.inspace.cloud/public-node-local-active-ports": "[{\"pr\":\"TCP\",\"p\":443}]"
+    },
+    "childAnnotations": {
+      "service.inspace.cloud/public-node-local-pool": "spe-relay-share"
+    },
+    "childPorts": [
+      443
+    ]
+  },
+  "pool change refused by a peer": {
+    "passes": [
+      "hold",
+      "hold",
+      "hold",
+      "hold",
+      "hold"
+    ],
+    "calls": [],
+    "createdFirewalls": [
+      "inlb-08026f06-edge-service-uid-886b49b4"
+    ],
+    "updatedFirewalls": [],
+    "deletedFirewalls": [],
+    "assignedFirewalls": [
+      "00000000-0000-4000-8000-000000000001/11111111-2222-4333-8444-555555555555"
+    ],
+    "unassignedFirewalls": [],
+    "unassignedIPs": [],
+    "floatingIPs": [
+      "203.0.113.21=11111111-2222-4333-8444-555555555555"
+    ],
+    "firewallAssignments": [
+      "00000000-0000-4000-8000-000000000001/11111111-2222-4333-8444-555555555555"
+    ],
+    "ingress": [
+      "203.0.113.21"
+    ],
+    "finalizers": [
+      "service.inspace.cloud/public-node-local"
+    ],
+    "annotations": {
+      "service.inspace.cloud/node-lb-firewall-hash": "886b49b4",
+      "service.inspace.cloud/node-lb-firewall-uuid": "00000000-0000-4000-8000-000000000001",
+      "service.inspace.cloud/node-lb-mode": "public-node-local",
+      "service.inspace.cloud/node-lb-pool": "spe-relay-share",
+      "service.inspace.cloud/public-node-local-active-policy": "886b49b4",
+      "service.inspace.cloud/public-node-local-active-pool": "edge",
+      "service.inspace.cloud/public-node-local-active-ports": "[{\"pr\":\"TCP\",\"p\":443}]"
+    },
+    "childAnnotations": {
+      "service.inspace.cloud/public-node-local-pool": "edge"
+    },
+    "childPorts": [
+      443
+    ]
+  },
+  "pool change without Nodes holds": {
+    "passes": [
+      "ok",
+      "ok",
+      "hold",
+      "hold",
+      "hold",
+      "hold",
+      "hold",
+      "hold"
+    ],
+    "calls": [],
+    "createdFirewalls": [
+      "inlb-08026f06-edge-service-uid-886b49b4"
+    ],
+    "updatedFirewalls": [],
+    "deletedFirewalls": [],
+    "assignedFirewalls": [
+      "00000000-0000-4000-8000-000000000001/11111111-2222-4333-8444-555555555555",
+      "00000000-0000-4000-8000-000000000001/22222222-2222-4333-8444-555555555555"
+    ],
+    "unassignedFirewalls": [],
+    "unassignedIPs": [],
+    "floatingIPs": [
+      "203.0.113.21=11111111-2222-4333-8444-555555555555",
+      "203.0.113.22=22222222-2222-4333-8444-555555555555"
+    ],
+    "firewallAssignments": [
+      "00000000-0000-4000-8000-000000000001/11111111-2222-4333-8444-555555555555",
+      "00000000-0000-4000-8000-000000000001/22222222-2222-4333-8444-555555555555"
+    ],
+    "ingress": [
+      "203.0.113.21",
+      "203.0.113.22"
+    ],
+    "finalizers": [
+      "service.inspace.cloud/public-node-local"
+    ],
+    "annotations": {
+      "service.inspace.cloud/node-lb-firewall-hash": "886b49b4",
+      "service.inspace.cloud/node-lb-firewall-uuid": "00000000-0000-4000-8000-000000000001",
+      "service.inspace.cloud/node-lb-mode": "public-node-local",
+      "service.inspace.cloud/node-lb-pool": "other",
+      "service.inspace.cloud/public-node-local-active-policy": "886b49b4",
+      "service.inspace.cloud/public-node-local-active-pool": "edge",
+      "service.inspace.cloud/public-node-local-active-ports": "[{\"pr\":\"TCP\",\"p\":443}]",
+      "service.inspace.cloud/public-node-local-target-policy": "886b49b4",
+      "service.inspace.cloud/public-node-local-target-pool": "other",
+      "service.inspace.cloud/public-node-local-target-since": "\u003ct\u003e"
+    },
+    "childAnnotations": {
+      "service.inspace.cloud/public-node-local-pool": "edge",
+      "service.inspace.cloud/public-node-local-target-pool": "other"
+    },
+    "childPorts": [
+      443
+    ]
+  },
+  "port narrowing": {
+    "passes": [
+      "ok",
+      "ok",
+      "hold",
+      "hold",
+      "ok",
+      "ok",
+      "ok",
+      "ok",
+      "ok",
+      "ok",
+      "ok",
+      "ok",
+      "hold",
+      "hold",
+      "ok"
+    ],
+    "calls": [
+      "CreateFirewall inlb-08026f06-edge-service-uid-886b49b4",
+      "AssignFirewallToVM 00000000-0000-4000-8000-000000000002 11111111-2222-4333-8444-555555555555",
+      "AssignFirewallToVM 00000000-0000-4000-8000-000000000002 22222222-2222-4333-8444-555555555555",
+      "UnassignFirewallFromVM 00000000-0000-4000-8000-000000000001 11111111-2222-4333-8444-555555555555",
+      "UnassignFirewallFromVM 00000000-0000-4000-8000-000000000001 22222222-2222-4333-8444-555555555555",
+      "DeleteFirewall 00000000-0000-4000-8000-000000000001"
+    ],
+    "createdFirewalls": [
+      "inlb-08026f06-edge-service-uid-41fe85dd",
+      "inlb-08026f06-edge-service-uid-886b49b4"
+    ],
+    "updatedFirewalls": [],
+    "deletedFirewalls": [
+      "00000000-0000-4000-8000-000000000001"
+    ],
+    "assignedFirewalls": [
+      "00000000-0000-4000-8000-000000000001/11111111-2222-4333-8444-555555555555",
+      "00000000-0000-4000-8000-000000000001/22222222-2222-4333-8444-555555555555",
+      "00000000-0000-4000-8000-000000000002/11111111-2222-4333-8444-555555555555",
+      "00000000-0000-4000-8000-000000000002/22222222-2222-4333-8444-555555555555"
+    ],
+    "unassignedFirewalls": [
+      "00000000-0000-4000-8000-000000000001/11111111-2222-4333-8444-555555555555",
+      "00000000-0000-4000-8000-000000000001/22222222-2222-4333-8444-555555555555"
+    ],
+    "unassignedIPs": [],
+    "floatingIPs": [
+      "203.0.113.21=11111111-2222-4333-8444-555555555555",
+      "203.0.113.22=22222222-2222-4333-8444-555555555555"
+    ],
+    "firewallAssignments": [
+      "00000000-0000-4000-8000-000000000002/11111111-2222-4333-8444-555555555555",
+      "00000000-0000-4000-8000-000000000002/22222222-2222-4333-8444-555555555555"
+    ],
+    "ingress": [
+      "203.0.113.21",
+      "203.0.113.22"
+    ],
+    "finalizers": [
+      "service.inspace.cloud/public-node-local"
+    ],
+    "annotations": {
+      "service.inspace.cloud/node-lb-cleanup-firewall-absence-checked-at": "\u003ct\u003e",
+      "service.inspace.cloud/node-lb-cleanup-firewall-absence-count": "3",
+      "service.inspace.cloud/node-lb-firewall-hash": "886b49b4",
+      "service.inspace.cloud/node-lb-firewall-uuid": "00000000-0000-4000-8000-000000000002",
+      "service.inspace.cloud/node-lb-mode": "public-node-local",
+      "service.inspace.cloud/node-lb-pool": "edge",
+      "service.inspace.cloud/public-node-local-active-policy": "886b49b4",
+      "service.inspace.cloud/public-node-local-active-pool": "edge",
+      "service.inspace.cloud/public-node-local-active-ports": "[{\"n\":\"p0\",\"pr\":\"TCP\",\"p\":443,\"ti\":443}]",
+      "service.inspace.cloud/public-node-local-promoted-at": "\u003ct\u003e"
+    },
+    "childAnnotations": {
+      "service.inspace.cloud/public-node-local-pool": "edge"
+    },
+    "childPorts": [
+      443
+    ]
+  },
+  "port widening": {
+    "passes": [
+      "ok",
+      "ok",
+      "hold",
+      "hold",
+      "ok",
+      "ok",
+      "ok",
+      "ok",
+      "ok",
+      "ok",
+      "ok",
+      "ok",
+      "hold",
+      "hold"
+    ],
+    "calls": [
+      "CreateFirewall inlb-08026f06-edge-service-uid-23464192",
+      "AssignFirewallToVM 00000000-0000-4000-8000-000000000002 11111111-2222-4333-8444-555555555555",
+      "AssignFirewallToVM 00000000-0000-4000-8000-000000000002 22222222-2222-4333-8444-555555555555",
+      "UnassignFirewallFromVM 00000000-0000-4000-8000-000000000001 11111111-2222-4333-8444-555555555555",
+      "UnassignFirewallFromVM 00000000-0000-4000-8000-000000000001 22222222-2222-4333-8444-555555555555",
+      "DeleteFirewall 00000000-0000-4000-8000-000000000001"
+    ],
+    "createdFirewalls": [
+      "inlb-08026f06-edge-service-uid-886b49b4",
+      "inlb-08026f06-edge-service-uid-23464192"
+    ],
+    "updatedFirewalls": [],
+    "deletedFirewalls": [
+      "00000000-0000-4000-8000-000000000001"
+    ],
+    "assignedFirewalls": [
+      "00000000-0000-4000-8000-000000000001/11111111-2222-4333-8444-555555555555",
+      "00000000-0000-4000-8000-000000000001/22222222-2222-4333-8444-555555555555",
+      "00000000-0000-4000-8000-000000000002/11111111-2222-4333-8444-555555555555",
+      "00000000-0000-4000-8000-000000000002/22222222-2222-4333-8444-555555555555"
+    ],
+    "unassignedFirewalls": [
+      "00000000-0000-4000-8000-000000000001/11111111-2222-4333-8444-555555555555",
+      "00000000-0000-4000-8000-000000000001/22222222-2222-4333-8444-555555555555"
+    ],
+    "unassignedIPs": [],
+    "floatingIPs": [
+      "203.0.113.21=11111111-2222-4333-8444-555555555555",
+      "203.0.113.22=22222222-2222-4333-8444-555555555555"
+    ],
+    "firewallAssignments": [
+      "00000000-0000-4000-8000-000000000002/11111111-2222-4333-8444-555555555555",
+      "00000000-0000-4000-8000-000000000002/22222222-2222-4333-8444-555555555555"
+    ],
+    "ingress": [
+      "203.0.113.21",
+      "203.0.113.22"
+    ],
+    "finalizers": [
+      "service.inspace.cloud/public-node-local"
+    ],
+    "annotations": {
+      "service.inspace.cloud/node-lb-cleanup-firewall-absence-checked-at": "\u003ct\u003e",
+      "service.inspace.cloud/node-lb-cleanup-firewall-absence-count": "3",
+      "service.inspace.cloud/node-lb-firewall-hash": "23464192",
+      "service.inspace.cloud/node-lb-firewall-uuid": "00000000-0000-4000-8000-000000000002",
+      "service.inspace.cloud/node-lb-mode": "public-node-local",
+      "service.inspace.cloud/node-lb-pool": "edge",
+      "service.inspace.cloud/public-node-local-active-policy": "23464192",
+      "service.inspace.cloud/public-node-local-active-pool": "edge",
+      "service.inspace.cloud/public-node-local-active-ports": "[{\"n\":\"p0\",\"pr\":\"TCP\",\"p\":443,\"ti\":443},{\"n\":\"p1\",\"pr\":\"TCP\",\"p\":8443,\"ti\":8443}]",
+      "service.inspace.cloud/public-node-local-promoted-at": "\u003ct\u003e"
+    },
+    "childAnnotations": {
+      "service.inspace.cloud/public-node-local-pool": "edge"
+    },
+    "childPorts": [
+      443,
+      8443
+    ]
+  },
+  "remove node": {
+    "passes": [
+      "ok",
+      "ok",
+      "ok",
+      "ok"
+    ],
+    "calls": [
+      "UnassignFirewallFromVM 00000000-0000-4000-8000-000000000001 22222222-2222-4333-8444-555555555555"
+    ],
+    "createdFirewalls": [
+      "inlb-08026f06-edge-service-uid-886b49b4"
+    ],
+    "updatedFirewalls": [],
+    "deletedFirewalls": [],
+    "assignedFirewalls": [
+      "00000000-0000-4000-8000-000000000001/11111111-2222-4333-8444-555555555555",
+      "00000000-0000-4000-8000-000000000001/22222222-2222-4333-8444-555555555555"
+    ],
+    "unassignedFirewalls": [
+      "00000000-0000-4000-8000-000000000001/22222222-2222-4333-8444-555555555555"
+    ],
+    "unassignedIPs": [],
+    "floatingIPs": [
+      "203.0.113.21=11111111-2222-4333-8444-555555555555",
+      "203.0.113.22=22222222-2222-4333-8444-555555555555"
+    ],
+    "firewallAssignments": [
+      "00000000-0000-4000-8000-000000000001/11111111-2222-4333-8444-555555555555"
+    ],
+    "ingress": [
+      "203.0.113.21"
+    ],
+    "finalizers": [
+      "service.inspace.cloud/public-node-local"
+    ],
+    "annotations": {
+      "service.inspace.cloud/node-lb-firewall-hash": "886b49b4",
+      "service.inspace.cloud/node-lb-firewall-uuid": "00000000-0000-4000-8000-000000000001",
+      "service.inspace.cloud/node-lb-mode": "public-node-local",
+      "service.inspace.cloud/node-lb-pool": "edge",
+      "service.inspace.cloud/public-node-local-active-policy": "886b49b4",
+      "service.inspace.cloud/public-node-local-active-pool": "edge",
+      "service.inspace.cloud/public-node-local-active-ports": "[{\"pr\":\"TCP\",\"p\":443}]"
+    },
+    "childAnnotations": {
+      "service.inspace.cloud/public-node-local-pool": "edge"
+    },
+    "childPorts": [
+      443
+    ]
+  },
+  "restart mid policy change": {
+    "passes": [
+      "ok",
+      "ok",
+      "hold",
+      "hold",
+      "ok",
+      "ok",
+      "ok",
+      "ok",
+      "ok",
+      "ok",
+      "ok",
+      "ok",
+      "hold",
+      "hold"
+    ],
+    "calls": [
+      "CreateFirewall inlb-08026f06-edge-service-uid-23464192",
+      "AssignFirewallToVM 00000000-0000-4000-8000-000000000002 11111111-2222-4333-8444-555555555555",
+      "AssignFirewallToVM 00000000-0000-4000-8000-000000000002 22222222-2222-4333-8444-555555555555",
+      "UnassignFirewallFromVM 00000000-0000-4000-8000-000000000001 11111111-2222-4333-8444-555555555555",
+      "UnassignFirewallFromVM 00000000-0000-4000-8000-000000000001 22222222-2222-4333-8444-555555555555",
+      "DeleteFirewall 00000000-0000-4000-8000-000000000001"
+    ],
+    "createdFirewalls": [
+      "inlb-08026f06-edge-service-uid-886b49b4",
+      "inlb-08026f06-edge-service-uid-23464192"
+    ],
+    "updatedFirewalls": [],
+    "deletedFirewalls": [
+      "00000000-0000-4000-8000-000000000001"
+    ],
+    "assignedFirewalls": [
+      "00000000-0000-4000-8000-000000000001/11111111-2222-4333-8444-555555555555",
+      "00000000-0000-4000-8000-000000000001/22222222-2222-4333-8444-555555555555",
+      "00000000-0000-4000-8000-000000000002/11111111-2222-4333-8444-555555555555",
+      "00000000-0000-4000-8000-000000000002/22222222-2222-4333-8444-555555555555"
+    ],
+    "unassignedFirewalls": [
+      "00000000-0000-4000-8000-000000000001/11111111-2222-4333-8444-555555555555",
+      "00000000-0000-4000-8000-000000000001/22222222-2222-4333-8444-555555555555"
+    ],
+    "unassignedIPs": [],
+    "floatingIPs": [
+      "203.0.113.21=11111111-2222-4333-8444-555555555555",
+      "203.0.113.22=22222222-2222-4333-8444-555555555555"
+    ],
+    "firewallAssignments": [
+      "00000000-0000-4000-8000-000000000002/11111111-2222-4333-8444-555555555555",
+      "00000000-0000-4000-8000-000000000002/22222222-2222-4333-8444-555555555555"
+    ],
+    "ingress": [
+      "203.0.113.21",
+      "203.0.113.22"
+    ],
+    "finalizers": [
+      "service.inspace.cloud/public-node-local"
+    ],
+    "annotations": {
+      "service.inspace.cloud/node-lb-cleanup-firewall-absence-checked-at": "\u003ct\u003e",
+      "service.inspace.cloud/node-lb-cleanup-firewall-absence-count": "3",
+      "service.inspace.cloud/node-lb-firewall-hash": "23464192",
+      "service.inspace.cloud/node-lb-firewall-uuid": "00000000-0000-4000-8000-000000000002",
+      "service.inspace.cloud/node-lb-mode": "public-node-local",
+      "service.inspace.cloud/node-lb-pool": "edge",
+      "service.inspace.cloud/public-node-local-active-policy": "23464192",
+      "service.inspace.cloud/public-node-local-active-pool": "edge",
+      "service.inspace.cloud/public-node-local-active-ports": "[{\"n\":\"p0\",\"pr\":\"TCP\",\"p\":443,\"ti\":443},{\"n\":\"p1\",\"pr\":\"TCP\",\"p\":8443,\"ti\":8443}]",
+      "service.inspace.cloud/public-node-local-promoted-at": "\u003ct\u003e"
+    },
+    "childAnnotations": {
+      "service.inspace.cloud/public-node-local-pool": "edge"
+    },
+    "childPorts": [
+      443,
+      8443
+    ]
+  },
+  "service deleted": {
+    "passes": [
+      "waiting",
+      "ok",
+      "waiting",
+      "waiting",
+      "waiting",
+      "waiting",
+      "waiting",
+      "waiting",
+      "waiting",
+      "waiting",
+      "waiting",
+      "waiting",
+      "waiting",
+      "waiting",
+      "waiting",
+      "waiting",
+      "waiting",
+      "waiting",
+      "waiting",
+      "waiting",
+      "waiting",
+      "waiting",
+      "waiting",
+      "waiting",
+      "waiting",
+      "waiting",
+      "waiting",
+      "waiting",
+      "waiting",
+      "waiting",
+      "waiting",
+      "waiting",
+      "waiting",
+      "waiting",
+      "waiting",
+      "waiting",
+      "waiting",
+      "waiting",
+      "waiting",
+      "waiting",
+      "waiting",
+      "waiting",
+      "waiting",
+      "waiting",
+      "waiting",
+      "waiting",
+      "waiting",
+      "waiting",
+      "waiting",
+      "waiting",
+      "waiting",
+      "waiting",
+      "waiting",
+      "waiting",
+      "waiting",
+      "waiting",
+      "waiting",
+      "waiting",
+      "waiting",
+      "waiting"
+    ],
+    "calls": [
+      "UnassignFirewallFromVM 00000000-0000-4000-8000-000000000001 11111111-2222-4333-8444-555555555555",
+      "UnassignFirewallFromVM 00000000-0000-4000-8000-000000000001 22222222-2222-4333-8444-555555555555",
+      "DeleteFirewall 00000000-0000-4000-8000-000000000001"
+    ],
+    "createdFirewalls": [
+      "inlb-08026f06-edge-service-uid-886b49b4"
+    ],
+    "updatedFirewalls": [],
+    "deletedFirewalls": [
+      "00000000-0000-4000-8000-000000000001"
+    ],
+    "assignedFirewalls": [
+      "00000000-0000-4000-8000-000000000001/11111111-2222-4333-8444-555555555555",
+      "00000000-0000-4000-8000-000000000001/22222222-2222-4333-8444-555555555555"
+    ],
+    "unassignedFirewalls": [
+      "00000000-0000-4000-8000-000000000001/11111111-2222-4333-8444-555555555555",
+      "00000000-0000-4000-8000-000000000001/22222222-2222-4333-8444-555555555555"
+    ],
+    "unassignedIPs": [],
+    "floatingIPs": [
+      "203.0.113.21=11111111-2222-4333-8444-555555555555",
+      "203.0.113.22=22222222-2222-4333-8444-555555555555"
+    ],
+    "firewallAssignments": [],
+    "ingress": [],
+    "finalizers": [
+      "service.inspace.cloud/public-node-local"
+    ],
+    "annotations": {
+      "service.inspace.cloud/node-lb-firewall-delete-issued-at": "\u003ct\u003e",
+      "service.inspace.cloud/node-lb-firewall-delete-target-uuid": "00000000-0000-4000-8000-000000000001",
+      "service.inspace.cloud/node-lb-firewall-hash": "886b49b4",
+      "service.inspace.cloud/node-lb-firewall-uuid": "00000000-0000-4000-8000-000000000001",
+      "service.inspace.cloud/node-lb-mode": "public-node-local",
+      "service.inspace.cloud/node-lb-pool": "edge",
+      "service.inspace.cloud/node-lb-withdraw-firewall-absence-checked-at": "\u003ct\u003e",
+      "service.inspace.cloud/node-lb-withdraw-firewall-absence-count": "1",
+      "service.inspace.cloud/node-lb-withdraw-firewall-detach-at": "\u003ct\u003e",
+      "service.inspace.cloud/node-lb-withdraw-firewall-detach-set": "00000000-0000-4000-8000-000000000001/22222222-2222-4333-8444-555555555555",
+      "service.inspace.cloud/node-lb-withdraw-firewall-missing-set": "00000000-0000-4000-8000-000000000001"
+    },
+    "childAnnotations": null,
+    "childPorts": null
+  },
+  "withdraw all nodes gone": {
+    "passes": [
+      "waiting",
+      "ok"
+    ],
+    "calls": [
+      "UnassignFirewallFromVM 00000000-0000-4000-8000-000000000001 11111111-2222-4333-8444-555555555555",
+      "UnassignFirewallFromVM 00000000-0000-4000-8000-000000000001 22222222-2222-4333-8444-555555555555"
+    ],
+    "createdFirewalls": [
+      "inlb-08026f06-edge-service-uid-886b49b4"
+    ],
+    "updatedFirewalls": [],
+    "deletedFirewalls": [],
+    "assignedFirewalls": [
+      "00000000-0000-4000-8000-000000000001/11111111-2222-4333-8444-555555555555",
+      "00000000-0000-4000-8000-000000000001/22222222-2222-4333-8444-555555555555"
+    ],
+    "unassignedFirewalls": [
+      "00000000-0000-4000-8000-000000000001/11111111-2222-4333-8444-555555555555",
+      "00000000-0000-4000-8000-000000000001/22222222-2222-4333-8444-555555555555"
+    ],
+    "unassignedIPs": [],
+    "floatingIPs": [
+      "203.0.113.21=11111111-2222-4333-8444-555555555555",
+      "203.0.113.22=22222222-2222-4333-8444-555555555555"
+    ],
+    "firewallAssignments": [],
+    "ingress": [],
+    "finalizers": [
+      "service.inspace.cloud/public-node-local"
+    ],
+    "annotations": {
+      "service.inspace.cloud/node-lb-firewall-hash": "886b49b4",
+      "service.inspace.cloud/node-lb-firewall-uuid": "00000000-0000-4000-8000-000000000001",
+      "service.inspace.cloud/node-lb-mode": "public-node-local",
+      "service.inspace.cloud/node-lb-pool": "edge",
+      "service.inspace.cloud/node-lb-withdraw-firewall-detach-at": "\u003ct\u003e",
+      "service.inspace.cloud/node-lb-withdraw-firewall-detach-set": "00000000-0000-4000-8000-000000000001/22222222-2222-4333-8444-555555555555"
+    },
+    "childAnnotations": {
+      "service.inspace.cloud/public-node-local-pool": "edge"
+    },
+    "childPorts": [
+      443
+    ]
+  },
+  "withdraw and rebuild on allow-rebuild": {
+    "passes": [
+      "ok",
+      "ok",
+      "ok",
+      "ok",
+      "ok",
+      "ok",
+      "ok",
+      "ok",
+      "ok",
+      "ok",
+      "ok"
+    ],
+    "calls": [
+      "UnassignFirewallFromVM 00000000-0000-4000-8000-000000000001 11111111-2222-4333-8444-555555555555",
+      "CreateFirewall inlb-08026f06-edge-service-uid-23464192",
+      "DeleteFirewall 00000000-0000-4000-8000-000000000001",
+      "AssignFirewallToVM 00000000-0000-4000-8000-000000000002 11111111-2222-4333-8444-555555555555"
+    ],
+    "createdFirewalls": [
+      "inlb-08026f06-edge-service-uid-886b49b4",
+      "inlb-08026f06-edge-service-uid-23464192"
+    ],
+    "updatedFirewalls": [],
+    "deletedFirewalls": [
+      "00000000-0000-4000-8000-000000000001"
+    ],
+    "assignedFirewalls": [
+      "00000000-0000-4000-8000-000000000001/11111111-2222-4333-8444-555555555555",
+      "00000000-0000-4000-8000-000000000002/11111111-2222-4333-8444-555555555555"
+    ],
+    "unassignedFirewalls": [
+      "00000000-0000-4000-8000-000000000001/11111111-2222-4333-8444-555555555555"
+    ],
+    "unassignedIPs": [],
+    "floatingIPs": [
+      "203.0.113.21=11111111-2222-4333-8444-555555555555"
+    ],
+    "firewallAssignments": [
+      "00000000-0000-4000-8000-000000000002/11111111-2222-4333-8444-555555555555"
+    ],
+    "ingress": [
+      "203.0.113.21"
+    ],
+    "finalizers": [
+      "service.inspace.cloud/public-node-local"
+    ],
+    "annotations": {
+      "service.inspace.cloud/node-lb-allow-rebuild": "true",
+      "service.inspace.cloud/node-lb-allow-rebuild-consumed": "true",
+      "service.inspace.cloud/node-lb-cleanup-firewall-absence-checked-at": "\u003ct\u003e",
+      "service.inspace.cloud/node-lb-cleanup-firewall-absence-count": "3",
+      "service.inspace.cloud/node-lb-firewall-hash": "23464192",
+      "service.inspace.cloud/node-lb-firewall-uuid": "00000000-0000-4000-8000-000000000002",
+      "service.inspace.cloud/node-lb-mode": "public-node-local",
+      "service.inspace.cloud/node-lb-pool": "edge",
+      "service.inspace.cloud/node-lb-withdraw-firewall-detach-at": "\u003ct\u003e",
+      "service.inspace.cloud/node-lb-withdraw-firewall-detach-set": "00000000-0000-4000-8000-000000000001/11111111-2222-4333-8444-555555555555",
+      "service.inspace.cloud/public-node-local-active-policy": "23464192",
+      "service.inspace.cloud/public-node-local-active-pool": "edge",
+      "service.inspace.cloud/public-node-local-active-ports": "[{\"n\":\"p0\",\"pr\":\"TCP\",\"p\":443,\"ti\":443},{\"n\":\"p1\",\"pr\":\"TCP\",\"p\":8443,\"ti\":8443}]"
+    },
+    "childAnnotations": {
+      "service.inspace.cloud/public-node-local-pool": "edge"
+    },
+    "childPorts": [
+      443,
+      8443
+    ]
+  }
+}
